@@ -8,21 +8,17 @@ import torch
 import numpy as np
 from pprint import pprint
 from omegaconf import OmegaConf
-from torch.utils.data import Dataset, RandomSampler, SequentialSampler
 
 from verl.single_controller.ray import RayWorkerGroup
 from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, RewardModelWorker
 from verl.trainer.ppo.reward import load_reward_manager
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
-from verl.utils.import_utils import load_extern_type
-from verl.utils.dataset.rl_dataset import collate_fn, RLHFDataset
 
-from psrl.workers.gen import PSRL_GenWorker
+from psrl.workers.rollout import PSRL_GenWorker
 from psrl.workers.train import PSRL_TrainWorker
 from psrl.workers.ps import PSRL_PSWorker
-from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer, PSRL_Role
+from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
 
 
 def seed_everything(seed: int):
@@ -100,29 +96,36 @@ class TaskRunner:
         processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
 
         # define worker classes
-        assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "currently only fsdp and fsdp2 are supported"
-        assert config.critic.strategy in ["fsdp", "fsdp2"], "currently only fsdp and fsdp2 are supported"
+        assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
+        assert config.critic.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
         ray_worker_group_cls = RayWorkerGroup
         
-        gen_pool_id = 'gen_pool'
+        deployment_config = config.psrl.deployment
+        rollout_pool_id_list = [f'rollout_pool_{i}' for i in range(deployment_config.n_rollout_instances)]
         train_pool_id = 'train_pool'
         ps_pool_id = 'ps_pool'
+        # format: {pool_id: [ngpus_per_node] * nnodes}
+        # nnodes will be the number of ray placement groups
+        # and ngpus_per_node will be the number of ray bundles (currently all equals to {"CPU": self.max_colocate_count, "GPU": 1}) in each placement group
         resource_pool_spec = {
-            gen_pool_id: [config.psrl.gen_ngpus_per_node] * config.psrl.gen_nnodes,
-            train_pool_id: [config.psrl.train_ngpus_per_node] * config.psrl.train_nnodes,
-            ps_pool_id: [config.psrl.ps_ngpus_per_node] * config.psrl.ps_nnodes,
+            train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
+            ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,
         }
+        for i in range(deployment_config.n_rollout_instances):
+            rollout_pool_id = rollout_pool_id_list[i]
+            resource_pool_spec[rollout_pool_id] = [deployment_config.rollout_ngpus_per_node_per_instance] * deployment_config.rollout_nnodes_per_instance,
         role_worker_mapping = {
             PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
             PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
             PSRL_Role.Critic: ray.remote(CriticWorker),
             PSRL_Role.ParameterServer: ray.remote(PSRL_PSWorker)
         }
+        # multiple instances mapping
         mapping = {
-            PSRL_Role.Rollout: gen_pool_id,
-            PSRL_Role.Actor: train_pool_id,
-            PSRL_Role.Critic: train_pool_id,
-            PSRL_Role.ParameterServer: ps_pool_id
+            PSRL_Role.Rollout: rollout_pool_id_list,
+            PSRL_Role.Actor: [train_pool_id],
+            PSRL_Role.Critic: [train_pool_id],
+            PSRL_Role.ParameterServer: [ps_pool_id]
         }
 
         # we should adopt a multi-source reward function here
@@ -132,22 +135,19 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
-            assert config.reward_model.strategy in ["fsdp", "fsdp2"], "currently only fsdp and fsdp2 are supported"
+            assert config.reward_model.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
             role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
-            mapping[PSRL_Role.RewardModel] = train_pool_id
+            mapping[PSRL_Role.RewardModel] = [train_pool_id]
 
         # use reference model
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
-            mapping[PSRL_Role.RefPolicy] = train_pool_id
+            mapping[PSRL_Role.RefPolicy] = [train_pool_id]
 
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+        resource_pool_manager = PSRL_ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
-        train_sampler = create_rl_sampler(config.data, train_dataset)
         trainer = PSRL_RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -157,62 +157,9 @@ class TaskRunner:
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
-            train_dataset=train_dataset,
-            val_dataset=val_dataset,
-            collate_fn=collate_fn,
-            train_sampler=train_sampler,
         )
         trainer.init_workers()
         trainer.fit()
-
-
-def create_rl_dataset(data_paths, data_config, tokenizer, processor):
-    """Create a dataset.
-
-    Arguments:
-        data_config: The data config.
-        tokenizer (Tokenizer): The tokenizer.
-        processor (Processor): The processor.
-
-    Returns:
-        dataset (Dataset): The dataset.
-    """
-    if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
-        dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
-        if not issubclass(dataset_cls, Dataset):
-            raise TypeError(f"The custom dataset class '{data_config.custom_cls.name}' from '{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset")
-    else:
-        dataset_cls = RLHFDataset
-    print(f"Using dataset class: {dataset_cls.__name__}")
-
-    dataset = dataset_cls(
-        data_files=data_paths,
-        tokenizer=tokenizer,
-        processor=processor,
-        config=data_config,
-    )
-
-    return dataset
-
-
-def create_rl_sampler(data_config, dataset):
-    """Create a sampler for the dataset.
-
-    Arguments:
-        data_config: The data config.
-        dataset (Dataset): The dataset.
-
-    Returns:
-        sampler (Sampler): The sampler.
-    """
-    if data_config.shuffle:
-        train_dataloader_generator = torch.Generator()
-        train_dataloader_generator.manual_seed(data_config.get("seed", 1))
-        sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
-    else:
-        sampler = SequentialSampler(data_source=dataset)
-
-    return sampler
 
 
 if __name__ == "__main__":

@@ -4,16 +4,16 @@ psrl:
   gen_mode: batch
   ps_mode: cpu
   log_prob:
-		enable_inference_engine_log_prob: True
-		enable_proxy_log_prob: False
+    enable_inference_engine_log_prob: True
+    enable_proxy_log_prob: False
   deployment:
-		n_rollout_instances: 1
+    n_rollout_instances: 1
     rollout_nnodes_per_instance: 1
-		rollout_ngpus_per_node_per_instance: 1
-		train_nnodes: 1
+    rollout_ngpus_per_node_per_instance: 1
+    train_nnodes: 1
     train_ngpus_per_node: 1
     ps_nnodes: 1
-		ps_ngpus_per_node: 1
+    ps_ngpus_per_node: 1
 
 data:
   tokenizer: null

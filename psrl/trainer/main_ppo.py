@@ -15,7 +15,7 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 
-from psrl.workers.rollout import PSRL_GenWorker
+from psrl.workers.gen import PSRL_GenWorker
 from psrl.workers.train import PSRL_TrainWorker
 from psrl.workers.ps import PSRL_PSWorker
 from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
@@ -29,39 +29,6 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    
-
-def get_custom_reward_fn(config):
-    """Load a custom reward function from a file."""
-    reward_fn_config = config.get("custom_reward_function") or {}
-    file_path = reward_fn_config.get("path")
-    if not file_path:
-        return None
-
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Reward function file '{file_path}' not found.")
-
-    spec = importlib.util.spec_from_file_location("custom_module", file_path)
-    module = importlib.util.module_from_spec(spec)
-    try:
-        sys.modules["custom_module"] = module
-        spec.loader.exec_module(module)
-    except Exception as e:
-        raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
-
-    function_name = reward_fn_config.get("name")
-    if not hasattr(module, function_name):
-        raise AttributeError(f"Reward function '{function_name}' not found in '{file_path}'.")
-
-    print(f"using customized reward function '{function_name}' from '{file_path}'")
-    raw_fn = getattr(module, function_name)
-
-    reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
-
-    def wrapped_fn(*args, **kwargs):
-        return raw_fn(*args, **kwargs, **reward_kwargs)
-
-    return wrapped_fn
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -113,7 +80,7 @@ class TaskRunner:
         }
         for i in range(deployment_config.n_rollout_instances):
             rollout_pool_id = rollout_pool_id_list[i]
-            resource_pool_spec[rollout_pool_id] = [deployment_config.rollout_ngpus_per_node_per_instance] * deployment_config.rollout_nnodes_per_instance,
+            resource_pool_spec[rollout_pool_id] = [deployment_config.rollout_ngpus_per_node_per_instance] * deployment_config.rollout_nnodes_per_instance
         role_worker_mapping = {
             PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
             PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
@@ -146,6 +113,8 @@ class TaskRunner:
 
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
+        
+        print(f"resource_pool_spec = {resource_pool_spec}, mapping = {mapping}")
         resource_pool_manager = PSRL_ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
         trainer = PSRL_RayPPOTrainer(
@@ -163,5 +132,5 @@ class TaskRunner:
 
 
 if __name__ == "__main__":
-    seed_everything(42)
+    seed_everything(0)
     main()

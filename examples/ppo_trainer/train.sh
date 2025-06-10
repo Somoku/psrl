@@ -1,7 +1,7 @@
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-7B-Instruct
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=128
 NGPUS_PER_NODE=8
 NNODES=2
@@ -10,21 +10,19 @@ INFER_TP=4
 PS_NNODES=1
 PS_NGPUS_PER_NODE=2
 
-REMAIN_GPUS_PER_NODE=$(( NGPUS_PER_NODE - TP ))
+REMAIN_GPUS_PER_NODE=$(( NGPUS_PER_NODE - INFER_TP ))
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
-math_train_path=$HOME/data/math/train.parquet
-math_test_path=$HOME/data/math/test.parquet
 
-train_files="['$gsm8k_train_path', '$math_train_path']"
-test_files="['$gsm8k_test_path', '$math_test_path']"
+train_files="['$gsm8k_train_path']"
+test_files="['$gsm8k_test_path']"
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.staleness=0 \
-    psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \ 
-    psrl.gen_mode=batch \
-    psrl.ps_model=cpu \
+    psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
+    psrl.gen_mode='batch' \
+    psrl.ps_mode='cpu' \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${NNODES} \

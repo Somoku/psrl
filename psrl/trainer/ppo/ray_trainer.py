@@ -2,6 +2,7 @@ import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
+from enum import Enum
 from pprint import pprint
 from typing import Type
 
@@ -24,7 +25,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.ray_trainer import WorkerType, Role, AdvantageEstimator, ResourcePoolManager, apply_kl_penalty, compute_response_mask, compute_advantage, _timer, RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import WorkerType, AdvantageEstimator, ResourcePoolManager, apply_kl_penalty, compute_response_mask, compute_advantage, _timer, RayPPOTrainer
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
@@ -37,19 +38,23 @@ from psrl.workers.train import TrainInterface
 from psrl.workers.gen import GenInterface
 from psrl.workers.ps import PSRL_PSWorker
 
-class PSRL_Role(Role):
-    """
-    To create more roles dynamically, you can subclass Role and add new members
-    """
+class PSRL_Role(Enum):
+    Actor = 0
+    Rollout = 1
+    ActorRollout = 2
+    Critic = 3
+    RefPolicy = 4
+    RewardModel = 5
+    ActorRolloutRef = 6
     ParameterServer = 7
 
 class PSRL_ResourcePoolManager(ResourcePoolManager):
     """
     Support multiple instances of the same role
     """
-    mapping: dict[Role, list[str]]
+    mapping: dict[PSRL_Role, list[str]]
     
-    def get_resource_pool(self, role: Role, instance_id: int = 0) -> RayResourcePool:
+    def get_resource_pool(self, role: PSRL_Role, instance_id: int = 0) -> RayResourcePool:
         """Get the resource pool of the worker_cls for the given instance_id."""
         return self.resource_pool_dict[self.mapping[role][instance_id]]
 
@@ -113,17 +118,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         """
         Creates the train and validation dataloaders.
         """
+        # TODO: support different rollout instances use difference TP
+        tp = self.config.psrl.deployment.rollout_ngpus_per_node_per_instance
+        rollout_instances_tp = {i: tp for i in range(self.config.psrl.deployment.n_rollout_instances)}
         self.dataset_handle = DatasetHandle.remote(
             self.config,
             self.tokenizer,
-            self.processor
+            self.processor,
+            rollout_instances_tp
         )
         self.dataset_handle.build_train_and_val_dataset.remote()
         self.dataset_handle.build_train_sampler.remote()
         self.dataset_handle.build_train_dataloader.remote()
         self.dataset_handle.build_val_dataloader.remote()
 
-        total_training_steps = ray.get(self.dataset_handle.get_train_len().remote()) * self.config.trainer.total_epochs
+        total_training_steps = ray.get(self.dataset_handle.get_train_len.remote()) * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
 
@@ -289,7 +298,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             dataset_handle=self.dataset_handle,
             ps_handle=self.ps_handle
         )
-        for i in range(self.config.psrl.n_rollout_instances):
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
             gen_interface.rollout_instance_id = i
             rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[PSRL_Role.Rollout],
@@ -364,8 +373,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.actor_wg.init_model()
         
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.config.psrl.n_rollout_instances)]
-        for i in range(self.config.psrl.n_rollout_instances):
+        self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.config.psrl.deployment.n_rollout_instances)]
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
             self.rollout_wg_list[i].init_model()
 
     def _save_checkpoint(self):
@@ -438,7 +447,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # load actor (train only)
         self.actor_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load rollout instance
-        for i in range(self.config.psrl.n_rollout_instances):
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
             self.rollout_wg_list[i].load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # TODO: push the actor model state dict to the PS worker (thoughit is not necessary to do so)
         # load critic
@@ -493,7 +502,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         last_val_metrics = None
 
         # rollout instances keep generating sequences in their busy loop
-        for i in range(self.config.psrl.n_rollout_instances):
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
             self.rollout_wg_list[i].execute_all("busy_loop_generate_sequences")
         
         # busy loop for training

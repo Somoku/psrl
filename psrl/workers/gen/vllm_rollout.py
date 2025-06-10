@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import contextmanager
 from collections.abc import Sequence
-from typing import Any, Callable, ClassVar, Optional, Union, List, cast, overload
+from typing import Any, Callable, ClassVar, Optional, Union, List, Tuple, cast, overload
 
 import numpy as np
 import torch
@@ -139,7 +139,7 @@ class PSRL_vLLMRollout(BaseRollout):
     def pre_process_inputs(
         self, 
         prompts: DataProto
-    ) -> List[Union[PromptType, Sequence[PromptType]], dict[str, Any]]:
+    ) -> Tuple[Union[PromptType, Sequence[PromptType]], dict[str, Any]]:
         """Pre-process the prompts to convert them into vLLM inputs."""
         
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)

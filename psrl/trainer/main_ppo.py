@@ -40,7 +40,14 @@ def run_ppo(config) -> None:
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(
-            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN"}},
+            runtime_env={
+                "env_vars": {
+                    "TOKENIZERS_PARALLELISM": "true", 
+                    "NCCL_DEBUG": "WARN", 
+                    "VLLM_LOGGING_LEVEL": "WARN",
+                    "PSRL_LOGGING_PATH": config.psrl.logging_path,
+                }
+            },
             num_cpus=config.ray_init.num_cpus,
         )
 
@@ -56,14 +63,14 @@ class TaskRunner:
         OmegaConf.resolve(config)
 
         # download the checkpoint from hdfs
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        local_path = copy_to_local(config.train_actor_rollout_ref.model.path)
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
 
         # define worker classes
-        assert config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
+        assert config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
         assert config.critic.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
         ray_worker_group_cls = RayWorkerGroup
         
@@ -107,7 +114,7 @@ class TaskRunner:
             mapping[PSRL_Role.RewardModel] = [train_pool_id]
 
         # use reference model
-        if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        if config.algorithm.use_kl_in_reward or config.train_actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[PSRL_Role.RefPolicy] = [train_pool_id]
 

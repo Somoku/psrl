@@ -3,6 +3,7 @@ psrl:
   staleness_buffer_entries: 512
   gen_mode: batch
   ps_mode: cpu
+  logging_path: ~/psrl_logs
   log_prob:
     enable_inference_engine_log_prob: True
     enable_proxy_log_prob: False
@@ -37,15 +38,21 @@ data:
       path: null
       name: null
 
-actor_rollout_ref:
-  hybrid_engine: False
+train_actor_rollout_ref:
+  hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
+    use_shm: False
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
+    enable_activation_offload: False
     use_remove_padding: False
+    lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
+    lora_alpha: 16  # LoRA scaling factor
+    target_modules: all-linear  # all-linear or [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
     use_liger: False
+    use_fused_kernels: False
     trust_remote_code: False
   actor:
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
@@ -75,7 +82,8 @@ actor_rollout_ref:
       lr: 1e-6
       lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
-      min_lr_ratio: null   # only useful for warmup with cosine
+      min_lr_ratio: 0.0   # only used with cosine lr scheduler, default to 0.0
+      num_cycles: 0.5     # only used with cosine lr scheduler, default to 0.5
       warmup_style: constant  # select from constant/cosine
       total_training_steps: -1  # must be override by program
       weight_decay: 0.01
@@ -96,12 +104,72 @@ actor_rollout_ref:
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
-    use_torch_compile: ${actor_rollout_ref.actor.use_torch_compile}
+    use_torch_compile: ${train_actor_rollout_ref.actor.use_torch_compile}
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
-    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
-    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
-    ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+    log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    ulysses_sequence_parallel_size: ${train_actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+  rollout:
+    name: vllm
+    mode: sync # sync: LLM, async: AsyncLLM
+    temperature: 1.0
+    top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+    top_p: 1
+    use_fire_sampling: False # https://arxiv.org/abs/2410.21236
+    prompt_length: ${data.max_prompt_length}  # not use for opensource
+    response_length: ${data.max_response_length}
+    # for vllm rollout
+    dtype: bfloat16 # should align with FSDP
+    gpu_memory_utilization: 0.5
+    ignore_eos: False
+    enforce_eager: True
+    free_cache_engine: True
+    load_format: dummy_dtensor  # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
+    layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
+    tensor_model_parallel_size: 2
+    max_num_batched_tokens: 8192
+    max_model_len: null
+    max_num_seqs: 1024
+    log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
+    log_prob_micro_batch_size_per_gpu: null
+    log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    disable_log_stats: True
+    enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
+    # for hf rollout
+    do_sample: True
+    # number of responses (i.e. num sample times)
+    n: 1 # > 1 for grpo
+    engine_kwargs: # inference engine parameters
+      vllm:
+        swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+      sglang:
+        attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
+    val_kwargs:
+      # sampling parameters for validation
+      top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+      top_p: 1.0
+      temperature: 0
+      n: 1
+      do_sample: False # default eager for validation
+    multi_turn:
+      enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
+      max_turns: null  # null for no limit (default max_length // 3)
+      tool_config_path: null  # null for no tool
+      format: chatml  # chatml, more formats will be supported in the future
+      completion_callback: null # null for default callback
+
+gen_actor_rollout:
+  hybrid_engine: False
+  model:
+    path: ${train_actor_rollout_ref.model.path}
+    external_lib: null
+  actor:
+    strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
+    ulysses_sequence_parallel_size: 1 # sp size
+    fsdp_config:
+      fsdp_size: -1
   rollout:
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
@@ -125,8 +193,8 @@ actor_rollout_ref:
     max_num_seqs: 1024
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
-    log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
-    log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+    log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
+    log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     disable_log_stats: True
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     # for hf rollout
@@ -149,7 +217,7 @@ actor_rollout_ref:
       format: chatml  # chatml, more formats will be supported in the future
 
 critic:
-  rollout_n: ${actor_rollout_ref.rollout.n}
+  rollout_n: ${train_actor_rollout_ref.rollout.n}
   strategy: fsdp # [fsdp, fsdp2]
   optim:
     lr: 1e-5
@@ -160,12 +228,13 @@ critic:
     weight_decay: 0.01
   model:
     path: ~/models/deepseek-llm-7b-chat
-    tokenizer_path: ${actor_rollout_ref.model.path}
+    tokenizer_path: ${train_actor_rollout_ref.model.path}
     override_config: { }
-    external_lib: ${actor_rollout_ref.model.external_lib}
+    external_lib: ${train_actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: True
+    enable_activation_offload: False
     use_remove_padding: False
-    trust_remote_code: ${actor_rollout_ref.model.trust_remote_code}
+    trust_remote_code: ${train_actor_rollout_ref.model.trust_remote_code}
     fsdp_config:
       param_offload: False
       optimizer_offload: False
@@ -175,19 +244,23 @@ critic:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
       fsdp_size: -1
-  ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+    lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
+    lora_alpha: 16  # LoRA scaling factor
+    target_modules: all-linear  # all-linear or [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
+  ppo_mini_batch_size: ${train_actor_rollout_ref.actor.ppo_mini_batch_size}
   ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
   ppo_micro_batch_size_per_gpu: null
   forward_micro_batch_size: ${critic.ppo_micro_batch_size}
   forward_micro_batch_size_per_gpu: ${critic.ppo_micro_batch_size_per_gpu}
-  use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
-  ppo_max_token_len_per_gpu: 32768 # (${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}) * 2
+  use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
+  ppo_max_token_len_per_gpu: 32768 # (${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}) * 2
   forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
   ulysses_sequence_parallel_size: 1 # sp size
-  ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
-  shuffle: ${actor_rollout_ref.actor.shuffle}
+  ppo_epochs: ${train_actor_rollout_ref.actor.ppo_epochs}
+  shuffle: ${train_actor_rollout_ref.actor.shuffle}
   grad_clip: 1.0
   cliprange_value: 0.5
+  loss_agg_mode: ${train_actor_rollout_ref.actor.loss_agg_mode}
   checkpoint:
     contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
 
@@ -195,9 +268,9 @@ reward_model:
   enable: False
   strategy: fsdp
   model:
-    input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
+    input_tokenizer: ${train_actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
-    external_lib: ${actor_rollout_ref.model.external_lib}
+    external_lib: ${train_actor_rollout_ref.model.external_lib}
     use_remove_padding: False
     trust_remote_code: False
     fsdp_config:
@@ -242,8 +315,6 @@ trainer:
   log_val_generations: 0
   rollout_data_dir: null # directory for logging the rollout data, no dump if null
   validation_data_dir: null # directory for logging the validation data, no dump if null
-  nnodes: 1
-  n_gpus_per_node: 8
   save_freq: -1
   # auto: find the last ckpt to resume. If can't find, start from scratch
   resume_mode: auto # or disable or resume_path if resume_from_path is set
@@ -258,6 +329,8 @@ trainer:
   max_critic_ckpt_to_keep: null
   # The timeout for ray worker group to wait for the register center to be ready
   ray_wait_register_center_timeout: 300
+  device: cuda
 
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
+  timeline_json_file: null

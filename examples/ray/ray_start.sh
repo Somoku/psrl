@@ -2,7 +2,7 @@
 env_file="${PSRL_WORKSPACE}/env/psrl.sh"
 source ${env_file}
 
-HOSTFILE=${1:-"${PSRL_WORKSPACE}/hosts/node01"}
+HOSTFILE=${1:-"${PSRL_WORKSPACE}/hosts/node203"}
 PORT=8888                # Ray节点通信端口
 DASHBOARD_PORT=8265      # Ray Dashboard端口
 
@@ -27,7 +27,7 @@ pssh -H "${HEAD_IP}" -i \
     --port=${PORT} \
     --dashboard-host=0.0.0.0 \
     --dashboard-port=${DASHBOARD_PORT} \
-    --num-cpus=32"
+    --num-cpus=16"
 
 # 启动Worker节点
 if [ ${#workers[@]} -gt 0 ]; then
@@ -35,5 +35,5 @@ if [ ${#workers[@]} -gt 0 ]; then
     pssh -H "${workers[*]}" -i \
         "source ${env_file} && \
         ray start --address=${HEAD_IP}:${PORT} \
-        --num-cpus=32"
+        --num-cpus=16"
 fi

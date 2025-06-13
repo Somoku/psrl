@@ -23,10 +23,12 @@ from verl.workers.rollout.vllm_rollout import vllm_mode
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
 from psrl.utils.atomic import add_lock
+from psrl.utils.logger import DualOutputHandler, get_worker_info
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, StalenessBuffer, EntryCategory, EntryInfo, Entry
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 # TODO: may support other tag format
@@ -71,20 +73,33 @@ class PSRL_PSWorker(Worker):
             dist.init_process_group()
         assert self.world_size == dist.get_world_size(), "The world size of PSRL_PSWorker must match the torch distributed world size."
         
-        if self.rank == 0:
+        if self.is_ps_representive_rank:
             # Initialize the staleness inventory
             self.staleness_inventory = StalenessInventory(
                 num_entries=self.psrl_config.staleness_buffer_entries,
             )
+            
+        # Build logger
+        self.log_prefix = f"PSWorker_R{self.rank}"
+        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        
+    @property   
+    def is_ps_representive_rank(self) -> bool:
+        """
+        Check if the current rank is the representative rank.
+        The representative rank is the rank 0 of the PS.
+        """
+        return self.rank == 0
         
     def get_ps_handle(self):
         """Get the PS handle."""
-        assert self.rank == 0, "Only the rank 0 PS worker can get the PS handle."
-        return ray.get_current_actor()
+        assert self.is_ps_representive_rank, "Only the representive PS worker can get the PS handle."
+        return ray.get_runtime_context().current_actor
     
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
         """Register a new rollout instance."""
-        assert self.rank == 0, "Only the rank 0 PS worker can register a rollout instance."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can register a rollout instance."
         self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(
             version_tag=0
         )
@@ -93,7 +108,7 @@ class PSRL_PSWorker(Worker):
         
     def get_max_reserve_num(self, model_version) -> int:
         """Get the maximum number of entries that can be reserved for a specific model version."""
-        assert self.rank == 0, "Only the rank 0 PS worker can get the max reserve num."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can get the max reserve num."
     
         max_staleness_buffer_id = model_version + self.psrl_config.staleness
         return self.staleness_inventory.get_empty_entries_total_num(max_staleness_buffer_id)
@@ -105,7 +120,7 @@ class PSRL_PSWorker(Worker):
         model_version: int
     ) -> Tuple[Optional[int], Optional[int]]:
         """Reserve a request for a specific rollout instance."""
-        assert self.rank == 0, "Only the rank 0 PS worker can reserve a rollout instance request."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can reserve a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         # Create an entry in the staleness inventory
@@ -135,10 +150,10 @@ class PSRL_PSWorker(Worker):
         data: DataProto
     ):
         """Occupy a request for a specific rollout instance."""
-        assert self.rank == 0, "Only the rank 0 PS worker can occupy a rollout instance request."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can occupy a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
-        curr_rollout_instance_model_version = self.get_rollout_instance_model_version(self, rollout_instance_id)
+        curr_rollout_instance_model_version = self.get_rollout_instance_model_version(rollout_instance_id)
         entry_info = EntryInfo(
             rollout_instance_id=rollout_instance_id,
             local_request_id=local_request_id,
@@ -150,6 +165,7 @@ class PSRL_PSWorker(Worker):
         )
         
         min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
+        psrl_logger.debug(f"Occupy data with info {entry_info}, min ready buffer is {min_ready_buffer_id}")
         if min_ready_buffer_id is not None:
             # If there are ready buffers, wake up the waiters for the minimum ready buffer
             self._awake_training_batch_waiters(min_ready_buffer_id)
@@ -157,9 +173,10 @@ class PSRL_PSWorker(Worker):
     async def wait_for_training_batch(
         self,
         buffer_id: int
-    ) -> Optional[DataProto]:
+    ) -> DataProto:
         """Await a training batch for a specific buffer ID."""
-        assert self.rank == 0, "Only the rank 0 PS worker can await a training batch."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can await a training batch."
+        self.staleness_inventory.ensure_buffer_exists(buffer_id)
         if self.staleness_inventory.get_buffer_status(buffer_id) == BufferStatus.READY:
             # If the buffer is ready, return immediately
             return self.staleness_inventory.consume_buffer(buffer_id)
@@ -169,13 +186,14 @@ class PSRL_PSWorker(Worker):
         # 2. Truncate if buffer status is STUCK
         # 3. Drop the RESERVED entry if buffer status is STUCK and move some OCCUPIED entries from other buffers 
         
-        logger.info(f"<PS>: buffer {buffer_id} is not ready, waiting for it to be ready.")
+        psrl_logger.info(f"Buffer {buffer_id} is not ready, waiting for it to be ready.")
         fut = asyncio.get_event_loop().create_future()
         if buffer_id not in self._buffer_waiters:
             self._buffer_waiters[buffer_id] = []
         self._buffer_waiters[buffer_id].append(fut)
-        await fut
+        result = await fut
         # Once resumed, return
+        return result
         
     def _awake_training_batch_waiters(self, buffer_id: int):
         """
@@ -185,6 +203,7 @@ class PSRL_PSWorker(Worker):
         # Wake all Futures waiting for this buffer
         if buffer_id in self._buffer_waiters:
             buffer_data = self.staleness_inventory.consume_buffer(buffer_id)
+            psrl_logger.debug(f"Consume buffer {buffer_id}: {buffer_data}")
             assert len(self._buffer_waiters[buffer_id]) == 1, \
                 f"Expected only one waiter for buffer {buffer_id}, but found {len(self._buffer_waiters[buffer_id])}."
             for fut in self._buffer_waiters[buffer_id]:
@@ -197,18 +216,24 @@ class PSRL_PSWorker(Worker):
         
     def get_rollout_instance_model_version(self, rollout_instance_id: Union[str, int]) -> int:
         """Get the model version for a specific rollout instance."""
-        assert self.rank == 0, "Only the rank 0 PS worker can get the model version for a rollout instance."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can get the model version for a rollout instance."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         return tag_to_int(self.rollout_instance_tracker[rollout_instance_id].version_tag)
         
     def get_ps_model_version(self) -> int:
         """Get the current model version."""
-        assert self.rank == 0, "Only the rank 0 PS worker can get the model version."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can get the model version."
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
         
         return tag_to_int(self.model_store.version_tag)
+    
+    def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: Union[str, int]):
+        """Update the rollout instance model version to the latest model version."""
+        assert self.is_ps_representive_rank, "Only the representive PS worker can update the rollout instance model version to the latest."
+        assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
+        self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
      
     async def wait_for_ps_model_version(self, target_version: int):
         """
@@ -246,7 +271,7 @@ class PSRL_PSWorker(Worker):
         model_state_dict: Optional[Mapping[str, Union[Tensor, DTensor]]],
     ):
         """Push a model to the PS."""
-        assert self.rank == 0, "Only the rank 0 PS worker can push a model on CPU."
+        assert self.is_ps_representive_rank, "Only the representive PS worker can push a model on CPU."
         
         self.model_store = ModelStore(
             version_tag=version_tag,
@@ -254,13 +279,16 @@ class PSRL_PSWorker(Worker):
         )
         self._awake_ps_model_version_waiters(tag_to_int(version_tag))
         
-        logger.info(f"Model instance with version tag {version_tag} pushed successfully.")
+        psrl_logger.info(f"Model with version tag {version_tag} pushed successfully.")
         
-    def get_model_state_dict_cpu(
-        self
+    def pull_model_state_dict_cpu(
+        self,
+        rollout_instance_id: Union[str, int]
     ) -> Optional[Mapping[str, Union[Tensor, DTensor]]]:
-        """Get the latest model state dict from PS."""
-        assert self.rank == 0, "Only the rank 0 PS worker can get a model on CPU."
+        """Pull the latest model state dict from PS via CPU."""
+        assert self.is_ps_representive_rank, "Only the representive PS worker can pull a model on CPU."
         assert self.model_store is not None, "Model instance is not initialized."
         
+        psrl_logger.info(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag}")
+        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
         return self.model_store.model_state_dict

@@ -1,8 +1,8 @@
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-GLOBAL_BATCH_SIZE=128
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
+GLOBAL_BATCH_SIZE=512
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
@@ -26,11 +26,11 @@ train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
-    psrl.staleness=2 \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
     psrl.ps_mode=cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/psrl_log \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/psrl_log_precision_sync \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -84,7 +84,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl' \
-    trainer.experiment_name='psrl_test_run' \
+    trainer.experiment_name='psrl_sync' \
+    trainer.total_training_steps=100 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_test_run.log
+    trainer.total_epochs=30 2>&1 | tee psrl_precision_staleness_sync.log

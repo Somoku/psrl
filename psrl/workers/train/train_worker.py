@@ -34,9 +34,11 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.rollout.vllm_rollout import vllm_mode
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
+from psrl.utils.logger import DualOutputHandler, get_worker_info
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 @dataclass
@@ -51,6 +53,19 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         self.psrl_config = psrl_config
         self.train_interface = train_interface
         
+        # Build logger
+        self.log_prefix = f"TrainWorker_R{self.rank}"
+        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        
+    @property   
+    def is_train_representive_rank(self) -> bool:
+        """
+        Check if the current rank is the representative rank.
+        The representative rank is the rank 0 of the PS.
+        """
+        return self.rank == 0
+        
     def push_model_cpu(self) -> None:
         """Push the model weights to the PS via CPU."""
         ps_handle = self.train_interface.ps_handle
@@ -59,15 +74,22 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         # Gather the model state dict on rank 0
         # TODO: support FSDP2
         assert fsdp_version(self.actor_module_fsdp) == 1, "FSDP version 2 is not supported yet."
+        psrl_logger.info(f"Gathering the full state dict on the CPU of the representive rank.")
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
             full_state_dict = self.actor_module_fsdp.state_dict()
-        if self.rank == 0:
-            assert len(full_state_dict) > 0, "The model state dict shouldn't be empty on rank 0 worker."
-            logger.info(f"<TrainWorker_{self.rank}>: push the model via CPU (async).")
+        if self.is_train_representive_rank:
+            assert len(full_state_dict) > 0, "The model state dict shouldn't be empty on the representive worker."
+            psrl_logger.info(f"Push the model via CPU on the representive rank (async).")
             # Do not need to wait for the push to complete, as it can be overlapped with the next-iteration training
             self.train_interface.ps_handle.push_model_state_dict_cpu.remote(next_ps_model_version, full_state_dict)
         else:
-            assert len(full_state_dict) == 0, "The model state dict should be empty on non-rank-0 workers."
+            assert len(full_state_dict) == 0, "The model state dict should be empty on non-representive workers."
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        psrl_logger.info(f"Initialize model begin.")
+        super().init_model()
+        psrl_logger.info(f"Initialize model end.")
     
     # The log_prob in training side is only used when there is a proxy policy    
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -102,7 +124,7 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
+            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=psrl_logger)
 
         return output
                 
@@ -110,9 +132,11 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
     def update_actor(self, data: DataProto):
         # The model weights are pushed to the PS via CPU
         if self.psrl_config.ps_mode == "cpu":
-            logger.info(f"<TrainWorker_{self.rank}>: train actor.")
-            super().update_actor(data)
+            psrl_logger.info(f"Train actor begin.")
+            output = super().update_actor(data)
+            psrl_logger.info(f"Train actor end, begin pushing model to PS via CPU.")
             self.push_model_cpu()
+            return output
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
             

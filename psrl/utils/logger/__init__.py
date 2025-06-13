@@ -1,5 +1,6 @@
-from .ray_logger import DualLogger
+from .ray_logger import DualOutputHandler, get_worker_info
 
 __all__ = [
-    "DualLogger",
+    "DualOutputHandler",
+    "get_worker_info",
 ]

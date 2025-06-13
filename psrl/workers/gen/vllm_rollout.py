@@ -22,8 +22,8 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
@@ -138,7 +138,8 @@ class PSRL_vLLMRollout(BaseRollout):
             
     def pre_process_inputs(
         self, 
-        prompts: DataProto
+        prompts: DataProto,
+        kwargs: dict
     ) -> Tuple[Union[PromptType, Sequence[PromptType]], dict[str, Any]]:
         """Pre-process the prompts to convert them into vLLM inputs."""
         
@@ -206,17 +207,20 @@ class PSRL_vLLMRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
         
         response = []
+        response_unpadded_len = []
         rollout_log_probs = []
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response_ids = output.outputs[sample_id].token_ids
                 response.append(response_ids)
+                response_unpadded_len.append(len(response_ids))
                 curr_log_prob = []
                 for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                     curr_log_prob.append(logprob[response_ids[i]].logprob)
                 rollout_log_probs.append(curr_log_prob)
 
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+        response_unpadded_len = torch.tensor(response_unpadded_len).to(idx.device)
         rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
         rollout_log_probs = rollout_log_probs.to(torch.float32)
 
@@ -255,6 +259,7 @@ class PSRL_vLLMRollout(BaseRollout):
             {
                 "prompts": idx,
                 "responses": response,
+                "response_unpadded_lens": response_unpadded_len,
                 "input_ids": seq,  # here input_ids become the whole sentences
                 "rollout_log_probs": rollout_log_probs,  # we will recompute old log prob with actor
                 "attention_mask": attention_mask,
@@ -272,8 +277,8 @@ class PSRL_vLLMRollout(BaseRollout):
         """Get the next request ID."""
         return next(self.inference_engine.request_counter)
     
-    def add_requests(self, prompts: DataProto):
-        vllm_inputs, kwargs = self.pre_process_inputs(prompts)
+    def add_requests(self, prompts: DataProto, **kwargs):
+        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         parsed_vllm_inputs = cast(Union[PromptType, Sequence[PromptType]], vllm_inputs)
         if isinstance(parsed_vllm_inputs, (str, dict)):
             # Convert a single prompt to a list.
@@ -306,11 +311,11 @@ class PSRL_vLLMRollout(BaseRollout):
     def step(self) -> list[Union[RequestOutput, PoolingRequestOutput]]:
         return self.inference_engine.llm_engine.step()
 
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         """Generate sequences from the prompts using vLLM."""
-        vllm_inputs, kwargs = self.pre_process_inputs(prompts)
+        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             # the inference_engine will handle the request_id internally

@@ -86,8 +86,8 @@ class DatasetHandle:
         # Write tag: 0 for train, 1 for val
         # Read tag: 0-tp indicates the number of times the rollout instance has been read for each tp rank
         self.rollout_instance_write_flag = {rollout_instance_id: DatasetType.unknown for rollout_instance_id in rollout_instances_tp.keys()}
-        self.rollout_instance_read_flag = {rollout_instance_id: 0 for rollout_instance_id in rollout_instances_tp.keys()}
-        self.rollout_instance_cur_data = {rollout_instance_id: 0 for rollout_instance_id in rollout_instances_tp.keys()}
+        self.rollout_instance_read_flags = {rollout_instance_id: set() for rollout_instance_id in rollout_instances_tp.keys()}
+        self.rollout_instance_cur_data = {rollout_instance_id: None for rollout_instance_id in rollout_instances_tp.keys()}
         
     def build_train_and_val_dataset(self) -> None:
         self.train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
@@ -178,29 +178,47 @@ class DatasetHandle:
     
     # Get the current batch for a specific rollout instance
     # Only when all tp rank finish reading the data, the data will be updated (call get_next_data_func)
-    def get_rollout_instance_batch_nowait(self, dataset_type: DatasetType, rollout_instance_id: int):
-        rollout_instance_write_flag = self.rollout_instance_write_flag[rollout_instance_id]
-        get_next_data_func = self.get_train_next if dataset_type == DatasetType.train else self.get_val_next
-        if rollout_instance_write_flag == DatasetType.unknown:
+    def get_rollout_instance_batch_nowait(
+        self,
+        dataset_type: DatasetType,
+        rollout_instance_id: int,
+        rank: int
+    ) :
+        # Select the appropriate data-fetching function based on dataset type
+        get_next_data_func = (
+            self.get_train_next if dataset_type == DatasetType.train else self.get_val_next
+        )
+
+        # Write stage: fetch new data if the flag is unknown
+        if self.rollout_instance_write_flag[rollout_instance_id] == DatasetType.unknown:
+            assert not self.rollout_instance_read_flags[rollout_instance_id], (
+                f"Rollout instance {rollout_instance_id}'s read_flags set is not empty: "
+                f"{self.rollout_instance_read_flags[rollout_instance_id]}"
+            )
             try:
                 self.rollout_instance_cur_data[rollout_instance_id] = get_next_data_func()
             except StopIteration:
-                print("get_rollout_instance_batch_nowait() runs into StopIteration")
+                print("get_rollout_instance_batch_nowait(): encountered StopIteration")
                 raise
+            # Mark the batch as ready for the current dataset type
             self.rollout_instance_write_flag[rollout_instance_id] = dataset_type
-            self.rollout_instance_read_flag[rollout_instance_id] = 0
-            return self.rollout_instance_cur_data[rollout_instance_id]
-        else:
-            if rollout_instance_write_flag == dataset_type:
-                self.rollout_instance_read_flag[rollout_instance_id] += 1
-                if self.rollout_instance_read_flag[rollout_instance_id] == self.rollout_instances_tp[rollout_instance_id]:
-                    self.rollout_instance_write_flag[rollout_instance_id] = DatasetType.unknown
-                    self.rollout_instance_read_flag[rollout_instance_id] = 0
-                return self.rollout_instance_cur_data[rollout_instance_id]
-            # If the data is not ready, return None
-            # Need to wait for other tp ranks to finish reading
-            else:
+
+        # Read stage: if the batch is ready for this dataset type
+        if self.rollout_instance_write_flag[rollout_instance_id] == dataset_type:
+            ranks_set = self.rollout_instance_read_flags[rollout_instance_id]
+            # If this rank already consumed the batch, treat as not-ready
+            if rank in ranks_set:
                 return None
+            # Record this rank's consumption
+            ranks_set.add(rank)
+            # Once all TP ranks have read, reset flags for the next batch
+            if len(ranks_set) == self.rollout_instances_tp[rollout_instance_id]:
+                self.rollout_instance_write_flag[rollout_instance_id] = DatasetType.unknown
+                ranks_set.clear()
+            # Return the current batch data
+            return self.rollout_instance_cur_data[rollout_instance_id]
+        # If the batch is not ready, return None (waiting for another dataset type)
+        return None
     
     # Get the current batch for the main controller
     # Just directly return the next batch   

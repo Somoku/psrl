@@ -10,11 +10,21 @@ class EntryCategory(enum.Enum):
     OCCUPIED = 2
 
 
+# Note:The model version is not a part of the hashing key, because model version may be updated after the reservation but before the occupation
 @dataclass(frozen=True)
 class EntryInfo:
     rollout_instance_id: Union[str, int]  # The ID of the rollout instance this entry belongs to
     local_request_id: Union[str, int] # The local request ID for the rollout instance, used to track requests within the same instance
     model_version: int # The model version when generating this entry, which should be higher than the buffer ID minus the staleness limit
+    
+    def __hash__(self):
+        return hash((self.rollout_instance_id, self.local_request_id))
+    
+    def __eq__(self, other):
+        return (
+            isinstance(other, EntryInfo) and 
+            (self.rollout_instance_id, self.local_request_id) == (other.rollout_instance_id, other.local_request_id)
+        )
 
 
 @dataclass
@@ -211,7 +221,7 @@ class StalenessInventory:
         max_staleness_buffer_id: int
     ) -> Tuple[Optional[int], Optional[int]]:
         """Reserve entry for instance in appropriate buffer"""
-        assert entry_info not in self.data_tracker, "Instance must not have existing mapping"
+        assert entry_info not in self.data_tracker, f"Entry info {entry_info} must not have existing mapping: {self.data_tracker}"
         # Ensure buffer IDs up to max_staleness_buffer_id exist
         self.ensure_buffer_exists(max_staleness_buffer_id)
 
@@ -252,16 +262,31 @@ class StalenessInventory:
         data: DataProto
     ):
         """Move data to first non-occupied entry in appropriate buffer"""
-        assert entry_info in self.data_tracker, "Instance must have existing mapping"
+        assert entry_info in self.data_tracker, f"Entry info {entry_info} must have existing mapping"
         old_buffer_id, old_entry_id = self.data_tracker[entry_info]
         old_buffer = self.buffers[old_buffer_id]
 
-        # Clean up old entry
+        # Step 1: Clean up old entry (may cause entry movement)
         old_buffer.delete(old_entry_id)
-        del self.instance_map[entry_info]
+        del self.data_tracker[entry_info]
+        # Caution: this will make an intermediate status for the buffer!
+        # Need to move the smallest RESERVED entry in this buffer (if existed) to the deleted (i.e., EMPTY) entry
+        # Otherwise the RESERVED and EMPTY entries will be criss-crossed in the buffer and hard to manage
+        first_reserved_entry_id = None
+        for entry_id, entry in enumerate(old_buffer.entries):
+            if entry.category == EntryCategory.RESERVED:
+                first_reserved_entry_id = entry_id
+                break
+        if first_reserved_entry_id != None and first_reserved_entry_id < old_entry_id:
+            first_reserved_entry_info = old_buffer.entries[first_reserved_entry_id].entry_info
+            # Move the RESERVED entry to the position of the deleted (i.e., EMPTY) entry
+            old_buffer.entries[old_entry_id] = old_buffer.entries[first_reserved_entry_id]
+            old_buffer.delete(first_reserved_entry_id)
+            # Update data tracker with the new position
+            self.data_tracker[first_reserved_entry_info] = (old_buffer_id, old_entry_id)
         self._update_buffer_status(old_buffer_id)
 
-        # Get all PENDING buffers within the staleness limit
+        # Step 2: Get all PENDING buffers within the staleness limit
         pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
         candidate_ids = [
             bid for bid in pending_buffers if bid <= old_buffer_id
@@ -269,13 +294,12 @@ class StalenessInventory:
 
         assert candidate_ids, f"No suitable PENDING buffer found, but at least buffer {old_buffer_id} should be available for rollout instance {rollout_instance_id}"
 
-        # Select the lowest buffer ID
+        # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()
         assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, \
             "Found non-occupied entry must be EMPTY"
-
         # Create entry info and update buffer
         buffer.insert(
             entry_id, 

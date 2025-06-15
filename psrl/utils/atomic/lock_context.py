@@ -4,7 +4,7 @@ from collections import deque
 
 def add_lock(cls):
     """
-    通用的类装饰器：给任意一个类注入 _locked、_waiters，以及 acquire/release 方法。
+    A general class decorator that injects _locked, _waiters, and acquire/release methods into any class.
     """
     original_init = getattr(cls, "__init__", None)
 

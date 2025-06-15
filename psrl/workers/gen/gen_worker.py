@@ -25,7 +25,7 @@ from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
 from psrl.utils.atomic import RayLock
 from psrl.utils.dataset import DatasetType, DatasetHandle
-from psrl.utils.logger import DualOutputHandler, get_worker_info
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.ps import PSRL_PSWorker
 
@@ -50,7 +50,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         self.instance_dist_group = None
         
         # Build logger
-        self.log_prefix = f"GenWorker_I{self.get_instance_id()}:R{self.get_instance_local_rank()}"
+        self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
     
@@ -135,9 +135,8 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        psrl_logger.info(f"Initialize model begin.")
-        super().init_model()
-        psrl_logger.info(f"Initialize model end.")
+        with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
+            super().init_model()
     
     def pull_model(self) -> None:
         """
@@ -205,65 +204,63 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # Step 1: Determine the model version to use and reserve requests in the PS worker
         # This is take place only on the representative rank of the rollout instance
         # Get the PS worker handle
-        ps_handle = self.gen_interface.ps_handle
-        # Get the current rollout instance id
-        rollout_instance_id = self.get_instance_id()
-        # Get the model versions
-        curr_rollout_instance_model_version = ray.get(ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
-        if self.is_instance_representive_rank:
-            curr_ps_model_version = ray.get(ps_handle.get_ps_model_version.remote())
-            needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
-            # TODO (Done already): Implement a wrapper for ps_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
-            # Add asyncio method to the ps_handle ray actor to ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
-            with RayLock(ps_handle):
-                # Check if we can reserve the requests
-                # If not, we will wait until the requests can be reserved (the waiting will take place later)
-                max_reserve_num = ray.get(ps_handle.get_max_reserve_num.remote(curr_rollout_instance_model_version))
-                if max_reserve_num < batch_size:
-                    # Need to pull new model version
-                    needed_model_version = curr_ps_model_version
-                    # If the current PS model version is still not enough, we will wait for the training side to update the model version
-                    while ray.get(ps_handle.get_max_reserve_num.remote(needed_model_version)) < batch_size:
-                        needed_model_version += 1
-                # TODO: Maybe we can support partial reservation, currently we fix the batch size outside
-                # assert max_reserve_num >= batch_size, f"Cannot reserve {batch_size} requests, only {max_reserve_num} requests can be reserved."
-                request_ids = list(range(curr_request_id + 1, curr_request_id + batch_size + 1))
-                futures = []
-                for request_id in request_ids:
-                    futures.append(ps_handle.reserve_rollout_instance_request.remote(
-                        rollout_instance_id=rollout_instance_id,
-                        local_request_id=request_id,
-                        model_version=needed_model_version
-                    ))
-                results = ray.get(futures)
-                for request_id, (buffer_id, entry_id) in zip(request_ids, results):
-                    assert buffer_id is not None and entry_id is not None, f"Failed to reserve rollout instance {rollout_instance_id} request {request_id}."
-            # Use the pytorch distributed communication here to broadcast the model version
-            self._broadcast_int_val_from_representive_rank(needed_model_version)
-        else:
-            # If not the representative rank, we will get the needed_model_version from the representative rank
-            needed_model_version = self._broadcast_int_val_from_representive_rank()
+        with log_dual_events("Reserve requests", psrl_logger, event_type=EventType.OTHER):
+            ps_handle = self.gen_interface.ps_handle
+            # Get the current rollout instance id
+            rollout_instance_id = self.get_instance_id()
+            # Get the model versions
+            curr_rollout_instance_model_version = ray.get(ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
+            if self.is_instance_representive_rank:
+                curr_ps_model_version = ray.get(ps_handle.get_ps_model_version.remote())
+                needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
+                # TODO (Done already): Implement a wrapper for ps_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
+                # Add asyncio method to the ps_handle ray actor to ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
+                with RayLock(ps_handle):
+                    # Check if we can reserve the requests
+                    # If not, we will wait until the requests can be reserved (the waiting will take place later)
+                    max_reserve_num = ray.get(ps_handle.get_max_reserve_num.remote(curr_rollout_instance_model_version))
+                    if max_reserve_num < batch_size:
+                        # Need to pull new model version
+                        needed_model_version = curr_ps_model_version
+                        # If the current PS model version is still not enough, we will wait for the training side to update the model version
+                        while ray.get(ps_handle.get_max_reserve_num.remote(needed_model_version)) < batch_size:
+                            needed_model_version += 1
+                    # TODO: Maybe we can support partial reservation, currently we fix the batch size outside
+                    # assert max_reserve_num >= batch_size, f"Cannot reserve {batch_size} requests, only {max_reserve_num} requests can be reserved."
+                    request_ids = list(range(curr_request_id + 1, curr_request_id + batch_size + 1))
+                    futures = []
+                    for request_id in request_ids:
+                        futures.append(ps_handle.reserve_rollout_instance_request.remote(
+                            rollout_instance_id=rollout_instance_id,
+                            local_request_id=request_id,
+                            model_version=needed_model_version
+                        ))
+                    results = ray.get(futures)
+                    for request_id, (buffer_id, entry_id) in zip(request_ids, results):
+                        assert buffer_id is not None and entry_id is not None, f"Failed to reserve rollout instance {rollout_instance_id} request {request_id}."
+                # Use the pytorch distributed communication here to broadcast the model version
+                self._broadcast_int_val_from_representive_rank(needed_model_version)
+            else:
+                # If not the representative rank, we will get the needed_model_version from the representative rank
+                needed_model_version = self._broadcast_int_val_from_representive_rank()
         
         # Step 2: Pull the model version if needed (may need waiting)
         # All the ranks should participate
         if needed_model_version != curr_rollout_instance_model_version:
-            psrl_logger.info(f"Begin waiting for model version {needed_model_version}.")
-            ray.get(ps_handle.wait_for_ps_model_version.remote(needed_model_version)) # This will block until the PS worker has the needed model version 
-            psrl_logger.info(f"End waiting for model version {needed_model_version}.")
+            with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
+                ray.get(ps_handle.wait_for_ps_model_version.remote(needed_model_version)) # This will block until the PS worker has the needed model version 
             # The PS model version may be higher than the needed model version
             # if a pushing happens between step 1 and step 2
             # but that is ok since a higher model version will not break the staleness
-            psrl_logger.info(f"Begin pulling the model.")
-            self.pull_model()
-            psrl_logger.info(f"End pulling the model.")
+            with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
+                self.pull_model()
             
         # Step 3: Generate sequences
         # All the ranks should participate
-        psrl_logger.info(f"Begin core generation with model version {needed_model_version}.")
-        start_time = time.time()
-        outputs : DataProto = self.rollout.generate_sequences(prompts)
-        end_time = time.time()
-        psrl_logger.info(f"Core generation end, time elapse is {end_time - start_time}s")
+        # Note that the actual model version may be higher than the needed model version
+        actual_model_version = ray.get(ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
+        with log_dual_events(f"Core generation with model version {actual_model_version}", psrl_logger, event_type=EventType.GEN):
+            outputs : DataProto = self.rollout.generate_sequences(prompts)
         
         # Step 4: Union the generated sequences with the input batch
         # This is take place only on the representative rank of the rollout instance
@@ -277,15 +274,16 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # Step 5: Occupy requests in the PS worker
         # This is take place only on the representative rank of the rollout instance
         if self.is_instance_representive_rank:
-            futures = []
-            for request_id, sequence in zip(request_ids, sequences):
-                # Occupy the request in the PS worker
-                futures.append(ps_handle.occupy_rollout_instance_request.remote(
-                    rollout_instance_id=rollout_instance_id,
-                    local_request_id=request_id,
-                    data=sequence
-                ))
-            ray.get(futures)
+            with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
+                futures = []
+                for request_id, sequence in zip(request_ids, sequences):
+                    # Occupy the request in the PS worker
+                    futures.append(ps_handle.occupy_rollout_instance_request.remote(
+                        rollout_instance_id=rollout_instance_id,
+                        local_request_id=request_id,
+                        data=sequence
+                    ))
+                ray.get(futures)
       
     def stream_gen(self) -> None:
         """

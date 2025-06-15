@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PSRL Log Visualizer</title>
+    <script src="https://cdn.tailwindcss.com"></script> 
+    <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css"  rel="stylesheet">
+    <script src="https://d3js.org/d3.v7.min.js"></script> 
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#3b82f6',
+                        secondary: '#6366f1',
+                        accent: '#8b5cf6',
+                        neutral: '#64748b',
+                        'neutral-light': '#f1f5f9',
+                        success: '#10b981',
+                        warning: '#f59e0b',
+                        danger: '#ef4444',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <style type="text/tailwindcss">
+        @layer utilities {
+            .content-auto {
+                content-visibility: auto;
+            }
+            .drop-shadow-lg {
+                filter: drop-shadow(0 10px 8px rgb(0 0 0 / 0.04)) drop-shadow(0 4px 3px rgb(0 0 0 / 0.1));
+            }
+            .animate-pulse-slow {
+                animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+            }
+            .scrollbar-hide {
+                -ms-overflow-style: none;
+                scrollbar-width: none;
+            }
+            .scrollbar-hide::-webkit-scrollbar {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 font-sans">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <!-- Header -->
+        <header class="mb-10 text-center">
+            <h1 class="text-[clamp(2rem,5vw,3rem)] font-bold text-gray-900 mb-2">PSRL Log Visualizer</h1>
+            <p class="text-gray-600 text-lg max-w-3xl mx-auto">A visualization tool for <span class="font-semibold text-primary">PSRL</span> system logs. Upload log files to view event timelines and statistics.</p>
+        </header>
+        <!-- Main Content -->
+        <main class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            <!-- Upload Section -->
+            <section class="lg:col-span-4 space-y-6">
+                <div class="bg-white rounded-xl shadow-lg p-6 transition-all duration-300 hover:shadow-xl">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4 flex items-center">
+                        <i class="fa fa-upload text-primary mr-2"></i> Upload Log Files
+                    </h2>
+                    <form id="upload-form" class="space-y-4">
+                        <div id="drop-area" class="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center transition-all duration-300 hover:border-primary hover:bg-blue-50 cursor-pointer">
+                            <i class="fa fa-file-text-o text-4xl text-gray-400 mb-4"></i>
+                            <p class="text-gray-600 mb-2">Drag and drop log files here</p>
+                            <p class="text-sm text-gray-500">or click to browse</p>
+                            <input type="file" id="input-file" name="files" multiple class="hidden">
+                        </div>
+                        <div id="file-list" class="space-y-2 max-h-40 overflow-y-auto"></div>
+                        <button type="submit" id="upload-btn" class="w-full bg-primary hover:bg-primary/90 text-white font-medium py-3 px-4 rounded-lg transition-all duration-300 flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
+                            <i class="fa fa-play-circle mr-2"></i> Analyze Logs
+                        </button>
+                    </form>
+                </div>
+                <!-- File Selector -->
+                <div class="bg-white rounded-xl shadow-lg p-6 transition-all duration-300 hover:shadow-xl" id="file-selector-container" style="display: none;">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4 flex items-center">
+                        <i class="fa fa-files-o text-accent mr-2"></i> File Selection
+                    </h2>
+                    <div id="file-selector" class="space-y-2 max-h-60 overflow-y-auto">
+                        <!-- File checkboxes will be dynamically populated -->
+                    </div>
+                    <button id="update-timeline-btn" class="w-full mt-4 bg-accent hover:bg-accent/90 text-white font-medium py-2 px-4 rounded-lg transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed">
+                        <i class="fa fa-refresh mr-2"></i> Update Timeline
+                    </button>
+                </div>
+            </section>
+            <!-- Timeline Section -->
+            <section class="lg:col-span-8 space-y-3">
+                <div class="bg-white rounded-xl shadow-lg p-6 transition-all duration-300 hover:shadow-xl">
+                    <div class="flex justify-between items-center mb-6">
+                        <h2 class="text-xl font-bold text-gray-800 flex items-center">
+                            <i class="fa fa-clock-o text-primary mr-2"></i> Timeline Visualization
+                        </h2>
+                        <div class="flex space-x-2">
+                            <button id="zoom-in-btn" class="p-2 rounded-full bg-gray-100 hover:bg-gray-200 transition-colors duration-200">
+                                <i class="fa fa-search-plus text-gray-600"></i>
+                            </button>
+                            <button id="zoom-out-btn" class="p-2 rounded-full bg-gray-100 hover:bg-gray-200 transition-colors duration-200">
+                                <i class="fa fa-search-minus text-gray-600"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div id="timeline-container" class="relative flex" style="min-height: 300px;">
+                        <div id="timeline-label-svg-container" style="flex: none;"></div>
+                        <div id="timeline-svg-container" class="flex-1 overflow-x-auto" style="position: relative;">
+                            <div id="empty-state" class="absolute inset-0 flex flex-col items-center justify-center text-center p-8" style="left:0;right:0;top:0;bottom:0;margin:auto;">
+                                <i class="fa fa-bar-chart text-5xl text-gray-300 mb-4"></i>
+                                <h3 class="text-xl font-medium text-gray-500 mb-2">No timeline data available</h3>
+                                <p class="text-gray-400 max-w-md">Upload log files to visualize their timeline events</p>
+                            </div>
+                        </div>
+                        <div id="loading-indicator" class="absolute inset-0 flex items-center justify-center bg-white/80 z-10 hidden">
+                            <div class="text-center">
+                                <div class="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-primary mb-4"></div>
+                                <p class="text-gray-600">Processing logs...</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <!-- Statistics Section -->
+                <div class="bg-white rounded-xl shadow-lg p-6 transition-all duration-300 hover:shadow-xl" id="stats-container" style="display: none;">
+                    <h2 class="text-xl font-bold text-gray-800 mb-4 flex items-center">
+                        <i class="fa fa-bar-chart text-secondary mr-2"></i> Event Statistics
+                    </h2>
+                    <div class="grid grid-cols-1 md:grid-cols-1 gap-4">
+                        <div class="bg-gray-50 rounded-lg p-4">
+                            <h3 class="text-sm font-medium text-gray-500 mb-1">Total Duration</h3>
+                            <p id="total-duration" class="text-2xl font-bold text-gray-800">0s</p>
+                        </div>
+                    </div>
+                    <div class="mt-6">
+                        <h3 class="text-lg font-medium text-gray-700 mb-3">Event Duration Distribution</h3>
+                        <div id="stats-charts" class="grid grid-cols-1 md:grid-cols-2 gap-6 mt-6">
+                            <!-- Pie charts will be dynamically inserted here -->
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>    

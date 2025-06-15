@@ -1,8 +1,8 @@
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-GLOBAL_BATCH_SIZE=128
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
+GLOBAL_BATCH_SIZE=512
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
@@ -45,7 +45,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout.rollout.n=1 \
-    gen_actor_rollout.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout.rollout.gpu_memory_utilization=0.6 \
     gen_actor_rollout.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
@@ -54,7 +54,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.rollout.n=1 \
-    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
@@ -83,8 +83,9 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='psrl' \
+    trainer.project_name='psrl_test' \
     trainer.experiment_name='psrl_test_run' \
+    trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 2>&1 | tee psrl_test_run.log

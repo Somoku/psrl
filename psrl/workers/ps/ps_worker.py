@@ -23,7 +23,7 @@ from verl.workers.rollout.vllm_rollout import vllm_mode
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
 from psrl.utils.atomic import add_lock
-from psrl.utils.logger import DualOutputHandler, get_worker_info
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, StalenessBuffer, EntryCategory, EntryInfo, Entry
 
 
@@ -83,6 +83,7 @@ class PSRL_PSWorker(Worker):
         self.log_prefix = f"PSWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        self.logged_ready_buffer_ids: Set[int] = set()
         
     @property   
     def is_ps_representive_rank(self) -> bool:
@@ -112,6 +113,12 @@ class PSRL_PSWorker(Worker):
     
         max_staleness_buffer_id = model_version + self.psrl_config.staleness
         return self.staleness_inventory.get_empty_entries_total_num(max_staleness_buffer_id)
+    
+    def log_ready_buffer(self, buffer_id: int):
+        """Log the ready buffer."""
+        if buffer_id not in self.logged_ready_buffer_ids:
+            log_single_event(f"Buffer {buffer_id} is ready", psrl_logger, event_type=EventType.BUFFER_READY)
+            self.logged_ready_buffer_ids.add(buffer_id)
         
     def reserve_rollout_instance_request(
         self,
@@ -167,6 +174,7 @@ class PSRL_PSWorker(Worker):
         min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
         psrl_logger.debug(f"Occupy data with info {entry_info}, min ready buffer is {min_ready_buffer_id}")
         if min_ready_buffer_id is not None:
+            self.log_ready_buffer(min_ready_buffer_id)
             # If there are ready buffers, wake up the waiters for the minimum ready buffer
             self._awake_training_batch_waiters(min_ready_buffer_id)
         
@@ -279,7 +287,7 @@ class PSRL_PSWorker(Worker):
         )
         self._awake_ps_model_version_waiters(tag_to_int(version_tag))
         
-        psrl_logger.info(f"Model with version tag {version_tag} pushed successfully.")
+        log_single_event(f"Model with version tag {version_tag} pushed successfully", psrl_logger, event_type=EventType.PUSH)
         
     def pull_model_state_dict_cpu(
         self,
@@ -289,6 +297,6 @@ class PSRL_PSWorker(Worker):
         assert self.is_ps_representive_rank, "Only the representive PS worker can pull a model on CPU."
         assert self.model_store is not None, "Model instance is not initialized."
         
-        psrl_logger.info(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag}")
+        log_single_event(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag}", psrl_logger, event_type=EventType.PULL)
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
         return self.model_store.model_state_dict

@@ -2,6 +2,10 @@ import os
 import logging
 import socket
 import torch
+import time
+from contextlib import contextmanager
+from enum import Enum
+
 
 def get_worker_info():
     """Get the worker info from the environment variables."""
@@ -18,6 +22,34 @@ def get_worker_info():
             worker_gpu = f"GPU {current_physical}"
     return worker_ip, worker_gpu
 
+
+class EventType(Enum):
+    PULL = "PULL"
+    PUSH = "PUSH"
+    BUFFER_READY = "BUFFER_READY"
+    INIT = "INIT"
+    TRAIN = "TRAIN"
+    GEN = "GEN"
+    VAL = "VAL"
+    WAIT = "WAIT"
+    OTHER = "OTHER"
+
+
+@contextmanager
+def log_dual_events(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER):
+    start_time = time.time()
+    psrl_logger.log(level, f"[Begin Event] {event_type.value} - {message}")  # Log with label when entering
+    try:
+        yield  # Execute code within the with block
+    finally:
+        end_time = time.time()
+        psrl_logger.log(level, f"[End Event] {event_type.value} - {message} - Time taken: {end_time - start_time:.2f} seconds")  # Log end tag when exiting
+        
+        
+def log_single_event(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER):
+    psrl_logger.log(level, f"[Single Event] {event_type.value} - {message}")
+    
+    
 class DualOutputHandler(logging.Handler):
     """A logger handler that writes to both the original stdout and a file."""
     def __init__(self, log_prefix):

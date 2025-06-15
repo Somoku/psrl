@@ -1,4 +1,7 @@
+# PSRL
+examples/visualization/.*/
 
+# General
 **/*.pt
 **/checkpoints
 **/wget-log

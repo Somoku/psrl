@@ -1,0 +1,11 @@
+{
+    "PULL": {"color": "#F59E0B", "marker": "x", "plot_marker": "x", "label": "Model Pull"},
+    "PUSH": {"color": "#10B981", "marker": "√", "plot_marker": "v", "label": "Model Push"},
+    "BUFFER_READY": {"color": "#6366F1", "marker": "●", "plot_marker": "o", "label": "Buffer Ready"},
+    "INIT": {"color": "#EF4444", "marker": "■", "plot_marker": "s", "label": "Initialization"},
+    "TRAIN": {"color": "#8B5CF6", "marker": "▲", "plot_marker": "^", "label": "Training"},
+    "GEN": {"color": "#3B82F6", "marker": "★", "plot_marker": "*", "label": "Generation"},
+    "VAL": {"color": "#EC4899", "marker": "◆", "plot_marker": "d", "label": "Validation"},
+    "WAIT": {"color": "#9CA3AF", "marker": "▼", "plot_marker": "v", "label": "Waiting"},
+    "OTHER": {"color": "#6B7280", "marker": "•", "plot_marker": ".", "label": "Other"}
+}

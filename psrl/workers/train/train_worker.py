@@ -34,7 +34,7 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.rollout.vllm_rollout import vllm_mode
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
-from psrl.utils.logger import DualOutputHandler, get_worker_info
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 
 
 psrl_logger = logging.getLogger(__file__)
@@ -87,9 +87,8 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
-        psrl_logger.info(f"Initialize model begin.")
-        super().init_model()
-        psrl_logger.info(f"Initialize model end.")
+        with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
+            super().init_model()
     
     # The log_prob in training side is only used when there is a proxy policy    
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -132,10 +131,10 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
     def update_actor(self, data: DataProto):
         # The model weights are pushed to the PS via CPU
         if self.psrl_config.ps_mode == "cpu":
-            psrl_logger.info(f"Train actor begin.")
-            output = super().update_actor(data)
-            psrl_logger.info(f"Train actor end, begin pushing model to PS via CPU.")
-            self.push_model_cpu()
+            with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
+                output = super().update_actor(data)
+            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+                self.push_model_cpu()
             return output
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")

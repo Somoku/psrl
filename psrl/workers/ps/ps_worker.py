@@ -22,7 +22,7 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.rollout.vllm_rollout import vllm_mode
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
-from psrl.utils.atomic import add_lock
+from psrl.utils.ray import add_lock
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, StalenessBuffer, EntryCategory, EntryInfo, Entry
 
@@ -49,8 +49,10 @@ class RolloutInstanceStatus:
     
 @dataclass
 class ModelStore:
-    version_tag: Union[str, int]   
+    version_tag: Union[str, int]
+    # In 'cpu' mode, model_state_dict is the real state dict; in 'cpu_ref' mode, model_state_dict_ref is a ray object_ref
     model_state_dict: Optional[Mapping[str, Union[Tensor, DTensor]]] = None
+    model_state_dict_ref: Optional[ray.ObjectRef] = None  # ray object_ref
 
 
 @add_lock
@@ -273,30 +275,56 @@ class PSRL_PSWorker(Worker):
             # Remove the key after waking all waiters
             del self._version_waiters[version]
         
-    def push_model_state_dict_cpu(
-        self,
-        version_tag: Union[str, int],
-        model_state_dict: Optional[Mapping[str, Union[Tensor, DTensor]]],
-    ):
-        """Push a model to the PS."""
+    def push_model_state_dict_cpu(self, version_tag: Union[str, int], model_state_dict: Optional[Mapping[str, Union[Tensor, DTensor]]]):
+        """
+        Push a model to the PS. In 'cpu' mode, store the real state dict. In 'cpu_ref' mode, this should not be called.
+        This method will block until the state dict is received by the PS worker (potential bottleneck for large models).
+        """
         assert self.is_ps_representive_rank, "Only the representive PS worker can push a model on CPU."
-        
+        assert self.psrl_config.ps_mode == "cpu", "push_model_state_dict_cpu should only be used in 'cpu' mode."
         self.model_store = ModelStore(
             version_tag=version_tag,
             model_state_dict=model_state_dict
         )
         self._awake_ps_model_version_waiters(tag_to_int(version_tag))
-        
         log_single_event(f"Model with version tag {version_tag} pushed successfully", psrl_logger, event_type=EventType.PUSH)
-        
-    def pull_model_state_dict_cpu(
-        self,
-        rollout_instance_id: Union[str, int]
-    ) -> Optional[Mapping[str, Union[Tensor, DTensor]]]:
-        """Pull the latest model state dict from PS via CPU."""
+
+    # Tricky part: If you manually wrap ObjectRef in a container (like list/tuple), ray will not recursively dereference all refs inside the container
+    # Only the top-level task/actor arguments are expanded to real values, and ray will not traverse all nested structures to find ObjectRefs. 
+    def push_model_state_dict_cpu_ref_list(self, version_tag: Union[str, int], model_state_dict_ref_list: List[ray.ObjectRef]):
+        """
+        Push a model to the PS by storing a ray object_ref. Only used in 'cpu_ref' mode.
+        This method is non-blocking for the PS worker and only updates metadata (no large data transfer here).
+        """
+        assert self.is_ps_representive_rank, "Only the representive PS worker can push a model on CPU."
+        assert self.psrl_config.ps_mode == "cpu_ref", "push_model_state_dict_ref should only be used in 'cpu_ref' mode."
+        self.model_store = ModelStore(
+            version_tag=version_tag,
+            model_state_dict_ref=model_state_dict_ref_list[0]
+        )
+        self._awake_ps_model_version_waiters(tag_to_int(version_tag))
+        log_single_event(f"Model with version tag {version_tag} (ref) pushed successfully", psrl_logger, event_type=EventType.PUSH)
+
+    def pull_model_state_dict_cpu(self, rollout_instance_id: Union[str, int]) -> Optional[Mapping[str, Union[Tensor, DTensor]]]:
+        """
+        Pull the latest model state dict from PS via CPU. Only used in 'cpu' mode.
+        This will block until the state dict is transferred (potential bottleneck for large models).
+        """
         assert self.is_ps_representive_rank, "Only the representive PS worker can pull a model on CPU."
+        assert self.psrl_config.ps_mode == "cpu", "pull_model_state_dict_cpu should only be used in 'cpu' mode."
         assert self.model_store is not None, "Model instance is not initialized."
-        
         log_single_event(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag}", psrl_logger, event_type=EventType.PULL)
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
         return self.model_store.model_state_dict
+
+    def pull_model_state_dict_cpu_ref(self, rollout_instance_id: Union[str, int]) -> ray.ObjectRef:
+        """
+        Return the ray object_ref for the latest model state dict. Only used in 'cpu_ref' mode.
+        This is a fast operation (no large data transfer here).
+        """
+        assert self.is_ps_representive_rank, "Only the representive PS worker can provide model ref."
+        assert self.psrl_config.ps_mode == "cpu_ref", "get_model_state_dict_ref should only be used in 'cpu_ref' mode."
+        assert self.model_store is not None, "Model instance is not initialized."
+        log_single_event(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag} (ref)", psrl_logger, event_type=EventType.PULL)
+        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
+        return self.model_store.model_state_dict_ref

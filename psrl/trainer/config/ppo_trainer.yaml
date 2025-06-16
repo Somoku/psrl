@@ -2,7 +2,7 @@ psrl:
   staleness: 0
   staleness_buffer_entries: 512
   gen_mode: batch
-  ps_mode: cpu
+  ps_mode: cpu_ref
   logging_path: ~/psrl_logs
   log_prob:
     enable_inference_engine_log_prob: True

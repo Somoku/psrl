@@ -769,7 +769,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # compute values
                 if self.use_critic:
                     with _timer("values", timing_raw):
-                        with log_dual_events("Compute criticvalues", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events("Compute critic values", psrl_logger, event_type=EventType.OTHER):
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 

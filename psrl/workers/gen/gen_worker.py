@@ -23,7 +23,7 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.rollout.vllm_rollout import vllm_mode
 from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
-from psrl.utils.atomic import RayLock
+from psrl.utils.ray import RayLock
 from psrl.utils.dataset import DatasetType, DatasetHandle
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 from psrl.workers.gen import PSRL_vLLMRollout
@@ -140,14 +140,22 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
     
     def pull_model(self) -> None:
         """
-        Pull the model state dict from PS on CPU and update the rollout model weights.
+        Pull the model state dict from PS via CPU and update the rollout model weights.
+        In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
+        In 'cpu_ref' mode, get the ray object_ref and ray.get it (parallel, non-blocking for PS worker).
         """
         ps_handle = self.gen_interface.ps_handle
         model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         device = get_torch_device().current_device()
         
-        if self.psrl_config.ps_mode == "cpu":
-            model_state_dict_cpu = ray.get(ps_handle.pull_model_state_dict_cpu.remote(self.get_instance_id()))
+        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+            if self.psrl_config.ps_mode == "cpu":
+                # In 'cpu' mode, pull the full state dict (PS worker will block on transfer)
+                model_state_dict_cpu = ray.get(ps_handle.pull_model_state_dict_cpu.remote(self.get_instance_id()))
+            elif self.psrl_config.ps_mode == "cpu_ref":
+                # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
+                object_ref = ray.get(ps_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
+                model_state_dict_cpu = ray.get(object_ref)  # This blocks until the state dict is available in the object store
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
             model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))

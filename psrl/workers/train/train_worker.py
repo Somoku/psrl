@@ -32,7 +32,6 @@ from verl.utils.fsdp_utils import (
 )
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.rollout.vllm_rollout import vllm_mode
-from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 
@@ -59,7 +58,7 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         
     @property   
-    def is_train_representive_rank(self) -> bool:
+    def is_train_representative_rank(self) -> bool:
         """
         Check if the current rank is the representative rank.
         The representative rank is the rank 0 of the PS.
@@ -78,12 +77,12 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         # Gather the model state dict on rank 0
         # TODO: support FSDP2
         assert fsdp_version(self.actor_module_fsdp) == 1, "FSDP version 2 is not supported yet."
-        psrl_logger.info(f"Gathering the full state dict on the CPU of the representive rank.")
+        psrl_logger.info(f"Gathering the full state dict on the CPU of the representative rank.")
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
             full_state_dict = self.actor_module_fsdp.state_dict()
-        if self.is_train_representive_rank:
-            assert len(full_state_dict) > 0, "The model state dict shouldn't be empty on the representive worker."
-            psrl_logger.info(f"Push the model via CPU on the representive rank (async).")
+        if self.is_train_representative_rank:
+            assert len(full_state_dict) > 0, "The model state dict shouldn't be empty on the representative worker."
+            psrl_logger.info(f"Push the model via CPU on the representative rank (async).")
             if self.psrl_config.ps_mode == "cpu":
                 # In 'cpu' mode, push the full state dict (PS worker will block on transfer)
                 # But the training side does not need to wait for the push to complete, as it can be overlapped with the next-iteration training
@@ -96,7 +95,7 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
             else:
                 raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         else:
-            assert len(full_state_dict) == 0, "The model state dict should be empty on non-representive workers."
+            assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):

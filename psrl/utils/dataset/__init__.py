@@ -1,6 +1,6 @@
-from .dataset_handle import DatasetType, DatasetHandle
+from .data_processor import DatasetType, DataProcessor
 
 __all__ = [
     "DatasetType",
-    "DatasetHandle",
+    "DataProcessor",
 ]

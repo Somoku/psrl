@@ -1,8 +1,12 @@
+import os
+import logging
 import enum
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Union, Tuple, Set
 from verl import DataProto
 
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 class EntryCategory(enum.Enum):
     EMPTY = 0
@@ -14,16 +18,15 @@ class EntryCategory(enum.Enum):
 @dataclass(frozen=True)
 class EntryInfo:
     rollout_instance_id: Union[str, int]  # The ID of the rollout instance this entry belongs to
-    local_request_id: Union[str, int] # The local request ID for the rollout instance, used to track requests within the same instance
+    request_id: Union[str, int] # The unique request ID for the rollout instance, used to track requests within the same instance
     model_version: int # The model version when generating this entry, which should be higher than the buffer ID minus the staleness limit
     
     def __hash__(self):
-        return hash((self.rollout_instance_id, self.local_request_id))
+        return hash(self.request_id)
     
     def __eq__(self, other):
         return (
-            isinstance(other, EntryInfo) and 
-            (self.rollout_instance_id, self.local_request_id) == (other.rollout_instance_id, other.local_request_id)
+            isinstance(other, EntryInfo) and self.request_id == other.request_id
         )
 
 
@@ -127,6 +130,7 @@ class StalenessBuffer:
 class StalenessInventory:
     def __init__(self, num_entries: int):
         self.num_entries = num_entries
+        self.data_pool: Dict[EntryInfo, DataProto] = {}
         self.buffers: Dict[int, StalenessBuffer] = {}
         self.data_tracker: Dict[EntryInfo, Tuple[int, int]] = {}
         # Status tracking for buffer IDs
@@ -215,6 +219,22 @@ class StalenessInventory:
             self.buffers[bid].get_empty_entries_num() for bid in pending_buffers if bid <= max_staleness_buffer_id
         )
 
+    def add_data(
+        self,
+        entry_info: EntryInfo,
+        data: DataProto,
+    ):
+        assert entry_info not in self.data_pool, f"Data pool already has data for entry info {entry_info}"
+        self.data_pool[entry_info] = data
+
+    def remove_data(
+        self,
+        entry_info: EntryInfo
+    ):
+        """Delete data from data pool"""
+        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+        del self.data_pool[entry_info]
+
     def reserve_data(
         self, 
         entry_info: EntryInfo, 
@@ -259,10 +279,14 @@ class StalenessInventory:
     def occupy_data(
         self, 
         entry_info: EntryInfo, 
-        data: DataProto
+        data: Optional[DataProto]=None,
     ):
         """Move data to first non-occupied entry in appropriate buffer"""
-        assert entry_info in self.data_tracker, f"Entry info {entry_info} must have existing mapping"
+        assert entry_info in self.data_tracker, f"Entry info {entry_info} must have existing mapping, but {self.data_tracker=}"
+        if data is None:
+            assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+            data = self.data_pool.pop(entry_info)
+
         old_buffer_id, old_entry_id = self.data_tracker[entry_info]
         old_buffer = self.buffers[old_buffer_id]
 

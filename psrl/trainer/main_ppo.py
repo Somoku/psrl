@@ -4,6 +4,7 @@ import random
 import sys
 import hydra
 import ray
+import logging
 import torch
 import numpy as np
 from pprint import pprint
@@ -20,6 +21,8 @@ from psrl.workers.train import PSRL_TrainWorker
 from psrl.workers.ps import PSRL_PSWorker
 from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
 
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -45,6 +48,7 @@ def run_ppo(config) -> None:
                     "TOKENIZERS_PARALLELISM": "true", 
                     "NCCL_DEBUG": "WARN", 
                     "VLLM_LOGGING_LEVEL": "WARN",
+                    "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
                 }
             },
@@ -54,6 +58,11 @@ def run_ppo(config) -> None:
     runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
 
+    # [Optional] get the path of the timeline trace file from the configuration, default to None
+    # This file is used for performance analysis
+    timeline_json_file = config.ray_init.get("timeline_json_file", None)
+    if timeline_json_file:
+        ray.timeline(filename=timeline_json_file)
 
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
@@ -62,12 +71,22 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
-        # download the checkpoint from hdfs
-        local_path = copy_to_local(config.train_actor_rollout_ref.model.path)
+        # Download the checkpoint from HDFS to the local machine.
+        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        local_path = copy_to_local(config.train_actor_rollout_ref.model.path, use_shm=config.train_actor_rollout_ref.model.get("use_shm", False))
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
+        # Used for multimodal LLM, could be None
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        
+        # Version validation for vllm.
+        if config.gen_actor_rollout_ref.rollout.name in ["vllm"]:
+            from verl.utils.vllm_utils import is_version_ge
+
+            if config.gen_actor_rollout_ref.model.get("lora_rank", 0) > 0:
+                if not is_version_ge(pkg="vllm", minver="0.7.3"):
+                    raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
 
         # define worker classes
         assert config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
@@ -85,9 +104,24 @@ class TaskRunner:
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
             ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,
         }
-        for i in range(deployment_config.n_rollout_instances):
-            rollout_pool_id = rollout_pool_id_list[i]
-            resource_pool_spec[rollout_pool_id] = [deployment_config.rollout_ngpus_per_node_per_instance] * deployment_config.rollout_nnodes_per_instance
+        if deployment_config.heterogeneous_rollout.enable:
+            heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
+            assert len(heterogeneous_deployment_config.rollout_nnodes_per_instance) == heterogeneous_deployment_config.n_rollout_instances, \
+                "The number of rollout nnodes per instance must match the number of rollout instances."
+            assert len(heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance) == heterogeneous_deployment_config.n_rollout_instances, \
+                "The number of rollout ngpus per node per instance must match the number of rollout instances."
+            assert len(heterogeneous_deployment_config.tensor_model_parallel_size_per_instance) == heterogeneous_deployment_config.n_rollout_instances, \
+                "The number of tensor model parallel size per instance must match the number of rollout instances."
+            assert len(heterogeneous_deployment_config.pipeline_model_parallel_size_per_instance) == heterogeneous_deployment_config.n_rollout_instances, \
+                "The number of pipeline model parallel size per instance must match the number of rollout instances."
+
+            for i in range(deployment_config.n_rollout_instances):
+                rollout_pool_id = rollout_pool_id_list[i]
+                resource_pool_spec[rollout_pool_id] = [heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance[i]] * heterogeneous_deployment_config.rollout_nnodes_per_instance[i]
+        else:
+            for i in range(deployment_config.n_rollout_instances):
+                rollout_pool_id = rollout_pool_id_list[i]
+                resource_pool_spec[rollout_pool_id] = [deployment_config.rollout_ngpus_per_node_per_instance] * deployment_config.rollout_nnodes_per_instance
         role_worker_mapping = {
             PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
             PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
@@ -119,10 +153,12 @@ class TaskRunner:
             mapping[PSRL_Role.RefPolicy] = [train_pool_id]
 
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
-        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1)
+        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
         
         print(f"resource_pool_spec = {resource_pool_spec}, mapping = {mapping}")
         resource_pool_manager = PSRL_ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+        
+        from verl.utils.dataset.rl_dataset import collate_fn
 
         trainer = PSRL_RayPPOTrainer(
             config=config,
@@ -133,6 +169,8 @@ class TaskRunner:
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
+            collate_fn=collate_fn,
+            device_name=config.trainer.device,
         )
         trainer.init_workers()
         trainer.fit()

@@ -1,3 +1,5 @@
+#!/bin/bash
+
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
@@ -41,12 +43,12 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.ps_nnodes=${PS_NNODES} \
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
     \
-    gen_actor_rollout.model.path="$MODEL_PATH" \
-    gen_actor_rollout.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    gen_actor_rollout.rollout.tensor_model_parallel_size=${GEN_TP} \
-    gen_actor_rollout.rollout.n=1 \
-    gen_actor_rollout.rollout.gpu_memory_utilization=0.8 \
-    gen_actor_rollout.rollout.max_num_batched_tokens=8192 \
+    gen_actor_rollout_ref.model.path="$MODEL_PATH" \
+    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
+    gen_actor_rollout_ref.rollout.n=1 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \

@@ -1,18 +1,22 @@
 import logging
 import os
+import uuid
+import asyncio
 from contextlib import contextmanager
+from copy import deepcopy
 from collections.abc import Sequence
-from typing import Any, Callable, ClassVar, Optional, Union, List, Tuple, cast, overload
+from typing import Any, Dict, Optional, Union, List, Tuple, cast
 
 import numpy as np
 import torch
 import torch.distributed
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.distributed import parallel_state as vllm_ps
-from vllm.worker.worker_base import WorkerWrapperBase
-from vllm.inputs import PromptType, SingletonPrompt, TextPrompt, TokensPrompt
+from vllm.inputs import PromptType, TokensPrompt
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
@@ -53,14 +57,95 @@ class PSRL_vLLMRollout(BaseRollout):
             tokenizer: the task/model tokenizer
             model_hf_config: the huggingface config to initiallize the generating model in vllm
         """
+       
+        # Monkey patch for vLLM to ensure RAY_ADDRESS is set in Ray actors.
+        try:
+            import vllm.utils
+            from vllm.utils import cuda_is_initialized, is_in_ray_actor
+
+            def _patched_maybe_force_spawn():
+                """Patched version of vllm.utils._maybe_force_spawn.
+
+                This patch changes an `elif is_in_ray_actor()` to an `if` statement.
+                This ensures that `os.environ["RAY_ADDRESS"]` is set when running
+                within a Ray actor, even if CUDA has already been initialized.
+                This is crucial for vLLM workers to connect back to the Ray cluster.
+                """
+                import os
+
+                if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
+                    return
+
+                reason = None
+                if cuda_is_initialized():
+                    reason = "CUDA is initialized"
+
+                if is_in_ray_actor():
+                    # even if we choose to spawn, we need to pass the ray address
+                    # to the subprocess so that it knows how to connect to the ray cluster.
+                    # env vars are inherited by subprocesses, even if we use spawn.
+                    import ray
+
+                    os.environ["RAY_ADDRESS"] = ray.get_runtime_context().gcs_address
+                    if reason is None:
+                        reason = "In a Ray actor and can only be spawned"
+
+                if reason is not None:
+                    psrl_logger.warning(
+                        "We must use the `spawn` multiprocessing start method. "
+                        "Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
+                        "See https://docs.vllm.ai/en/latest/getting_started/"
+                        "troubleshooting.html#python-multiprocessing "
+                        "for more information. Reason: %s",
+                        reason,
+                    )
+                    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+            vllm.utils._maybe_force_spawn = _patched_maybe_force_spawn
+            psrl_logger.info("Successfully patched vllm.utils._maybe_force_spawn.")
+        
+        except (ImportError, AttributeError):
+            # vllm not installed or has a different structure, skipping patch.
+            pass
+
+        tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
+        pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        model_parallel_size = tensor_parallel_size * pipeline_parallel_size
+        if config.mode == "psrl_async" and model_parallel_size > 1:
+            import os
+            if os.environ.get("LOCAL_RANK") != '0':
+                self.inference_engine = None
+                return
+
         super().__init__()
         self.config = config
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
-        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
-        assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
+
+        if kwargs.get("train_tp") is not None:
+            # deployed with megatron
+            import os
+
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
+        
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        if not rope_scaling_config:
+            max_position_embeddings = None
+            if hasattr(model_hf_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.max_position_embeddings
+            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
+            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+            if max_position_embeddings is None:
+                raise ValueError("max_position_embeddings not found in model_hf_config")
+
+            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
 
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
 
@@ -72,40 +157,94 @@ class PSRL_vLLMRollout(BaseRollout):
 
         trust_remote_code = kwargs.get("trust_remote_code", False)
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+        if config.mode == "psrl_async":
+            load_format = "auto"
 
-        limit_mm_per_prompt = None
+        lora_kwargs = kwargs.pop("lora_kwargs", {})
+        self.lora_kwargs = lora_kwargs
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        # For each vLLM engine parameter,
+        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
+        #    (which can vary across different vLLM versions);
+        # - Otherwise it's the desired value we want to explicitly set.
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if config.get("limit_images", None):  # support for multi-image data
-            limit_mm_per_prompt = {"image": config.get("limit_images")}
+            engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
-        self.inference_engine = LLM(
-            model=model_path,
-            enable_sleep_mode=True,
-            tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
-            limit_mm_per_prompt=limit_mm_per_prompt,
-            skip_tokenizer_init=False,
-            max_model_len=max_model_len,
-            load_format=load_format,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
-            trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
-        )
+        if config.mode == "psrl_async" and model_parallel_size > 1:
+            # Configure vLLM for tensor/pipeline parallelism within Ray
+            # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+            distributed_executor_backend = "ray"
+        elif config.mode == "sync":
+            distributed_executor_backend = "external_launcher"
+        else:
+            distributed_executor_backend = None
+
+        if config.mode == "psrl_async":
+            self.inference_engine = AsyncLLM.from_engine_args(
+                AsyncEngineArgs(
+                    model=model_path,
+                    enable_sleep_mode=False,
+                    tensor_parallel_size=tensor_parallel_size,
+                    pipeline_parallel_size=pipeline_parallel_size,
+                    distributed_executor_backend=distributed_executor_backend,
+                    dtype=config.dtype,
+                    enforce_eager=config.enforce_eager,
+                    gpu_memory_utilization=config.gpu_memory_utilization,
+                    disable_custom_all_reduce=True,
+                    skip_tokenizer_init=False,
+                    max_model_len=max_model_len,
+                    load_format=load_format,
+                    disable_log_stats=config.disable_log_stats,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    enable_chunked_prefill=config.enable_chunked_prefill,
+                    enable_prefix_caching=True,
+                    trust_remote_code=trust_remote_code,
+                    worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
+                    seed=kwargs.get("seed", 0),
+                    **lora_kwargs,
+                    **engine_kwargs,
+                )
+            )
+        else:
+            if pipeline_parallel_size > 1:
+                raise NotImplementedError("Pipeline parallel is not supported in synchronous LLM rollout yet.")
+
+            self.inference_engine = LLM(
+                model=model_path,
+                enable_sleep_mode=True,
+                tensor_parallel_size=tensor_parallel_size,
+                distributed_executor_backend=distributed_executor_backend,
+                dtype=config.dtype,
+                enforce_eager=config.enforce_eager,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                disable_custom_all_reduce=True,
+                skip_tokenizer_init=False,
+                max_model_len=max_model_len,
+                load_format=load_format,
+                disable_log_stats=config.disable_log_stats,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                enable_prefix_caching=True,
+                trust_remote_code=trust_remote_code,
+                worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
+                seed=config.get("seed", 0),
+                **lora_kwargs,
+                **engine_kwargs,
+            )
 
         # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        if config.mode != "psrl_async":
+            self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
+            output_kind=RequestOutputKind.CUMULATIVE,
         )
 
         # we may detokenize the result all together later
@@ -151,7 +290,7 @@ class PSRL_vLLMRollout(BaseRollout):
             non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-            raise RuntimeError("vllm sharding manager is not work properly.")
+            raise RuntimeError(f"vllm sharding manager is not work properly with {batch_size=} v.s. {len(non_tensor_batch['raw_prompt_ids'])=}.")
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
@@ -187,15 +326,21 @@ class PSRL_vLLMRollout(BaseRollout):
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
             }
+        else:
+            kwargs = {
+                "n": 1, # we repeat the request manually to support partial rollout
+            }
             
         return vllm_inputs, kwargs
             
     def post_process_outputs(
         self,
         prompts: DataProto,
-        outputs: list[Union[RequestOutput, PoolingRequestOutput]]
+        outputs: Union[Union[RequestOutput, PoolingRequestOutput], list[Union[RequestOutput, PoolingRequestOutput]]],
     ) -> DataProto:
         """Post-process the vllm outputs to convert them into DataProto."""
+        if isinstance(outputs, (RequestOutput, PoolingRequestOutput)):
+            outputs = [outputs]
         
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         batch_size = idx.size(0)
@@ -214,28 +359,21 @@ class PSRL_vLLMRollout(BaseRollout):
                 response_ids = output.outputs[sample_id].token_ids
                 response.append(response_ids)
                 response_unpadded_len.append(len(response_ids))
-                curr_log_prob = []
-                for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                    curr_log_prob.append(logprob[response_ids[i]].logprob)
-                rollout_log_probs.append(curr_log_prob)
+                if (
+                    self.config.enable_inference_engine_log_prob and
+                    hasattr(output.outputs[sample_id], 'logprobs') and
+                    output.outputs[sample_id].logprobs is not None
+                ):
+                    log_prob_list = []
+                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        log_prob_list.append(logprob[response_ids[i]].logprob)
+                    rollout_log_probs.append(log_prob_list)
 
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
         response_unpadded_len = torch.tensor(response_unpadded_len).to(idx.device)
-        rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-        rollout_log_probs = rollout_log_probs.to(torch.float32)
-
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-        do_sample = prompts.meta_info.get("do_sample", True)
-        if self.sampling_params.n > 1 and do_sample:
-            idx = _repeat_interleave(idx, self.sampling_params.n)
-            attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-            position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-            batch_size = batch_size * self.sampling_params.n
-            if "multi_modal_inputs" in non_tensor_batch.keys():
-                non_tensor_batch["multi_modal_inputs"] = _repeat_interleave(non_tensor_batch["multi_modal_inputs"], self.sampling_params.n)
-            # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
-            if "tools_kwargs" in non_tensor_batch.keys():
-                non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
+        if self.config.enable_inference_engine_log_prob:
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = rollout_log_probs.to(torch.float32)
 
         seq = torch.cat([idx, response], dim=-1)
 
@@ -255,18 +393,33 @@ class PSRL_vLLMRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "response_unpadded_lens": response_unpadded_len,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                "rollout_log_probs": rollout_log_probs,  # we will recompute old log prob with actor
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
+        if output.outputs[0].finish_reason == "abort":
+            batch = TensorDict(
+                {
+                    "input_ids": seq,  # here input_ids become the whole sentences
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=batch_size,
+            )
+            if "multi_modal_data" in prompts[0].keys():
+                non_tensor_batch["multi_modal_data"] = np.array([prompts[i]["multi_modal_data"]for i in range(batch_size)], dtype=object)
+            prompts.meta_info["interrupted"] = True
+        else:
+            batch = TensorDict(
+                {
+                    "prompts": idx,
+                    "responses": response,
+                    "response_unpadded_lens": response_unpadded_len,
+                    "input_ids": seq,  # here input_ids become the whole sentences
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=batch_size,
+            )
+            if self.config.enable_inference_engine_log_prob:
+                batch['rollout_log_probs'] = rollout_log_probs
+
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
     
     def get_curr_request_id(self) -> int:
@@ -283,8 +436,6 @@ class PSRL_vLLMRollout(BaseRollout):
         if isinstance(parsed_vllm_inputs, (str, dict)):
             # Convert a single prompt to a list.
             parsed_vllm_inputs = [parsed_vllm_inputs]
-        # Return all outputs in a single step.
-        self.sampling_params.output_kind = RequestOutputKind.CUMULATIVE
         
         with self.update_sampling_params(**kwargs):
             for prompt in parsed_vllm_inputs:
@@ -325,3 +476,68 @@ class PSRL_vLLMRollout(BaseRollout):
                 use_tqdm=False,
             )
             return self.post_process_outputs(prompts, outputs)
+    
+    async def generate_sequence_task(
+        self,
+        idx: int,
+        prompt_tokens: Union[Dict[str, Any], List[int]],
+        sampling_params: SamplingParams = None,
+        uid: Optional[str] = None
+    ) -> Tuple[int, RequestOutput]:
+        if sampling_params is None:
+            sampling_params = self.sampling_params
+        if isinstance(prompt_tokens, list):
+            prompt_tokens = {'prompt_token_ids': prompt_tokens}
+
+        task = self.inference_engine.generate(
+            prompt=TokensPrompt(**prompt_tokens),
+            sampling_params=sampling_params,
+            request_id=str(uuid.uuid4()) if uid is None else uid,
+        )
+        async for output in task:
+            last_output = output
+        return idx, last_output
+    
+    @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
+    @torch.no_grad()
+    async def generate_sequences_async(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generate sequences from the prompts using vLLM asynchronously."""
+        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
+        sample_ids = prompts.non_tensor_batch.get("uid", None)
+        assert sample_ids is not None, \
+            "sample_ids must be provided in the prompts.non_tensor_batch"
+        
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            tasks = [
+                self.generate_sequence_task(
+                    prompt_idx,
+                    vllm_input,
+                    self.sampling_params,
+                    str(sample_id),
+                ) for prompt_idx, (vllm_input, sample_id) in enumerate(zip(vllm_inputs, sample_ids))
+            ]
+        
+            completed_rollout = []
+            for completed_task in asyncio.as_completed(tasks):
+                prompt_idx, output = await completed_task
+                completed_rollout.append(self.post_process_outputs(prompts[prompt_idx:prompt_idx+1], output))
+        
+        return DataProto.concat(completed_rollout)
+
+    async def interrupt_all_requests_async(self) -> int:
+        scheduler = self.inference_engine.llm_engine.scheduler
+        request_ids_to_abort = []
+        for request in scheduler.running:
+            request_ids_to_abort.append(request.request_id)
+        for request in scheduler.waiting:
+            request_ids_to_abort.append(request.request_id)
+        interrupted_request_num = len(request_ids_to_abort)
+        
+        if interrupted_request_num > 0:
+            await self.inference_engine.abort_requests(request_ids_to_abort)
+            psrl_logger.info(f"Interrupted {interrupted_request_num} requests.")
+        else:
+            psrl_logger.info("No requests to interrupt.")
+            
+        return interrupted_request_num

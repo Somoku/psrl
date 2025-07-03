@@ -1,4 +1,5 @@
 #!/bin/bash
+set -x
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -47,7 +48,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.mode=sync \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
-    gen_actor_rollout_ref.rollout.n=1 \
+    gen_actor_rollout_ref.rollout.n=4 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
@@ -56,15 +57,20 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
-    train_actor_rollout_ref.rollout.n=1 \
-    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    train_actor_rollout_ref.rollout.n=4 \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    train_actor_rollout_ref.actor.use_kl_loss=False \
+    train_actor_rollout_ref.actor.use_kl_loss=True \
+    train_actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    train_actor_rollout_ref.actor.entropy_coeff=0 \
+    train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    train_actor_rollout_ref.ref.fsdp_config.param_offload=False \
     \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
@@ -75,7 +81,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=False \
     \
     algorithm.use_kl_in_reward=False \
-    algorithm.adv_estimator=gae \
+    algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
@@ -87,8 +93,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_test' \
-    trainer.experiment_name='psrl_test_ppo_run' \
+    trainer.experiment_name='psrl_test_grpo_run' \
     trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_test_ppo_run.log
+    trainer.total_epochs=30 2>&1 | tee psrl_test_grpo_run.log

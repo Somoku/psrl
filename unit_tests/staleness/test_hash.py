@@ -4,7 +4,7 @@ from typing import Union
 @dataclass(frozen=True)
 class EntryInfo:
     rollout_instance_id: Union[str, int]
-    local_request_id: Union[str, int]
+    request_id: Union[str, int]
     model_version: int
 
 # Creating instances of EntryInfo

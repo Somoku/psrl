@@ -1,6 +1,7 @@
 psrl:
   staleness: 0
   staleness_buffer_entries: 512
+  rollout_n: ${gen_actor_rollout_ref.rollout.n}
   gen_mode: batch
   ps_mode: cpu_ref
   logging_path: ~/psrl_logs
@@ -15,9 +16,17 @@ psrl:
     train_ngpus_per_node: 1
     ps_nnodes: 1
     ps_ngpus_per_node: 1
+    heterogeneous_rollout:
+      enable: False # Whether to enable heterogeneous strategies for different rollout instances.
+      n_rollout_instances: ${psrl.deployment.n_rollout_instances}
+      rollout_nnodes_per_instance: []
+      rollout_ngpus_per_node_per_instance: []
+      tensor_model_parallel_size_per_instance: [] # Tensor model parallel size for each rollout instance.
+      pipeline_model_parallel_size_per_instance: [] # Pipeline model parallel size for each rollout instance.
 
 data:
   tokenizer: null
+  use_shm: False # Whether to use shared memory for data loading.
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
   prompt_key: prompt
@@ -28,12 +37,15 @@ data:
   val_batch_size: null
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
   return_raw_chat: False
+  return_full_prompt: False
   shuffle: True
+  validation_shuffle: False
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
   filter_overlong_prompts_workers: 1
   truncation: error
   image_key: images
   video_key: videos
+  trust_remote_code: False
   custom_cls:
       path: null
       name: null
@@ -53,6 +65,8 @@ train_actor_rollout_ref:
     target_modules: all-linear  # all-linear or [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
     use_liger: False
     use_fused_kernels: False
+    fused_kernel_options:
+      impl_backend: torch
     trust_remote_code: False
   actor:
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
@@ -66,6 +80,14 @@ train_actor_rollout_ref:
     clip_ratio: 0.2 # default value if clip_ratio_low and clip_ratio_high are not specified
     clip_ratio_low: 0.2
     clip_ratio_high: 0.2
+    # policy loss config
+    policy_loss:
+      loss_mode: "vanilla" # Loss function mode: vanilla / clip-cov / kl-cov from https://arxiv.org/abs/2505.22617
+      clip_cov_ratio: 0.0002 # Ratio of tokens to be clipped for clip-cov loss
+      clip_cov_lb: 1.0 # Lower bound for clip-cov loss
+      clip_cov_ub: 5.0 # Upper bound for clip-cov loss
+      kl_cov_ratio: 0.0002 # Ratio of tokens to be applied kl penalty for kl-cov loss
+      ppo_kl_coef: 0.1 # KL divergence penalty coefficient
     clip_ratio_c: 3.0 # lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729
     loss_agg_mode: "token-mean" # / "seq-mean-token-sum" / "seq-mean-token-mean"
     entropy_coeff: 0
@@ -76,12 +98,18 @@ train_actor_rollout_ref:
     ppo_epochs: 1
     shuffle: False
     ulysses_sequence_parallel_size: 1 # sp size
+    entropy_from_logits_with_chunking: False
+    entropy_checkpointing: False
     checkpoint:
-      contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+      # What to include in saved checkpoints
+      # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+      save_contents: ['model', 'optimizer', 'extra']
+      # For more flexibility, you can specify the contents to load from the checkpoint.
+      load_contents: ${train_actor_rollout_ref.actor.checkpoint.save_contents}
     optim:
       lr: 1e-6
       lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
-      lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+      lr_warmup_steps_ratio: 0.0  # the total steps will be injected during runtime
       min_lr_ratio: 0.0   # only used with cosine lr scheduler, default to 0.0
       num_cycles: 0.5     # only used with cosine lr scheduler, default to 0.5
       warmup_style: constant  # select from constant/cosine
@@ -96,11 +124,17 @@ train_actor_rollout_ref:
       offload_policy: False # only for fsdp2, offload param\grad\optimizer during train
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       fsdp_size: -1
+      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
+      # before the current forward computation.
+      forward_prefetch: False
   ref:
     strategy: fsdp
     fsdp_config:
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
+      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
+      # before the current forward computation.
+      forward_prefetch: False
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -110,7 +144,12 @@ train_actor_rollout_ref:
     log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${train_actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+    entropy_from_logits_with_chunking: False # calculate entropy with chunking to reduce memory peak
+    entropy_checkpointing: False # recompute entropy
   rollout:
+    ### Config for streaming rollout ###
+    max_inflight_requests: 512 # Max in-flight requests for each rollout worker
+
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
     temperature: 1.0
@@ -123,14 +162,15 @@ train_actor_rollout_ref:
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
-    enforce_eager: True
-    free_cache_engine: True
+    enforce_eager: False
+    free_cache_engine: False
     load_format: dummy_dtensor  # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
     layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
     tensor_model_parallel_size: 2
     max_num_batched_tokens: 8192
     max_model_len: null
     max_num_seqs: 1024
+    enable_inference_engine_log_prob: ${psrl.log_prob.enable_inference_engine_log_prob} # Use log prob from inference engine rollout
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
@@ -159,20 +199,38 @@ train_actor_rollout_ref:
       tool_config_path: null  # null for no tool
       format: chatml  # chatml, more formats will be supported in the future
       completion_callback: null # null for default callback
+      # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
+      # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
+      #   which may contain additional content such as reasoning content. This maintains the consistency between training and rollout, but it will lead to longer prompts.
+      use_inference_chat_template: False
+      # Tokenization is performed turn by turn and the resulting token ids are concatenated to form the full conversation.
+      # To ensure this matches the result of tokenizing the entire conversation at once, a sanity check is run at the end of each multi-turn rollout to compare the two sets of token ids.
+      # Some models are known to produce different tokenization results when tokenizing turn by turn vs. all at once. aThis behavior has already been validated for them.
+      # To reduce excessive warnings, you can turn off the sanity check for these models if you are using their default chat template:
+      # Qwen/QwQ-32B, Qwen/Qwen3-xxB
+      enable_tokenization_sanity_check: True
+    calculate_log_probs: ${psrl.log_prob.enable_inference_engine_log_prob}
 
-gen_actor_rollout:
+gen_actor_rollout_ref:
   hybrid_engine: False
   model:
     path: ${train_actor_rollout_ref.model.path}
     external_lib: null
+  # for compatibility with verl
   actor:
     strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
     ulysses_sequence_parallel_size: 1 # sp size
     fsdp_config:
       fsdp_size: -1
+      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
+      # before the current forward computation.
+      forward_prefetch: False
   rollout:
+    ### Config for streaming rollout ###
+    max_inflight_requests: 512 # Max in-flight requests for each rollout worker
+
     name: vllm
-    mode: sync # sync: LLM, async: AsyncLLM
+    mode: sync # sync: LLM, async: AsyncLLM, psrl_async: AsyncLLMEngine
     chat_scheduler: null # async chat scheduler, e.g examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -184,13 +242,18 @@ gen_actor_rollout:
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
-    enforce_eager: True
-    free_cache_engine: True
+    enforce_eager: False
+    free_cache_engine: False
+    # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
+    # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
     load_format: dummy_dtensor
+    layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
     tensor_model_parallel_size: 2
+    pipeline_model_parallel_size: 1
     max_num_batched_tokens: 8192
     max_model_len: null
     max_num_seqs: 1024
+    enable_inference_engine_log_prob: ${psrl.log_prob.enable_inference_engine_log_prob} # Use log prob from inference engine rollout
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
@@ -201,8 +264,12 @@ gen_actor_rollout:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    use_post_sampling_logprobs: True
     engine_kwargs: # inference engine parameters
-      swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+      vllm:
+        swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+      sglang:
+        attention_backend: null # The attention backend for sglang engine. Options: flashinfer, triton, flashmla, null for default.
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -215,6 +282,17 @@ gen_actor_rollout:
       max_turns: null  # null for no limit (default max_length // 3)
       tool_config_path: null  # null for no tool
       format: chatml  # chatml, more formats will be supported in the future
+      completion_callback: null # null for default callback
+      # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
+      # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
+      #   which may contain additional content such as reasoning content. This maintains the consistency between training and rollout, but it will lead to longer prompts.
+      use_inference_chat_template: False
+      # Tokenization is performed turn by turn and the resulting token ids are concatenated to form the full conversation.
+      # To ensure this matches the result of tokenizing the entire conversation at once, a sanity check is run at the end of each multi-turn rollout to compare the two sets of token ids.
+      # Some models are known to produce different tokenization results when tokenizing turn by turn vs. all at once. aThis behavior has already been validated for them.
+      # To reduce excessive warnings, you can turn off the sanity check for these models if you are using their default chat template:
+      # Qwen/QwQ-32B, Qwen/Qwen3-xxB
+      enable_tokenization_sanity_check: True
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
@@ -228,6 +306,7 @@ critic:
     weight_decay: 0.01
   model:
     path: ~/models/deepseek-llm-7b-chat
+    use_shm: False
     tokenizer_path: ${train_actor_rollout_ref.model.path}
     override_config: { }
     external_lib: ${train_actor_rollout_ref.model.external_lib}
@@ -244,6 +323,9 @@ critic:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
       fsdp_size: -1
+      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
+      # before the current forward computation.
+      forward_prefetch: False
     lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
     lora_alpha: 16  # LoRA scaling factor
     target_modules: all-linear  # all-linear or [q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]
@@ -262,7 +344,8 @@ critic:
   cliprange_value: 0.5
   loss_agg_mode: ${train_actor_rollout_ref.actor.loss_agg_mode}
   checkpoint:
-    contents: ['model', 'optimizer', 'extra']  # with 'hf_model' you can save whole model as hf format, now only use sharded model checkpoint to save space
+    save_contents: ['model', 'optimizer', 'extra']
+    load_contents: ${critic.checkpoint.save_contents}
 
 reward_model:
   enable: False
@@ -270,8 +353,10 @@ reward_model:
   model:
     input_tokenizer: ${train_actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
+    use_shm: False
     external_lib: ${train_actor_rollout_ref.model.external_lib}
     use_remove_padding: False
+    use_fused_kernels: ${train_actor_rollout_ref.model.use_fused_kernels}
     trust_remote_code: False
     fsdp_config:
       wrap_policy:
@@ -279,6 +364,7 @@ reward_model:
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       fsdp_size: -1
+      forward_prefetch: False
   micro_batch_size: null # will be deprecated, use micro_batch_size_per_gpu
   micro_batch_size_per_gpu: null # set a number
   max_length: null
@@ -287,6 +373,10 @@ reward_model:
   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
   reward_manager: naive
   launch_reward_fn_async: False # custom reward function executed async on CPU, during log_prob
+  # Cloud/local sandbox fusion configuration for custom reward logic
+  sandbox_fusion:
+    url: null # Cloud/local function URL for sandbox execution
+    max_concurrent: 64 # Max concurrent requests allowed to sandbox
 
 custom_reward_function:
   path: null
@@ -304,6 +394,11 @@ algorithm:
     kl_coef: 0.001
     horizon: 10000
     target_kl: 0.1
+  use_pf_ppo: False # Whether to enable preference feedback PPO
+  # Preference feedback PPO settings
+  pf_ppo:
+    reweight_method: pow # Method for reweighting samples: "pow", "max_min", or "max_random"
+    weight_pow: 2.0 # Power used for weight scaling in "pow" method
 
 trainer:
   balance_batch: True
@@ -333,4 +428,4 @@ trainer:
 
 ray_init:
   num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
-  timeline_json_file: null
+  timeline_json_file: null # Path to save Ray timeline JSON for performance profiling

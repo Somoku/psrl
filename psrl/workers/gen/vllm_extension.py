@@ -2,9 +2,15 @@ import os
 import logging
 from typing import List
 
-import torch
 import vllm
+import torch
+try:
+    # for torch 2.5+
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
 
+from verl.utils.device import get_device_id
 from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
 psrl_logger = logging.getLogger(__file__)
@@ -18,8 +24,18 @@ class vLLMWorkerExtension:
                 for name, handle in weights:
                     func, args = handle
                     list_args = list(args)
-                    tensor = func(*list_args)
-                    tensor = tensor.to(current_device, non_blocking=True)
+                    # CPU bundle: (type(tensor), storage, metadata)
+                    if len(list_args) == 3:
+                        tensor = func(*list_args)
+                        tensor = tensor.to(current_device, non_blocking=True)
+                        if isinstance(tensor, DTensor):
+                            tensor = tensor.full_tensor()
+                    else:
+                        list_args[6] = get_device_id()
+                        tensor = func(*list_args)
+                        if isinstance(tensor, DTensor):
+                            tensor = tensor.full_tensor()
+                    # tensor = tensor.to(current_device, non_blocking=True)
                     yield (name, tensor)
             
             rebuild_weights = rebuild_weights_generator()

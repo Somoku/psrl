@@ -2,7 +2,7 @@ import os
 import numpy as np
 import threading
 import logging
-from typing import Dict
+from typing import Dict, Tuple
 from dataclasses import dataclass
 
 import torch
@@ -88,7 +88,7 @@ class DataProcessor:
         tokenizer,
         processor,
         ps_handle,
-        rollout_instances_tp: Dict[int, int],
+        rollout_instances_strategy: Dict[int, Tuple[int, int]],
         collate_fn=None,
         reward_fn=None,
         process_mode="batch",
@@ -118,8 +118,8 @@ class DataProcessor:
         self.rollout_request_buffer = {}
         self.rollout_parent_counter = {}
 
-        self.rollout_instances_tp = rollout_instances_tp # key: rollout instance id, value: tp size
-        self.rollout_instance_num = len(rollout_instances_tp)
+        self.rollout_instances_strategy = rollout_instances_strategy # key: rollout instance id, value: tp size
+        self.rollout_instance_num = len(rollout_instances_strategy)
         
         self._threads = []
         self._reward_shutdown = False

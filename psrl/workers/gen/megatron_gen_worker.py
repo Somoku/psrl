@@ -20,25 +20,18 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
 from verl.utils.debug import log_gpu_memory_usage
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
+from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 from psrl.utils.ray import RayLock, AsyncLock
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
-from psrl.workers.gen import PSRL_vLLMRollout
-from psrl.workers.sharding_manager import PSRL_FSDPASyncvLLMShardingManager, PSRL_FSDPVLLMShardingManager
+from psrl.workers.gen import PSRL_vLLMRollout, GenInterface
+from psrl.workers.sharding_manager import PSRL_MegatronASyncvLLMShardingManager, PSRL_MegatronvLLMShardingManager
 
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
-
-@dataclass
-class GenInterface:
-    """Info for the PSRL GenWorker."""
-    rollout_instance_id: int
-    ps_handle: ray.actor.ActorHandle
-
-class PSRL_GenWorker(ActorRolloutRefWorker):
+class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
 
     @staticmethod
     def configure_worker(
@@ -187,6 +180,10 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             return val_tensor.item()
         
     def _build_rollout(self, trust_remote_code=False):
+        layer_name_mapping = {
+            "qkv_layer_name": "self_attention.linear_qkv.",
+            "gate_proj_layer_name": "linear_fc1.",
+        }
         tp = self.config.rollout.tensor_model_parallel_size
         pp = self.config.rollout.pipeline_model_parallel_size
         assert self.world_size == tp * pp, "Only support dp=1 for now"
@@ -207,16 +204,22 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             seed=self.seed,
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
-        
-        rollout_sharding_manager_cls = PSRL_FSDPVLLMShardingManager if self.config.rollout.mode == "sync" else PSRL_FSDPASyncvLLMShardingManager
+        from verl.models.mcore import get_mcore_weight_converter
+        weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
+
+        rollout_sharding_manager_cls = PSRL_MegatronvLLMShardingManager if self.config.rollout.mode == "sync" else PSRL_MegatronASyncvLLMShardingManager
         rollout_sharding_manager = rollout_sharding_manager_cls(
-            module=self.actor_module_fsdp,
+            actor_module=self.actor_module,
             inference_engine=rollout.inference_engine,
             model_config=self.actor_model_config,
-            seed=self.seed,
-            full_params="hf" in self.config.rollout.load_format,
+            transformer_config=self.tf_config,
+            rollout_config=self.config.rollout,
+            layer_name_mapping=layer_name_mapping,
+            weight_converter=weight_converter,
             device_mesh=self.rollout_device_mesh,
+            seed=self.seed,
             offload_param=self._is_offload_param,
+            bridge=None,
         )
         log_gpu_memory_usage("After building sharding manager", logger=psrl_logger)
         
@@ -275,7 +278,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
             # NOTE: transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
-            params_to_load = [(name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in model_state_dict_cpu.items()]
+            params_to_load = ((name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in model_state_dict_cpu.items())
             loaded_params = await self.rollout.inference_engine.collective_rpc(
                 "load_weights",
                 args=(params_to_load,),
@@ -470,7 +473,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
                                             f"waiting for new model version >= {min(self.version_to_task_num.keys())}")
                         self.require_version_update_event.set()
         
-        async with self.rollout_sharding_manager:
+        async with self.sharding_manager:
             while self._rollout_running:
                 if self._async_interrupt_event and self._async_interrupt_event.is_set():
                     psrl_logger.info(f"Generation interrupted, waiting for resume...")
@@ -608,7 +611,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         
         if self.psrl_config.gen_mode == "batch":
             def batch_gen_loop():
-                with self.rollout_sharding_manager:
+                with self.sharding_manager:
                     round = 0
                     while True:
                         request_num = self.request_num_queue.get()

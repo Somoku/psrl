@@ -28,18 +28,23 @@ from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import fsdp_version, layered_summon_lora_params, load_fsdp_model_to_gpu, offload_fsdp_model_to_cpu
 from verl.utils.model import convert_weight_keys
 from verl.utils.torch_functional import check_device_is_available
-from verl.utils.vllm_utils import TensorLoRARequest, VLLMHijack, is_version_ge
+from verl.utils.vllm_utils import TensorLoRARequest, VLLMHijack, is_version_ge, patch_vllm_moe_model_weight_loader
 from verl.workers.sharding_manager.base import BaseShardingManager
 from verl.utils.debug import simple_timer
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
-class PSRL_FSDPVLLMShardingManager(BaseShardingManager):
+class PSRL_FSDPvLLMShardingManager(BaseShardingManager):
     @check_device_is_available()
     def __init__(self, module: FSDP, inference_engine: LLM, model_config, seed: int = 0, full_params: bool = False, device_mesh: DeviceMesh = None, offload_param: bool = False, load_format: str = "dummy_hf", layered_summon: bool = True):
         self.module = module
         self.inference_engine = inference_engine
+        self.model_runner = (
+            self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+            if self.inference_engine
+            else None
+        )
 
         self.model_config = model_config
         self.device_mesh = device_mesh
@@ -209,6 +214,7 @@ class PSRL_FSDPVLLMShardingManager(BaseShardingManager):
         return data.chunk(chunks=self.tp_size)[self.tp_rank]
 
     def update_params(self, updated_params, peft_config=None):
+        model = self.model_runner.model
         if peft_config:
             if self.base_sync_done:
                 lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
@@ -234,16 +240,13 @@ class PSRL_FSDPVLLMShardingManager(BaseShardingManager):
 
                 updated_params = {replace_lora_wrapper(k): v for k, v in updated_params.items()}
 
-        self.inference_engine.collective_rpc("patch_vllm_moe_model_weight_loader", args=tuple())
+        patch_vllm_moe_model_weight_loader(model)
         device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-        params_to_load = [
+        params_to_load = (
             (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
             for name, param in updated_params.items()
-        ]
-        loaded_params = self.inference_engine.collective_rpc(
-            "load_weights",
-            args=(params_to_load,),
         )
+        loaded_params = model.load_weights(params_to_load)
 
         self.base_sync_done = True
         psrl_logger.info(f"vLLM load weights, loaded_params: {len(loaded_params) if loaded_params else -1}")
@@ -448,8 +451,6 @@ class PSRL_FSDPASyncvLLMShardingManager(BaseShardingManager):
 
                 updated_params = {replace_lora_wrapper(k): v for k, v in updated_params.items()}
 
-        device = get_device_id()  # used when fsdp2 set cpu_offload_policy
-
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.inference_engine.collective_rpc(
             "patch_vllm_moe_model_weight_loader",
@@ -458,7 +459,8 @@ class PSRL_FSDPASyncvLLMShardingManager(BaseShardingManager):
 
         # For AsyncLLM, param update is handled through collective_rpc
         # NOTE: Only CPU tensor can be passed to collective_rpc
-        params_to_load = [(name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in updated_params.items()]
+        params_to_load = ((name, reduce_tensor(param.detach())) for name, param in updated_params.items())
+
         loaded_params = loop.run_until_complete(self.inference_engine.collective_rpc(
             "load_weights",
             args=(params_to_load,),

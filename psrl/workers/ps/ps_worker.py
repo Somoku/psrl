@@ -15,7 +15,7 @@ from time import sleep
 from omegaconf import DictConfig, open_dict
 from dataclasses import dataclass
 from verl import DataProto
-from verl.single_controller.base import Worker
+from verl.single_controller.base.worker import Worker, DistGlobalInfo, DistRankInfo
 from verl.utils.fs import copy_to_local
 from verl.utils.debug import log_gpu_memory_usage
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
@@ -88,7 +88,25 @@ class PSRL_PSWorker(Worker):
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         self.logged_ready_buffer_ids: Set[int] = set()
-        
+
+    def get_megatron_global_info(self):
+        # NOTE: for compatibility with megatron worker
+        tp_size = 1
+        dp_size = 1
+        pp_size = 1
+        cp_size = 1
+        info = DistGlobalInfo(tp_size=tp_size, dp_size=dp_size, pp_size=pp_size, cp_size=cp_size)
+        return info
+
+    def get_megatron_rank_info(self):
+        # NOTE: for compatibility with megatron worker
+        tp_rank = 0
+        dp_rank = 0
+        pp_rank = 0
+        cp_rank = 0
+        info = DistRankInfo(tp_rank=tp_rank, dp_rank=dp_rank, pp_rank=pp_rank, cp_rank=cp_rank)
+        return info
+
     @property   
     def is_ps_representative_rank(self) -> bool:
         """

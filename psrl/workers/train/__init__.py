@@ -1,6 +1,7 @@
-from .train_worker import PSRL_TrainWorker, TrainInterface
+from .base_train_worker import TrainInterface
+
+# NOTE: Backend-specific worker will be lazily imported
 
 __all__ = [
-    "PSRL_TrainWorker",
     "TrainInterface",
 ]

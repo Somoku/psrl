@@ -57,7 +57,7 @@ train_actor_rollout_ref:
     use_shm: False
     external_lib: null
     override_config: { }
-    enable_gradient_checkpointing: True
+    enable_gradient_checkpointing: False
     enable_activation_offload: False
     use_remove_padding: False
     lora_rank: 0  # Set to positive value to enable LoRA (e.g., 32)
@@ -147,9 +147,6 @@ train_actor_rollout_ref:
     entropy_from_logits_with_chunking: False # calculate entropy with chunking to reduce memory peak
     entropy_checkpointing: False # recompute entropy
   rollout:
-    ### Config for streaming rollout ###
-    max_inflight_requests: 512 # Max in-flight requests for each rollout worker
-
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
     temperature: 1.0
@@ -162,8 +159,8 @@ train_actor_rollout_ref:
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
-    enforce_eager: False
-    free_cache_engine: False
+    enforce_eager: True
+    free_cache_engine: True
     load_format: dummy_dtensor  # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
     layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
     tensor_model_parallel_size: 2
@@ -242,11 +239,11 @@ gen_actor_rollout_ref:
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
-    enforce_eager: False
-    free_cache_engine: False
+    enforce_eager: True
+    free_cache_engine: True
     # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
     # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
-    load_format: dummy_dtensor
+    load_format: auto
     layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1

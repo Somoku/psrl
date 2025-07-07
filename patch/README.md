@@ -9,6 +9,7 @@ The patches provide the following enhancements:
 ### veRL Patch (v0.4.1.x)
 - **Custom Resource Management**: Enables workers to define custom resource requirements, environment variables, and initialization parameters by implementing a `configure_worker` class method.
 - **Distributed AsyncLLM Support**: Allows for flexible distributed deployment of AsyncLLM across multiple nodes
+- **Compatibility with Disaggregated Architecture**: Fix compatibility issues with disaggregated architectures in Megatron workers
 
 ### VLLM Patch (v0.9.0)
 - **Post-Sampling Logprobs**: Introduces `use_post_sampling_logprobs` parameter in SamplingMetadata to allow returning logprobs computed after sampling for more accurate probability distributions
@@ -117,6 +118,7 @@ sampling_metadata = SamplingMetadata(
 ### VERL Patch
 - `verl/single_controller/ray/base.py`: Enhanced worker configuration and Ray scheduling
 - `verl/workers/actor/dp_actor.py`: Improved data type handling and imports
+- `verl/workers/megatron_workers.py`: Fixed compatibility issues with disaggregated architectures
 
 ### VLLM Patch
 - `vllm/model_executor/layers/fused_moe/fused_moe.py`: Updated type annotations from `list[int]` to `List[int]`

@@ -60,6 +60,7 @@ fi
 TARGET_FILES=(
     "verl/single_controller/ray/base.py"
     "verl/workers/actor/dp_actor.py"
+    "verl/workers/megatron_workers.py"
 )
 for file in "${TARGET_FILES[@]}"; do
     if [ ! -f "$VERL_PATH/$file" ]; then

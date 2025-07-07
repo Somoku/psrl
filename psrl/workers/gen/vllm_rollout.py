@@ -187,7 +187,7 @@ class PSRL_vLLMRollout(BaseRollout):
             self.inference_engine = AsyncLLM.from_engine_args(
                 AsyncEngineArgs(
                     model=model_path,
-                    enable_sleep_mode=False,
+                    enable_sleep_mode=True,
                     tensor_parallel_size=tensor_parallel_size,
                     pipeline_parallel_size=pipeline_parallel_size,
                     distributed_executor_backend=distributed_executor_backend,
@@ -237,7 +237,7 @@ class PSRL_vLLMRollout(BaseRollout):
             )
 
         # Offload vllm model to reduce peak memory usage
-        if config.mode != "psrl_async":
+        if load_format == "dummy":
             self.inference_engine.sleep(level=1)
 
         kwargs = dict(

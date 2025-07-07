@@ -252,26 +252,34 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
-    def start_data_processor(self):
+    def init_data_processor(self):
         if self.data_processor is not None:
             return
         
-        # TODO: support different rollout instances use difference TP
-        tp = self.config.psrl.deployment.rollout_ngpus_per_node_per_instance
-        rollout_instances_tp = {i: tp for i in range(self.config.psrl.deployment.n_rollout_instances)}
+        deployment_config = self.config.psrl.deployment
+        rollout_instances_strategy = {}
+        if deployment_config.heterogeneous_rollout.enable:
+            heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
+            for i in range(deployment_config.n_rollout_instances):
+                tp = heterogeneous_deployment_config.tensor_model_parallel_size_per_instance[i]
+                pp = heterogeneous_deployment_config.pipeline_model_parallel_size_per_instance[i]
+                rollout_instances_strategy[i] = (tp, pp)
+        else:
+            tp = self.config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size
+            pp = self.config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size
+            rollout_instances_strategy = {i: (tp, pp) for i in range(self.config.psrl.deployment.n_rollout_instances)}
         self.data_processor = DataProcessor.remote(
             self.config,
             self.tokenizer,
             self.processor,
             self.ps_handle,
-            rollout_instances_tp,
+            rollout_instances_strategy,
             collate_fn=self.collate_fn,
             reward_fn=self.reward_fn,
             process_mode=self.config.psrl.gen_mode,
             use_rm=self.use_rm,
         )
         self.total_training_steps = ray.get(self.data_processor.get_total_training_steps.remote())
-        self.data_process_task = self.data_processor.initialize_and_start.remote()
 
         psrl_logger.info(f"Total training steps: {self.total_training_steps}")
 
@@ -284,6 +292,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self.config.critic.optim.total_training_steps = self.total_training_steps
         except Exception as e:
             psrl_logger.info(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def start_data_processor(self):
+        assert self.data_processor is not None, "Data processor must be initialized before starting it."
+        self.data_process_task = self.data_processor.initialize_and_start.remote()
 
     def start_rollout_server(self, data_queue, rollout_queue):
         if self.config.psrl.gen_mode == "batch":
@@ -447,6 +459,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # using `ray.get_runtime_context()` is time-consuming, so we have to expose the `_workers` attribute of the PS worker group
         # self.ps_handle = self.ps_wg.execute_rank_zero_sync("get_ps_handle")
         self.ps_handle = self.ps_wg._workers[0]
+
+        # create data processor
+        self.init_data_processor()
          
         # create rollout instances  
         for i in range(self.config.psrl.deployment.n_rollout_instances):

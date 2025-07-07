@@ -1,56 +1,37 @@
 import ray
 import os
-import sys
 import logging
-import torch
-import torch.distributed as dist
 
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import ShardingStrategy, StateDictType, FullStateDictConfig
-from typing import Any, Callable, ClassVar, Optional, Union, List
-from time import sleep
-from omegaconf import DictConfig, open_dict
-from dataclasses import dataclass
+from omegaconf import DictConfig
 from verl import DataProto
-from verl import DataProto
+from verl.models.mcore import get_mcore_weight_converter
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.device import get_torch_device
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.fsdp_utils import (
-    CPUOffloadPolicy,
-    MixedPrecisionPolicy,
-    apply_fsdp2,
-    fsdp2_load_full_state_dict,
-    fsdp_version,
-    get_fsdp_wrap_policy,
-    get_init_weight_context_manager,
-    init_fn,
-    load_fsdp_model_to_gpu,
-    load_fsdp_optimizer,
-    offload_fsdp_model_to_cpu,
-    offload_fsdp_optimizer,
+from verl.utils.device import get_device_id, get_torch_device
+from verl.utils.megatron_utils import (
+    load_megatron_model_to_gpu,
+    offload_megatron_model_to_cpu,
+    per_tensor_generator,
 )
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
-from verl.workers.rollout.vllm_rollout import vllm_mode
+from verl.workers.megatron_workers import ActorRolloutRefWorker
 
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
+from psrl.workers.train import TrainInterface
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
 
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
-
-@dataclass
-class TrainInterface:
-    """Info for the PSRL TrainWorker."""
-    ps_handle: ray.actor.ActorHandle
-
-
-class PSRL_TrainWorker(ActorRolloutRefWorker):
+class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, train_interface: TrainInterface) -> None:
         super().__init__(config, role)
         self.psrl_config = psrl_config
         self.train_interface = train_interface
+        self.layer_name_mapping = {
+            "qkv_layer_name": "self_attention.linear_qkv.",
+            "gate_proj_layer_name": "linear_fc1.",
+        }
+        self.weight_converter = None
         
         # Build logger
         self.log_prefix = f"TrainWorker_R{self.rank}"
@@ -75,11 +56,20 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         curr_ps_model_version = ray.get(ps_handle.get_ps_model_version.remote())
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
-        # TODO: support FSDP2
-        assert fsdp_version(self.actor_module_fsdp) == 1, "FSDP version 2 is not supported yet."
         psrl_logger.info(f"Gathering the full state dict on the CPU of the representative rank.")
-        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
-            full_state_dict = self.actor_module_fsdp.state_dict()
+        if self.weight_converter is None:
+            self.weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
+        per_tensor_param = per_tensor_generator(
+            self.actor_module,
+            self.actor_model_config,
+            self.weight_converter,
+            self.tf_config,
+            self.layer_name_mapping,
+        )
+        full_state_dict = {}
+        for name, param in per_tensor_param:
+            if self.is_train_representative_rank:
+                full_state_dict[name] = param.to("cpu", non_blocking=True)
         if self.is_train_representative_rank:
             assert len(full_state_dict) > 0, "The model state dict shouldn't be empty on the representative worker."
             psrl_logger.info(f"Push the model via CPU on the representative rank (async).")
@@ -103,43 +93,36 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
             super().init_model()
     
     # The log_prob in training side is only used when there is a proxy policy    
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+            load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+            log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=psrl_logger)
 
         # Support all hardwares
-        data = data.to(torch.cuda.current_device())
+        data = data.to(get_device_id())
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data)
-            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"proxy_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
-            output = self.ulysses_sharding_manager.postprocess_data(output)
-
+        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+        output = DataProto.from_dict(
+            tensors={"old_log_probs": output, "entropys": entropys},
+            meta_info={"temperature": self.config.rollout.temperature},
+        )
         output = output.to("cpu")
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-            self.actor.actor_module._handle.reshard(True)
-
+        # clear kv cache
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=psrl_logger)
-
+            offload_megatron_model_to_cpu(self.actor_module)
+            log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=psrl_logger)
+        get_torch_device().empty_cache()
         return output
                 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # The model weights are pushed to the PS via CPU
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":

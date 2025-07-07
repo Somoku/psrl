@@ -10,14 +10,10 @@ import numpy as np
 from pprint import pprint
 from omegaconf import OmegaConf
 
-from verl.single_controller.ray import RayWorkerGroup
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker, RewardModelWorker
 from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 
-from psrl.workers.gen import PSRL_GenWorker
-from psrl.workers.train import PSRL_TrainWorker
 from psrl.workers.ps import PSRL_PSWorker
 from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
 
@@ -49,6 +45,7 @@ def run_ppo(config) -> None:
                     "NCCL_DEBUG": "WARN", 
                     "VLLM_LOGGING_LEVEL": "WARN",
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
+                    "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
                 }
             },
@@ -89,9 +86,25 @@ class TaskRunner:
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
 
         # define worker classes
-        assert config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
-        assert config.critic.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
-        ray_worker_group_cls = RayWorkerGroup
+        if config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+            assert config.critic.strategy in ["fsdp", "fsdp2"], "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
+            from verl.single_controller.ray import RayWorkerGroup
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+            from psrl.workers.train.fsdp_train_worker import PSRL_FSDPTrainWorker as PSRL_TrainWorker
+            from psrl.workers.gen.fsdp_gen_worker import PSRL_FSDPGenWorker as PSRL_GenWorker
+
+            ray_worker_group_cls = RayWorkerGroup
+        elif config.train_actor_rollout_ref.actor.strategy == "megatron":
+            assert config.train_actor_rollout_ref.actor.strategy == config.critic.strategy
+            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+            from psrl.workers.train.megatron_train_worker import PSRL_MegatronTrainWorker as PSRL_TrainWorker
+            from psrl.workers.gen.megatron_gen_worker import PSRL_MegatronGenWorker as PSRL_GenWorker
+
+            ray_worker_group_cls = NVMegatronRayWorkerGroup
+        else:
+            raise NotImplementedError(f"Unsupported strategy: {config.train_actor_rollout_ref.actor.strategy}. "
+                                        "Currently only 'fsdp', 'fsdp2', and 'megatron' are supported.")
         
         deployment_config = config.psrl.deployment
         rollout_pool_id_list = [f'rollout_pool_{i}' for i in range(deployment_config.n_rollout_instances)]
@@ -143,7 +156,12 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
-            assert config.reward_model.strategy in ["fsdp", "fsdp2"], "Currently only fsdp and fsdp2 are supported."
+            if config.reward_model.strategy in ["fsdp", "fsdp2"]:
+                from verl.workers.fsdp_workers import RewardModelWorker
+            elif config.reward_model.strategy == "megatron":
+                from verl.workers.megatron_workers import RewardModelWorker
+            else:
+                raise NotImplementedError
             role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[PSRL_Role.RewardModel] = [train_pool_id]
 

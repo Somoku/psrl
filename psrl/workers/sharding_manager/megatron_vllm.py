@@ -155,15 +155,7 @@ class PSRL_MegatronvLLMShardingManager(BaseShardingManager):
                 )
             model = self.model_runner.model
             patch_vllm_moe_model_weight_loader(model)
-            # TODO: it only works for intra-node param sharing, inter-node transfer requires NCCL communication
-            def apply_reduce_tensor_generator(generator):
-                for name, param in generator:
-                    yield name, reduce_tensor(param.detach())
-            per_tensor_param = apply_reduce_tensor_generator(per_tensor_param)
-            loaded_params = self.inference_engine.collective_rpc(
-                "load_weights",
-                args=(per_tensor_param,),
-            )
+            loaded_params = model.load_weights(per_tensor_param)
             info = f"vLLM load weights, loaded_params: {len(loaded_params)}"
             psrl_logger.info(info)
 
@@ -329,14 +321,7 @@ class PSRL_MegatronASyncvLLMShardingManager(BaseShardingManager):
                 "patch_vllm_moe_model_weight_loader",
                 args=tuple(),
             ))
-            def apply_reduce_tensor_generator(generator):
-                for name, param in generator:
-                    yield name, reduce_tensor(param.detach())
-            per_tensor_param = apply_reduce_tensor_generator(per_tensor_param)
-            loaded_params = loop.run_until_complete(self.inference_engine.collective_rpc(
-                "load_weights",
-                args=(per_tensor_param,),
-            ))
+            loaded_params = loop.run_until_complete(self.update_params(per_tensor_param))
             info = f"vLLM load weights, loaded_params: {len(loaded_params)}"
             psrl_logger.info(info)
 
@@ -368,6 +353,24 @@ class PSRL_MegatronASyncvLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = get_torch_device().get_rng_state()
             get_torch_device().set_rng_state(self.torch_random_states)
+
+    @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=psrl_logger)
+    async def update_params(self, updated_params):
+        # NOTE: It might be inefficient to load weights one by one,
+        # but it is necessary because generator cannot be pickled and passed to collective_rpc.
+        # If we pass a list instead, the memory usage will be higher.
+        loaded_params = []
+        for name, param in updated_params:
+            per_loaded_params = await self.inference_engine.collective_rpc(
+                "load_weights",
+                args=((name, reduce_tensor(param.detach())), False)
+            )
+            loaded_params.extend(per_loaded_params)
+        await self.inference_engine.collective_rpc(
+            "cuda_synchronize",
+            args=tuple()
+        )
+        return loaded_params
 
     @GPUMemoryLogger(role="megatron vllm sharding_manager", logger=psrl_logger)
     def preprocess_data(self, data: DataProto) -> DataProto:

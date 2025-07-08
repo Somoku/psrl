@@ -89,7 +89,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
         self.version_task_lock = asyncio.Lock()
         self.version_to_task_num: dict[int, int] = {}
         self.require_version_update_event = asyncio.Event()
-        self.wait_on_version_events: dict[int, asyncio.Event] = {}
+        self.wait_on_version_events: dict[int, Optional[asyncio.Event]] = {}
         self.wait_on_version_events[0] = None
 
         def patched_reduce(self):
@@ -278,7 +278,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
             # NOTE: transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
-            params_to_load = ((name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in model_state_dict_cpu.items())
+            params_to_load = [(name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in model_state_dict_cpu.items()]
             loaded_params = await self.rollout.inference_engine.collective_rpc(
                 "load_weights",
                 args=(params_to_load,),
@@ -440,6 +440,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
 
             if needed_model_version != curr_rollout_instance_model_version:
                 psrl_logger.info(f"Waiting for model version update, need {needed_model_version}, current {curr_rollout_instance_model_version}")
+                assert needed_model_version > 0, "wait on model version 0 is not allowed, please check the model version logic"
                 await self.wait_on_version_events[needed_model_version].wait()
                 psrl_logger.info(f"Model version {needed_model_version} update done, proceeding with generation")
 
@@ -462,7 +463,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
             async with self.version_task_lock:
                 self.version_to_task_num[needed_model_version] -= 1
                 if self.version_to_task_num[needed_model_version] == 0:
-                    self.wait_on_version_events.pop(needed_model_version)
+                    self.wait_on_version_events.pop(needed_model_version, None)
                     self.version_to_task_num.pop(needed_model_version)
                     if (
                         self.version_to_task_num and

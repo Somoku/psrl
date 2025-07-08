@@ -30,7 +30,7 @@ class RolloutServer:
         rollout_queue,
     ):
         self.config = config
-        self.zero_0_is_model_owner = (
+        self.rank_0_is_model_owner = (
             self.config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size *
                 self.config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size > 1 and
             self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
@@ -60,7 +60,7 @@ class RolloutServer:
         self._running = True
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
-            if self.zero_0_is_model_owner:
+            if self.rank_0_is_model_owner:
                 futures.append(self.rollout_wg_list[i].execute_rank_zero_async("busy_loop_generate_sequences", rollout_queue=self.rollout_queue))
             else:
                 futures.extend(self.rollout_wg_list[i].execute_all_async("busy_loop_generate_sequences", rollout_queue=self.rollout_queue))
@@ -145,7 +145,7 @@ class RolloutServer:
         for worker_id, requests in schedule_plan.items():
             if requests is None:
                 continue
-            if self.zero_0_is_model_owner:
+            if self.rank_0_is_model_owner:
                 self.rollout_wg_list[worker_id].execute_rank_zero_async("add_request", requests)
             else:
                 self.rollout_wg_list[worker_id].execute_all_async("add_request", requests)
@@ -167,7 +167,7 @@ class RolloutServer:
                     psrl_logger.debug(f"begin to interrupt data queue processing")
                     futures = []
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
-                        if self.zero_0_is_model_owner:
+                        if self.rank_0_is_model_owner:
                             self.rollout_wg_list[i].execute_rank_zero_async("interrupt_all_requests")
                         else:
                             self.rollout_wg_list[i].execute_all_async("interrupt_all_requests")
@@ -179,7 +179,7 @@ class RolloutServer:
                 elif cmd_type == CommandType.SHUTDOWN:
                     self._running = False
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
-                        if self.zero_0_is_model_owner:
+                        if self.rank_0_is_model_owner:
                             self.rollout_wg_list[i].execute_rank_zero_async("shutdown_generate")
                         else:
                             self.rollout_wg_list[i].execute_all_async("shutdown_generate")
@@ -187,7 +187,7 @@ class RolloutServer:
                     raise NotImplementedError
                 elif cmd_type == CommandType.RESUME:
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
-                        if self.zero_0_is_model_owner:
+                        if self.rank_0_is_model_owner:
                             self.rollout_wg_list[i].execute_rank_zero_async("resume_generate")
                         else:
                             self.rollout_wg_list[i].execute_all_async("resume_generate")
@@ -204,7 +204,7 @@ class RolloutServer:
                 if data is None:
                     psrl_logger.info(f"RolloutServer: Received `None` data, skipping scheduling.")
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
-                        if self.zero_0_is_model_owner:
+                        if self.rank_0_is_model_owner:
                             self.rollout_wg_list[i].execute_rank_zero_async("add_request", None)
                         else:
                             self.rollout_wg_list[i].execute_all_async("add_request", None)

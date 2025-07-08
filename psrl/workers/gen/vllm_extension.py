@@ -17,7 +17,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 class vLLMWorkerExtension:
-    def load_weights(self, weights):
+    def load_weights(self, weights, blocking: bool = True):
         try:
             def rebuild_weights_generator():
                 current_device = torch.cuda.current_device()
@@ -35,16 +35,25 @@ class vLLMWorkerExtension:
                         tensor = func(*list_args)
                         if isinstance(tensor, DTensor):
                             tensor = tensor.full_tensor()
-                    # tensor = tensor.to(current_device, non_blocking=True)
                     yield (name, tensor)
             
             rebuild_weights = rebuild_weights_generator()
             loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
-            torch.cuda.synchronize()
+            if blocking:
+                # Ensure all operations are completed before returning
+                torch.cuda.synchronize()
         except Exception as e:
             psrl_logger.error(f"Error in vLLMWorkerExtension.load_weights: {e}")
             return None
         return loaded_params
+
+    def cuda_synchronize(self):
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            psrl_logger.error(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}")
+            return None
+        return None
 
     def patch_vllm_moe_model_weight_loader(self) -> None:
         try:

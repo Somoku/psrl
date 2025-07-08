@@ -80,7 +80,7 @@ class PSRL_PSWorker(Worker):
         if self.is_ps_representative_rank:
             # Initialize the staleness inventory
             self.staleness_inventory = StalenessInventory(
-                num_entries=self.psrl_config.staleness_buffer_entries,
+                num_entries=self.psrl_config.staleness_buffer_entries * self.psrl_config.rollout_n,
             )
             
         # Build logger

@@ -383,6 +383,7 @@ gen_actor_rollout_ref:
       gate_proj_layer_name: gate_up
     # number of responses (i.e. num sample times)
     n: 1
+    use_post_sampling_logprobs: True
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB

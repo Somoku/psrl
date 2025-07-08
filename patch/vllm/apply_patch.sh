@@ -2,7 +2,7 @@
 set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PATCH_FILE="$SCRIPT_DIR/v0.9.0.patch"
+PATCH_FILE="$SCRIPT_DIR/v0.9.0.1.patch"
 
 if [ ! -f "$PATCH_FILE" ]; then
     echo "Error: Patch file $PATCH_FILE does not exist."

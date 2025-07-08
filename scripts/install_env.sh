@@ -56,7 +56,7 @@ echo "7. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     mkdir -p vllm_src
     pushd vllm_src
-    git clone --b v0.9.0.1 https://github.com/vllm-project/vllm.git
+    git clone -b v0.9.0.1 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$(pwd)/vllm
     popd
 fi
@@ -69,7 +69,7 @@ popd
 if [ -z "$VERL_PATH" ]; then
     mkdir -p verl_src
     pushd verl_src
-    git clone --b v0.4.1.x https://github.com/volcengine/verl.git
+    git clone -b v0.4.1.x https://github.com/volcengine/verl.git
     VERL_PATH=$(pwd)/verl
     popd
 fi

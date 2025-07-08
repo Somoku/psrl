@@ -8,7 +8,7 @@ PSRL is a post-training framework for LLMs that supports both synchronous and as
 
 **Requirements:**
 
-- OS: Linux
+- GCC >= 9
 - Python 3.9+
 - PyTorch 2.7.1
 - CUDA 12.8

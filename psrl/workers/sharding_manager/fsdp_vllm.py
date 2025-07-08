@@ -458,8 +458,8 @@ class PSRL_FSDPASyncvLLMShardingManager(BaseShardingManager):
         ))
 
         # For AsyncLLM, param update is handled through collective_rpc
-        # NOTE: Only CPU tensor can be passed to collective_rpc
-        params_to_load = ((name, reduce_tensor(param.detach())) for name, param in updated_params.items())
+        # NOTE: Generator can not be pickled and passed to collective_rpc
+        params_to_load = [(name, reduce_tensor(param.detach())) for name, param in updated_params.items()]
 
         loaded_params = loop.run_until_complete(self.inference_engine.collective_rpc(
             "load_weights",

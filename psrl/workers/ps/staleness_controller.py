@@ -287,6 +287,7 @@ class StalenessInventory:
             assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
             data = self.data_pool.pop(entry_info)
 
+        '''
         old_buffer_id, old_entry_id = self.data_tracker[entry_info]
         old_buffer = self.buffers[old_buffer_id]
 
@@ -309,14 +310,18 @@ class StalenessInventory:
             # Update data tracker with the new position
             self.data_tracker[first_reserved_entry_info] = (old_buffer_id, old_entry_id)
         self._update_buffer_status(old_buffer_id)
+        '''
+
+        rollout_instance_id = entry_info.rollout_instance_id
 
         # Step 2: Get all PENDING buffers within the staleness limit
         pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
-        candidate_ids = [
-            bid for bid in pending_buffers if bid <= old_buffer_id
-        ]
+        candidate_ids = list(pending_buffers)
+        # candidate_ids = [
+        #     bid for bid in pending_buffers if bid <= old_buffer_id
+        # ]
 
-        assert candidate_ids, f"No suitable PENDING buffer found, but at least buffer {old_buffer_id} should be available for rollout instance {rollout_instance_id}"
+        # assert candidate_ids, f"No suitable PENDING buffer found, but at least buffer {old_buffer_id} should be available for rollout instance {rollout_instance_id}"
 
         # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)

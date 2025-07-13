@@ -1,7 +1,7 @@
 from .vllm_rollout import PSRL_vLLMRollout
 from .base_gen_worker import GenInterface
 from .rollout_scheduler import BatchRolloutScheduler, RoundRobinRolloutScheduler
-from .rollout_server import RolloutServer
+from .rollout_server import RolloutServer, RolloutCommand, CommandType
 from .vllm_extension import vLLMWorkerExtension
 
 # NOTE: Backend-specific worker will be lazily imported
@@ -12,5 +12,7 @@ __all__ = [
     "BatchRolloutScheduler",
     "RoundRobinRolloutScheduler",
     "RolloutServer",
+    "RolloutCommand",
+    "CommandType",
     "vLLMWorkerExtension",
 ]

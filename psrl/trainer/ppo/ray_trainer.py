@@ -90,6 +90,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # asynchronous data processor and rollout server
         self.data_processor = None
         self.rollout_server = None
+        self.data_process_task = []
 
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
@@ -293,11 +294,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         except Exception as e:
             psrl_logger.info(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def start_data_processor(self):
+    def start_data_preprocess(self):
         assert self.data_processor is not None, "Data processor must be initialized before starting it."
-        self.data_process_task = self.data_processor.initialize_and_start.remote()
+        self.data_process_task.append(self.data_processor.initialize_data_preprocess.remote())
+    
+    def start_reward_computation(self):
+        assert self.data_processor is not None, "Data processor must be initialized before starting reward computation."
+        assert self.rollout_server is not None, "Rollout server must be initialized before starting reward computation."
+        self.data_process_task.append(self.data_processor.initialize_reward_computation.remote())
 
-    def start_rollout_server(self, data_queue, rollout_queue):
+    def start_rollout_server(self, data_queue, rollout_queue, replay_buffer):
         if self.config.psrl.gen_mode == "batch":
             from psrl.workers.gen.rollout_scheduler import BatchRolloutScheduler
             rollout_scheduler_cls = BatchRolloutScheduler
@@ -311,6 +317,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             rollout_scheduler_cls,
             data_queue,
             rollout_queue,
+            replay_buffer,
         )
         ray.get(self.rollout_server.start_server.remote())
 
@@ -735,9 +742,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 return
 
         psrl_logger.info("Starting data processor...")
-        self.start_data_processor()
+        self.start_data_preprocess()
         data_queue = ray.get(self.data_processor.get_data_queue.remote())
         rollout_queue = ray.get(self.data_processor.get_rollout_queue.remote())
+        replay_buffer = ray.get(self.data_processor.get_replay_buffer.remote())
         psrl_logger.info("Data processor started successfully.")
 
         # add tqdm
@@ -749,8 +757,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # rollout instances keep generating sequences in their busy loop
         psrl_logger.info("Starting rollout server...")
-        self.start_rollout_server(data_queue, rollout_queue)
+        self.start_rollout_server(data_queue, rollout_queue, replay_buffer)
+        ray.get(self.data_processor.set_rollout_server_ref.remote(self.rollout_server))
         psrl_logger.info("Rollout server started successfully.")
+        
+        psrl_logger.info("Starting reward computation...")
+        self.start_reward_computation()
+        psrl_logger.info("Reward computation started successfully.")
         
         # busy loop for training
         while True:

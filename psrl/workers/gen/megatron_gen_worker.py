@@ -230,7 +230,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             super().init_model()
     
-    def pull_model(self) -> None:
+    def _pull_model(self) -> None:
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
@@ -257,7 +257,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
-    async def pull_model_async(self) -> None:
+    async def _pull_model_async(self) -> None:
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
@@ -289,7 +289,16 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
                 raise
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-    
+
+    def pull_model(self):
+        with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
+            if self.config.rollout.mode == "sync":
+                self._pull_model()
+            elif self.config.rollout.mode == "psrl_async":
+                asyncio.run(self._pull_model_async())
+            else:
+                raise NotImplementedError(f"PSRL GenWorker does not support rollout mode '{self.config.rollout.mode}' yet.")
+
     def get_prompts_on_device(self, batch: DataProto) -> DataProto:
         """
         Convert a batch dictionary to DataProto.
@@ -408,7 +417,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
             # if a pushing happens between step 1 and step 2
             # but that is ok since a higher model version will not break the staleness
             with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
-                self.pull_model()
+                self._pull_model()
             
         # Step 3: Generate sequences
         # All the ranks should participate
@@ -582,7 +591,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
                     # if a pushing happens between step 1 and step 2
                     # but that is ok since a higher model version will not break the staleness
                     with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
-                        await self.pull_model_async()
+                        await self._pull_model_async()
                     self.require_version_update_event.clear()
                     self.wait_on_version_events[needed_model_version].set()
                 if stop_add_request:

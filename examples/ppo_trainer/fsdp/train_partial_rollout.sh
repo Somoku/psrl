@@ -9,8 +9,10 @@ export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=16
-GEN_TP_SIZES=(2 1 1 2)
-GEN_PP_SIZES=(1 2 2 1)
+REDUNDANT_BATCH_SIZE=32
+
+GEN_TP=2 # TP in the generation side
+GEN_PP=2 # PP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
 NNODES=3
@@ -21,18 +23,8 @@ PS_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 GEN_NNODES=$(( ${NNODES} - ${PS_NNODES} )) # Number of nodes for generation
 GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
-GEN_INSTANCES=${#GEN_TP_SIZES[@]} # Number of generation instances
-
-ROLLOUT_NGPUS_PER_NODE_PER_INSTANCE=()
-for i in "${!GEN_TP_SIZES[@]}"; do
-    gpu_count=$((${GEN_TP_SIZES[$i]} * ${GEN_PP_SIZES[$i]}))
-    ROLLOUT_NGPUS_PER_NODE_PER_INSTANCE+=($gpu_count)
-done
-
-GEN_TP_SIZES_STR="[$(IFS=,; echo "${GEN_TP_SIZES[*]}")]"
-GEN_PP_SIZES_STR="[$(IFS=,; echo "${GEN_PP_SIZES[*]}")]"
-ROLLOUT_NGPUS_STR="[$(IFS=,; echo "${ROLLOUT_NGPUS_PER_NODE_PER_INSTANCE[*]}")]"
-ROLLOUT_NNODES_STR="[$(printf "1,%.0s" $(seq 1 $GEN_INSTANCES) | sed 's/,$//')]"  # One node per instance
+GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
+GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance]
 
 TRAIN_NNODES=${GEN_NNODES} # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
@@ -42,11 +34,6 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
-
-echo "Tensor parallel sizes: ${GEN_TP_SIZES_STR}"
-echo "Pipeline parallel sizes: ${GEN_PP_SIZES_STR}"
-echo "Rollout GPUs per node per instance: ${ROLLOUT_NGPUS_STR}"
-echo "Rollout nodes per instance: ${ROLLOUT_NNODES_STR}"
 
 bash $HOME/kill.sh 3
 
@@ -59,15 +46,16 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
-    psrl.deployment.heterogeneous_rollout.enable=True \
-    psrl.deployment.heterogeneous_rollout.rollout_nnodes_per_instance="${ROLLOUT_NNODES_STR}" \
-    psrl.deployment.heterogeneous_rollout.rollout_ngpus_per_node_per_instance="${ROLLOUT_NGPUS_STR}" \
-    psrl.deployment.heterogeneous_rollout.tensor_model_parallel_size_per_instance="${GEN_TP_SIZES_STR}" \
-    psrl.deployment.heterogeneous_rollout.pipeline_model_parallel_size_per_instance="${GEN_PP_SIZES_STR}" \
+    psrl.deployment.rollout_nnodes_per_instance=1 \
+    psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.ps_nnodes=${PS_NNODES} \
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
+    \
+    psrl.rollout_test.partial_rollout.enable=True \
+    psrl.rollout_test.partial_rollout.threshould=4 \
+    psrl.rollout_test.partial_rollout.interrupt_as_prompt=False \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.max_inflight_requests=512 \
@@ -115,10 +103,10 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_fsdp_ppo_test' \
-    trainer.experiment_name='hetero_stream' \
+    trainer.experiment_name='stream' \
     trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-hetero_stream.log
+    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-stream.log
 
 bash $HOME/occupy.sh 3

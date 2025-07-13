@@ -1,12 +1,16 @@
 #!/bin/bash
+set -x
 
-source ${PSRL_WORKSPACE}/env/psrl.sh
+PSRL_WORKSPACE=/jizhicfs/johnnyslin
+source ${PSRL_WORKSPACE}/env/verl_H20.sh
+
+export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=${PSRL_WORKSPACE}/psrl
 
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-0.5B-Instruct
+HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
+DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-0.5B-Instruct
 python3 ${PSRL_PATH}/scripts/converter_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 GLOBAL_BATCH_SIZE=16
@@ -51,6 +55,8 @@ echo "Tensor parallel sizes: ${GEN_TP_SIZES_STR}"
 echo "Pipeline parallel sizes: ${GEN_PP_SIZES_STR}"
 echo "Rollout GPUs per node per instance: ${ROLLOUT_NGPUS_STR}"
 echo "Rollout nodes per instance: ${ROLLOUT_NNODES_STR}"
+
+bash $HOME/kill.sh 3
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.staleness=2 \
@@ -138,3 +144,5 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     trainer.save_freq=100 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 2>&1 | tee psrl_megatron_grpo_test-hetero_stream.log
+
+bash $HOME/occupy.sh 3

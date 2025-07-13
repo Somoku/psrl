@@ -1,10 +1,13 @@
 #!/bin/bash
 set -x
 
-source ${PSRL_WORKSPACE}/env/psrl.sh
+PSRL_WORKSPACE=/jizhicfs/johnnyslin
+source ${PSRL_WORKSPACE}/env/verl_H20.sh
+
+export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
+MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=16
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
@@ -27,6 +30,8 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
+
+bash $HOME/kill.sh 3
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.staleness=2 \
@@ -98,3 +103,5 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 2>&1 | tee psrl_fsdp_grpo_test-batch.log
+
+bash $HOME/occupy.sh 3

@@ -287,18 +287,28 @@ class PSRL_vLLMRollout(BaseRollout):
         non_tensor_batch = prompts.non_tensor_batch
         
         if "raw_prompt_ids" not in non_tensor_batch:
+            # Remove the left padding in the prompt token_id
             non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
             raise RuntimeError(f"vllm sharding manager is not work properly with {batch_size=} v.s. {len(non_tensor_batch['raw_prompt_ids'])=}.")
 
+        raw_prompt_ids = non_tensor_batch["raw_prompt_ids"]
+        if "raw_response_ids" in non_tensor_batch:
+            raw_response_ids = non_tensor_batch["raw_response_ids"]
+        else:
+            raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
+            for raw_prompt_ids_, raw_response_ids_, multi_modal_data in zip(raw_prompt_ids, raw_response_ids, non_tensor_batch["multi_modal_data"]):
+                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids_ + raw_response_ids_, "multi_modal_data": multi_modal_data})
         else:
-            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
+            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids_ + raw_response_ids_} for raw_prompt_ids_, raw_response_ids_ in zip(raw_prompt_ids, raw_response_ids)]
 
+        '''
+        vllm_inputs include: prompt_token_ids, (multi_modal_data)
+        '''
         # ensure the type of `prompt_token_ids` passed to vllm is list[int]
         # https://github.com/volcengine/verl/pull/772
         for input_data in vllm_inputs:
@@ -329,6 +339,7 @@ class PSRL_vLLMRollout(BaseRollout):
         else:
             kwargs = {
                 "n": 1, # we repeat the request manually to support partial rollout
+                "prompt_logprobs": 0 if self.config.interrupt_as_prompt else None,
             }
             
         return vllm_inputs, kwargs
@@ -353,11 +364,13 @@ class PSRL_vLLMRollout(BaseRollout):
         
         response = []
         response_unpadded_len = []
+        interrupted = []
         rollout_log_probs = []
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response_ids = output.outputs[sample_id].token_ids
                 response.append(response_ids)
+                interrupted.append(output.outputs[sample_id].finish_reason == "abort")
                 response_unpadded_len.append(len(response_ids))
                 if (
                     self.config.enable_inference_engine_log_prob and
@@ -365,15 +378,43 @@ class PSRL_vLLMRollout(BaseRollout):
                     output.outputs[sample_id].logprobs is not None
                 ):
                     log_prob_list = []
-                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                        log_prob_list.append(logprob[response_ids[i]].logprob)
+                    if self.config.interrupt_as_prompt:
+                        curr_response_len = non_tensor_batch.get("response_unpadded_len", 0)
+                        if output.outputs[sample_id].finish_reason != "abort" and curr_response_len > 0:
+                            # partial response log probs from prompt log probs
+                            prompt_token_ids = output.prompt_token_ids
+                            for i, logprob in enumerate(output.prompt_logprobs[-curr_response_len:]):
+                                log_prob_list.append(logprob[prompt_token_ids[i - curr_response_len]].logprob)
+                            # new response log probs from decode log probs
+                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                                log_prob_list.append(logprob[response_ids[i]].logprob)
+                    else:
+                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                            log_prob_list.append(logprob[response_ids[i]].logprob)
                     rollout_log_probs.append(log_prob_list)
+        non_tensor_batch["interrupted"] = np.array(interrupted, dtype=bool)
+        raw_response_ids = non_tensor_batch["raw_response_ids"]
+        response = raw_response_ids + np.fromiter(response, dtype=object)
+        non_tensor_batch["raw_response_ids"] = response
+        if "response_unpadded_len" in non_tensor_batch:
+            curr_response_unpadded_len = non_tensor_batch["response_unpadded_len"]
+        else:
+            curr_response_unpadded_len = [0] * batch_size
+        response_unpadded_len = [
+            curr_response_unpadded_len[i] + response_unpadded_len[i] for i in range(batch_size)
+        ]
+        non_tensor_batch["response_unpadded_len"] = np.array(response_unpadded_len, dtype=int)
 
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-        response_unpadded_len = torch.tensor(response_unpadded_len).to(idx.device)
+        # response_unpadded_len = torch.tensor(response_unpadded_len).to(idx.device)
         if self.config.enable_inference_engine_log_prob:
-            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-            rollout_log_probs = rollout_log_probs.to(torch.float32)
+            if "rollout_log_probs" in non_tensor_batch:
+                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+            else:
+                curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+            non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs + rollout_log_probs
+            # rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            # rollout_log_probs = rollout_log_probs.to(torch.float32)
 
         seq = torch.cat([idx, response], dim=-1)
 
@@ -393,34 +434,29 @@ class PSRL_vLLMRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        if output.outputs[0].finish_reason == "abort":
-            batch = TensorDict(
-                {
-                    "input_ids": seq,  # here input_ids become the whole sentences
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                },
-                batch_size=batch_size,
-            )
-            if "multi_modal_data" in prompts[0].keys():
-                non_tensor_batch["multi_modal_data"] = np.array([prompts[i]["multi_modal_data"]for i in range(batch_size)], dtype=object)
-            prompts.meta_info["interrupted"] = True
-        else:
-            batch = TensorDict(
-                {
-                    "prompts": idx,
-                    "responses": response,
-                    "response_unpadded_lens": response_unpadded_len,
-                    "input_ids": seq,  # here input_ids become the whole sentences
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                },
-                batch_size=batch_size,
-            )
-            if self.config.enable_inference_engine_log_prob:
-                batch['rollout_log_probs'] = rollout_log_probs
-
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                # "response_unpadded_lens": response_unpadded_len,
+                "input_ids": seq,  # here input_ids become the whole sentences (including left padding & right padding)
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+        # if "multi_modal_data" in prompts[0].keys() and np.all(non_tensor_batch["interrupted"]):
+        #     non_tensor_batch["multi_modal_data"] = np.array([prompts[i]["multi_modal_data"]for i in range(batch_size)], dtype=object)
+        
+        # if self.config.enable_inference_engine_log_prob:
+        #     # TODO: rollout_log_probs 是带 padding 的，需要除掉再 concat
+        #     if prompts.batch.get("rollout_log_probs", None) is not None:
+        #         # if the rollout_log_probs is already in the batch, we just update it
+        #         batch['rollout_log_probs'] = torch.cat([prompts.batch['rollout_log_probs'], rollout_log_probs], dim=-1)
+        #     else:
+        #         # otherwise, we add it to the batch
+        #         batch['rollout_log_probs'] = rollout_log_probs
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
     
     def get_curr_request_id(self) -> int:
         """Get the current request ID."""
@@ -504,19 +540,35 @@ class PSRL_vLLMRollout(BaseRollout):
         """Generate sequences from the prompts using vLLM asynchronously."""
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         sample_ids = prompts.non_tensor_batch.get("uid", None)
+        curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", None)
         assert sample_ids is not None, \
             "sample_ids must be provided in the prompts.non_tensor_batch"
         
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            tasks = [
-                self.generate_sequence_task(
-                    prompt_idx,
-                    vllm_input,
-                    self.sampling_params,
-                    str(sample_id),
-                ) for prompt_idx, (vllm_input, sample_id) in enumerate(zip(vllm_inputs, sample_ids))
-            ]
+            tasks = []
+            for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(zip(vllm_inputs, sample_ids, curr_response_unpadded_len)):
+                partial_kwargs = dict(
+                    max_tokens=self.config.response_length - curr_response_len,
+                )
+                with self.update_sampling_params(**partial_kwargs):
+                    tasks.append(
+                        self.generate_sequence_task(
+                            prompt_idx,
+                            vllm_input,
+                            self.sampling_params,
+                            str(sample_id),
+                        )
+                    )
+            
+            # tasks = [
+            #     self.generate_sequence_task(
+            #         prompt_idx,
+            #         vllm_input,
+            #         self.sampling_params,
+            #         str(sample_id),
+            #     ) for prompt_idx, (vllm_input, sample_id) in enumerate(zip(vllm_inputs, sample_ids))
+            # ]
         
             completed_rollout = []
             for completed_task in asyncio.as_completed(tasks):
@@ -541,3 +593,9 @@ class PSRL_vLLMRollout(BaseRollout):
             psrl_logger.info("No requests to interrupt.")
             
         return interrupted_request_num
+
+    async def interrupt_requests_async(self, request_ids):
+        scheduler = self.inference_engine.llm_engine.scheduler
+        if len(request_ids) > 0:
+            request_ids = list(str(request_id) for request_id in request_ids)
+            await self.inference_engine.abort_requests(request_ids)

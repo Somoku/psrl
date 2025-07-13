@@ -51,20 +51,29 @@ class RoundRobinRolloutScheduler(RolloutSchedulerBase):
 
     def schedule(self, data):
         """
-        Schedule single data item to worker using round-robin.
-        Assumes data length is always 1.
+        Schedule data to worker using round-robin.
         """
 
-        if len(data) != 1:
-            raise ValueError(f"RoundRobinRolloutScheduler expects data length of 1, got {len(data)}")
-        
-        # Create schedule plan with current worker getting the data
+        request_num = len(data)
+        request_list = data.chunk(request_num)
         schedule_plan = {}
-        for i in range(self.rollout_worker_num):
-            if i == self.current_worker_index:
-                schedule_plan[i] = data
         
-        # Move to next worker for next schedule call
-        self.current_worker_index = (self.current_worker_index + 1) % self.rollout_worker_num
+        schedule_num = 0
+        for i, request in enumerate(request_list):
+            if "rollout_instance_id" in request.non_tensor_batch.keys():
+                worker_idx = int(request.non_tensor_batch["rollout_instance_id"])
+                schedule_plan[worker_idx].append(request)
+                continue
+
+            worker_idx = (self.current_worker_index + i) % self.rollout_worker_num
+            if worker_idx not in schedule_plan:
+                schedule_plan[worker_idx] = []
+            schedule_plan[worker_idx].append(request)
+            schedule_num += 1
+
+        for worker_idx in schedule_plan.keys():
+            schedule_plan[worker_idx] = DataProto.concat(schedule_plan[worker_idx])
+        
+        self.current_worker_index = (self.current_worker_index + schedule_num) % self.rollout_worker_num
         
         return schedule_plan

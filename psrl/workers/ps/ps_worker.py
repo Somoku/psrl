@@ -23,6 +23,7 @@ from verl.workers.rollout.vllm_rollout import vllm_mode
 
 from psrl.utils.ray import add_lock
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
+from psrl.workers.gen import RolloutCommand, CommandType
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, StalenessBuffer, EntryCategory, EntryInfo, Entry
 
 
@@ -59,7 +60,12 @@ class PSRL_PSWorker(Worker):
     def __init__(self, psrl_config: DictConfig) -> None:
         super().__init__()
         self.psrl_config = psrl_config
-        self.rollout_n = psrl_config.rollout_n
+        if self.config.psrl.rollout_test.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.rollout_test.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.rollout_test.redundant_rollout.alg_rollout_n
+        else:
+            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
+            self.alg_rollout_n = self.rollout_n
         
         # PS worker specific attributes
         self.rollout_instance_tracker: Dict[Union[str, int], RolloutInstanceStatus] = {}  # Maps rollout instance IDs to their corresponding info
@@ -80,7 +86,7 @@ class PSRL_PSWorker(Worker):
         if self.is_ps_representative_rank:
             # Initialize the staleness inventory
             self.staleness_inventory = StalenessInventory(
-                num_entries=self.psrl_config.staleness_buffer_entries * self.psrl_config.rollout_n,
+                num_entries=self.psrl_config.staleness_buffer_entries * self.rollout_n,
             )
             
         # Build logger
@@ -205,6 +211,21 @@ class PSRL_PSWorker(Worker):
         
         return buffer_ids, entry_ids
 
+    def process_ready_buffer(self, min_ready_buffer_id):
+        # 通知 rollout server 进行丢弃检查和中断检查
+        # 丢弃：需要发送满的 buffer id，则 version_tag 为 buffer_id - S 的正在 generate 的请求全部舍弃
+        # 中断：需要 track 每个 instance 内包含的请求数（running queue 的请求数？）；以及每个 instance 的 version_tag（对应内部 version_tag 最小的请求）
+        # 获取当前 model_store 的版本，衡量是否可以中断
+        curr_ps_model_version = self.get_ps_model_version()
+        self.rollout_server_ref.add_command(RolloutCommand(
+            command_type=CommandType.CHECK,
+            buffer_id=min_ready_buffer_id,
+            curr_ps_model_version=curr_ps_model_version,
+        ))
+        self.log_ready_buffer(min_ready_buffer_id)
+        # If there are ready buffers, wake up the waiters for the minimum ready buffer
+        self._awake_training_batch_waiters(min_ready_buffer_id)
+
     def occupy_rollout_instance_request(
         self,
         rollout_instance_id: Union[str, int],
@@ -229,9 +250,10 @@ class PSRL_PSWorker(Worker):
         min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
         psrl_logger.debug(f"Occupy data with info {entry_info}, min ready buffer is {min_ready_buffer_id}")
         if min_ready_buffer_id is not None:
-            self.log_ready_buffer(min_ready_buffer_id)
-            # If there are ready buffers, wake up the waiters for the minimum ready buffer
-            self._awake_training_batch_waiters(min_ready_buffer_id)
+            self.process_ready_buffer(min_ready_buffer_id)
+            # self.log_ready_buffer(min_ready_buffer_id)
+            # # If there are ready buffers, wake up the waiters for the minimum ready buffer
+            # self._awake_training_batch_waiters(min_ready_buffer_id)
 
     def store_and_maybe_occupy_rollout_instance_request(
         self,
@@ -262,8 +284,11 @@ class PSRL_PSWorker(Worker):
                 data=data,
             )
             self.rollout_request_tracker[parent_id].append(entry_info)
-            psrl_logger.info(f"[TRACE] Store data for parent {parent_id} with info {entry_info}, total requests: {len(self.rollout_request_tracker[parent_id])}")
-            if len(self.rollout_request_tracker[parent_id]) == self.rollout_n:
+            psrl_logger.debug(f"[TRACE] Store data for parent {parent_id} with info {entry_info}, total requests: {len(self.rollout_request_tracker[parent_id])}")
+            # （暂时不考虑）如果达到 alg_rollout_n，则丢弃剩余子请求（如果要在 reward 部分丢弃）
+            # 1. 通知 rollout server 丢弃 parent_id 对应的剩余子请求
+            # 2. TODO: 在 data processor 中丢弃 parent_id 对应的剩余子请求的 reward 计算
+            if len(self.rollout_request_tracker[parent_id]) == self.alg_rollout_n:
                 entry_infos = self.rollout_request_tracker.pop(parent_id)
                 for entry_info in entry_infos:
                     self.staleness_inventory.occupy_data(entry_info=entry_info)
@@ -271,9 +296,20 @@ class PSRL_PSWorker(Worker):
                 min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
                 psrl_logger.debug(f"Occupy data with info {entry_info}, min ready buffer is {min_ready_buffer_id}")
                 if min_ready_buffer_id is not None:
-                    self.log_ready_buffer(min_ready_buffer_id)
-                    # If there are ready buffers, wake up the waiters for the minimum ready buffer
-                    self._awake_training_batch_waiters(min_ready_buffer_id)
+                    self.process_ready_buffer(min_ready_buffer_id)
+                    # # 通知 rollout server 进行丢弃检查和中断检查
+                    # # 丢弃：需要发送满的 buffer id，则 version_tag 为 buffer_id - S 的正在 generate 的请求全部舍弃
+                    # # 中断：需要 track 每个 instance 内包含的请求数（running queue 的请求数？）；以及每个 instance 的 version_tag（对应内部 version_tag 最小的请求）
+                    # # 获取当前 model_store 的版本，衡量是否可以中断
+                    # curr_ps_model_version = self.get_ps_model_version()
+                    # self.rollout_server_ref.add_command(RolloutCommand(
+                    #     command_type=CommandType.CHECK,
+                    #     buffer_id=min_ready_buffer_id,
+                    #     curr_ps_model_version=curr_ps_model_version,
+                    # ))
+                    # self.log_ready_buffer(min_ready_buffer_id)
+                    # # If there are ready buffers, wake up the waiters for the minimum ready buffer
+                    # self._awake_training_batch_waiters(min_ready_buffer_id)
         else:
             self.staleness_inventory.occupy_data(
                 entry_info=entry_info,
@@ -283,9 +319,10 @@ class PSRL_PSWorker(Worker):
             min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
             psrl_logger.debug(f"Occupy data with info {entry_info}, min ready buffer is {min_ready_buffer_id}")
             if min_ready_buffer_id is not None:
-                self.log_ready_buffer(min_ready_buffer_id)
-                # If there are ready buffers, wake up the waiters for the minimum ready buffer
-                self._awake_training_batch_waiters(min_ready_buffer_id)
+                self.process_ready_buffer(min_ready_buffer_id)
+                # self.log_ready_buffer(min_ready_buffer_id)
+                # # If there are ready buffers, wake up the waiters for the minimum ready buffer
+                # self._awake_training_batch_waiters(min_ready_buffer_id)
 
     async def wait_for_training_batch(
         self,

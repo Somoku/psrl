@@ -26,47 +26,71 @@ class CommandType(Enum):
     RESUME = enum.auto()
     CHECK = enum.auto()
 
-@dataclass
 class RolloutCommand:
-    command_type: CommandType
-    args: dict
-    meta_data: dict
-    
+    __slots__ = ("command_type", "_args", "meta_data")
+
     def __init__(self, command_type, **kwargs):
-        self.command_type = command_type
+        object.__setattr__(self, "command_type", command_type)
+        object.__setattr__(self, "_args", {})
+        object.__setattr__(self, "meta_data", {})
+        
         for key, value in kwargs.items():
             if key == "meta_data":
                 if not isinstance(value, dict):
                     raise ValueError(f"meta_data must be a dict, got {type(value)}")
                 self.meta_data = value
             else:
-                self.args[key] = value
+                self._args[key] = value
 
     def __getattr__(self, item):
-        if item in self.args:
-            return self.args[item]
-        elif item in self.meta_data:
-            return self.meta_data[item]
-        else:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
+        if item in {"command_type", "_args", "meta_data"}:
+            return object.__getattribute__(self, item)
+        
+        args = object.__getattribute__(self, "_args")
+        if item in args:
+            return args[item]
+        
+        meta = object.__getattribute__(self, "meta_data")
+        if item in meta:
+            return meta[item]
+        
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
     
     def __setattr__(self, key, value):
-        if key in self.args:
-            self.args[key] = value
+        if key in {"command_type", "_args", "meta_data"}:
+            object.__setattr__(self, key, value)
+            return
+        
+        args = object.__getattribute__(self, "_args")
+        if key in args:
+            args[key] = value
         else:
-            self.meta_data[key] = value    
-
-@dataclass
-class RequestTracker:
-    _instance_to_running_requests: dict[int, list[tuple[int, int]]] = defaultdict(list)  # Mapping from instance_id to request_ids
-    _instance_to_updated_version: dict[int, int] = {}
+            meta = object.__getattribute__(self, "meta_data")
+            meta[key] = value
     
-    _running_request_id_to_metainfo: dict[int, tuple[int, int]] = {}  # Mapping from request_id to (instance_id, version_tag)
-    _version_to_running_request_ids: dict[int, set[int]] = defaultdict(set)  # Mapping from version_tag to request_ids
-    _finished_request_id_to_metainfo: dict[int, tuple[int, int]] = {}  # Mapping from finished request_id to (instance_id, version_tag)
-    _version_to_finished_request_ids: dict[int, set[int]] = defaultdict(set)  # Mapping from version_tag to finished request_ids
-    _interrupted_request_id_to_metainfo: dict[int, tuple[int, int]] = {}  # Mapping from interrupted request_id to (instance_id, version_tag)
-    _version_to_interrupted_request_ids: dict[int, set[int]] = defaultdict(set)  # Mapping from version_tag to finished request_ids
+    def __getstate__(self):
+        return {
+            "command_type": self.command_type,
+            "_args": self._args,
+            "meta_data": self.meta_data
+        }
+    
+    def __setstate__(self, state):
+        object.__setattr__(self, "command_type", state["command_type"])
+        object.__setattr__(self, "_args", state["_args"])
+        object.__setattr__(self, "meta_data", state["meta_data"])
+
+class RequestTracker:
+    def __init__(self):
+        self._instance_to_running_requests: dict[int, list[tuple[int, int]]] = defaultdict(list)  # Mapping from instance_id to request_ids
+        self._instance_to_updated_version: dict[int, int] = {}
+        
+        self._running_request_id_to_metainfo: dict[int, tuple[int, int]] = {}  # Mapping from request_id to (instance_id, version_tag)
+        self._version_to_running_request_ids: dict[int, set[int]] = defaultdict(set)  # Mapping from version_tag to request_ids
+        self._finished_request_id_to_metainfo: dict[int, tuple[int, int]] = {}  # Mapping from finished request_id to (instance_id, version_tag)
+        self._version_to_finished_request_ids: dict[int, set[int]] = defaultdict(set)  # Mapping from version_tag to finished request_ids
+        self._interrupted_request_id_to_metainfo: dict[int, tuple[int, int]] = {}  # Mapping from interrupted request_id to (instance_id, version_tag)
+        self._version_to_interrupted_request_ids: dict[int, set[int]] = defaultdict(set)  # Mapping from version_tag to finished request_ids
     
     def cache_instance_version(self, instance_id, version_tag):
         self._instance_to_updated_version[instance_id] = version_tag
@@ -344,9 +368,11 @@ class RolloutServer:
     def exec_command(self, command, timeout=None):
         command_id = self._command_counter
         self._command_counter += 1
+        psrl_logger.info("Executing command: %s with ID: %d", command.command_type, command_id)
 
         command.meta_data["id"] = command_id
         self._command_results[command_id] = {"completed": False, "result": None}
+        psrl_logger.info("Command %s with ID %d added to command queue.", command.command_type, command_id)
         self.command_queue.put(command)
 
         start_time = time.time()
@@ -356,7 +382,7 @@ class RolloutServer:
                 return None
             time.sleep(0.01)
 
-        psrl_logger.debug(f"Command {command_id} completed with result: {self._command_results[command_id]['result']}")
+        psrl_logger.info(f"Command {command_id} completed with result: {self._command_results[command_id]['result']}")
         result = self._command_results.pop(command_id, None)
         self._command_results.pop(command_id, None)
         
@@ -382,6 +408,7 @@ class RolloutServer:
                 self._request_tracker.add_request(request_id, worker_id, version_tag)
                 # heapq.heappush(self._instance_to_requests[worker_id], (version_tag, request_id))
                 # self._request_id_to_metainfo[request_id] = (worker_id, version_tag)
+            psrl_logger.info(f"{len(requests)} requets are scheduled to instance {worker_id}")
 
             if self.rank_0_is_model_owner:
                 self.rollout_wg_list[worker_id].execute_rank_zero_async("add_request", requests)
@@ -394,10 +421,12 @@ class RolloutServer:
             buffer_size = self.config.psrl.rollout_test.redundant_rollout.redundant_global_batch_size * self.rollout_n
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
-        if self._request_counter <= self.staleness * buffer_size:
-            version_tag = 0
-        else:
-            version_tag = (self._request_counter - self.staleness * buffer_size) // buffer_size
+        # if self._request_counter <= self.staleness * buffer_size:
+        #     version_tag = 0
+        # else:
+        #     version_tag = (self._request_counter - self.staleness * buffer_size) // buffer_size
+        version_tag = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
+        self._request_counter += 1
         return version_tag
 
     def check_interrupt(self, instance_id, curr_ps_model_version, staleness):
@@ -434,13 +463,17 @@ class RolloutServer:
         while self._running:
             # Command processing
             if not self.command_queue.empty():
+                psrl_logger.info("command queue is not empty, try to get commands")
                 command = self.command_queue.get()
+                psrl_logger.info(f"background: got command: {command.command_type}")
 
                 assert isinstance(command, RolloutCommand), f"Expected RolloutCommand, got {type(command)}"
 
                 command_type = command.command_type
                 command_id = command.meta_data.get("id", None)
-                command_args = command.args
+                command_args = command._args
+
+                psrl_logger.info(f"Command: type = {command_type}, meta_data = {command.meta_data}, args = {command_args}")
                 
                 result = None
 
@@ -507,6 +540,11 @@ class RolloutServer:
 
                     if parent_ids is None and uids is None:
                         raise ValueError("Abort command must contain either 'parent_ids' or 'uids' in args.")
+                    if not isinstance(parent_ids, (list, type(None))):
+                        parent_ids = [parent_ids]
+                    if not isinstance(uids, (list, type(None))):
+                        uids = [uids]
+
                     abort_map_from_instance_to_requests: dict[int, list[int]] = defaultdict(list)
                     # Get child requests from parent_ids
                     if parent_ids is not None:
@@ -547,7 +585,7 @@ class RolloutServer:
                             futures.append(self.rollout_wg_list[i].execute_all_async("interrupt_requests", abort_requests))
                     interrupted_request_nums = ray.get(futures)
                     self.interrupted_request_num = np.sum(interrupted_request_nums)
-                    psrl_logger.debug(f"RolloutServer: Received ABORT command, interrupted {self.interrupted_request_num} requests")
+                    psrl_logger.info(f"RolloutServer: Received ABORT command, interrupted {self.interrupted_request_num} requests")
                 elif command_type == CommandType.RESUME:
                     instance_ids = command_args.get("instance_ids", None)
                     if instance_ids is None:
@@ -569,7 +607,7 @@ class RolloutServer:
                     # 丢弃：需要发送满的 buffer id，则 version_tag 为 buffer_id - S 的正在 generate 的请求全部舍弃
                     # 中断：需要 track 每个 instance 内包含的请求数（running queue 的请求数？）；以及每个 instance 的 version_tag（对应内部 version_tag 最小的请求）
                     # 获取当前 model_store 的版本，衡量是否可以中断
-                    abort_request_version = buffer_id - self.staleness
+                    abort_request_version = max(buffer_id - self.staleness, 0)
                     # abort_requests = self._version_to_request_ids.get(abort_request_version, set())
                     abort_requests = self._request_tracker.get_running_requests_of_version(abort_request_version)
                     if abort_requests:
@@ -614,6 +652,7 @@ class RolloutServer:
             # Data processing
             # 先处理 replay buffer 中的请求
             if not self.replay_buffer.empty() and not self._paused:
+                psrl_logger.info(f"Scheduling requests in replay buffer...")
                 replay_data = self.replay_buffer.get_nowait()
                 
                 assert replay_data is not None, "Replay buffer data should not be None."
@@ -633,7 +672,7 @@ class RolloutServer:
                             self.rollout_wg_list[i].execute_rank_zero_async("add_request", None)
                         else:
                             self.rollout_wg_list[i].execute_all_async("add_request", None)
-                    self._running = False
+                    # self._running = False
                     continue
 
                 # data_queue 中的请求已经被复制 n 份，如果是子请求，会包含 parent_id 字段。每个请求都有唯一的 uid 字段
@@ -646,7 +685,9 @@ class RolloutServer:
                 for request in request_list:
                     version_tag = self.set_version_tag(request)
                     # self._version_to_request_ids[version_tag].add(request["uid"])
-                    request.non_tensor_batch["version_tag"] = np.array(version_tag)
+                    request.non_tensor_batch["version_tag"] = np.array([version_tag])
                 data = DataProto.concat(request_list)
 
                 self.schedule_requests(data)
+
+        psrl_logger.info("background event handler done")

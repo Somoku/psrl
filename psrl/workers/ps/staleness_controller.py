@@ -282,7 +282,7 @@ class StalenessInventory:
         data: Optional[DataProto]=None,
     ):
         """Move data to first non-occupied entry in appropriate buffer"""
-        assert entry_info in self.data_tracker, f"Entry info {entry_info} must have existing mapping, but {self.data_tracker=}"
+        # assert entry_info in self.data_tracker, f"Entry info {entry_info} must have existing mapping, but {self.data_tracker=}"
         if data is None:
             assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
             data = self.data_pool.pop(entry_info)

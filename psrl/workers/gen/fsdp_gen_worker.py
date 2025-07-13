@@ -434,10 +434,13 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
 
         def create_task_done_callback(require_version: int):
             def task_done_callback(task):
+                if task.cancelled():
+                    
                 self.version_to_active_tasks[require_version].discard(task)
             return task_done_callback
         
         async def process_request(request, needed_model_version):
+            psrl_logger.info("start to process request...")
             curr_rollout_instance_model_version = await ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id)
 
             if needed_model_version != curr_rollout_instance_model_version:
@@ -458,13 +461,18 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
             request.meta_info.update(meta_info)
             request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id] * len(request.batch))
             
+            psrl_logger.info("before core generation...")
             with log_dual_events(f"Core generation with model version {actual_model_version}", psrl_logger, event_type=EventType.GEN):
                 result = await self.rollout.generate_sequences_async(request)
 
             # 完成 generate 后，记录已完成请求的 version_tag -> request_id 映射关系
             # 有可能是中断/舍弃的请求
+            psrl_logger.info("after core generation...")
             rollout_queue.put(result)
+            psrl_logger.info("after put into rollout_queue...")
             async with self.version_task_lock:
+                psrl_logger.info(f"{needed_model_version=}, {self.version_to_task_num=}")
+                psrl_logger.info(f"{self.wait_on_version_events=}")
                 self.version_to_task_num[needed_model_version] -= 1
                 if self.version_to_task_num[needed_model_version] == 0:
                     self.wait_on_version_events.pop(needed_model_version, None)
@@ -477,6 +485,8 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                         psrl_logger.info(f"All tasks for model version {needed_model_version} done, "
                                             f"waiting for new model version >= {min(self.version_to_task_num.keys())}")
                         self.require_version_update_event.set()
+                psrl_logger.info("after lock")
+            psrl_logger.info("request process done")
         
         async with self.rollout_sharding_manager:
             while self._rollout_running:
@@ -485,11 +495,14 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                     await self._async_resume_event.wait()
                     psrl_logger.info(f"Generation resumed")
                 
+                # TODO: optimize it to avoid redundant calls
+                curr_rollout_instance_model_version = await ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id)
                 while not stop_add_request:
                     if len(self.active_tasks) < max_inflight_requests:
                         request_data = None
                         try:
                             with self._request_queue_lock:
+                                psrl_logger.info(f"[TRACE] Rank {self.rank}: Try to get request from request_queue")
                                 request_data = self.request_queue.get(block=False)
                             if request_data is None:
                                 psrl_logger.info(f"[TRACE] Rank {self.rank}: Received end signal")
@@ -504,6 +517,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                     
                         # 不再需要 reserve 操作，request 已经携带 version_tag
                         needed_model_version = int(request_data.non_tensor_batch["version_tag"])
+                        psrl_logger.info(f"[TRACE] needed_model_version = {needed_model_version}")
 
                         '''
                         with log_dual_events("Reserve requests", psrl_logger, event_type=EventType.OTHER):
@@ -556,21 +570,28 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                         
                         # 根据 version_tag 来决定是否需要等待模型更新
                         # Check model version and add waiting tasks which are woken up by event
+                        psrl_logger.info("before fetch version task lock")
                         async with self.version_task_lock:
+                            psrl_logger.info("got version task lock")
                             self.version_to_task_num[needed_model_version] = self.version_to_task_num.get(needed_model_version, 0) + 1
+                            psrl_logger.info(f"before check: {needed_model_version=}, {curr_rollout_instance_model_version=}")
                             if needed_model_version != curr_rollout_instance_model_version:
+                                psrl_logger.info("needed_model_version != curr_rollout_instance_model_version")
                                 if needed_model_version not in self.wait_on_version_events:
                                     psrl_logger.info(f"Creating wait_on_version_event for model version {needed_model_version}")
                                     self.wait_on_version_events[needed_model_version] = asyncio.Event()
                                     if min(self.version_to_task_num.keys()) == needed_model_version and not self.require_version_update_event.is_set():
                                         psrl_logger.info(f"Setting require_version_update_event for model version {needed_model_version}")
                                         self.require_version_update_event.set()
+                            psrl_logger.info("after check")
 
+                        psrl_logger.info("create tasks...")
                         task = self._generate_loop.create_task(process_request(request_data, needed_model_version))
                         task.add_done_callback(create_task_done_callback(needed_model_version))
                         if needed_model_version not in self.version_to_active_tasks:
                             self.version_to_active_tasks[needed_model_version] = set()
                         self.version_to_active_tasks[needed_model_version].add(task)
+                        psrl_logger.info("before asyncio sleep")
                         await asyncio.sleep(0)
                     else:
                         break
@@ -707,17 +728,41 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
     def waiting_and_running_queue_size(self):
         return len(self.inference_engine.llm_engine.scheduler.waiting) + len(self.inference_engine.llm_engine.scheduler.running)
     
+    async def _async_interrupt_requests(self, version_to_request_ids):
+        async with self.version_task_lock:
+            for version, request_ids in version_to_request_ids.items():
+                if version in self.version_to_task_num:
+                    self.version_to_task_num[version] -= len(request_ids)
+                    
+                    if self.version_to_task_num[version] <= 0:
+                        if version in self.wait_on_version_events:
+                            self.wait_on_version_events.pop(version)
+                        if version == min(self.version_to_task_num.keys()):
+                            self.require_version_update_event.set()
+                        self.version_to_task_num.pop(version, None)
+            
+            request_ids = [rid for ids in version_to_request_ids.values() for rid in ids]
+            return await self.rollout.interrupt_requests_async(request_ids)
+    
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def interrupt_requests(self, request_ids):
+    def interrupt_requests(self, version_to_request_ids):
+        # TODO: remove from tracker
         if self._generate_thread and self._generate_thread.is_alive() and self._generate_loop:
             future = asyncio.run_coroutine_threadsafe(
-                self.rollout.interrupt_requests_async(request_ids),
+                self._async_interrupt_requests(version_to_request_ids),
                 self._generate_loop,
             )
-            interrupted_request_num = future.result()
-            return interrupted_request_num
+            return future.result()
         else:
-            return asyncio.run(self.rollout.interrupt_requests_async(request_ids))
+            return asyncio.run(self._async_interrupt_requests(version_to_request_ids))
+    
+    async def _async_interrupt_all_requests(self):
+        async with self.version_task_lock:
+            # reset all status
+            self.version_to_task_num.clear()
+            self.require_version_update_event.clear()
+            self.wait_on_version_events.clear()
+        return await self.rollout.interrupt_all_requests_async()
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def interrupt_all_requests(self, rollout_queue):
@@ -749,7 +794,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
 
         if self._generate_thread and self._generate_thread.is_alive() and self._generate_loop:
             future = asyncio.run_coroutine_threadsafe(
-                self.rollout.interrupt_all_requests_async(), 
+                self._async_interrupt_all_requests(), 
                 self._generate_loop
             )
             interrupted_request_num = future.result()
@@ -760,7 +805,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
             self.active_tasks.clear()
             return interrupted_request_num
         else:
-            return asyncio.run(self.rollout.interrupt_all_requests_async())
+            return asyncio.run(self._async_interrupt_all_requests())
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def resume_generate(self):
@@ -779,6 +824,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                 with self._request_queue_lock:
                     if self.psrl_config.gen_mode == "batch":
                         self.request_num_queue.put(len(requests))
+                    psrl_logger.info("[TRACE] put into request_queue...")
                     for request in requests:
                         self.request_queue.put(request)
         elif requests is None:

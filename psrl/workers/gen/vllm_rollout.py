@@ -412,7 +412,8 @@ class PSRL_vLLMRollout(BaseRollout):
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-            non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs + rollout_log_probs
+            non_tensor_batch["rollout_log_probs"] = np.array([curr_rollout_log_probs[i] + rollout_log_probs[i] for i in range(batch_size)], dtype=object)
+            
             # rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
             # rollout_log_probs = rollout_log_probs.to(torch.float32)
 
@@ -540,7 +541,7 @@ class PSRL_vLLMRollout(BaseRollout):
         """Generate sequences from the prompts using vLLM asynchronously."""
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         sample_ids = prompts.non_tensor_batch.get("uid", None)
-        curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", None)
+        curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", [0] * len(vllm_inputs))
         assert sample_ids is not None, \
             "sample_ids must be provided in the prompts.non_tensor_batch"
         

@@ -127,6 +127,7 @@ class DataProcessor:
         self.data_queue = RayQueue(maxsize=self.data_queue_size)
         self.rollout_queue = RayQueue(maxsize=self.data_queue_size)
         self.replay_buffer = RayQueue(maxsize=self.data_queue_size)
+        psrl_logger.info(f"init rollout queue with size = {self.data_queue_size}")
         self.rollout_request_buffer = {}
         self.rollout_parent_counter = {}
 
@@ -294,6 +295,8 @@ class DataProcessor:
                 sample_ids = [self._train_sample_idx + i for i in range(batch_size)]
                 self._train_sample_idx += batch_size
                 # sample_ids = [f"b{self._train_batch_idx}_s{i}" for i in range(batch_size)]
+
+                batch_dict['raw_response_ids'] = np.fromiter(([] for _ in range(batch_size)), dtype=object)
                 if self.rollout_n > 1:
                     batch_dict['parent_id'] = np.array(sample_ids)
                 else:
@@ -305,7 +308,7 @@ class DataProcessor:
                 batch_dict = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
                 
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "raw_response_ids"]
                 meta_info_keys_to_pop = []
                 if "multi_modal_inputs" in batch_dict.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
@@ -322,7 +325,7 @@ class DataProcessor:
                 '''
                 gen_batch contains:
                 - batch: input_ids, attention_mask, position_ids
-                - non_tensor_batch: raw_prompt_ids, raw_prompt, multi_modal_data, multi_modal_inputs, tools_kwargs, uid, (parent_id)
+                - non_tensor_batch: raw_prompt_ids, raw_response_ids, raw_prompt, multi_modal_data, multi_modal_inputs, tools_kwargs, uid, (parent_id)
                 - meta_info: (do_sample)
                 '''
                 gen_batch = batch_dict.pop(
@@ -380,6 +383,7 @@ class DataProcessor:
         
         while not self._reward_shutdown:
             try:
+                # psrl_logger.info("Try to get data from rollout_queue")
                 rollout_data = self.rollout_queue.get(block=False)
                 if rollout_data is None:
                     psrl_logger.info("Received shutdown signal in batching thread.")
@@ -389,16 +393,20 @@ class DataProcessor:
                 
                 # 区分已完成和未完成(interrupted)，并区分interrupt和abort
                 # Interrupt 部分要放入 replay buffer
+                psrl_logger.info("before classify interrupted data")
                 interrupted = rollout_data.non_tensor_batch["interrupted"]
                 interrupted_idxs = np.where(interrupted)[0]
                 finished_idxs = np.where(~interrupted)[0]
                 
                 finished_request_ids = rollout_data.non_tensor_batch["uid"][finished_idxs]
+                psrl_logger.info("before finish requests")
                 ray.get(self.rollout_server_ref.finish_requests.remote(request_ids))
                 
+                psrl_logger.info("before classify finished data")
                 finished_rollout_data = rollout_data.select_idxs(finished_idxs)
                 interrupted_rollout_data = rollout_data.select_idxs(interrupted_idxs)
                 if len(interrupted_rollout_data) > 0:
+                    psrl_logger.info("partial rollout handler...")
                     is_aborted = ray.get(self.rollout_server_ref.is_aborted.remote(interrupted_rollout_data.non_tensor_batch["uid"]))
                     replay_idxs = np.where(~is_aborted)[0]
                     interrupt_request_ids = interrupted_rollout_data.non_tensor_batch["uid"][replay_idxs]
@@ -411,12 +419,13 @@ class DataProcessor:
                         for i in range(len(replay_rollout_data)):
                             self.replay_buffer.put(replay_rollout_data[i:i+1])
                 
+                psrl_logger.info("finished_rollout_data handling")
                 finished_rollout_data.non_tensor_batch.pop("raw_prompt_ids")
                 finished_rollout_data.non_tensor_batch.pop("raw_response_ids")
                 if self.config.psrl.log_prob.enable_inference_engine_log_prob:
                     device = finished_rollout_data.batch["input_ids"].device
                     rollout_log_probs = finished_rollout_data.non_tensor_batch.pop("rollout_log_probs", None)
-                    rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(device)
+                    rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.gen_actor_rollout_ref.rollout.response_length).to(device)
                     rollout_log_probs = rollout_log_probs.to(torch.float32)
                     finished_rollout_data.batch["rollout_log_probs"] = rollout_log_probs
                 
@@ -426,6 +435,7 @@ class DataProcessor:
                     sample_ids = finished_rollout_data.non_tensor_batch["uid"]
                 request_ids = finished_rollout_data.non_tensor_batch["uid"]
                 rollout_instance_ids = finished_rollout_data.non_tensor_batch["rollout_instance_id"]
+                psrl_logger.info("before loop")
                 for i, (sample_id, request_id, rollout_instance_id) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids)):
                     assert sample_id in self.rollout_request_buffer, \
                         f"Sample ID {sample_id} not found in rollout request buffer," \
@@ -445,13 +455,16 @@ class DataProcessor:
                         self.config.psrl.rollout_test.redundant_rollout.abort_stage == "rollout" and
                         self.rollout_parent_counter[sample_id] == self.alg_rollout_n
                     ):
+                        psrl_logger.info("before send abort command")
                         # Required children of this sample_id have been processed, remove it from the buffer
-                        ray.get(self.rollout_server_ref.exec_command(RolloutCommand(
+                        ray.get(self.rollout_server_ref.exec_command.remote(RolloutCommand(
                             CommandType.ABORT,
                             parent_ids=sample_id,
-                        )).remote())
+                        )))
+                        psrl_logger.info("after send abort command")
                         del self.rollout_request_buffer[sample_id]
                         del self.rollout_parent_counter[sample_id]
+                        psrl_logger.info("after delete")
                     
                     # TODO: change to select instead of pop
                     batch_keys_to_pop = ["prompts", "attention_mask", "responses"]
@@ -465,6 +478,7 @@ class DataProcessor:
                         non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                     )
                     
+                    psrl_logger.info("before launch reward computation")
                     # TODO: 改写 reward 计算逻辑
                     if self.use_rm:
                         pass

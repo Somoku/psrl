@@ -12,7 +12,7 @@ GLOBAL_BATCH_SIZE=16
 REDUNDANT_BATCH_SIZE=32
 
 GEN_TP=2 # TP in the generation side
-GEN_PP=2 # PP in the generation side
+GEN_PP=1 # PP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
 NNODES=3
@@ -103,10 +103,10 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_fsdp_ppo_test' \
-    trainer.experiment_name='stream' \
+    trainer.experiment_name='redundant' \
     trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-stream.log
+    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-redundant.log
 
 bash $HOME/occupy.sh 3

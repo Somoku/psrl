@@ -759,6 +759,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info("Starting rollout server...")
         self.start_rollout_server(data_queue, rollout_queue, replay_buffer)
         ray.get(self.data_processor.set_rollout_server_ref.remote(self.rollout_server))
+        ray.get(self.ps_handle.set_rollout_server_ref.remote(self.rollout_server))
         psrl_logger.info("Rollout server started successfully.")
         
         psrl_logger.info("Starting reward computation...")

@@ -60,11 +60,11 @@ class PSRL_PSWorker(Worker):
     def __init__(self, psrl_config: DictConfig) -> None:
         super().__init__()
         self.psrl_config = psrl_config
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.rollout_test.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.rollout_test.redundant_rollout.alg_rollout_n
+        if self.psrl_config.rollout_test.redundant_rollout.enable:
+            self.rollout_n = self.psrl_config.rollout_test.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.psrl_config.rollout_test.redundant_rollout.alg_rollout_n
         else:
-            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
+            self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n
         
         # PS worker specific attributes
@@ -88,7 +88,9 @@ class PSRL_PSWorker(Worker):
             self.staleness_inventory = StalenessInventory(
                 num_entries=self.psrl_config.staleness_buffer_entries * self.rollout_n,
             )
-            
+
+        self.rollout_server_ref = None
+
         # Build logger
         self.log_prefix = f"PSWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
@@ -126,6 +128,9 @@ class PSRL_PSWorker(Worker):
         assert self.is_ps_representative_rank, "Only the representative PS worker can get the PS handle."
         return ray.get_runtime_context().current_actor
     
+    def set_rollout_server_ref(self, rollout_server_ref):
+        self.rollout_server_ref = rollout_server_ref
+
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
         """Register a new rollout instance."""
         assert self.is_ps_representative_rank, "Only the representative PS worker can register a rollout instance."
@@ -217,7 +222,7 @@ class PSRL_PSWorker(Worker):
         # 中断：需要 track 每个 instance 内包含的请求数（running queue 的请求数？）；以及每个 instance 的 version_tag（对应内部 version_tag 最小的请求）
         # 获取当前 model_store 的版本，衡量是否可以中断
         curr_ps_model_version = self.get_ps_model_version()
-        self.rollout_server_ref.add_command(RolloutCommand(
+        self.rollout_server_ref.add_command.remote(RolloutCommand(
             command_type=CommandType.CHECK,
             buffer_id=min_ready_buffer_id,
             curr_ps_model_version=curr_ps_model_version,

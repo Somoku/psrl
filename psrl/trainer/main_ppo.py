@@ -1,18 +1,18 @@
 import os
-import importlib.util
+import socket
+import random
+import socket
 import random
 import sys
-import hydra
-import ray
 import logging
 import torch
 import numpy as np
-from pprint import pprint
+
+import ray
+import hydra
 from omegaconf import OmegaConf
 
 from verl.trainer.ppo.reward import load_reward_manager
-from verl.utils import hf_processor, hf_tokenizer
-from verl.utils.fs import copy_to_local
 
 from psrl.workers.ps import PSRL_PSWorker
 from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
@@ -21,6 +21,12 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 def seed_everything(seed: int):
+    """
+    Set random seed for reproducibility.
+    
+    Args:
+        seed (int): The seed value to set.
+    """
     random.seed(seed)
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
@@ -29,15 +35,18 @@ def seed_everything(seed: int):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     run_ppo(config)
 
-
+# Define a function to run the PPO-like training process
 def run_ppo(config) -> None:
+    # Check if Ray is not initialized
     if not ray.is_initialized():
-        # this is for local ray cluster
+        # Initialize Ray with a local cluster configuration
+        # Set environment variables in the runtime environment to control tokenizer parallelism,
+        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
+        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         ray.init(
             runtime_env={
                 "env_vars": {
@@ -52,7 +61,16 @@ def run_ppo(config) -> None:
             num_cpus=config.ray_init.num_cpus,
         )
 
-    runner = TaskRunner.remote()
+    # Create a remote instance of the TaskRunner class, and
+    # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
+    # [Optional] If the configuration specifies profiling steps, use the `controller_nsight_options`
+    # to set up the runtime environment for nsys profiling. `profile_steps` is a list of steps to profile,
+    # which can be specified in the configuration.
+    if OmegaConf.select(config.trainer, "profile_steps") is not None and len(OmegaConf.select(config.trainer, "profile_steps")) > 0:
+        nsight_options = OmegaConf.to_container(config.trainer.controller_nsight_options)
+        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
+    else:
+        runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
@@ -64,13 +82,26 @@ def run_ppo(config) -> None:
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
     def run(self, config):
+       # Print the initial configuration. `resolve=True` will evaluate symbolic values.
+        from pprint import pprint
+
+        from omegaconf import OmegaConf
+
+        from verl.utils.fs import copy_to_local
+        
+        print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
+
         # print initial config
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+        
         OmegaConf.resolve(config)
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
         local_path = copy_to_local(config.train_actor_rollout_ref.model.path, use_shm=config.train_actor_rollout_ref.model.get("use_shm", False))
+
+        # Instantiate the tokenizer and processor.
+        from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
@@ -85,9 +116,10 @@ class TaskRunner:
                 if not is_version_ge(pkg="vllm", minver="0.7.3"):
                     raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
 
-        # define worker classes
+        # Define worker classes based on the actor strategy.
         if config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
-            assert config.critic.strategy in ["fsdp", "fsdp2"], "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
+            assert config.critic.strategy in ["fsdp", "fsdp2"], \
+                "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.fsdp_train_worker import PSRL_FSDPTrainWorker as PSRL_TrainWorker
@@ -95,7 +127,8 @@ class TaskRunner:
 
             ray_worker_group_cls = RayWorkerGroup
         elif config.train_actor_rollout_ref.actor.strategy == "megatron":
-            assert config.train_actor_rollout_ref.actor.strategy == config.critic.strategy
+            assert config.train_actor_rollout_ref.actor.strategy == config.critic.strategy, \
+                "Critic strategy must be the same as actor strategy: 'megatron'."
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.megatron_train_worker import PSRL_MegatronTrainWorker as PSRL_TrainWorker
@@ -106,17 +139,31 @@ class TaskRunner:
             raise NotImplementedError(f"Unsupported strategy: {config.train_actor_rollout_ref.actor.strategy}. "
                                         "Currently only 'fsdp', 'fsdp2', and 'megatron' are supported.")
         
+        # Map roles to their corresponding remote worker classes.
+        role_worker_mapping = {
+            PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
+            PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
+            PSRL_Role.Critic: ray.remote(CriticWorker),
+            PSRL_Role.ParameterServer: ray.remote(PSRL_PSWorker)
+        }
+        
+        # Define the resource pool specification.
+        # Format: {pool_id: [ngpus_per_node] * nnodes}
+        # `nnodes` will be the number of ray placement groups
+        # and `ngpus_per_node` will be the number of ray bundles (currently all equals to {"CPU": self.max_colocate_count, "GPU": 1}) in each placement group
         deployment_config = config.psrl.deployment
         rollout_pool_id_list = [f'rollout_pool_{i}' for i in range(deployment_config.n_rollout_instances)]
         train_pool_id = 'train_pool'
         ps_pool_id = 'ps_pool'
-        # format: {pool_id: [ngpus_per_node] * nnodes}
-        # nnodes will be the number of ray placement groups
-        # and ngpus_per_node will be the number of ray bundles (currently all equals to {"CPU": self.max_colocate_count, "GPU": 1}) in each placement group
+        
+        # Map roles to the resource pool.
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
             ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,
         }
+
+        # Set the resource pool spec for each rollout instance.
+        # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
         if deployment_config.heterogeneous_rollout.enable:
             heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
             assert len(heterogeneous_deployment_config.rollout_nnodes_per_instance) == heterogeneous_deployment_config.n_rollout_instances, \
@@ -135,12 +182,7 @@ class TaskRunner:
             for i in range(deployment_config.n_rollout_instances):
                 rollout_pool_id = rollout_pool_id_list[i]
                 resource_pool_spec[rollout_pool_id] = [deployment_config.rollout_ngpus_per_node_per_instance] * deployment_config.rollout_nnodes_per_instance
-        role_worker_mapping = {
-            PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
-            PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
-            PSRL_Role.Critic: ray.remote(CriticWorker),
-            PSRL_Role.ParameterServer: ray.remote(PSRL_PSWorker)
-        }
+
         # multiple instances mapping
         mapping = {
             PSRL_Role.Rollout: rollout_pool_id_list,
@@ -165,19 +207,21 @@ class TaskRunner:
             role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
             mapping[PSRL_Role.RewardModel] = [train_pool_id]
 
-        # use reference model
+        # Add a reference policy worker if KL loss or KL reward is used.
         if config.algorithm.use_kl_in_reward or config.train_actor_rollout_ref.actor.use_kl_loss:
             role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
             mapping[PSRL_Role.RefPolicy] = [train_pool_id]
-
-        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
-        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
         
         print(f"resource_pool_spec = {resource_pool_spec}, mapping = {mapping}")
+
+        # Load the reward manager for training and validation.
+        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
+        val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
         resource_pool_manager = PSRL_ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
         
         from verl.utils.dataset.rl_dataset import collate_fn
 
+        # Initialize the PPO trainer.
         trainer = PSRL_RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -190,7 +234,9 @@ class TaskRunner:
             collate_fn=collate_fn,
             device_name=config.trainer.device,
         )
+        # Initialize the workers of the trainer.
         trainer.init_workers()
+        # Start the training process.
         trainer.fit()
 
 

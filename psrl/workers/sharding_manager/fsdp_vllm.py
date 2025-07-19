@@ -18,10 +18,11 @@ except ImportError:
 
 from dataclasses import asdict
 
-from verl import DataProto
-from verl.protocol import all_gather_data_proto
 from vllm import LLM
 from vllm.v1.engine.async_llm import AsyncLLM
+
+from verl import DataProto
+from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import parallel_state as vllm_ps
 from verl.utils.debug import GPUMemoryLogger, log_gpu_memory_usage
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
@@ -84,9 +85,9 @@ class PSRL_FSDPvLLMShardingManager(BaseShardingManager):
     def __enter__(self):
         is_sleeping = self.inference_engine.llm_engine.is_sleeping()
         if not is_sleeping:
-            psrl_logger.info("vLLM is not sleeping, skip sharding manager.")
+            psrl_logger.info("Rollout instance is not sleeping, skip sharding manager.")
             return
-        psrl_logger.info("vLLM is sleeping, start sharding manager.")
+        psrl_logger.info("Rollout instance is sleeping, start sharding manager.")
 
         def __collect_lora_params() -> OrderedDict:
             """
@@ -296,9 +297,9 @@ class PSRL_FSDPASyncvLLMShardingManager(BaseShardingManager):
     async def __aenter__(self):
         is_sleeping = await self.inference_engine.is_sleeping()
         if not is_sleeping:
-            psrl_logger.info("vLLM is not sleeping, skip sharding manager.")
+            psrl_logger.info("Rollout instance is not sleeping, skip sharding manager.")
             return
-        psrl_logger.info("vLLM is sleeping, start sharding manager.")
+        psrl_logger.info("Rollout instance is sleeping, start sharding manager.")
 
         def __collect_lora_params() -> OrderedDict:
             """

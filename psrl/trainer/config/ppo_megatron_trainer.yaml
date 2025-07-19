@@ -129,7 +129,8 @@ train_actor_rollout_ref:
       seed: 42
       override_transformer_config: {} # additional transformer config like: num_layers_in_first(/last)_pipeline_stage
       use_mbridge: False
-    profile: # profile the actor model in `update_policy` 
+    # NOTE: `profile` option will be replaced with `profiler`, which will use nvtx profiler
+    profile: # profile the actor model in `update_policy` with torch profiler
       use_profile: False # open it when you want to profile the actor model
       profile_ranks: null # list, you can specify the ranks to profile
       step_start: -1 # start step in update_policy
@@ -334,6 +335,7 @@ gen_actor_rollout_ref:
       seed: 42
       override_transformer_config: {} # additional transformer config like: num_layers_in_first(/last)_pipeline_stage
       use_mbridge: False
+    # TODO: remove these irrelevant options?
     profile: # profile the actor model in `update_policy` 
       use_profile: False # open it when you want to profile the actor model
       profile_ranks: null # list, you can specify the ranks to profile

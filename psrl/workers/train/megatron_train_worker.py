@@ -3,10 +3,11 @@ import os
 import logging
 
 from omegaconf import DictConfig
+
 from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.debug import log_gpu_memory_usage, GPUMemoryLogger
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
@@ -94,6 +95,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
     
     # The log_prob in training side is only used when there is a proxy policy    
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
+    @GPUMemoryLogger(role="compute_log_prob", logger=psrl_logger)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:

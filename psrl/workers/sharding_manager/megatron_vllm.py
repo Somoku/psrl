@@ -126,9 +126,9 @@ class PSRL_MegatronvLLMShardingManager(BaseShardingManager):
     def __enter__(self):
         is_sleeping = self.inference_engine.llm_engine.is_sleeping()
         if not is_sleeping:
-            psrl_logger.info("vLLM is not sleeping, skip sharding manager.")
+            psrl_logger.info("Rollout instance is not sleeping, skip sharding manager.")
             return
-        psrl_logger.info("vLLM is sleeping, start sharding manager.")
+        psrl_logger.info("Rollout instance is sleeping, start sharding manager.")
 
         self.timing = {}
         with simple_timer("reshard", self.timing):
@@ -289,9 +289,9 @@ class PSRL_MegatronASyncvLLMShardingManager(BaseShardingManager):
     async def __aenter__(self):
         is_sleeping = await self.inference_engine.is_sleeping()
         if not is_sleeping:
-            psrl_logger.info("vLLM is not sleeping, skip sharding manager.")
+            psrl_logger.info("Rollout instance is not sleeping, skip sharding manager.")
             return
-        psrl_logger.info("vLLM is sleeping, start sharding manager.")
+        psrl_logger.info("Rollout instance is sleeping, start sharding manager.")
 
         self.timing = {}
         with simple_timer("reshard", self.timing):

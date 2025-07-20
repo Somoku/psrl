@@ -3,7 +3,7 @@ import logging
 import enum
 from enum import Enum, auto
 from typing import Union, List, Optional, Any
-from multiprocessing import Event, Manager
+from threading import Event, Lock
 
 from ray.util.queue import Queue as RayQueue
 
@@ -138,11 +138,11 @@ class CommandEvent:
 class CommandExtension:
     def __init__(self):
         """
-        Initialize the CommandExtension with a multiprocessing manager to handle command results and events.
+        Initialize the CommandExtension with threading locks to handle command results and events.
         """
-        self._manager = Manager()
-        self._command_results = self._manager.dict()
-        self._command_events = self._manager.dict()
+        self._lock = Lock()
+        self._command_results = {}
+        self._command_events = {}
         self._command_counter = 0
         self.command_queue = RayQueue()  # For async commands like abort
 
@@ -160,13 +160,16 @@ class CommandExtension:
             Union[CommandEvent, dict[int, DataProto], None]: If `blocking` is True, returns a CommandEvent or the command result.
             If `blocking` is False, returns a CommandEvent that can be used to check the command status later.
         """
-        command_id = self._command_counter
-        self._command_counter += 1
+        with self._lock:
+            command_id = self._command_counter
+            self._command_counter += 1
+        
         psrl_logger.info("Executing command: %s with ID: %d", command.type, command_id)
 
         command_event = CommandEvent(command_id)
-        self._command_events[command_id] = command_event
-        self._command_results[command_id] = None
+        with self._lock:
+            self._command_events[command_id] = command_event
+            self._command_results[command_id] = None
         
         command._kwargs["id"] = command_id
         psrl_logger.info("Command %s with ID %d added to command queue.", command.type, command_id)
@@ -180,19 +183,22 @@ class CommandExtension:
         if timeout is not None:
             success = command_event.wait(timeout=timeout)
             if not success:
-                if command_id in self._command_results:
-                    del self._command_results[command_id]
-                if command_id in self._command_events:
-                    del self._command_events[command_id]
+                with self._lock:
+                    if command_id in self._command_results:
+                        del self._command_results[command_id]
+                    if command_id in self._command_events:
+                        del self._command_events[command_id]
                 return None
         else:
             command_event.wait()
 
-        psrl_logger.info(f"Command {command_id} completed with result: {self._command_results[command_id]}")
-        result = self._command_results.pop(command_id, None)
-        
-        del self._command_results[command_id]
-        del self._command_events[command_id]
+        with self._lock:
+            result = self._command_results.get(command_id, None)
+            psrl_logger.info(f"Command {command_id} completed with result: {result}")
+            if command_id in self._command_results:
+                del self._command_results[command_id]
+            if command_id in self._command_events:
+                del self._command_events[command_id]
         
         return result
 
@@ -220,20 +226,23 @@ class CommandExtension:
         else:
             command_event.wait()
         
-        result = self._command_results.get(command_id, None)
-        
-        del self._command_results[command_id]
-        del self._command_events[command_id]
+        with self._lock:
+            result = self._command_results.get(command_id, None)
+            if command_id in self._command_results:
+                del self._command_results[command_id]
+            if command_id in self._command_events:
+                del self._command_events[command_id]
 
         return result
     
     def _complete_command(self, command_id: int, result: Any):
         """Set the command result, mark it as completed and notify the event waiter."""
-        if command_id in self._command_results:
-            self._command_results[command_id] = result
-            psrl_logger.debug(f"Command ID {command_id} completed with result: {result}")
-            # Set event to notify that the command has completed
-            if command_id in self._command_events:
-                self._command_events[command_id].set()
-        else:
-            raise ValueError(f"Command ID {command_id} not found in results.")
+        with self._lock:
+            if command_id in self._command_results:
+                self._command_results[command_id] = result
+                psrl_logger.debug(f"Command ID {command_id} completed with result: {result}")
+                # Set event to notify that the command has completed
+                if command_id in self._command_events:
+                    self._command_events[command_id].set()
+            else:
+                raise ValueError(f"Command ID {command_id} not found in results.")

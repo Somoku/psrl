@@ -281,13 +281,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def init_request_status_manager(self):
         """Initialize the request status manager for handling request statuses."""
         if self.request_status_manager is not None:
+            psrl_logger.debug("Request status manager already initialized, skipping initialization")
             return
         
-        self.request_status_manager = RequestStatusManager.remote(self.config)   
+        self.request_status_manager = RequestStatusManager.remote(self.config)
     
     def init_data_processor(self):
         """Initialize the data processor for handling data preprocessing and batching."""
         if self.data_processor is not None:
+            psrl_logger.debug("Data processor already initialized, skipping initialization")
             return
         
         # Initialize the data processor
@@ -302,18 +304,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
         
         # Get total training steps from the data processor where dataloaders are built
+        psrl_logger.debug("Retrieving total training steps from data processor")
         self.total_training_steps = ray.get(self.data_processor.get_total_training_steps.remote())
 
         psrl_logger.info(f"Total training steps: {self.total_training_steps}")
 
         # Set the total training steps in the config
         try:
+            psrl_logger.debug("Setting total training steps in config")
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "train_actor_rollout_ref.actor.optim"):
                     self.config.train_actor_rollout_ref.actor.optim.total_training_steps = self.total_training_steps
+                    psrl_logger.debug("Set total_training_steps for actor optimizer")
                 if OmegaConf.select(self.config, "critic.optim"):
                     self.config.critic.optim.total_training_steps = self.total_training_steps
+                    psrl_logger.debug("Set total_training_steps for critic optimizer")
         except Exception as e:
             psrl_logger.info(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
@@ -329,7 +335,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert self.rollout_server is not None, "Rollout server must be initialized before starting reward computation."
         
         self.reward_server = RewardServer.remote(
-            self,
             self.config,
             self.tokenizer,
             self.ps_handle,
@@ -343,7 +348,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         """Start the reward server to handle reward computation requests in the background."""
         assert self.reward_server is not None, "Reward server must be initialized before starting it."
         
+        psrl_logger.debug("Starting reward server background thread")
         ray.get(self.reward_server.start_server.remote())
+        psrl_logger.debug("Reward server background thread started successfully")
 
     def init_rollout_server(self, data_queue, rollout_queue, replay_buffer):
         """Initialize the rollout server for managing rollouts and data generation."""
@@ -354,11 +361,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             from psrl.workers.gen.rollout_router import BatchRolloutRouter
             
             rollout_router_cls = BatchRolloutRouter
+            psrl_logger.debug("Using BatchRolloutRouter for batch generation mode")
         else:
             from psrl.workers.gen.rollout_router import RoundRobinRolloutRouter
             
             rollout_router_cls = RoundRobinRolloutRouter
+            psrl_logger.debug("Using RoundRobinRolloutRouter for streaming generation mode")
 
+        psrl_logger.debug("Initializing rollout server with %d rollout worker groups", 
+                         len(self.rollout_wg_list) if hasattr(self, 'rollout_wg_list') else 0)
         self.rollout_server = RolloutServer.remote(
             self.config,
             self.rollout_wg_list,
@@ -366,8 +377,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             data_queue,
             rollout_queue,
             replay_buffer,
-            self.request_status_manager,
             self.ps_handle,
+            self.request_status_manager,
         )
 
     def start_rollout_server(self):
@@ -381,6 +392,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         Note that we use the training side to do val for overlapping with generation.
         """
+        psrl_logger.debug("Starting validation process")
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -389,11 +401,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         sample_outputs = []
         sample_scores = []
 
+        psrl_logger.debug("Fetching validation data batches")
+        batch_count = 0
         while True:
             try:
                 test_data = ray.get(self.data_processor.get_single_controller_batch.remote(DatasetType.val))
+                batch_count += 1
+                psrl_logger.debug("Received validation batch %d with size %d", batch_count, len(test_data))
             except RayTaskError as e:
                 if isinstance(e.cause, StopIteration):
+                    psrl_logger.debug("Reached end of validation dataset after %d batches", batch_count)
                     break
                 else:
                     psrl_logger.info(f"Unknown exception happened during obtaining validation data: {type(e.cause)}")
@@ -821,12 +838,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
 
+        psrl_logger.debug("Starting PPO training process")
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
+        psrl_logger.debug("Initialized tracking logger with project: %s, experiment: %s", 
+                         self.config.trainer.project_name, self.config.trainer.experiment_name)
 
         self.global_steps = 0
 
@@ -836,23 +856,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            psrl_logger.debug("Performing initial validation")
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             psrl_logger.info(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                psrl_logger.info("Validation-only mode enabled, exiting after validation")
                 return
+            psrl_logger.debug("Initial validation completed")
 
         # Prepare communication handles (queues, buffers, etc.) between workers and initialize servers
+        psrl_logger.debug("Setting up communication handles between workers")
         data_queue = ray.get(self.data_processor.get_data_queue.remote())
         rollout_queue = ray.get(self.data_processor.get_rollout_queue.remote())
         replay_buffer = ray.get(self.data_processor.get_replay_buffer.remote())
+        psrl_logger.debug("Communication handles set up successfully")
         
         self.init_rollout_server(data_queue, rollout_queue, replay_buffer)
+        psrl_logger.debug("Setting rollout server in parameter server and request status manager")
         ray.get(self.ps_handle.set_rollout_server.remote(self.rollout_server))
         ray.get(self.request_status_manager.set_rollout_server.remote(self.rollout_server))
         
         self.init_reward_server(rollout_queue)
+        psrl_logger.debug("Setting reward server in request status manager")
         ray.get(self.request_status_manager.set_reward_server.remote(self.reward_server))
         
         # Start data pipeline (data processor, rollout server, reward server)
@@ -878,11 +905,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.global_steps += 1
         last_val_metrics = None
         
+        psrl_logger.debug("Entering main training loop, starting from step %d", self.global_steps)
         # busy loop for training
         while True:
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps >= self.total_training_steps
+            psrl_logger.debug("Starting training step %d (is_last_step: %s)", self.global_steps, is_last_step)
 
             with marked_timer("step", timing_raw): 
                 
@@ -890,9 +919,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 with marked_timer("wait_for_gen", timing_raw, color="gray"):   
                     buffer_id = self.global_steps - 1
                     # will block until the training batch is ready
+                    psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
                     with log_dual_events(f"Wait for training batch {buffer_id}", psrl_logger, event_type=EventType.WAIT):
                         batch = ray.get(self.ps_handle.wait_for_training_batch.remote(buffer_id)) 
-                    psrl_logger.debug(f"Global step {self.global_steps} training batch: {batch}")
+                    psrl_logger.debug("Received training batch for step %d, batch size: %d", 
+                                     self.global_steps, len(batch) if batch is not None else 0)
                 
                 # Check profile status and start profiling if needed
                 do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False

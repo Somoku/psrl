@@ -56,6 +56,7 @@ def run_ppo(config) -> None:
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
+                    "PSRL_LOGGING_LEVEL": "DEBUG",
                 }
             },
             num_cpus=config.ray_init.num_cpus,
@@ -82,7 +83,7 @@ def run_ppo(config) -> None:
 @ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
 class TaskRunner:
     def run(self, config):
-       # Print the initial configuration. `resolve=True` will evaluate symbolic values.
+        # Print the initial configuration. `resolve=True` will evaluate symbolic values.
         from pprint import pprint
 
         from omegaconf import OmegaConf

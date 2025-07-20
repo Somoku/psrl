@@ -245,9 +245,11 @@ class StalenessInventory:
             AssertionError: If the buffer already exists.
         """
         assert buffer_id not in self.buffers, f"Buffer {buffer_id} already exists"
+        psrl_logger.debug(f"Creating new StalenessBuffer with ID {buffer_id} and {self.num_entries} entries")
 
         buffer = StalenessBuffer(self.num_entries)
         self.buffers[buffer_id] = buffer
+        psrl_logger.debug(f"Created buffer {buffer_id}, current buffer count: {len(self.buffers)}")
         self._update_buffer_status(buffer_id)
 
     def delete_buffer(self, buffer_id: int):

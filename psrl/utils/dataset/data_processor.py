@@ -13,7 +13,7 @@ from ray.util.queue import Queue as RayQueue
 
 from verl import DataProto
 
-from psrl.utils.dataset import create_rl_dataset, create_rl_sampler
+from psrl.utils.dataset.utils import create_rl_dataset, create_rl_sampler
 from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
@@ -91,16 +91,19 @@ class DataProcessor:
         # If process_mode is "batch", it will hold a single batch for batch processing.
         self.data_queue_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n if self.process_mode == "stream" else 1
         self.data_queue = RayQueue(maxsize=self.data_queue_size)
+        psrl_logger.debug("Created data_queue with maxsize=%d", self.data_queue_size)
         
         # Rollout queue is the communication handle between the rollout workers and the data processor (reward module).
         # It holds the rollout data that is ready for reward computation.
         # The size of the queue is the same as the data queue size.
         self.rollout_queue = RayQueue(maxsize=self.data_queue_size)
+        psrl_logger.debug("Created rollout_queue with maxsize=%d", self.data_queue_size)
         
         # Replay buffer is used to store the interrupted requests that need to be replayed.
         # It is a queue that holds the requests that are not yet finished.
         # The size of the replay buffer is not limited, it will grow as needed.
         self.replay_buffer = RayQueue()
+        psrl_logger.debug("Created replay_buffer with unlimited size")
         
         # Threads for data processing
         self.data_preprocess_thread = None
@@ -264,23 +267,30 @@ class DataProcessor:
         return len(self.val_dataloader)
 
     def get_single_controller_batch(self, dataset_type: DatasetType):
-        """Get a single batch of data for the main controller.
-        
-        This method retrieves a single batch of data from the training or validation dataset,
-        depending on the dataset_type provided.
+        """
+        Get a single batch from the dataset for single controller training.
         
         Args:
-            dataset_type (DatasetType): The type of dataset to retrieve the batch from.
+            dataset_type (DatasetType): The type of dataset to get the batch from (train, val, test).
+        
         Returns:
-            DataProto: A single batch of data from the specified dataset.
+            DataProto: A single batch from the dataset.
+        
+        Raises:
+            StopIteration: If there are no more batches in the dataset.
         """
-        get_next_data_func = self.get_train_next if dataset_type == DatasetType.train else self.get_val_next
-        try:
-            return get_next_data_func()
-        except StopIteration:
-            print("get_single_controller_batch() runs into StopIteration")
-            raise
-
+        psrl_logger.debug("Getting single controller batch for dataset_type: %s", dataset_type)
+        
+        if dataset_type == DatasetType.train:
+            batch = self.get_train_next()
+        elif dataset_type == DatasetType.val:
+            batch = self.get_val_next()
+        else:
+            raise ValueError(f"Unsupported dataset type: {dataset_type}")
+            
+        psrl_logger.debug("Got batch with size: %d", len(batch))
+        return batch
+    
     def get_data_queue(self) -> RayQueue:
         """Get the data queue."""
         return self.data_queue
@@ -299,13 +309,16 @@ class DataProcessor:
     
     def initialize_data_preprocess(self):
         """Initialize the thread for data preprocessing."""
-        preprocess_thread = threading.Thread(
+        if self.data_preprocess_thread is not None:
+            psrl_logger.debug("Data preprocessing thread already exists, skipping initialization")
+            return
+            
+        self.data_preprocess_thread = threading.Thread(
             target=self.preprocess_data,
             name="data_preprocess_thread",
             daemon=True,
         )
-        preprocess_thread.start()
-        self.data_preprocess_thread = preprocess_thread
+        self.data_preprocess_thread.start()
     
     def preprocess_data(self):
         """
@@ -322,23 +335,29 @@ class DataProcessor:
         
         The data queue will hold the processed batches, which can be consumed by the rollout server.
         """
+        psrl_logger.debug("Starting preprocess_data method in DataProcessor")
         self.train_dataloader_iter = iter(self.train_dataloader)
         total_epochs = self.config.trainer.total_epochs
+        psrl_logger.debug(f"Total epochs to process: {total_epochs}")
         
         # loop until all epochs are processed
         while True:
             try:
+                psrl_logger.debug(f"Fetching next batch from train_dataloader_iter, current batch_idx: {self._train_batch_idx}")
                 batch_dict = next(self.train_dataloader_iter)
                 self._train_batch_idx += 1
                 batch_size = len(batch_dict[list(batch_dict.keys())[0]])
                 sample_ids = [self._train_sample_idx + i for i in range(batch_size)]
                 self._train_sample_idx += batch_size
+                psrl_logger.debug(f"Got batch with {batch_size} samples, sample_ids: {sample_ids[:5]}{'...' if len(sample_ids) > 5 else ''}")
 
                 # For Group Sampling, we use `parent_id` to indicate the shared prompt.
                 if self.rollout_n > 1:
                     batch_dict['parent_id'] = np.array(sample_ids)
+                    psrl_logger.debug(f"Using Group Sampling with rollout_n={self.rollout_n}, added parent_id")
                 else:
                     batch_dict['uid'] = np.array(sample_ids)
+                    psrl_logger.debug("Added uid for standard sampling")
                 # Record partial response ids for resume
                 batch_dict['raw_response_ids'] = np.fromiter(([] for _ in range(batch_size)), dtype=object)
                 
@@ -365,21 +384,26 @@ class DataProcessor:
                 if "do_sample" in batch_dict.meta_info:
                     meta_info_keys_to_pop.append("do_sample")
 
+                psrl_logger.debug(f"Keys to pop for gen_batch - batch: {batch_keys_to_pop}, non_tensor: {non_tensor_batch_keys_to_pop}, meta_info: {meta_info_keys_to_pop}")
                 gen_batch = batch_dict.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                     meta_info_keys=meta_info_keys_to_pop,
                 )
+                psrl_logger.debug(f"Created gen_batch with size {len(gen_batch)}")
                 
                 # Store the other batch data in the request buffer of the request status manager.
                 # They will be merged with the reward data.
+                psrl_logger.debug(f"Adding {batch_size} requests to buffer in request_status_manager")
                 ray.get(self.request_status_manager.add_request_data_to_buffer.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
+                psrl_logger.debug("Successfully added requests to buffer")
                 
                 # We manually repeat prompts in the generation batch for Group Sampling.
                 # Requests in the batch are unique during generation and synchronized through parent tracker.
                 if self.rollout_n > 1:
+                    psrl_logger.debug(f"Repeating gen_batch for Group Sampling with rollout_n={self.rollout_n}")
                     gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
                     uid_list = []
                     for i in range(batch_size):
@@ -387,29 +411,37 @@ class DataProcessor:
                             child_id = sample_ids[i] * self.rollout_n + j
                             uid_list.append(child_id)
                     gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
+                    psrl_logger.debug(f"Created {len(uid_list)} child UIDs for Group Sampling, first few: {uid_list[:5]}{'...' if len(uid_list) > 5 else ''}")
                 
                 # Record the request status in the request status manager and put the batch into the data queue.
                 if self.process_mode == "stream":
+                    psrl_logger.debug(f"Process mode: stream, adding {len(gen_batch)} individual requests to data_queue")
                     batch_size = len(gen_batch)
                     for i in range(batch_size):
                         ray.get(self.request_status_manager.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i],
                         ))
                         self.data_queue.put(gen_batch[i:i+1])
+                    psrl_logger.debug(f"Added {batch_size} individual requests to data_queue")
                 else:
+                    psrl_logger.debug(f"Process mode: batch, adding {len(gen_batch.non_tensor_batch['uid'])} UIDs as a batch to data_queue")
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.request_status_manager.add_request.remote(uid))
                     self.data_queue.put(gen_batch)
+                    psrl_logger.debug(f"Added batch with {len(gen_batch)} samples to data_queue")
                 
                 if self._train_batch_idx > self.total_training_steps:
+                    psrl_logger.debug(f"Reached total_training_steps: {self.total_training_steps}, breaking loop")
                     break
 
             except StopIteration:
                 curr_epoch = self._train_batch_idx // len(self.train_dataloader)
+                psrl_logger.debug(f"StopIteration encountered, current epoch: {curr_epoch}/{total_epochs}")
                 if curr_epoch >= total_epochs:
                     psrl_logger.info("All training epochs completed.")
                     break
                 else:
+                    psrl_logger.debug("Reinitializing train_dataloader_iter for next epoch")
                     self.train_dataloader_iter = iter(self.train_dataloader)
         
         # Signal end of data processing

@@ -99,9 +99,11 @@ class PSRL_PSWorker(Worker):
         
         if self.is_ps_representative_rank:
             # Initialize the staleness inventory
+            entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.alg_rollout_n
             self.staleness_inventory = StalenessInventory(
-                num_entries=self.psrl_config.staleness_buffer_entries * self.alg_rollout_n,
+                num_entries=entries_per_buffer,
             )
+            psrl_logger.debug(f"Staleness inventory initialized with {entries_per_buffer} entries per buffer")
 
         # Build logger
         self.log_prefix = f"PSWorker_R{self.rank}"
@@ -345,51 +347,79 @@ class PSRL_PSWorker(Worker):
             data (DataProto): The data to store
             parent_id (Optional[Union[str, int]]): The parent request id (for group sampling)
         """
+        psrl_logger.debug(f"store_and_maybe_occupy_rollout_instance_request called with rollout_instance_id={rollout_instance_id}, request_id={request_id}, parent_id={parent_id}")
         assert self.is_ps_representative_rank, "Only the representative PS worker can occupy a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         curr_rollout_instance_model_version = self.get_rollout_instance_model_version(rollout_instance_id)
+        psrl_logger.debug(f"Current model version for rollout_instance_id {rollout_instance_id}: {curr_rollout_instance_model_version}")
         entry_info = EntryInfo(
             rollout_instance_id=rollout_instance_id,
             request_id=request_id,
             model_version=curr_rollout_instance_model_version
         )
+        
         # Remove the request from the training ready requests in the request status manager
+        psrl_logger.debug(f"Removing request_id {request_id} from train_ready_requests")
         ray.get(self.request_status_manager.remove_train_ready_request.remote(request_id))
+        psrl_logger.debug(f"Successfully removed request_id {request_id} from train_ready_requests")
         
         if parent_id is not None:
             # Group Sampling
             assert self.rollout_n > 1, "rollout_n must be greater than 1 to use parent_id."
+            psrl_logger.debug(f"Adding data for entry_info to staleness inventory")
             self.staleness_inventory.add_data(
                 entry_info=entry_info,
                 data=data,
             )
+            
+            if parent_id not in self.rollout_request_tracker:
+                self.rollout_request_tracker[parent_id] = []
+                
             self.rollout_request_tracker[parent_id].append(entry_info)
-            psrl_logger.debug(f"[TRACE] Store data for parent {parent_id} with info {entry_info}, total requests: {len(self.rollout_request_tracker[parent_id])}")
-            # 丢弃 parent_id 对应的剩余子请求的计算
+            psrl_logger.debug(f"Store data for parent {parent_id} with info {entry_info}, total requests: {len(self.rollout_request_tracker[parent_id])}")
+            
             if len(self.rollout_request_tracker[parent_id]) == self.alg_rollout_n:
+                psrl_logger.debug(f"Reached required alg_rollout_n={self.alg_rollout_n} for parent_id {parent_id}")
                 entry_infos = self.rollout_request_tracker.pop(parent_id)
+                psrl_logger.debug(f"Popped entry_infos from rollout_request_tracker for parent_id {parent_id}, entry count: {len(entry_infos)}")
+                
                 all_child_ids = set(range(self.rollout_n))
-                stored_child_ids = set([entry_info.request_id % self.rollout_n for entry_info in entry_infos])
+                stored_child_ids = set([int(entry_info.request_id) % self.rollout_n for entry_info in entry_infos])
                 abort_child_ids = all_child_ids - stored_child_ids
+                psrl_logger.debug(f"All child IDs: {all_child_ids}, Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
                 
                 # Remove the parent request (sample) data from the buffer in the request status manager
+                psrl_logger.debug(f"Removing request data of {parent_id} from request status manager buffer")
                 ray.get(self.request_status_manager.remove_request_data_from_buffer.remote(parent_id))
+                psrl_logger.debug(f"Successfully removed request data of {parent_id} from buffer")
+                
                 # Notify the request status manager to abort the child requests
                 if abort_child_ids:
                     psrl_logger.debug(f"Aborting child requests {abort_child_ids} for parent request {parent_id}.")
                     ray.get(self.request_status_manager.abort_requests.remote(abort_child_ids))
+                    psrl_logger.debug(f"Successfully aborted {len(abort_child_ids)} child requests")
 
-                for entry_info in entry_infos:
+                psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
+                for i, entry_info in enumerate(entry_infos):
+                    psrl_logger.debug(f"Occupying data for entry_info {i+1}/{len(entry_infos)}: {entry_info}")
                     self.staleness_inventory.occupy_data(entry_info=entry_info)
+                
+                psrl_logger.debug(f"Trying to awake waiters after occupying data for parent_id {parent_id}")
                 self.try_awake_waiters()
+                psrl_logger.debug(f"Finished group sampling request processing for parent_id {parent_id}")
         else:
             # Directly occupy data, bypassing storing process
+            psrl_logger.debug(f"No parent_id provided, directly occupying data for request_id {request_id}")
             self.staleness_inventory.occupy_data(
                 entry_info=entry_info,
                 data=data,
             )
+            psrl_logger.debug(f"Successfully occupied data for entry_info: {entry_info}")
+
+            psrl_logger.debug(f"Trying to awake waiters after direct data occupation")
             self.try_awake_waiters()
+            psrl_logger.debug(f"Finished direct data occupation for request_id {request_id}")
 
     async def wait_for_training_batch(
         self,

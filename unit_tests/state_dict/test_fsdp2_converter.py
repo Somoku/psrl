@@ -1,0 +1,83 @@
+"""
+Example usage of vLLM to HuggingFace state dict converter.
+
+This example shows how to convert a vLLM model's state dict to HuggingFace format
+using the new class-based API.
+"""
+import os
+import torch
+import time
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp._traversal_utils import _get_fsdp_handles 
+from torch.distributed.fsdp.api import ShardingStrategy, StateDictType, FullStateDictConfig, ShardedStateDictConfig
+from transformers import AutoModel, AutoConfig, AutoModelForCausalLM
+from verl.utils.fsdp_utils import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    apply_fsdp2,
+    fsdp2_load_full_state_dict,
+    fsdp_version,
+    get_fsdp_wrap_policy,
+    get_init_weight_context_manager,
+    init_fn,
+    layered_summon_lora_params,
+    load_fsdp_model_to_gpu,
+    load_fsdp_optimizer,
+    offload_fsdp_model_to_cpu,
+    offload_fsdp_optimizer,
+)
+
+from psrl.utils.state_dict import convert_fsdp_inplace
+
+
+def example_with_real_model():
+    """Example with a real vLLM model instance, now supports distributed torchrun."""
+    import torch.distributed as dist
+    from vllm import LLM
+    
+    # Read distributed info from environment variables
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    print(f"rank: {rank}, world_size: {world_size}")
+    
+    # Initialize torch distributed
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+
+    model = AutoModelForCausalLM.from_pretrained("/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct")
+    fsdp_kwargs = {
+        "mesh": init_device_mesh("cuda", mesh_shape=(world_size,)),
+    }
+    apply_fsdp2(model, fsdp_kwargs, {})
+    fsdp_model = model
+
+    # Get the model class
+    model_class = type(fsdp_model)
+    print(f"[rank{rank}] model_class: {model_class}")
+    print(f"[rank{rank}] fsdp_model: {fsdp_model}")
+
+    # Get the state dict
+    start_time = time.time()
+    fsdp_state_dict = fsdp_model.state_dict()
+    end_time = time.time()
+    print(f"[rank{rank}] State dict loaded in {end_time - start_time:.2f} seconds")
+    for name, param in fsdp_state_dict.items():
+    # for name, param in fsdp_model.named_parameters():
+        print(f"[rank{rank}] {name}: {param.to_local().shape}, {param.placements}")
+
+    # Convert to HuggingFace format
+    hf_state_dict, sharding = convert_fsdp_inplace("fsdp2", fsdp_model)
+
+    # Save the converted state dict for each rank
+    print("=" * 50)
+    for name in hf_state_dict.keys():
+        print(f"[rank{rank}] {name}: {hf_state_dict[name].shape}, {hf_state_dict[name].sum()}, {sharding[name]}")
+    # torch.save(hf_state_dict, f"converted_model_rank{rank}.pth")
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    print("Real model conversion example...")
+    example_with_real_model() 

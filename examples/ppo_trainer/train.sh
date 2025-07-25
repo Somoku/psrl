@@ -1,7 +1,7 @@
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=512
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
@@ -40,6 +40,9 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.ps_nnodes=${PS_NNODES} \
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
+    psrl.nixl_server_mode=meta_server \
+    psrl.nixl_server_ip=${MASTER_NODE_IP} \
+    psrl.nixl_server_port=23456 \
     \
     gen_actor_rollout.model.path="$MODEL_PATH" \
     gen_actor_rollout.rollout.log_prob_micro_batch_size_per_gpu=16 \

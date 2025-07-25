@@ -26,8 +26,9 @@ from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 from psrl.utils.ray import RayLock
 from psrl.utils.dataset import DatasetType, DatasetHandle
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
+from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, global_meta_server_name
 from psrl.workers.gen import PSRL_vLLMRollout
-from psrl.workers.ps import PSRL_PSWorker
 
 
 psrl_logger = logging.getLogger(__file__)
@@ -39,20 +40,71 @@ class GenInterface:
     """Info for the PSRL GenWorker."""
     rollout_instance_id: int
     dataset_handle: ray.actor.ActorHandle
-    ps_handle: ray.actor.ActorHandle
+    ps_manager_handle: ray.actor.ActorHandle
 
 
 class PSRL_GenWorker(ActorRolloutRefWorker):
-    def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, gen_interface: GenInterface) -> None:
+    def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, gen_interface: GenInterface, nixl_interface: NIXLInterface) -> None:
         super().__init__(config, role)
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
+        self.nixl_interface = nixl_interface
         self.instance_dist_group = None
-        
+
         # Build logger
         self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        
+    def init_nixl_client(self):
+        assert self.rollout, "Rollout must be initialized before calling init_nixl_client."
+        """Initialize the NIXL client."""
+        if self.psrl_config.nixl_server_mode == "storage_server":
+            raise ValueError("Storage server mode is deprecated.")
+        elif self.psrl_config.nixl_server_mode == "meta_server":
+            self.nixl_storage_client = NIXLStorageClient(
+                client_name=f"NIXLGenClient_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
+                server_name=global_meta_server_name,
+                server_ip=self.psrl_config.nixl_server_ip,
+                server_port=self.psrl_config.nixl_server_port,
+                use_gpu=True,
+                mode=self.psrl_config.nixl_server_mode,
+                client_type=NIXLClientType.PULL_SIDE,
+                nixl_interface=self.nixl_interface
+            )
+        else:
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl_server_mode}")
+        psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
+        
+    def nixl_protocol(self):
+        # Register the state dict and sharding dict to the NIXL client
+        psrl_logger.info(f"nixl client protocol step 0: convert_vllm_inplace")
+        vllm_model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model.state_dict()
+        param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(self.config.model.path))
+        unified_state_dict, local_sharding_dict = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=self.rank)
+        psrl_logger.info(f"nixl client protocol step 1: connect_to_server")
+        self.nixl_storage_client.connect_to_server()
+        psrl_logger.info(f"nixl client protocol step 2: send_local_sharding")
+        self.nixl_storage_client.send_local_sharding(local_sharding_dict)
+        psrl_logger.info(f"nixl client protocol step 3: wait_for_server_sharding")
+        unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
+        psrl_logger.info(f"nixl client protocol step 4: register_local_tensors")
+        self.nixl_storage_client.register_local_tensors(unified_state_dict, unified_sharding_dict)
+        psrl_logger.info(f"nixl client protocol step 5: send_local_info")
+        self.nixl_storage_client.send_local_info()
+        psrl_logger.info(f"nixl client protocol step 6: wait_for_server_info")
+        self.nixl_storage_client.wait_for_server_info()
+        psrl_logger.info(f"nixl client protocol step 7: send_local_temp_mapping")
+        self.nixl_storage_client.send_local_temp_mapping()
+        psrl_logger.info(f"nixl client protocol step 8: wait_for_server_temp_mappings")
+        self.nixl_storage_client.wait_for_server_temp_mappings()
+        psrl_logger.info(f"nixl client protocol done.")
+        
+    def get_node_id(self) -> str:
+        """
+        Get the node id of the rollout instance.
+        """
+        return ray.get_runtime_context().get_node_id()
     
     def get_instance_representive_rank(self) -> int:
         """
@@ -144,17 +196,17 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
         In 'cpu_ref' mode, get the ray object_ref and ray.get it (parallel, non-blocking for PS worker).
         """
-        ps_handle = self.gen_interface.ps_handle
+        ps_manager_handle = self.gen_interface.ps_manager_handle
         model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         device = get_torch_device().current_device()
         
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             if self.psrl_config.ps_mode == "cpu":
                 # In 'cpu' mode, pull the full state dict (PS worker will block on transfer)
-                model_state_dict_cpu = ray.get(ps_handle.pull_model_state_dict_cpu.remote(self.get_instance_id()))
+                model_state_dict_cpu = ray.get(ps_manager_handle.pull_model_state_dict_cpu.remote(self.get_instance_id()))
             elif self.psrl_config.ps_mode == "cpu_ref":
                 # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
-                object_ref = ray.get(ps_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
+                object_ref = ray.get(ps_manager_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
                 model_state_dict_cpu = ray.get(object_ref)  # This blocks until the state dict is available in the object store
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
@@ -213,32 +265,32 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # This is take place only on the representative rank of the rollout instance
         # Get the PS worker handle
         with log_dual_events("Reserve requests", psrl_logger, event_type=EventType.OTHER):
-            ps_handle = self.gen_interface.ps_handle
+            ps_manager_handle = self.gen_interface.ps_manager_handle
             # Get the current rollout instance id
             rollout_instance_id = self.get_instance_id()
             # Get the model versions
-            curr_rollout_instance_model_version = ray.get(ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
+            curr_rollout_instance_model_version = ray.get(ps_manager_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
             if self.is_instance_representive_rank:
-                curr_ps_model_version = ray.get(ps_handle.get_ps_model_version.remote())
+                curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
                 needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
-                # TODO (Done already): Implement a wrapper for ps_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
-                # Add asyncio method to the ps_handle ray actor to ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
-                with RayLock(ps_handle):
+                # TODO (Done already): Implement a wrapper for ps_manager_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
+                # Add asyncio method to the ps_manager_handle ray actor to ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
+                with RayLock(ps_manager_handle):
                     # Check if we can reserve the requests
                     # If not, we will wait until the requests can be reserved (the waiting will take place later)
-                    max_reserve_num = ray.get(ps_handle.get_max_reserve_num.remote(curr_rollout_instance_model_version))
+                    max_reserve_num = ray.get(ps_manager_handle.get_max_reserve_num.remote(curr_rollout_instance_model_version))
                     if max_reserve_num < batch_size:
                         # Need to pull new model version
                         needed_model_version = curr_ps_model_version
                         # If the current PS model version is still not enough, we will wait for the training side to update the model version
-                        while ray.get(ps_handle.get_max_reserve_num.remote(needed_model_version)) < batch_size:
+                        while ray.get(ps_manager_handle.get_max_reserve_num.remote(needed_model_version)) < batch_size:
                             needed_model_version += 1
                     # TODO: Maybe we can support partial reservation, currently we fix the batch size outside
                     # assert max_reserve_num >= batch_size, f"Cannot reserve {batch_size} requests, only {max_reserve_num} requests can be reserved."
                     request_ids = list(range(curr_request_id + 1, curr_request_id + batch_size + 1))
                     futures = []
                     for request_id in request_ids:
-                        futures.append(ps_handle.reserve_rollout_instance_request.remote(
+                        futures.append(ps_manager_handle.reserve_rollout_instance_request.remote(
                             rollout_instance_id=rollout_instance_id,
                             local_request_id=request_id,
                             model_version=needed_model_version
@@ -256,7 +308,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # All the ranks should participate
         if needed_model_version != curr_rollout_instance_model_version:
             with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
-                ray.get(ps_handle.wait_for_ps_model_version.remote(needed_model_version)) # This will block until the PS worker has the needed model version 
+                ray.get(ps_manager_handle.wait_for_ps_model_version.remote(needed_model_version)) # This will block until the PS worker has the needed model version 
             # The PS model version may be higher than the needed model version
             # if a pushing happens between step 1 and step 2
             # but that is ok since a higher model version will not break the staleness
@@ -266,7 +318,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # Step 3: Generate sequences
         # All the ranks should participate
         # Note that the actual model version may be higher than the needed model version
-        actual_model_version = ray.get(ps_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
+        actual_model_version = ray.get(ps_manager_handle.get_rollout_instance_model_version.remote(rollout_instance_id))
         with log_dual_events(f"Core generation with model version {actual_model_version}", psrl_logger, event_type=EventType.GEN):
             outputs : DataProto = self.rollout.generate_sequences(prompts)
         
@@ -286,7 +338,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
                 futures = []
                 for request_id, sequence in zip(request_ids, sequences):
                     # Occupy the request in the PS worker
-                    futures.append(ps_handle.occupy_rollout_instance_request.remote(
+                    futures.append(ps_manager_handle.occupy_rollout_instance_request.remote(
                         rollout_instance_id=rollout_instance_id,
                         local_request_id=request_id,
                         data=sequence
@@ -311,7 +363,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # Register the rollout instance in the PS worker
         if self.is_instance_representive_rank:
             # Only the representive rank needs to register the rollout instance
-            ray.get(self.gen_interface.ps_handle.register_rollout_instance.remote(self.get_instance_id()))
+            ray.get(self.gen_interface.ps_manager_handle.register_rollout_instance.remote(self.get_instance_id()))
         
         ending = False
         

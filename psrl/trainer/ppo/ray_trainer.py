@@ -5,6 +5,7 @@ import logging
 import numpy as np
 import ray
 from ray.exceptions import RayTaskError
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from collections import defaultdict
 from copy import deepcopy
 from enum import Enum
@@ -34,11 +35,12 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tracking import ValidationGenerationsLogger
 
+from psrl.utils.nixl import NIXLInterface, global_port_scanner
 from psrl.utils.dataset import DatasetType, DatasetHandle
 from psrl.utils.logger import DualOutputHandler, log_dual_events, log_single_event, EventType
 from psrl.workers.train import TrainInterface
 from psrl.workers.gen import GenInterface
-
+from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSWorker
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -95,9 +97,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.validation_generations_logger = ValidationGenerationsLogger()
         
         # Build logger
-        self.log_prefix = f"Trainer"
+        self.log_prefix = f"Main_Ray_Trainer"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
-        psrl_logger.info(f"Initialized trainer (single controller).")
+        psrl_logger.info(f"Initialized major ray trainer (single controller).")
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -407,44 +409,46 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
 
         # create rollout, actor and ps
-        # PS need to be created before rollout and actor to pass the ps_handle
-        assert PSRL_Role.Rollout in self.role_worker_mapping and PSRL_Role.Actor in self.role_worker_mapping and PSRL_Role.ParameterServer in self.role_worker_mapping, "Rollout, Actor and PS must be in role_worker_mapping." 
+        # PS need to be created before rollout and actor to pass the ps_manager_handle
+        # assert PSRL_Role.Rollout in self.role_worker_mapping and PSRL_Role.Actor in self.role_worker_mapping and PSRL_Role.ParameterServer in self.role_worker_mapping, "Rollout, Actor and PS must be in role_worker_mapping." 
+        assert PSRL_Role.Rollout in self.role_worker_mapping and PSRL_Role.Actor in self.role_worker_mapping, "Rollout, Actor must be in role_worker_mapping." 
          
-        # create PS and initialize workergroup 
-        psrl_logger.info("Create PS and initialize workergroup")
-        ps_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.ParameterServer)
-        ps_cls = RayClassWithInitArgs(
-            cls=self.role_worker_mapping[PSRL_Role.ParameterServer],
-            psrl_config=self.config.psrl
+        # create ps manager
+        ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
+        assert self.config.psrl.ps_manager_ip in ip_to_node_id, f"PSManager IP {self.config.psrl.ps_manager_ip} not found in ray nodes"
+        psrl_logger.info("Getting the handle of the PSManager")
+        self.ps_manager_handle = PSManager.options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=ip_to_node_id[self.config.psrl.ps_manager_ip],
+                soft=False
+            )
+        ).remote(self.config.psrl)
+        
+        nixl_interface = NIXLInterface(
+            port_scanner=global_port_scanner
         )
-        self.resource_pool_to_cls[ps_resource_pool]["ps"] = ps_cls
-        all_wg["ps"] = self.ray_worker_group_cls(resource_pool=ps_resource_pool, ray_cls_with_init=ps_cls, **wg_kwargs)
-        self.ps_wg = all_wg["ps"] 
-        psrl_logger.info("Getting PS handle")
-        # using `ray.get_runtime_context()` is time-consuming, so we have to expose the `_workers` attribute of the PS worker group
-        # self.ps_handle = self.ps_wg.execute_rank_zero_sync("get_ps_handle")
-        self.ps_handle = self.ps_wg._workers[0]
          
         # create rollout instances  
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             gen_interface = GenInterface(
                 rollout_instance_id=i, 
                 dataset_handle=self.dataset_handle,
-                ps_handle=self.ps_handle
+                ps_manager_handle=self.ps_manager_handle
             )
             rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[PSRL_Role.Rollout],
                 config=self.config.gen_actor_rollout,
                 role='rollout',
                 psrl_config=self.config.psrl,
-                gen_interface=gen_interface
+                gen_interface=gen_interface,
+                nixl_interface=nixl_interface
             )
             rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
             self.resource_pool_to_cls[rollout_resource_pool][f"rollout_{i}"] = rollout_cls  
         
         # create actor (train only) 
         train_interface = TrainInterface(
-            ps_handle=self.ps_handle
+            ps_manager_handle=self.ps_manager_handle
         )   
         actor_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Actor)
         actor_cls = RayClassWithInitArgs(
@@ -452,7 +456,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             config=self.config.train_actor_rollout_ref,
             role='actor_rollout', # also need rollout for validation set
             psrl_config=self.config.psrl,
-            train_interface=train_interface
+            train_interface=train_interface,
+            nixl_interface=nixl_interface
         )
         self.resource_pool_to_cls[actor_resource_pool]["actor"] = actor_cls
 
@@ -534,6 +539,45 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 continue # PS is created first, so we skip it here
             all_wg.update(create_worker_group(resource_pool, class_dict))
         '''
+        
+        # create PS WorkerGroup
+        psrl_logger.info("Create PS WorkerGroup")
+        if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
+            # PSManager is used to store the model state dict 
+            # No need to create PS WorkerGroup
+            pass
+        elif self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            # PSManager is only used to build the nixl meta server
+            # The PS WorkerGroup is used to store the model state dict
+            # It is colocate with the rollout instances
+            if self.config.psrl.ps_mode == "nixl_cpu":
+                # Get all rollout instances' distinct node ids
+                ps_node_ids = set()
+                for i in range(self.config.psrl.deployment.n_rollout_instances):
+                    rollout_instance_node_ids = all_wg[f"rollout_{i}"].execute_all_sync("get_node_id")
+                    for node_id in rollout_instance_node_ids:
+                        ps_node_ids.add(node_id)
+                ps_spec_list = []
+                for node_id in ps_node_ids:
+                    ps_spec_list.append(PSResourceSpec(
+                        node_id=node_id,
+                        attached_gpu_id=None
+                    ))
+                ps_resource_pool = PSResourcePool(ps_spec_list=ps_spec_list)
+                psrl_logger.info(f"PS resource pool: {ps_resource_pool}")
+                self.ps_wg = PSWorkerGroup(
+                    resource_pool=ps_resource_pool,
+                    ps_cls_with_init=PSClassWithInitArgs(
+                        cls=ray.remote(PSWorker),
+                        psrl_config=self.config.psrl,
+                        nixl_interface=nixl_interface
+                    )
+                )
+                self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg)
+            elif self.config.psrl.ps_mode == "nixl_gpu":
+                raise NotImplementedError("PS mode 'nixl_gpu' is not implemented yet")
+        else:
+            raise ValueError(f"Invalid PS mode: {self.config.psrl.ps_mode}")
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -560,7 +604,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
         ray.get(futures)
         
-        psrl_logger.info("All workers initialized successfully!")
+        psrl_logger.info("All workers' models initialized successfully!")
+        
+        psrl_logger.info("Initializing NIXL")
+        futures = []
+        expected_clients = self.ps_wg.world_size + \
+            self.actor_wg.world_size + \
+            sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
+        futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_clients))
+        futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
+        futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
+        ray.get(futures)
+        psrl_logger.info("NIXL initialized successfully!")
+        
+        psrl_logger.info("Executing NIXL protocol")
+        futures = []
+        futures.append(self.ps_manager_handle.nixl_potocol.remote())
+        futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
+        futures.extend(self.actor_wg.execute_all_async("nixl_protocol"))
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
+        ray.get(futures)
+        psrl_logger.info("NIXL protocol executed successfully!")
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -634,7 +701,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # load rollout instance
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             self.rollout_wg_list[i].load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
-        # TODO: push the actor model state dict to the PS worker (thoughit is not necessary to do so)
+        # TODO: push the actor model state dict to the PS worker (though it is not necessary to do so)
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
@@ -714,7 +781,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     buffer_id = self.global_steps - 1
                     # will block until the training batch is ready
                     with log_dual_events(f"Wait for training batch {buffer_id}", psrl_logger, event_type=EventType.WAIT):
-                        batch = ray.get(self.ps_handle.wait_for_training_batch.remote(buffer_id)) 
+                        batch = ray.get(self.ps_manager_handle.wait_for_training_batch.remote(buffer_id)) 
                     psrl_logger.debug(f"Global step {self.global_steps} training batch: {batch}")
                     
                 batch.batch["response_mask"] = compute_response_mask(batch)

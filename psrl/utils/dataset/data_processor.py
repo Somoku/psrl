@@ -34,7 +34,7 @@ class DataProcessor:
         config,
         tokenizer,
         processor,
-        ps_handle,
+        ps_manager_handle,
         request_status_manager,
         collate_fn=None,
         process_mode="batch",
@@ -47,7 +47,7 @@ class DataProcessor:
             config: Configuration object containing data processing parameters.
             tokenizer: Tokenizer used for encoding and decoding text.
             processor: Optional data processor, used for multimodal data
-            ps_handle: Parameter Server handle for communication with the PS worker.
+            ps_manager_handle: Parameter Server handle for communication with the PS worker.
             request_status_manager: Manager for tracking request statuses. (Ray actor handle)
             collate_fn: Function to collate data samples into batches.
             process_mode: Mode of processing data, either "stream" or "batch".
@@ -71,7 +71,7 @@ class DataProcessor:
             self.collate_fn = collate_fn
         
         # Communication handles
-        self.ps_handle = ps_handle
+        self.ps_manager_handle = ps_manager_handle
         self.request_status_manager = request_status_manager
         
         self.process_mode = process_mode

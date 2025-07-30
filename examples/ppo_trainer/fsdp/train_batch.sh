@@ -7,8 +7,8 @@ source ${PSRL_WORKSPACE}/env/verl_H20.sh
 export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
-GLOBAL_BATCH_SIZE=16
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
+GLOBAL_BATCH_SIZE=512
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
@@ -48,6 +48,9 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.ps_nnodes=${PS_NNODES} \
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
+    psrl.nixl_server_mode=meta_server \
+    psrl.nixl_server_ip=${MASTER_NODE_IP} \
+    psrl.nixl_server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=sync \
@@ -97,6 +100,4 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-batch.log
-
-bash $HOME/occupy.sh 3
+    trainer.total_epochs=30 2>&1 | tee psrl_test_run.log

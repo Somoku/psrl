@@ -53,8 +53,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
         In 'cpu' mode, the PS worker will block on large model transfer (potential bottleneck).
         In 'cpu_ref' mode, only the train worker blocks on ray.put, PS worker is non-blocking.
         """
-        ps_handle = self.train_interface.ps_handle
-        curr_ps_model_version = ray.get(ps_handle.get_ps_model_version.remote())
+        ps_manager_handle = self.train_interface.ps_manager_handle
+        curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
         psrl_logger.info(f"Gathering the full state dict on the CPU of the representative rank.")
@@ -77,12 +77,12 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
             if self.psrl_config.ps_mode == "cpu":
                 # In 'cpu' mode, push the full state dict (PS worker will block on transfer)
                 # But the training side does not need to wait for the push to complete, as it can be overlapped with the next-iteration training
-                self.train_interface.ps_handle.push_model_state_dict_cpu.remote(next_ps_model_version, full_state_dict)
+                self.train_interface.ps_manager_handle.push_model_state_dict_cpu.remote(next_ps_model_version, full_state_dict)
             elif self.psrl_config.ps_mode == "cpu_ref":
                 # In 'cpu_ref' mode, push a ray object_ref (PS worker is non-blocking)
                 # But the training side needs to wait for the push to complete, as `ray.put` is blocking
                 object_ref = ray.put(full_state_dict)  # This blocks until the state dict is in the object store
-                self.train_interface.ps_handle.push_model_state_dict_cpu_ref_list.remote(next_ps_model_version, [object_ref]) # Tricky part: manually wrap the object_ref in a list to avoid ray dereferencing the full state dict
+                self.train_interface.ps_manager_handle.push_model_state_dict_cpu_ref_list.remote(next_ps_model_version, [object_ref]) # Tricky part: manually wrap the object_ref in a list to avoid ray dereferencing the full state dict
             else:
                 raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         else:

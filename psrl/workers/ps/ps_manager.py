@@ -14,9 +14,11 @@ from verl import DataProto
 from verl.single_controller.base.worker import Worker, DistGlobalInfo, DistRankInfo
 
 from psrl.utils.ray import add_lock
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType
-from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, EntryInfo
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
 from psrl.utils.server.command import CommandType, Command
+from psrl.utils.nixl import NIXLMetaServer
+from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, EntryInfo
+from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -48,19 +50,19 @@ class ModelStore:
     # 'cpu_ref' mode will store the Ray object reference in `model_state_dict_ref`
     model_state_dict_ref: Optional[ray.ObjectRef] = None  # ray object_ref
 
+
+# TODO: Ensure PSManager is a singleton
+@ray.remote
 @add_lock
-class PSRL_PSWorker(Worker):
+class PSManager:
     def __init__(self, psrl_config: DictConfig, request_status_manager) -> None:
         """
-        Initialize the Parameter Server (PS) Worker, responsible for management of model versions,
+        Initialize the Parameter Server (PS) Manager, responsible for management of model versions,
         staleness buffers, and rollout requests.
-        NOTE: PS workers are initialized on a node, but only the representative rank (rank 0) will perform
-        the actual PS operations such as model storage and staleness buffer management.
         
         Args:
             psrl_config (DictConfig): Configuration object containing parameters such as rollout_n, staleness buffer entries, etc.
         """
-        super().__init__()
         self.psrl_config = psrl_config
         if self.psrl_config.rollout_test.redundant_rollout.enable:
             self.rollout_n = self.psrl_config.rollout_test.redundant_rollout.redundant_rollout_n
@@ -95,17 +97,19 @@ class PSRL_PSWorker(Worker):
         
         self.max_ready_buffer_id = -1
         
-        if self.is_ps_representative_rank:
-            # Initialize the staleness inventory
-            entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.alg_rollout_n
-            self.staleness_inventory = StalenessInventory(
-                num_entries=entries_per_buffer,
-                staleness=self.psrl_config.staleness,
-            )
-            psrl_logger.debug(f"Staleness inventory initialized with {entries_per_buffer} entries per buffer")
+        # Initialize the staleness inventory
+        entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.alg_rollout_n
+        self.staleness_inventory = StalenessInventory(
+            num_entries=entries_per_buffer,
+            staleness=self.psrl_config.staleness,
+        )
+        
+        # NIXL related attributes
+        self.expected_clients = 0
+        self.nixl_meta_server: Optional[NIXLMetaServer] = None
 
         # Build logger
-        self.log_prefix = f"PSWorker_R{self.rank}"
+        self.log_prefix = f"PSManager"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
@@ -127,28 +131,17 @@ class PSRL_PSWorker(Worker):
         info = DistRankInfo(tp_rank=tp_rank, dp_rank=dp_rank, pp_rank=pp_rank, cp_rank=cp_rank)
         return info
 
-    @property   
-    def is_ps_representative_rank(self) -> bool:
-        """
-        Check if the current rank is the representative rank.
-        The representative rank is the rank 0 of the PS.
-        """
-        return self.rank == 0
-        
-    def get_ps_handle(self):
+    @deprecated("It is too slow to get the PS handle by `ray.get_runtime_context()`")
+    def get_ps_manager_handle(self):
         """Get the PS handle."""
-        assert self.is_ps_representative_rank, "Only the representative PS worker can get the PS handle."
-        
         return ray.get_runtime_context().current_actor
-    
+
     def set_rollout_server(self, rollout_server: ray.actor.ActorHandle):
         """Set the reference to the rollout server."""
         self.rollout_server = rollout_server
 
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
         """Register a new rollout instance."""
-        assert self.is_ps_representative_rank, "Only the representative PS worker can register a rollout instance."
-        
         self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(
             version_tag=0
         )
@@ -164,8 +157,6 @@ class PSRL_PSWorker(Worker):
         Returns:
             int: The maximum number of entries that can be reserved for the given model version
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can get the max reserve num."
-    
         max_staleness_buffer_id = model_version + self.psrl_config.staleness
         return self.staleness_inventory.get_empty_entries_total_num(max_staleness_buffer_id)
     
@@ -313,7 +304,6 @@ class PSRL_PSWorker(Worker):
             request_id (Union[str, int]): The request id
             data (DataProto): The data to occupy
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can occupy a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         curr_rollout_instance_model_version = self.get_rollout_instance_model_version(rollout_instance_id)
@@ -354,7 +344,6 @@ class PSRL_PSWorker(Worker):
             parent_id (Optional[Union[str, int]]): The parent request id (for group sampling)
         """
         psrl_logger.debug(f"store_and_maybe_occupy_rollout_instance_request called with rollout_instance_id={rollout_instance_id}, request_id={request_id}, parent_id={parent_id}")
-        assert self.is_ps_representative_rank, "Only the representative PS worker can occupy a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         entry_info = EntryInfo(
@@ -431,7 +420,6 @@ class PSRL_PSWorker(Worker):
         buffer_id: int
     ) -> DataProto:
         """Waiting for the training batch in the specified buffer."""
-        assert self.is_ps_representative_rank, "Only the representative PS worker can await a training batch."
         self.staleness_inventory.ensure_buffer_exists(buffer_id)
         
         if self.staleness_inventory.get_buffer_status(buffer_id) == BufferStatus.READY:
@@ -474,8 +462,6 @@ class PSRL_PSWorker(Worker):
         Returns:
             Dict[Union[str, int], int]: A dictionary mapping rollout instance IDs to their model versions
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can get all rollout instance model versions."
-        
         return {instance_id: tag_to_int(instance_status.version_tag) for instance_id, instance_status in self.rollout_instance_tracker.items()}
 
     def get_rollout_instance_model_version(self, rollout_instance_id: Union[str, int]) -> int:
@@ -487,22 +473,19 @@ class PSRL_PSWorker(Worker):
         Returns:
             int: The model version for the specified rollout instance
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can get the model version for a rollout instance."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         return tag_to_int(self.rollout_instance_tracker[rollout_instance_id].version_tag)
         
     def get_ps_model_version(self) -> int:
-        """Get current model version in the model store."""
-        assert self.is_ps_representative_rank, "Only the representative PS worker can get the model version."
+        """Get the current model version."""
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
         
         return tag_to_int(self.model_store.version_tag)
     
     def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: Union[str, int]):
-        """Update the rollout instance model version to the latest model version in `model_store`."""
-        assert self.is_ps_representative_rank, "Only the representative PS worker can update the rollout instance model version to the latest."
+        """Update the rollout instance model version to the latest model version."""
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
 
         self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
@@ -542,6 +525,10 @@ class PSRL_PSWorker(Worker):
                     fut.set_result(None)
             # Remove the key after waking all waiters
             del self._version_waiters[version]
+            
+    # ------- MODEL PUSH/PULL -------
+    # Now we separate the control plane and data plane (ps_model = "nixl"), all the dataflow is handled by PSWorkerGroup.
+    # And PSManager is only responsible for the control plane.
         
     def push_model_state_dict_cpu(
         self,
@@ -556,7 +543,6 @@ class PSRL_PSWorker(Worker):
             version_tag (Union[str, int]): The version tag of the model
             model_state_dict (Optional[Mapping[str, Union[Tensor, DTensor]]]): The model state dict to push
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can push a model on CPU."
         assert self.psrl_config.ps_mode == "cpu", "push_model_state_dict_cpu should only be used in 'cpu' mode."
 
         self.model_store = ModelStore(
@@ -582,7 +568,6 @@ class PSRL_PSWorker(Worker):
             version_tag (Union[str, int]): The version tag of the model
             model_state_dict_ref_list (List[ray.ObjectRef]): The list of ray object_refs to push
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can push a model on CPU."
         assert self.psrl_config.ps_mode == "cpu_ref", "push_model_state_dict_ref should only be used in 'cpu_ref' mode."
         assert len(model_state_dict_ref_list) == 1, "Only one model state dict ref is supported in 'cpu_ref' mode."
 
@@ -608,7 +593,6 @@ class PSRL_PSWorker(Worker):
         Returns:
             Optional[Mapping[str, Union[Tensor, DTensor]]]: The model state dict
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can pull a model on CPU."
         assert self.psrl_config.ps_mode == "cpu", "pull_model_state_dict_cpu should only be used in 'cpu' mode."
         assert self.model_store is not None, "Model instance is not initialized."
 
@@ -630,10 +614,44 @@ class PSRL_PSWorker(Worker):
         Returns:
             ray.ObjectRef: The ray object_ref for the latest model state dict
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can provide model ref."
         assert self.psrl_config.ps_mode == "cpu_ref", "get_model_state_dict_ref should only be used in 'cpu_ref' mode."
         assert self.model_store is not None, "Model instance is not initialized."
 
         log_single_event(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag} (ref)", psrl_logger, event_type=EventType.PULL)
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
         return self.model_store.model_state_dict_ref
+    
+    # ------- PS NIXL DATAFLOW CONTROL -------
+    
+    def init_nixl_server(self, expected_clients: int):
+        """Initialize the nixl server."""
+        self.expected_clients = expected_clients
+        if self.psrl_config.nixl_server_mode == "storage_server":
+            raise ValueError("Storage server mode is deprecated.")
+        elif self.psrl_config.nixl_server_mode == "meta_server":
+            self.nixl_meta_server = NIXLMetaServer(
+                "NIXLMetaServer", 
+                self.psrl_config.nixl_server_ip, 
+                self.psrl_config.nixl_server_port
+            )
+        else:
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl_server_mode}")
+        
+    def nixl_protocol(self):
+        """Connect to the nixl clients and sync the client shardings/infos/comm_plan/temp_mappings to all clients."""
+        psrl_logger.info(f"nixl server protocol step 1: waiting for {self.expected_clients} clients to connect and send sharding")
+        self.nixl_meta_server.wait_for_client_shardings(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 2: notify all client shardings")
+        self.nixl_meta_server.notify_all_client_shardings()
+        psrl_logger.info(f"nixl server protocol step 3: waiting for {self.expected_clients} clients to send infos")
+        self.nixl_meta_server.wait_for_client_infos(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 4: notify all client infos and the global comm plan")
+        self.nixl_meta_server.notify_all_client_infos_and_comm_plan()
+        psrl_logger.info(f"nixl server protocol step 5: waiting for {self.expected_clients} clients to send temp mappings")
+        self.nixl_meta_server.wait_for_client_temp_mappings(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 6: notify all client temp mappings")
+        self.nixl_meta_server.notify_all_client_temp_mappings()
+    
+    def bind_ps_worker_group(self, ps_worker_group: PSWorkerGroup):
+        """Bind the PS worker group to the PSManager."""
+        self.ps_worker_group = ps_worker_group

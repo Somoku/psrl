@@ -34,6 +34,10 @@ psrl:
       enable: False
       threshold: null
       interrupt_as_prompt: False
+  nixl:
+    server_mode: meta_server
+    server_ip: 127.0.0.1
+    server_port: 23456
 
 data:
   tokenizer: null

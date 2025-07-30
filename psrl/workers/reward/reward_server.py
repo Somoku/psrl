@@ -25,7 +25,7 @@ class RewardServer(CommandExtension):
         self,
         config,
         tokenizer,
-        ps_handle,
+        ps_manager_handle,
         rollout_queue,
         request_status_manager,
         reward_fn=None,
@@ -37,7 +37,7 @@ class RewardServer(CommandExtension):
         Args:
             config: Configuration object containing server settings.
             tokenizer: Tokenizer for processing text data.
-            ps_handle: Handle to the parameter server for communication.
+            ps_manager_handle: Handle to the parameter server for communication.
             rollout_queue: Queue for receiving rollout data from rollout server.
             request_status_manager: Manager for tracking request statuses.
             reward_fn: Optional function for computing rewards.
@@ -75,7 +75,7 @@ class RewardServer(CommandExtension):
         self._threads = []
         
         # Communication handles
-        self.ps_handle = ps_handle
+        self.ps_manager_handle = ps_manager_handle
         self.request_status_manager = request_status_manager
         
     def start_server(self):
@@ -335,7 +335,7 @@ class RewardServer(CommandExtension):
                         
                         if complete_request_idxs:
                             with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
-                                future = self.ps_handle.store_and_maybe_occupy_rollout_instance_request.remote(
+                                future = self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
                                     rollout_instance_id=int(rollout_instance_id),
                                     request_id=int(request_id),
                                     version_tag=version_tag,
@@ -399,7 +399,7 @@ class RewardServer(CommandExtension):
                             
                             psrl_logger.debug(f"Occupying request_id {request_id} from rollout_instance_id {rollout_instance_id}")
                             occupy_futures.append(
-                                self.ps_handle.store_and_maybe_occupy_rollout_instance_request.remote(
+                                self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
                                     rollout_instance_id=int(rollout_instance_id),
                                     request_id=int(request_id),
                                     version_tag=version_tag,

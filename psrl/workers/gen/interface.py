@@ -5,5 +5,5 @@ from dataclasses import dataclass
 class GenInterface:
     """Info for the PSRL GenWorker."""
     rollout_instance_id: int
-    ps_handle: ray.actor.ActorHandle
+    ps_manager_handle: ray.actor.ActorHandle
     request_status_manager: ray.actor.ActorHandle

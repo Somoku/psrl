@@ -33,7 +33,7 @@ class RolloutServer(CommandExtension):
         data_queue,
         rollout_queue,
         replay_buffer,
-        ps_handle,
+        ps_manager_handle,
         request_status_manager,
     ):
         """
@@ -46,7 +46,7 @@ class RolloutServer(CommandExtension):
             data_queue: Queue for incoming data requests.
             rollout_queue: Queue for outgoing rollout requests.
             replay_buffer: Buffer for storing replay data.
-            ps_handle: Handle to the parameter server for model version management.
+            ps_manager_handle: Handle to the parameter server for model version management.
             request_status_manager: Manager for tracking request statuses.
         """
         super().__init__()
@@ -95,7 +95,7 @@ class RolloutServer(CommandExtension):
         self.request_status_manager = request_status_manager
         
         # Parameter server handle for model version management
-        self.ps_handle = ps_handle
+        self.ps_manager_handle = ps_manager_handle
         
         # Build logger
         self.log_prefix = "RolloutServer"

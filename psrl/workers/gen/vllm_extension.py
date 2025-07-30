@@ -14,7 +14,7 @@ from verl.utils.device import get_device_id
 from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class vLLMWorkerExtension:
     def load_weights(self, weights, blocking: bool = True):

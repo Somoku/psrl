@@ -1,5 +1,5 @@
 from .vllm_rollout import PSRL_vLLMRollout
-from .base_gen_worker import GenInterface
+from .interface import GenInterface
 from .rollout_router import BatchRolloutRouter, RoundRobinRolloutRouter
 from .rollout_server import RolloutServer, Command, CommandType
 from .vllm_extension import vLLMWorkerExtension

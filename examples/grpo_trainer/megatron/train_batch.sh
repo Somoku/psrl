@@ -59,7 +59,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.max_inflight_requests=512 \
-    gen_actor_rollout_ref.actor.strategy=megatron \
     gen_actor_rollout_ref.rollout.mode=sync \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \

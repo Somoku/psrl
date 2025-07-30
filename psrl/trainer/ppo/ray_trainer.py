@@ -40,7 +40,7 @@ from psrl.workers.request_manager import RequestStatusManager
 from psrl.workers.reward import RewardServer
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class PSRL_Role(Enum):
     Actor = 0
@@ -75,7 +75,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         reward_fn=None,
         val_reward_fn=None,
         collate_fn=None,
-        device_name="cuda",
+        device_name=None,
     ):
         """
         Initialize distributed PPO trainer with Ray backend.
@@ -91,12 +91,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             reward_fn: Function to compute rewards for the training data.
             val_reward_fn: Function to compute rewards for the validation data.
             collate_fn: Optional function to collate data into batches.
-            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to "cuda".
+            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
         """
 
-        self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.collate_fn = collate_fn
@@ -106,8 +106,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.use_reference_policy = PSRL_Role.RefPolicy in role_worker_mapping
         self.use_rm = PSRL_Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
-        self.device_name = device_name
-        self.validation_generations_logger = ValidationGenerationsLogger()
+        self.device_name = device_name if device_name else self.config.trainer.device
+        self.validation_generations_logger = ValidationGenerationsLogger(
+            project_name=self.config.trainer.project_name,
+            experiment_name=self.config.trainer.experiment_name,
+        )
         
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.train_actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -160,7 +163,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # number of GPUs used in training
         train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
         if config.train_actor_rollout_ref.actor.strategy == "megatron":
-            model_parallel_size = config.train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size * config.train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
+            model_parallel_size = (
+                config.train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size
+                * config.train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
+            )
             context_parallel_size = config.train_actor_rollout_ref.actor.megatron.context_parallel_size
             assert train_n_gpus % (model_parallel_size * context_parallel_size) == 0, \
                 f"train_n_gpus ({train_n_gpus}) must be divisible by model_parallel_size ({model_parallel_size}) times" \
@@ -172,11 +178,27 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.train_actor_rollout_ref.rollout.n
-        assert real_train_batch_size % minimal_bsz == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size ({minimal_bsz})"
+        assert real_train_batch_size % minimal_bsz == 0, (
+            f"real_train_batch_size ({real_train_batch_size}) must be divisible by minimal possible batch size "
+            f"({minimal_bsz})"
+        )
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
         def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+            """Validate mutually exclusive micro batch size configuration options.
+
+            Ensures that users don't set both deprecated micro_batch_size and
+            the new micro_batch_size_per_gpu parameters simultaneously.
+
+            Args:
+                mbs: Deprecated micro batch size parameter value.
+                mbs_per_gpu: New micro batch size per GPU parameter value.
+                name (str): Configuration section name for error messages.
+
+            Raises:
+                ValueError: If both parameters are set or neither is set.
+            """
             settings = {
                 "train_actor_rollout_ref.actor": "micro_batch_size",
                 "critic": "micro_batch_size",
@@ -190,10 +212,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 param_per_gpu = f"{param}_per_gpu"
 
                 if mbs is None and mbs_per_gpu is None:
-                    raise ValueError(f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'.")
+                    raise ValueError(
+                        f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'."
+                    )
 
                 if mbs is not None and mbs_per_gpu is not None:
-                    raise ValueError(f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. Please remove '{name}.{param}' because only '*_{param_per_gpu}'" + "is supported (the former is deprecated).")
+                    raise ValueError(
+                        f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. Please remove "
+                        f"'{name}.{param}' because only '*_{param_per_gpu}' is supported (the former is deprecated)."
+                    )
 
         if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:
             # actor: ppo_micro_batch_size vs. ppo_micro_batch_size_per_gpu
@@ -220,11 +247,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         if self.use_critic and not config.critic.use_dynamic_bsz:
             # Check for critic micro-batch size conflicts
-            check_mutually_exclusive(config.critic.ppo_micro_batch_size, config.critic.ppo_micro_batch_size_per_gpu, "critic")
+            check_mutually_exclusive(
+                config.critic.ppo_micro_batch_size, config.critic.ppo_micro_batch_size_per_gpu, "critic"
+            )
 
         # Check for reward model micro-batch size conflicts
         if config.reward_model.enable and not config.reward_model.use_dynamic_bsz:
-            check_mutually_exclusive(config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model")
+            check_mutually_exclusive(
+                config.reward_model.micro_batch_size, config.reward_model.micro_batch_size_per_gpu, "reward_model"
+            )
 
         # Actor
         # check if train_batch_size is larger than ppo_mini_batch_size
@@ -235,7 +266,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             assert config.data.train_batch_size >= config.train_actor_rollout_ref.actor.ppo_mini_batch_size
             sp_size = config.train_actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1)
             if config.train_actor_rollout_ref.actor.ppo_micro_batch_size is not None:
-                assert config.train_actor_rollout_ref.actor.ppo_mini_batch_size % config.train_actor_rollout_ref.actor.ppo_micro_batch_size == 0
+                assert (
+                    config.train_actor_rollout_ref.actor.ppo_mini_batch_size
+                    % config.train_actor_rollout_ref.actor.ppo_micro_batch_size
+                    == 0
+                )
                 assert config.train_actor_rollout_ref.actor.ppo_micro_batch_size * sp_size >= train_n_gpus
 
         assert config.train_actor_rollout_ref.actor.loss_agg_mode in [
@@ -257,24 +292,36 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 assert config.critic.ppo_micro_batch_size * sp_size >= train_n_gpus
 
         # Check if use_remove_padding is enabled when using sequence parallelism for fsdp
-        if config.train_actor_rollout_ref.actor.strategy == "fsdp" and (config.train_actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1) > 1 or config.train_actor_rollout_ref.ref.get("ulysses_sequence_parallel_size", 1) > 1):
-            assert config.train_actor_rollout_ref.model.use_remove_padding, "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+        if config.train_actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"} and (
+            config.train_actor_rollout_ref.actor.get("ulysses_sequence_parallel_size", 1) > 1
+            or config.train_actor_rollout_ref.ref.get("ulysses_sequence_parallel_size", 1) > 1
+        ):
+            assert config.train_actor_rollout_ref.model.use_remove_padding, (
+                "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+            )
 
-        if self.use_critic and config.critic.strategy == "fsdp":
+        if self.use_critic and config.critic.strategy in {"fsdp", "fsdp2"}:
             if config.critic.get("ulysses_sequence_parallel_size", 1) > 1:
-                assert config.critic.model.use_remove_padding, "When using sequence parallelism for critic, you must enable `use_remove_padding`."
+                assert config.critic.model.use_remove_padding, (
+                    "When using sequence parallelism for critic, you must enable `use_remove_padding`."
+                )
 
         if config.data.get("val_batch_size", None) is not None:
-            psrl_logger.info("WARNING: val_batch_size is deprecated." + " Validation datasets are sent to inference engines as a whole batch," + " which will schedule the memory themselves.")
+            print(
+                "WARNING: val_batch_size is deprecated."
+                + " Validation datasets are sent to inference engines as a whole batch,"
+                + " which will schedule the memory themselves."
+            )
 
         # check eval config
         if config.train_actor_rollout_ref.rollout.val_kwargs.do_sample:
             assert config.train_actor_rollout_ref.rollout.temperature > 0, "validation gen temperature should be greater than 0 when enabling do_sample"
 
         # check multi_turn with tool config
-        if config.train_actor_rollout_ref.rollout.multi_turn.enable:
-            assert config.train_actor_rollout_ref.rollout.multi_turn.tool_config_path is not None, "tool_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
-            assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
+        if config.train_actor_rollout_ref.rollout.val_kwargs.do_sample:
+            assert config.train_actor_rollout_ref.rollout.temperature > 0, (
+                "validation gen temperature should be greater than 0 when enabling do_sample"
+            )
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -400,6 +447,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
+        sample_turns = []
 
         psrl_logger.debug("Fetching validation data batches")
         batch_count = 0
@@ -418,7 +466,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.train_actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
+            test_batch = test_batch.repeat(
+                repeat_times=self.config.train_actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+            )
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
@@ -432,12 +482,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_inputs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+            if "multi_modal_data" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("multi_modal_data")
             if "raw_prompt" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("raw_prompt")
             if "tools_kwargs" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            if "interaction_kwargs" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+            if "agent_name" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("agent_name")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -449,22 +503,27 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "recompute_log_prob": False,
                 "do_sample": self.config.train_actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
+                "global_steps": self.global_steps,
             }
             psrl_logger.info(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_wg.world_size)
+            size_divisor = (
+                self.actor_wg.world_size
+                if not self.async_rollout_mode
+                else self.config.train_actor_rollout_ref.rollout.agent.num_workers
+            )
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             # switch to the inference engine and generate sequences
             # NOTE: `async_rollout_mode` regards to aysnc engine in verl, not the async rollout mode in PSRL as `psrl_async`.
             if not self.async_rollout_mode:
                 test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
             else:
-                self.async_rollout_manager.wake_up()
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                self.async_rollout_manager.sleep()
             
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+
             psrl_logger.info("validation generation end")
 
             # Store generated outputs
@@ -473,6 +532,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
@@ -484,6 +544,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if "reward_extra_info" in result:
                 for key, lst in result["reward_extra_info"].items():
                     reward_extra_infos_dict[key].extend(lst)
+            
+            # collect num_turns of each prompt
+            if "__num_turns__" in test_batch.non_tensor_batch:
+                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
@@ -512,12 +576,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    if (var_name == core_var) and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"]) and (f"@{n_max}" in metric_name):
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
                         metric_sec = "val-core"
                     else:
                         metric_sec = "val-aux"
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
+        
+        if len(sample_turns) > 0:
+            sample_turns = np.concatenate(sample_turns)
+            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
+            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
+            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
 
@@ -735,7 +809,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             critic_futures = self.critic_wg.init_model()
             ray.get(critic_futures)
 
-        if self.use_reference_policy:
+        if self.use_reference_policy and not self.ref_in_actor:
             self.ref_policy_wg = all_wg["ref"]
             ref_futures = self.ref_policy_wg.init_model()
             ray.get(ref_futures)
@@ -776,25 +850,45 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         from verl.utils.fs import local_mkdir_safe
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        local_global_step_folder = os.path.join(
+            self.config.trainer.default_local_dir, f"global_step_{self.global_steps}"
+        )
 
         psrl_logger.info(f"local_global_step_folder: {local_global_step_folder}")
         actor_local_path = os.path.join(local_global_step_folder, "actor")
 
-        actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+        actor_remote_path = (
+            None
+            if self.config.trainer.default_hdfs_dir is None
+            else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "actor")
+        )
 
         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
         if remove_previous_ckpt_in_save:
-            psrl_logger.info("Warning: remove_previous_ckpt_in_save is deprecated," + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead")
-        max_actor_ckpt_to_keep = self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
-        max_critic_ckpt_to_keep = self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+            psrl_logger.info(
+                "Warning: remove_previous_ckpt_in_save is deprecated,"
+                + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
+            )
+        max_actor_ckpt_to_keep = (
+            self.config.trainer.get("max_actor_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
+        max_critic_ckpt_to_keep = (
+            self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
+        )
 
-        self.actor_wg.save_checkpoint(actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep)
-
+        self.actor_wg.save_checkpoint(
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+        )
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, "critic")
-            critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
-            self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep)
+            critic_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
+            )
+            self.critic_wg.save_checkpoint(
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+            )
 
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
@@ -804,7 +898,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # latest checkpointed iteration tracker (for atomic usage)
         local_mkdir_safe(self.config.trainer.default_local_dir)
         psrl_logger.info(f"Saving latest checkpointed iteration to {self.config.trainer.default_local_dir}")
-        local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+        local_latest_checkpointed_iteration = os.path.join(
+            self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
+        )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
@@ -845,14 +941,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
         # load actor (train only)
-        self.actor_wg.load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        self.actor_wg.load_checkpoint(
+            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+        )
+        
+        # load critic
+        if self.use_critic:
+            self.critic_wg.load_checkpoint(
+                critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
+
         # load rollout instance
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             self.rollout_wg_list[i].load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # TODO: push the actor model state dict to the PS worker (though it is not necessary to do so)
-        # load critic
-        if self.use_critic:
-            self.critic_wg.load_checkpoint(critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
         # load dataloader,
         # TODO: from remote not implemented yet
@@ -862,17 +964,43 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.info(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+    def _start_profiling(self, do_profile: bool) -> None:
+        """Start profiling for all worker groups if profiling is enabled."""
+        if do_profile:
+            self.actor_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            if self.use_reference_policy:
+                self.ref_policy_wg.start_profile()
+            if self.use_critic:
+                self.critic_wg.start_profile()
+            if self.use_rm:
+                self.rm_wg.start_profile()
+
+    def _stop_profiling(self, do_profile: bool) -> None:
+        """Stop profiling for all worker groups if profiling is enabled."""
+        if do_profile:
+            self.actor_wg.stop_profile()
+            if self.use_reference_policy:
+                self.ref_policy_wg.stop_profile()
+            if self.use_critic:
+                self.critic_wg.stop_profile()
+            if self.use_rm:
+                self.rm_wg.stop_profile()
+
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
         world_size = self.actor_wg.world_size
-        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst, k_partitions=world_size, equal_size=True)
+        global_partition_lst = get_seqlen_balanced_partitions(
+            global_seqlen_lst, k_partitions=world_size, equal_size=True
+        )
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
-        global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
+        global_balance_stats = log_seqlen_unbalance(
+            seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
+        )
         metrics.update(global_balance_stats)
 
     def fit(self):
@@ -885,7 +1013,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
 
-        psrl_logger.debug("Starting PPO training process")
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -903,15 +1030,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # perform validation before training
         # currently, we only support validation using the reward_function.
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            psrl_logger.debug("Performing initial validation")
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             psrl_logger.info(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
-                psrl_logger.info("Validation-only mode enabled, exiting after validation")
                 return
-            psrl_logger.debug("Initial validation completed")
 
         # Prepare communication handles (queues, buffers, etc.) between workers and initialize servers
         psrl_logger.debug("Setting up communication handles between workers")
@@ -951,6 +1075,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
         last_val_metrics = None
+        self.max_steps_duration = 0
         
         psrl_logger.debug("Entering main training loop, starting from step %d", self.global_steps)
         # busy loop for training
@@ -973,17 +1098,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                      self.global_steps, len(batch) if batch is not None else 0)
                 
                 # Check profile status and start profiling if needed
-                do_profile = self.global_steps in self.config.trainer.profile_steps if self.config.trainer.profile_steps is not None else False
-                if do_profile:
-                    self.actor_wg.start_profile()
-                    if self.use_reference_policy:
-                        self.ref_policy_wg.start_profile()
-                    if self.use_critic:
-                        self.critic_wg.start_profile()
-                    if self.use_rm:
-                        self.rm_wg.start_profile()
+                do_profile = (
+                    self.global_steps in self.config.trainer.profile_steps
+                    if self.config.trainer.profile_steps is not None
+                    else False
+                )
+                with marked_timer("start_profile", timing_raw):
+                    self._start_profiling(do_profile)
                 
-                batch.batch["response_mask"] = compute_response_mask(batch)
+                if "response_mask" not in batch.batch.keys():
+                    batch.batch["response_mask"] = compute_response_mask(batch)
                 # Balance the number of valid tokens across DP ranks.
                 # NOTE: This usually changes the order of data in the `batch`,
                 # which won't affect the advantage calculation (since it's based on uid),
@@ -1020,7 +1144,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     # compute reference log_prob
                     with marked_timer("ref", timing_raw, color="olive"):
                         with log_dual_events("Compute reference log_prob", psrl_logger, event_type=EventType.OTHER):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            if not self.ref_in_actor:
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            else:
+                                ref_log_prob = self.actor_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                 # compute values
@@ -1073,7 +1200,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
                         # compute advantages, executed on the driver process
 
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                            "norm_adv_by_std_in_grpo", True
+                        )  # GRPO adv normalization factor
 
                         batch = compute_advantage(
                             batch,
@@ -1084,6 +1213,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             multi_turn=self.config.gen_actor_rollout_ref.rollout.multi_turn.enable,
                             config=self.config.algorithm
+                        )
+                        
+                        batch = compute_advantage(
+                            batch,
+                            adv_estimator=self.config.algorithm.adv_estimator,
+                            gamma=self.config.algorithm.gamma,
+                            lam=self.config.algorithm.lam,
+                            num_repeat=self.config.gen_actor_rollout_ref.rollout.n,
+                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                            config=self.config.algorithm,
                         )
 
                 # update critic
@@ -1109,10 +1248,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 if rollout_data_dir:
                     with marked_timer("dump_rollout_generations", timing_raw, color="green"):
                         with log_dual_events("Dump rollout generations", psrl_logger, event_type=EventType.OTHER):
-                            psrl_logger.info(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            if "request_id" in batch.non_tensor_batch:
+                                reward_extra_infos_dict.setdefault(
+                                    "request_id",
+                                    batch.non_tensor_batch["request_id"].tolist(),
+                                )
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
@@ -1122,7 +1265,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             )
 
                 # validate
-                if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
+                if (
+                    self.val_reward_fn is not None and
+                    self.config.trainer.test_freq > 0 and
+                    (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                ):
                     with marked_timer("testing", timing_raw, color="green"):
                         with log_dual_events("Validate", psrl_logger, event_type=EventType.VAL):
                             val_metrics: dict = self._validate()
@@ -1130,10 +1277,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                 last_val_metrics = val_metrics
                     metrics.update(val_metrics)
 
-                if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
+                if self.config.trainer.save_freq > 0 and (
+                    is_last_step or
+                    self.global_steps % self.config.trainer.save_freq == 0
+                ):
                     with marked_timer("save_checkpoint", timing_raw, color="green"):
                         with log_dual_events("Save checkpoint", psrl_logger, event_type=EventType.OTHER):
                             self._save_checkpoint()
+
+            with marked_timer("stop_profile", timing_raw):
+                self._stop_profiling(do_profile)
+            
+            steps_duration = timing_raw["step"]
+            self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
             # training metrics
             metrics.update(
@@ -1153,16 +1309,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             progress_bar.update(1)
             self.global_steps += 1
-            
-            # Stop profiling if needed
-            if do_profile:
-                self.actor_wg.stop_profile()
-                if self.use_reference_policy:
-                    self.ref_policy_wg.stop_profile()
-                if self.use_critic:
-                    self.critic_wg.stop_profile()
-                if self.use_rm:
-                    self.rm_wg.stop_profile()
 
             if is_last_step:
                 psrl_logger.info(f"Final validation metrics: {last_val_metrics}")

@@ -17,7 +17,7 @@ from psrl.utils.server.command import Command, CommandType, CommandExtension
 from psrl.workers.request_manager.request_status_manager import RequestStatus, RequestStatusManager
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RewardServer(CommandExtension):

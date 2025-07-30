@@ -1,4 +1,4 @@
-from .base_train_worker import TrainInterface
+from .interface import TrainInterface
 
 # NOTE: Backend-specific worker will be lazily imported
 

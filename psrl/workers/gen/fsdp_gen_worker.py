@@ -11,25 +11,23 @@ from collections import deque, defaultdict
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from torch.distributed.device_mesh import init_device_mesh
 from torch.multiprocessing.reductions import reduce_tensor
 
 import ray
 
 from verl import DataProto
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.device import get_torch_device
+from verl.utils.device import get_torch_device, get_device_name
 from verl.utils.fs import copy_to_local
 from verl.utils.debug import log_gpu_memory_usage
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
 from psrl.workers.gen import PSRL_vLLMRollout, GenInterface
-from psrl.workers.sharding_manager import PSRL_FSDPASyncvLLMShardingManager, PSRL_FSDPvLLMShardingManager
 from psrl.workers.request_manager.request_status_manager import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
     @staticmethod
@@ -155,30 +153,6 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
-
-        # Patch for vLLM's BackendCompilerFailed exception to make it serializable.
-        # This is a workaround for the issue where vLLM's BackendCompilerFailed exception is not serializable,
-        # which can cause issues when using FSDP with vLLM.
-        '''
-        def patched_reduce(self):
-            # We inherit from RuntimeError so the only thing in args is the message.
-            args = self.args
-            assert len(args) == 1
-            msg = args[0]
-            first_useful_frame = None  # self.first_useful_frame is not serializable...
-            return (reconstruct_exception, (type(self), msg, self.inner_exception, None))
-
-        def reconstruct_exception(cls, msg, inner_exception, first_useful_frame):
-            try:
-                instance = cls(msg)
-                if hasattr(instance, 'inner_exception'):
-                    instance.inner_exception = inner_exception
-                return instance
-            except Exception:
-                return RuntimeError(f"{cls.__name__}: {msg}")
-
-        torch._dynamo.exc.BackendCompilerFailed.__reduce__ = patched_reduce
-        '''
     
     def get_instance_representative_rank(self) -> int:
         """
@@ -234,17 +208,26 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         Build the rollout engine and sharding manager for the PSRL GenWorker.
         NOTE: This method only supports building for one rollout instance at a time.
         """
+        from torch.distributed.device_mesh import init_device_mesh
+
         tp = self.config.rollout.tensor_model_parallel_size
         pp = self.config.rollout.pipeline_model_parallel_size
         assert self.world_size == tp * pp, "Only support dp=1 for now"
         
-        self.rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(1, pp, tp), mesh_dim_names=["dp", "pp", "infer_tp"])
+        self.rollout_device_mesh = init_device_mesh(
+            get_device_name(), mesh_shape=(1, pp, tp), mesh_dim_names=["dp", "pp", "infer_tp"]
+        )
         rollout_name = self.config.rollout.name
         assert rollout_name == "vllm", "Only support vLLM rollout for now"
         
         # Build the rollout engine
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=psrl_logger)
-        local_path = copy_to_local(self.config.model.path)
+        local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
+        lora_kwargs = (
+            {"lora_kwargs": {"enable_lora": True, "max_loras": 1, "max_lora_rank": self._lora_rank}}
+            if self._is_lora
+            else {}
+        )
         rollout = PSRL_vLLMRollout(
             model_path=local_path,
             config=self.config.rollout,
@@ -252,6 +235,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
             device_mesh=self.rollout_device_mesh,
             trust_remote_code=trust_remote_code,
             seed=self.seed,
+            **lora_kwargs,
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
         
@@ -338,11 +322,19 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
         if "multi_modal_inputs" in batch.non_tensor_batch:
-            non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+            non_tensor_batch_keys_to_pop.extend(["multi_modal_inputs"])
+        if "multi_modal_data" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("multi_modal_data")
         if "raw_prompt" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("raw_prompt")
         if "tools_kwargs" in batch.non_tensor_batch:
             non_tensor_batch_keys_to_pop.append("tools_kwargs")
+        if "interaction_kwargs" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("interaction_kwargs")
+        if "index" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("index")
+        if "agent_name" in batch.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("agent_name")
         prompts = batch.pop(
             batch_keys=batch_keys_to_pop,
             non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -351,8 +343,12 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         # The batch_size of prompts is already the number of sequences to generate per instance
         prompts = prompts.to(get_torch_device().current_device())
         meta_info = {
-            "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
-            "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
+            "eos_token_id": self.generation_config.eos_token_id
+            if self.generation_config is not None
+            else self.tokenizer.eos_token_id,
+            "pad_token_id": self.generation_config.pad_token_id
+            if self.generation_config is not None
+            else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
         

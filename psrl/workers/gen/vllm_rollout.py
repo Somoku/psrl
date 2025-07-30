@@ -29,7 +29,7 @@ from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
@@ -107,6 +107,9 @@ class PSRL_vLLMRollout(BaseRollout):
             # vllm not installed or has a different structure, skipping patch.
             pass
 
+        super().__init__()
+        self.config = config
+
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
         model_parallel_size = tensor_parallel_size * pipeline_parallel_size
@@ -121,10 +124,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 self.inference_engine = None
                 return
 
-        super().__init__()
-        self.config = config
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
-        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
         if kwargs.get("train_tp") is not None:
             # deployed with megatron
@@ -135,6 +135,7 @@ class PSRL_vLLMRollout(BaseRollout):
             vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
         
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
+        
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
             raise ValueError(
                 "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
@@ -147,9 +148,13 @@ class PSRL_vLLMRollout(BaseRollout):
         # LoRA configuration
         lora_kwargs = kwargs.pop("lora_kwargs", {})
         self.lora_kwargs = lora_kwargs
-        
         # copy it to avoid secretly modifying the engine config
-        engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        engine_kwargs = (
+            {}
+            if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs
+            else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        )
+        
         # For each vLLM engine parameter,
         # - `None` means not setting it, so we pop it, and leave it to vLLM default value
         #    (which can vary across different vLLM versions);
@@ -199,7 +204,7 @@ class PSRL_vLLMRollout(BaseRollout):
             self.inference_engine = LLM(**llm_kwargs)
 
         # Offload vllm model to reduce peak memory usage
-        if load_format == "dummy":
+        if load_format == "dummy" and config.free_cache_engine:
             self.inference_engine.sleep(level=1)
 
         kwargs = dict(
@@ -214,11 +219,12 @@ class PSRL_vLLMRollout(BaseRollout):
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
+            if hasattr(SamplingParams(), str(k)) and k != "seed":
                 kwargs[k] = config.get(k)
 
         psrl_logger.info(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
+
         self.pad_token_id = tokenizer.pad_token_id
 
     @contextmanager
@@ -246,14 +252,17 @@ class PSRL_vLLMRollout(BaseRollout):
         
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         batch_size = idx.size(0)
-        non_tensor_batch = prompts.non_tensor_batch
         
+        non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
             # Remove the left padding in the prompt token_id
-            non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+            non_tensor_batch["raw_prompt_ids"] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object
+            )
 
         if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-            raise RuntimeError(f"vllm sharding manager is not work properly with {batch_size=} v.s. {len(non_tensor_batch['raw_prompt_ids'])=}.")
+            raise RuntimeError(f"vllm sharding manager is not work properly with "
+                               f"{batch_size=} v.s. {len(non_tensor_batch['raw_prompt_ids'])=}.")
 
         raw_prompt_ids = non_tensor_batch["raw_prompt_ids"]
         if "raw_response_ids" in non_tensor_batch:
@@ -263,7 +272,9 @@ class PSRL_vLLMRollout(BaseRollout):
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
-            for raw_prompt_ids_, raw_response_ids_, multi_modal_data in zip(raw_prompt_ids, raw_response_ids, non_tensor_batch["multi_modal_data"]):
+            for raw_prompt_ids_, raw_response_ids_, multi_modal_data in zip(
+                raw_prompt_ids, raw_response_ids, non_tensor_batch["multi_modal_data"]
+            ):
                 vllm_inputs.append({"prompt_token_ids": raw_prompt_ids_ + raw_response_ids_, "multi_modal_data": multi_modal_data})
         else:
             vllm_inputs = [{"prompt_token_ids": raw_prompt_ids_ + raw_response_ids_} for raw_prompt_ids_, raw_response_ids_ in zip(raw_prompt_ids, raw_response_ids)]
@@ -277,7 +288,9 @@ class PSRL_vLLMRollout(BaseRollout):
             if isinstance(input_data["prompt_token_ids"], np.ndarray):
                 input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
             elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+                raise TypeError(
+                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
+                )
 
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
@@ -359,6 +372,7 @@ class PSRL_vLLMRollout(BaseRollout):
                         for i, logprob in enumerate(output.outputs[sample_id].logprobs):
                             log_prob_list.append(logprob[response_ids[i]].logprob)
                     rollout_log_probs.append(log_prob_list)
+
         non_tensor_batch["interrupted"] = np.array(interrupted, dtype=bool)
         raw_response_ids = non_tensor_batch["raw_response_ids"]
         # Reconstruct the raw response ids by concatenating the previous raw response ids
@@ -399,7 +413,9 @@ class PSRL_vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(
+            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
+        )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid

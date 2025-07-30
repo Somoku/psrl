@@ -19,7 +19,7 @@ from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventor
 from psrl.utils.server.command import CommandType, Command
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 # TODO: may support other tag format
 # Question(linsh): why not just use int?

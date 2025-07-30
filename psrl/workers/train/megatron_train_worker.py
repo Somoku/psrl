@@ -21,7 +21,7 @@ from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_event
 
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, train_interface: TrainInterface) -> None:
@@ -101,22 +101,18 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=psrl_logger)
-
-        # Support all hardwares
-        data = data.to(get_device_id())
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
         data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
         data.meta_info["temperature"] = self.config.rollout.temperature
-        # perform recompute log_prob
+        data = data.to(get_device_id())
         output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
-            tensors={"old_log_probs": output, "entropys": entropys},
+            tensors={"proxy_log_probs": output, "entropys": entropys},
             meta_info={"temperature": self.config.rollout.temperature},
         )
         output = output.to("cpu")
-
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)

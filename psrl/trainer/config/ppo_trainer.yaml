@@ -50,6 +50,7 @@ data:
   return_raw_chat: False
   return_full_prompt: False
   shuffle: True
+  dataloader_num_workers: 8
   validation_shuffle: False
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
   filter_overlong_prompts_workers: 1
@@ -60,12 +61,21 @@ data:
   custom_cls:
       path: null
       name: null
+  return_multi_modal_inputs: True
+  # settings related to data sampler
+  sampler:
+    # the path to the module containing a curriculum class which implements the
+    # AbstractSampler interface
+    class_path: null
+    # the name of the curriculum class like `MySampler`
+    class_name: null
 
 train_actor_rollout_ref:
   hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
-    use_shm: False
+    custom_chat_template: null
+    use_shm: True
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: False
@@ -142,7 +152,7 @@ train_actor_rollout_ref:
       # True for each task has its own database, False for all tasks in one training step share one database.
       discrete: False
       all_ranks: False # Whether to profile all ranks.
-      ranks: null # The ranks that will be profiled. null or [0,1,...]
+      ranks: [] # The ranks that will be profiled. [] or [0,1,...]
   ref:
     strategy: fsdp
     fsdp_config:
@@ -166,14 +176,13 @@ train_actor_rollout_ref:
       # True for each task has its own database, False for all tasks in one training step share one database.
       discrete: False
       all_ranks: False # Whether to profile all ranks.
-      ranks: null # The ranks that will be profiled. null or [0,1,...]
+      ranks: [] # The ranks that will be profiled. [] or [0,1,...]
   rollout:
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
-    use_fire_sampling: False # https://arxiv.org/abs/2410.21236
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
@@ -199,9 +208,11 @@ train_actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    multi_stage_wake_up: false # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+        disable_mm_preprocessor_cache: False # Whether to disable the preprocessor cache for multimodel models.
       sglang:
         attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
     val_kwargs:
@@ -213,9 +224,14 @@ train_actor_rollout_ref:
       do_sample: False # default eager for validation
     multi_turn:
       enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
-      max_turns: null  # null for no limit (default max_length // 3)
+      max_assistant_turns: null  # null for no limit (default max_length // 3)
       tool_config_path: null  # null for no tool
-      format: chatml  # chatml, more formats will be supported in the future
+      max_user_turns: null # null for no limit (default max_length // 3)
+      max_parallel_calls: 1 # max parallel call for tools in single turn
+      max_tool_response_length: 256 # max length of tool response
+      tool_response_truncate_side: middle # truncate side of tool response: left, middle, right
+      interaction_config_path: null # null for no interaction
+      format: hermes  # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
       completion_callback: null # null for default callback
       # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
       # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
@@ -226,28 +242,57 @@ train_actor_rollout_ref:
       # Some models are known to produce different tokenization results when tokenizing turn by turn vs. all at once. aThis behavior has already been validated for them.
       # To reduce excessive warnings, you can turn off the sanity check for these models if you are using their default chat template:
       # Qwen/QwQ-32B, Qwen/Qwen3-xxB
-      enable_tokenization_sanity_check: True
+      tokenization_sanity_check_mode: strict
+    agent:
+      num_workers: 8 # Number of agent loop workers
+      # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
+      # https://hydra.cc/docs/advanced/instantiate_objects/overview/
+      #
+      # - name: react_agent
+      #   _target_: recipe.langgraph_agent.react_agent_loop.ReactAgentLoop
+      #   tools: ["get_current_temperature"]
+      # - name: math_expression
+      #   _target_: recipe.langgraph_agent.example.math_expression.MathExpressionReactAgentLoop
+      #   min_terms: 2
+      #   max_terms: 6
+      agent_loop_config_path: null
+      # custom async server configs
+      custom_async_server:
+        # Path to the custom async server implementation
+        path: null
+
+        # Class name of the custom async server class (e.g. AsyncvLLMServer)
+        name: null
     calculate_log_probs: ${psrl.log_prob.enable_inference_engine_log_prob}
+    # Specifies the tensor bucket size (in megabytes) for batch weight updates during rollout operations.
+    # This parameter controls the maximum payload size for a single weight update request.
+    # Reference: https://github.com/volcengine/verl/pull/2418
+    # Currently only supported in SGLang rollout implementations
+    # Larger values may improve throughput but increase memory overhead
+    # Detailed performance comparison:
+    # https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/issues/169#issuecomment-3070686720
+    # Default value (512MB) is optimized for typical GPU memory configurations
+    # For the best performance of `rebuild_cuda_tensor`, it is recommended to:
+    # 1. Enable `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`
+    # 2. Manually set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
+    # when using Tensor Parallelism (TP) >= 8.
+    update_weights_bucket_megabytes: 512
+    # trace rollout data
+    trace:
+      backend: null # trace backend, support mlflow, weave
+      token2text: False # whether translate token id to text in output
     profiler:
       # True for each task has its own database, False for all tasks in one training step share one database.
       discrete: False
       all_ranks: False # Whether to profile all ranks.
-      ranks: null # The ranks that will be profiled. null or [0,1,...]
+      ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 gen_actor_rollout_ref:
   hybrid_engine: False
   model:
     path: ${train_actor_rollout_ref.model.path}
     external_lib: null
-  # for compatibility with verl
-  actor:
-    strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
-    ulysses_sequence_parallel_size: 1 # sp size
-    fsdp_config:
-      fsdp_size: -1
-      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
-      # before the current forward computation.
-      forward_prefetch: False
+    use_shm: True
   rollout:
     ### Config for streaming rollout ###
     max_inflight_requests: 512 # Max in-flight requests for each rollout worker
@@ -258,7 +303,6 @@ gen_actor_rollout_ref:
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
-    use_fire_sampling: False # https://arxiv.org/abs/2410.21236
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
@@ -289,9 +333,11 @@ gen_actor_rollout_ref:
     n: 1 # > 1 for grpo
     use_post_sampling_logprobs: True
     interrupt_as_prompt: ${psrl.rollout_test.partial_rollout.interrupt_as_prompt}
+    multi_stage_wake_up: false # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+        disable_mm_preprocessor_cache: False # Whether to disable the preprocessor cache for multimodel models.
       sglang:
         attention_backend: null # The attention backend for sglang engine. Options: flashinfer, triton, flashmla, null for default.
     val_kwargs:
@@ -301,11 +347,16 @@ gen_actor_rollout_ref:
       temperature: 0
       n: 1
       do_sample: False # default eager for validation
-    multi_turn: 
-      enable: False  # should set rollout.name to sglang_async if True
-      max_turns: null  # null for no limit (default max_length // 3)
+    multi_turn:
+      enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
+      max_assistant_turns: null  # null for no limit (default max_length // 3)
       tool_config_path: null  # null for no tool
-      format: chatml  # chatml, more formats will be supported in the future
+      max_user_turns: null # null for no limit (default max_length // 3)
+      max_parallel_calls: 1 # max parallel call for tools in single turn
+      max_tool_response_length: 256 # max length of tool response
+      tool_response_truncate_side: middle # truncate side of tool response: left, middle, right
+      interaction_config_path: null # null for no interaction
+      format: hermes  # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
       completion_callback: null # null for default callback
       # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
       # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
@@ -316,14 +367,38 @@ gen_actor_rollout_ref:
       # Some models are known to produce different tokenization results when tokenizing turn by turn vs. all at once. aThis behavior has already been validated for them.
       # To reduce excessive warnings, you can turn off the sanity check for these models if you are using their default chat template:
       # Qwen/QwQ-32B, Qwen/Qwen3-xxB
-      enable_tokenization_sanity_check: True
+      tokenization_sanity_check_mode: strict
+    agent:
+      num_workers: 8 # Number of agent loop workers
+      # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
+      # https://hydra.cc/docs/advanced/instantiate_objects/overview/
+      #
+      # - name: react_agent
+      #   _target_: recipe.langgraph_agent.react_agent_loop.ReactAgentLoop
+      #   tools: ["get_current_temperature"]
+      # - name: math_expression
+      #   _target_: recipe.langgraph_agent.example.math_expression.MathExpressionReactAgentLoop
+      #   min_terms: 2
+      #   max_terms: 6
+      agent_loop_config_path: null
+      # custom async server configs
+      custom_async_server:
+        # Path to the custom async server implementation
+        path: null
+
+        # Class name of the custom async server class (e.g. AsyncvLLMServer)
+        name: null
+    # trace rollout data
+    trace:
+      backend: null # trace backend, support mlflow, weave
+      token2text: False # whether translate token id to text in output
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
   strategy: fsdp # [fsdp, fsdp2]
   optim:
     lr: 1e-5
-    lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+    lr_warmup_steps_ratio: 0.0  # the total steps will be injected during runtime
     min_lr_ratio: null   # only useful for warmup with cosine
     warmup_style: constant  # select from constant/cosine
     total_training_steps: -1  # must be override by program
@@ -374,7 +449,7 @@ critic:
     # True for each task has its own database, False for all tasks in one training step share one database.
     discrete: False
     all_ranks: False # Whether to profile all ranks.
-    ranks: null # The ranks that will be profiled. null or [0,1,...]
+    ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 reward_model:
   enable: False
@@ -406,11 +481,12 @@ reward_model:
   sandbox_fusion:
     url: null # Cloud/local function URL for sandbox execution
     max_concurrent: 64 # Max concurrent requests allowed to sandbox
+    memory_limit_mb: 1024 # Max memory limit for each sandbox process in MB
   profiler:
     # True for each task has its own database, False for all tasks in one training step share one database.
     discrete: False
     all_ranks: False # Whether to profile all ranks.
-    ranks: null # The ranks that will be profiled. null or [0,1,...]
+    ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 custom_reward_function:
   path: null

@@ -21,7 +21,7 @@ from psrl.workers.request_manager.request_status_manager import RequestStatus, R
 from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RolloutServer(CommandExtension):

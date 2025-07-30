@@ -11,7 +11,7 @@ from psrl.utils.server.command import CommandType, Command
 from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class RequestStatus(Enum):
     """

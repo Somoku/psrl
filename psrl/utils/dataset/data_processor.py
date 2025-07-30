@@ -17,7 +17,7 @@ from psrl.utils.dataset.utils import create_rl_dataset, create_rl_sampler
 from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class DatasetType:

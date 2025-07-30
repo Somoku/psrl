@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Union, Tuple, Set
 from verl import DataProto
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class EntryCategory(enum.Enum):
     """

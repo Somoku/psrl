@@ -11,13 +11,14 @@ import ray
 import hydra
 from omegaconf import OmegaConf
 
+from verl.utils.device import is_cuda_available
 from verl.trainer.ppo.reward import load_reward_manager
 
 from psrl.workers.ps import PSRL_PSWorker
 from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 def seed_everything(seed: int):
     """
@@ -67,7 +68,11 @@ def run_ppo(config) -> None:
     # [Optional] If the configuration specifies profiling steps, use the `controller_nsight_options`
     # to set up the runtime environment for nsys profiling. `profile_steps` is a list of steps to profile,
     # which can be specified in the configuration.
-    if OmegaConf.select(config.trainer, "profile_steps") is not None and len(OmegaConf.select(config.trainer, "profile_steps")) > 0:
+    if (
+        is_cuda_available
+        and config.trainer.get("profile_steps") is not None
+        and len(config.trainer.get("profile_steps", [])) > 0
+    ):
         nsight_options = OmegaConf.to_container(config.trainer.controller_nsight_options)
         runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
     else:
@@ -91,15 +96,14 @@ class TaskRunner:
         from verl.utils.fs import copy_to_local
         
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-
-        # print initial config
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
-        
         OmegaConf.resolve(config)
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(config.train_actor_rollout_ref.model.path, use_shm=config.train_actor_rollout_ref.model.get("use_shm", False))
+        local_path = copy_to_local(
+            config.train_actor_rollout_ref.model.path, use_shm=config.train_actor_rollout_ref.model.get("use_shm", False)
+        )
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
@@ -108,14 +112,6 @@ class TaskRunner:
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-        
-        # Version validation for vllm.
-        if config.gen_actor_rollout_ref.rollout.name in ["vllm"]:
-            from verl.utils.vllm_utils import is_version_ge
-
-            if config.gen_actor_rollout_ref.model.get("lora_rank", 0) > 0:
-                if not is_version_ge(pkg="vllm", minver="0.7.3"):
-                    raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
 
         # Define worker classes based on the actor strategy.
         if config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:

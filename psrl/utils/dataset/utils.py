@@ -3,7 +3,7 @@ import torch
 import logging
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     """Create a dataset.

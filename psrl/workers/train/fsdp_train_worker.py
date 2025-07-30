@@ -22,11 +22,11 @@ from psrl.workers.train import TrainInterface
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class PSRL_FSDPTrainWorker(ActorRolloutRefWorker):
-    def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, train_interface: TrainInterface) -> None:
-        super().__init__(config, role)
+    def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, train_interface: TrainInterface, **kwargs) -> None:
+        super().__init__(config, role, **kwargs)
         self.psrl_config = psrl_config
         self.train_interface = train_interface
         
@@ -84,6 +84,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @GPUMemoryLogger(role="compute_log_prob", logger=psrl_logger)
     def compute_log_prob(self, data: DataProto):
+        # NOTE: compared with verl, we replace `old_log_probs` with `proxy_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor

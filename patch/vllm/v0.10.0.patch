@@ -1,0 +1,214 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 446f98034..1e8f92bb6 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -109,6 +109,7 @@ class Scheduler(SchedulerInterface):
+         # Priority queues for requests.
+         self.waiting = create_request_queue(self.policy)
+         self.running: list[Request] = []
++        self.aborted: list[Request] = []
+ 
+         # The request IDs that are finished in between the previous and the
+         # current steps. This is used to notify the workers about the finished
+@@ -882,6 +883,22 @@ class Scheduler(SchedulerInterface):
+         if stopped_preempted_reqs:
+             # This is a rare case and unlikely to impact performance.
+             self.waiting.remove_requests(stopped_preempted_reqs)
++        
++        for request in self.aborted:
++            req_id = request.request_id
++            outputs[request.client_index].append(
++                EngineCoreOutput(
++                    request_id=req_id,
++                    new_token_ids=[],
++                    finish_reason=request.get_finished_reason(),
++                    new_logprobs=None,
++                    new_prompt_logprobs_tensors=None,
++                    stop_reason=None,
++                    events=request.take_events(),
++                    kv_transfer_params=None,
++                    num_cached_tokens=request.num_cached_tokens,
++                ))
++        self.aborted.clear()
+ 
+         # KV Connector: update state for finished KV Transfers.
+         self._update_from_kv_xfer_finished(model_runner_output)
+@@ -1005,6 +1022,7 @@ class Scheduler(SchedulerInterface):
+         for request in valid_requests:
+             request.status = finished_status
+             self._free_request(request)
++            self.aborted.append(request)
+ 
+     def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
+         assert request.is_finished()
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 02cb80197..0e566f260 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -4,7 +4,7 @@ import asyncio
+ import time
+ from collections.abc import AsyncGenerator, Mapping
+ from copy import copy
+-from typing import Any, Optional, Union
++from typing import Any, Optional, Union, Iterable
+ 
+ import numpy as np
+ 
+@@ -418,8 +418,10 @@ class AsyncLLM(EngineClient):
+ 
+         self.output_handler = asyncio.create_task(output_handler())
+ 
+-    async def abort(self, request_id: str) -> None:
++    async def abort(self, request_id: Union[str, Iterable[str]]) -> None:
+         """Abort RequestId in OutputProcessor and EngineCore."""
++        if not isinstance(request_id, Iterable):
++            request_id = (request_id, )
+ 
+         request_ids = self.output_processor.abort_requests((request_id, ))
+         await self.engine_core.abort_requests_async(request_ids)
+@@ -587,6 +589,28 @@ class AsyncLLM(EngineClient):
+         """Prevent an adapter from being evicted."""
+         return await self.engine_core.pin_lora_async(lora_id)
+ 
++    async def running_queue(self) -> int:
++        """
++        Get the number of requests currently running in the engine.
++        This is the number of requests that are being processed by the engine.
++        """
++        return await self.engine_core.running_queue_async()
++    
++    async def waiting_queue(self) -> int:
++        """
++        Get the number of requests currently waiting in the engine.
++        This is the number of requests that are waiting to be processed by the engine.
++        """
++        return await self.engine_core.waiting_queue_async()
++    
++    async def waiting_and_running_queue(self) -> int:
++        """
++        Get the number of requests currently waiting and running in the engine.
++        This is the total number of requests that are either waiting to be processed
++        or currently being processed by the engine.
++        """
++        return await self.engine_core.waiting_and_running_queue_async()
++
+     async def collective_rpc(self,
+                              method: str,
+                              timeout: Optional[float] = None,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 7779b559c..e4b159442 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -370,6 +370,15 @@ class EngineCore:
+     def pin_lora(self, lora_id: int) -> bool:
+         return self.model_executor.pin_lora(lora_id)
+ 
++    def running_queue(self) -> int:
++        return [request.request_id for request in self.scheduler.running]
++    
++    def waiting_queue(self) -> int:
++        return [request.request_id for request in self.scheduler.waiting]
++
++    def waiting_and_running_queue(self) -> int:
++        return self.running_queue() + self.waiting_queue()
++
+     def save_sharded_state(
+         self,
+         path: str,
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index 69ae3690d..7993d8b20 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -844,6 +844,18 @@ class AsyncMPClient(MPClient):
+     async def pin_lora_async(self, lora_id: int) -> bool:
+         return await self.call_utility_async("pin_lora", lora_id)
+ 
++    async def running_queue_async(self) -> int:
++        """Returns the number of requests currently in the queue."""
++        return await self.call_utility_async("running_queue")
++    
++    async def waiting_queue_async(self) -> int:
++        """Returns the number of requests currently waiting in the queue."""
++        return await self.call_utility_async("waiting_queue")
++    
++    async def waiting_and_running_queue_async(self) -> int:
++        """Returns the number of requests currently waiting and running in the queue."""
++        return await self.call_utility_async("waiting_and_running_queue")
++
+     async def save_sharded_state_async(self,
+                                        path: str,
+                                        pattern: Optional[str] = None,
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 3be6c4821..f1f2c269e 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -304,7 +304,7 @@ class OutputProcessor:
+     ) -> list[str]:
+         request_ids_to_abort = []
+         for request_id in request_ids:
+-            req_state = self.request_states.pop(request_id, None)
++            req_state = self.request_states.get(request_id, None)
+             if req_state is not None:
+                 self.lora_states.abort_request(req_state)
+                 request_ids_to_abort.append(request_id)
+diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
+index 1189b12f3..c6a04d167 100644
+--- a/vllm/v1/sample/metadata.py
++++ b/vllm/v1/sample/metadata.py
+@@ -41,3 +41,5 @@ class SamplingMetadata:
+ 
+     # Loaded logits processors
+     logitsprocs: LogitsProcessorManager
++    
++    use_post_sampling_logprobs: bool
+diff --git a/vllm/v1/sample/sampler.py b/vllm/v1/sample/sampler.py
+index 82f51298f..a0361bf1f 100644
+--- a/vllm/v1/sample/sampler.py
++++ b/vllm/v1/sample/sampler.py
+@@ -37,7 +37,7 @@ class Sampler(nn.Module):
+         # TODO(rob): provide option for logprobs post sampling.
+         # See https://vllm-dev.slack.com/archives/C07UUL8E61Z/p1735907856007919 # noqa: E501
+         num_logprobs = sampling_metadata.max_num_logprobs
+-        if num_logprobs is not None:
++        if num_logprobs is not None and not sampling_metadata.use_post_sampling_logprobs:
+             if self.logprobs_mode == "raw_logprobs":
+                 raw_logprobs = self.compute_logprobs(logits)
+             elif self.logprobs_mode == "raw_logits":
+@@ -66,6 +66,13 @@ class Sampler(nn.Module):
+ 
+         # Sample the next token.
+         sampled = self.sample(logits, sampling_metadata)
++        if sampling_metadata.use_post_sampling_logprobs:
++            # Compute logprobs after sampling.
++            if self.logprobs_mode == "raw_logprobs":
++                raw_logprobs = self.compute_logprobs(logits)
++            elif self.logprobs_mode == "raw_logits":
++                raw_logprobs = logits.clone()
++
+         # Convert sampled token ids to int64 (long) type to ensure compatibility
+         # with subsequent operations that may use these values as indices.
+         # This conversion is necessary because FlashInfer sampling operations
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index c63041600..61efdc43b 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -659,6 +659,7 @@ class InputBatch:
+             allowed_token_ids_mask=allowed_token_ids_mask,
+             bad_words_token_ids=self.bad_words_token_ids,
+             logitsprocs=self.logitsprocs,
++            use_post_sampling_logprobs=False,
+         )
+ 
+     @property
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a5bf197ba..896579451 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -2231,6 +2231,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             allowed_token_ids_mask=None,
+             bad_words_token_ids={},
+             logitsprocs=LogitsProcessorManager(),
++            use_post_sampling_logprobs=False,
+         )
+         try:
+             sampler_output = self.sampler(logits=logits,

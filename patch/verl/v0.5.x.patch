@@ -1,0 +1,408 @@
+diff --git a/verl/protocol.py b/verl/protocol.py
+index 39979f84..806aa7ca 100644
+--- a/verl/protocol.py
++++ b/verl/protocol.py
+@@ -268,7 +268,7 @@ class DataProto:
+         import io
+ 
+         buffer = io.BytesIO()
+-        if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None:
++        if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None and len(self.batch.keys()) > 0:
+             self.batch = self.batch.contiguous()
+             self.batch = self.batch.consolidate()
+         torch.save(self.batch, buffer)
+diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
+index 2606a3ef..4705f00a 100644
+--- a/verl/single_controller/base/worker.py
++++ b/verl/single_controller/base/worker.py
+@@ -101,7 +101,7 @@ class Worker(WorkerHelper):
+         assert isinstance(rank, int), f"rank must be int, instead of {type(rank)}"
+ 
+         if rank == 0:
+-            master_addr, master_port = self.get_availale_master_addr_port()
++            master_addr, master_port = os.environ.get("MASTER_ADDR", None), os.environ.get("MASTER_PORT", None)
+             rank_zero_info = {
+                 "MASTER_ADDR": master_addr,
+                 "MASTER_PORT": master_port,
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+index b692206b..d6c8e600 100644
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -31,6 +31,18 @@ from verl.utils.py_functional import temp_env_var
+ 
+ __all__ = ["Worker"]
+ 
++@ray.remote
++def get_node_master_info():
++    """Get master address and port on remote node."""
++    import socket
++
++    master_addr = ray._private.services.get_node_ip_address()
++    
++    with socket.socket() as sock:
++        sock.bind(("", 0))
++        master_port = str(sock.getsockname()[1])
++    
++    return master_addr, master_port
+ 
+ def get_random_string(length: int) -> str:
+     import random
+@@ -230,12 +242,51 @@ class RayClassWithInitArgs(ClassWithInitArgs):
+             options = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=target_node_id, soft=False)}
+             return self.cls.options(**options).remote(*self.args, cuda_visible_devices=visible_devices, **self.kwargs)
+ 
+-        options = {
+-            "scheduling_strategy": PlacementGroupSchedulingStrategy(
+-                placement_group=placement_group, placement_group_bundle_index=placement_group_bundle_idx
+-            )
+-        }
++        options = {}
+         options.update(self._options)
++        
++        if hasattr(self.cls, "configure_worker"):
++            config = self.kwargs.get("config", None)
++            # Specialized for PSRL
++            gen_interface = self.kwargs.get("gen_interface", None)
++            dp_idx = 0
++            if gen_interface is not None:
++                dp_idx = gen_interface.rollout_instance_id
++            # Get complete worker configuration from the worker class
++            # bundle_indices = range(len(placement_group.bundle_specs)) if placement_group_bundle_idx == 0 else None
++            bundle_indices = range(len(placement_group.bundle_specs))
++            resources, env_vars, init_kwargs = self.cls.configure_worker(
++                config=config,
++                num_gpus=num_gpus,
++                dp_idx=dp_idx,
++                bundle_indices=bundle_indices,
++            )
++            
++            # Apply resource configuration
++            if resources and "num_gpus" in resources:
++                num_gpus = resources["num_gpus"]
++            if resources and "num_cpus" in resources:
++                num_cpus = resources["num_cpus"]
++                options["num_cpus"] = num_cpus
++            
++            # Apply environment variables if provided
++            if env_vars:
++                if "runtime_env" not in options:
++                    options["runtime_env"] = {"env_vars": {}}
++                if "env_vars" not in options["runtime_env"]:
++                    options["runtime_env"]["env_vars"] = {}
++                for k, v in env_vars.items():
++                    options["runtime_env"]["env_vars"][k] = v
++
++            # Apply initialization parameters
++            if init_kwargs:
++                self.kwargs.update(init_kwargs)
++        
++        options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
++            placement_group=placement_group,
++            placement_group_bundle_index=placement_group_bundle_idx,
++            placement_group_capture_child_tasks=True,
++        )
+ 
+         if use_gpu and device_name == "cuda":
+             options["num_gpus"] = num_gpus
+@@ -356,6 +407,17 @@ class RayWorkerGroup(WorkerGroup):
+         self._world_size = world_size
+         # cia.add_kwarg("_world_size", world_size)
+         num_gpus = 1 / resource_pool.max_colocate_count
++        
++        sorted_pgs = sort_placement_group_by_node_ip(pgs)
++        rank_0_pg = sorted_pgs[0]
++
++        master_info_task = get_node_master_info.options(
++            scheduling_strategy=PlacementGroupSchedulingStrategy(
++                placement_group=rank_0_pg,
++                placement_group_bundle_index=0,
++            )
++        ).remote()
++        self._master_addr, self._master_port = ray.get(master_info_task)
+ 
+         rank = -1
+         local_world_size = resource_pool.store[0]
+@@ -372,10 +434,9 @@ class RayWorkerGroup(WorkerGroup):
+                     "WG_BACKEND": "ray",
+                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
+                     "RAY_LOCAL_RANK": str(local_rank),
++                    "MASTER_ADDR": self._master_addr,
++                    "MASTER_PORT": self._master_port,
+                 }
+-                if rank != 0:
+-                    env_vars["MASTER_ADDR"] = self._master_addr
+-                    env_vars["MASTER_PORT"] = self._master_port
+ 
+                 import re
+ 
+@@ -411,43 +472,6 @@ class RayWorkerGroup(WorkerGroup):
+                 self._workers.append(worker)
+                 self._worker_names.append(name)
+ 
+-                if rank == 0:
+-                    register_center_actor = None
+-                    actor_name = f"{self.name_prefix}_register_center"
+-                    start_time = time.time()
+-
+-                    while time.time() - start_time < self._ray_wait_register_center_timeout:
+-                        if actor_name in list_named_actors():
+-                            register_center_actor = ray.get_actor(actor_name)
+-                            break
+-
+-                        elapsed = int(time.time() - start_time)
+-                        if elapsed % 30 == 0:
+-                            logging.warning(
+-                                "Waiting for register center actor %s to be ready. Elapsed time: %s seconds out of "
+-                                "%s seconds.",
+-                                actor_name,
+-                                elapsed,
+-                                self._ray_wait_register_center_timeout,
+-                            )
+-                        time.sleep(1)
+-
+-                    if register_center_actor is None:
+-                        raise TimeoutError(
+-                            f"Failed to get register_center_actor {actor_name} "
+-                            f"in {list_named_actors(all_namespaces=True)} "
+-                            f"for {self._ray_wait_register_center_timeout} seconds. "
+-                            "Ensure that any lingering Ray resources from previous "
+-                            "runs are cleaned up (e.g., by restarting the Ray cluster), "
+-                            "or adjust the waiting time by modifying the config "
+-                            "`trainer.ray_wait_register_center_timeout`."
+-                        )
+-
+-                    rank_zero_info = ray.get(register_center_actor.get_rank_zero_info.remote())
+-                    self._master_addr, self._master_port = rank_zero_info["MASTER_ADDR"], rank_zero_info["MASTER_PORT"]
+-                    # print(f"rank_zero_info: {rank_zero_info}")
+-                    # print(f"master_addr: {self._master_addr}, master_port: {self._master_port}")
+-
+     @property
+     def worker_names(self):
+         return self._worker_names
+diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
+index d5cea362..24238f8d 100644
+--- a/verl/workers/actor/dp_actor.py
++++ b/verl/workers/actor/dp_actor.py
+@@ -26,20 +26,26 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl import DataProto
+-from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
+-from verl.utils.device import get_device_name, is_cuda_available, is_npu_available
++from verl.trainer.ppo.core_algos import (agg_loss, compute_policy_loss,
++                                         get_policy_loss_fn, kl_penalty)
++from verl.utils.device import (get_device_name, is_cuda_available,
++                               is_npu_available)
+ from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
+ from verl.utils.profiler import GPUMemoryLogger
+ from verl.utils.py_functional import append_to_dict
+-from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
++from verl.utils.seqlen_balancing import (prepare_dynamic_batch,
++                                         restore_dynamic_batch)
+ from verl.utils.torch_functional import logprobs_from_logits
+-from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
++from verl.utils.ulysses import (gather_outputs_and_unpad, ulysses_pad,
++                                ulysses_pad_and_slice_inputs)
+ from verl.workers.actor import BasePPOActor
+ 
+ if is_cuda_available:
+-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
++    from flash_attn.bert_padding import (index_first_axis, pad_input,
++                                         rearrange, unpad_input)
+ elif is_npu_available:
+-    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
++    from transformers.integrations.npu_flash_attention import (
++        index_first_axis, pad_input, rearrange, unpad_input)
+ 
+ 
+ __all__ = ["DataParallelPPOActor"]
+@@ -125,7 +131,8 @@ class DataParallelPPOActor(BasePPOActor):
+                     ).transpose(0, 1)
+ 
+                 if "image_bound" in multi_modal_inputs:
+-                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
++                    from verl.utils.dataset.vision_utils import \
++                        process_multi_modal_inputs_for_minicpmo
+ 
+                     multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
+                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
+@@ -179,6 +186,7 @@ class DataParallelPPOActor(BasePPOActor):
+ 
+                 else:
+                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
++                    logits_rmpad = logits_rmpad.to(torch.float32)
+                     logits_rmpad.div_(temperature)
+ 
+                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index 4141d986..84d49e62 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -113,33 +113,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         self.config = config
+         self.profile_option = kwargs.get("profile_option", None)
+-        import torch.distributed
+-
+-        if not torch.distributed.is_initialized():
+-            rank = int(os.environ.get("RANK", 0))
+-            world_size = int(os.environ.get("WORLD_SIZE", 1))
+-            torch.distributed.init_process_group(
+-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+-                rank=rank,
+-                world_size=world_size,
+-                init_method=os.environ.get("DIST_INIT_METHOD", None),
+-            )
+-
+-        # build device mesh for FSDP
+-        world_size = torch.distributed.get_world_size()
+-        # TODO(sgm): support FSDP hybrid shard for larger model
+-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+-
+-        # build device mesh for Ulysses Sequence Parallel
+-        self.ulysses_device_mesh = None
+-        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+-        dp = world_size // self.ulysses_sequence_parallel_size
+-        if self.ulysses_sequence_parallel_size > 1:
+-            self.ulysses_device_mesh = init_device_mesh(
+-                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+-            )
+-
+-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+         self._lora_rank = self.config.model.get("lora_rank", 0)
+         self._is_lora = self._lora_rank > 0
+ 
+@@ -170,6 +143,35 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             # TODO: it seems that manual offload is slowly than FSDP offload
+             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
+ 
++    def _build_distributed(self, rank, world_size):
++        import torch.distributed
++
++        if not torch.distributed.is_initialized():
++            rank = int(os.environ.get("RANK", 0))
++            world_size = int(os.environ.get("WORLD_SIZE", 1))
++            torch.distributed.init_process_group(
++                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
++                rank=rank,
++                world_size=world_size,
++                init_method=os.environ.get("DIST_INIT_METHOD", None),
++            )
++
++        # build device mesh for FSDP
++        world_size = torch.distributed.get_world_size()
++        # TODO(sgm): support FSDP hybrid shard for larger model
++        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
++
++        # build device mesh for Ulysses Sequence Parallel
++        self.ulysses_device_mesh = None
++        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
++        dp = world_size // self.ulysses_sequence_parallel_size
++        if self.ulysses_sequence_parallel_size > 1:
++            self.ulysses_device_mesh = init_device_mesh(
++                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
++            )
++
++        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
++        
+         # normalize config
+         if self._is_actor:
+             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+@@ -242,6 +244,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 self.processor.chat_template = self.config.model.custom_chat_template
+             else:
+                 self.tokenizer.chat_template = self.config.model.custom_chat_template
++        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
++
++        if self.config.rollout.mode == "psrl_async" and not self._is_actor:
++            return None, None, None, None
+ 
+         torch_dtype = fsdp_config.get("model_dtype", None)
+         if torch_dtype is None:
+@@ -559,12 +565,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         return rollout, rollout_sharding_manager
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         from verl.workers.actor import DataParallelPPOActor
+ 
+         # This is used to import external_lib into the huggingface systems
+         import_external_libs(self.config.model.get("external_lib", None))
++        
++        self._build_distributed(
++            int(os.environ.get("RANK", 0)),
++            int(os.environ.get("WORLD_SIZE", 1)),
++        )
+ 
+         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
+ 
+@@ -921,13 +932,22 @@ class CriticWorker(Worker, DistProfilerExtension):
+         DistProfilerExtension.__init__(
+             self, DistProfiler(rank=self.rank, config=omega_conf_to_dataclass(config.get("profiler")))
+         )
++
++        self.config = config
++
++        # set FSDP offload params
++        self._is_offload_param = self.config.model.fsdp_config.param_offload
++        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
++
++        self._is_lora = self.config.model.get("lora_rank", 0) > 0
++
++    def _build_distributed(self):
+         import torch.distributed
+ 
+         if not torch.distributed.is_initialized():
+             torch.distributed.init_process_group(
+                 backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
+             )
+-        self.config = config
+ 
+         # build device mesh for Ulysses Sequence Parallel
+         world_size = torch.distributed.get_world_size()
+@@ -946,10 +966,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+ 
+         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+ 
+-        # set FSDP offload params
+-        self._is_offload_param = self.config.model.fsdp_config.param_offload
+-        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+-
+         # normalize config
+         self.config.ppo_mini_batch_size *= self.config.rollout_n
+         self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+@@ -972,7 +988,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+                 f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
+                 f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
+             )
+-        self._is_lora = self.config.model.get("lora_rank", 0) > 0
+ 
+     def _build_critic_model_optimizer(self, config):
+         # the following line is necessary
+@@ -1171,12 +1186,14 @@ class CriticWorker(Worker, DistProfilerExtension):
+ 
+         return critic_module, critic_optimizer, critic_lr_scheduler
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # This is used to import external_lib into the huggingface systems
+         import_external_libs(self.config.model.get("external_lib", None))
+ 
+         from verl.workers.critic import DataParallelPPOCritic
++        
++        self._build_distributed()
+ 
+         self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
+             self.config
+@@ -1421,7 +1438,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+             raise NotImplementedError(f"Unknown strategy: {config.strategy}")
+         return reward_module
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # This is used to import external_lib into the huggingface systems
+         import_external_libs(self.config.model.get("external_lib", None))

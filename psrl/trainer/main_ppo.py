@@ -56,7 +56,7 @@ def run_ppo(config) -> None:
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
                     "PSRL_LOGGING_LEVEL": "DEBUG",
-                    "VLLM_SKIP_P2P_CHECK": "1",  # Skip P2P check for vLLM
+                    "VLLM_SKIP_P2P_CHECK": "1",  # Skip P2P check for init speedup in vLLM
                 }
             },
             num_cpus=config.ray_init.num_cpus,
@@ -140,22 +140,18 @@ class TaskRunner:
             PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
             PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
             PSRL_Role.Critic: ray.remote(CriticWorker),
-            # PSRL_Role.ParameterServer: ray.remote(PSRL_PSWorker)
         }
 
         # Define the resource pool specification.
         deployment_config = config.psrl.deployment
         rollout_pool_id_list = [f'rollout_pool_{i}' for i in range(deployment_config.n_rollout_instances)]
         train_pool_id = 'train_pool'
-        # PS pool is not used, we now use self-defined PS worker group
-        # ps_pool_id = 'ps_pool'
         
         # format: {pool_id: [ngpus_per_node] * nnodes}
         # `nnodes` will be the number of ray placement groups
         # and `ngpus_per_node` will be the number of ray bundles (currently all equals to {"CPU": self.max_colocate_count, "GPU": 1}) in each placement group
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
-            # ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,
         }
 
         # Set the resource pool spec for each rollout instance.
@@ -184,7 +180,6 @@ class TaskRunner:
             PSRL_Role.Rollout: rollout_pool_id_list,
             PSRL_Role.Actor: [train_pool_id],
             PSRL_Role.Critic: [train_pool_id],
-            # PSRL_Role.ParameterServer: [ps_pool_id]
         }
 
         # we should adopt a multi-source reward function here

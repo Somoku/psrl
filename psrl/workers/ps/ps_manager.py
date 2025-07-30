@@ -2,7 +2,6 @@ import ray
 import os
 import logging
 import asyncio
-import torch.distributed as dist
 from collections.abc import Mapping
 from typing import Optional, List, Dict, Union, Tuple, Set
 
@@ -11,7 +10,6 @@ from torch.distributed.tensor import DTensor
 from omegaconf import DictConfig
 from dataclasses import dataclass
 from verl import DataProto
-from verl.single_controller.base.worker import Worker, DistGlobalInfo, DistRankInfo
 
 from psrl.utils.ray import add_lock
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
@@ -19,20 +17,10 @@ from psrl.utils.server.command import CommandType, Command
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, EntryInfo
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
+from psrl.workers.ps.request_status_tracker import RequestStatusTracker
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
-
-# TODO: may support other tag format
-# Question(linsh): why not just use int?
-def tag_to_int(version_tag: Union[str, int]) -> int:
-    """Convert a version tag to an integer."""
-    if isinstance(version_tag, str):
-        return int(version_tag)
-    elif isinstance(version_tag, int):
-        return version_tag
-    else:
-        raise ValueError(f"Invalid version tag type: {type(version_tag)}. Expected str or int.")
 
 @dataclass
 class RolloutInstanceStatus:
@@ -50,12 +38,11 @@ class ModelStore:
     # 'cpu_ref' mode will store the Ray object reference in `model_state_dict_ref`
     model_state_dict_ref: Optional[ray.ObjectRef] = None  # ray object_ref
 
-
 # TODO: Ensure PSManager is a singleton
 @ray.remote
 @add_lock
-class PSManager:
-    def __init__(self, psrl_config: DictConfig, request_status_manager) -> None:
+class PSManager(RequestStatusTracker):
+    def __init__(self, psrl_config: DictConfig) -> None:
         """
         Initialize the Parameter Server (PS) Manager, responsible for management of model versions,
         staleness buffers, and rollout requests.
@@ -63,6 +50,8 @@ class PSManager:
         Args:
             psrl_config (DictConfig): Configuration object containing parameters such as rollout_n, staleness buffer entries, etc.
         """
+        RequestStatusTracker.__init__(self)
+
         self.psrl_config = psrl_config
         if self.psrl_config.rollout_test.redundant_rollout.enable:
             self.rollout_n = self.psrl_config.rollout_test.redundant_rollout.redundant_rollout_n
@@ -71,11 +60,15 @@ class PSManager:
             self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n
         
-        # Request status manager for tracking request statuses
-        self.request_status_manager = request_status_manager
-        
         # Rollout server reference
         self.rollout_server: Optional[ray.actor.ActorHandle] = None
+        
+        # Reward server reference
+        self.reward_server: Optional[ray.actor.ActorHandle] = None
+        
+        # NIXL related attributes
+        self.expected_clients = 0
+        self.nixl_meta_server: Optional[NIXLMetaServer] = None
         
         # PS worker specific attributes
         self.rollout_instance_tracker: Dict[Union[str, int], RolloutInstanceStatus] = {}  # Maps rollout instance IDs to their corresponding info
@@ -83,9 +76,6 @@ class PSManager:
         
         # Staleness buffer management
         self.staleness_inventory: Optional[StalenessInventory] = None  # The staleness inventory for managing stale entries
-        # Track finished child requests for Group Sampling
-        # TODO: move to request status manager? (leave for future merge with PS manager)
-        self.rollout_request_tracker: Dict[Union[str, int], List[EntryInfo]] = {} # Maps parent request ids to "occupied" child entries
         
         # Waiting lists for training batches
         self._buffer_waiters: Dict[int, List[asyncio.Future]] = {}  # Maps buffer IDs to a set of futures waiting for that buffer
@@ -96,7 +86,7 @@ class PSManager:
         self.logged_ready_buffer_ids: Set[int] = set()
         
         self.max_ready_buffer_id = -1
-        
+
         # Initialize the staleness inventory
         entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.alg_rollout_n
         self.staleness_inventory = StalenessInventory(
@@ -104,32 +94,14 @@ class PSManager:
             staleness=self.psrl_config.staleness,
         )
         
-        # NIXL related attributes
-        self.expected_clients = 0
-        self.nixl_meta_server: Optional[NIXLMetaServer] = None
+        # Track finished child requests for Group Sampling
+        # TODO: move to request status manager? (leave for future merge with PS manager)
+        self.rollout_request_tracker: Dict[Union[str, int], List[EntryInfo]] = {} # Maps parent request ids to "occupied" child entries
 
         # Build logger
         self.log_prefix = f"PSManager"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
-
-    def get_megatron_global_info(self):
-        """Megatron distributed global info (for compatibility)"""
-        tp_size = 1
-        dp_size = 1
-        pp_size = 1
-        cp_size = 1
-        info = DistGlobalInfo(tp_size=tp_size, dp_size=dp_size, pp_size=pp_size, cp_size=cp_size)
-        return info
-
-    def get_megatron_rank_info(self):
-        """Megatron distributed rank info (for compatibility)"""
-        tp_rank = 0
-        dp_rank = 0
-        pp_rank = 0
-        cp_rank = 0
-        info = DistRankInfo(tp_rank=tp_rank, dp_rank=dp_rank, pp_rank=pp_rank, cp_rank=cp_rank)
-        return info
 
     @deprecated("It is too slow to get the PS handle by `ray.get_runtime_context()`")
     def get_ps_manager_handle(self):
@@ -139,6 +111,10 @@ class PSManager:
     def set_rollout_server(self, rollout_server: ray.actor.ActorHandle):
         """Set the reference to the rollout server."""
         self.rollout_server = rollout_server
+
+    def set_reward_server(self, reward_server: ray.actor.ActorHandle):
+        """Set the reference to the reward server."""
+        self.reward_server = reward_server
 
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
         """Register a new rollout instance."""
@@ -201,7 +177,6 @@ class PSManager:
         Returns:
             Tuple[Optional[int], Optional[int]]: The buffer id and entry id
         """
-        assert self.is_ps_representative_rank, "Only the representative PS worker can reserve a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         if not by_parent:
             assert reserve_num == 1, "Non-group sampling should reserve one entry per request."
@@ -257,17 +232,25 @@ class PSManager:
                 # Abort requests with version_tag equal to `min_ready_buffer_id - S`
                 version_to_abort = max_ready_buffer_id - self.psrl_config.staleness
                 psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")
-                ray.get(self.request_status_manager.abort_requests_of_version.remote(version_to_abort))
+                self.abort_requests_of_version(version_to_abort)
                 psrl_logger.debug(f"Abort requests of version {version_to_abort} done")
             
             # Notify the rollout server to check interruption
             if self.psrl_config.rollout_test.partial_rollout.enable:
                 psrl_logger.debug(f"Start to check and sync for ready buffer {max_ready_buffer_id} with current PS model version {curr_ps_model_version}.")
-                ray.get(self.rollout_server.exec_command.remote(Command(
+                # Create async task to avoid blocking
+                command = Command(
                     type=CommandType.CHECK_AND_SYNC,
                     buffer_id=max_ready_buffer_id,
                     curr_ps_model_version=curr_ps_model_version,
-                ), blocking=False))
+                )
+                asyncio.create_task(self.execute_command(self.rollout_server, command, blocking=False))
+
+    async def execute_command(self, server, command: Command, blocking: bool = False):
+        try:
+            await server.exec_command.remote(command, blocking=blocking)
+        except Exception as e:
+            psrl_logger.error(f"Failed to execute command {command}: {e}")
 
     def log_ready_buffer(self, buffer_id: int):
         """Log the ready buffer."""
@@ -313,7 +296,7 @@ class PSManager:
             model_version=curr_rollout_instance_model_version
         )
         # Remove the request from the training ready requests in the request status manager
-        ray.get(self.request_status_manager.remove_train_ready_request.remote(request_id))
+        self.remove_train_ready_request(request_id)
         
         self.staleness_inventory.occupy_data(
             entry_info=entry_info,
@@ -354,7 +337,7 @@ class PSManager:
         
         # Remove the request from the training ready requests in the request status manager
         psrl_logger.debug(f"Removing request_id {request_id} from train_ready_requests")
-        ray.get(self.request_status_manager.remove_train_ready_request.remote(request_id))
+        self.remove_train_ready_request(request_id)
         psrl_logger.debug(f"Successfully removed request_id {request_id} from train_ready_requests")
         
         if parent_id is not None:
@@ -384,13 +367,13 @@ class PSManager:
                 
                 # Remove the sample data from the buffer in the request status manager
                 psrl_logger.debug(f"Removing request data of {parent_id} from request status manager buffer")
-                ray.get(self.request_status_manager.remove_request_data_from_buffer.remote(parent_id))
+                self.remove_request_data_from_buffer(parent_id)
                 psrl_logger.debug(f"Successfully removed request data of {parent_id} from buffer")
                 
                 # Notify the request status manager to abort the child requests
                 if abort_child_ids:
                     psrl_logger.debug(f"Aborting child requests {abort_child_ids} for parent request {parent_id}.")
-                    ray.get(self.request_status_manager.abort_requests.remote(list(abort_child_ids)))
+                    self.abort_requests(list(abort_child_ids))
                     psrl_logger.debug(f"Successfully aborted {len(abort_child_ids)} child requests")
 
                 psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
@@ -403,7 +386,7 @@ class PSManager:
                 psrl_logger.debug(f"Finished group sampling request processing for parent_id {parent_id}")
         else:
             # Remove the sample data from the buffer in the request status manager
-            ray.get(self.request_status_manager.remove_request_data_from_buffer.remote(request_id))
+            self.remove_request_data_from_buffer(request_id)
             # Directly occupy data, bypassing storing process
             self.staleness_inventory.occupy_data(
                 entry_info=entry_info,
@@ -462,7 +445,7 @@ class PSManager:
         Returns:
             Dict[Union[str, int], int]: A dictionary mapping rollout instance IDs to their model versions
         """
-        return {instance_id: tag_to_int(instance_status.version_tag) for instance_id, instance_status in self.rollout_instance_tracker.items()}
+        return {instance_id: instance_status.version_tag for instance_id, instance_status in self.rollout_instance_tracker.items()}
 
     def get_rollout_instance_model_version(self, rollout_instance_id: Union[str, int]) -> int:
         """Get the model version for a specific rollout instance.
@@ -475,14 +458,14 @@ class PSManager:
         """
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
-        return tag_to_int(self.rollout_instance_tracker[rollout_instance_id].version_tag)
+        return self.rollout_instance_tracker[rollout_instance_id].version_tag
         
     def get_ps_model_version(self) -> int:
         """Get the current model version."""
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
         
-        return tag_to_int(self.model_store.version_tag)
+        return self.model_store.version_tag
     
     def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: Union[str, int]):
         """Update the rollout instance model version to the latest model version."""
@@ -550,7 +533,7 @@ class PSManager:
             model_state_dict=model_state_dict
         )
         # Awake all rollout waiters for this version
-        self._awake_ps_model_version_waiters(tag_to_int(version_tag))
+        self._awake_ps_model_version_waiters(version_tag)
         log_single_event(f"Model with version tag {version_tag} pushed successfully", psrl_logger, event_type=EventType.PUSH)
 
     # NOTE: If you manually wrap ObjectRef in a container (like list/tuple),ray will not recursively dereference all refs inside the container
@@ -576,7 +559,7 @@ class PSManager:
             model_state_dict_ref=model_state_dict_ref_list[0]
         )
         # Awake all rollout waiters for this version
-        self._awake_ps_model_version_waiters(tag_to_int(version_tag))
+        self._awake_ps_model_version_waiters(version_tag)
         log_single_event(f"Model with version tag {version_tag} (ref) pushed successfully", psrl_logger, event_type=EventType.PUSH)
 
     def pull_model_state_dict_cpu(

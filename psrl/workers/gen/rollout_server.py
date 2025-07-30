@@ -1,14 +1,7 @@
 import os
 import logging
-import time
-import enum
-import heapq
-import threading
 import numpy as np
 from threading import Thread
-from enum import Enum
-from typing import Union, List, Any
-from dataclasses import dataclass
 from collections import defaultdict
 
 import ray
@@ -17,8 +10,8 @@ from verl import DataProto
 
 from psrl.utils.server.command import CommandType, Command, CommandExtension
 from psrl.workers.ps.staleness_controller import EntryInfo
-from psrl.workers.request_manager.request_status_manager import RequestStatus, RequestStatusManager
-from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
+from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.utils.logger import DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -34,7 +27,6 @@ class RolloutServer(CommandExtension):
         rollout_queue,
         replay_buffer,
         ps_manager_handle,
-        request_status_manager,
     ):
         """
         Initialize the rollout server with the given configuration, worker group list and communication handles.
@@ -47,7 +39,6 @@ class RolloutServer(CommandExtension):
             rollout_queue: Queue for outgoing rollout requests.
             replay_buffer: Buffer for storing replay data.
             ps_manager_handle: Handle to the parameter server for model version management.
-            request_status_manager: Manager for tracking request statuses.
         """
         super().__init__()
 
@@ -90,9 +81,6 @@ class RolloutServer(CommandExtension):
         
         self._request_counter = 0 # For version tag setting
         self._abort_request_ids = set() # Request IDs to be aborted if the instance is interrupted
-        
-        # Request status manager for tracking request statuses
-        self.request_status_manager = request_status_manager
         
         # Parameter server handle for model version management
         self.ps_manager_handle = ps_manager_handle
@@ -195,7 +183,7 @@ class RolloutServer(CommandExtension):
         batch_size = len(data)
         request_ids = data.non_tensor_batch["uid"]
         version_tags = data.non_tensor_batch["version_tag"]
-        update_status_success = ray.get(self.request_status_manager.update_status.remote(
+        update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             RequestStatus.DISPATCHED,
             model_version=version_tags.tolist(),
@@ -226,7 +214,7 @@ class RolloutServer(CommandExtension):
             
             for i, version_tag in enumerate(version_tags):
                 request_id = requests.non_tensor_batch["uid"][i]
-                ray.get(self.request_status_manager.update_request_info.remote(
+                ray.get(self.ps_manager_handle.update_request_info.remote(
                     EntryInfo(
                         rollout_instance_id=instance_id,
                         request_id=request_id,
@@ -308,7 +296,7 @@ class RolloutServer(CommandExtension):
             return True
 
         # Collect request IDs of the instance and check if they are stale
-        instance_requests = ray.get(self.request_status_manager.get_dispatched_requests_of_instance.remote(instance_id))
+        instance_requests = ray.get(self.ps_manager_handle.get_dispatched_requests_of_instance.remote(instance_id))
 
         abort_version_to_requests: dict[int, set] = defaultdict(set)
         abort_parent_to_request_num: dict[int, int] = defaultdict(int)
@@ -329,7 +317,7 @@ class RolloutServer(CommandExtension):
         # Check if the number of rest child requests is sufficient for Group Sampling
         psrl_logger.debug(f"Checking if remaining child requests are sufficient for Group Sampling")
         for parent_id, request_num in abort_parent_to_request_num.items():
-            total_child_requests = len(ray.get(self.request_status_manager.get_recorded_child_requests.remote(parent_id)))
+            total_child_requests = len(ray.get(self.ps_manager_handle.get_recorded_child_requests.remote(parent_id)))
             remaining_requests = total_child_requests - request_num
             psrl_logger.debug(f"Parent {parent_id}: total={total_child_requests}, to_abort={request_num}, remaining={remaining_requests}, required={self.alg_rollout_n}")
             
@@ -350,7 +338,7 @@ class RolloutServer(CommandExtension):
                 psrl_logger.debug(f"Version {v} is impacted by aborting version {version_tag}")
                 for src_v in range(max(0, v - staleness), v + 1):
                     if src_v not in version_to_requests:
-                        version_to_requests[src_v] = ray.get(self.request_status_manager.get_requests_ids_of_version.remote(src_v))
+                        version_to_requests[src_v] = ray.get(self.ps_manager_handle.get_requests_ids_of_version.remote(src_v))
         
         for version_tag in impacted_version_tags:
             original_count = len(version_to_requests[version_tag])
@@ -551,7 +539,7 @@ class RolloutServer(CommandExtension):
                             # Notify the request status manager to abort requests
                             if self._abort_request_ids:
                                 psrl_logger.debug(f"Aborting {len(self._abort_request_ids)} requests: {list(self._abort_request_ids)[:5]}{'...' if len(self._abort_request_ids) > 5 else ''}")
-                                ray.get(self.request_status_manager.abort_requests.remote(list(self._abort_request_ids)))
+                                ray.get(self.ps_manager_handle.abort_requests.remote(list(self._abort_request_ids)))
                                 self._abort_request_ids.clear()
                             else:
                                 psrl_logger.debug("No requests to abort")

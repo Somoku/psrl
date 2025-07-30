@@ -8,7 +8,6 @@ import ray
 
 from psrl.workers.ps.staleness_controller import EntryInfo
 from psrl.utils.server.command import CommandType, Command
-from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -34,8 +33,7 @@ class RequestStatus(Enum):
     REWARD_RUNNING = enum.auto()
     REWARD_COMPLETED = enum.auto()
 
-@ray.remote
-class RequestStatusManager:
+class RequestStatusTracker:
     """
     Manages the status of requests in the system.
 
@@ -43,15 +41,7 @@ class RequestStatusManager:
     It is used to track the lifecycle of requests as they move through different stages.
     """
     
-    def __init__(self, config):
-        self.config = config
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.rollout_test.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.rollout_test.redundant_rollout.alg_rollout_n
-        else:
-            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
-            self.alg_rollout_n = self.rollout_n
-        
+    def __init__(self):
         self._request_id_to_status: dict[int, RequestStatus] = {} # Maps request ID to their statuses
         self._request_infos = {}  # Maps request IDs to EntryInfo objects
         # Maps statuses to sets of request IDs for quick access
@@ -61,34 +51,14 @@ class RequestStatusManager:
         self._abort_request_ids = set() # Set of request IDs that are marked for abortion
         self._running_min_version = 0 # Minimum version of requests that are currently running
         self.rollout_request_buffer = {}  # Buffer for storing request data during rollout processing
-        
-        # Communication handle with rollout and reward servers
-        self.rollout_server = None
-        self.reward_server = None
-        
-        # Build logger
-        self.log_prefix = "RequestStatusManager"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
 
-    def set_rollout_server(self, rollout_server: ray.actor.ActorHandle):
-        """
-        Set the reference to the rollout server.
-        
-        Args:
-            rollout_server: The reference to the rollout server actor.
-        """
-        self.rollout_server = rollout_server
-
-    def set_reward_server(self, reward_server_ref):
-        """
-        Set the reference to the reward server.
-        
-        Args:
-            reward_server_ref: The reference to the reward server actor.
-        """
-        self.reward_server = reward_server_ref
-
-    def update_status(self, request_id: Union[List[int], int], status: RequestStatus, model_version=-1, rollout_instance_id=-1):
+    def update_request_status(
+        self,
+        request_id: Union[List[int], int],
+        status: RequestStatus,
+        model_version: int = -1,
+        rollout_instance_id: int = -1,
+    ) -> Union[List[bool], bool]:
         """
         Update the status of a request.
         This method will first check if the request will be aborted, and if so,
@@ -158,7 +128,7 @@ class RequestStatusManager:
         psrl_logger.debug("Status update results: %s", request_update_success)
         return request_update_success
 
-    def get_status(self, request_id: Union[List[int], int]):
+    def get_request_status(self, request_id: Union[List[int], int]):
         """
         Get the current status of a request.
         
@@ -201,7 +171,7 @@ class RequestStatusManager:
             del self._request_infos[req_id]
             self._status_to_request_ids[RequestStatus.REWARD_COMPLETED].discard(req_id)
 
-    def get_all_statuses(self) -> dict:
+    def get_all_request_statuses(self) -> dict:
         """
         Get the statuses of all requests.
         
@@ -442,7 +412,7 @@ class RequestStatusManager:
             if req_id in self._abort_request_ids:
                 self._abort_request_ids.remove(req_id)
 
-    def clear(self):
+    def clear_request_status_manager(self):
         """
         Clear all requests and their statuses.
         """

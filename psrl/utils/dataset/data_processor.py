@@ -35,7 +35,6 @@ class DataProcessor:
         tokenizer,
         processor,
         ps_manager_handle,
-        request_status_manager,
         collate_fn=None,
         process_mode="batch",
     ):
@@ -48,7 +47,6 @@ class DataProcessor:
             tokenizer: Tokenizer used for encoding and decoding text.
             processor: Optional data processor, used for multimodal data
             ps_manager_handle: Parameter Server handle for communication with the PS worker.
-            request_status_manager: Manager for tracking request statuses. (Ray actor handle)
             collate_fn: Function to collate data samples into batches.
             process_mode: Mode of processing data, either "stream" or "batch".
         """
@@ -72,7 +70,6 @@ class DataProcessor:
         
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
-        self.request_status_manager = request_status_manager
         
         self.process_mode = process_mode
         if self.config.psrl.rollout_test.redundant_rollout.enable:
@@ -396,10 +393,10 @@ class DataProcessor:
                 )
                 psrl_logger.debug(f"Created gen_batch with size {len(gen_batch)}")
                 
-                # Store the other batch data in the request buffer of the request status manager.
+                # Store the other batch data in the request buffer of the ps manager.
                 # They will be merged with the reward data.
-                psrl_logger.debug(f"Adding {batch_size} requests to buffer in request_status_manager")
-                ray.get(self.request_status_manager.add_request_data_to_buffer.remote(
+                psrl_logger.debug(f"Adding {batch_size} requests to buffer in ps manager")
+                ray.get(self.ps_manager_handle.add_request_data_to_buffer.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
                 psrl_logger.debug("Successfully added requests to buffer")
@@ -422,7 +419,7 @@ class DataProcessor:
                     psrl_logger.debug(f"Process mode: stream, adding {len(gen_batch)} individual requests to data_queue")
                     batch_size = len(gen_batch)
                     for i in range(batch_size):
-                        ray.get(self.request_status_manager.add_request.remote(
+                        ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i],
                         ))
                         self.data_queue.put(gen_batch[i:i+1])
@@ -430,7 +427,7 @@ class DataProcessor:
                 else:
                     psrl_logger.debug(f"Process mode: batch, adding {len(gen_batch.non_tensor_batch['uid'])} UIDs as a batch to data_queue")
                     for uid in gen_batch.non_tensor_batch["uid"]:
-                        ray.get(self.request_status_manager.add_request.remote(uid))
+                        ray.get(self.ps_manager_handle.add_request.remote(uid))
                     self.data_queue.put(gen_batch)
                     psrl_logger.debug(f"Added batch with {len(gen_batch)} samples to data_queue")
                 

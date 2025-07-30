@@ -53,7 +53,6 @@ class PSRL_Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
-    ParameterServer = 7
 
 class PSRL_ResourcePoolManager(ResourcePoolManager):
     """
@@ -119,8 +118,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.ref_in_actor = config.train_actor_rollout_ref.model.get("lora_rank", 0) > 0
         
         # CPU workers for Streaming Rollout
-        # TODO: merge into role_worker_mapping
-        self.request_status_manager = None
         self.data_processor = None
         self.rollout_server = None
         self.reward_server = None
@@ -328,14 +325,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
-    def init_request_status_manager(self):
-        """Initialize the request status manager for handling request statuses."""
-        if self.request_status_manager is not None:
-            psrl_logger.debug("Request status manager already initialized, skipping initialization")
-            return
-        
-        self.request_status_manager = RequestStatusManager.remote(self.config)
-    
     def init_data_processor(self):
         """Initialize the data processor for handling data preprocessing and batching."""
         if self.data_processor is not None:
@@ -348,7 +337,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
-            self.request_status_manager,
             collate_fn=self.collate_fn,
             process_mode=self.config.psrl.gen_mode,
         )
@@ -389,7 +377,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.ps_manager_handle,
             rollout_queue,
-            self.request_status_manager,
             reward_fn=self.reward_fn,
             use_rm=self.use_rm,
         )
@@ -428,7 +415,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             rollout_queue,
             replay_buffer,
             self.ps_manager_handle,
-            self.request_status_manager,
         )
 
     def start_rollout_server(self):
@@ -623,15 +609,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, "worker_nsight_options must be set when profile_steps is set"
             wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(OmegaConf.select(self.config.trainer, "worker_nsight_options"))
 
-        # create the global request status manager
-        self.init_request_status_manager()
-
         # create rollout, actor and ps
         # PS need to be created before rollout and actor to pass the ps_manager_handle
         assert (
             PSRL_Role.Rollout in self.role_worker_mapping and
-            PSRL_Role.Actor in self.role_worker_mapping and
-            PSRL_Role.ParameterServer in self.role_worker_mapping
+            PSRL_Role.Actor in self.role_worker_mapping
         ), "Rollout, Actor and PS must be in role_worker_mapping." 
 
         # create PS manager and initialize workergroup 
@@ -657,12 +639,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             gen_interface = GenInterface(
                 rollout_instance_id=i,
                 ps_manager_handle=self.ps_manager_handle,
-                request_status_manager=self.request_status_manager,
             )
             rollout_config = self.config.gen_actor_rollout_ref
             if self.config.psrl.deployment.heterogeneous_rollout.enable:
                 rollout_config.rollout.tensor_model_parallel_size = self.config.psrl.deployment.heterogeneous_rollout.tensor_model_parallel_size_per_instance[i]
                 rollout_config.rollout.pipeline_model_parallel_size = self.config.psrl.deployment.heterogeneous_rollout.pipeline_model_parallel_size_per_instance[i]
+
             rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[PSRL_Role.Rollout],
                 config=rollout_config,
@@ -1112,13 +1094,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.debug("Communication handles set up successfully")
         
         self.init_rollout_server(data_queue, rollout_queue, replay_buffer)
-        psrl_logger.debug("Setting rollout server in parameter server and request status manager")
+        psrl_logger.debug("Setting rollout server in parameter manager")
         ray.get(self.ps_manager_handle.set_rollout_server.remote(self.rollout_server))
-        ray.get(self.request_status_manager.set_rollout_server.remote(self.rollout_server))
         
         self.init_reward_server(rollout_queue)
-        psrl_logger.debug("Setting reward server in request status manager")
-        ray.get(self.request_status_manager.set_reward_server.remote(self.reward_server))
+        psrl_logger.debug("Setting reward server in parameter manager")
+        ray.get(self.ps_manager_handle.set_reward_server.remote(self.reward_server))
         
         # Start data pipeline (data processor, rollout server, reward server)
         # 1. Start data processor to handle data preprocessing and batching
@@ -1251,7 +1232,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                     reward_extra_infos_dict[key].extend(value)
                             batch.meta_info["reward_extra_info_keys"] = list(reward_extra_infos_dict.keys())
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-                            # TODO: update request status manager
                 else:
                     reward_tensor = batch.batch.pop("reward", None)
                 batch.batch["token_level_scores"] = reward_tensor

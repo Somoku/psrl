@@ -1,7 +1,6 @@
 import os
 import logging
 import numpy as np
-from typing import Any
 from threading import Thread
 
 import torch
@@ -14,7 +13,7 @@ from verl.utils.torch_functional import pad_2d_list_to_length
 
 from psrl.utils.logger import log_dual_events, EventType
 from psrl.utils.server.command import Command, CommandType, CommandExtension
-from psrl.workers.request_manager.request_status_manager import RequestStatus, RequestStatusManager
+from psrl.workers.ps.request_status_tracker import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -27,7 +26,6 @@ class RewardServer(CommandExtension):
         tokenizer,
         ps_manager_handle,
         rollout_queue,
-        request_status_manager,
         reward_fn=None,
         use_rm=False,
     ):
@@ -39,7 +37,6 @@ class RewardServer(CommandExtension):
             tokenizer: Tokenizer for processing text data.
             ps_manager_handle: Handle to the parameter server for communication.
             rollout_queue: Queue for receiving rollout data from rollout server.
-            request_status_manager: Manager for tracking request statuses.
             reward_fn: Optional function for computing rewards.
             use_rm: Boolean indicating whether to use a reward model.
         """
@@ -76,7 +73,6 @@ class RewardServer(CommandExtension):
         
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
-        self.request_status_manager = request_status_manager
         
     def start_server(self):
         """
@@ -197,7 +193,7 @@ class RewardServer(CommandExtension):
                     if parent_ids is not None:
                         parent_ids = set(parent_ids) # Ensure uniqueness
                         psrl_logger.debug(f"Getting child requests for {len(parent_ids)} parent_ids")
-                        child_uids = ray.get(self.request_status_manager.get_recorded_child_requests.remote(list(parent_ids)))
+                        child_uids = ray.get(self.ps_manager_handle.get_recorded_child_requests.remote(list(parent_ids)))
                         psrl_logger.debug(f"Found {len(child_uids)} child requests for the parent_ids")
                         abort_request_uids.update(child_uids)
                     # Step 2. Get requests from uids
@@ -224,7 +220,7 @@ class RewardServer(CommandExtension):
                     psrl_logger.debug(f"Aborted {aborted_count} running reward computations")
                     
                     # 2. Remove from the request tracker (update_status)
-                    update_status_success = ray.get(self.request_status_manager.update_status.remote(list(abort_request_uids), RequestStatus.REWARD_COMPLETED))
+                    update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(list(abort_request_uids), RequestStatus.REWARD_COMPLETED))
                     assert all(not status for status in update_status_success), "Update status should not be successful for aborted requests."
                     result = aborted_count
                 else:
@@ -248,7 +244,7 @@ class RewardServer(CommandExtension):
                 
                 # Update the request status to REWARD_RUNNING
                 psrl_logger.debug(f"Updating status for request_id {request_ids[0]} to REWARD_RUNNING")
-                update_status_success = ray.get(self.request_status_manager.update_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))
+                update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))
                 if not update_status_success[0]:
                     psrl_logger.debug(f"Failed to update status for request_id {request_ids[0]}, skipping")
                     continue
@@ -276,7 +272,7 @@ class RewardServer(CommandExtension):
                 version_tags = rollout_data.non_tensor_batch["version_tag"]
 
                 for i, (sample_id, request_id, rollout_instance_id, version_tag) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids, version_tags)):
-                    request_data = ray.get(self.request_status_manager.get_request_data_from_buffer.remote(sample_id))
+                    request_data = ray.get(self.ps_manager_handle.get_request_data_from_buffer.remote(sample_id))
                     if request_data is None:
                         # If request data is None, it means the request has been aborted or not found.
                         assert self.rollout_n > 1, "Request data should not be None when rollout_n is 1."
@@ -328,7 +324,7 @@ class RewardServer(CommandExtension):
                             psrl_logger.debug("Added reward data to merge_request_data")
 
                         # Update the request status to REWARD_COMPLETED
-                        update_status_success = ray.get(self.request_status_manager.update_status.remote(int(request_id), RequestStatus.REWARD_COMPLETED))
+                        update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(int(request_id), RequestStatus.REWARD_COMPLETED))
                         complete_request_idxs = [
                             i for i, success in enumerate(update_status_success) if success
                         ]
@@ -378,7 +374,7 @@ class RewardServer(CommandExtension):
                     
                     # Update the request status to REWARD_COMPLETED
                     psrl_logger.debug(f"Updating status for {len(request_ids)} requests to REWARD_COMPLETED")
-                    update_status_success = ray.get(self.request_status_manager.update_status.remote(request_ids.tolist(), RequestStatus.REWARD_COMPLETED))
+                    update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_COMPLETED))
                     complete_request_idxs = [
                         i for i, success in enumerate(update_status_success) if success
                     ]

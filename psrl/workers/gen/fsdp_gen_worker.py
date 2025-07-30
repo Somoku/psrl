@@ -26,7 +26,7 @@ from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_event
 from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, global_meta_server_name
 from psrl.workers.gen import PSRL_vLLMRollout, GenInterface
-from psrl.workers.request_manager.request_status_manager import RequestStatus
+from psrl.workers.ps.request_status_tracker import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -548,7 +548,6 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         max_inflight_requests = self.config.rollout.max_inflight_requests
         rollout_instance_id = self.get_instance_id()
         ps_manager_handle = self.gen_interface.ps_manager_handle
-        request_status_manager = self.gen_interface.request_status_manager
 
         # Remove from the active tasks tracker when the task is done
         def create_task_done_callback(require_version: int, request_id: int):
@@ -565,7 +564,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                 psrl_logger.warning(f"Actual model version for generation is {actual_model_version}, needed model version is {needed_model_version}")
             
             # Update the request status to ROLLOUT_RUNNING
-            update_status_success = await request_status_manager.update_status.remote(request.non_tensor_batch["uid"].tolist(), RequestStatus.ROLLOUT_RUNNING)
+            update_status_success = await ps_manager_handle.update_request_status.remote(request.non_tensor_batch["uid"].tolist(), RequestStatus.ROLLOUT_RUNNING)
             
             # If the update status is successful, proceed with generation
             if update_status_success[0]:
@@ -585,7 +584,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                 # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
                 # depending on `interrupted` field in the result
                 update_status = RequestStatus.ROLLOUT_INTERRUPTED if result.non_tensor_batch["interrupted"][0] else RequestStatus.ROLLOUT_COMPLETED
-                update_status_success = await request_status_manager.update_status.remote(request.non_tensor_batch["uid"].tolist(), update_status)
+                update_status_success = await ps_manager_handle.update_request_status.remote(request.non_tensor_batch["uid"].tolist(), update_status)
                 filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                 if filtered_request_idxs:
                     filtered_result = result[filtered_request_idxs]

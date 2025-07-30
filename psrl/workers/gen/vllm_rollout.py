@@ -47,14 +47,13 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return np.repeat(value, repeats, axis=0)
 
 class PSRL_vLLMRollout(BaseRollout):
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
             module: module here follows huggingface APIs
             config: DictConfig
             tokenizer: the task/model tokenizer
-            model_hf_config: the huggingface config to initiallize the generating model in vllm
         """
        
         # Monkey patch adapted from NeMo-RL for vLLM to ensure RAY_ADDRESS is set in Ray actors.
@@ -135,21 +134,6 @@ class PSRL_vLLMRollout(BaseRollout):
             os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
             vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
         
-        # Rope scaling configuration
-        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
-        if not rope_scaling_config:
-            max_position_embeddings = None
-            if hasattr(model_hf_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.max_position_embeddings
-            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
-            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
-            if max_position_embeddings is None:
-                raise ValueError("max_position_embeddings not found in model_hf_config")
-
-            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
-
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
             raise ValueError(
@@ -393,15 +377,13 @@ class PSRL_vLLMRollout(BaseRollout):
         # TODO: optimize the DataProto construction to packing
         # Here we pad the response to the right side for both interrupted and completed requests.
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-        if (
-            self.config.enable_inference_engine_log_prob and
-            not self.config.interrupt_as_prompt
-        ):
+        if self.config.enable_inference_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+                curr_rollout_log_probs = curr_rollout_log_probs.reshape(batch_size, -1)
             else:
-                curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-            non_tensor_batch["rollout_log_probs"] = np.array([curr_rollout_log_probs[i] + rollout_log_probs[i] for i in range(batch_size)], dtype=object)
+                curr_rollout_log_probs = np.empty((batch_size, 0), dtype=object)
+            non_tensor_batch["rollout_log_probs"] = np.concatenate([curr_rollout_log_probs, np.array(rollout_log_probs, dtype=object).reshape(batch_size, -1)], axis=-1)
 
         seq = torch.cat([idx, response], dim=-1)
 
@@ -542,16 +524,11 @@ class PSRL_vLLMRollout(BaseRollout):
     async def interrupt_all_requests_async(self) -> int:
         """Interrupt all requests (both running and waiting) asynchronously."""
         # Get request IDs of all running and waiting requests from the scheduler
-        scheduler = self.inference_engine.llm_engine.scheduler
-        request_ids_to_abort = []
-        for request in scheduler.running:
-            request_ids_to_abort.append(request.request_id)
-        for request in scheduler.waiting:
-            request_ids_to_abort.append(request.request_id)
+        request_ids_to_abort = await self.inference_engine.waiting_and_running_queue()
         interrupted_request_num = len(request_ids_to_abort)
         
         if interrupted_request_num > 0:
-            await self.inference_engine.abort_requests(request_ids_to_abort)
+            await self.inference_engine.abort(request_ids_to_abort)
             psrl_logger.debug(f"Interrupted {interrupted_request_num} requests.")
         else:
             psrl_logger.debug("No requests to interrupt.")
@@ -561,5 +538,9 @@ class PSRL_vLLMRollout(BaseRollout):
     async def interrupt_requests_async(self, request_ids):
         """Interrupt specific requests asynchronously."""
         if len(request_ids) > 0:
-            request_ids = list(str(request_id) for request_id in request_ids)
-            await self.inference_engine.abort_requests(request_ids)
+            request_ids = [str(request_id) for request_id in request_ids]
+            await self.inference_engine.abort(request_ids)
+    
+    async def waiting_and_running_queue_size(self):
+        """Get the size of waiting and running queues."""
+        return len(await self.inference_engine.waiting_and_running_queue())

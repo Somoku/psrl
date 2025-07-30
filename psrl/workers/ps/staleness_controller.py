@@ -86,12 +86,13 @@ class StalenessBuffer:
     Args:
         num_entries (int): The number of entries in the buffer.
     """
-    def __init__(self, num_entries: int):
+    def __init__(self, num_entries: int, staleness: int):
         self.num_entries = num_entries
         self.entries: List[Entry] = [
             Entry(category=EntryCategory.EMPTY) 
             for _ in range(num_entries)
         ]
+        self.staleness = staleness
 
     def get_first_non_occupied(self) -> int:
         """
@@ -224,7 +225,9 @@ class StalenessInventory:
     Args:
         num_entries (int): Number of entries per buffer.
     """
-    def __init__(self, num_entries: int):
+    def __init__(self, num_entries: int, staleness: int):
+        self.staleness = staleness
+        self.buffer_id = 0
         self.num_entries = num_entries
         self.data_pool: Dict[EntryInfo, DataProto] = {} # Rollout data pool for requests in Group Sampling
         self.buffers: Dict[int, StalenessBuffer] = {}
@@ -244,13 +247,19 @@ class StalenessInventory:
         Raises:
             AssertionError: If the buffer already exists.
         """
-        assert buffer_id not in self.buffers, f"Buffer {buffer_id} already exists"
-        psrl_logger.debug(f"Creating new StalenessBuffer with ID {buffer_id} and {self.num_entries} entries")
+        assert self.buffer_id not in self.buffers, f"Buffer {self.buffer_id} already exists"
 
+        buffer = StalenessBuffer(self.num_entries, self.staleness)
+        self.buffers[self.buffer_id] = buffer
+        self._update_buffer_status(self.buffer_id)
+        self.buffer_id += 1
+        
+        '''
         buffer = StalenessBuffer(self.num_entries)
         self.buffers[buffer_id] = buffer
         psrl_logger.debug(f"Created buffer {buffer_id}, current buffer count: {len(self.buffers)}")
         self._update_buffer_status(buffer_id)
+        '''
 
     def delete_buffer(self, buffer_id: int):
         """
@@ -263,6 +272,8 @@ class StalenessInventory:
             return
 
         # Remove entries associated with this buffer from data tracker
+        # TODO: deprecate data_tracker, since we can directly use entry_info in the buffer
+        '''
         entries_to_remove = [
             entry.entry_info for entry in self.buffers[buffer_id].entries
         ]
@@ -270,6 +281,7 @@ class StalenessInventory:
             assert entry_info in self.data_tracker, \
                 f"Entry info {entry_info} not found in data tracker"
             del self.data_tracker[entry_info]
+        '''
         # Remove from status tracking
         for status_set in self._buffer_ids_by_status.values():
             status_set.discard(buffer_id)
@@ -318,13 +330,23 @@ class StalenessInventory:
      
     def min_ready_buffer_id(self) -> Optional[int]:
         """
-        Get the smallest buffer ID that is in READY state.
+        Get the min buffer ID that is in READY state.
 
         Returns:
-            Optional[int]: The smallest READY buffer ID, or None if none exist.
+            Optional[int]: The min READY buffer ID, or None if none exist.
         """
         ready_buffers = self._buffer_ids_by_status[BufferStatus.READY]
         return min(ready_buffers) if ready_buffers else None
+
+    def max_ready_buffer_id(self) -> Optional[int]:
+        """
+        Get the max buffer ID that is in READY state.
+
+        Returns:
+            Optional[int]: The max READY buffer ID, or None if none exist.
+        """
+        ready_buffers = self._buffer_ids_by_status[BufferStatus.READY]
+        return max(ready_buffers) if ready_buffers else None
 
     def min_not_ready_buffer_id(self) -> Optional[int]:
         """
@@ -453,7 +475,7 @@ class StalenessInventory:
 
         return target_buffer_id, entry_id
 
-    def occupy_data(
+    def old_occupy_data(
         self,
         entry_info: EntryInfo,
         data: Optional[DataProto] = None,
@@ -482,6 +504,55 @@ class StalenessInventory:
 
         # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
+        buffer = self.buffers[target_buffer_id]
+        entry_id = buffer.get_first_non_occupied()
+        assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, \
+            "Found non-occupied entry must be EMPTY"
+        
+        # Create entry info and update buffer
+        buffer.insert(
+            entry_id,
+            EntryCategory.OCCUPIED, 
+            data=data, 
+            entry_info=entry_info
+        )
+        self._update_buffer_status(target_buffer_id)
+
+    def occupy_data(
+        self,
+        entry_info: EntryInfo,
+        data: Optional[DataProto] = None,
+    ):
+        """
+        Append data to an appropriate buffer, occupying it.
+        NOTE: Since we simplified the reserve process as `set_version_tag` in rollout server,
+        this method is used to occupy the data in the buffer directly, such that the data tracker
+        is not used.
+
+        Args:
+            entry_info (EntryInfo): The entry metadata to occupy.
+            data (Optional[DataProto]): The data to occupy with. If None, will use data from data_pool.
+        """
+        if data is None:
+            # For group sampling, the rollout data is stored in the group data pool.
+            assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+            data = self.data_pool.pop(entry_info)
+
+        # Step 2: Get all PENDING buffers within the staleness limit
+        pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
+        candidate_ids = list(pending_buffers)
+        if not candidate_ids:
+            buffer_id = self.buffer_id
+            self.create_buffer(buffer_id)
+            candidate_ids = [buffer_id]
+        assert candidate_ids, f"No suitable PENDING buffer found."
+
+        # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
+        target_buffer_id = min(candidate_ids)
+        if entry_info.model_version + self.staleness < target_buffer_id:
+            psrl_logger.debug(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
+            return
+
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()
         assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, \

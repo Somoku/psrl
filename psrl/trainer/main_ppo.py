@@ -3,7 +3,6 @@ import socket
 import random
 import socket
 import random
-import sys
 import logging
 import torch
 import numpy as np
@@ -57,6 +56,7 @@ def run_ppo(config) -> None:
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
                     "PSRL_LOGGING_LEVEL": "DEBUG",
+                    "VLLM_SKIP_P2P_CHECK": "1",  # Skip P2P check for vLLM
                 }
             },
             num_cpus=config.ray_init.num_cpus,

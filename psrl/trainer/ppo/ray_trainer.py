@@ -1,6 +1,7 @@
 import os
 import torch
 import logging
+import asyncio
 import numpy as np
 from collections import defaultdict
 from enum import Enum
@@ -16,7 +17,6 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     compute_data_metrics,
     compute_throughout_metrics,
@@ -457,7 +457,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # switch to the inference engine and generate sequences
             # NOTE: `async_rollout_mode` regards to aysnc engine in verl, not the async rollout mode in PSRL as `psrl_async`.
             if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
             else:
                 self.async_rollout_manager.wake_up()
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
@@ -654,6 +654,47 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
                 return wg_dict.spawn(prefix_set=class_dict.keys())
         
+        # coroutine version
+        async def async_create_worker_groups():
+            tasks = []
+            for resource_pool, class_dict in self.resource_pool_to_cls.items():
+                psrl_logger.info(f"Creating worker group for resource pool: {resource_pool}, classes: {class_dict}")
+                if "ps" in class_dict:
+                    assert class_dict.keys() == {"ps"}, "PS resource pool should only have PS role."
+                    continue
+                tasks.append((resource_pool, class_dict))
+            
+            async def create_single_worker_group(resource_pool, class_dict):
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = loop.run_in_executor(executor, create_worker_group, resource_pool, class_dict)
+                    return await future
+            
+            # Concurrency control within 16 tasks at a time
+            max_concurrent = min(len(tasks), 16)
+            semaphore = asyncio.Semaphore(max_concurrent)
+            
+            async def controlled_create(resource_pool, class_dict):
+                async with semaphore:
+                    return await create_single_worker_group(resource_pool, class_dict)
+            
+            coroutines = [controlled_create(rp, cd) for rp, cd in tasks]
+            results = await asyncio.gather(*coroutines, return_exceptions=True)
+            
+            all_wg_async = {}
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    resource_pool, class_dict = tasks[i]
+                    psrl_logger.error(f"Error creating worker group for {resource_pool}, class {class_dict}: {str(result)}")
+                    raise result
+                all_wg_async.update(result)
+            
+            return all_wg_async
+
+        async_results = asyncio.run(async_create_worker_groups())
+        all_wg.update(async_results)
+        
+        '''
         # multi-thread version 
         tasks = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
@@ -678,6 +719,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     resource_pool, class_dict = futures[future]
                     psrl_logger.info(f"Error creating worker group for {resource_pool}, class {class_dict}: {str(e)}")
                     raise
+        '''
         
         '''
         # sync version
@@ -690,25 +732,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
-            self.critic_wg.init_model()
+            critic_futures = self.critic_wg.init_model()
+            ray.get(critic_futures)
 
         if self.use_reference_policy:
             self.ref_policy_wg = all_wg["ref"]
-            self.ref_policy_wg.init_model()
+            ref_futures = self.ref_policy_wg.init_model()
+            ray.get(ref_futures)
 
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
-            self.rm_wg.init_model()
+            rm_futures = self.rm_wg.init_model()
+            ray.get(rm_futures)
 
+        # Concurrently initialize actor and rollout instances
+        futures = []
         psrl_logger.info("Initializing actor model")
         self.actor_wg = all_wg["actor"]
-        self.actor_wg.init_model()
+        actor_futures = self.actor_wg.init_model()
+        futures.extend(actor_futures)
         
         psrl_logger.info("Initializing models in all rollout instances")
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         # simutaneously init all rollout instances
         self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.config.psrl.deployment.n_rollout_instances)]
-        futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
         ray.get(futures)

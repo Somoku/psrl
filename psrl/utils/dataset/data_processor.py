@@ -137,9 +137,13 @@ class DataProcessor:
         assert self.train_dataset is not None, "Train dataset is not built yet. Call build_train_and_val_dataset() first."
         assert self.train_sampler is not None, "Train sampler is not built yet. Call build_train_sampler() first."
 
-        batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
-        assert batch_size % self.config.psrl.deployment.n_rollout_instances == 0, \
-            f"Batch size {batch_size} is not divisible by" \
+        if self.config.psrl.rollout_test.redundant_rollout.enable:
+            batch_size = self.config.psrl.rollout_test.redundant_rollout.redundant_global_batch_size
+        else:
+            batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        
+        assert self.config.psrl.gen_mode != "batch" or batch_size % self.config.psrl.deployment.n_rollout_instances == 0, \
+            f"In batch mode, batch size {batch_size} is not divisible by" \
             f" the number of rollout instances {self.config.psrl.deployment.n_rollout_instances}"
 
         self.train_dataloader = StatefulDataLoader(

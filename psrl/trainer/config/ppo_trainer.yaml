@@ -32,12 +32,12 @@ psrl:
       redundant_rollout_n: null
     partial_rollout:
       enable: False
-      threshould: null
+      threshold: null
       interrupt_as_prompt: False
 
 data:
   tokenizer: null
-  use_shm: False # Whether to use shared memory for data loading.
+  use_shm: True # Whether to use shared memory for data loading.
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
   prompt_key: prompt
@@ -330,7 +330,7 @@ critic:
     weight_decay: 0.01
   model:
     path: ~/models/deepseek-llm-7b-chat
-    use_shm: False
+    use_shm: True
     tokenizer_path: ${train_actor_rollout_ref.model.path}
     override_config: { }
     external_lib: ${train_actor_rollout_ref.model.external_lib}

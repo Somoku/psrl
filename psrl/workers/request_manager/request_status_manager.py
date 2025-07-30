@@ -6,7 +6,6 @@ from typing import Union, List, Optional
 
 import ray
 
-from psrl.utils.ray import add_lock
 from psrl.workers.ps.staleness_controller import EntryInfo
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
@@ -89,7 +88,7 @@ class RequestStatusManager:
         """
         self.reward_server = reward_server_ref
 
-    def update_status(self, request_id: Union[List[int], int], status: RequestStatus, model_version=None, rollout_instance_id=None):
+    def update_status(self, request_id: Union[List[int], int], status: RequestStatus, model_version=-1, rollout_instance_id=-1):
         """
         Update the status of a request.
         This method will first check if the request will be aborted, and if so,
@@ -104,31 +103,37 @@ class RequestStatusManager:
         Returns:
             True if the status was updated successfully, False if the request was aborted.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]  # Convert single request_id to a list for uniform processing
+        if not isinstance(model_version, list):
+            model_version = [model_version] * len(request_id)
+        if not isinstance(rollout_instance_id, list):
+            rollout_instance_id = [rollout_instance_id] * len(request_id)
+
+        assert len(request_id) == len(model_version) == len(rollout_instance_id), \
+            "request_id, model_version, and rollout_instance_id must have the same length."
         
         # Ensure the status is valid
         if status not in RequestStatus:
             raise ValueError(f"Invalid status: {status}")
         
-        psrl_logger.debug("Updating status for request_ids: %s to status: %s", request_id, status.name)
         request_update_success = [True for _ in range(len(request_id))]
         
         for i, req_id in enumerate(request_id):
             # Check if the request is marked for abortion
             if req_id in self._abort_request_ids:
-                psrl_logger.debug("Request %d is marked for abortion, cannot update status", req_id)
                 request_update_success[i] = False
                 self._abort_request_ids.remove(req_id)  # Remove from abort set
                 self.remove_request(req_id)  # Remove from status and info maps
-                if req_id in self.rollout_request_buffer:
-                    del self.rollout_request_buffer[req_id]  # Remove from buffer if exists
-                psrl_logger.debug("Removed aborted request %d from all tracking structures", req_id)
                 continue
             
             # If the request is stale, we should not update its status
             if req_id in self._request_infos:
-                request_version = model_version[i] if model_version else self._request_infos[req_id].model_version
+                if rollout_instance_id[i] != -1:
+                    self._request_infos[req_id].rollout_instance_id = rollout_instance_id[i]
+                if model_version[i] != -1:
+                    self._request_infos[req_id].model_version = model_version[i]
+                request_version = self._request_infos[req_id].model_version
                 if request_version < self._running_min_version:
                     psrl_logger.debug("Request %d is stale (version %d < %d), cannot update status", 
                                       req_id, request_version, self._running_min_version)
@@ -143,16 +148,10 @@ class RequestStatusManager:
                 self._status_to_request_ids[status].add(req_id)
                 self._request_id_to_status[req_id] = status
                 # Update the rollout instance ID if provided
-                if rollout_instance_id:
-                    old_instance = self._request_infos[req_id].rollout_instance_id
-                    self._request_infos[req_id].rollout_instance_id = rollout_instance_id
-                    psrl_logger.debug("Updated rollout_instance_id for request %d: %d -> %d", 
-                                     req_id, old_instance, rollout_instance_id)
-                if model_version:
-                    old_version = self._request_infos[req_id].model_version
+                if rollout_instance_id[i] != -1:
+                    self._request_infos[req_id].rollout_instance_id = rollout_instance_id[i]
+                if model_version[i] != -1:
                     self._request_infos[req_id].model_version = model_version[i]
-                    psrl_logger.debug("Updated model version for request %d: %d -> %d", 
-                                     req_id, old_version, model_version[i])
             else:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
         
@@ -169,7 +168,7 @@ class RequestStatusManager:
         Returns:
             RequestStatus: The current status of the requests. If the request ID does not exist, returns None.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]
 
         status_list = [self._request_id_to_status.get(req_id, None) for req_id in request_id]
@@ -185,14 +184,14 @@ class RequestStatusManager:
         Args:
             request_id (List[int], int): The unique identifier of the request to remove.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]
 
         for req_id in request_id:
             assert req_id in self._request_id_to_status, f"Request ID {req_id} not found in status map."
             assert req_id in self._request_infos, f"Request ID {req_id} not found in request infos."
-            assert self._request_id_to_status[req_id] == RequestStatus.ROLLOUT_COMPLETED, \
-                f"Request ID {req_id} is not in ROLLOUT_COMPLETED status."
+            assert self._request_id_to_status[req_id] == RequestStatus.REWARD_COMPLETED, \
+                f"Request ID {req_id} is not in REWARD_COMPLETED status."
             
             assert req_id not in self._abort_request_ids, \
                 f"Request ID {req_id} is marked for abortion and cannot be removed."
@@ -200,7 +199,7 @@ class RequestStatusManager:
             # Remove the request from the status map and request infos
             del self._request_id_to_status[req_id]
             del self._request_infos[req_id]
-            self._status_to_request_ids[RequestStatus.ROLLOUT_COMPLETED].discard(req_id)
+            self._status_to_request_ids[RequestStatus.REWARD_COMPLETED].discard(req_id)
 
     def get_all_statuses(self) -> dict:
         """
@@ -239,21 +238,13 @@ class RequestStatusManager:
             model_version (int, optional): The model version of the request. Defaults to -1.
             status (RequestStatus, optional): The initial status of the request. Defaults to RequestStatus.PENDING.
         """
-        psrl_logger.debug("Adding new request %d with rollout_instance_id=%d, model_version=%d, status=%s",
-                         request_id, rollout_instance_id, model_version, status.name)
-        
-        if request_id in self._request_id_to_status:
-            psrl_logger.debug("Request %d already exists with status %s, updating", 
-                             request_id, self._request_id_to_status[request_id].name)
-            self._status_to_request_ids[self._request_id_to_status[request_id]].discard(request_id)
-        
-        # Add request to status map and status set
+        self._request_infos[request_id] = EntryInfo(
+            request_id=request_id,
+            rollout_instance_id=rollout_instance_id,
+            model_version=model_version,
+        )
         self._request_id_to_status[request_id] = status
         self._status_to_request_ids[status].add(request_id)
-        
-        # Add request info
-        entry_info = EntryInfo(rollout_instance_id=rollout_instance_id, request_id=request_id, model_version=model_version)
-        self._request_infos[request_id] = entry_info
     
     def abort_requests(self, request_ids: Union[List[int], int], blocking: bool = False):
         """
@@ -263,7 +254,7 @@ class RequestStatusManager:
             request_ids (Union[List[int], int]): The unique identifiers of the requests to abort.
             blocking (bool, optional): Whether to block until the abortion is complete. Defaults to False.
         """
-        if isinstance(request_ids, int):
+        if not isinstance(request_ids, list):
             request_ids = [request_ids]
         
         psrl_logger.debug("Marking requests for abortion: %s, blocking=%s", request_ids, blocking)
@@ -288,33 +279,28 @@ class RequestStatusManager:
         
         # Abort requests in rollout stage (ROLLOUT_RUNNING)
         if abort_requests_for_rollout:
-            try:
-                psrl_logger.debug("Aborting requests in rollout stages: %s", abort_requests_for_rollout)
-                ray.get(self.rollout_server.exec_command.remote(
-                    Command(
-                        type=CommandType.ABORT,
-                        uids=list(abort_requests_for_rollout),
-                    ),
-                    blocking=blocking,
-                ))
-                psrl_logger.debug("Abort command sent to rollout server for requests: %s", abort_requests_for_rollout)
-            except Exception as e:
-                psrl_logger.debug("Error aborting requests in rollout server: %s", e)
+            psrl_logger.debug("Aborting requests in rollout stages: %s", abort_requests_for_rollout)
+            instance_to_request_ids = self.classify_requests_in_instance(list(abort_requests_for_rollout))
+            ray.get(self.rollout_server.exec_command.remote(
+                Command(
+                    type=CommandType.ABORT,
+                    instance_to_uids=instance_to_request_ids,
+                ),
+                blocking=blocking,
+            ))
+            psrl_logger.debug("Abort command sent to rollout server for requests: %s", abort_requests_for_rollout)
         
         # Abort requests in reward stage (REWARD_RUNNING)
         if abort_requests_for_reward:
-            try:
-                psrl_logger.debug("Aborting requests in reward stages: %s", abort_requests_for_reward)
-                ray.get(self.reward_server.exec_command.remote(
-                    Command(
-                        type=CommandType.ABORT,
-                        uids=list(abort_requests_for_reward),
-                    ),
-                    blocking=blocking,
-                ))
-                psrl_logger.debug("Abort command sent to reward server for requests: %s", abort_requests_for_reward)
-            except Exception as e:
-                    psrl_logger.debug("Error aborting requests in reward server: %s", e)
+            psrl_logger.debug("Aborting requests in reward stages: %s", abort_requests_for_reward)
+            ray.get(self.reward_server.exec_command.remote(
+                Command(
+                    type=CommandType.ABORT,
+                    uids=list(abort_requests_for_reward),
+                ),
+                blocking=blocking,
+            ))
+            psrl_logger.debug("Abort command sent to reward server for requests: %s", abort_requests_for_reward)
     
     def classify_requests_in_status(self, request_ids: Union[List[int], int]) -> dict:
         """
@@ -326,14 +312,16 @@ class RequestStatusManager:
         Returns:
             dict: A dictionary mapping statuses to sets of request IDs that are in those statuses.
         """
-        if isinstance(request_ids, int):
+        if not isinstance(request_ids, list):
             request_ids = [request_ids]
         
         classified_requests = {}
         for req_id in request_ids:
             if req_id in self._request_id_to_status:
                 status = self._request_id_to_status[req_id]
-                classified_requests.setdefault(status, set()).add(req_id)
+                if status not in classified_requests:
+                    classified_requests[status] = set()
+                classified_requests[status].add(req_id)
             else:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
         
@@ -349,14 +337,16 @@ class RequestStatusManager:
         Returns:
             dict: A dictionary mapping instance IDs to sets of request IDs that belong to those instances.
         """
-        if isinstance(request_ids, int):
+        if not isinstance(request_ids, list):
             request_ids = [request_ids]
         
         classified_requests = {}
         for req_id in request_ids:
             if req_id in self._request_infos:
                 instance_id = self._request_infos[req_id].rollout_instance_id
-                classified_requests.setdefault(instance_id, set()).add(req_id)
+                if instance_id not in classified_requests:
+                    classified_requests[instance_id] = set()
+                classified_requests[instance_id].add(req_id)
             else:
                 raise KeyError(f"Request ID {req_id} not found in request infos.")
         
@@ -372,7 +362,7 @@ class RequestStatusManager:
         Returns:
             set[int]: A list of child request IDs associated with the parent request.
         """
-        if isinstance(parent_id, int):
+        if not isinstance(parent_id, list):
             parent_id = [parent_id]
         
         child_requests = []
@@ -394,7 +384,7 @@ class RequestStatusManager:
         Returns:
             EntryInfo: The EntryInfo objects associated with the request IDs, or None if not found.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]
         
         request_infos = [self._request_infos.get(req_id, None) for req_id in request_id]
@@ -413,7 +403,7 @@ class RequestStatusManager:
         Args:
             entry_info (List[EntryInfo], EntryInfo): The new EntryInfo object to associate with the request ID.
         """
-        if isinstance(entry_info, EntryInfo):
+        if not isinstance(entry_info, list):
             entry_info = [entry_info]
         
         # Ensure all request IDs in entry_info exist in the manager
@@ -426,7 +416,7 @@ class RequestStatusManager:
         for info in entry_info:
             request_id = info.request_id
             if request_id in self._request_infos:
-                self._request_infos[request_id] = entry_info
+                self._request_infos[request_id] = info
             else:
                 raise KeyError(f"Request ID {request_id} not found.")
 
@@ -437,7 +427,7 @@ class RequestStatusManager:
         Args:
             request_id (List[int], int): The unique identifier of the request to abort.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]
 
         for req_id in request_id:
@@ -461,7 +451,7 @@ class RequestStatusManager:
         self._request_infos.clear()
         self._abort_request_ids.clear()
     
-    def get_requests_of_version(self, version: int) -> set[int]:
+    def get_requests_ids_of_version(self, version: int) -> set[int]:
         """
         Get all requests associated with a specific version.
         
@@ -473,6 +463,18 @@ class RequestStatusManager:
         """
         assert version >= 0, "Version must be a non-negative integer."
         return {req_id for req_id, info in self._request_infos.items() if info.model_version == version}
+    
+    def get_dispatched_requests_of_instance(self, instance_id: int) -> set[int]:
+        """
+        Get all dispatched requests associated with a specific rollout instance.
+        
+        Args:
+            instance_id (int): The ID of the rollout instance to filter requests by.
+        
+        Returns:
+            set[int]: A set of requests that are dispatched to the specified instance.
+        """
+        return {info for req_id, info in self._request_infos.items() if info.rollout_instance_id == instance_id}
     
     def abort_requests_of_version(self, version: int):
         """
@@ -491,8 +493,6 @@ class RequestStatusManager:
             if info.model_version == version:
                 # If the request version matches, we will abort it
                 abort_request_ids.add(req_id)
-            elif info.model_version < version:
-                raise ValueError(f"Found request ID {req_id} with version {info.model_version} when buffer version is {version}.")
         self._running_min_version = max(self._running_min_version, version + 1)
         self.abort_requests(list(abort_request_ids), blocking=True)
 
@@ -504,7 +504,7 @@ class RequestStatusManager:
             request_id (List[int], int): The unique identifier of the request.
             new_version (int): The new version to set for the request.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]
 
         for req_id in request_id:
@@ -521,7 +521,7 @@ class RequestStatusManager:
             request_id (List[int], int): The unique identifier of the request.
             new_instance (id): The new instance to set for the request.
         """
-        if isinstance(request_id, int):
+        if not isinstance(request_id, list):
             request_id = [request_id]
 
         for req_id in request_id:
@@ -538,8 +538,6 @@ class RequestStatusManager:
             request_data (dict): A dictionary mapping request IDs to their corresponding data.
         """
         for req_id, data in request_data.items():
-            if req_id in self._request_id_to_status:
-                raise KeyError(f"Request ID {req_id} already exists in status map.")
             self.rollout_request_buffer[req_id] = data
     
     def get_request_data_from_buffer(self, request_id: int) -> Optional[dict]:
@@ -564,6 +562,8 @@ class RequestStatusManager:
         Returns:
             dict: The data associated with the request ID, or None if not found.
         """
+        assert request_id in self.rollout_request_buffer, \
+            f"Request ID {request_id} not found in rollout request buffer."
         return self.rollout_request_buffer.pop(request_id, None)
     
     def remove_request_data_from_buffer(self, request_id: int):

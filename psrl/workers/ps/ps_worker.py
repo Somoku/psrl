@@ -93,15 +93,14 @@ class PSRL_PSWorker(Worker):
         # Set of buffer ids that have been logged as ready, to avoid duplicate logging
         self.logged_ready_buffer_ids: Set[int] = set()
         
-        if not dist.is_initialized():
-            dist.init_process_group()
-        assert self.world_size == dist.get_world_size(), "The world size of PSRL_PSWorker must match the torch distributed world size."
+        self.max_ready_buffer_id = -1
         
         if self.is_ps_representative_rank:
             # Initialize the staleness inventory
             entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.alg_rollout_n
             self.staleness_inventory = StalenessInventory(
                 num_entries=entries_per_buffer,
+                staleness=self.psrl_config.staleness,
             )
             psrl_logger.debug(f"Staleness inventory initialized with {entries_per_buffer} entries per buffer")
 
@@ -253,10 +252,31 @@ class PSRL_PSWorker(Worker):
 
     def try_awake_waiters(self):
         # Check whether there exists ready buffer for training
-        min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
-        if min_ready_buffer_id is not None:
-            psrl_logger.debug(f"Found min ready buffer is {min_ready_buffer_id}")
-            self.process_ready_buffer(min_ready_buffer_id)
+        max_ready_buffer_id = self.staleness_inventory.max_ready_buffer_id()
+        if (
+            max_ready_buffer_id is not None and
+            max_ready_buffer_id > self.max_ready_buffer_id
+        ):
+            self.max_ready_buffer_id = max_ready_buffer_id
+            curr_ps_model_version = self.get_ps_model_version()
+        
+            # Notify the request status manager to abort requests
+            # whose version_tag is equal to `min_ready_buffer_id - S`
+            if max_ready_buffer_id >= self.psrl_config.staleness:
+                # Abort requests with version_tag equal to `min_ready_buffer_id - S`
+                version_to_abort = max_ready_buffer_id - self.psrl_config.staleness
+                psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")
+                ray.get(self.request_status_manager.abort_requests_of_version.remote(version_to_abort))
+                psrl_logger.debug(f"Abort requests of version {version_to_abort} done")
+            
+            # Notify the rollout server to check interruption
+            if self.psrl_config.rollout_test.partial_rollout.enable:
+                psrl_logger.debug(f"Start to check and sync for ready buffer {max_ready_buffer_id} with current PS model version {curr_ps_model_version}.")
+                ray.get(self.rollout_server.exec_command.remote(Command(
+                    type=CommandType.CHECK_AND_SYNC,
+                    buffer_id=max_ready_buffer_id,
+                    curr_ps_model_version=curr_ps_model_version,
+                ), blocking=False))
 
     def log_ready_buffer(self, buffer_id: int):
         """Log the ready buffer."""
@@ -276,22 +296,6 @@ class PSRL_PSWorker(Worker):
         Args:
             min_ready_buffer_id (int): The minimum ready buffer ID to process
         """
-        curr_ps_model_version = self.get_ps_model_version()
-        
-        # Notify the request status manager to abort requests
-        # whose version_tag is equal to `min_ready_buffer_id - S`
-        if min_ready_buffer_id >= self.psrl_config.staleness:
-            # Abort requests with version_tag equal to `min_ready_buffer_id - S`
-            version_to_abort = min_ready_buffer_id - self.psrl_config.staleness
-            psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {min_ready_buffer_id}.")
-            ray.get(self.request_status_manager.abort_requests_of_version.remote(version_to_abort))
-        
-        # Notify the rollout server to check interruption
-        ray.get(self.rollout_server.exec_command.remote(Command(
-            type=CommandType.CHECK_AND_SYNC,
-            buffer_id=min_ready_buffer_id,
-            curr_ps_model_version=curr_ps_model_version,
-        ), blocking=False))
         self.log_ready_buffer(min_ready_buffer_id)
         # If there are ready buffers, wake up the waiters for the minimum ready buffer
         self._awake_training_batch_waiters(min_ready_buffer_id)
@@ -330,7 +334,8 @@ class PSRL_PSWorker(Worker):
     def store_and_maybe_occupy_rollout_instance_request(
         self,
         rollout_instance_id: Union[str, int],
-        request_id: Union[str, int],
+        request_id: int,
+        version_tag: int,
         data: DataProto,
         parent_id: Optional[Union[str, int]]=None,
     ):
@@ -343,7 +348,8 @@ class PSRL_PSWorker(Worker):
         
         Args:
             rollout_instance_id (Union[str, int]): The rollout instance id
-            request_id (Union[str, int]): The request id
+            request_id (int): The request id
+            version_tag (int): The model version tag for the request
             data (DataProto): The data to store
             parent_id (Optional[Union[str, int]]): The parent request id (for group sampling)
         """
@@ -351,12 +357,10 @@ class PSRL_PSWorker(Worker):
         assert self.is_ps_representative_rank, "Only the representative PS worker can occupy a rollout instance request."
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
-        curr_rollout_instance_model_version = self.get_rollout_instance_model_version(rollout_instance_id)
-        psrl_logger.debug(f"Current model version for rollout_instance_id {rollout_instance_id}: {curr_rollout_instance_model_version}")
         entry_info = EntryInfo(
             rollout_instance_id=rollout_instance_id,
             request_id=request_id,
-            model_version=curr_rollout_instance_model_version
+            model_version=version_tag
         )
         
         # Remove the request from the training ready requests in the request status manager
@@ -389,7 +393,7 @@ class PSRL_PSWorker(Worker):
                 abort_child_ids = all_child_ids - stored_child_ids
                 psrl_logger.debug(f"All child IDs: {all_child_ids}, Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
                 
-                # Remove the parent request (sample) data from the buffer in the request status manager
+                # Remove the sample data from the buffer in the request status manager
                 psrl_logger.debug(f"Removing request data of {parent_id} from request status manager buffer")
                 ray.get(self.request_status_manager.remove_request_data_from_buffer.remote(parent_id))
                 psrl_logger.debug(f"Successfully removed request data of {parent_id} from buffer")
@@ -397,7 +401,7 @@ class PSRL_PSWorker(Worker):
                 # Notify the request status manager to abort the child requests
                 if abort_child_ids:
                     psrl_logger.debug(f"Aborting child requests {abort_child_ids} for parent request {parent_id}.")
-                    ray.get(self.request_status_manager.abort_requests.remote(abort_child_ids))
+                    ray.get(self.request_status_manager.abort_requests.remote(list(abort_child_ids)))
                     psrl_logger.debug(f"Successfully aborted {len(abort_child_ids)} child requests")
 
                 psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
@@ -409,8 +413,9 @@ class PSRL_PSWorker(Worker):
                 self.try_awake_waiters()
                 psrl_logger.debug(f"Finished group sampling request processing for parent_id {parent_id}")
         else:
+            # Remove the sample data from the buffer in the request status manager
+            ray.get(self.request_status_manager.remove_request_data_from_buffer.remote(request_id))
             # Directly occupy data, bypassing storing process
-            psrl_logger.debug(f"No parent_id provided, directly occupying data for request_id {request_id}")
             self.staleness_inventory.occupy_data(
                 entry_info=entry_info,
                 data=data,
@@ -452,7 +457,6 @@ class PSRL_PSWorker(Worker):
         # Wake all Futures waiting for this buffer
         if buffer_id in self._buffer_waiters:
             buffer_data = self.staleness_inventory.consume_buffer(buffer_id)
-            psrl_logger.debug(f"Consume buffer {buffer_id}: {buffer_data}")
             assert len(self._buffer_waiters[buffer_id]) == 1, \
                 f"Expected only one waiter for buffer {buffer_id}, but found {len(self._buffer_waiters[buffer_id])}."
             # Set the result for all futures

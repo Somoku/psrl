@@ -75,7 +75,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker):
         else:
             assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
     
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             super().init_model()

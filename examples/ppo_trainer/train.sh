@@ -40,9 +40,9 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.ps_nnodes=${PS_NNODES} \
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
-    psrl.nixl_server_mode=meta_server \
-    psrl.nixl_server_ip=${MASTER_NODE_IP} \
-    psrl.nixl_server_port=23456 \
+    psrl.nixl.server_mode=meta_server \
+    psrl.nixl.server_ip=${MASTER_NODE_IP} \
+    psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout.model.path="$MODEL_PATH" \
     gen_actor_rollout.rollout.log_prob_micro_batch_size_per_gpu=16 \

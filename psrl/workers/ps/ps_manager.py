@@ -318,16 +318,15 @@ class PSManager:
     def init_nixl_server(self, expected_clients: int):
         """Initialize the nixl server."""
         self.expected_clients = expected_clients
-        if self.psrl_config.nixl_server_mode == "storage_server":
+        if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl_server_mode == "meta_server":
+        elif self.psrl_config.nixl.server_mode == "meta_server":
             self.nixl_meta_server = NIXLMetaServer(
                 "NIXLMetaServer", 
-                self.psrl_config.nixl_server_ip, 
-                self.psrl_config.nixl_server_port
+                self.psrl_config.nixl
             )
         else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl_server_mode}")
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         
     def nixl_protocol(self):
         """Connect to the nixl clients and sync the client shardings/infos/comm_plan/temp_mappings to all clients."""

@@ -9,6 +9,7 @@ from copy import deepcopy
 from typing import Dict, Any, Set, Optional, List, Tuple
 from dataclasses import dataclass
 from nixl._api import nixl_agent, nixl_agent_config
+from omegaconf import DictConfig
 
 from psrl.utils.logger import deprecated, get_worker_info
 from psrl.utils.nixl.network_topology import get_local_ip, get_local_gpu_id
@@ -75,7 +76,7 @@ class NIXLStorageServer:
             desc_bytes = self.agent.get_serialized_descs(desc)
             self.tensor_descs[key] = NIXLTensorDescInfo(desc_bytes_list=[desc_bytes], shard_dim=-1, shard_mesh=1, shard_indices=[0])
 
-    def wait_for_client_infos(self, expected_clients: int = 1, timeout: float = 30.0):
+    def wait_for_client_infos(self, expected_clients: int = 1, timeout: float = 60.0):
         """
         Wait for all clients to connect and synchronize metadata.
         """
@@ -119,10 +120,10 @@ class NIXLMetaServer:
     """
     NIXL meta server: only stores client meta and desc info, not state dict.
     """
-    def __init__(self, server_name: str, server_ip: str, server_port: int = 23456):
+    def __init__(self, server_name: str, nixl_config: DictConfig):
         self.server_name = server_name
-        self.server_ip = server_ip
-        self.server_port = server_port
+        self.server_ip = nixl_config.server_ip
+        self.server_port = nixl_config.server_port
         self.agent = nixl_agent(
             self.server_name,
             nixl_agent_config(True, True, self.server_port)
@@ -302,22 +303,21 @@ class NIXLStorageClient:
         self, 
         client_name: str, 
         server_name: str, 
-        server_ip: str, 
-        server_port: int = 23456, 
-        use_gpu: bool = False, 
-        mode: str = "meta_server",
-        client_type: NIXLClientType = NIXLClientType.PS,
+        use_gpu: bool, 
+        client_type: NIXLClientType,
+        nixl_config: DictConfig,
         nixl_interface: NIXLInterface = NIXLInterface()
     ):
         self.client_name = client_name
         self.server_name = server_name
-        self.server_ip = server_ip
-        self.server_port = server_port
         if use_gpu:
             assert torch.cuda.is_available(), "CUDA is not available."
         self.device = torch.device("cuda" if use_gpu else "cpu")
-        self.mode = mode  # "storage_server" or "meta_server"
         self.client_type = client_type
+        self.mode = nixl_config.server_mode  # "storage_server" or "meta_server"
+        self.server_ip = nixl_config.server_ip
+        self.server_port = nixl_config.server_port
+        self.max_pinned_temp_memory_slots = nixl_config.max_pinned_temp_memory_slots # None means no pinned temp memory
         self.nixl_interface = nixl_interface
         
         self.client_port = 0 if self.nixl_interface.port_scanner is None else \
@@ -330,11 +330,14 @@ class NIXLStorageClient:
         self.xfer_handles: Dict[tuple, Any] = {}  # (key, tag, op_type) or (key, tag, op_type, target_client) -> handle
         self._is_connected = False
         
-        # Temporary memory management for non-contiguous tensors
+        # Original tensor mapping for contiguous tensors
         self._original_tensor_mapping: Dict[Tuple[str, Tuple[int, ...]], torch.Tensor] = {}  # (key, shard_idx) -> original_tensor
+        # Temporary memory management for non-contiguous tensors
+        self._temp_pinned_idx_mapping: Dict[Tuple[str, Tuple[int, ...]], int] = {}  # (key, shard_idx) -> pinned_idx
         self._temp_tensor_mapping: Dict[Tuple[str, Tuple[int, ...]], torch.Tensor] = {}  # (key, shard_idx) -> contiguous_tensor
         self._temp_desc_mapping: Dict[Tuple[str, Tuple[int, ...]], bytes] = {}  # (key, shard_idx) -> desc_bytes
         self._temp_meta_mapping: Dict[Tuple[str, Tuple[int, ...]], NIXLShardMetaInfo] = {}  # (key, shard_idx) -> meta_info
+        self._pinned_slot_running_xfer: Dict[int, tuple] = {} # pinned_idx -> (key, tag, op_type, target_client)
         
         # Deprecated: storage_server mode
         self.server_client_info: Optional[NIXLClientInfo] = None
@@ -363,6 +366,7 @@ class NIXLStorageClient:
     def reallocate_temp_memory(self):
         """Reallocate temporary memory for non-contiguous shards"""
         assert self.local_client_info is not None, "Local client info not registered."
+        assert self.max_pinned_temp_memory_slots is None, "temporary memory reallocation is forbidden if pinned temp memory is enabled"
         
         for key, tensor_info in self.local_client_info.descs.items():
             for idx, meta_info in enumerate(tensor_info.shard_meta_infos):
@@ -412,7 +416,28 @@ class NIXLStorageClient:
             state_dict: {key: torch.Tensor}
             sharding_dict: {key: NIXLSharding}
         """
+        # If pinned temp memory is enabled, we need to first scan the state_dict and find all the tensors that are not contiguous
+        # Then we need to find the largest uncontiguous tensor and allocate max_pinned_temp_memory_slots times of its size as pinned memory (a tensor like this: [max_pinned_temp_memory_slots, *])
+        # Then we enumerate the uncontiguous tensors again and map them with the pinned memory in a round-robin manner (the first uncontiguous tensor map to [0, *], the second to [1, *], the (max_pinned_temp_memory_slots+1)-th to [0, *] again, etc.)
+        # We should record a mapping from the uncontiguous tensor to the index of the pinned memory
+        _uncontiguous_tensor_list = []
+        if self.max_pinned_temp_memory_slots is not None:
+            # Scan the state_dict and find all the tensors that are not contiguous
+            for key, tensor in state_dict.items():
+                assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                if tensor.device == torch.device("meta"):
+                    continue
+                sharding = sharding_dict[key]
+                local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+                for local_sharded_tensor in local_sharded_tensors:
+                    if not local_sharded_tensor.is_contiguous():
+                        _uncontiguous_tensor_list.append(local_sharded_tensor)
+            # Find the largest uncontiguous tensor and allocate pinned memory for it
+            largest_uncontiguous_tensor = max(_uncontiguous_tensor_list, key=lambda x: x.numel() * x.element_size())
+            self._pinned_memory = torch.empty(self.max_pinned_temp_memory_slots, largest_uncontiguous_tensor.numel(), dtype=largest_uncontiguous_tensor.dtype, device=largest_uncontiguous_tensor.device)
+        
         descs = {}
+        uncontiguous_tensor_pinned_idx = 0
         for key, tensor in state_dict.items():
             assert key in sharding_dict, f"Key {key} not found in sharding_dict."
             sharding = sharding_dict[key]
@@ -429,6 +454,17 @@ class NIXLStorageClient:
                 if local_sharded_tensor.device == torch.device("meta"):
                     local_sharded_tensor = torch.empty_like(local_sharded_tensor, device=self.device)
                 self._original_tensor_mapping[(key, shard_indices[local_pos])] = local_sharded_tensor
+                
+                # Create meta info for non-contiguous shard
+                is_contiguous = local_sharded_tensor.is_contiguous()
+                meta_info = NIXLShardMetaInfo(
+                    dtype=local_sharded_tensor.dtype,
+                    device=local_sharded_tensor.device,
+                    shape=local_sharded_tensor.shape,
+                    stride=local_sharded_tensor.stride(),
+                    is_contiguous=is_contiguous
+                )
+                shard_meta_info_list.append(meta_info)
                     
                 # Check if the shard is contiguous
                 if local_sharded_tensor.is_contiguous():
@@ -438,38 +474,37 @@ class NIXLStorageClient:
                         raise RuntimeError(f"Memory registration failed for key {key} shard {shard_indices[local_pos]}.")
                     desc_bytes = self.agent.get_serialized_descs(desc)
                     desc_bytes_list.append(desc_bytes)
-                    # Create meta info for contiguous shard
-                    meta_info = NIXLShardMetaInfo(
-                        dtype=local_sharded_tensor.dtype,
-                        device=local_sharded_tensor.device,
-                        shape=local_sharded_tensor.shape,
-                        stride=local_sharded_tensor.stride(),
-                        is_contiguous=True
-                    )
-                    shard_meta_info_list.append(meta_info)
                 else:
-                    # Non-contiguous shard: create temporary contiguous memory
-                    # Create a new contiguous tensor with the same shape and dtype
-                    contiguous_tensor = torch.empty_like(local_sharded_tensor, memory_format=torch.contiguous_format)
-                    # Register the contiguous tensor
+                    if self.max_pinned_temp_memory_slots is None:
+                        # Non-contiguous shard: create temporary contiguous memory
+                        # Create a new contiguous tensor with the same shape and dtype
+                        contiguous_tensor = torch.empty_like(local_sharded_tensor)
+                    else:
+                        # Non-contiguous shard: map to pinned memory
+                        pinned_slot = self._pinned_memory[uncontiguous_tensor_pinned_idx]
+                        required_bytes = local_sharded_tensor.numel() * local_sharded_tensor.element_size()
+                        available_bytes = pinned_slot.numel() * pinned_slot.element_size()
+                        assert available_bytes >= required_bytes, f"Pinned slot {uncontiguous_tensor_pinned_idx} has {available_bytes} bytes, but the {key} shard {shard_indices[local_pos]} requires {required_bytes} bytes."
+                        # Make a view of the pinned slot
+                        # We use the base_addr of pinned_slot as the base_addr of the contiguous tensor and the shape/dtype of the contiguous tensor is the same as the local_sharded_tensor
+                        contiguous_tensor = torch.frombuffer(
+                            pinned_slot, 
+                            dtype=local_sharded_tensor.dtype,
+                            count=local_sharded_tensor.numel()
+                        ).reshape(local_sharded_tensor.shape)
+                        self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])] = uncontiguous_tensor_pinned_idx
+                        uncontiguous_tensor_pinned_idx = (uncontiguous_tensor_pinned_idx + 1) % self.max_pinned_temp_memory_slots
+                     
+                    # Register the contiguous tensor   
                     desc = self.agent.register_memory([contiguous_tensor])
                     if not desc:
                         raise RuntimeError(f"Memory registration failed for key {key} shard {shard_indices[local_pos]} (contiguous temp).")
                     desc_bytes = self.agent.get_serialized_descs(desc)
                     # Store None in desc_bytes_list to indicate this shard uses temp memory
-                    desc_bytes_list.append(None)
+                    desc_bytes_list.append(desc_bytes)
                     # Store temporary mappings
                     self._temp_tensor_mapping[(key, shard_indices[local_pos])] = contiguous_tensor
                     self._temp_desc_mapping[(key, shard_indices[local_pos])] = desc_bytes
-                    # Create meta info for non-contiguous shard
-                    meta_info = NIXLShardMetaInfo(
-                        dtype=local_sharded_tensor.dtype,
-                        device=local_sharded_tensor.device,
-                        shape=local_sharded_tensor.shape,
-                        stride=local_sharded_tensor.stride(),
-                        is_contiguous=False
-                    )
-                    shard_meta_info_list.append(meta_info)
                     self._temp_meta_mapping[(key, shard_indices[local_pos])] = meta_info
             
             # Create the tensor descriptor info
@@ -489,7 +524,7 @@ class NIXLStorageClient:
             meta=self.agent.get_agent_metadata()
         )
         
-    def connect_to_server(self, timeout: float = 30.0):
+    def connect_to_server(self, timeout: float = 60.0):
         """
         Connect to the storage/meta server.
         """
@@ -536,7 +571,7 @@ class NIXLStorageClient:
         assert self._is_connected, "Not connected to server"
         self.agent.send_notif(self.server_name, pickle.dumps(self._temp_desc_mapping))
         
-    def wait_for_server_sharding(self, timeout: float = 120.0):
+    def wait_for_server_sharding(self, timeout: float = 60.0):
         """
         Wait for the server sharding to be fetched.
         """
@@ -556,7 +591,7 @@ class NIXLStorageClient:
         self._unified_sharding_dict_fetched = True
         return self._unified_sharding_dict
         
-    def wait_for_server_info(self, timeout: float = 30.0):
+    def wait_for_server_info(self, timeout: float = 60.0):
         """
         Wait for the server info to be fetched.
         For storage_server mode, wait for the storage server info to be fetched.
@@ -615,7 +650,7 @@ class NIXLStorageClient:
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-    def wait_for_server_temp_mappings(self, timeout: float = 30.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 60.0):
         """Wait for the server temporary mappings to be fetched."""
         assert self.mode == "meta_server", "wait_for_server_temp_mappings only valid in meta_server mode"
         assert self._is_connected, "Not connected to server"
@@ -712,6 +747,16 @@ class NIXLStorageClient:
                 local_desc_bytes = self._get_temp_desc(self.client_name, key, shard_idx)
                 if local_desc_bytes is None:
                     raise RuntimeError(f"No temporary descriptor found for key {key} shard {shard_idx}")
+                # Wait for the pinned slot to be available
+                if self.max_pinned_temp_memory_slots is not None:
+                    pinned_idx = self._temp_pinned_idx_mapping[(key, shard_idx)]
+                    if pinned_idx in self._pinned_slot_running_xfer:
+                        key, tag, op_type, target_client = self._pinned_slot_running_xfer[pinned_idx]
+                        start_time = time.time()
+                        self.wait(key, tag, op_type, target_client=target_client)
+                        end_time = time.time()
+                        print(f"{self.client_name} read uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available after {end_time - start_time} seconds")
+                    self._pinned_slot_running_xfer[pinned_idx] = (key, tag, "READ", target_client)  
             
             # Get remote descriptor (check if it's a temporary one)
             remote_desc_bytes = remote_info.desc_bytes_list[remote_pos]
@@ -769,6 +814,16 @@ class NIXLStorageClient:
                 contiguous_tensor = self._get_local_temp_tensor(key, shard_idx)
                 if contiguous_tensor is None:
                     raise RuntimeError(f"No temporary tensor mapping found for key {key} shard {shard_idx}")
+                # Wait for the pinned slot to be available
+                if self.max_pinned_temp_memory_slots is not None:
+                    pinned_idx = self._temp_pinned_idx_mapping[(key, shard_idx)]
+                    if pinned_idx in self._pinned_slot_running_xfer:
+                        key, tag, op_type, target_client = self._pinned_slot_running_xfer[pinned_idx]
+                        start_time = time.time()
+                        self.wait(key, tag, op_type, target_client=target_client)
+                        end_time = time.time()
+                        print(f"{self.client_name} write uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available after {end_time - start_time} seconds")
+                    self._pinned_slot_running_xfer[pinned_idx] = (key, tag, "WRITE", target_client)  
                 # Copy data from original non-contiguous tensor to temporary contiguous tensor
                 contiguous_tensor.copy_(original_tensor)
                 
@@ -802,7 +857,7 @@ class NIXLStorageClient:
                 raise RuntimeError(f"Posting client WRITE transfer failed for key {key} shard {shard_idx}.")
             self.xfer_handles[(key, make_shard_tag(tag, shard_idx), "WRITE", target_client)] = handle
 
-    def wait(self, key: str, tag: bytes, op_type: str, timeout: float = 30.0, target_client: Optional[str] = None):
+    def wait(self, key: str, tag: bytes, op_type: str, target_client: Optional[str] = None, timeout: float = 60.0):
         """
         Wait for a transfer to be completed.
         """

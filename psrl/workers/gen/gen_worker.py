@@ -59,21 +59,19 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
     def init_nixl_client(self):
         assert self.rollout, "Rollout must be initialized before calling init_nixl_client."
         """Initialize the NIXL client."""
-        if self.psrl_config.nixl_server_mode == "storage_server":
+        if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl_server_mode == "meta_server":
+        elif self.psrl_config.nixl.server_mode == "meta_server":
             self.nixl_storage_client = NIXLStorageClient(
                 client_name=f"NIXLGenClient_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
                 server_name=global_meta_server_name,
-                server_ip=self.psrl_config.nixl_server_ip,
-                server_port=self.psrl_config.nixl_server_port,
                 use_gpu=True,
-                mode=self.psrl_config.nixl_server_mode,
                 client_type=NIXLClientType.PULL_SIDE,
+                nixl_config=self.psrl_config.nixl,  
                 nixl_interface=self.nixl_interface
             )
         else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl_server_mode}")
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
         
     def nixl_protocol(self):

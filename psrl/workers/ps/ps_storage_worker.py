@@ -41,22 +41,20 @@ class PSStorageWorker:
     def init_nixl_client(self):
         """Initialize the NIXL client."""
         assert self.meta_hf_model, "The HuggingFace model must be initialized before calling init_nixl_client."
-        if self.psrl_config.nixl_server_mode == "storage_server":
+        if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl_server_mode == "meta_server":
-            use_gpu = self.psrl_config.ps_mode == "gpu"
+        elif self.psrl_config.nixl.server_mode == "meta_server":
+            use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
             self.nixl_storage_client = NIXLStorageClient(
                 client_name=f"NIXLPSClient_{self.rank}",
                 server_name=global_meta_server_name,
-                server_ip=self.psrl_config.nixl_server_ip,
-                server_port=self.psrl_config.nixl_server_port,
                 use_gpu=use_gpu,
-                mode=self.psrl_config.nixl_server_mode,
                 client_type=NIXLClientType.PS,
+                nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface
             )
         else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl_server_mode}")
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
         
     def nixl_protocol(self):

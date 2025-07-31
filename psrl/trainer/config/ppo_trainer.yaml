@@ -15,9 +15,10 @@ psrl:
     train_ngpus_per_node: 1
     ps_nnodes: 1
     ps_ngpus_per_node: 1
-  nixl_server_mode: meta_server
-  nixl_server_ip: 127.0.0.1
-  nixl_server_port: 23456
+  nixl:
+    server_mode: meta_server
+    server_ip: 127.0.0.1
+    server_port: 23456
 
 data:
   tokenizer: null

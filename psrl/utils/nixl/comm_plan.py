@@ -173,12 +173,12 @@ class CommunicationPlanner:
         for target_client in target_clients:
             target_info = clients[target_client]
             
-            for key, target_tensor_info in target_info.descs.items():
+            for key, target_tensor_info in target_info.tensor_infos.items():
                 # Find all source clients with the same key
                 available_source_clients = []
                 for source_client in source_clients:
                     source_info = clients[source_client]
-                    if key in source_info.descs:
+                    if key in source_info.tensor_infos:
                         available_source_clients.append(source_client)
                 
                 # Get all shards needed by target client
@@ -204,7 +204,7 @@ class CommunicationPlanner:
                     )
                     
                     source_info = clients[min_volume_client]
-                    source_tensor_info = source_info.descs[key]
+                    source_tensor_info = source_info.tensor_infos[key]
                     
                     # Find shards this client can provide (and needed by the target client)
                     available_shards = (set(source_tensor_info.sharding.shard_indices) - assigned_shards) & needed_shards

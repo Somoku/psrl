@@ -43,8 +43,7 @@ def run_ppo(config) -> None:
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true", 
                     "NCCL_DEBUG": "WARN", 
-                    "VLLM_LOGGING_LEVEL": "WARN",
-                    "PSRL_LOGGING_PATH": config.psrl.logging_path,
+                    "VLLM_LOGGING_LEVEL": "WARN"
                 }
             },
             num_cpus=config.ray_init.num_cpus,
@@ -82,6 +81,7 @@ class TaskRunner:
         # format: {pool_id: [ngpus_per_node] * nnodes}
         # nnodes will be the number of ray placement groups
         # and ngpus_per_node will be the number of ray bundles (currently all equals to {"CPU": self.max_colocate_count, "GPU": 1}) in each placement group
+        # For now, PS nodes are colocated with rollout nodes (on CPUs)
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
             # ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,

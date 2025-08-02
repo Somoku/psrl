@@ -57,7 +57,6 @@ class ModelStore:
 
 
 # TODO: Ensure PSManager is a singleton
-@ray.remote
 @add_lock
 class PSManager:
     def __init__(self, psrl_config: DictConfig) -> None:
@@ -84,7 +83,7 @@ class PSManager:
             
         # Build logger
         self.log_prefix = f"PSManager"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         self.logged_ready_buffer_ids: Set[int] = set()
      

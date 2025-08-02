@@ -35,7 +35,7 @@ class PSStorageWorker:
         # Build logger
         self.rank = int(os.environ.get("RANK"))
         self.log_prefix = f"PSStorageWorker_R{self.rank}"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         
     def init_nixl_client(self):

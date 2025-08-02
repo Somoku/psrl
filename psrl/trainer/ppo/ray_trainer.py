@@ -40,7 +40,7 @@ from psrl.utils.dataset import DatasetType, DatasetHandle
 from psrl.utils.logger import DualOutputHandler, log_dual_events, log_single_event, EventType
 from psrl.workers.train import TrainInterface
 from psrl.workers.gen import GenInterface
-from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSWorker
+from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStorageWorker
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -98,7 +98,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         # Build logger
         self.log_prefix = f"Main_Ray_Trainer"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized major ray trainer (single controller).")
 
         # define in-reward KL control
@@ -242,6 +242,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if config.train_actor_rollout_ref.rollout.multi_turn.enable:
             assert config.train_actor_rollout_ref.rollout.multi_turn.tool_config_path is not None, "tool_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
             assert config.algorithm.adv_estimator in [AdvantageEstimator.GRPO], "only GRPO is tested for multi-turn with tool"
+            
+        # check nixl compatibility
+        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, "PSManager IP and NIXL server IP must be the same"
+            assert self.config.train_actor_rollout_ref.actor.strategy != "fsdp", "FSDP1 is not supported for NIXL because it uses flat_param"
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -417,7 +422,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
         assert self.config.psrl.ps_manager_ip in ip_to_node_id, f"PSManager IP {self.config.psrl.ps_manager_ip} not found in ray nodes"
         psrl_logger.info("Getting the handle of the PSManager")
-        self.ps_manager_handle = PSManager.options(
+        self.ps_manager_handle = ray.remote(PSManager).options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ip_to_node_id[self.config.psrl.ps_manager_ip],
                 soft=False
@@ -513,7 +518,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 assert class_dict.keys() == {"ps"}, "PS resource pool should only have PS role."
                 continue
             tasks.append((resource_pool, class_dict))
-        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:  # 最多同时处理所有任务
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:  # max_workers is the number of threads to use
             futures = {}
             for resource_pool, class_dict in tasks:
                 future = executor.submit(
@@ -550,6 +555,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # PSManager is only used to build the nixl meta server
             # The PS WorkerGroup is used to store the model state dict
             # It is colocate with the rollout instances
+            assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, "PSManager IP and NIXL server IP must be the same"
             if self.config.psrl.ps_mode == "nixl_cpu":
                 # Get all rollout instances' distinct node ids
                 ps_node_ids = set()
@@ -568,7 +574,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.ps_wg = PSWorkerGroup(
                     resource_pool=ps_resource_pool,
                     ps_cls_with_init=PSClassWithInitArgs(
-                        cls=ray.remote(PSWorker),
+                        cls=ray.remote(PSStorageWorker),
                         psrl_config=self.config.psrl,
                         nixl_interface=nixl_interface
                     )
@@ -606,28 +612,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         psrl_logger.info("All workers' models initialized successfully!")
         
-        psrl_logger.info("Initializing NIXL")
-        futures = []
-        expected_clients = self.ps_wg.world_size + \
-            self.actor_wg.world_size + \
-            sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
-        futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_clients))
-        futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
-        futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
-            futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
-        ray.get(futures)
-        psrl_logger.info("NIXL initialized successfully!")
-        
-        psrl_logger.info("Executing NIXL protocol")
-        futures = []
-        futures.append(self.ps_manager_handle.nixl_potocol.remote())
-        futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
-        futures.extend(self.actor_wg.execute_all_async("nixl_protocol"))
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
-            futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
-        ray.get(futures)
-        psrl_logger.info("NIXL protocol executed successfully!")
+        # initialize NIXL
+        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            psrl_logger.info("Initializing NIXL")
+            futures = []
+            expected_clients = self.ps_wg.world_size + \
+                self.actor_wg.world_size + \
+                sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
+            futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_clients))
+            futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
+            futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
+            for i in range(self.config.psrl.deployment.n_rollout_instances):
+                futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
+            ray.get(futures)
+            psrl_logger.info("NIXL initialized successfully!")
+            
+            psrl_logger.info("Executing NIXL protocol")
+            futures = []
+            futures.append(self.ps_manager_handle.nixl_potocol.remote())
+            futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
+            futures.extend(self.actor_wg.execute_all_async("nixl_protocol"))
+            for i in range(self.config.psrl.deployment.n_rollout_instances):
+                futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
+            ray.get(futures)
+            psrl_logger.info("NIXL protocol executed successfully!")
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`

@@ -377,7 +377,7 @@ class NIXLShardMetaInfo:
 
 
 @dataclass
-class NIXLTensorDescInfo:
+class NIXLTensorInfo:
     """Tensor descriptor information with sharding support"""
     desc_bytes_list: List[bytes]  # Descriptors for each shard (None for non-contiguous shards)
     sharding: NIXLSharding        # Sharding information
@@ -435,16 +435,16 @@ class NIXLClientInfo:
     ip: str
     gpu_id: int
     type: NIXLClientType
-    descs: Dict[str, NIXLTensorDescInfo]  # key -> TensorDescInfo
+    tensor_infos: Dict[str, NIXLTensorInfo]  # key -> TensorDescInfo
     meta: bytes  # agent metadata
 
     def get_tensor_desc(self, agent, key, local_pos: int = 0):
         """Get tensor descriptor for specific key and shard"""
-        return self.descs[key].get_desc(agent, local_pos)
+        return self.tensor_infos[key].get_desc(agent, local_pos)
 
     def get_tensor_desc_info(self, key):
         """Get tensor descriptor info for specific key"""
-        return self.descs[key]
+        return self.tensor_infos[key]
 
     def serialize(self):
         """Serialize client info"""

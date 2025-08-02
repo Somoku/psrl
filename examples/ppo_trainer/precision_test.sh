@@ -9,10 +9,7 @@ TRAIN_TP=2 # TP in the training side for validation
 NNODES=3
 NGPUS_PER_NODE=8
 
-PS_NNODES=1
-PS_NGPUS_PER_NODE=${NGPUS_PER_NODE} 
-
-GEN_NNODES=$(( ${NNODES} - ${PS_NNODES} )) # Number of nodes for generation
+GEN_NNODES=${NNODES} # Number of nodes for generation
 GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ${GEN_TP} )) # Number of generation instances
 
@@ -38,8 +35,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_TP} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.deployment.ps_nnodes=${PS_NNODES} \
-    psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
     \
     gen_actor_rollout.model.path="$MODEL_PATH" \
     gen_actor_rollout.rollout.log_prob_micro_batch_size_per_gpu=16 \

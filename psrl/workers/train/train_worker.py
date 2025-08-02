@@ -38,8 +38,45 @@ from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_event
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, global_meta_server_name
 from psrl.utils.state_dict import convert_fsdp_inplace
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+
+
+def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True, rank0_only: bool = True):
+    """
+    Get the full state dict from an FSDP model.
+
+    Args:
+        model (torch.nn.Module): The FSDP model to get state dict from
+        offload_to_cpu (bool, optional): Whether to offload the state dict to CPU. Defaults to True.
+        rank0_only (bool, optional): Whether to only get state dict on rank 0. Defaults to True.
+
+    Returns:
+        dict: The full state dict of the model
+
+    Raises:
+        NotImplementedError: If the FSDP version is unknown
+    """
+    if fsdp_version(model) == 1:
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+
+        state_dict_config = FullStateDictConfig(offload_to_cpu=offload_to_cpu, rank0_only=rank0_only)
+        with get_fsdp_state_ctx(
+            model, state_type=StateDictType.FULL_STATE_DICT, state_cfg=state_dict_config, optim_cfg=None
+        ):
+            state_dict = model.state_dict()
+        return state_dict
+    elif fsdp_version(model) == 2:
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+        state_dict_config = StateDictOptions(
+            full_state_dict=True, cpu_offload=offload_to_cpu, broadcast_from_rank0=not rank0_only
+        )
+        state_dict = get_model_state_dict(model, options=state_dict_config)
+        return state_dict
+    else:
+        raise NotImplementedError(f"Unknown FSDP version {fsdp_version}")
 
 
 @dataclass
@@ -57,7 +94,7 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         
         # Build logger
         self.log_prefix = f"TrainWorker_R{self.rank}"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
      
     def get_node_id(self) -> str:
@@ -124,11 +161,9 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
-        # TODO: support FSDP2
-        assert fsdp_version(self.actor_module_fsdp) == 1, "FSDP version 2 is not supported yet."
+        # assert fsdp_version(self.actor_module_fsdp) == 1, "FSDP version 2 is not supported yet."
         psrl_logger.info(f"Gathering the full state dict on the CPU of the representive rank.")
-        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
-            full_state_dict = self.actor_module_fsdp.state_dict()
+        full_state_dict = get_fsdp_full_state_dict(self.actor_module_fsdp, offload_to_cpu=True, rank0_only=True)
         if self.is_train_representive_rank:
             assert len(full_state_dict) > 0, "The model state dict shouldn't be empty on the representive worker."
             psrl_logger.info(f"Push the model via CPU on the representive rank (async).")

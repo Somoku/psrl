@@ -2,7 +2,7 @@ import logging
 import os
 from contextlib import contextmanager
 from collections.abc import Sequence
-from typing import Any, Callable, ClassVar, Optional, Union, List, Tuple, cast, overload
+from typing import Any, Union, List, Tuple, cast
 
 import numpy as np
 import torch
@@ -10,14 +10,11 @@ import torch.distributed
 from omegaconf import DictConfig
 from tensordict import TensorDict
 from vllm import LLM, SamplingParams
-from vllm.distributed import parallel_state as vllm_ps
-from vllm.worker.worker_base import WorkerWrapperBase
-from vllm.inputs import PromptType, SingletonPrompt, TextPrompt, TokensPrompt
+from vllm.inputs import PromptType
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
 from verl import DataProto
-from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout

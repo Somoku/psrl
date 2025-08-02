@@ -214,6 +214,7 @@ class GenClientActor:
         self.client.send_local_info()
         self.print("step6: wait_for_server_info (client infos & comm plan)")
         self.client.wait_for_server_info()
+        self.print(f"comm plan: {self.client._comm_plan}")
         self.print("step7: send_local_temp_mapping")
         self.client.send_local_temp_mapping()
         self.print("step8: wait_for_server_temp_mappings")
@@ -240,11 +241,10 @@ def create_ps_worker_group(psrl_config, model_path, nixl_interface: NIXLInterfac
         "model": {"path": model_path, "use_shm": False, "trust_remote_code": False}
     })
     ray_nodes = ray.nodes()
-    node = ray_nodes[0]
-    node_ip = node["NodeManagerAddress"]
-    node_id = node["NodeID"]
+    nodes = [ray_nodes[0], ray_nodes[1]]
     ps_resource_pool = PSResourcePool([
-        PSResourceSpec(node_ip=node_ip, node_id=node_id, attached_gpu_id=None)
+        PSResourceSpec(node_ip=node["NodeManagerAddress"], node_id=node["NodeID"], attached_gpu_id=None)
+        for node in nodes
     ])
     ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), config, psrl_config, nixl_interface)
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
@@ -262,13 +262,14 @@ def test_nixl_e2e():
     torch_port_gen = 29503
     num_train = 2
     num_gen = 2
-    num_ps = 1
+    num_ps = 2
     
     psrl_config = OmegaConf.create({
+        "ps_manager_ip": listen_ip,
         "nixl": {
             "server_mode": "meta_server",
-            "server_ip": listen_ip,
             "server_port": listen_port,
+            "max_pinned_temp_memory_slots": 4
         },
         "ps_mode": "nixl_cpu"
     })
@@ -278,6 +279,7 @@ def test_nixl_e2e():
     )
     # nixl_interface = NIXLInterface()
     
+    start_time = time.time()
     ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = MetaServerActor.options(
@@ -287,16 +289,22 @@ def test_nixl_e2e():
         )
     ).remote(server_name, psrl_config, num_train + num_gen + num_ps, log_dir)
     ray.get(server.init_finished.remote())
+    end_time = time.time()
+    print(f"[PASS] server init done. time: {end_time - start_time}s")
     
+    start_time = time.time()
     ps_wg = create_ps_worker_group(psrl_config, QWEN_MODEL_PATH, nixl_interface)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
-
+    end_time = time.time()
+    print(f"[PASS] ps init done. time: {end_time - start_time}s")
+    
     # train_pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(num_train)], strategy="PACK")
     # gen_pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(num_gen)], strategy="PACK")
     # ray.get(train_pg.ready())
     # ray.get(gen_pg.ready())
-
+    
+    start_time = time.time()
     train_actors = [
         TrainClientActor.options(
             num_gpus=1,
@@ -315,7 +323,10 @@ def test_nixl_e2e():
         ray.get(train_actors[i].init_finished.remote())
     for i in range(num_gen):
         ray.get(gen_actors[i].init_finished.remote())
+    end_time = time.time()
+    print(f"[PASS] client init done. time: {end_time - start_time}s")
 
+    start_time = time.time()
     # Run protocol for server, clients, and PS workers
     server.protocol.remote()
     futures = []
@@ -325,7 +336,8 @@ def test_nixl_e2e():
         futures.append(g.protocol.remote())
     futures.extend(ps_wg.execute_all_async("nixl_protocol"))
     ray.get(futures)
-    print("[PASS] protocol done.")
+    end_time = time.time()
+    print(f"[PASS] protocol done. time: {end_time - start_time}s")
 
     ps_names = ["NIXLPSClient_{}".format(i) for i in range(num_ps)]
 

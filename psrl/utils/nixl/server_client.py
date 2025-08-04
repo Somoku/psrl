@@ -7,9 +7,7 @@ import pickle
 import ray
 from copy import deepcopy
 from typing import Dict, Any, Set, Optional, List, Tuple
-from dataclasses import dataclass
 from nixl._api import nixl_agent, nixl_agent_config
-from nixl._bindings import nixlInvalidParamError
 from omegaconf import DictConfig
 
 from psrl.utils.logger import deprecated, get_worker_info
@@ -146,7 +144,7 @@ class NIXLMetaServer:
         """
         psrl_logger.info(f"Waiting for {expected_clients} clients to connect and send sharding...")
         if self._is_all_client_shardings_recved:
-            # TODO: support elastic adding new clients after all clients are connected
+            # TODO(lhy): support elastic adding new clients after all clients are connected
             assert len(self.client_sharding_dicts) == expected_clients, f"Expected {expected_clients} clients, but got {len(self.client_sharding_dicts)}"
             return True
         start = time.time()
@@ -170,7 +168,7 @@ class NIXLMetaServer:
         """
         psrl_logger.info(f"Waiting for {expected_clients} clients to send client infos...")
         if self._is_all_client_infos_recved:
-            # TODO: support elastic adding new clients after all clients are connected
+            # TODO(lhy): support elastic adding new clients after all clients are connected
             assert len(self.client_infos) == expected_clients, f"Expected {expected_clients} clients, but got {len(self.client_infos)}"
             return True
         start = time.time()
@@ -480,7 +478,11 @@ class NIXLStorageClient:
                 # Check if the shard is contiguous
                 if local_sharded_tensor.is_contiguous():
                     # Contiguous shard: register directly
-                    desc = self.agent.register_memory([local_sharded_tensor])
+                    try:
+                        desc = self.agent.register_memory([local_sharded_tensor])
+                    except Exception as e:
+                        psrl_logger.error(f"Memory registration failed for key {key} shard {shard_indices[local_pos]}: {e}")
+                        raise e
                     if not desc:
                         raise RuntimeError(f"Memory registration failed for key {key} shard {shard_indices[local_pos]}.")
                     desc_bytes = self.agent.get_serialized_descs(desc)
@@ -531,7 +533,7 @@ class NIXLStorageClient:
             tensor_infos=tensor_infos,
             meta=self.agent.get_agent_metadata()
         )
-        psrl_logger.info(f"Local client info is built, temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, temp meta mapping is: {self._temp_meta_mapping}")
+        psrl_logger.debug(f"Local client info is built, temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, temp meta mapping is: {self._temp_meta_mapping}")
         
     def connect_to_server(self, timeout: float = 60.0):
         """
@@ -785,7 +787,7 @@ class NIXLStorageClient:
                 handle = self.agent.initialize_xfer(
                     "READ", local_desc, remote_desc, target_client, make_shard_tag(tag, shard_idx)
                 )
-            except nixlInvalidParamError as e:
+            except Exception as e:
                 raise RuntimeError(f"Creating client READ transfer failed for key {key} shard {shard_idx}: {e}")
             if not handle:
                 raise RuntimeError(f"Creating client READ transfer failed for key {key} shard {shard_idx}.")
@@ -867,7 +869,7 @@ class NIXLStorageClient:
                 handle = self.agent.initialize_xfer(
                     "WRITE", local_desc, remote_desc, target_client, make_shard_tag(tag, shard_idx)
                 )
-            except nixlInvalidParamError as e:
+            except Exception as e:
                 raise RuntimeError(f"Creating client WRITE transfer failed for key {key} shard {shard_idx}: {e}")
             if not handle:
                 raise RuntimeError(f"Creating client WRITE transfer failed for key {key} shard {shard_idx}.")

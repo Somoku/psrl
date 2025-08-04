@@ -27,7 +27,7 @@ from psrl.utils.ray import RayLock
 from psrl.utils.dataset import DatasetType, DatasetHandle
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
-from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, global_meta_server_name
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_GEN_CLIENT_NAME
 from psrl.workers.gen import PSRL_vLLMRollout
 
 
@@ -50,6 +50,11 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
         self.instance_dist_group = None
+        
+        # NIXL
+        self.nixl_storage_client = None
+        self.unified_state_dict = None
+        self.unified_sharding_dict = None
 
         # Build logger
         self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
@@ -63,8 +68,8 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
             self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"NIXLGenClient_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
-                server_name=global_meta_server_name,
+                client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
+                server_name=GLOBAL_META_SERVER_NAME,
                 use_gpu=True,
                 client_type=NIXLClientType.PULL_SIDE,
                 nixl_config=self.psrl_config.nixl,  
@@ -77,7 +82,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
     def nixl_protocol(self):
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info(f"nixl client protocol step 0: convert_vllm_inplace")
-        vllm_model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model.state_dict()
+        vllm_model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(self.config.model.path))
         unified_state_dict, local_sharding_dict = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=self.rank)
         psrl_logger.info(f"nixl client protocol step 1: connect_to_server")
@@ -97,6 +102,8 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         psrl_logger.info(f"nixl client protocol step 8: wait_for_server_temp_mappings")
         self.nixl_storage_client.wait_for_server_temp_mappings()
         psrl_logger.info(f"nixl client protocol done.")
+        self.unified_state_dict = unified_state_dict
+        self.unified_sharding_dict = unified_sharding_dict
         
     def get_node_id(self) -> str:
         """
@@ -140,6 +147,8 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         return self.rank == self.get_instance_representive_rank()
     
     def _broadcast_int_val_from_representive_rank(self, val: Optional[int] = None) -> None:
+        # TODO(lhy): This is a temporary solution to broadcast the int value from the representive rank to all instance ranks
+        # A more general solution is to use the `torch.distributed.broadcast_object_list` (https://pytorch.org/docs/stable/distributed.html#torch.distributed.broadcast_object_list)
         if self.instance_dist_group == None:
             # If the instance dist group is not set, we will create it
             self.instance_dist_group = dist.new_group(ranks=self.get_instance_ranks())
@@ -187,8 +196,12 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             super().init_model()
+            # Currently only need enter once for the rollout sharding manager
+            # because we use the old_log_prob directly from the vllm rollout
+            # otherwise, we need to enter the rollout sharding manager for each batch
+            self.rollout_sharding_manager.__enter__()
     
-    def pull_model(self) -> None:
+    def ray_pull_model(self) -> None:
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
@@ -212,6 +225,31 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             # Question: Do we need to clear the cache after loading the model?
             # get_torch_device().empty_cache()
             torch.cuda.synchronize()
+        else:
+            raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+    
+    def nixl_pull_model(self) -> None:
+        """
+        Pull the model state dict from PS via NIXL and update the rollout model weights.
+        """
+        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+        ps_manager_handle = self.gen_interface.ps_manager_handle
+        ps_nixl_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_storage_client_names.remote())
+        wait_operations = []
+        for target_client_name in ps_nixl_storage_client_names: 
+            for key in self.unified_state_dict:
+                self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
+                wait_operations.append((key, target_client_name))
+        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
+        for key, target_client_name in wait_operations:
+            self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+        psrl_logger.info(f"NIXL pull model done.")
+        
+    def pull_model(self) -> None:
+        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+            self.ray_pull_model()
+        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            self.nixl_pull_model()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
@@ -271,8 +309,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             if self.is_instance_representive_rank:
                 curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
                 needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
-                # TODO (Done already): Implement a wrapper for ps_manager_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
-                # Add asyncio method to the ps_manager_handle ray actor to ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
+                # RayLock ensures that there won't be race condition when multiple GenWorkers are trying to reserve requests
                 with RayLock(ps_manager_handle):
                     # Check if we can reserve the requests
                     # If not, we will wait until the requests can be reserved (the waiting will take place later)
@@ -283,7 +320,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
                         # If the current PS model version is still not enough, we will wait for the training side to update the model version
                         while ray.get(ps_manager_handle.get_max_reserve_num.remote(needed_model_version)) < batch_size:
                             needed_model_version += 1
-                    # TODO: Maybe we can support partial reservation, currently we fix the batch size outside
+                    # TODO(lhy): Maybe we can support partial reservation, currently we fix the batch size outside
                     # assert max_reserve_num >= batch_size, f"Cannot reserve {batch_size} requests, only {max_reserve_num} requests can be reserved."
                     request_ids = list(range(curr_request_id + 1, curr_request_id + batch_size + 1))
                     futures = []
@@ -365,16 +402,11 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         
         ending = False
         
-        # Currently only need enter once for the rollout sharding manager
-        # because we use the old_log_prob directly from the vllm rollout
-        # otherwise, we need to enter the rollout sharding manager for each batch
-        self.rollout_sharding_manager.__enter__()
-        
         if self.psrl_config.gen_mode == "batch":
             round = 0
             while True:
                 batch_dict = None
-                # TODO: better implementation, currently need busy polling to get the current batch
+                # TODO(lhy): better implementation, currently need busy polling to get the current batch
                 while True:
                     # Get the current batch from the dataset handle
                     try:
@@ -402,7 +434,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
                 round += 1
                 
         elif self.psrl_config.gen_mode == "stream":
-            # TODO: Implement stream generation
+            # TODO(lhy): Implement stream generation
             # should use the dataset_handle rather than the batched prompts inside the stream_gen method
             # the dataset_handle should support obtaining data in a streaming manner
             self.stream_gen()
@@ -410,4 +442,4 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         else:
             raise ValueError(f"Unsupported generation mode: {self.config.rollout.gen_mode}")
             
-        self.rollout_sharding_manager.__exit__()
+        # self.rollout_sharding_manager.__exit__()

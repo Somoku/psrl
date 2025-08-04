@@ -9,7 +9,7 @@ from accelerate import init_empty_weights
 
 from verl.utils.fs import copy_to_local
 
-from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, global_meta_server_name
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PS_CLIENT_NAME
 from psrl.utils.state_dict.hf_converter import convert_hf_inplace
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 
@@ -18,7 +18,8 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
-# TODO: Implement the PSStoragePlan
+# TODO(lhy): Implement the PSStoragePlan
+# support zero/half/full redundancy for PSStorageWorker
 class PSStoragePlan:
     pass
 
@@ -26,11 +27,16 @@ class PSStoragePlan:
 class PSStorageWorker:
     """A worker that only stores the data and uses NIXL to communicate."""
     
-    def __init__(self, config: DictConfig, psrl_config: DictConfig, nixl_interface: NIXLInterface) -> None:
-        self.config = config
+    def __init__(self, model_config: DictConfig, psrl_config: DictConfig, nixl_interface: NIXLInterface) -> None:
+        self.model_config = model_config
         self.psrl_config = psrl_config
         self.nixl_interface = nixl_interface
         self.meta_hf_model: Optional[torch.nn.Module] = None
+        
+        # NIXL
+        self.nixl_storage_client = None
+        self.unified_state_dict = None
+        self.unified_sharding_dict = None
         
         # Build logger
         self.rank = int(os.environ.get("RANK"))
@@ -46,8 +52,8 @@ class PSStorageWorker:
         elif self.psrl_config.nixl.server_mode == "meta_server":
             use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
             self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"NIXLPSClient_{self.rank}",
-                server_name=global_meta_server_name,
+                client_name=f"{GLOBAL_PS_CLIENT_NAME}_{self.rank}",
+                server_name=GLOBAL_META_SERVER_NAME,
                 use_gpu=use_gpu,
                 client_type=NIXLClientType.PS,
                 nixl_config=self.psrl_config.nixl,
@@ -78,11 +84,18 @@ class PSStorageWorker:
         psrl_logger.info(f"nixl client protocol step 8: wait_for_server_temp_mappings")
         self.nixl_storage_client.wait_for_server_temp_mappings()
         psrl_logger.info(f"nixl client protocol done.")
+        self.unified_state_dict = unified_meta_state_dict
+        self.unified_sharding_dict = unified_sharding_dict
+        
+    def get_nixl_storage_client_name(self) -> str:
+        """Get the name of the NIXL storage client."""
+        assert self.nixl_storage_client, "The NIXL storage client must be initialized before calling get_nixl_storage_client_name."
+        return self.nixl_storage_client.client_name
 
     def init_model(self):
         """Initialize the model."""
-        local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
-        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=self.config.model.get("trust_remote_code", False))
+        local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
+        model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=self.model_config.get("trust_remote_code", False))
         if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
             model_class = AutoModelForVision2Seq
         else:
@@ -93,8 +106,8 @@ class PSStorageWorker:
             with init_empty_weights():
                 self.meta_hf_model = model_class.from_config(
                     model_config, 
-                    torch_dtype=torch.bfloat16, # TODO: read from config
-                    trust_remote_code=self.config.model.get("trust_remote_code", False)
+                    torch_dtype=torch.bfloat16, # TODO(lhy): read from config
+                    trust_remote_code=self.model_config.get("trust_remote_code", False)
                 )
         elif self.psrl_config.ps_mode == "nixl_gpu":
             raise NotImplementedError("NIXL GPU mode is not implemented yet.")

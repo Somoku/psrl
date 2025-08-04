@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 
 from verl.utils.fs import copy_to_local
 
-from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, global_meta_server_name, global_port_scanner
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PORT_SCANNER
 from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker
 
@@ -237,8 +237,8 @@ class GenClientActor:
         self.client.shutdown()
 
 def create_ps_worker_group(psrl_config, model_path, nixl_interface: NIXLInterface):
-    config = OmegaConf.create({
-        "model": {"path": model_path, "use_shm": False, "trust_remote_code": False}
+    model_config = OmegaConf.create({
+        "path": model_path, "use_shm": False, "trust_remote_code": False
     })
     ray_nodes = ray.nodes()
     nodes = [ray_nodes[0], ray_nodes[1]]
@@ -246,7 +246,7 @@ def create_ps_worker_group(psrl_config, model_path, nixl_interface: NIXLInterfac
         PSResourceSpec(node_ip=node["NodeManagerAddress"], node_id=node["NodeID"], attached_gpu_id=None)
         for node in nodes
     ])
-    ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), config, psrl_config, nixl_interface)
+    ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), model_config, psrl_config, nixl_interface)
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
     return ps_wg
 
@@ -256,7 +256,7 @@ def test_nixl_e2e():
     ray.init(ignore_reinit_error=True)
     listen_ip = "29.210.128.48"
     listen_port = 23459
-    server_name = global_meta_server_name
+    server_name = GLOBAL_META_SERVER_NAME
     backend = "nccl"
     torch_port_train = 29502
     torch_port_gen = 29503
@@ -265,9 +265,11 @@ def test_nixl_e2e():
     num_ps = 2
     
     psrl_config = OmegaConf.create({
+        "logging_path": log_dir,
         "ps_manager_ip": listen_ip,
         "nixl": {
             "server_mode": "meta_server",
+            "server_ip": listen_ip,
             "server_port": listen_port,
             "max_pinned_temp_memory_slots": 4
         },
@@ -275,7 +277,7 @@ def test_nixl_e2e():
     })
     
     nixl_interface = NIXLInterface(
-        port_scanner=global_port_scanner
+        port_scanner=GLOBAL_PORT_SCANNER
     )
     # nixl_interface = NIXLInterface()
     

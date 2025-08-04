@@ -177,7 +177,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 "n": 1,  # if greedy, only 1 response
             }
         elif is_validate:
-            # TODO: try **
+            # TODO(verl): try **
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
@@ -303,7 +303,7 @@ class PSRL_vLLMRollout(BaseRollout):
                     outputs.append(output)
         return sorted(outputs, key=lambda x: int(x.request_id))
     
-    # TODO: align attention mask
+    # TODO(lhy): align attention mask
     @torch.no_grad()
     def step(self) -> list[Union[RequestOutput, PoolingRequestOutput]]:
         return self.inference_engine.llm_engine.step()

@@ -20,6 +20,7 @@ psrl:
     server_mode: meta_server
     server_ip: ${psrl.ps_manager_ip}
     server_port: 23456
+    max_pinned_temp_memory_slots: 4
 
 data:
   tokenizer: null
@@ -329,7 +330,7 @@ trainer:
   critic_warmup: 0
   default_hdfs_dir: null
   del_local_ckpt_after_load: False
-  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: ${psrl.logging_path}/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
   # The timeout for ray worker group to wait for the register center to be ready

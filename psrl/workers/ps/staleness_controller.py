@@ -10,7 +10,7 @@ class EntryCategory(enum.Enum):
     OCCUPIED = 2
 
 
-# Note:The model version is not a part of the hashing key, because model version may be updated after the reservation but before the occupation
+# Note(lhy): The model version is not a part of the hashing key, because model version may be updated after the reservation but before the occupation
 @dataclass(frozen=True)
 class EntryInfo:
     rollout_instance_id: Union[str, int]  # The ID of the rollout instance this entry belongs to

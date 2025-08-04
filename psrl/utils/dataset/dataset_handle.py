@@ -102,7 +102,7 @@ class DatasetHandle:
         assert self.train_sampler is not None, "Train sampler is not built yet. Call build_train_sampler() first."
         batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         assert batch_size % self.config.psrl.deployment.n_rollout_instances == 0, f"Batch size {batch_size} is not divisible by the number of rollout instances {self.config.psrl.deployment.n_rollout_instances}"
-        # TODO: use a smaller batch size, or different batch size for different rollout instance (with different parallel scheme)
+        # TODO(lhy): use a smaller batch size, or different batch size for different rollout instance (with different parallel scheme)
         batch_size_per_instance = batch_size // self.config.psrl.deployment.n_rollout_instances
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,

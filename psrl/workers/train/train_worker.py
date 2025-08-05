@@ -349,12 +349,9 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         # The model weights are pushed to the PS via CPU
-        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
-                output = super().update_actor(data)
-            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-                self.push_model()
-            return output
-        else:
-            raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+        with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
+            output = super().update_actor(data)
+        with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+            self.push_model()
+        return output
             

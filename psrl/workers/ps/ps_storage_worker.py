@@ -106,7 +106,7 @@ class PSStorageWorker:
             with init_empty_weights():
                 self.meta_hf_model = model_class.from_config(
                     model_config, 
-                    torch_dtype=torch.bfloat16, # TODO(lhy): read from config
+                    torch_dtype=torch.float32, # TODO(lhy): read from config
                     trust_remote_code=self.model_config.get("trust_remote_code", False)
                 )
         elif self.psrl_config.ps_mode == "nixl_gpu":

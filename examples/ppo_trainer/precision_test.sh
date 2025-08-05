@@ -6,14 +6,14 @@ GLOBAL_BATCH_SIZE=512
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
-NNODES=3
+NNODES=2
 NGPUS_PER_NODE=8
 
 GEN_NNODES=${NNODES} # Number of nodes for generation
 GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ${GEN_TP} )) # Number of generation instances
 
-TRAIN_NNODES=${GEN_NNODES} # Number of nodes for training
+TRAIN_NNODES=${NNODES} # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
@@ -23,11 +23,12 @@ train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
-    psrl.staleness=5 \
+    psrl.ps_manager_ip=${LOCAL_IP} \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
     psrl.ps_mode=cpu_ref \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/psrl_log_precision_5_new \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/psrl_log_nixl_staleness_0 \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -35,6 +36,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_TP} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
+    psrl.nixl.server_mode=meta_server \
+    psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout.model.path="$MODEL_PATH" \
     gen_actor_rollout.rollout.log_prob_micro_batch_size_per_gpu=16 \
@@ -76,11 +79,11 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     trainer.critic_warmup=0 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='psrl' \
-    trainer.experiment_name='psrl_staleness_5_new' \
-    trainer.total_training_steps=100 \
-    trainer.save_freq=100 \
+    trainer.project_name='psrl_nixl' \
+    trainer.experiment_name='cpu_ref_staleness_0_bf16' \
+    trainer.total_training_steps=500 \
+    trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_precision_staleness_5.log
+    trainer.total_epochs=30 2>&1 | tee psrl_cpu_ref_precision_staleness_0_bf16.log

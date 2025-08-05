@@ -14,14 +14,16 @@ from typing import Any, Callable, ClassVar, Optional, Union, List
 from time import sleep
 from omegaconf import DictConfig, open_dict
 from dataclasses import dataclass
+from transformers import AutoConfig
 from verl import DataProto
+from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
+from verl.utils import hf_tokenizer
+from verl.utils.model import get_generation_config
 from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
 from verl.utils.debug import log_gpu_memory_usage
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.rollout.vllm_rollout import vllm_mode
-from verl.workers.sharding_manager.fsdp_vllm import FSDPVLLMShardingManager
 
 from psrl.utils.ray import RayLock
 from psrl.utils.dataset import DatasetType, DatasetHandle
@@ -43,9 +45,17 @@ class GenInterface:
     ps_manager_handle: ray.actor.ActorHandle
 
 
-class PSRL_GenWorker(ActorRolloutRefWorker):
+class PSRL_GenWorker(Worker):
     def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, gen_interface: GenInterface, nixl_interface: NIXLInterface) -> None:
-        super().__init__(config, role)
+        super().__init__()
+        # Initialize the distributed process group
+        if not dist.is_initialized():
+            is_cuda_available = torch.cuda.is_available()
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            dist.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
+            
+        self.config = config
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
@@ -91,6 +101,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         self.nixl_storage_client.send_local_sharding(local_sharding_dict)
         psrl_logger.info(f"nixl client protocol step 3: wait_for_server_sharding")
         unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
+        # psrl_logger.info(f"unified_sharding_dict: {unified_sharding_dict}")
         psrl_logger.info(f"nixl client protocol step 4: register_local_tensors")
         self.nixl_storage_client.register_local_tensors(unified_state_dict, unified_sharding_dict)
         psrl_logger.info(f"nixl client protocol step 5: send_local_info")
@@ -170,6 +181,9 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=psrl_logger)
         local_path = copy_to_local(self.config.model.path)
+        self.actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
         rollout = PSRL_vLLMRollout(
             model_path=local_path,
             config=self.config.rollout,
@@ -179,27 +193,13 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             trust_remote_code=trust_remote_code,
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
-        
-        rollout_sharding_manager = FSDPVLLMShardingManager(
-            module=self.actor_module_fsdp,
-            inference_engine=rollout.inference_engine,
-            model_config=self.actor_model_config,
-            full_params="hf" in self.config.rollout.load_format,
-            device_mesh=self.rollout_device_mesh,
-            offload_param=self._is_offload_param,
-        )
-        log_gpu_memory_usage("After building sharding manager", logger=psrl_logger)
-        
-        return rollout, rollout_sharding_manager
+
+        return rollout
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
-            super().init_model()
-            # Currently only need enter once for the rollout sharding manager
-            # because we use the old_log_prob directly from the vllm rollout
-            # otherwise, we need to enter the rollout sharding manager for each batch
-            self.rollout_sharding_manager.__enter__()
+            self.rollout = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
     
     def ray_pull_model(self) -> None:
         """
@@ -243,6 +243,7 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
         for key, target_client_name in wait_operations:
             self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+        ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
         
     def pull_model(self) -> None:
@@ -441,5 +442,3 @@ class PSRL_GenWorker(ActorRolloutRefWorker):
             
         else:
             raise ValueError(f"Unsupported generation mode: {self.config.rollout.gen_mode}")
-            
-        # self.rollout_sharding_manager.__exit__()

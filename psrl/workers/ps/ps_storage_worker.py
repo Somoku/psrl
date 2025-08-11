@@ -2,6 +2,7 @@ import ray
 import torch
 import os
 import logging
+from dataclasses import dataclass
 from typing import Optional
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 from omegaconf import DictConfig
@@ -20,18 +21,25 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 # TODO(lhy): Implement the PSStoragePlan
 # support zero/half/full redundancy for PSStorageWorker
+@dataclass
 class PSStoragePlan:
-    pass
+    train_model_dtype: torch.dtype
+    gen_model_dtype: torch.dtype
+    
+    def train_gen_model_share(self) -> bool:
+        return self.train_model_dtype == self.gen_model_dtype
 
 
 class PSStorageWorker:
     """A worker that only stores the data and uses NIXL to communicate."""
     
-    def __init__(self, model_config: DictConfig, psrl_config: DictConfig, nixl_interface: NIXLInterface) -> None:
+    def __init__(self, storage_plan: PSStoragePlan, model_config: DictConfig, psrl_config: DictConfig, nixl_interface: NIXLInterface) -> None:
+        self.storage_plan = storage_plan
         self.model_config = model_config
         self.psrl_config = psrl_config
         self.nixl_interface = nixl_interface
-        self.meta_hf_model: Optional[torch.nn.Module] = None
+        self.train_meta_hf_model: Optional[torch.nn.Module] = None
+        self.gen_meta_hf_model: Optional[torch.nn.Module] = None
         
         # NIXL
         self.nixl_storage_client = None
@@ -46,7 +54,7 @@ class PSStorageWorker:
         
     def init_nixl_client(self):
         """Initialize the NIXL client."""
-        assert self.meta_hf_model, "The HuggingFace model must be initialized before calling init_nixl_client."
+        assert self.train_meta_hf_model and self.gen_meta_hf_model, "The HuggingFace models must be initialized before calling init_nixl_client."
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
@@ -104,11 +112,19 @@ class PSStorageWorker:
         if self.psrl_config.ps_mode == "nixl_cpu":
             # Initialize the model on meta device
             with init_empty_weights():
-                self.meta_hf_model = model_class.from_config(
+                self.train_meta_hf_model = model_class.from_config(
                     model_config, 
-                    torch_dtype=torch.float32, # TODO(lhy): read from config
+                    torch_dtype=self.storage_plan.train_model_dtype,
                     trust_remote_code=self.model_config.get("trust_remote_code", False)
                 )
+                if self.storage_plan.train_gen_model_share():
+                    self.gen_meta_hf_model = self.train_meta_hf_model
+                else:
+                    self.gen_meta_hf_model = model_class.from_config(
+                        model_config, 
+                        torch_dtype=self.storage_plan.gen_model_dtype,
+                        trust_remote_code=self.model_config.get("trust_remote_code", False)
+                    )
         elif self.psrl_config.ps_mode == "nixl_gpu":
             raise NotImplementedError("NIXL GPU mode is not implemented yet.")
         else:

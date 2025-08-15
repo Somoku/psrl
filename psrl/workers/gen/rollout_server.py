@@ -97,7 +97,6 @@ class RolloutServer(CommandExtension):
         and begins the busy loop of backend rollout workers for generating sequences.
         """
         if self.server_running:
-            psrl_logger.debug("Server already running, ignoring start_server call")
             return
         
         self.server_running = True
@@ -185,7 +184,7 @@ class RolloutServer(CommandExtension):
         version_tags = data.non_tensor_batch["version_tag"]
         update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
-            RequestStatus.DISPATCHED,
+            RequestStatus.ROLLOUT_DISPATCHED,
             model_version=version_tags.tolist(),
         ))
         dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
@@ -623,7 +622,6 @@ class RolloutServer(CommandExtension):
 
             # Process requests in the data queue
             if not self.data_queue.empty() and not self.rollout_paused and not self.skipping_data_queue:
-                psrl_logger.debug("Data queue is not empty, processing new requests")
                 data = self.data_queue.get_nowait()
                 
                 # Receive END signal to stop processing data queue

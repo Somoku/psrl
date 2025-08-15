@@ -2,19 +2,17 @@ import os
 import numpy as np
 import threading
 import logging
-from typing import Dict, Tuple
 from dataclasses import dataclass
 
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 import ray
-from ray.util.queue import Queue as RayQueue
 
 from verl import DataProto
 
 from psrl.utils.dataset.utils import create_rl_dataset, create_rl_sampler
-from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
+from psrl.utils.logger import DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -35,6 +33,7 @@ class DataProcessor:
         tokenizer,
         processor,
         ps_manager_handle,
+        data_queue,
         collate_fn=None,
         process_mode="batch",
     ):
@@ -58,8 +57,8 @@ class DataProcessor:
         self.processor = processor
         self.train_dataloader_iter = None
         self.val_dataloader_iter = None
+        self.global_steps = 0
         self._train_sample_idx = 0
-        self._train_batch_idx = 0 # TODO: will be deprecated in the future
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import \
                 collate_fn as default_collate_fn
@@ -70,6 +69,7 @@ class DataProcessor:
         
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
+        self.data_queue = data_queue
         
         self.process_mode = process_mode
         if self.config.psrl.rollout_test.redundant_rollout.enable:
@@ -81,38 +81,19 @@ class DataProcessor:
         assert self.rollout_n >= self.alg_rollout_n, \
             f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
 
-        # Data queue is the communication handle between the data processor and the rollout server.
-        # It holds the data batches that are ready for processing.
-        # The size of the queue is determined by the batch size and the process mode.
-        # If process_mode is "stream", it will hold multiple requests for streaming processing.
-        # If process_mode is "batch", it will hold a single batch for batch processing.
-        self.data_queue_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n if self.process_mode == "stream" else 1
-        self.data_queue = RayQueue(maxsize=self.data_queue_size)
-        psrl_logger.debug("Created data_queue with maxsize=%d", self.data_queue_size)
-        
-        # Rollout queue is the communication handle between the rollout workers and the data processor (reward module).
-        # It holds the rollout data that is ready for reward computation.
-        # The size of the queue is the same as the data queue size.
-        self.rollout_queue = RayQueue(maxsize=self.data_queue_size)
-        psrl_logger.debug("Created rollout_queue with maxsize=%d", self.data_queue_size)
-        
-        # Replay buffer is used to store the interrupted requests that need to be replayed.
-        # It is a queue that holds the requests that are not yet finished.
-        # The size of the replay buffer is not limited, it will grow as needed.
-        self.replay_buffer = RayQueue()
-        psrl_logger.debug("Created replay_buffer with unlimited size")
-        
         # Threads for data processing
-        self.data_preprocess_thread = None
+        self.data_process_thread = None
+        self.stop_data_process = False
         
         # Build logger
         self.log_prefix = "DataProcessor"
         psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
-        psrl_logger.info(f"DataProcessor initialized with process_mode={self.process_mode}, data_queue_size={self.data_queue_size}")
         
         # Create the initial datasets and dataloaders
+        self.total_training_steps = None
         self._create_dataloader()
 
+    # ------- Dataset and Dataloader Building Methods -------
     def build_train_and_val_dataset(self) -> None:
         """Build the training and validation datasets."""
         self.train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
@@ -193,19 +174,29 @@ class DataProcessor:
 
         self.total_training_steps = total_training_steps
 
+    def get_total_training_steps(self):
+        """Get the total number of training steps."""
+        assert self.total_training_steps is not None, "Total training steps are not set. Call _create_dataloader() first."
+
+        return self.total_training_steps
+    
+    # ------- Dataloader Management Methods -------
     def save_train_dataloader(self, dataloader_local_path: str) -> None:
         """Save the dataloader to a local path for future resume."""
         assert self.train_dataloader is not None, "Train dataloader is not built yet. Call build_train_dataloader() first."
+
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
-        print(f"Train dataloader saved to {dataloader_local_path}")
-        
+        psrl_logger.info(f"Train dataloader saved to {dataloader_local_path}")
+
     def load_train_dataloader(self, dataloader_local_path: str) -> None:
         """Load the dataloader from a local path."""
         assert self.train_dataloader is not None, "Train dataloader is not built yet. Call build_train_dataloader() first."
+
         dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
         self.train_dataloader.load_state_dict(dataloader_state_dict)
-        print(f"Train dataloader loaded from {dataloader_local_path}")
-        
+        psrl_logger.info(f"Train dataloader loaded from {dataloader_local_path}")
+
+    # ------- Data Retrieval Methods -------
     def get_train_next(self):
         """Get the next batch of training data.
         
@@ -226,10 +217,10 @@ class DataProcessor:
         try:
             data = next(self.train_dataloader_iter)
         except StopIteration:
-            print("Train dataloader iterator exhausted.")
+            psrl_logger.info("Train dataloader iterator exhausted.")
             epoch += 1
             if epoch == self.config.trainer.total_epochs:
-                print("All epoches finished.")
+                psrl_logger.info("All training epochs completed, stopping data processing.")
                 raise
             self.train_dataloader_iter = iter(self.train_dataloader)
             data = next(self.train_dataloader_iter)
@@ -256,7 +247,7 @@ class DataProcessor:
         try:
             data = next(self.val_dataloader_iter)
         except StopIteration:
-            print("Validation dataloader iterator exhausted.")
+            psrl_logger.info("Validation dataloader iterator exhausted.")
             self.val_dataloader_iter = iter(self.val_dataloader)
             raise
         return data
@@ -280,50 +271,40 @@ class DataProcessor:
         Raises:
             StopIteration: If there are no more batches in the dataset.
         """
-        psrl_logger.debug("Getting single controller batch for dataset_type: %s", dataset_type)
-        
         if dataset_type == DatasetType.train:
             batch = self.get_train_next()
         elif dataset_type == DatasetType.val:
             batch = self.get_val_next()
         else:
             raise ValueError(f"Unsupported dataset type: {dataset_type}")
-            
-        psrl_logger.debug("Got batch with size: %d", len(batch))
+
         return batch
-    
-    def get_data_queue(self) -> RayQueue:
-        """Get the data queue."""
-        return self.data_queue
 
-    def get_rollout_queue(self) -> RayQueue:
-        """Get the rollout queue."""
-        return self.rollout_queue
-
-    def get_replay_buffer(self) -> RayQueue:
-        """Get the replay buffer."""
-        return self.replay_buffer
-    
-    def get_total_training_steps(self):
-        """Get the total number of training steps."""
-        return self.total_training_steps
-    
-    def initialize_data_preprocess(self):
-        """Initialize the thread for data preprocessing."""
-        if self.data_preprocess_thread is not None:
-            psrl_logger.debug("Data preprocessing thread already exists, skipping initialization")
+    # ------- Streaming Data Processing Methods -------
+    def start_busy_loop(self):
+        """Initialize the thread for data processing."""
+        if self.data_process_thread is not None:
             return
             
-        self.data_preprocess_thread = threading.Thread(
-            target=self.preprocess_data,
-            name="data_preprocess_thread",
+        self.data_process_thread = threading.Thread(
+            target=self._process_data,
+            name="data_process_thread",
             daemon=True,
         )
-        self.data_preprocess_thread.start()
+        self.data_process_thread.start()
     
-    def preprocess_data(self):
+    def stop_busy_loop(self):
+        """Stop the data processing thread."""
+        if self.data_process_thread is not None:
+            self.stop_data_process = True
+            self.data_process_thread.join(timeout=5)
+            if self.data_process_thread.is_alive():
+                psrl_logger.warning("Data processing thread did not stop gracefully, force stopping.")
+            self.data_process_thread = None
+    
+    def _process_data(self):
         """
-        Preprocess the training data in a busy loop.
+        Process the training data in a busy loop.
         
         This method continuously fetches batches from the training dataloader,
         processes them, and puts them into the data queue for further processing.
@@ -336,37 +317,26 @@ class DataProcessor:
         
         The data queue will hold the processed batches, which can be consumed by the rollout server.
         """
-        psrl_logger.debug("Starting preprocess_data method in DataProcessor")
         self.train_dataloader_iter = iter(self.train_dataloader)
         total_epochs = self.config.trainer.total_epochs
-        psrl_logger.debug(f"Total epochs to process: {total_epochs}")
         
         # loop until all epochs are processed
-        while True:
+        while not self.stop_data_process:
             try:
-                psrl_logger.debug(f"Fetching next batch from train_dataloader_iter, current batch_idx: {self._train_batch_idx}")
                 batch_dict = next(self.train_dataloader_iter)
-                self._train_batch_idx += 1
                 batch_size = len(batch_dict[list(batch_dict.keys())[0]])
                 sample_ids = [self._train_sample_idx + i for i in range(batch_size)]
                 self._train_sample_idx += batch_size
-                psrl_logger.debug(f"Got batch with {batch_size} samples, sample_ids: {sample_ids[:5]}{'...' if len(sample_ids) > 5 else ''}")
 
                 # For Group Sampling, we use `parent_id` to indicate the shared prompt.
                 if self.rollout_n > 1:
                     batch_dict['parent_id'] = np.array(sample_ids)
-                    psrl_logger.debug(f"Using Group Sampling with rollout_n={self.rollout_n}, added parent_id")
                 else:
                     batch_dict['uid'] = np.array(sample_ids)
-                    psrl_logger.debug("Added uid for standard sampling")
-                # Record partial response ids for resume
+                # Record partial response ids for resume in partial rollout
                 batch_dict['raw_response_ids'] = np.fromiter(([] for _ in range(batch_size)), dtype=object)
                 
-                meta_info = {
-                    'batch_idx': self._train_batch_idx, # TODO: used for logging, not necessary
-                }
-                
-                batch_dict = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
+                batch_dict = DataProto.from_single_dict(batch_dict)
                 
                 # Pop the keys that are needed for generation to form the generation batch.
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -393,18 +363,15 @@ class DataProcessor:
                 )
                 psrl_logger.debug(f"Created gen_batch with size {len(gen_batch)}")
                 
-                # Store the other batch data in the request buffer of the ps manager.
+                # Store the other batch fields in the request buffer of the ps manager.
                 # They will be merged with the reward data.
-                psrl_logger.debug(f"Adding {batch_size} requests to buffer in ps manager")
                 ray.get(self.ps_manager_handle.add_request_data_to_buffer.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
-                psrl_logger.debug("Successfully added requests to buffer")
                 
                 # We manually repeat prompts in the generation batch for Group Sampling.
                 # Requests in the batch are unique during generation and synchronized through parent tracker.
                 if self.rollout_n > 1:
-                    psrl_logger.debug(f"Repeating gen_batch for Group Sampling with rollout_n={self.rollout_n}")
                     gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
                     uid_list = []
                     for i in range(batch_size):
@@ -412,39 +379,34 @@ class DataProcessor:
                             child_id = sample_ids[i] * self.rollout_n + j
                             uid_list.append(child_id)
                     gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
-                    psrl_logger.debug(f"Created {len(uid_list)} child UIDs for Group Sampling, first few: {uid_list[:5]}{'...' if len(uid_list) > 5 else ''}")
                 
                 # Record the request status in the request status manager and put the batch into the data queue.
                 if self.process_mode == "stream":
-                    psrl_logger.debug(f"Process mode: stream, adding {len(gen_batch)} individual requests to data_queue")
                     batch_size = len(gen_batch)
                     for i in range(batch_size):
                         ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i],
                         ))
                         self.data_queue.put(gen_batch[i:i+1])
-                    psrl_logger.debug(f"Added {batch_size} individual requests to data_queue")
                 else:
-                    psrl_logger.debug(f"Process mode: batch, adding {len(gen_batch.non_tensor_batch['uid'])} UIDs as a batch to data_queue")
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))
                     self.data_queue.put(gen_batch)
-                    psrl_logger.debug(f"Added batch with {len(gen_batch)} samples to data_queue")
                 
-                if self._train_batch_idx > self.total_training_steps:
-                    psrl_logger.debug(f"Reached total_training_steps: {self.total_training_steps}, breaking loop")
-                    break
+                self.global_steps += 1
+                if self.global_steps >= self.total_training_steps:
+                    self.stop_data_process = True
 
             except StopIteration:
-                curr_epoch = self._train_batch_idx // len(self.train_dataloader)
+                curr_epoch = self.global_steps // len(self.train_dataloader)
                 psrl_logger.debug(f"StopIteration encountered, current epoch: {curr_epoch}/{total_epochs}")
                 if curr_epoch >= total_epochs:
-                    psrl_logger.info("All training epochs completed.")
-                    break
+                    psrl_logger.info("All training epochs completed, stopping data processing.")
+                    self.stop_data_process = True
                 else:
                     psrl_logger.debug("Reinitializing train_dataloader_iter for next epoch")
                     self.train_dataloader_iter = iter(self.train_dataloader)
         
         # Signal end of data processing
-        psrl_logger.info("Data processing completed, sending shutdown signal to reward computation thread.")
+        psrl_logger.info("Data processing stopped, sending shutdown signal.")
         self.data_queue.put(None)

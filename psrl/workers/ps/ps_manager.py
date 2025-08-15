@@ -42,7 +42,7 @@ class ModelStore:
 @ray.remote
 @add_lock
 class PSManager(RequestStatusTracker):
-    def __init__(self, psrl_config: DictConfig) -> None:
+    def __init__(self, psrl_config: DictConfig, group_post_process_fn: Optional[callable] = None) -> None:
         """
         Initialize the Parameter Server (PS) Manager, responsible for management of model versions,
         staleness buffers, and rollout requests.
@@ -60,11 +60,7 @@ class PSManager(RequestStatusTracker):
             self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n
         
-        # Rollout server reference
-        self.rollout_server: Optional[ray.actor.ActorHandle] = None
-        
-        # Reward server reference
-        self.reward_server: Optional[ray.actor.ActorHandle] = None
+        self.group_post_process_fn = group_post_process_fn
         
         # NIXL related attributes
         self.expected_clients = 0
@@ -108,14 +104,6 @@ class PSManager(RequestStatusTracker):
         """Get the PS handle."""
         return ray.get_runtime_context().current_actor
 
-    def set_rollout_server(self, rollout_server: ray.actor.ActorHandle):
-        """Set the reference to the rollout server."""
-        self.rollout_server = rollout_server
-
-    def set_reward_server(self, reward_server: ray.actor.ActorHandle):
-        """Set the reference to the reward server."""
-        self.reward_server = reward_server
-
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
         """Register a new rollout instance."""
         self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(
@@ -123,7 +111,15 @@ class PSManager(RequestStatusTracker):
         )
         
     # ------- STALENESS INVENTORY MANAGEMENT -------
-        
+
+    def _group_post_processing(self, entry_infos: List[EntryInfo]):
+        """Apply post-processing function to a group of entry infos."""
+        assert self.group_post_process_fn is not None, "Group post-processing function is not set."
+        data_list = [self.staleness_inventory.get_from_data_pool(entry_info) for entry_info in entry_infos]
+        processed_data_list = self.group_post_process_fn(data_list)
+        for entry_info, processed_data in zip(entry_infos, processed_data_list):
+            self.staleness_inventory.add_to_data_pool(entry_info, processed_data)
+
     def get_max_reserve_num(self, model_version) -> int:
         """Get the maximum number of entries that can be reserved for a specific model version.
         
@@ -244,7 +240,7 @@ class PSManager(RequestStatusTracker):
                     buffer_id=max_ready_buffer_id,
                     curr_ps_model_version=curr_ps_model_version,
                 )
-                asyncio.create_task(self.execute_command(self.rollout_server, command, blocking=False))
+                asyncio.create_task(self.execute_command(self.rollout_coordinator, command, blocking=False))
 
     async def execute_command(self, server, command: Command, blocking: bool = False):
         try:
@@ -344,7 +340,7 @@ class PSManager(RequestStatusTracker):
             # Group Sampling
             assert self.rollout_n > 1, "rollout_n must be greater than 1 to use parent_id."
             psrl_logger.debug(f"Adding data for entry_info to staleness inventory")
-            self.staleness_inventory.add_data(
+            self.staleness_inventory.add_to_data_pool(
                 entry_info=entry_info,
                 data=data,
             )
@@ -375,6 +371,9 @@ class PSManager(RequestStatusTracker):
                     psrl_logger.debug(f"Aborting child requests {abort_child_ids} for parent request {parent_id}.")
                     self.abort_requests(list(abort_child_ids))
                     psrl_logger.debug(f"Successfully aborted {len(abort_child_ids)} child requests")
+
+                if self.group_post_process_fn:
+                    self._group_post_processing(entry_infos)
 
                 psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
                 for i, entry_info in enumerate(entry_infos):
@@ -473,7 +472,7 @@ class PSManager(RequestStatusTracker):
 
         self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
         # Sync the rollout instance model version in the rollout server
-        ray.get(self.rollout_server.set_rollout_instance_model_version.remote(
+        ray.get(self.rollout_coordinator.set_rollout_instance_model_version.remote(
             rollout_instance_id=rollout_instance_id,
             version_tag=self.model_store.version_tag,
         ))

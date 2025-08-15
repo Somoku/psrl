@@ -249,6 +249,12 @@ class PSRL_vLLMRollout(BaseRollout):
         kwargs: dict
     ) -> Tuple[Union[PromptType, Sequence[PromptType]], dict[str, Any]]:
         """Pre-process the prompts to convert them into vLLM inputs."""
+        # 1. remove left padding -> raw_prompt_ids
+        # 2. concat raw_prompt_ids and raw_response_ids -> prompt_token_ids in `vllm_inputs`
+        # 3. add multi_modal_data if exists
+        # 4. sampling params configuration
+        
+        # TODO: 在外部移除 single-request 的 padding
         
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         batch_size = idx.size(0)
@@ -279,9 +285,6 @@ class PSRL_vLLMRollout(BaseRollout):
         else:
             vllm_inputs = [{"prompt_token_ids": raw_prompt_ids_ + raw_response_ids_} for raw_prompt_ids_, raw_response_ids_ in zip(raw_prompt_ids, raw_response_ids)]
 
-        '''
-        vllm_inputs include: prompt_token_ids, (multi_modal_data)
-        '''
         # ensure the type of `prompt_token_ids` passed to vllm is list[int]
         # https://github.com/volcengine/verl/pull/772
         for input_data in vllm_inputs:
@@ -324,6 +327,15 @@ class PSRL_vLLMRollout(BaseRollout):
         outputs: Union[Union[RequestOutput, PoolingRequestOutput], list[Union[RequestOutput, PoolingRequestOutput]]],
     ) -> DataProto:
         """Post-process the vllm outputs to convert them into DataProto."""
+        # 1. collect response_ids, response_len, interrupted
+        # 2. collect log_probs if required
+        # 3. concat new response_ids to raw_response_ids, update response_unpadded_len and rollout_log_probs
+        # 4. pad response to the right side
+        # 5. construct position_ids and attention_mask (final)
+        # 6. construct the final data proto
+        
+        # partial rollout 情况下需要 response_ids 和 log_probs -> outputs
+
         if isinstance(outputs, (RequestOutput, PoolingRequestOutput)):
             outputs = [outputs]
         
@@ -537,6 +549,40 @@ class PSRL_vLLMRollout(BaseRollout):
         
         return DataProto.concat(completed_rollout)
 
+    @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
+    @torch.no_grad()
+    async def raw_generate_sequences_async(self, prompts: DataProto, **kwargs) -> DataProto:
+        """Generate sequences from the prompts using vLLM asynchronously w/o post-processing."""
+        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
+        sample_ids = prompts.non_tensor_batch.get("uid", None)
+        curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", [0] * len(vllm_inputs))
+        assert sample_ids is not None, \
+            "sample_ids must be provided in the prompts.non_tensor_batch"
+        
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            tasks = []
+            for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(zip(vllm_inputs, sample_ids, curr_response_unpadded_len)):
+                partial_kwargs = dict(
+                    max_tokens=self.config.response_length - curr_response_len,
+                )
+                with self.update_sampling_params(**partial_kwargs):
+                    tasks.append(
+                        self.generate_sequence_task(
+                            prompt_idx,
+                            vllm_input,
+                            self.sampling_params,
+                            str(sample_id),
+                        )
+                    )
+        
+            vllm_outputs = []
+            for completed_task in asyncio.as_completed(tasks):
+                output = await completed_task
+                vllm_outputs.append(output)
+        
+        return vllm_outputs
+
     async def interrupt_all_requests_async(self) -> int:
         """Interrupt all requests (both running and waiting) asynchronously."""
         # Get request IDs of all running and waiting requests from the scheduler
@@ -560,3 +606,13 @@ class PSRL_vLLMRollout(BaseRollout):
     async def waiting_and_running_queue_size(self):
         """Get the size of waiting and running queues."""
         return len(await self.inference_engine.waiting_and_running_queue())
+    
+    async def get_engine_status(self):
+        """Get the status of the vLLM engine."""
+        if self.inference_engine is None:
+            return {"status": "not initialized"}
+        
+        status = {
+            "waiting_and_running_queue_size": await self.waiting_and_running_queue_size(),
+        }
+        return status

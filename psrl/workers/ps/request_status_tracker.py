@@ -26,10 +26,11 @@ class RequestStatus(Enum):
     """
     
     PENDING = enum.auto()
-    DISPATCHED = enum.auto()
+    RUNNING = enum.auto()
+    ROLLOUT_DISPATCHED = enum.auto()
     ROLLOUT_RUNNING = enum.auto()
-    ROLLOUT_COMPLETED = enum.auto()
     ROLLOUT_INTERRUPTED = enum.auto()
+    COMPLETED = enum.auto()
     REWARD_RUNNING = enum.auto()
     REWARD_COMPLETED = enum.auto()
 
@@ -51,6 +52,20 @@ class RequestStatusTracker:
         self._abort_request_ids = set() # Set of request IDs that are marked for abortion
         self._running_min_version = 0 # Minimum version of requests that are currently running
         self.rollout_request_buffer = {}  # Buffer for storing request data during rollout processing
+        
+        # Rollout coordinator reference
+        self.rollout_coordinator: Optional[ray.actor.ActorHandle] = None
+        
+        # Reward server reference
+        self.reward_server: Optional[ray.actor.ActorHandle] = None
+
+    def set_rollout_coordinator(self, rollout_coordinator: ray.actor.ActorHandle):
+        """Set the reference to the rollout coordinator."""
+        self.rollout_coordinator = rollout_coordinator
+
+    def set_reward_server(self, reward_server: ray.actor.ActorHandle):
+        """Set the reference to the reward server."""
+        self.reward_server = reward_server
 
     def update_request_status(
         self,
@@ -251,14 +266,14 @@ class RequestStatusTracker:
         if abort_requests_for_rollout:
             psrl_logger.debug("Aborting requests in rollout stages: %s", abort_requests_for_rollout)
             instance_to_request_ids = self.classify_requests_in_instance(list(abort_requests_for_rollout))
-            ray.get(self.rollout_server.exec_command.remote(
+            ray.get(self.rollout_coordinator.exec_command.remote(
                 Command(
                     type=CommandType.ABORT,
                     instance_to_uids=instance_to_request_ids,
                 ),
                 blocking=blocking,
             ))
-            psrl_logger.debug("Abort command sent to rollout server for requests: %s", abort_requests_for_rollout)
+            psrl_logger.debug("Abort command sent to rollout coordinator for requests: %s", abort_requests_for_rollout)
         
         # Abort requests in reward stage (REWARD_RUNNING)
         if abort_requests_for_reward:

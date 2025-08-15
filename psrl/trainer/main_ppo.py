@@ -223,6 +223,8 @@ class TaskRunner:
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
             collate_fn=collate_fn,
+            group_post_process_fn=None,
+            buffer_post_process_fn=None,
             device_name=config.trainer.device,
         )
         # Initialize the workers of the trainer.

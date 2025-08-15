@@ -19,6 +19,7 @@ class CommandType(Enum):
     SYNC: Synchronize the server state with the latest weights.
     ABORT: Abort requests running in the server.
     CHECK_AND_SYNC: Check if the server needs to sync with the latest weights and do so if necessary.
+    ENGINE_STATUS: Send engine status information.
     """
     STOP = enum.auto()
     RESUME = enum.auto()
@@ -26,6 +27,7 @@ class CommandType(Enum):
     SYNC = enum.auto()
     ABORT = enum.auto()
     CHECK_AND_SYNC = enum.auto()
+    ENGINE_STATUS = enum.auto()
 
 class Command:
     """

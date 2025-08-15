@@ -19,7 +19,8 @@ class EntryCategory(enum.Enum):
     """
     EMPTY = 0
     RESERVED = 1
-    OCCUPIED = 2
+    STORED = 2
+    OCCUPIED = 3
 
 @dataclass
 class EntryInfo:
@@ -225,10 +226,17 @@ class StalenessInventory:
     Args:
         num_entries (int): Number of entries per buffer.
     """
-    def __init__(self, num_entries: int, staleness: int):
+    def __init__(
+        self,
+        num_entries: int,
+        staleness: int,
+        buffer_post_process_fn: Optional[callable] = None,
+    ):
         self.staleness = staleness
         self.buffer_id = 0
         self.num_entries = num_entries
+        self.buffer_post_process_fn = buffer_post_process_fn
+
         self.data_pool: Dict[EntryInfo, DataProto] = {} # Rollout data pool for requests in Group Sampling
         self.buffers: Dict[int, StalenessBuffer] = {}
         self.data_tracker: Dict[EntryInfo, Tuple[int, int]] = {} # Maps entry to location (buffer_id, entry_id)
@@ -325,6 +333,9 @@ class StalenessInventory:
                 break
                 
         new_status = buffer.get_status()
+        if new_status == BufferStatus.READY:
+            if self.buffer_post_process_fn:
+                self.buffer_post_process_fn(buffer)
         # Update in the new status track
         self._buffer_ids_by_status[new_status].add(buffer_id)
      
@@ -392,7 +403,7 @@ class StalenessInventory:
             self.buffers[bid].get_empty_entries_num() for bid in pending_buffers if bid <= max_staleness_buffer_id
         )
 
-    def add_data(
+    def add_to_data_pool(
         self,
         entry_info: EntryInfo,
         data: DataProto,
@@ -410,7 +421,25 @@ class StalenessInventory:
 
         self.data_pool[entry_info] = data
 
-    def remove_data(
+    def get_from_data_pool(
+        self,
+        entry_info: EntryInfo,
+    ) -> DataProto:
+        """
+        Retrieve rollout data from the group data pool for a specific entry.
+
+        Args:
+            entry_info (EntryInfo): The entry metadata.
+        Returns:
+            DataProto: The retrieved data.
+        Raises:
+            AssertionError: If data for the entry does not exist.
+        """
+        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+
+        return self.data_pool[entry_info]
+
+    def remove_from_data_pool(
         self,
         entry_info: EntryInfo
     ):
@@ -494,6 +523,8 @@ class StalenessInventory:
             # For group sampling, the rollout data is stored in the group data pool.
             assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
             data = self.data_pool.pop(entry_info)
+            if data is None:
+                return
         
         rollout_instance_id = entry_info.rollout_instance_id
 
@@ -537,6 +568,8 @@ class StalenessInventory:
             # For group sampling, the rollout data is stored in the group data pool.
             assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
             data = self.data_pool.pop(entry_info)
+            if data is None:
+                return
 
         # Step 2: Get all PENDING buffers within the staleness limit
         pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
@@ -590,6 +623,8 @@ class StalenessInventory:
             # For group sampling, the rollout data is stored in the group data pool.
             assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
             data = self.data_pool.pop(entry_info)
+            if data is None:
+                return
 
         old_buffer_id, old_entry_id = self.data_tracker[entry_info]
         old_buffer = self.buffers[old_buffer_id]

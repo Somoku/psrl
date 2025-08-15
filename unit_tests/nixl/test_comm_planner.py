@@ -10,7 +10,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
 from psrl.utils.nixl.network_topology import NetworkTopology, LinkType
 from psrl.utils.nixl.comm_plan import (
     CommunicationPlanner, NIXLClientInfo, NIXLClientType, 
-    NIXLTensorDescInfo, global_comm_planner
+    NIXLTensorInfo, global_comm_planner
 )
 
 
@@ -18,7 +18,7 @@ def create_test_tensor_desc_info_1():
     """Create a test tensor descriptor info"""
     # Simulate a tensor with 4 shards
     desc_bytes_list = [b"shard_0", b"shard_1", b"shard_2", b"shard_3"]
-    return NIXLTensorDescInfo(
+    return NIXLTensorInfo(
         desc_bytes_list=desc_bytes_list,
         shard_dim=0,
         shard_mesh=4,
@@ -33,7 +33,7 @@ def create_test_tensor_desc_info_2():
     """Create a test tensor descriptor info"""
     # Simulate a tensor with 4 shards
     desc_bytes_list = [b"shard_0", b"shard_1", b"shard_2", b"shard_3"]
-    return NIXLTensorDescInfo(
+    return NIXLTensorInfo(
         desc_bytes_list=desc_bytes_list,
         shard_dim=0,
         shard_mesh=4,
@@ -48,7 +48,7 @@ def create_test_tensor_desc_info_3():
     """Create a test tensor descriptor info"""
     # Simulate a tensor with 4 shards
     desc_bytes_list = [b"shard_0", b"shard_1", b"shard_2", b"shard_3"]
-    return NIXLTensorDescInfo(
+    return NIXLTensorInfo(
         desc_bytes_list=desc_bytes_list,
         shard_dim=0,
         shard_mesh=4,
@@ -73,7 +73,7 @@ def test_communication_planner():
         ip="192.168.1.1",
         gpu_id=0,
         type=NIXLClientType.PUSH_SIDE,
-        descs={"weight": create_test_tensor_desc_info_1()},
+        tensor_infos={"weight": create_test_tensor_desc_info_1()},
         meta=b"push_meta_A"
     )
     
@@ -83,7 +83,7 @@ def test_communication_planner():
         ip="192.168.1.1",
         gpu_id=1,
         type=NIXLClientType.PUSH_SIDE,
-        descs={"weight": create_test_tensor_desc_info_2()},
+        tensor_infos={"weight": create_test_tensor_desc_info_2()},
         meta=b"push_meta_B"
     )
     
@@ -93,7 +93,7 @@ def test_communication_planner():
         ip="192.168.1.1",
         gpu_id=-1,
         type=NIXLClientType.PUSH_SIDE,
-        descs={"weight": create_test_tensor_desc_info_1()},
+        tensor_infos={"weight": create_test_tensor_desc_info_1()},
         meta=b"push_meta_C"
     )
     
@@ -103,7 +103,7 @@ def test_communication_planner():
         ip="192.168.1.2",
         gpu_id=0,
         type=NIXLClientType.PUSH_SIDE,
-        descs={"weight": create_test_tensor_desc_info_3()},
+        tensor_infos={"weight": create_test_tensor_desc_info_3()},
         meta=b"push_meta_D"
     )
     
@@ -113,7 +113,7 @@ def test_communication_planner():
         ip="192.168.1.1",
         gpu_id=0,
         type=NIXLClientType.PS,
-        descs={"weight": create_test_tensor_desc_info_3()},
+        tensor_infos={"weight": create_test_tensor_desc_info_3()},
         meta=b"ps_meta_1"
     )
     
@@ -123,7 +123,7 @@ def test_communication_planner():
         ip="192.168.1.3",
         gpu_id=0,
         type=NIXLClientType.PULL_SIDE,
-        descs={"weight": create_test_tensor_desc_info_1()},
+        tensor_infos={"weight": create_test_tensor_desc_info_1()},
         meta=b"pull_meta_1"
     )
     

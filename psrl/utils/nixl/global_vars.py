@@ -2,10 +2,13 @@ from psrl.utils.nixl.network_topology import NetworkTopology
 from psrl.utils.nixl.port_scanner import PortScanner
 
 # Global network topology instance
-global_topology = NetworkTopology() 
+GLOBAL_TOPOLOGY = NetworkTopology() 
 
 # Global port scanner instance
-global_port_scanner = PortScanner.remote()
+GLOBAL_PORT_SCANNER = PortScanner.remote()
 
-# Global name of meta server
-global_meta_server_name = "NIXLMetaServer"
+# Global name
+GLOBAL_META_SERVER_NAME = "NIXLMetaServer"
+GLOBAL_TRAIN_CLIENT_NAME = "NIXLTrainClient"
+GLOBAL_GEN_CLIENT_NAME = "NIXLGenClient"
+GLOBAL_PS_CLIENT_NAME = "NIXLPSClient"

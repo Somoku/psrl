@@ -1,3 +1,5 @@
+import os
+import logging
 import asyncio
 import hydra
 import torch
@@ -14,6 +16,10 @@ from verl.utils.model import compute_position_id_with_mask
 from psrl.workers.agent_loop.utils import DummyConfig, AgentLoopOutput, _agent_loop_registry
 from psrl.workers.ps.request_status_tracker import RequestStatus
 from psrl.workers.agent_loop.router import RolloutRouter
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class PSRL_AgentLoopWorker:

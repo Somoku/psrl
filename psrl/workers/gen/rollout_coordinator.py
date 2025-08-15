@@ -62,7 +62,7 @@ class RolloutCoordinator(CommandExtension):
         
         # Build logger
         self.log_prefix = "RolloutCoordinator"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
     def start_busy_loop(self):
         if self.background_running:

@@ -8,21 +8,18 @@ export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
 
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-GLOBAL_BATCH_SIZE=512
+GLOBAL_BATCH_SIZE=16
 GEN_TP=2 # TP in the generation side
 TRAIN_TP=2 # TP in the training side for validation
 
-NNODES=3
+NNODES=2
 NGPUS_PER_NODE=8
 
-PS_NNODES=1
-PS_NGPUS_PER_NODE=${NGPUS_PER_NODE} 
-
-GEN_NNODES=$(( ${NNODES} - ${PS_NNODES} )) # Number of nodes for generation
+GEN_NNODES=${NNODES} # Number of nodes for generation
 GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ${GEN_TP} )) # Number of generation instances
 
-TRAIN_NNODES=${GEN_NNODES} # Number of nodes for training
+TRAIN_NNODES=${NNODES} # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
@@ -34,6 +31,7 @@ test_files="['$gsm8k_test_path']"
 bash $HOME/kill.sh 3
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
+    psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
@@ -46,11 +44,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_TP} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.deployment.ps_nnodes=${PS_NNODES} \
-    psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
-    psrl.nixl_server_mode=meta_server \
-    psrl.nixl_server_ip=${MASTER_NODE_IP} \
-    psrl.nixl_server_port=23456 \
+    psrl.nixl.server_mode=meta_server \
+    psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=sync \
@@ -88,8 +83,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
-    data.max_prompt_length=1024 \
-    data.max_response_length=1024 \
+    data.max_prompt_length=128 \
+    data.max_response_length=128 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     trainer.critic_warmup=0 \

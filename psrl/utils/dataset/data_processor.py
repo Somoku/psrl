@@ -87,7 +87,7 @@ class DataProcessor:
         
         # Build logger
         self.log_prefix = "DataProcessor"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         
         # Create the initial datasets and dataloaders
         self.total_training_steps = None

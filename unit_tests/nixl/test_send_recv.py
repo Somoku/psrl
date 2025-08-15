@@ -68,7 +68,8 @@ if __name__ == "__main__":
     # print(f"{args.mode} Tensors: {tensors}")
 
     start_time = time.time()
-    reg_descs = agent.register_memory(tensors)
+    reg_descs_all = agent.register_memory(tensors)
+    reg_descs = agent.register_memory([tensor[:512] for tensor in tensors])
     end_time = time.time()
     print(f"Register memory time: {end_time - start_time} seconds")
     if not reg_descs:  # Same as reg_descs if successful

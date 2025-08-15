@@ -10,14 +10,15 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.util.placement_group import placement_group, PlacementGroupSchedulingStrategy
+from omegaconf import OmegaConf
 
 from verl.utils.fs import copy_to_local
 
-from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, global_meta_server_name, global_port_scanner
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PORT_SCANNER
 from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker
 
-QWEN_MODEL_PATH = "/jizhicfs/lhy/models/Qwen2.5-7B-Instruct"
+QWEN_MODEL_PATH = "/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct"
 
 def make_dual_print(log_path, prefix=None):
     with open(log_path, "w") as f:
@@ -33,8 +34,8 @@ def make_dual_print(log_path, prefix=None):
 
 @ray.remote
 class MetaServerActor:
-    def __init__(self, server_name, listen_ip, listen_port, expected_clients, log_dir):
-        self.server = NIXLMetaServer(server_name, listen_ip, listen_port)
+    def __init__(self, server_name, psrl_config, expected_clients, log_dir):
+        self.server = NIXLMetaServer(server_name, psrl_config.nixl)
         self.expected_clients = expected_clients
         self.client_name = server_name
         os.makedirs(log_dir, exist_ok=True)
@@ -72,8 +73,8 @@ class MetaServerActor:
 
 @ray.remote(num_cpus=1)
 class TrainClientActor:
-    def __init__(self, rank, world_size, server_name, server_ip, server_port, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
-        os.environ["MASTER_ADDR"] = server_ip
+    def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
+        os.environ["MASTER_ADDR"] = psrl_config.nixl.server_ip
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -84,7 +85,7 @@ class TrainClientActor:
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         torch.manual_seed(42)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
-        model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL_PATH, torch_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL_PATH, torch_dtype=torch.float32)
         # Set all model parameters to 1
         for p in model.parameters():
             p.data.fill_(1)
@@ -101,11 +102,9 @@ class TrainClientActor:
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
-            server_ip=server_ip,
-            server_port=server_port,
             use_gpu=True,
-            mode="meta_server",
             client_type=NIXLClientType.PUSH_SIDE,
+            nixl_config=psrl_config.nixl,
             nixl_interface=nixl_interface
         )
         
@@ -155,9 +154,9 @@ class TrainClientActor:
 
 @ray.remote(num_cpus=1)
 class GenClientActor:
-    def __init__(self, rank, world_size, server_name, server_ip, server_port, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
+    def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
         from vllm import LLM
-        os.environ["MASTER_ADDR"] = server_ip
+        os.environ["MASTER_ADDR"] = psrl_config.nixl.server_ip
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -171,6 +170,7 @@ class GenClientActor:
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
         llm = LLM(
             model=QWEN_MODEL_PATH,
+            dtype="float32",
             tensor_parallel_size=world_size,
             distributed_executor_backend="external_launcher",
             enforce_eager=True,
@@ -183,11 +183,9 @@ class GenClientActor:
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
-            server_ip=server_ip,
-            server_port=server_port,
             use_gpu=True,
-            mode="meta_server",
             client_type=NIXLClientType.PULL_SIDE,
+            nixl_config=psrl_config.nixl,
             nixl_interface=nixl_interface
         )
         
@@ -217,6 +215,7 @@ class GenClientActor:
         self.client.send_local_info()
         self.print("step6: wait_for_server_info (client infos & comm plan)")
         self.client.wait_for_server_info()
+        # self.print(f"comm plan: {self.client._comm_plan}")
         self.print("step7: send_local_temp_mapping")
         self.client.send_local_temp_mapping()
         self.print("step8: wait_for_server_temp_mappings")
@@ -238,25 +237,17 @@ class GenClientActor:
     def shutdown(self):
         self.client.shutdown()
 
-def create_ps_worker_group(server_ip, server_port, model_path, nixl_interface: NIXLInterface):
-    from omegaconf import OmegaConf
-    config = OmegaConf.create({
-        "model": {"path": model_path, "use_shm": False, "trust_remote_code": False}
-    })
-    psrl_config = OmegaConf.create({
-        "nixl_server_mode": "meta_server",
-        "nixl_server_ip": server_ip,
-        "nixl_server_port": server_port,
-        "ps_mode": "nixl_cpu"
+def create_ps_worker_group(num_ps, psrl_config, model_path, nixl_interface: NIXLInterface):
+    model_config = OmegaConf.create({
+        "path": model_path, "use_shm": False, "trust_remote_code": False
     })
     ray_nodes = ray.nodes()
-    node = ray_nodes[0]
-    node_ip = node["NodeManagerAddress"]
-    node_id = node["NodeID"]
+    nodes = [ray_nodes[i] for i in range(num_ps)]
     ps_resource_pool = PSResourcePool([
-        PSResourceSpec(node_ip=node_ip, node_id=node_id, attached_gpu_id=None)
+        PSResourceSpec(node_ip=node["NodeManagerAddress"], node_id=node["NodeID"], attached_gpu_id=None)
+        for node in nodes
     ])
-    ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), config, psrl_config, nixl_interface)
+    ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), model_config, psrl_config, nixl_interface)
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
     return ps_wg
 
@@ -266,19 +257,32 @@ def test_nixl_e2e():
     ray.init(ignore_reinit_error=True)
     listen_ip = "29.210.128.48"
     listen_port = 23459
-    server_name = global_meta_server_name
+    server_name = GLOBAL_META_SERVER_NAME
     backend = "nccl"
     torch_port_train = 29502
     torch_port_gen = 29503
-    num_train = 2
+    num_train = 4
     num_gen = 2
-    num_ps = 1
+    num_ps = 2
+    
+    psrl_config = OmegaConf.create({
+        "logging_path": log_dir,
+        "ps_manager_ip": listen_ip,
+        "nixl": {
+            "server_mode": "meta_server",
+            "server_ip": listen_ip,
+            "server_port": listen_port,
+            "max_pinned_temp_memory_slots": 4
+        },
+        "ps_mode": "nixl_cpu"
+    })
     
     nixl_interface = NIXLInterface(
-        port_scanner=global_port_scanner
+        port_scanner=GLOBAL_PORT_SCANNER
     )
     # nixl_interface = NIXLInterface()
     
+    start_time = time.time()
     ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = MetaServerActor.options(
@@ -286,37 +290,46 @@ def test_nixl_e2e():
             node_id=ip_to_node_id[listen_ip],
             soft=False
         )
-    ).remote(server_name, listen_ip, listen_port, num_train + num_gen + num_ps, log_dir)
+    ).remote(server_name, psrl_config, num_train + num_gen + num_ps, log_dir)
     ray.get(server.init_finished.remote())
+    end_time = time.time()
+    print(f"[PASS] server init done. time: {end_time - start_time}s")
     
-    ps_wg = create_ps_worker_group(listen_ip, listen_port, QWEN_MODEL_PATH, nixl_interface)
+    start_time = time.time()
+    ps_wg = create_ps_worker_group(num_ps,psrl_config, QWEN_MODEL_PATH, nixl_interface)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
-
+    end_time = time.time()
+    print(f"[PASS] ps init done. time: {end_time - start_time}s")
+    
     # train_pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(num_train)], strategy="PACK")
     # gen_pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(num_gen)], strategy="PACK")
     # ray.get(train_pg.ready())
     # ray.get(gen_pg.ready())
-
+    
+    start_time = time.time()
     train_actors = [
         TrainClientActor.options(
             num_gpus=1,
             # scheduling_strategy=PlacementGroupSchedulingStrategy(train_pg, placement_group_bundle_index=rank)
-        ).remote(rank, num_train, server_name, listen_ip, listen_port, backend, torch_port_train, log_dir, nixl_interface)
+        ).remote(rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface)
         for rank in range(num_train)
     ]
     gen_actors = [
         GenClientActor.options(
             num_gpus=1,
             # scheduling_strategy=PlacementGroupSchedulingStrategy(gen_pg, placement_group_bundle_index=rank)
-        ).remote(rank, num_gen, server_name, listen_ip, listen_port, backend, torch_port_gen, log_dir, nixl_interface)
+        ).remote(rank, num_gen, server_name, psrl_config, backend, torch_port_gen, log_dir, nixl_interface)
         for rank in range(num_gen)
     ]
     for i in range(num_train):
         ray.get(train_actors[i].init_finished.remote())
     for i in range(num_gen):
         ray.get(gen_actors[i].init_finished.remote())
+    end_time = time.time()
+    print(f"[PASS] client init done. time: {end_time - start_time}s")
 
+    start_time = time.time()
     # Run protocol for server, clients, and PS workers
     server.protocol.remote()
     futures = []
@@ -326,9 +339,11 @@ def test_nixl_e2e():
         futures.append(g.protocol.remote())
     futures.extend(ps_wg.execute_all_async("nixl_protocol"))
     ray.get(futures)
-    print("[PASS] protocol done.")
+    end_time = time.time()
+    print(f"[PASS] protocol done. time: {end_time - start_time}s")
 
-    ps_names = ["NIXLPSClient_{}".format(i) for i in range(num_ps)]
+    ps_names = ray.get(ps_wg.execute_all_async("get_nixl_storage_client_name"))
+    print(f"ps_names: {ps_names}")
 
     # Each train client pushes to each PS worker
     start_time = time.time()
@@ -336,8 +351,8 @@ def test_nixl_e2e():
     for ps_name in ps_names:
         for t in train_actors:
             t.push_to_ps.remote(ps_name)
-    for t in train_actors:
-        futures.append(t.wait_push_done.remote(ps_name))
+        for t in train_actors:
+            futures.append(t.wait_push_done.remote(ps_name))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] train push to all ps done. time: {end_time - start_time}s")
@@ -348,8 +363,8 @@ def test_nixl_e2e():
     for ps_name in ps_names:
         for g in gen_actors:
             g.pull_from_ps.remote(ps_name)
-    for g in gen_actors:
-        futures.append(g.wait_pull_done.remote(ps_name))
+        for g in gen_actors:
+            futures.append(g.wait_pull_done.remote(ps_name))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] gen pull from all ps done. time: {end_time - start_time}s")

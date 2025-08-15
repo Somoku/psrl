@@ -29,7 +29,10 @@ class NIXLSharding:
     """Sharding of a global tensor"""
     # Total number of shards, a dict of ints, key is the shard dimension, value is the number of shards 
     # e.g., {0: 2, 1: 8} for 2D sharding, meaning the first dimension has 2 shards and the second dimension has 8 shards
-    shard_mesh: OrderedDict[int, int]             
+    shard_mesh: OrderedDict[int, int]  
+    # Shard mesh from a local perspective, a dict of ints, key is the shard dimension, value is the number of shards 
+    # e.g., {0: 1, 1: 1} for 2D sharding, meaning the local tensor is already the finest-grained shard, no need to split
+    _local_shard_mesh: OrderedDict[int, int]           
     # Current shard indices, a list of tuples of ints
     # e.g., [(0, 0), (0, 1), ..., (0, 7)] for 2D sharding, meaning it contains 8 shards in the first row
     shard_indices: List[Tuple[int, ...]]   
@@ -374,10 +377,15 @@ class NIXLShardMetaInfo:
     shape: torch.Size
     stride: Tuple[int, ...]
     is_contiguous: bool
+    
+    def can_xfer_to(self, other: 'NIXLShardMetaInfo') -> bool:
+        """Check if the shard can be transferred to another shard"""
+        # xfer between non-contiguous shards is not supported
+        return self.is_contiguous and other.is_contiguous and self.dtype == other.dtype and self.shape == other.shape and self.stride == other.stride
 
 
 @dataclass
-class NIXLTensorDescInfo:
+class NIXLTensorInfo:
     """Tensor descriptor information with sharding support"""
     desc_bytes_list: List[bytes]  # Descriptors for each shard (None for non-contiguous shards)
     sharding: NIXLSharding        # Sharding information
@@ -435,16 +443,16 @@ class NIXLClientInfo:
     ip: str
     gpu_id: int
     type: NIXLClientType
-    descs: Dict[str, NIXLTensorDescInfo]  # key -> TensorDescInfo
+    tensor_infos: Dict[str, NIXLTensorInfo]  # key -> TensorDescInfo
     meta: bytes  # agent metadata
 
     def get_tensor_desc(self, agent, key, local_pos: int = 0):
         """Get tensor descriptor for specific key and shard"""
-        return self.descs[key].get_desc(agent, local_pos)
+        return self.tensor_infos[key].get_desc(agent, local_pos)
 
     def get_tensor_desc_info(self, key):
         """Get tensor descriptor info for specific key"""
-        return self.descs[key]
+        return self.tensor_infos[key]
 
     def serialize(self):
         """Serialize client info"""

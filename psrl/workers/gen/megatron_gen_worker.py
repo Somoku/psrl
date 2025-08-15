@@ -116,7 +116,7 @@ class PSRL_MegatronGenWorker(ActorRolloutRefWorker):
         
         # Build logger
         self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
     
     def get_instance_representative_rank(self) -> int:

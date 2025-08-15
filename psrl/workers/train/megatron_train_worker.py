@@ -36,7 +36,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
         
         # Build logger
         self.log_prefix = f"TrainWorker_R{self.rank}"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         
     @property   

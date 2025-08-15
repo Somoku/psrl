@@ -2,6 +2,7 @@ import logging
 import os
 import uuid
 import asyncio
+
 import numpy as np
 from deprecated import deprecated
 from contextlib import contextmanager
@@ -23,7 +24,6 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
 from verl import DataProto
-from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -176,7 +176,7 @@ class PSRL_vLLMRollout(BaseRollout):
 
         llm_kwargs = dict(
             model=model_path,
-            enable_sleep_mode=True,
+            # enable_sleep_mode=True,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             distributed_executor_backend=distributed_executor_backend,
@@ -307,6 +307,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 "n": 1,  # if greedy, only 1 response
             }
         elif is_validate:
+            # TODO(verl): try **
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,

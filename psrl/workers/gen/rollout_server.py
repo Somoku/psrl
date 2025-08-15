@@ -87,7 +87,7 @@ class RolloutServer(CommandExtension):
         
         # Build logger
         self.log_prefix = "RolloutServer"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
     def start_server(self):
         """

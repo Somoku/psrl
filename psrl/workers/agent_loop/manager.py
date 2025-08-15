@@ -9,6 +9,7 @@ import ray
 from verl import DataProto
 
 from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -47,6 +48,10 @@ class PSRL_AgentLoopManager:
         self._dispatch_idx = 0
         self.busy_loop_task = None
         self.stop_busy_loop_task = False
+        
+        # Build logger
+        self.log_prefix = f"AgentLoopManager"
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
     
     def start_busy_loop(self):
         """Start a busy loop to continuously process data from the queue."""
@@ -106,12 +111,10 @@ class PSRL_AgentLoopManager:
         self._request_counter += 1
         return version_tag
 
-    def _inner_dispatch_data(self, data: DataProto) -> dict[int, DataProto]:
+    def _inner_dispatch_data(self, data: DataProto):
         """Dispatch data to agent loop workers in a round-robin manner.
         Args:
             data (DataProto): Input data.
-        Returns:
-            dict[int, DataProto]: A dictionary mapping worker index to DataProto.
         """
 
         # Update request status from PENDING to RUNNING

@@ -7,6 +7,7 @@ import numpy as np
 from omegaconf import DictConfig
 from typing import Any, Optional, List
 from collections import deque, defaultdict
+from transformers import AutoConfig
 
 import torch
 import torch.distributed as dist
@@ -16,22 +17,25 @@ from torch.multiprocessing.reductions import reduce_tensor
 import ray
 
 from verl import DataProto
+from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
+from verl.utils import hf_tokenizer
 from verl.utils.device import get_torch_device, get_device_name
 from verl.utils.fs import copy_to_local
+from verl.utils.model import get_generation_config
 from verl.utils.debug import log_gpu_memory_usage
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
 from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
-from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, global_meta_server_name
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_GEN_CLIENT_NAME
 from psrl.workers.gen import PSRL_vLLMRollout, GenInterface
 from psrl.workers.ps.request_status_tracker import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
+class PSRL_FSDPGenWorker(Worker):
     @staticmethod
     def configure_worker(
         config,
@@ -111,15 +115,15 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
             nixl_interface (NIXLInterface): The interface for NIXL storage.
             **kwargs: Additional keyword arguments, including 'seed'.
         """
-        super().__init__(config, role)
+        super().__init__()
+        self.config = config
         self.dtype = self.config.rollout.dtype
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
+        self.instance_dist_group = None
 
         self.seed = kwargs.get("seed", 0)
-        
-        self.instance_dist_group = None
         
         self.curr_rollout_instance_model_version = 0 # Current model version for the rollout instance
         
@@ -157,38 +161,47 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         self.require_version_update_event = asyncio.Event()
         self.wait_on_version_events: dict[int, Optional[asyncio.Event]] = {}
         self.wait_on_version_events[0] = None
-        
-        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        # NIXL
+        self.nixl_storage_client = None
+        self.unified_state_dict = None
+        self.unified_sharding_dict = None
         
         # Build logger
         self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
+
+    def _build_distributed(self):
+        # Initialize the distributed process group
+        if not dist.is_initialized():
+            is_cuda_available = torch.cuda.is_available()
+            rank = int(os.environ.get("RANK", 0))
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            dist.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
 
     def init_nixl_client(self):
         assert self.rollout, "Rollout must be initialized before calling init_nixl_client."
         """Initialize the NIXL client."""
-        if self.psrl_config.nixl_server_mode == "storage_server":
+        if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl_server_mode == "meta_server":
+        elif self.psrl_config.nixl.server_mode == "meta_server":
             self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"NIXLGenClient_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
-                server_name=global_meta_server_name,
-                server_ip=self.psrl_config.nixl_server_ip,
-                server_port=self.psrl_config.nixl_server_port,
+                client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
+                server_name=GLOBAL_META_SERVER_NAME,
                 use_gpu=True,
-                mode=self.psrl_config.nixl_server_mode,
                 client_type=NIXLClientType.PULL_SIDE,
+                nixl_config=self.psrl_config.nixl,  
                 nixl_interface=self.nixl_interface
             )
         else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl_server_mode}")
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
     def nixl_protocol(self):
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info(f"nixl client protocol step 0: convert_vllm_inplace")
-        vllm_model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model.state_dict()
+        vllm_model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(self.config.model.path))
         unified_state_dict, local_sharding_dict = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=self.rank)
         psrl_logger.info(f"nixl client protocol step 1: connect_to_server")
@@ -197,6 +210,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         self.nixl_storage_client.send_local_sharding(local_sharding_dict)
         psrl_logger.info(f"nixl client protocol step 3: wait_for_server_sharding")
         unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
+        # psrl_logger.info(f"unified_sharding_dict: {unified_sharding_dict}")
         psrl_logger.info(f"nixl client protocol step 4: register_local_tensors")
         self.nixl_storage_client.register_local_tensors(unified_state_dict, unified_sharding_dict)
         psrl_logger.info(f"nixl client protocol step 5: send_local_info")
@@ -208,7 +222,9 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         psrl_logger.info(f"nixl client protocol step 8: wait_for_server_temp_mappings")
         self.nixl_storage_client.wait_for_server_temp_mappings()
         psrl_logger.info(f"nixl client protocol done.")
-        
+        self.unified_state_dict = unified_state_dict
+        self.unified_sharding_dict = unified_sharding_dict
+
     def get_node_id(self) -> str:
         """
         Get the node id of the rollout instance.
@@ -251,6 +267,8 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         return self.rank == self.get_instance_representative_rank()
     
     def _broadcast_int_val_from_representative_rank(self, val: Optional[int] = None) -> None:
+        # TODO(lhy): This is a temporary solution to broadcast the int value from the representive rank to all instance ranks
+        # A more general solution is to use the `torch.distributed.broadcast_object_list` (https://pytorch.org/docs/stable/distributed.html#torch.distributed.broadcast_object_list)
         """Broadcast an integer value from the representative rank to all instance ranks."""
         if self.instance_dist_group == None:
             # If the instance dist group is not set, we will create it
@@ -271,6 +289,8 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         """
         from torch.distributed.device_mesh import init_device_mesh
 
+        self._build_distributed()
+
         tp = self.config.rollout.tensor_model_parallel_size
         pp = self.config.rollout.pipeline_model_parallel_size
         assert self.world_size == tp * pp, "Only support dp=1 for now"
@@ -289,6 +309,9 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
             if self._is_lora
             else {}
         )
+        self.actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
         rollout = PSRL_vLLMRollout(
             model_path=local_path,
             config=self.config.rollout,
@@ -305,9 +328,10 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
-            super().init_model()
+            # super().init_model()
+            self.rollout = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
     
-    def _pull_model(self) -> None:
+    def ray_pull_model(self) -> None:
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
@@ -334,7 +358,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
-    async def _pull_model_async(self) -> None:
+    async def ray_pull_model_async(self) -> None:
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
@@ -366,13 +390,57 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
+    def nixl_pull_model(self) -> None:
+        """
+        Pull the model state dict from PS via NIXL and update the rollout model weights.
+        """
+        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+
+        ps_manager_handle = self.gen_interface.ps_manager_handle
+        ps_nixl_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_storage_client_names.remote())
+        wait_operations = []
+        for target_client_name in ps_nixl_storage_client_names: 
+            for key in self.unified_state_dict:
+                self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
+                wait_operations.append((key, target_client_name))
+        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
+        for key, target_client_name in wait_operations:
+            self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+        ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
+        psrl_logger.info(f"NIXL pull model done.")
+
+    async def nixl_pull_model_async(self) -> None:
+        """
+        Pull the model state dict from PS via NIXL and update the rollout model weights.
+        """
+        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+
+        ps_manager_handle = self.gen_interface.ps_manager_handle
+        ps_nixl_storage_client_names = await ps_manager_handle.get_ps_nixl_storage_client_names.remote()
+        wait_operations = []
+        for target_client_name in ps_nixl_storage_client_names: 
+            for key in self.unified_state_dict:
+                self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
+                wait_operations.append((key, target_client_name))
+        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
+        for key, target_client_name in wait_operations:
+            self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+        ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
+        psrl_logger.info(f"NIXL pull model done.")
+    
     async def pull_model(self):
         """Pull the model state dict from PS and update the rollout model weights."""
         with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
             if self.config.rollout.mode == "sync":
-                self._pull_model()
+                if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+                    self.ray_pull_model()
+                elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+                    self.nixl_pull_model()
             elif self.config.rollout.mode == "psrl_async":
-                await self._pull_model_async()
+                if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+                    await self.ray_pull_model_async()
+                elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+                    await self.nixl_pull_model_async()
             else:
                 raise NotImplementedError(f"PSRL GenWorker does not support rollout mode '{self.config.rollout.mode}' yet.")
     
@@ -463,8 +531,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
             if self.is_instance_representative_rank:
                 curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
                 needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
-                # TODO (Done already): Implement a wrapper for ps_manager_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
-                # Add asyncio method to the ps_manager_handle ray actor to ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
+                # RayLock ensures that there won't be race condition when multiple GenWorkers are trying to reserve requests
                 with RayLock(ps_manager_handle):
                     # Filter out the parent_ids for new requests that need to be reserved
                     if self.config.rollout.n > 1:
@@ -480,7 +547,7 @@ class PSRL_FSDPGenWorker(ActorRolloutRefWorker):
                         # If the current PS model version is still not enough, we will wait for the training side to update the model version
                         while ray.get(ps_manager_handle.get_max_reserve_num.remote(needed_model_version)) < batch_size:
                             needed_model_version += 1
-                    # TODO: Maybe we can support partial reservation, currently we fix the batch size outside
+                    # TODO(lhy): Maybe we can support partial reservation, currently we fix the batch size outside
                     # assert max_reserve_num >= batch_size, f"Cannot reserve {batch_size} requests, only {max_reserve_num} requests can be reserved."
                     futures = []
                     reserve_ids = parent_ids if self.config.rollout.n > 1 else prompts.non_tensor_batch["uid"]

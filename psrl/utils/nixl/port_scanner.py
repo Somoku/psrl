@@ -18,4 +18,4 @@ class PortScanner:
 
 
 # Global port scanner instance
-global_port_scanner = PortScanner.remote()
+GLOBAL_PORT_SCANNER = PortScanner.remote()

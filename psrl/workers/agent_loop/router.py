@@ -1,3 +1,5 @@
+import os
+import logging
 import numpy as np
 from tensordict import TensorDict
 from omegaconf import DictConfig
@@ -7,6 +9,10 @@ import ray
 from verl import DataProto
 
 from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class RolloutRouter:
     def __init__(
@@ -24,6 +30,10 @@ class RolloutRouter:
         # NOTE: The engine status will be updated by RolloutCoordinator
         # and can be accessed via get_engine_status() method
         self.latest_engine_status = {}
+        
+        # Build logger
+        self.log_prefix = f"RolloutRouter"
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
     def update_engine_status(self, engine_status: dict):
         self.latest_engine_status = engine_status

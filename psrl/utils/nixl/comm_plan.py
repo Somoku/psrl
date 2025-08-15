@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from psrl.utils.nixl.nixl_spec import NIXLClientType, NIXLClientInfo
-from psrl.utils.nixl.global_vars import global_topology
+from psrl.utils.nixl.global_vars import GLOBAL_TOPOLOGY
 
 
 @dataclass
@@ -80,7 +80,7 @@ class CommunicationPlanner:
         """
         # Register all clients to network topology
         for client_name, client_info in clients.items():
-            global_topology.register_client(client_name, client_info.ip, client_info.gpu_id)
+            GLOBAL_TOPOLOGY.register_client(client_name, client_info.ip, client_info.gpu_id)
         
         # Classify clients
         push_clients = []
@@ -173,12 +173,12 @@ class CommunicationPlanner:
         for target_client in target_clients:
             target_info = clients[target_client]
             
-            for key, target_tensor_info in target_info.descs.items():
+            for key, target_tensor_info in target_info.tensor_infos.items():
                 # Find all source clients with the same key
                 available_source_clients = []
                 for source_client in source_clients:
                     source_info = clients[source_client]
-                    if key in source_info.descs:
+                    if key in source_info.tensor_infos:
                         available_source_clients.append(source_client)
                 
                 # Get all shards needed by target client
@@ -190,7 +190,7 @@ class CommunicationPlanner:
                     # Custom sorting: first by link type (LOCAL > NVLINK > PCIE > IB > ETH), then by data volume
                     def sort_key(source_client):
                         # Get link priority (higher is better)
-                        link_priority = global_topology.get_link_priority(source_client, target_client)
+                        link_priority = GLOBAL_TOPOLOGY.get_link_priority(source_client, target_client)
                         # We want best first, so we negate the value
                         link_priority = -link_priority
                         # Secondary sort by data volume (lower is better)
@@ -204,7 +204,7 @@ class CommunicationPlanner:
                     )
                     
                     source_info = clients[min_volume_client]
-                    source_tensor_info = source_info.descs[key]
+                    source_tensor_info = source_info.tensor_infos[key]
                     
                     # Find shards this client can provide (and needed by the target client)
                     available_shards = (set(source_tensor_info.sharding.shard_indices) - assigned_shards) & needed_shards
@@ -233,7 +233,7 @@ class CommunicationPlanner:
                     # Update data volume (considering bandwidth)
                     local_indices = [source_tensor_info.sharding.shard_indices.index(shard) for shard in shards_to_assign]
                     shard_size_bytes = sum(source_tensor_info.get_shard_size_bytes(local_idx) for local_idx in local_indices)
-                    bandwidth_gbps = global_topology.get_bandwidth_gbps(min_volume_client, target_client)
+                    bandwidth_gbps = GLOBAL_TOPOLOGY.get_bandwidth_gbps(min_volume_client, target_client)
                     volume_increase = shard_size_bytes / (bandwidth_gbps * 1e9)  # Convert to time
                     source_client_volumes[min_volume_client] += volume_increase
                     
@@ -248,7 +248,7 @@ class CommunicationPlanner:
     
     def _get_link_type_for_test(self, client1: str, client2: str):
         """Helper method for testing to get link type between clients"""
-        return global_topology.get_link_type(client1, client2)
+        return GLOBAL_TOPOLOGY.get_link_type(client1, client2)
 
 
 # Global communication planner instance

@@ -22,7 +22,7 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \

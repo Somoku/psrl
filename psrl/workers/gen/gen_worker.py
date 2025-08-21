@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import numpy as np
 
+from omegaconf import OmegaConf
 from ray.exceptions import RayTaskError
 from torch.distributed.tensor import DTensor
 from torch.distributed.device_mesh import init_device_mesh
@@ -23,6 +24,7 @@ from verl.utils.model import get_generation_config
 from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
 from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.model import update_model_config
 from verl.workers.rollout.vllm_rollout import vllm_mode
 
 from psrl.utils.ray import RayLock
@@ -178,17 +180,34 @@ class PSRL_GenWorker(Worker):
         self.rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(1, tp), mesh_dim_names=["dp", "infer_tp"])
         rollout_name = self.config.rollout.name
         assert rollout_name == "vllm" and vllm_mode == "spmd" and self.config.rollout.mode == "sync", "Only support vllm spmd sync rollout for now"
-        
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=psrl_logger)
         local_path = copy_to_local(self.config.model.path)
-        self.actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        
+        # Get the tokenizer
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        
+        # Get the model config
+        self.model_hf_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        # patch for kimi-vl
+        if getattr(self.model_hf_config, "model_type", None) == "kimi_vl":
+            self.model_hf_config.text_config.topk_method = "greedy"
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
+        override_config_kwargs.update(override_model_config)
+        update_model_config(self.model_hf_config, override_config_kwargs=override_config_kwargs)
+        if self.rank == 0:
+            print(f"Model config after override: {self.model_hf_config}")
+        
         rollout = PSRL_vLLMRollout(
             model_path=local_path,
             config=self.config.rollout,
             tokenizer=self.tokenizer,
-            model_hf_config=self.actor_model_config,
+            model_hf_config=self.model_hf_config,
             device_mesh=self.rollout_device_mesh,
             trust_remote_code=trust_remote_code,
         )

@@ -48,7 +48,7 @@ train_actor_rollout_ref:
   hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
-    use_shm: False
+    use_shm: True
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: True
@@ -186,12 +186,12 @@ gen_actor_rollout:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: float32 # should align with FSDP
+    dtype: float32
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
     free_cache_engine: True
-    load_format: dummy_dtensor
+    load_format: auto
     tensor_model_parallel_size: 2
     max_num_batched_tokens: 8192
     max_model_len: null

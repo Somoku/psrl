@@ -40,7 +40,7 @@ from psrl.utils.dataset import DatasetType, DatasetHandle
 from psrl.utils.logger import DualOutputHandler, log_dual_events, log_single_event, EventType
 from psrl.workers.train import TrainInterface
 from psrl.workers.gen import GenInterface
-from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStorageWorker
+from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStoragePlan, PSStorageWorker
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -554,6 +554,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         # create PS WorkerGroup
         psrl_logger.info("Create PS WorkerGroup")
+        storage_plan = PSStoragePlan(
+            train_model_dtype=torch.float32,
+            gen_model_dtype=self.config.gen_actor_rollout.rollout.dtype
+        )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict 
             # No need to create PS WorkerGroup
@@ -582,6 +586,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     resource_pool=ps_resource_pool,
                     ps_cls_with_init=PSClassWithInitArgs(
                         cls=ray.remote(PSStorageWorker),
+                        storage_plan=storage_plan,
                         model_config=self.config.train_actor_rollout_ref.model,
                         psrl_config=self.config.psrl,
                         nixl_interface=nixl_interface

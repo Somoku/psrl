@@ -16,7 +16,7 @@ from verl.utils.fs import copy_to_local
 
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PORT_SCANNER
 from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
-from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker
+from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
 QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/Qwen2.5-0.5B-Instruct"
 
@@ -34,9 +34,9 @@ def make_dual_print(log_path, prefix=None):
 
 @ray.remote
 class MetaServerActor:
-    def __init__(self, server_name, psrl_config, expected_clients, log_dir):
+    def __init__(self, server_name, psrl_config, expected_agents, log_dir):
         self.server = NIXLMetaServer(server_name, psrl_config.nixl)
-        self.expected_clients = expected_clients
+        self.expected_agents = expected_agents
         self.client_name = server_name
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{self.client_name}.log")
@@ -46,8 +46,8 @@ class MetaServerActor:
         return True
 
     def protocol(self):
-        self.print("step1: wait_for_client_shardings")
-        self.server.wait_for_client_shardings(self.expected_clients, timeout=120)
+        self.print("step1: wait_for_client_shardings")  
+        self.server.wait_for_client_shardings(self.expected_agents, timeout=120)
         # self.print(f"client_sharding_dicts: {self.server.client_sharding_dicts}")
         self.print("step2: make_unified_sharding")
         self.server.make_unified_sharding()
@@ -55,14 +55,14 @@ class MetaServerActor:
         self.print("step3: notify_all_client_shardings")
         self.server.notify_all_client_shardings()
         self.print("step4: wait_for_client_infos")
-        self.server.wait_for_client_infos(self.expected_clients, timeout=120)
+        self.server.wait_for_client_infos(self.expected_agents, timeout=120)
         # self.print(f"client_infos: {self.server.client_infos}")
         self.print("step5: make_comm_plan")
         self.server.make_comm_plan()
         self.print("step6: notify_all_client_infos_and_comm_plan")
         self.server.notify_all_client_infos_and_comm_plan()
         self.print("step7: wait_for_client_temp_mappings")
-        self.server.wait_for_client_temp_mappings(self.expected_clients, timeout=120)
+        self.server.wait_for_client_temp_mappings(self.expected_agents, timeout=120)
         self.print("step8: notify_all_client_temp_mappings")
         self.server.notify_all_client_temp_mappings()
         self.print("protocol done.")
@@ -73,7 +73,7 @@ class MetaServerActor:
 
 @ray.remote(num_cpus=1)
 class TrainClientActor:
-    def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
+    def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, ps_for_push_worker_handles):
         os.environ["MASTER_ADDR"] = psrl_config.nixl.server_ip
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
@@ -107,7 +107,8 @@ class TrainClientActor:
             nixl_config=psrl_config.nixl,
             nixl_interface=nixl_interface
         )
-        
+        self.ps_for_push_worker_handles = ps_for_push_worker_handles
+    
     def init_finished(self):
         return True
     
@@ -136,16 +137,17 @@ class TrainClientActor:
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
 
-    def push_to_ps(self, ps_client_name):
+    def push_to_ps(self, ps_agent_name, ps_client_name):
         for key in self.state_dict_keys:
             # self.print(f"push {key} to {ps_client_name}")
-            self.client.client_write(ps_client_name, key, b"train_push")
+            self.client.client_write(ps_agent_name, ps_client_name, key, b"train_push")
             # self.client.wait(key, b"train_push", "WRITE", target_client=ps_client_name)
         return True
     
     def wait_push_done(self, ps_client_name):
         for key in self.state_dict_keys:
             self.client.wait(key, b"train_push", "WRITE", target_client=ps_client_name)
+            self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key)
         return True
     
     def shutdown(self):
@@ -170,7 +172,7 @@ class GenClientActor:
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
         llm = LLM(
             model=QWEN_MODEL_PATH,
-            dtype="float32",
+            dtype="bfloat16",
             tensor_parallel_size=world_size,
             distributed_executor_backend="external_launcher",
             enforce_eager=True,
@@ -222,10 +224,10 @@ class GenClientActor:
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
 
-    def pull_from_ps(self, ps_client_name):
+    def pull_from_ps(self, ps_agent_name, ps_client_name):
         for key in self.state_dict_keys:
             # self.print(f"pull {key} from {ps_client_name}")
-            self.client.client_read(ps_client_name, key, b"gen_pull")
+            self.client.client_read(ps_agent_name, ps_client_name, key, b"gen_pull")
             # self.client.wait(key, b"gen_pull", "READ", target_client=ps_client_name)
         return True
     
@@ -247,7 +249,11 @@ def create_ps_worker_group(num_ps, psrl_config, model_path, nixl_interface: NIXL
         PSResourceSpec(node_ip=node["NodeManagerAddress"], node_id=node["NodeID"], attached_gpu_id=None)
         for node in nodes
     ])
-    ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), model_config, psrl_config, nixl_interface)
+    storage_plan = PSStoragePlan(
+        train_model_dtype=torch.float32,
+        gen_model_dtype=torch.bfloat16
+    )
+    ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), storage_plan, model_config, psrl_config, nixl_interface)
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
     return ps_wg
 
@@ -299,6 +305,14 @@ def test_nixl_e2e():
     ps_wg = create_ps_worker_group(num_ps,psrl_config, QWEN_MODEL_PATH, nixl_interface)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
+    ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
+    ps_for_push_names = ray.get(ps_wg.execute_all_async("get_nixl_train_storage_client_name"))
+    ps_for_pull_names = ray.get(ps_wg.execute_all_async("get_nixl_gen_storage_client_name"))
+    print(f"ps_for_push_names: {ps_for_push_names}")
+    print(f"ps_for_pull_names: {ps_for_pull_names}")
+    ps_for_push_worker_handles = {}
+    for ps_for_push_name in ps_for_push_names:
+        ps_for_push_worker_handles[ps_for_push_name] = ps_wg.distinguish_worker_by_method(lambda worker: ray.get(worker.get_nixl_train_storage_client_name.remote()) == ps_for_push_name)
     end_time = time.time()
     print(f"[PASS] ps init done. time: {end_time - start_time}s")
     
@@ -312,7 +326,7 @@ def test_nixl_e2e():
         TrainClientActor.options(
             num_gpus=1,
             # scheduling_strategy=PlacementGroupSchedulingStrategy(train_pg, placement_group_bundle_index=rank)
-        ).remote(rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface)
+        ).remote(rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface, ps_for_push_worker_handles)
         for rank in range(num_train)
     ]
     gen_actors = [
@@ -342,17 +356,14 @@ def test_nixl_e2e():
     end_time = time.time()
     print(f"[PASS] protocol done. time: {end_time - start_time}s")
 
-    ps_names = ray.get(ps_wg.execute_all_async("get_nixl_storage_client_name"))
-    print(f"ps_names: {ps_names}")
-
     # Each train client pushes to each PS worker
     start_time = time.time()
     futures = []
-    for ps_name in ps_names:
+    for ps_agent_name, ps_for_push_name in zip(ps_agent_names, ps_for_push_names):
         for t in train_actors:
-            t.push_to_ps.remote(ps_name)
-        for t in train_actors:
-            futures.append(t.wait_push_done.remote(ps_name))
+            t.push_to_ps.remote(ps_agent_name, ps_for_push_name)
+        for t in train_actors: 
+            futures.append(t.wait_push_done.remote(ps_for_push_name))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] train push to all ps done. time: {end_time - start_time}s")
@@ -360,11 +371,11 @@ def test_nixl_e2e():
     # Each gen client pulls from each PS worker
     start_time = time.time()
     futures = []
-    for ps_name in ps_names:
+    for ps_agent_name, ps_for_pull_name in zip(ps_agent_names, ps_for_pull_names):
         for g in gen_actors:
-            g.pull_from_ps.remote(ps_name)
+            g.pull_from_ps.remote(ps_agent_name, ps_for_pull_name)
         for g in gen_actors:
-            futures.append(g.wait_pull_done.remote(ps_name))
+            futures.append(g.wait_pull_done.remote(ps_for_pull_name))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] gen pull from all ps done. time: {end_time - start_time}s")
@@ -374,7 +385,7 @@ def test_nixl_e2e():
     gen_state_dicts = ray.get([g.get_state_dict.remote() for g in gen_actors])
     for gen_idx, state_dict in enumerate(gen_state_dicts):
         for k, v in state_dict.items():
-            assert torch.allclose(v, torch.ones_like(v), atol=1e-5), f"[VERIFY] Gen client {gen_idx} param {k} is not all ones!"
+            assert torch.allclose(v, torch.ones_like(v), atol=1e-6), f"[VERIFY] Gen client {gen_idx} param {k} is not all ones: {v}"
     print("[PASS] All GenClientActor parameters are all ones.")
 
     # Shutdown all actors and Ray

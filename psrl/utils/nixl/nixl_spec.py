@@ -431,7 +431,9 @@ class NIXLTensorInfo:
 
 class NIXLClientType(Enum):
     """NIXL client types for communication planning"""
-    PS = "ps"
+    PS = "ps" # PS for both push and pull, now deprecated because PUSH and PULL have different types (i.e., PUSH: fp32, PULL: bf16)
+    PS_FOR_PUSH = "ps_for_push"
+    PS_FOR_PULL = "ps_for_pull"
     PUSH_SIDE = "push_side"
     PULL_SIDE = "pull_side"
 

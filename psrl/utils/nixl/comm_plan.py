@@ -84,28 +84,31 @@ class CommunicationPlanner:
         
         # Classify clients
         push_clients = []
-        ps_clients = []
+        ps_for_push_clients = []
         pull_clients = []
+        ps_for_pull_clients = []
         
         for client_name, client_info in clients.items():
             if client_info.type == NIXLClientType.PUSH_SIDE:
                 push_clients.append(client_name)
-            elif client_info.type == NIXLClientType.PS:
-                ps_clients.append(client_name)
+            elif client_info.type == NIXLClientType.PS_FOR_PUSH:
+                ps_for_push_clients.append(client_name)
             elif client_info.type == NIXLClientType.PULL_SIDE:
                 pull_clients.append(client_name)
+            elif client_info.type == NIXLClientType.PS_FOR_PULL:
+                ps_for_pull_clients.append(client_name)
         
         # Initialize communication plans
         push_to_ps_plan = {client: {} for client in push_clients}
         pull_from_ps_plan = {client: {} for client in pull_clients}
         
-        # Generate PUSH_SIDE -> PS write plan
-        if push_clients and ps_clients:
-            self._make_push_to_ps_plan(clients, push_clients, ps_clients, push_to_ps_plan)
+        # Generate PUSH_SIDE -> PS_FOR_PUSH write plan
+        if push_clients and ps_for_push_clients:
+            self._make_push_to_ps_plan(clients, push_clients, ps_for_push_clients, push_to_ps_plan)
         
-        # Generate PULL_SIDE <- PS read plan
-        if pull_clients and ps_clients:
-            self._make_pull_from_ps_plan(clients, pull_clients, ps_clients, pull_from_ps_plan)
+        # Generate PULL_SIDE <- PS_FOR_PULL read plan
+        if pull_clients and ps_for_pull_clients:
+            self._make_pull_from_ps_plan(clients, pull_clients, ps_for_pull_clients, pull_from_ps_plan)
         
         return NIXLCommPlan(
             push_to_ps_plan=push_to_ps_plan,
@@ -116,14 +119,14 @@ class CommunicationPlanner:
         self, 
         clients: Dict[str, NIXLClientInfo], 
         push_clients: List[str], 
-        ps_clients: List[str],
+        ps_for_push_clients: List[str],
         push_to_ps_plan: Dict[str, Dict[str, Dict[str, List[int]]]],
     ):
         """Generate PUSH_SIDE to PS write plan with load balancing"""
         self._make_comm_plan_generic(
             clients=clients,
             source_clients=push_clients,
-            target_clients=ps_clients,
+            target_clients=ps_for_push_clients,
             comm_plan=push_to_ps_plan,
             is_push_to_ps=True
         )
@@ -132,13 +135,13 @@ class CommunicationPlanner:
         self, 
         clients: Dict[str, NIXLClientInfo],
         pull_clients: List[str], 
-        ps_clients: List[str],
+        ps_for_pull_clients: List[str],
         pull_from_ps_plan: Dict[str, Dict[str, Dict[str, List[int]]]]
     ):
         """Generate PULL_SIDE from PS read plan with load balancing"""
         self._make_comm_plan_generic(
             clients=clients,
-            source_clients=ps_clients,
+            source_clients=ps_for_pull_clients,
             target_clients=pull_clients,
             comm_plan=pull_from_ps_plan,
             is_push_to_ps=False
@@ -161,10 +164,10 @@ class CommunicationPlanner:
         
         Args:
             clients: Dictionary mapping client names to client info
-            source_clients: List of source client names (PUSH_SIDE or PS)
-            target_clients: List of target client names (PS or PULL_SIDE)
+            source_clients: List of source client names (PUSH_SIDE or PS_FOR_PULL)
+            target_clients: List of target client names (PS_FOR_PUSH or PULL_SIDE)
             comm_plan: Communication plan to update
-            is_push_to_ps: True if PUSH_SIDE to PS, False if PS to PULL_SIDE
+            is_push_to_ps: True if PUSH_SIDE to PS_FOR_PUSH, False if PS_FOR_PULL to PULL_SIDE
         """
         # Track data volume for each source client
         source_client_volumes = {client: 0.0 for client in source_clients}
@@ -220,12 +223,12 @@ class CommunicationPlanner:
                     
                     # Update plan
                     if is_push_to_ps:
-                        # PUSH_SIDE -> PS: push_client -> {key -> {ps_client -> shards}}
+                        # PUSH_SIDE -> PS_FOR_PUSH: push_client -> {key -> {ps_client -> shards}}
                         if key not in comm_plan[min_volume_client]:
                             comm_plan[min_volume_client][key] = {}
                         comm_plan[min_volume_client][key][target_client] = shards_to_assign
                     else:
-                        # PS -> PULL_SIDE: pull_client -> {key -> {ps_client -> shards}}
+                        # PS_FOR_PULL -> PULL_SIDE: pull_client -> {key -> {ps_client -> shards}}
                         if key not in comm_plan[target_client]:
                             comm_plan[target_client][key] = {}
                         comm_plan[target_client][key][min_volume_client] = shards_to_assign

@@ -78,10 +78,11 @@ class PSManager:
         )
         
         # NIXL related attributes
-        self.expected_clients = 0
+        self.expected_agents = 0
         self.nixl_meta_server: Optional[NIXLMetaServer] = None
         self.ps_worker_group: Optional[PSWorkerGroup] = None
-        self.ps_nixl_storage_client_names: Optional[List[str]] = None
+        self.ps_nixl_train_storage_client_names: Optional[List[str]] = None
+        self.ps_nixl_gen_storage_client_names: Optional[List[str]] = None
             
         # Build logger
         self.log_prefix = f"PSManager"
@@ -262,9 +263,9 @@ class PSManager:
      
     # ------- PS NIXL CONTROL PLANE -------
     
-    def init_nixl_server(self, expected_clients: int):
+    def init_nixl_server(self, expected_agents: int):
         """Initialize the nixl server."""
-        self.expected_clients = expected_clients
+        self.expected_agents = expected_agents
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
@@ -277,20 +278,20 @@ class PSManager:
         
     def nixl_protocol(self):
         """Connect to the nixl clients and sync the client shardings/infos/comm_plan/temp_mappings to all clients."""
-        psrl_logger.info(f"nixl server protocol step 1: waiting for {self.expected_clients} clients to connect and send sharding")
-        self.nixl_meta_server.wait_for_client_shardings(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 1: waiting for {self.expected_agents} agents to connect and send sharding")
+        self.nixl_meta_server.wait_for_client_shardings(self.expected_agents)
         psrl_logger.info(f"nixl server protocol step 2: make unified sharding")
         self.nixl_meta_server.make_unified_sharding()
         psrl_logger.info(f"nixl server protocol step 3: notify all client shardings")
         self.nixl_meta_server.notify_all_client_shardings()
-        psrl_logger.info(f"nixl server protocol step 4: waiting for {self.expected_clients} clients to send infos")
-        self.nixl_meta_server.wait_for_client_infos(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 4: waiting for {self.expected_agents} agents to send infos")
+        self.nixl_meta_server.wait_for_client_infos(self.expected_agents)
         psrl_logger.info(f"nixl server protocol step 5: make comm plan")
         self.nixl_meta_server.make_comm_plan()
         psrl_logger.info(f"nixl server protocol step 6: notify all client infos and the global comm plan")
         self.nixl_meta_server.notify_all_client_infos_and_comm_plan()
-        psrl_logger.info(f"nixl server protocol step 7: waiting for {self.expected_clients} clients to send temp mappings")
-        self.nixl_meta_server.wait_for_client_temp_mappings(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 7: waiting for {self.expected_agents} agents to send temp mappings")
+        self.nixl_meta_server.wait_for_client_temp_mappings(self.expected_agents)
         psrl_logger.info(f"nixl server protocol step 8: notify all client temp mappings")
         self.nixl_meta_server.notify_all_client_temp_mappings()
         psrl_logger.info(f"nixl server protocol done.")
@@ -298,13 +299,28 @@ class PSManager:
     def bind_ps_worker_group(self, ps_worker_group: PSWorkerGroup):
         """Bind the PS worker group to the PSManager."""
         self.ps_worker_group = ps_worker_group
-        ps_nixl_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_storage_client_name")
-        self.ps_nixl_storage_client_names = ray.get(ps_nixl_storage_client_name_futures)
+        ps_nixl_train_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_train_storage_client_name")
+        ps_nixl_gen_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_gen_storage_client_name")
+        self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
+        self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
 
-    def get_ps_nixl_storage_client_names(self) -> List[str]:
-        """Get the NIXL storage client names of the PS worker group."""
-        assert self.ps_nixl_storage_client_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_storage_client_names."
-        return self.ps_nixl_storage_client_names  
+    def get_ps_worker_handle(self, client_name: str) -> ray.ObjectRef:
+        """Get the PS worker handle by the client name."""
+        assert self.ps_worker_group is not None, "The PS worker group must be initialized before calling get_ps_worker_handle."
+        worker = self.ps_worker_group.distinguish_worker_by_method(
+            lambda worker: client_name == ray.get(worker.get_nixl_train_storage_client_name.remote()) or client_name == ray.get(worker.get_nixl_gen_storage_client_name.remote())
+        )
+        return worker
+
+    def get_ps_nixl_train_storage_client_names(self) -> List[str]:
+        """Get the NIXL train storage client name of the PS worker group."""
+        assert self.ps_nixl_train_storage_client_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_train_storage_client_name."
+        return self.ps_nixl_train_storage_client_names
+    
+    def get_ps_nixl_gen_storage_client_names(self) -> List[str]:
+        """Get the NIXL gen storage client name of the PS worker group."""
+        assert self.ps_nixl_gen_storage_client_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_gen_storage_client_name."
+        return self.ps_nixl_gen_storage_client_names
             
     # ------- MODEL PUSH/PULL -------
     # Now we separate the control plane and data plane (ps_model = "nixl_cpu" or "nixl_gpu"), all the dataflow is handled by PSWorkerGroup.

@@ -1,6 +1,7 @@
 # PSRL
 examples/visualization/.*/
 unit_tests/nixl/plot/
+third_party/
 
 # General
 **/*.pt

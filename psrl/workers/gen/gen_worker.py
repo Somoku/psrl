@@ -253,9 +253,9 @@ class PSRL_GenWorker(Worker):
         """
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         ps_manager_handle = self.gen_interface.ps_manager_handle
-        ps_nixl_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_storage_client_names.remote())
+        ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
         wait_operations = []
-        for target_client_name in ps_nixl_storage_client_names: 
+        for target_client_name in ps_nixl_gen_storage_client_names: 
             for key in self.unified_state_dict:
                 self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
                 wait_operations.append((key, target_client_name))

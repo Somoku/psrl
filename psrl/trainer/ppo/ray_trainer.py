@@ -630,10 +630,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             psrl_logger.info("Initializing NIXL")
             futures = []
-            expected_clients = self.ps_wg.world_size + \
+            expected_agents = self.ps_wg.world_size + \
                 self.actor_wg.world_size + \
                 sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
-            futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_clients))
+            futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
             futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
             futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
             for i in range(self.config.psrl.deployment.n_rollout_instances):

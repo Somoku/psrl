@@ -136,7 +136,6 @@ class VllmConverter(BaseConverter):
         Convert vLLM model to unified state dict and generate sharding info.
         Args:
             model: The vLLM model instance
-            tp_rank: tensor parallel rank
         Returns:
             (converted_state_dict, sharding)
         """

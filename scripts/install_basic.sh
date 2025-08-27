@@ -19,7 +19,7 @@ echo "2. Install xformers"
 python -m pip install -v --no-build-isolation -U "git+https://github.com/facebookresearch/xformers.git@v0.0.31#egg=xformers"
 
 echo "3. Install basic packages"
-python -m pip install "transformers[hf_xet]<4.54.0" accelerate datasets peft hf-transfer \
+python -m pip install "transformers[hf_xet]<4.54.0" accelerate datasets peft hf-transfer matplotlib flask \
     "numpy<2.0.0" "pyarrow>=15.0.0" pandas \
     ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
     pytest py-spy pyext pre-commit ruff meson ninja pynvml requests einops

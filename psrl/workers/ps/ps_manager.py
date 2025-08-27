@@ -299,8 +299,10 @@ class PSManager:
     def bind_ps_worker_group(self, ps_worker_group: PSWorkerGroup):
         """Bind the PS worker group to the PSManager."""
         self.ps_worker_group = ps_worker_group
+        ps_nixl_agent_name_futures = self.ps_worker_group.execute_all_async("get_nixl_agent_name")
         ps_nixl_train_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_train_storage_client_name")
         ps_nixl_gen_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_gen_storage_client_name")
+        self.ps_nixl_agent_names = ray.get(ps_nixl_agent_name_futures)
         self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
         self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
 
@@ -311,6 +313,11 @@ class PSManager:
             lambda worker: client_name == ray.get(worker.get_nixl_train_storage_client_name.remote()) or client_name == ray.get(worker.get_nixl_gen_storage_client_name.remote())
         )
         return worker
+    
+    def get_ps_nixl_agent_names(self) -> List[str]:
+        """Get the NIXL agent name of the PS worker group."""
+        assert self.ps_nixl_agent_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_agent_names."
+        return self.ps_nixl_agent_names
 
     def get_ps_nixl_train_storage_client_names(self) -> List[str]:
         """Get the NIXL train storage client name of the PS worker group."""

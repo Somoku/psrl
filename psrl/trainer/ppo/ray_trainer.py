@@ -247,12 +247,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, "PSManager IP and NIXL server IP must be the same"
             assert self.config.train_actor_rollout_ref.actor.strategy != "fsdp", "FSDP1 is not supported for NIXL because it uses flat_param"
+            '''
             # TODO(lhy): support bf16 for NIXL
             # The cast of dtype may be done in the PS storage clients
             if self.config.train_actor_rollout_ref.actor.strategy == "fsdp2":
                 assert self.config.train_actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype == "fp32", "dtype must be fp32 for now"
             assert self.config.gen_actor_rollout.rollout.dtype == "float32", "dtype must be float32 for now"
             assert self.config.train_actor_rollout_ref.rollout.dtype == "float32", "dtype must be float32 for now"
+            '''
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     

@@ -252,7 +252,7 @@ class NIXLStorageClient:
                 shard_meta_info_list.append(meta_info)
                     
                 # Check if the shard is contiguous
-                psrl_logger.info(f"{self.client_name} key {key} shard {shard_indices[local_pos]} register local tensor with shape {local_sharded_tensor.shape} and dtype {local_sharded_tensor.dtype}")
+                psrl_logger.debug(f"{self.client_name} key {key} shard {shard_indices[local_pos]} register local tensor with shape {local_sharded_tensor.shape} and dtype {local_sharded_tensor.dtype}")
                 if local_sharded_tensor.is_contiguous():
                     # Contiguous shard: register directly
                     try:

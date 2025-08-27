@@ -76,7 +76,7 @@ class PSRL_vLLMRollout(BaseRollout):
 
         self.inference_engine = LLM(
             model=model_path,
-            enable_sleep_mode=True,
+            # enable_sleep_mode=True,
             tensor_parallel_size=tensor_parallel_size,
             distributed_executor_backend="external_launcher",
             dtype=config.dtype,

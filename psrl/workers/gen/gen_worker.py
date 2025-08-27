@@ -67,7 +67,9 @@ class PSRL_GenWorker(Worker):
         self.nixl_storage_client = None
         self.unified_state_dict = None
         self.unified_sharding_dict = None
-
+        self._cached_ps_nixl_agent_names = None
+        self._cached_ps_nixl_gen_storage_client_names = None
+        
         # Build logger
         self.log_prefix = f"GenWorker_I{self.get_instance_id()}_R{self.get_instance_local_rank()}"
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
@@ -253,11 +255,16 @@ class PSRL_GenWorker(Worker):
         """
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         ps_manager_handle = self.gen_interface.ps_manager_handle
-        ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
+        if self._cached_ps_nixl_agent_names is None:
+            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
+        if self._cached_ps_nixl_gen_storage_client_names is None:
+            self._cached_ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
+        ps_nixl_agent_names = self._cached_ps_nixl_agent_names
+        ps_nixl_gen_storage_client_names = self._cached_ps_nixl_gen_storage_client_names
         wait_operations = []
-        for target_client_name in ps_nixl_gen_storage_client_names: 
+        for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
             for key in self.unified_state_dict:
-                self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
+                self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, b"gen_pull")
                 wait_operations.append((key, target_client_name))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
         for key, target_client_name in wait_operations:

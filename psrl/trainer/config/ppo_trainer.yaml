@@ -95,7 +95,7 @@ train_actor_rollout_ref:
       weight_decay: 0.01
     fsdp_config:
       mixed_precision:
-        param_dtype: fp32
+        param_dtype: bf16
         reduce_dtype: fp32
         buffer_dtype: fp32
       wrap_policy:
@@ -130,7 +130,7 @@ train_actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: float32 # should align with FSDP
+    dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -186,7 +186,7 @@ gen_actor_rollout:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: float32
+    dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True

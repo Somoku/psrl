@@ -4,6 +4,7 @@ import logging
 import torch
 import threading
 import time
+from typing import List, Dict
 
 from omegaconf import DictConfig
 from dataclasses import dataclass
@@ -77,6 +78,8 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         self.nixl_storage_client = None
         self.unified_state_dict = None
         self.unified_sharding_dict = None
+        self._cached_ps_nixl_agent_names = None
+        self._cached_ps_nixl_train_storage_client_names = None
         self._cached_ps_worker_handles: Dict[str, ray.ObjectRef] = {}
         # NIXL wait threads
         self.nixl_wait_thread = None  # Single thread for all wait operations
@@ -199,7 +202,12 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         ps_manager_handle = self.train_interface.ps_manager_handle
         curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
         next_ps_model_version = curr_ps_model_version + 1
-        ps_nixl_train_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_names.remote())
+        if self._cached_ps_nixl_agent_names is None:
+            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
+        if self._cached_ps_nixl_train_storage_client_names is None:
+            self._cached_ps_nixl_train_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_names.remote())
+        ps_nixl_agent_names = self._cached_ps_nixl_agent_names
+        ps_nixl_train_storage_client_names = self._cached_ps_nixl_train_storage_client_names
         psrl_logger.info(f"Pushing the model to the PS via NIXL on {len(ps_nixl_train_storage_client_names)} clients.")
         
         # Clear previous wait thread
@@ -211,11 +219,11 @@ class PSRL_TrainWorker(ActorRolloutRefWorker):
         
         # Collect all operations to wait for
         wait_operations = []
-        for target_client_name in ps_nixl_train_storage_client_names: 
+        for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_train_storage_client_names): 
             if target_client_name not in self._cached_ps_worker_handles:
                 self._cached_ps_worker_handles[target_client_name] = ray.get(ps_manager_handle.get_ps_worker_handle.remote(target_client_name))
             for key in self.unified_state_dict:
-                self.nixl_storage_client.client_write(target_client_name, key, b"train_push")
+                self.nixl_storage_client.client_write(target_agent_name, target_client_name, key, b"train_push")
                 wait_operations.append((key, target_client_name))
         
         # Start a single background thread to wait for all operations

@@ -18,7 +18,7 @@ from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLS
 from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
-QWEN_MODEL_PATH = "/apdcephfs_fsgm/share_303760348/lhy/models/Qwen2.5-0.5B-Instruct"
+QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-0.5B-Instruct"
 
 def make_dual_print(log_path, prefix=None):
     with open(log_path, "w") as f:
@@ -177,7 +177,7 @@ class GenClientActor:
             distributed_executor_backend="external_launcher",
             enforce_eager=True,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
+            # disable_mm_preprocessor_cache=True,
             seed=42,
         )
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
@@ -258,10 +258,10 @@ def create_ps_worker_group(num_ps, psrl_config, model_path, nixl_interface: NIXL
     return ps_wg
 
 def test_nixl_e2e():
-    log_dir = "/apdcephfs_fsgm/share_303760348/lhy/psrl/unit_tests/nixl/log"
+    log_dir = os.environ.get("PSRL_WORKSPACE") + "/psrl/unit_tests/nixl/log"
     os.makedirs(log_dir, exist_ok=True)
     ray.init(ignore_reinit_error=True)
-    listen_ip = "28.12.131.133"
+    listen_ip = os.environ.get("LOCAL_IP")
     listen_port = 23459
     server_name = GLOBAL_META_SERVER_NAME
     backend = "nccl"

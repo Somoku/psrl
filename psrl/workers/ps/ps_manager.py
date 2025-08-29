@@ -254,6 +254,12 @@ class PSManager(RequestStatusTracker):
                     curr_ps_model_version=curr_ps_model_version,
                 )
                 asyncio.create_task(self.execute_command(self.rollout_coordinator, command, blocking=False))
+        
+        # Check whether there exists ready buffer for training
+        min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
+        if min_ready_buffer_id is not None:
+            psrl_logger.debug(f"Found min ready buffer is {min_ready_buffer_id}")
+            self.process_ready_buffer(min_ready_buffer_id)
 
     async def execute_command(self, server, command: Command, blocking: bool = False):
         try:
@@ -484,6 +490,8 @@ class PSManager(RequestStatusTracker):
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
 
         self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
+        psrl_logger.debug(f"Before update rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
+        assert self.rollout_coordinator is not None, "Rollout coordinator is not set. Please set it before updating rollout instance model version."
         # Sync the rollout instance model version in the rollout server
         ray.get(self.rollout_coordinator.set_rollout_instance_model_version.remote(
             rollout_instance_id=rollout_instance_id,
@@ -672,6 +680,7 @@ class PSManager(RequestStatusTracker):
 
         log_single_event(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag} (ref)", psrl_logger, event_type=EventType.PULL)
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
+        psrl_logger.debug(f"Returning model state dict ref for rollout instance {rollout_instance_id} with version tag {self.model_store.version_tag}")
         return self.model_store.model_state_dict_ref
     
     def pull_model_state_dict_nixl(self, rollout_instance_id: Union[str, int]):

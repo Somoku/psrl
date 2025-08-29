@@ -46,8 +46,11 @@ class PSRL_AgentLoopManager:
         self._request_counter = 0 # For version tag setting
         
         self._dispatch_idx = 0
+        self.running_loop = None
         self.busy_loop_task = None
         self.stop_busy_loop_task = False
+        
+        self.curr_ps_version_tag = 0
         
         # Build logger
         self.log_prefix = f"AgentLoopManager"
@@ -57,10 +60,16 @@ class PSRL_AgentLoopManager:
         """Start a busy loop to continuously process data from the queue."""
         if self.busy_loop_task is not None and not self.busy_loop_task.done():
             return
+        
+        # Start the busy loop of agent loop workers
+        futures = []
+        for worker in self.agent_loop_workers:
+            futures.append(worker.start_busy_loop.remote())
+        ray.get(futures)
 
         # Start the background task to process data
-        running_loop = asyncio.get_running_loop()
-        self.busy_loop_task = running_loop.create_task(self._dispatch_data())
+        self.running_loop = asyncio.get_running_loop()
+        self.busy_loop_task = self.running_loop.create_task(self._dispatch_data())
 
     def stop_busy_loop(self):
         """Stop the busy loop."""
@@ -69,13 +78,19 @@ class PSRL_AgentLoopManager:
 
         self.stop_busy_loop_task = True
         # Wait for the background task to finish
-        running_loop = asyncio.get_running_loop()
-        running_loop.run_until_complete(self.busy_loop_task)
+        self.running_loop.run_until_complete(self.busy_loop_task)
+
+        # Stop the busy loop of agent loop workers
+        futures = []
+        for worker in self.agent_loop_workers:
+            futures.append(worker.stop_busy_loop.remote())
+        ray.get(futures)
 
     async def _dispatch_data(self):
         while not self.stop_busy_loop_task:
             if not self.data_queue.empty():
                 data = self.data_queue.get_nowait()
+                psrl_logger.debug(f"Get data from data queue")
                 
                 # Receive END signal to stop processing data queue
                 if data is None:
@@ -91,8 +106,16 @@ class PSRL_AgentLoopManager:
                     version_tags.append(version_tag)
                 data.non_tensor_batch["version_tag"] = np.array(version_tags)
 
+                # Wait for version update in ps
+                max_version_tag = np.max(version_tags)
+                if max_version_tag > self.curr_ps_version_tag:
+                    psrl_logger.debug(f"Waiting for ps model version: {max_version_tag}")
+                    await self.ps_manager_handle.wait_for_ps_model_version.remote(max_version_tag)
+                    self.curr_ps_version_tag = max_version_tag
+                    psrl_logger.debug(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
+
                 # Dispatch data to agent loop workers
-                self._inner_dispatch_data(data)
+                await self._inner_dispatch_data(data)
             await asyncio.sleep(0) # Yield control to the event loop
 
     def set_version_tag(self, request):
@@ -111,7 +134,7 @@ class PSRL_AgentLoopManager:
         self._request_counter += 1
         return version_tag
 
-    def _inner_dispatch_data(self, data: DataProto):
+    async def _inner_dispatch_data(self, data: DataProto):
         """Dispatch data to agent loop workers in a round-robin manner.
         Args:
             data (DataProto): Input data.
@@ -119,10 +142,12 @@ class PSRL_AgentLoopManager:
 
         # Update request status from PENDING to RUNNING
         request_ids = data.non_tensor_batch["uid"]
-        update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(
+        version_tags = data.non_tensor_batch["version_tag"]
+        update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             RequestStatus.RUNNING,
-        ))
+            model_version=version_tags.tolist(),
+        )
         dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
         if not dispatch_request_idxs:
             return
@@ -137,7 +162,8 @@ class PSRL_AgentLoopManager:
             
             # Dispatch data to the corresponding worker
             futures.append(self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data))
-        ray.get(futures)
+        # Wait for all workers to finish processing the data
+        await asyncio.gather(*futures)
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
         dispatch_plan = {}

@@ -74,7 +74,7 @@ class RewardServer(CommandExtension):
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
         
-    def start_server(self):
+    def start_busy_loop(self):
         """
         Start the reward server and begin processing requests.
         
@@ -99,7 +99,7 @@ class RewardServer(CommandExtension):
         self._threads = [event_handler]
         psrl_logger.debug("Background event handler thread started")
     
-    def shutdown_server(self):
+    def stop_busy_loop(self):
         """Shutdown the reward server gracefully."""
         if not self.server_running:
             psrl_logger.debug("Server not running, ignoring shutdown_server call")
@@ -250,7 +250,7 @@ class RewardServer(CommandExtension):
                     continue
 
                 rollout_data.non_tensor_batch.pop("raw_prompt_ids")
-                rollout_data.non_tensor_batch.pop("raw_response_ids")
+                # rollout_data.non_tensor_batch.pop("raw_response_ids")
                 
                 # Rollout log probs processing
                 if self.config.psrl.log_prob.enable_inference_engine_log_prob:

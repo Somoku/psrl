@@ -13,8 +13,8 @@ from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-@register("generate_only_agent")
-class GenerateAgentLoop(AgentLoopBase):
+@register("batch_generate_only_agent")
+class BatchGenerateAgentLoop(AgentLoopBase):
     """Naive agent loop that only do generation."""
 
     def __init__(self, *args, **kwargs):
@@ -24,11 +24,17 @@ class GenerateAgentLoop(AgentLoopBase):
 
     async def run(self, request: DataProto) -> DataProto:
         # with simple_timer("generate_sequences"):
-        output = await self.rollout_router.generate_async(request)
+        output = self.rollout_router.generate(request)
         if output is not None:
-            response_ids = output.non_tensor_batch["raw_response_ids"][0]
-            response_mask = [1] * len(response_ids)
-            output.non_tensor_batch["response_mask"] = np.array([response_mask[: self.response_length]])
-            output.non_tensor_batch["__num_turns__"] = np.array([0])
+            batch_size = len(output)
+            response_mask_list = []
+            num_turns_list = []
+            for i in range(batch_size):
+                response_ids = output.non_tensor_batch["raw_response_ids"][i]
+                response_mask = [1] * len(response_ids)
+                response_mask_list.append(response_mask[: self.response_length])
+                num_turns_list.append(0)
+            output.non_tensor_batch["response_mask"] = np.fromiter(response_mask_list, dtype=object)
+            output.non_tensor_batch["__num_turns__"] = np.array(num_turns_list)
 
         return output

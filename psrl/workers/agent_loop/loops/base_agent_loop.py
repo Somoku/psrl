@@ -7,7 +7,7 @@ import ray
 
 from verl import DataProto
 
-from psrl.workers.agent_loop.utils import DummyConfig, AgentLoopOutput
+from psrl.workers.agent_loop.loops.utils import DummyConfig
 from psrl.workers.agent_loop.router import RolloutRouter
 
 class AgentLoopBase(ABC):

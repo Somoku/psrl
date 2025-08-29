@@ -1,5 +1,5 @@
 psrl:
-  ps_manager_ip: 127.0.0.1
+  ps_manager_ip: 28.59.80.224
   staleness: 0
   staleness_buffer_entries: 512
   rollout_n: ${gen_actor_rollout_ref.rollout.n}
@@ -25,10 +25,12 @@ psrl:
       tensor_model_parallel_size_per_instance: [] # Tensor model parallel size for each rollout instance.
       pipeline_model_parallel_size_per_instance: [] # Pipeline model parallel size for each rollout instance.
   rollout_test:
-    # Engine status collection interval in seconds (for each GenWorker)
-    status_collection_interval: 5.0 # Collect status every 5 seconds
-    # Engine status sync interval in seconds (for RolloutCoordinator -> AgentLoopWorkers)
-    engine_status_sync_interval: 15.0  # Sync to agent workers every 15 seconds
+    status_collection:
+      enable: True
+      # Engine status collection interval in seconds (for each GenWorker)
+      # status_collection_interval: 2.0 # Collect status every 2 seconds
+      # Engine status sync interval in seconds (for RolloutCoordinator -> AgentLoopWorkers)
+      engine_status_sync_interval_in_ms: 100  # Sync to agent workers every 0.1 seconds
     redundant_rollout:
       enable: False
       alg_global_batch_size: ${psrl.staleness_buffer_entries}
@@ -44,6 +46,12 @@ psrl:
     server_ip: ${psrl.ps_manager_ip}
     server_port: 23456
     max_pinned_temp_memory_slots: 4
+
+profiler:
+  # True for each task has its own database, False for all tasks in one training step share one database.
+  discrete: False
+  all_ranks: False # Whether to profile all ranks.
+  ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 data:
   tokenizer: null
@@ -100,7 +108,7 @@ train_actor_rollout_ref:
       impl_backend: torch
     trust_remote_code: False
   actor:
-    strategy: fsdp2  # [fsdp, fsdp2]
+    strategy: fsdp  # [fsdp, fsdp2]
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: null
@@ -162,13 +170,8 @@ train_actor_rollout_ref:
       # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
       # before the current forward computation.
       forward_prefetch: False
-    profiler:
-      # True for each task has its own database, False for all tasks in one training step share one database.
-      discrete: False
-      all_ranks: False # Whether to profile all ranks.
-      ranks: [] # The ranks that will be profiled. [] or [0,1,...]
   ref:
-    strategy: fsdp2
+    strategy: fsdp
     fsdp_config:
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
@@ -186,11 +189,11 @@ train_actor_rollout_ref:
     ulysses_sequence_parallel_size: ${train_actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
     entropy_from_logits_with_chunking: False # calculate entropy with chunking to reduce memory peak
     entropy_checkpointing: False # recompute entropy
-    profiler:
-      # True for each task has its own database, False for all tasks in one training step share one database.
-      discrete: False
-      all_ranks: False # Whether to profile all ranks.
-      ranks: [] # The ranks that will be profiled. [] or [0,1,...]
+    # profiler:
+    #   # True for each task has its own database, False for all tasks in one training step share one database.
+    #   discrete: False
+    #   all_ranks: False # Whether to profile all ranks.
+    #   ranks: [] # The ranks that will be profiled. [] or [0,1,...]
   rollout:
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
@@ -200,7 +203,7 @@ train_actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: float32 # should align with FSDP
+    dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -295,11 +298,11 @@ train_actor_rollout_ref:
     trace:
       backend: null # trace backend, support mlflow, weave
       token2text: False # whether translate token id to text in output
-    profiler:
-      # True for each task has its own database, False for all tasks in one training step share one database.
-      discrete: False
-      all_ranks: False # Whether to profile all ranks.
-      ranks: [] # The ranks that will be profiled. [] or [0,1,...]
+    # profiler:
+    #   # True for each task has its own database, False for all tasks in one training step share one database.
+    #   discrete: False
+    #   all_ranks: False # Whether to profile all ranks.
+    #   ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 gen_actor_rollout_ref:
   hybrid_engine: False
@@ -320,7 +323,7 @@ gen_actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: float32 # should align with FSDP
+    dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -339,7 +342,7 @@ gen_actor_rollout_ref:
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
-    disable_log_stats: True
+    disable_log_stats: False
     enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     # for hf rollout
     do_sample: True
@@ -383,7 +386,7 @@ gen_actor_rollout_ref:
       # Qwen/QwQ-32B, Qwen/Qwen3-xxB
       tokenization_sanity_check_mode: strict
     agent:
-      num_workers: 8 # Number of agent loop workers
+      num_workers: 1 # Number of agent loop workers
       # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
       # https://hydra.cc/docs/advanced/instantiate_objects/overview/
       #
@@ -402,6 +405,7 @@ gen_actor_rollout_ref:
 
         # Class name of the custom async server class (e.g. AsyncvLLMServer)
         name: null
+    status_collection: ${psrl.rollout_test.status_collection}
     # trace rollout data
     trace:
       backend: null # trace backend, support mlflow, weave
@@ -409,7 +413,7 @@ gen_actor_rollout_ref:
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
-  strategy: fsdp2 # [fsdp, fsdp2]
+  strategy: fsdp # [fsdp, fsdp2]
   optim:
     lr: 1e-5
     lr_warmup_steps_ratio: 0.0  # the total steps will be injected during runtime
@@ -459,11 +463,11 @@ critic:
   checkpoint:
     save_contents: ['model', 'optimizer', 'extra']
     load_contents: ${critic.checkpoint.save_contents}
-  profiler:
-    # True for each task has its own database, False for all tasks in one training step share one database.
-    discrete: False
-    all_ranks: False # Whether to profile all ranks.
-    ranks: [] # The ranks that will be profiled. [] or [0,1,...]
+  # profiler:
+  #   # True for each task has its own database, False for all tasks in one training step share one database.
+  #   discrete: False
+  #   all_ranks: False # Whether to profile all ranks.
+  #   ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 reward_model:
   enable: False
@@ -496,11 +500,11 @@ reward_model:
     url: null # Cloud/local function URL for sandbox execution
     max_concurrent: 64 # Max concurrent requests allowed to sandbox
     memory_limit_mb: 1024 # Max memory limit for each sandbox process in MB
-  profiler:
-    # True for each task has its own database, False for all tasks in one training step share one database.
-    discrete: False
-    all_ranks: False # Whether to profile all ranks.
-    ranks: [] # The ranks that will be profiled. [] or [0,1,...]
+  # profiler:
+  #   # True for each task has its own database, False for all tasks in one training step share one database.
+  #   discrete: False
+  #   all_ranks: False # Whether to profile all ranks.
+  #   ranks: [] # The ranks that will be profiled. [] or [0,1,...]
 
 custom_reward_function:
   path: null

@@ -8,8 +8,11 @@ export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
 
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-GLOBAL_BATCH_SIZE=64
-REDUNDANT_BATCH_SIZE=64
+GLOBAL_BATCH_SIZE=16
+REDUNDANT_BATCH_SIZE=16
+
+ALG_ROLLOUT_N=4
+REDUNDANT_ROLLOUT_N=4
 
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
@@ -37,12 +40,12 @@ test_files="['$gsm8k_test_path']"
 
 # bash $HOME/kill.sh 3
 
-PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
-    psrl.gen_mode=stream \
+    psrl.gen_mode=batch \
     psrl.ps_mode=cpu_ref \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/fsdp/psrl_log \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/grpo_trainer/fsdp/psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -58,25 +61,24 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.rollout_test.partial_rollout.interrupt_as_prompt=False \
     psrl.rollout_test.redundant_rollout.enable=True \
     psrl.rollout_test.redundant_rollout.redundant_global_batch_size=${REDUNDANT_BATCH_SIZE} \
-    psrl.rollout_test.redundant_rollout.redundant_rollout_n=1 \
+    psrl.rollout_test.redundant_rollout.redundant_rollout_n=${REDUNDANT_ROLLOUT_N} \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.load_format=dummy_dtensor \
     gen_actor_rollout_ref.rollout.max_inflight_requests=32 \
-    gen_actor_rollout_ref.rollout.mode=psrl_async \
-    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    gen_actor_rollout_ref.rollout.mode=sync \
+    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.n=1 \
+    gen_actor_rollout_ref.rollout.n=$ALG_ROLLOUT_N \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
-    train_actor_rollout_ref.rollout.n=1 \
+    train_actor_rollout_ref.rollout.n=$ALG_ROLLOUT_N \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -84,7 +86,12 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    train_actor_rollout_ref.actor.use_kl_loss=False \
+    train_actor_rollout_ref.actor.use_kl_loss=True \
+    train_actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    train_actor_rollout_ref.actor.entropy_coeff=0 \
+    train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    train_actor_rollout_ref.ref.fsdp_config.param_offload=False \
     \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
@@ -95,7 +102,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     critic.model.fsdp_config.optimizer_offload=False \
     \
     algorithm.use_kl_in_reward=False \
-    algorithm.adv_estimator=gae \
+    algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
@@ -106,11 +113,11 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.critic_warmup=0 \
     trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='psrl_fsdp_ppo_test' \
+    trainer.project_name='psrl_fsdp_grpo_test' \
     trainer.experiment_name='stream' \
-    trainer.total_training_steps=5 \
+    trainer.total_training_steps=20 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-stream.log
+    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_grpo_test-stream.log
 
 # bash $HOME/occupy.sh 3

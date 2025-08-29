@@ -2,9 +2,18 @@ import torch
 from omegaconf import DictConfig
 from pydantic import BaseModel
 
-from psrl.workers.agent_loop.loops.agent_loop_base import AgentLoopBase
+AGENT_LOOP_REGISTRY: dict[str, dict] = {}
 
-_agent_loop_registry: dict[str, dict] = {}
+def register(agent_name: str):
+    """Register agent loop class."""
+    from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
+
+    def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
+        fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
+        AGENT_LOOP_REGISTRY[agent_name] = {"_target_": fqdn}
+        return subclass
+
+    return decorator
 
 # make hydra.utils.instantiate happy
 class DummyConfig:
@@ -30,13 +39,3 @@ class AgentLoopOutput(BaseModel):
     """Number of chat turns, including user, assistant, tool."""
     metrics: AgentLoopMetrics
     """Auxiliary performance metrics"""
-
-def register(agent_name: str):
-    """Register agent loop class."""
-
-    def decorator(subclass: type[AgentLoopBase]) -> type[AgentLoopBase]:
-        fqdn = f"{subclass.__module__}.{subclass.__qualname__}"
-        _agent_loop_registry[agent_name] = {"_target_": fqdn}
-        return subclass
-
-    return decorator

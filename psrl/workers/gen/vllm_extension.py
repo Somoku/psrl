@@ -40,6 +40,8 @@ class vLLMWorkerExtension:
             Exception: If there is an error during the loading process.
         """
         try:
+            print("[extension] vLLMWorkerExtension.load_weights called")
+            psrl_logger.info("[extension] vLLMWorkerExtension.load_weights called")
             def rebuild_weights_generator():
                 current_device = torch.cuda.current_device()
                 for name, handle in weights:
@@ -60,6 +62,8 @@ class vLLMWorkerExtension:
             
             rebuild_weights = rebuild_weights_generator()
             loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
+            print("[extension] vLLMWorkerExtension.load_weights finished")
+            psrl_logger.info("[extension] vLLMWorkerExtension.load_weights finished")
             if blocking:
                 # Ensure all operations are completed before returning
                 torch.cuda.synchronize()

@@ -28,6 +28,8 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
+from psrl.workers.gen import StatCollector
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
@@ -199,7 +201,15 @@ class PSRL_vLLMRollout(BaseRollout):
         )
 
         if config.mode == "psrl_async":
-            self.inference_engine = AsyncLLM.from_engine_args(AsyncEngineArgs(**llm_kwargs))
+            engine_args = AsyncEngineArgs(**llm_kwargs)
+            stat_loggers = None
+            if not config.disable_log_stats and self.config.status_collection.enable:
+                vllm_config = engine_args.create_engine_config()
+                status_queue = kwargs["status_queue"]
+                stat_logger = StatCollector(vllm_config, engine_index=kwargs.get("instance_id", 0))
+                stat_logger.init_output_queue(status_queue)
+                stat_loggers = [stat_logger]
+            self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)
         else:
             self.inference_engine = LLM(**llm_kwargs)
 
@@ -493,6 +503,21 @@ class PSRL_vLLMRollout(BaseRollout):
                 use_tqdm=False,
             )
             return self.post_process_outputs(prompts, outputs)
+
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
+    @torch.no_grad()
+    def raw_generate_sequences(self, prompts: DataProto, **kwargs):
+        """Generate sequences from the prompts using vLLM."""
+        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            # the inference_engine will handle the request_id internally
+            outputs = self.inference_engine.generate(
+                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                use_tqdm=False,
+            )
+            return outputs
     
     async def generate_sequence_task(
         self,
@@ -552,7 +577,7 @@ class PSRL_vLLMRollout(BaseRollout):
 
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
-    async def raw_generate_sequences_async(self, prompts: DataProto, **kwargs) -> DataProto:
+    async def raw_generate_sequences_async(self, prompts: DataProto, **kwargs):
         """Generate sequences from the prompts using vLLM asynchronously w/o post-processing."""
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         sample_ids = prompts.non_tensor_batch.get("uid", None)

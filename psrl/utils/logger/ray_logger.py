@@ -68,7 +68,21 @@ class DualOutputHandler(logging.Handler):
         self.file_handler.setFormatter(file_formatter)
 
     def emit(self, record):
-        # Emit the log record to both handlers
+        # Emit the original log record to file handler
         self.file_handler.emit(record)
-        record.msg = f"<{self.log_prefix}> - {record.getMessage()}"
-        self.stream_handler.emit(record)
+        
+        # Create a new record for stream handler with modified message
+        stream_record = logging.LogRecord(
+            name=record.name,
+            level=record.levelno,
+            pathname=record.pathname,
+            lineno=record.lineno,
+            msg=f"<{self.log_prefix}> - {record.getMessage()}",
+            args=(),  # No args needed since we already formatted the message
+            exc_info=record.exc_info,
+            func=record.funcName,
+            stack_info=record.stack_info
+        )
+        
+        # Emit the modified record to stream handler
+        self.stream_handler.emit(stream_record)

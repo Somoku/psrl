@@ -11,10 +11,9 @@ import ray
 import hydra
 from omegaconf import OmegaConf
 
-from verl.utils.device import is_cuda_available
 from verl.trainer.ppo.reward import load_reward_manager
 
-from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
+from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -49,9 +48,10 @@ def run_ppo(config) -> None:
         ray.init(
             runtime_env={
                 "env_vars": {
-                    "TOKENIZERS_PARALLELISM": "true", 
+                    "TOKENIZERS_PARALLELISM": "false", 
                     "NCCL_DEBUG": "WARN", 
-                    "VLLM_LOGGING_LEVEL": "WARN",
+                    "NCCL_ALGO": "Ring",
+                    "VLLM_LOGGING_LEVEL": "INFO",
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
@@ -68,8 +68,7 @@ def run_ppo(config) -> None:
     # to set up the runtime environment for nsys profiling. `profile_steps` is a list of steps to profile,
     # which can be specified in the configuration.
     if (
-        is_cuda_available
-        and config.trainer.get("profile_steps") is not None
+        config.trainer.get("profile_steps") is not None
         and len(config.trainer.get("profile_steps", [])) > 0
     ):
         nsight_options = OmegaConf.to_container(config.trainer.controller_nsight_options)
@@ -208,8 +207,12 @@ class TaskRunner:
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {}))
         val_reward_fn = load_reward_manager(config, tokenizer, num_examine=1, **config.reward_model.get("reward_kwargs", {}))
+
         resource_pool_manager = PSRL_ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
         
+        # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
+        # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
+        from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Initialize the PPO trainer.

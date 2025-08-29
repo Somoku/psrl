@@ -88,6 +88,7 @@ class DataProcessor:
         # Build logger
         self.log_prefix = "DataProcessor"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+        psrl_logger.info("DataProcessor initialized with configuration: %s", self.config)
         
         # Create the initial datasets and dataloaders
         self.total_training_steps = None
@@ -292,14 +293,13 @@ class DataProcessor:
             daemon=True,
         )
         self.data_process_thread.start()
+        psrl_logger.debug("Data processing thread started.")
     
     def stop_busy_loop(self):
         """Stop the data processing thread."""
         if self.data_process_thread is not None:
             self.stop_data_process = True
-            self.data_process_thread.join(timeout=5)
-            if self.data_process_thread.is_alive():
-                psrl_logger.warning("Data processing thread did not stop gracefully, force stopping.")
+            self.data_process_thread.join()
             self.data_process_thread = None
     
     def _process_data(self):
@@ -334,13 +334,14 @@ class DataProcessor:
                 else:
                     batch_dict['uid'] = np.array(sample_ids)
                 # Record partial response ids for resume in partial rollout
-                batch_dict['raw_response_ids'] = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+                # batch_dict['raw_response_ids'] = np.fromiter(([] for _ in range(batch_size)), dtype=object)
                 
                 batch_dict = DataProto.from_single_dict(batch_dict)
                 
                 # Pop the keys that are needed for generation to form the generation batch.
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "raw_response_ids"]
+                # non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "raw_response_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 meta_info_keys_to_pop = []
                 if "multi_modal_inputs" in batch_dict.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
@@ -380,6 +381,7 @@ class DataProcessor:
                             uid_list.append(child_id)
                     gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
                 
+                psrl_logger.debug("before record request status")
                 # Record the request status in the request status manager and put the batch into the data queue.
                 if self.process_mode == "stream":
                     batch_size = len(gen_batch)
@@ -387,14 +389,17 @@ class DataProcessor:
                         ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i],
                         ))
+                        psrl_logger.debug(f"Recorded request for uid {gen_batch.non_tensor_batch['uid'][i]}, with full = {self.data_queue.full()}")
                         self.data_queue.put(gen_batch[i:i+1])
+                        psrl_logger.debug(f"Put batch {i} into data queue, with full = {self.data_queue.full()}")
                 else:
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))
                     self.data_queue.put(gen_batch)
+                psrl_logger.debug("after record request status")
                 
                 self.global_steps += 1
-                if self.global_steps >= self.total_training_steps:
+                if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:
                     self.stop_data_process = True
 
             except StopIteration:

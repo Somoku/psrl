@@ -104,20 +104,26 @@ class RolloutServer(CommandExtension):
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             psrl_logger.debug(f"Initializing busy loop for rollout instance {i}")
-            if self.rank_0_is_model_owner:
-                psrl_logger.debug(f"Starting rank_zero busy_loop_generate_sequences for instance {i}")
-                futures.append(self.rollout_wg_list[i].execute_rank_zero_async(
-                    "busy_loop_generate_sequences",
-                    rollout_queue=self.rollout_queue,
-                    replay_buffer=self.replay_buffer
-                ))
-            else:
-                psrl_logger.debug(f"Starting all ranks busy_loop_generate_sequences for instance {i}")
-                futures.extend(self.rollout_wg_list[i].execute_all_async(
-                    "busy_loop_generate_sequences",
-                    rollout_queue=self.rollout_queue,
-                    replay_buffer=self.replay_buffer
-                ))
+            # if self.rank_0_is_model_owner:
+            #     psrl_logger.debug(f"Starting rank_zero busy_loop_generate_sequences for instance {i}")
+            #     futures.append(self.rollout_wg_list[i].execute_rank_zero_async(
+            #         "busy_loop_generate_sequences",
+            #         rollout_queue=self.rollout_queue,
+            #         replay_buffer=self.replay_buffer
+            #     ))
+            # else:
+            #     psrl_logger.debug(f"Starting all ranks busy_loop_generate_sequences for instance {i}")
+            #     futures.extend(self.rollout_wg_list[i].execute_all_async(
+            #         "busy_loop_generate_sequences",
+            #         rollout_queue=self.rollout_queue,
+            #         replay_buffer=self.replay_buffer
+            #     ))
+            psrl_logger.debug(f"Starting rank_zero busy_loop_generate_sequences for instance {i}")
+            futures.append(self.rollout_wg_list[i].execute_rank_zero_async(
+                "busy_loop_generate_sequences",
+                rollout_queue=self.rollout_queue,
+                replay_buffer=self.replay_buffer
+            ))
             self.instance_running_status[i] = True
             psrl_logger.debug(f"Marked instance {i} as running")
         psrl_logger.debug(f"Waiting for {len(futures)} futures to complete")
@@ -226,12 +232,14 @@ class RolloutServer(CommandExtension):
 
             # Add requests to the rollout worker group for processing
             psrl_logger.debug(f"Sending {len(requests)} requests to instance {instance_id} worker group")
-            if self.rank_0_is_model_owner:
-                self.rollout_wg_list[instance_id].execute_rank_zero_async("add_request", requests)
-                psrl_logger.debug(f"Requests sent to rank 0 of instance {instance_id}")
-            else:
-                self.rollout_wg_list[instance_id].execute_all_async("add_request", requests)
-                psrl_logger.debug(f"Requests sent to all ranks of instance {instance_id}")
+            # if self.rank_0_is_model_owner:
+            #     self.rollout_wg_list[instance_id].execute_rank_zero_async("add_request", requests)
+            #     psrl_logger.debug(f"Requests sent to rank 0 of instance {instance_id}")
+            # else:
+            #     self.rollout_wg_list[instance_id].execute_all_async("add_request", requests)
+            #     psrl_logger.debug(f"Requests sent to all ranks of instance {instance_id}")
+            self.rollout_wg_list[instance_id].execute_rank_zero_async("add_request", requests)
+            psrl_logger.debug(f"Requests sent to rank 0 of instance {instance_id}")
 
     def set_rollout_instance_model_version(self, rollout_instance_id: int, version_tag: int):
         """
@@ -392,10 +400,11 @@ class RolloutServer(CommandExtension):
                     self.rollout_paused = True
                     futures = []
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
-                        if self.rank_0_is_model_owner:
-                            futures.append(self.rollout_wg_list[i].execute_rank_zero_async("interrupt_generation"))
-                        else:
-                            futures.append(self.rollout_wg_list[i].execute_all_async("interrupt_generation"))
+                        # if self.rank_0_is_model_owner:
+                        #     futures.append(self.rollout_wg_list[i].execute_rank_zero_async("interrupt_generation"))
+                        # else:
+                        #     futures.append(self.rollout_wg_list[i].execute_all_async("interrupt_generation"))
+                        futures.append(self.rollout_wg_list[i].execute_rank_zero_async("interrupt_generation"))
                     interrupted_request_nums = ray.get(futures)
                     result = np.sum(interrupted_request_nums)
                     psrl_logger.debug(f"Received STOP command, interrupted {result} requests")
@@ -409,10 +418,11 @@ class RolloutServer(CommandExtension):
                         psrl_logger.debug(f"Resuming specific instances: {instance_ids}")
                     
                     for instance_id in instance_ids:
-                        if self.rank_0_is_model_owner:
-                            self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
-                        else:
-                            self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                        # if self.rank_0_is_model_owner:
+                        #     self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
+                        # else:
+                        #     self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                        self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
                     self.rollout_paused = False
                     psrl_logger.debug("Resumed data queue processing")
                 elif command_type == CommandType.SHUTDOWN:
@@ -420,10 +430,11 @@ class RolloutServer(CommandExtension):
                     self.server_running = False
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
                         psrl_logger.debug(f"Shutting down instance {i}")
-                        if self.rank_0_is_model_owner:
-                            self.rollout_wg_list[i].execute_rank_zero_async("shutdown_generate")
-                        else:
-                            self.rollout_wg_list[i].execute_all_async("shutdown_generate")
+                        # if self.rank_0_is_model_owner:
+                        #     self.rollout_wg_list[i].execute_rank_zero_async("shutdown_generate")
+                        # else:
+                        #     self.rollout_wg_list[i].execute_all_async("shutdown_generate")
+                        self.rollout_wg_list[i].execute_rank_zero_async("shutdown_generate")
                     psrl_logger.debug("All instances have been shut down.")
                 elif command_type == CommandType.SYNC:
                     # Interrupt the instance, pull the model weights from PS and resume generation.
@@ -436,29 +447,32 @@ class RolloutServer(CommandExtension):
                     # Interrupt the instance (including requests in request queue and running tasks)
                     psrl_logger.debug(f"SYNC command for instance {instance_id}: stopping generation...")
                     future = None
-                    if self.rank_0_is_model_owner:
-                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation", self.replay_buffer)
-                    else:
-                        future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation", self.replay_buffer)
+                    # if self.rank_0_is_model_owner:
+                    #     future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation", self.replay_buffer)
+                    # else:
+                    #     future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation", self.replay_buffer)
+                    future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation", self.replay_buffer)
                     interrupted_request_num = ray.get(future)
                     self.instance_running_status[instance_id] = False
                     psrl_logger.debug(f"SYNC command for instance {instance_id}: interrupted {interrupted_request_num} requests")
                     
                     # Pull model
                     psrl_logger.debug(f"SYNC command for instance {instance_id}: pulling model...")
-                    if self.rank_0_is_model_owner:
-                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
-                    else:
-                        future = self.rollout_wg_list[instance_id].execute_all_async("pull_model")
+                    # if self.rank_0_is_model_owner:
+                    #     future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
+                    # else:
+                    #     future = self.rollout_wg_list[instance_id].execute_all_async("pull_model")
+                    future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
                     ray.get(future)
                     psrl_logger.debug(f"SYNC command for instance {instance_id}: pulled model")
                     
                     # Resume generation
                     psrl_logger.debug(f"SYNC command for instance {instance_id}: resuming generation...")
-                    if self.rank_0_is_model_owner:
-                        self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
-                    else:
-                        self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                    # if self.rank_0_is_model_owner:
+                    #     self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
+                    # else:
+                    #     self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                    self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
                     self.instance_running_status[instance_id] = True
                     psrl_logger.debug(f"SYNC command for instance {instance_id}: resumed generation")
                 elif command_type == CommandType.ABORT:
@@ -476,10 +490,11 @@ class RolloutServer(CommandExtension):
                         if not isinstance(uids, (list, set)):
                             uids = [uids]
                         abort_requests = set(uids)  # Ensure uniqueness
-                        if self.rank_0_is_model_owner:
-                            futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", abort_requests))
-                        else:
-                            futures.append(self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", abort_requests))
+                        # if self.rank_0_is_model_owner:
+                        #     futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", abort_requests))
+                        # else:
+                        #     futures.append(self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", abort_requests))
+                        futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", abort_requests))
                     if not futures:
                         interrupted_request_num = 0
                     else:
@@ -509,10 +524,11 @@ class RolloutServer(CommandExtension):
                             psrl_logger.debug(f"RolloutServer: Instance {instance_id} is already up-to-date with model version {curr_ps_model_version}, skipping interruption...")
                             continue
                         instance_ids.append(instance_id)
-                        if self.rank_0_is_model_owner:
-                            waiting_and_running_queue_size_ref = self.rollout_wg_list[instance_id].execute_rank_zero_async("waiting_and_running_queue_size")
-                        else:
-                            waiting_and_running_queue_size_ref = self.rollout_wg_list[instance_id].execute_all_async("waiting_and_running_queue_size")
+                        # if self.rank_0_is_model_owner:
+                        #     waiting_and_running_queue_size_ref = self.rollout_wg_list[instance_id].execute_rank_zero_async("waiting_and_running_queue_size")
+                        # else:
+                        #     waiting_and_running_queue_size_ref = self.rollout_wg_list[instance_id].execute_all_async("waiting_and_running_queue_size")
+                        waiting_and_running_queue_size_ref = self.rollout_wg_list[instance_id].execute_rank_zero_async("waiting_and_running_queue_size")
                         instance_to_request_num[instance_id] = waiting_and_running_queue_size_ref
                         futures.append(waiting_and_running_queue_size_ref)
                     
@@ -557,29 +573,32 @@ class RolloutServer(CommandExtension):
                             # Interrupt the instance (including requests in request queue and running tasks)
                             psrl_logger.debug(f"SYNC command for instance {instance_id}: stopping generation...")
                             future = None
-                            if self.rank_0_is_model_owner:
-                                future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation", self.replay_buffer)
-                            else:
-                                future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation", self.replay_buffer)
+                            # if self.rank_0_is_model_owner:
+                            #     future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation", self.replay_buffer)
+                            # else:
+                            #     future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation", self.replay_buffer)
+                            future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation", self.replay_buffer)
                             interrupted_request_num = ray.get(future)
                             self.instance_running_status[instance_id] = False
                             psrl_logger.debug(f"SYNC command for instance {instance_id}: interrupted {interrupted_request_num} requests")
                             
                             # Pull model
                             psrl_logger.debug(f"SYNC command for instance {instance_id}: pulling model...")
-                            if self.rank_0_is_model_owner:
-                                future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
-                            else:
-                                future = self.rollout_wg_list[instance_id].execute_all_async("pull_model")
+                            # if self.rank_0_is_model_owner:
+                            #     future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
+                            # else:
+                            #     future = self.rollout_wg_list[instance_id].execute_all_async("pull_model")
+                            future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
                             ray.get(future)
                             psrl_logger.debug(f"SYNC command for instance {instance_id}: pulled model")
                             
                             # Resume generation
                             psrl_logger.debug(f"SYNC command for instance {instance_id}: resuming generation...")
-                            if self.rank_0_is_model_owner:
-                                self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
-                            else:
-                                self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                            # if self.rank_0_is_model_owner:
+                            #     self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
+                            # else:
+                            #     self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                            self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
                             self.instance_running_status[instance_id] = True
                             psrl_logger.debug(f"SYNC command for instance {instance_id}: resumed generation")
                 else:
@@ -629,10 +648,11 @@ class RolloutServer(CommandExtension):
                     psrl_logger.info(f"RolloutServer: Received `None` data, skipping scheduling.")
                     for i in range(self.config.psrl.deployment.n_rollout_instances):
                         psrl_logger.debug(f"Sending None request to instance {i} to signal end of data")
-                        if self.rank_0_is_model_owner:
-                            self.rollout_wg_list[i].execute_rank_zero_async("add_request", None)
-                        else:
-                            self.rollout_wg_list[i].execute_all_async("add_request", None)
+                        # if self.rank_0_is_model_owner:
+                        #     self.rollout_wg_list[i].execute_rank_zero_async("add_request", None)
+                        # else:
+                        #     self.rollout_wg_list[i].execute_all_async("add_request", None)
+                        self.rollout_wg_list[i].execute_rank_zero_async("add_request", None)
                     self.skipping_data_queue = True
                     psrl_logger.debug("Set skipping_data_queue to True")
                     continue

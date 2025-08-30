@@ -42,7 +42,7 @@ index 446f98034..1e8f92bb6 100644
      def _free_request(self, request: Request) -> Optional[dict[str, Any]]:
          assert request.is_finished()
 diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
-index 02cb80197..0e566f260 100644
+index 02cb80197..23a82bdc5 100644
 --- a/vllm/v1/engine/async_llm.py
 +++ b/vllm/v1/engine/async_llm.py
 @@ -4,7 +4,7 @@ import asyncio
@@ -54,7 +54,7 @@ index 02cb80197..0e566f260 100644
  
  import numpy as np
  
-@@ -418,8 +418,10 @@ class AsyncLLM(EngineClient):
+@@ -418,10 +418,12 @@ class AsyncLLM(EngineClient):
  
          self.output_handler = asyncio.create_task(output_handler())
  
@@ -64,8 +64,11 @@ index 02cb80197..0e566f260 100644
 +        if not isinstance(request_id, Iterable):
 +            request_id = (request_id, )
  
-         request_ids = self.output_processor.abort_requests((request_id, ))
+-        request_ids = self.output_processor.abort_requests((request_id, ))
++        request_ids = self.output_processor.abort_requests(request_id)
          await self.engine_core.abort_requests_async(request_ids)
+ 
+         if self.log_requests:
 @@ -587,6 +589,28 @@ class AsyncLLM(EngineClient):
          """Prevent an adapter from being evicted."""
          return await self.engine_core.pin_lora_async(lora_id)
@@ -151,6 +154,24 @@ index 3be6c4821..f1f2c269e 100644
              if req_state is not None:
                  self.lora_states.abort_request(req_state)
                  request_ids_to_abort.append(request_id)
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 7f2556bab..185a0c980 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -657,8 +657,11 @@ class StatLoggerManager:
+                         and issubclass(logger_factory, PrometheusStatLogger)):
+                     prometheus_factory = logger_factory
+                     continue
+-                loggers.append(logger_factory(vllm_config,
+-                                              engine_idx))  # type: ignore
++                if not isinstance(logger_factory, Callable):
++                    loggers.append(logger_factory)
++                else:
++                    loggers.append(logger_factory(vllm_config,
++                                                engine_idx))  # type: ignore
+             self.per_engine_logger_dict[engine_idx] = loggers
+ 
+         # For Prometheus, need to share the metrics between EngineCores.
 diff --git a/vllm/v1/sample/metadata.py b/vllm/v1/sample/metadata.py
 index 1189b12f3..c6a04d167 100644
 --- a/vllm/v1/sample/metadata.py

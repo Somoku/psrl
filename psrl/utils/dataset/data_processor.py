@@ -72,9 +72,9 @@ class DataProcessor:
         self.data_queue = data_queue
         
         self.process_mode = process_mode
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.rollout_test.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.rollout_test.redundant_rollout.alg_rollout_n
+        if self.config.psrl.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
@@ -88,7 +88,6 @@ class DataProcessor:
         # Build logger
         self.log_prefix = "DataProcessor"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
-        psrl_logger.info("DataProcessor initialized with configuration: %s", self.config)
         
         # Create the initial datasets and dataloaders
         self.total_training_steps = None
@@ -116,8 +115,8 @@ class DataProcessor:
         assert self.train_dataset is not None, "Train dataset is not built yet. Call build_train_and_val_dataset() first."
         assert self.train_sampler is not None, "Train sampler is not built yet. Call build_train_sampler() first."
 
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            batch_size = self.config.psrl.rollout_test.redundant_rollout.redundant_global_batch_size
+        if self.config.psrl.redundant_rollout.enable:
+            batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
         else:
             batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
         
@@ -218,7 +217,7 @@ class DataProcessor:
         try:
             data = next(self.train_dataloader_iter)
         except StopIteration:
-            psrl_logger.info("Train dataloader iterator exhausted.")
+            psrl_logger.debug("Train dataloader iterator exhausted.")
             epoch += 1
             if epoch == self.config.trainer.total_epochs:
                 psrl_logger.info("All training epochs completed, stopping data processing.")
@@ -293,7 +292,6 @@ class DataProcessor:
             daemon=True,
         )
         self.data_process_thread.start()
-        psrl_logger.debug("Data processing thread started.")
     
     def stop_busy_loop(self):
         """Stop the data processing thread."""
@@ -333,14 +331,11 @@ class DataProcessor:
                     batch_dict['parent_id'] = np.array(sample_ids)
                 else:
                     batch_dict['uid'] = np.array(sample_ids)
-                # Record partial response ids for resume in partial rollout
-                # batch_dict['raw_response_ids'] = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-                
+
                 batch_dict = DataProto.from_single_dict(batch_dict)
                 
                 # Pop the keys that are needed for generation to form the generation batch.
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                # non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "raw_response_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 meta_info_keys_to_pop = []
                 if "multi_modal_inputs" in batch_dict.non_tensor_batch:
@@ -356,13 +351,11 @@ class DataProcessor:
                 if "do_sample" in batch_dict.meta_info:
                     meta_info_keys_to_pop.append("do_sample")
 
-                psrl_logger.debug(f"Keys to pop for gen_batch - batch: {batch_keys_to_pop}, non_tensor: {non_tensor_batch_keys_to_pop}, meta_info: {meta_info_keys_to_pop}")
                 gen_batch = batch_dict.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                     meta_info_keys=meta_info_keys_to_pop,
                 )
-                psrl_logger.debug(f"Created gen_batch with size {len(gen_batch)}")
                 
                 # Store the other batch fields in the request buffer of the ps manager.
                 # They will be merged with the reward data.
@@ -381,7 +374,6 @@ class DataProcessor:
                             uid_list.append(child_id)
                     gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
                 
-                psrl_logger.debug("before record request status")
                 # Record the request status in the request status manager and put the batch into the data queue.
                 if self.process_mode == "stream":
                     batch_size = len(gen_batch)
@@ -389,14 +381,11 @@ class DataProcessor:
                         ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i],
                         ))
-                        psrl_logger.debug(f"Recorded request for uid {gen_batch.non_tensor_batch['uid'][i]}, with full = {self.data_queue.full()}")
                         self.data_queue.put(gen_batch[i:i+1])
-                        psrl_logger.debug(f"Put batch {i} into data queue, with full = {self.data_queue.full()}")
                 else:
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))
                     self.data_queue.put(gen_batch)
-                psrl_logger.debug("after record request status")
                 
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:

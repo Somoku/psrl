@@ -50,12 +50,14 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
 
 class PSRL_vLLMRollout(BaseRollout):
     def __init__(self, model_path: str, config: DictConfig, tokenizer, **kwargs):
-        """A vLLM rollout. It requires the module is supported by the vllm.
+        """
+        Initialize PSRL vLLM rollout with specified configuration.
 
         Args:
-            module: module here follows huggingface APIs
-            config: DictConfig
-            tokenizer: the task/model tokenizer
+            model_path: Path to the model to load
+            config: Configuration object containing vLLM and PSRL settings
+            tokenizer: Tokenizer instance for the model
+            **kwargs: Additional keyword arguments (trust_remote_code, lora_kwargs, etc.)
         """
        
         # Monkey patch adapted from NeMo-RL for vLLM to ensure RAY_ADDRESS is set in Ray actors.
@@ -204,6 +206,7 @@ class PSRL_vLLMRollout(BaseRollout):
             engine_args = AsyncEngineArgs(**llm_kwargs)
             stat_loggers = None
             if not config.disable_log_stats and self.config.status_collection.enable:
+                # Use custom stat loggers to collect engine stats
                 vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]
                 stat_logger = StatCollector(vllm_config, engine_index=kwargs.get("instance_id", 0))
@@ -239,15 +242,24 @@ class PSRL_vLLMRollout(BaseRollout):
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
-        """Context manager to temporarily update sampling parameters."""
+        """
+        Context manager to temporarily update sampling parameters.
+        
+        This allows temporary modifications to sampling parameters for specific
+        generation requests while preserving the original parameters.
+        
+        Args:
+            **kwargs: Sampling parameters to temporarily override
+            
+        Yields:
+            None: Context for temporary parameter usage
+        """
         # update sampling params
         old_sampling_params_args = {}
         if kwargs:
             for key, value in kwargs.items():
-                if hasattr(self.sampling_params, key):
-                    old_value = getattr(self.sampling_params, key)
-                    old_sampling_params_args[key] = old_value
-                    setattr(self.sampling_params, key, value)
+                old_sampling_params_args[key] = getattr(self.sampling_params, key)
+                setattr(self.sampling_params, key, value)
         yield
         # roll back to previous sampling params
         for key, value in old_sampling_params_args.items():
@@ -258,13 +270,22 @@ class PSRL_vLLMRollout(BaseRollout):
         prompts: DataProto,
         kwargs: dict
     ) -> Tuple[Union[PromptType, Sequence[PromptType]], dict[str, Any]]:
-        """Pre-process the prompts to convert them into vLLM inputs."""
-        # 1. remove left padding -> raw_prompt_ids
-        # 2. concat raw_prompt_ids and raw_response_ids -> prompt_token_ids in `vllm_inputs`
-        # 3. add multi_modal_data if exists
-        # 4. sampling params configuration
+        """
+        Pre-process prompts to convert them into vLLM-compatible inputs.
         
-        # TODO: 在外部移除 single-request 的 padding
+        This method performs several transformations:
+        1. Remove left padding from prompt token IDs
+        2. Concatenate raw prompt IDs and response IDs for continuation
+        3. Add multi-modal data if present (images, etc.)
+        4. Configure sampling parameters based on mode (sampling/validation/greedy)
+        
+        Args:
+            prompts: DataProto containing input prompts and metadata
+            kwargs: Additional keyword arguments for processing
+            
+        Returns:
+            Tuple of (vllm_inputs, sampling_kwargs) ready for vLLM generation
+        """
         
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         batch_size = idx.size(0)
@@ -337,15 +358,24 @@ class PSRL_vLLMRollout(BaseRollout):
         prompts: DataProto,
         outputs: Union[Union[RequestOutput, PoolingRequestOutput], list[Union[RequestOutput, PoolingRequestOutput]]],
     ) -> DataProto:
-        """Post-process the vllm outputs to convert them into DataProto."""
-        # 1. collect response_ids, response_len, interrupted
-        # 2. collect log_probs if required
-        # 3. concat new response_ids to raw_response_ids, update response_unpadded_len and rollout_log_probs
-        # 4. pad response to the right side
-        # 5. construct position_ids and attention_mask (final)
-        # 6. construct the final data proto
+        """
+        Post-process vLLM outputs to convert them back into DataProto format.
         
-        # partial rollout 情况下需要 response_ids 和 log_probs -> outputs
+        This method performs several transformations:
+        1. Extract response token IDs, lengths, and interruption status
+        2. Collect log probabilities if required
+        3. Concatenate new response IDs to existing raw response IDs
+        4. Apply right-side padding to responses
+        5. Construct proper position IDs and attention masks
+        6. Build final DataProto with updated tensors and metadata
+        
+        Args:
+            prompts: Original input DataProto containing prompts
+            outputs: vLLM generation outputs (single output or list of outputs)
+            
+        Returns:
+            Updated DataProto with generated responses and proper formatting
+        """
 
         if isinstance(outputs, (RequestOutput, PoolingRequestOutput)):
             outputs = [outputs]
@@ -397,7 +427,10 @@ class PSRL_vLLMRollout(BaseRollout):
                     rollout_log_probs.append(log_prob_list)
 
         non_tensor_batch["interrupted"] = np.array(interrupted, dtype=bool)
-        raw_response_ids = non_tensor_batch["raw_response_ids"]
+        if "raw_response_ids" in non_tensor_batch:
+            raw_response_ids = non_tensor_batch["raw_response_ids"]
+        else:
+            raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
         # Reconstruct the raw response ids by concatenating the previous raw response ids
         # with the new response ids.
         response = raw_response_ids + np.fromiter(response, dtype=object)
@@ -411,16 +444,16 @@ class PSRL_vLLMRollout(BaseRollout):
         ]
         non_tensor_batch["response_unpadded_len"] = np.array(response_unpadded_len, dtype=int)
 
-        # TODO: optimize the DataProto construction to packing
+        # TODO(linsh): optimize the DataProto construction to packing
         # Here we pad the response to the right side for both interrupted and completed requests.
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
         if self.config.enable_inference_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
-                curr_rollout_log_probs = curr_rollout_log_probs.reshape(batch_size, -1)
             else:
-                curr_rollout_log_probs = np.empty((batch_size, 0), dtype=object)
-            non_tensor_batch["rollout_log_probs"] = np.concatenate([curr_rollout_log_probs, np.array(rollout_log_probs, dtype=object).reshape(batch_size, -1)], axis=-1)
+                curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+            curr_rollout_log_probs += np.fromiter(rollout_log_probs, dtype=object)
+            non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
 
         seq = torch.cat([idx, response], dim=-1)
 
@@ -456,7 +489,16 @@ class PSRL_vLLMRollout(BaseRollout):
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
     
     def add_requests(self, prompts: DataProto, **kwargs):
-        """Add requests to the vLLM inference engine."""
+        """
+        Add generation requests to the vLLM inference engine.
+        
+        This method converts prompts to vLLM format and queues them for generation.
+        Used primarily for async/streaming generation modes.
+        
+        Args:
+            prompts: DataProto containing input prompts
+            **kwargs: Additional parameters for generation
+        """
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         parsed_vllm_inputs = cast(Union[PromptType, Sequence[PromptType]], vllm_inputs)
         if isinstance(parsed_vllm_inputs, (str, dict)):
@@ -473,7 +515,7 @@ class PSRL_vLLMRollout(BaseRollout):
                     priority=0,
                 )
 
-    @deprecated("vllm_rollout.step_all is not supported.")
+    @deprecated("vllm_rollout.step_all is not used.")
     @torch.no_grad()
     def step_all(self) -> list[Union[RequestOutput, PoolingRequestOutput]]:
         outputs: list[Union[RequestOutput, PoolingRequestOutput]] = []
@@ -484,7 +526,7 @@ class PSRL_vLLMRollout(BaseRollout):
                     outputs.append(output)
         return sorted(outputs, key=lambda x: int(x.request_id))
     
-    @deprecated("vllm_rollout.step is not supported.")
+    @deprecated("vllm_rollout.step is not used.")
     @torch.no_grad()
     def step(self) -> list[Union[RequestOutput, PoolingRequestOutput]]:
         return self.inference_engine.llm_engine.step()
@@ -492,7 +534,21 @@ class PSRL_vLLMRollout(BaseRollout):
     @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        """Generate sequences from the prompts using vLLM."""
+        """
+        Generate sequences from prompts using synchronous vLLM generation.
+        
+        This is the main synchronous generation method that:
+        1. Pre-processes inputs for vLLM
+        2. Runs generation with specified sampling parameters
+        3. Post-processes outputs back to DataProto format
+        
+        Args:
+            prompts: DataProto containing input prompts and metadata
+            **kwargs: Additional generation parameters
+            
+        Returns:
+            DataProto with generated sequences and updated metadata
+        """
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -503,48 +559,26 @@ class PSRL_vLLMRollout(BaseRollout):
                 use_tqdm=False,
             )
             return self.post_process_outputs(prompts, outputs)
-
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
-    @torch.no_grad()
-    def raw_generate_sequences(self, prompts: DataProto, **kwargs):
-        """Generate sequences from the prompts using vLLM."""
-        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            # the inference_engine will handle the request_id internally
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                use_tqdm=False,
-            )
-            return outputs
-    
-    async def generate_sequence_task(
-        self,
-        idx: int,
-        prompt_tokens: Union[Dict[str, Any], List[int]],
-        sampling_params: SamplingParams = None,
-        uid: Optional[str] = None
-    ) -> Tuple[int, RequestOutput]:
-        """Generate a single sequence asynchronously using vLLM."""
-        if sampling_params is None:
-            sampling_params = self.sampling_params
-        if isinstance(prompt_tokens, list):
-            prompt_tokens = {'prompt_token_ids': prompt_tokens}
-
-        task = self.inference_engine.generate(
-            prompt=TokensPrompt(**prompt_tokens),
-            sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()) if uid is None else uid,
-        )
-        async for output in task:
-            last_output = output
-        return idx, last_output
     
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
     async def generate_sequences_async(self, prompts: DataProto, **kwargs) -> DataProto:
-        """Generate sequences from the prompts using vLLM asynchronously."""
+        """
+        Generate sequences from prompts using asynchronous vLLM generation.
+        
+        This method enables concurrent generation of multiple sequences with:
+        1. Async task creation for each prompt
+        2. Independent sampling parameter customization per prompt
+        3. Support for partial rollout (continuation from previous responses)
+        4. Efficient concurrent processing with asyncio
+        
+        Args:
+            prompts: DataProto containing input prompts with required 'uid' field
+            **kwargs: Additional generation parameters
+            
+        Returns:
+            DataProto with concatenated results from all async generations
+        """
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         sample_ids = prompts.non_tensor_batch.get("uid", None)
         curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", [0] * len(vllm_inputs))
@@ -575,10 +609,25 @@ class PSRL_vLLMRollout(BaseRollout):
         
         return DataProto.concat(completed_rollout)
 
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
+    @torch.no_grad()
+    def raw_generate_sequences(self, prompts: DataProto, **kwargs):
+        """Generate sequences from the prompts using vLLM without post-processing."""
+        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
+        # users can customize different sampling_params at different run
+        with self.update_sampling_params(**kwargs):
+            # the inference_engine will handle the request_id internally
+            outputs = self.inference_engine.generate(
+                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                use_tqdm=False,
+            )
+            return outputs
+    
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
     async def raw_generate_sequences_async(self, prompts: DataProto, **kwargs):
-        """Generate sequences from the prompts using vLLM asynchronously w/o post-processing."""
+        """Generate sequences from the prompts using vLLM asynchronously without post-processing."""
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         sample_ids = prompts.non_tensor_batch.get("uid", None)
         curr_response_unpadded_len = prompts.non_tensor_batch.get("response_unpadded_len", [0] * len(vllm_inputs))
@@ -608,9 +657,53 @@ class PSRL_vLLMRollout(BaseRollout):
                 vllm_outputs.append(output)
         
         return vllm_outputs
+    
+    async def generate_sequence_task(
+        self,
+        idx: int,
+        prompt_tokens: Union[Dict[str, Any], List[int]],
+        sampling_params: SamplingParams = None,
+        uid: Optional[str] = None
+    ) -> Tuple[int, RequestOutput]:
+        """
+        Generate a single sequence asynchronously using vLLM.
+        
+        This method creates an async generation task for a single prompt and
+        waits for completion, returning the final output.
+        
+        Args:
+            idx: Index of the prompt in the batch
+            prompt_tokens: Either token IDs list or dict with prompt data
+            sampling_params: Sampling parameters for generation (optional)
+            uid: Unique identifier for the request (optional)
+            
+        Returns:
+            Tuple of (prompt_index, final_request_output)
+        """
+        if sampling_params is None:
+            sampling_params = self.sampling_params
+        if isinstance(prompt_tokens, list):
+            prompt_tokens = {'prompt_token_ids': prompt_tokens}
+
+        task = self.inference_engine.generate(
+            prompt=TokensPrompt(**prompt_tokens),
+            sampling_params=sampling_params,
+            request_id=str(uuid.uuid4()) if uid is None else uid,
+        )
+        async for output in task:
+            last_output = output
+        return idx, last_output
 
     async def interrupt_all_requests_async(self) -> int:
-        """Interrupt all requests (both running and waiting) asynchronously."""
+        """
+        Interrupt all requests (both running and waiting) asynchronously.
+        
+        This method aborts all currently queued and executing requests in the
+        vLLM engine, useful for emergency stops or model updates.
+        
+        Returns:
+            Number of requests that were interrupted
+        """
         # Get request IDs of all running and waiting requests from the scheduler
         request_ids_to_abort = await self.inference_engine.waiting_and_running_queue()
         interrupted_request_num = len(request_ids_to_abort)
@@ -624,17 +717,29 @@ class PSRL_vLLMRollout(BaseRollout):
         return interrupted_request_num
 
     async def interrupt_requests_async(self, request_ids):
-        """Interrupt specific requests asynchronously."""
+        """
+        Interrupt specific requests by their IDs asynchronously.
+        
+        This method aborts only the specified requests, allowing selective
+        interruption based on staleness or other criteria.
+        
+        Args:
+            request_ids: List of request IDs to interrupt
+        """
         if len(request_ids) > 0:
             request_ids = [str(request_id) for request_id in request_ids]
             await self.inference_engine.abort(request_ids)
-    
-    async def waiting_and_running_queue_size(self):
-        """Get the size of waiting and running queues."""
-        return len(await self.inference_engine.waiting_and_running_queue())
-    
+
     async def get_engine_status(self):
-        """Get the status of the vLLM engine."""
+        """
+        Get the current status of the vLLM engine.
+        
+        This method returns information about the engine state, including
+        queue sizes and other operational metrics.
+        
+        Returns:
+            Dictionary containing engine status information
+        """
         if self.inference_engine is None:
             return {"status": "not initialized"}
         

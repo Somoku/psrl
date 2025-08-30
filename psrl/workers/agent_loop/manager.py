@@ -16,7 +16,6 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class PSRL_AgentLoopManager:
-    """Agent loop manager that manages a group of agent loop workers."""
 
     def __init__(
         self,
@@ -26,15 +25,20 @@ class PSRL_AgentLoopManager:
         ps_manager_handle,
     ):
         """Initialize agent loop manager.
+        Agent loop manager that manages a group of agent loop workers.
+        Handles data distribution, versioning, and coordination between workers.
 
         Args:
-            config (DictConfig): trainer config.
+            config (DictConfig): Configuration containing training and rollout settings.
+            data_queue: Queue for receiving input data.
+            agent_loop_workers: List of agent loop worker instances.
+            ps_manager_handle: Handle to the parameter server manager.
         """
         self.config = config
         self.staleness = self.config.psrl.staleness
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.rollout_test.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.rollout_test.redundant_rollout.alg_rollout_n
+        if self.config.psrl.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
@@ -57,7 +61,7 @@ class PSRL_AgentLoopManager:
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
     
     def start_busy_loop(self):
-        """Start a busy loop to continuously process data from the queue."""
+        """Start the busy loop for continuous data processing from the queue."""
         if self.busy_loop_task is not None and not self.busy_loop_task.done():
             return
         
@@ -72,7 +76,7 @@ class PSRL_AgentLoopManager:
         self.busy_loop_task = self.running_loop.create_task(self._dispatch_data())
 
     def stop_busy_loop(self):
-        """Stop the busy loop."""
+        """Stop the busy loop and wait for all tasks to complete."""
         if not self.busy_loop_task or self.busy_loop_task.done():
             return
 
@@ -87,10 +91,10 @@ class PSRL_AgentLoopManager:
         ray.get(futures)
 
     async def _dispatch_data(self):
+        """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_busy_loop_task:
             if not self.data_queue.empty():
                 data = self.data_queue.get_nowait()
-                psrl_logger.debug(f"Get data from data queue")
                 
                 # Receive END signal to stop processing data queue
                 if data is None:
@@ -125,8 +129,8 @@ class PSRL_AgentLoopManager:
         NOTE: Currently it's a naive greedy implementation that increments the version tag
         for each request. This may not be optimal in a real-world scenario.
         """
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            buffer_size = self.config.psrl.rollout_test.redundant_rollout.redundant_global_batch_size * self.rollout_n
+        if self.config.psrl.redundant_rollout.enable:
+            buffer_size = self.config.psrl.redundant_rollout.redundant_global_batch_size * self.rollout_n
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
@@ -155,17 +159,22 @@ class PSRL_AgentLoopManager:
         dispatch_data = data.select_idxs(dispatch_request_idxs)
         dispatch_plan = self.get_dispatch_plan(dispatch_data)
         
-        futures = []
         for worker_index, worker_data in dispatch_plan.items():
             if not worker_data:
                 continue
             
             # Dispatch data to the corresponding worker
-            futures.append(self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data))
-        # Wait for all workers to finish processing the data
-        await asyncio.gather(*futures)
+            self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data)
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
+        """Create a dispatch plan for distributing data across workers.
+        
+        Args:
+            data (DataProto): Data to be distributed.
+            
+        Returns:
+            dict[int, DataProto]: Mapping of worker index to assigned data.
+        """
         dispatch_plan = {}
         batch_size = len(data)
         for i in range(batch_size):

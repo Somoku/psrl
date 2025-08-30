@@ -149,9 +149,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _initialize_queue_buffers(self):
         self.process_mode = self.config.psrl.gen_mode
-        if self.config.psrl.rollout_test.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.rollout_test.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.rollout_test.redundant_rollout.alg_rollout_n
+        if self.config.psrl.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
@@ -165,22 +165,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # If process_mode is "batch", it will hold a single batch for batch processing.
         self.data_queue_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n if self.process_mode == "stream" else 1
         self.data_queue = RayQueue(maxsize=self.data_queue_size)
-        psrl_logger.debug("Initialized data_queue with size: %d", self.data_queue_size)
         
         # Rollout queue is the communication handle between the rollout workers and the data processor (reward module).
         # It holds the rollout data that is ready for reward computation.
         # The size of the queue is the same as the data queue size.
         self.rollout_queue = RayQueue(maxsize=self.data_queue_size)
-        
-        # Replay buffer is used to store the interrupted requests that need to be replayed.
-        # It is a queue that holds the requests that are not yet finished.
-        # The size of the replay buffer is not limited, it will grow as needed.
-        # self.replay_buffer = RayQueue()
-        self.replay_buffer = None
 
+        # Status queue is used to store the status of the rollout workers.
+        # The status is collected by the rollout coordinator and sent to the agent loop workers.
         self.status_queue = RayQueue()
 
-        psrl_logger.debug("Initialized data_queue, rollout_queue, and replay_buffer with sizes: %d, %d, and unlimited respectively.",
+        psrl_logger.debug("Initialized data_queue, rollout_queue, and status_queue with sizes: %d, %d, and unlimited respectively.",
                          self.data_queue_size, self.data_queue_size)
 
     def _validate_config(self):
@@ -402,10 +397,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def stop_data_processor(self):
         """Stop the data processor."""
         if self.data_processor is not None:
-            psrl_logger.info("Stopping data processor...")
+            psrl_logger.debug("Stopping data processor...")
             ray.get(self.data_processor.stop_busy_loop.remote())
             self.data_processor = None
-            psrl_logger.info("Data processor stopped successfully.")
+            psrl_logger.debug("Data processor stopped successfully.")
         else:
             psrl_logger.warning("Data processor is not initialized, skipping stop operation.")
 
@@ -430,10 +425,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def stop_agent_loop_manager(self):
         """Stop the agent loop manager."""
         if self.agent_loop_manager is not None:
-            psrl_logger.info("Stopping agent loop manager...")
+            psrl_logger.debug("Stopping agent loop manager...")
             ray.get(self.agent_loop_manager.stop_busy_loop.remote())
             self.agent_loop_manager = None
-            psrl_logger.info("Agent loop manager stopped successfully.")
+            psrl_logger.debug("Agent loop manager stopped successfully.")
         else:
             psrl_logger.warning("Agent loop manager is not initialized, skipping stop operation.")
 
@@ -454,10 +449,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def stop_rollout_coordinator(self):
         """Stop the rollout coordinator."""
         if self.rollout_coordinator is not None:
-            psrl_logger.info("Stopping rollout coordinator...")
+            psrl_logger.debug("Stopping rollout coordinator...")
             ray.get(self.rollout_coordinator.stop_busy_loop.remote())
             self.rollout_coordinator = None
-            psrl_logger.info("Rollout coordinator stopped successfully.")
+            psrl_logger.debug("Rollout coordinator stopped successfully.")
         else:
             psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
 
@@ -484,48 +479,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def stop_reward_server(self):
         """Stop the reward server."""
         if self.reward_server is not None:
-            psrl_logger.info("Stopping reward server...")
+            psrl_logger.debug("Stopping reward server...")
             ray.get(self.reward_server.stop_busy_loop.remote())
             self.reward_server = None
-            psrl_logger.info("Reward server stopped successfully.")
+            psrl_logger.debug("Reward server stopped successfully.")
         else:
             psrl_logger.warning("Reward server is not initialized, skipping stop operation.")
-
-    '''
-    def init_rollout_server(self):
-        """Initialize the rollout server for managing rollouts and data generation."""
-        # Choose the rollout router class based on the generation mode
-        # TODO: allow user to specify the rollout router class in the config
-        # if we implement more rollout routers in the future
-        if self.process_mode == "batch":
-            from psrl.workers.gen.rollout_router import BatchRolloutRouter
-            
-            rollout_router_cls = BatchRolloutRouter
-            psrl_logger.debug("Using BatchRolloutRouter for batch generation mode")
-        else:
-            from psrl.workers.gen.rollout_router import RoundRobinRolloutRouter
-            
-            rollout_router_cls = RoundRobinRolloutRouter
-            psrl_logger.debug("Using RoundRobinRolloutRouter for streaming generation mode")
-
-        psrl_logger.debug("Initializing rollout server with %d rollout worker groups", 
-                         len(self.rollout_wg_list) if hasattr(self, 'rollout_wg_list') else 0)
-        self.rollout_server = RolloutServer.remote(
-            self.config,
-            self.rollout_wg_list,
-            rollout_router_cls,
-            self.data_queue,
-            self.rollout_queue,
-            self.replay_buffer,
-            self.ps_manager_handle,
-        )
-
-    def start_rollout_server(self):
-        """Start the rollout server to handle rollout requests in the background."""
-        assert self.rollout_server is not None, "Rollout server must be initialized before starting it."
-        
-        ray.get(self.rollout_server.start_server.remote())
-    '''
 
     def _validate(self):
         """Validate the model using the validation dataset.
@@ -542,19 +501,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         sample_scores = []
         sample_turns = []
 
-        psrl_logger.debug("Fetching validation data batches")
         batch_count = 0
         while True:
             try:
                 test_data = ray.get(self.data_processor.get_single_controller_batch.remote(DatasetType.val))
                 batch_count += 1
-                psrl_logger.debug("Received validation batch %d with size %d", batch_count, len(test_data))
             except RayTaskError as e:
                 if isinstance(e.cause, StopIteration):
                     psrl_logger.debug("Reached end of validation dataset after %d batches", batch_count)
                     break
                 else:
-                    psrl_logger.info(f"Unknown exception happened during obtaining validation data: {type(e.cause)}")
+                    psrl_logger.error(f"Unknown exception happened during obtaining validation data: {type(e.cause)}")
                     raise
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -598,7 +555,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "validate": True,
                 "global_steps": self.global_steps,
             }
-            psrl_logger.info(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
+            psrl_logger.debug(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
             size_divisor = (
@@ -616,8 +573,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
-            psrl_logger.info("validation generation end")
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
@@ -934,7 +889,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         attached_gpu_id=None
                     ))
                 ps_resource_pool = PSResourcePool(ps_spec_list=ps_spec_list)
-                psrl_logger.info(f"PS resource pool: {ps_resource_pool}")
+                psrl_logger.debug(f"PS resource pool: {ps_resource_pool}")
                 self.ps_wg = PSWorkerGroup(
                     resource_pool=ps_resource_pool,
                     ps_cls_with_init=PSClassWithInitArgs(
@@ -1030,8 +985,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         remove_previous_ckpt_in_save = self.config.trainer.get("remove_previous_ckpt_in_save", False)
         if remove_previous_ckpt_in_save:
-            psrl_logger.info(
-                "Warning: remove_previous_ckpt_in_save is deprecated,"
+            psrl_logger.warning(
+                "remove_previous_ckpt_in_save is deprecated,"
                 + " set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead"
             )
         max_actor_ckpt_to_keep = (
@@ -1116,13 +1071,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
-        # load rollout instance
-        # for i in range(self.config.psrl.deployment.n_rollout_instances):
-        #     self.rollout_wg_list[i].load_checkpoint(actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
-        # # TODO(lhy): push the actor model state dict to the PS worker (though it is not necessary to do so)
+        # TODO(lhy): push the actor model state dict to the PS worker (though it is not necessary to do so)
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
+        # load dataloader
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
         if os.path.exists(dataloader_local_path):
             ray.get(self.data_processor.load_train_dataloader.remote(dataloader_local_path))
@@ -1184,9 +1135,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             default_backend=self.config.trainer.logger,
             config=OmegaConf.to_container(self.config, resolve=True),
         )
-        psrl_logger.info(f"Initialized tracking logger with "
-                         f"project: {self.config.trainer.project_name}, "
-                         f"experiment: {self.config.trainer.experiment_name}")
+        psrl_logger.info("Initialized tracking logger with project: %s, experiment: %s", 
+                         self.config.trainer.project_name, self.config.trainer.experiment_name)
 
         self.global_steps = 0
         
@@ -1195,6 +1145,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        
+        if self.global_steps >= self.total_training_steps:
+            psrl_logger.warning(
+                f"Global steps {self.global_steps} >= total training steps {self.total_training_steps}, "
+                "skipping training."
+            )
+            return
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1238,6 +1195,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info("Starting reward server...")
         self.start_reward_server()
         psrl_logger.info("Reward server started successfully.")
+        
+        psrl_logger.info("All data pipeline components started successfully.")
 
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
@@ -1252,11 +1211,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             metrics = {}
             timing_raw = {}
             is_last_step = self.global_steps == self.total_training_steps
-
-            # Avoid busy waiting when resumed from a checkpoint
-            training_done = self.global_steps > self.total_training_steps
-            if training_done:
-                break
 
             with marked_timer("step", timing_raw): 
                 
@@ -1286,7 +1240,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # which won't affect the advantage calculation (since it's based on uid),
                 # but might affect the loss calculation (due to the change of mini-batching).
                 # Please take care when you implement group based adv computation such as GRPO and rloo
-                # TODO: Decouple the DP balancing and mini-batching.
+                # TODO(verl): Decouple the DP balancing and mini-batching.
                 if self.config.trainer.balance_batch:
                     self._balance_batch(batch, metrics=metrics)
 
@@ -1477,12 +1431,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 break
 
         # Stop all components
-        psrl_logger.debug(f"before stop reward server")
         self.stop_reward_server()
-        psrl_logger.debug(f"before stop agent loop manager")
         self.stop_agent_loop_manager()
-        psrl_logger.debug(f"before stop rollout coordinator")
         self.stop_rollout_coordinator()
-        psrl_logger.debug(f"before stop data processor")
         self.stop_data_processor()
+
         psrl_logger.info("Training completed successfully!")

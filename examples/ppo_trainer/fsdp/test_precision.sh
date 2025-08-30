@@ -53,12 +53,12 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.ps_nnodes=${PS_NNODES} \
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
     \
-    psrl.rollout_test.partial_rollout.enable=True \
-    psrl.rollout_test.partial_rollout.threshold=96 \
-    psrl.rollout_test.partial_rollout.interrupt_as_prompt=False \
-    psrl.rollout_test.redundant_rollout.enable=True \
-    psrl.rollout_test.redundant_rollout.redundant_global_batch_size=${REDUNDANT_BATCH_SIZE} \
-    psrl.rollout_test.redundant_rollout.redundant_rollout_n=1 \
+    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.threshold=96 \
+    psrl.partial_rollout.interrupt_as_prompt=False \
+    psrl.redundant_rollout.enable=True \
+    psrl.redundant_rollout.redundant_global_batch_size=${REDUNDANT_BATCH_SIZE} \
+    psrl.redundant_rollout.redundant_rollout_n=1 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.max_inflight_requests=32 \

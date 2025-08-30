@@ -20,20 +20,6 @@ Methods to check:
 - `compute_log_prob`
 - `update_actor`
 
-## Sharding Managers
-
-### PSRL_FSDPASyncvLLMShardingManager
-
-Methods to check:
-
-- `__aenter__`
-
-### PSRL_MegatronASyncvLLMShardingManager
-
-Methods to check:
-
-- `__aenter__`
-
 ## Generation Workers
 
 ### PSRL_FSDPGenWorker

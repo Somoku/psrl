@@ -40,8 +40,6 @@ class vLLMWorkerExtension:
             Exception: If there is an error during the loading process.
         """
         try:
-            print("[extension] vLLMWorkerExtension.load_weights called")
-            psrl_logger.info("[extension] vLLMWorkerExtension.load_weights called")
             def rebuild_weights_generator():
                 current_device = torch.cuda.current_device()
                 for name, handle in weights:
@@ -62,14 +60,11 @@ class vLLMWorkerExtension:
             
             rebuild_weights = rebuild_weights_generator()
             loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
-            print("[extension] vLLMWorkerExtension.load_weights finished")
-            psrl_logger.info("[extension] vLLMWorkerExtension.load_weights finished")
             if blocking:
                 # Ensure all operations are completed before returning
                 torch.cuda.synchronize()
         except Exception as e:
-            psrl_logger.error(f"Error in vLLMWorkerExtension.load_weights: {e}")
-            return None
+            raise ValueError(f"Error in vLLMWorkerExtension.load_weights: {e}")
         return loaded_params
 
     def cuda_synchronize(self):
@@ -77,8 +72,7 @@ class vLLMWorkerExtension:
         try:
             torch.cuda.synchronize()
         except Exception as e:
-            psrl_logger.error(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}")
-            return None
+            raise ValueError(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}")
         return None
 
     def patch_vllm_moe_model_weight_loader(self) -> None:
@@ -86,6 +80,5 @@ class vLLMWorkerExtension:
         try:
             patch_vllm_moe_model_weight_loader(self.model_runner.model)
         except Exception as e:
-            psrl_logger.error(f"Error in vLLMWorkerExtension.patch_vllm_moe_model_weight_loader: {e}")
-            return None
+            raise ValueError(f"Error in vLLMWorkerExtension.patch_vllm_moe_model_weight_loader: {e}")
         return None

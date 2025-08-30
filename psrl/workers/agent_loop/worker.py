@@ -34,10 +34,13 @@ class PSRL_AgentLoopWorker:
         rollout_wg_list,
         rollout_queue,
     ):
-        """Initialize agent loop manager.
+        """Initialize agent loop worker.
 
         Args:
-            config (DictConfig): YAML config.
+            config (DictConfig): Configuration containing model and rollout settings.
+            ps_manager_handle: Handle to the parameter server manager.
+            rollout_wg_list: List of rollout worker groups.
+            rollout_queue: Queue for storing completed rollout results.
         """
         self.config = config
         model_path = config.gen_actor_rollout_ref.model.path
@@ -70,6 +73,11 @@ class PSRL_AgentLoopWorker:
                 AGENT_LOOP_REGISTRY[agent_loop_config.name] = agent_loop_config
 
     def add_agent_program(self, data: DataProto):
+        """Add a new agent program to the pending queue for processing.
+        
+        Args:
+            data (DataProto or None): Data to process, or None to signal termination.
+        """
         if isinstance(data, DataProto):
             self.pending_program_queue.append(data)
         elif data is None:
@@ -78,16 +86,16 @@ class PSRL_AgentLoopWorker:
             raise TypeError(f"Unsupported data type: {type(data)}. Expected DataProto or None.")
 
     def start_busy_loop(self):
+        """Start the busy loop to continuously process agent programs from the queue."""
         if self.busy_loop_task is not None and not self.busy_loop_task.done():
             return
 
-        psrl_logger.debug("before starting busy loop task")
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._launch_agent_loop())
-        psrl_logger.debug("busy loop task started")
 
     def stop_busy_loop(self):
+        """Stop the busy loop and wait for the current task to complete."""
         if not self.busy_loop_task or self.busy_loop_task.done():
             return
 
@@ -96,15 +104,14 @@ class PSRL_AgentLoopWorker:
         self.running_loop.run_until_complete(self.busy_loop_task)
 
     async def _launch_agent_loop(self):
+        """Main loop that processes agent programs from the pending queue."""
         while not self.stop_busy_loop_task:
             if len(self.pending_program_queue) > 0:
                 program = self.pending_program_queue.popleft()
                 if program is None:
                     self.stop_busy_loop_task = True
                     continue
-                psrl_logger.debug(f"Processing program: {program}")
                 await self.generate_sequences(program)
-                psrl_logger.debug(f"Finished processing program: {program}")
             await asyncio.sleep(0)
 
     def _create_task_done_callback(self, task):
@@ -119,6 +126,14 @@ class PSRL_AgentLoopWorker:
         return task_done_callback
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
+        """Generate sequences using the specified agent type based on configuration.
+        
+        Args:
+            batch (DataProto): Input batch containing prompts and metadata.
+            
+        Returns:
+            DataProto: Generated sequences and associated data.
+        """
         # by default, we assume it's a generation-only agent
         if self.config.psrl.gen_mode == "batch":
             default_agent_name = "batch_generate_only_agent"
@@ -140,6 +155,12 @@ class PSRL_AgentLoopWorker:
         agent_name: str,
         requests: DataProto,
     ):
+        """Execute the specified agent loop on the given requests.
+        
+        Args:
+            agent_name (str): Name of the agent loop to run.
+            requests (DataProto): Input requests to process.
+        """
         assert agent_name in AGENT_LOOP_REGISTRY, (
             f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
         )
@@ -175,7 +196,6 @@ class PSRL_AgentLoopWorker:
 
     def update_engine_status(self, engine_status: dict):
         """Update the engine status received from RolloutCoordinator."""
-        print(f"Worker recv {engine_status=}")
         async def _update_status():
             self.rollout_router.update_engine_status(engine_status)
             # Log some key metrics
@@ -195,10 +215,25 @@ class PSRL_AgentLoopWorker:
             asyncio.run(_update_status())
 
     def get_engine_status(self):
-        """Get the latest engine status."""
+        """Get the latest engine status from the rollout router.
+        
+        Returns:
+            dict: Current engine status information.
+        """
         return self.rollout_router.latest_engine_status
 
     def _post_process(self, inputs: DataProto) -> DataProto:
+        """Post-process the generated outputs to create properly formatted tensors.
+        
+        This method handles padding, attention masks, position IDs, and multi-modal inputs
+        to ensure compatibility with the training pipeline.
+        
+        Args:
+            inputs (DataProto): Raw generation outputs.
+            
+        Returns:
+            DataProto: Formatted data ready for training.
+        """
         # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
         # prompts: left pad
         # responses: right pad
@@ -242,13 +277,6 @@ class PSRL_AgentLoopWorker:
         )
         response_mask = outputs["input_ids"]
 
-        psrl_logger.debug(f"Processing batch with sizes: "
-                            f"prompt_ids={prompt_ids.shape}, "
-                            f"response_ids={response_ids.shape}, "
-                            f"response_mask={response_mask.shape}, "
-                            f"prompt_attention_mask={prompt_attention_mask.shape}, "
-                            f"response_attention_mask={response_attention_mask.shape}")
-
         assert response_ids.shape == response_mask.shape, (
             f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"
         )
@@ -258,7 +286,7 @@ class PSRL_AgentLoopWorker:
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)
         # Handle multi-modal inputs and position_ids calculation
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
-        # TODO: support other multi-modal inputs
+        # TODO(verl): support other multi-modal inputs
         multi_modal_inputs = None
         if (
             self.processor is not None

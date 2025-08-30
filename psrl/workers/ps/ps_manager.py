@@ -54,19 +54,24 @@ class ModelStore:
 @add_lock
 class PSManager(RequestStatusTracker):
     def __init__(self, psrl_config: DictConfig, group_post_process_fn: Optional[callable] = None) -> None:
-        """
-        Initialize the Parameter Server (PS) Manager, responsible for management of model versions,
-        staleness buffers, and rollout requests.
+        """Initialize the Parameter Server (PS) Manager.
+        
+        The PS Manager is responsible for managing model versions, staleness buffers, 
+        and rollout requests. It coordinates between rollout workers and training workers
+        through a staleness-controlled buffer system.
         
         Args:
-            psrl_config (DictConfig): Configuration object containing parameters such as rollout_n, staleness buffer entries, etc.
+            psrl_config (DictConfig): Configuration object containing parameters such as 
+                rollout_n, staleness buffer entries, staleness limit, etc.
+            group_post_process_fn (Optional[callable]): Optional function to post-process 
+                grouped entry data before occupying the buffer
         """
         RequestStatusTracker.__init__(self)
 
         self.psrl_config = psrl_config
-        if self.psrl_config.rollout_test.redundant_rollout.enable:
-            self.rollout_n = self.psrl_config.rollout_test.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.psrl_config.rollout_test.redundant_rollout.alg_rollout_n
+        if self.psrl_config.redundant_rollout.enable:
+            self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.psrl_config.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n
@@ -98,7 +103,6 @@ class PSManager(RequestStatusTracker):
         )
         
         # Track finished child requests for Group Sampling
-        # TODO: move to request status manager? (leave for future merge with PS manager)
         self.rollout_request_tracker: Dict[Union[str, int], List[EntryInfo]] = {} # Maps parent request ids to "occupied" child entries
 
         # NIXL related attributes
@@ -118,7 +122,11 @@ class PSManager(RequestStatusTracker):
         return ray.get_runtime_context().current_actor
 
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
-        """Register a new rollout instance."""
+        """Register a new rollout instance with the PS Manager.
+        
+        Args:
+            rollout_instance_id (Union[str, int]): Unique identifier for the rollout instance
+        """
         self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(
             version_tag=0
         )
@@ -126,7 +134,17 @@ class PSManager(RequestStatusTracker):
     # ------- STALENESS INVENTORY MANAGEMENT -------
 
     def _group_post_processing(self, entry_infos: List[EntryInfo]):
-        """Apply post-processing function to a group of entry infos."""
+        """Apply post-processing function to a group of entry infos.
+        
+        This method retrieves data from the data pool for each entry, applies
+        the group post-processing function, and stores the processed data back.
+        
+        Args:
+            entry_infos (List[EntryInfo]): List of entry info objects to process
+            
+        Raises:
+            AssertionError: If group_post_process_fn is not set
+        """
         assert self.group_post_process_fn is not None, "Group post-processing function is not set."
         data_list = [self.staleness_inventory.get_from_data_pool(entry_info) for entry_info in entry_infos]
         processed_data_list = self.group_post_process_fn(data_list)
@@ -219,13 +237,19 @@ class PSManager(RequestStatusTracker):
             entry_ids.append(entry_id)
             buffer_ids.append(buffer_id)
         
-        # TODO: better handle the case where the staleness inventory is full
+        # TODO(lhy): better handle the case where the staleness inventory is full
         if buffer_ids is None or entry_ids is None:
             pass
         
         return buffer_ids, entry_ids
 
     def try_awake_waiters(self):
+        """Check for ready buffers and wake up waiters.
+        
+        This method checks if there are any new ready buffers for training and
+        processes them by waking up waiters and handling staleness control.
+        It also sends interruption commands for partial rollout if enabled.
+        """
         # Check whether there exists ready buffer for training
         max_ready_buffer_id = self.staleness_inventory.max_ready_buffer_id()
         if (
@@ -245,7 +269,7 @@ class PSManager(RequestStatusTracker):
                 psrl_logger.debug(f"Abort requests of version {version_to_abort} done")
             
             # Notify the rollout server to check interruption
-            if self.psrl_config.rollout_test.partial_rollout.enable:
+            if self.psrl_config.partial_rollout.enable:
                 psrl_logger.debug(f"Start to check and sync for ready buffer {max_ready_buffer_id} with current PS model version {curr_ps_model_version}.")
                 # Create async task to avoid blocking
                 command = Command(
@@ -255,17 +279,25 @@ class PSManager(RequestStatusTracker):
                 )
                 asyncio.create_task(self.execute_command(self.rollout_coordinator, command, blocking=False))
         
-        # Check whether there exists ready buffer for training
         min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
         if min_ready_buffer_id is not None:
-            psrl_logger.debug(f"Found min ready buffer is {min_ready_buffer_id}")
             self.process_ready_buffer(min_ready_buffer_id)
 
     async def execute_command(self, server, command: Command, blocking: bool = False):
+        """Execute a command on a server asynchronously.
+        
+        Args:
+            server: The server actor to execute the command on
+            command (Command): The command to execute
+            blocking (bool): Whether to wait for command completion
+            
+        Raises:
+            ValueError: If command execution fails
+        """
         try:
             await server.exec_command.remote(command, blocking=blocking)
         except Exception as e:
-            psrl_logger.error(f"Failed to execute command {command}: {e}")
+            raise ValueError(f"Failed to execute command {command}: {e}")
 
     def log_ready_buffer(self, buffer_id: int):
         """Log the ready buffer."""
@@ -341,7 +373,6 @@ class PSManager(RequestStatusTracker):
             data (DataProto): The data to store
             parent_id (Optional[Union[str, int]]): The parent request id (for group sampling)
         """
-        psrl_logger.debug(f"store_and_maybe_occupy_rollout_instance_request called with rollout_instance_id={rollout_instance_id}, request_id={request_id}, parent_id={parent_id}")
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         entry_info = EntryInfo(
@@ -351,14 +382,11 @@ class PSManager(RequestStatusTracker):
         )
         
         # Remove the request from the training ready requests in the request status manager
-        psrl_logger.debug(f"Removing request_id {request_id} from train_ready_requests")
         self.remove_train_ready_request(request_id)
-        psrl_logger.debug(f"Successfully removed request_id {request_id} from train_ready_requests")
         
         if parent_id is not None:
             # Group Sampling
             assert self.rollout_n > 1, "rollout_n must be greater than 1 to use parent_id."
-            psrl_logger.debug(f"Adding data for entry_info to staleness inventory")
             self.staleness_inventory.add_to_data_pool(
                 entry_info=entry_info,
                 data=data,
@@ -368,17 +396,18 @@ class PSManager(RequestStatusTracker):
                 self.rollout_request_tracker[parent_id] = []
                 
             self.rollout_request_tracker[parent_id].append(entry_info)
-            psrl_logger.debug(f"Store data for parent {parent_id} with info {entry_info}, total requests: {len(self.rollout_request_tracker[parent_id])}")
+            psrl_logger.debug(f"Store data for parent {parent_id} with info {entry_info}, "
+                              f"request num: {len(self.rollout_request_tracker[parent_id])}")
             
             if len(self.rollout_request_tracker[parent_id]) == self.alg_rollout_n:
-                psrl_logger.debug(f"Reached required alg_rollout_n={self.alg_rollout_n} for parent_id {parent_id}")
+                psrl_logger.debug(f"Reached required {self.alg_rollout_n} samples for parent {parent_id}")
                 entry_infos = self.rollout_request_tracker.pop(parent_id)
                 psrl_logger.debug(f"Popped entry_infos from rollout_request_tracker for parent_id {parent_id}, entry count: {len(entry_infos)}")
                 
                 all_child_ids = set(range(self.rollout_n))
                 stored_child_ids = set([int(entry_info.request_id) % self.rollout_n for entry_info in entry_infos])
                 abort_child_ids = all_child_ids - stored_child_ids
-                psrl_logger.debug(f"All child IDs: {all_child_ids}, Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
+                psrl_logger.debug(f"Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
                 
                 # Remove the sample data from the buffer in the request status manager
                 psrl_logger.debug(f"Removing request data of {parent_id} from request status manager buffer")
@@ -399,9 +428,7 @@ class PSManager(RequestStatusTracker):
                     psrl_logger.debug(f"Occupying data for entry_info {i+1}/{len(entry_infos)}: {entry_info}")
                     self.staleness_inventory.occupy_data(entry_info=entry_info)
                 
-                psrl_logger.debug(f"Trying to awake waiters after occupying data for parent_id {parent_id}")
                 self.try_awake_waiters()
-                psrl_logger.debug(f"Finished group sampling request processing for parent_id {parent_id}")
         else:
             # Remove the sample data from the buffer in the request status manager
             self.remove_request_data_from_buffer(request_id)
@@ -410,11 +437,7 @@ class PSManager(RequestStatusTracker):
                 entry_info=entry_info,
                 data=data,
             )
-            psrl_logger.debug(f"Successfully occupied data for entry_info: {entry_info}")
-
-            psrl_logger.debug(f"Trying to awake waiters after direct data occupation")
             self.try_awake_waiters()
-            psrl_logger.debug(f"Finished direct data occupation for request_id {request_id}")
 
     async def wait_for_training_batch(
         self,
@@ -442,7 +465,14 @@ class PSManager(RequestStatusTracker):
         return result
         
     def _awake_training_batch_waiters(self, buffer_id: int):
-        """Awake all training waiters for the buffer if any."""
+        """Wake up all training waiters for a specific buffer.
+        
+        When a buffer becomes ready, this method consumes the buffer data
+        and sets the result for all futures waiting for this buffer.
+        
+        Args:
+            buffer_id (int): The buffer ID to wake waiters for
+        """
         # Wake all Futures waiting for this buffer
         if buffer_id in self._buffer_waiters:
             buffer_data = self.staleness_inventory.consume_buffer(buffer_id)
@@ -490,7 +520,6 @@ class PSManager(RequestStatusTracker):
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
 
         self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
-        psrl_logger.debug(f"Before update rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
         assert self.rollout_coordinator is not None, "Rollout coordinator is not set. Please set it before updating rollout instance model version."
         # Sync the rollout instance model version in the rollout server
         ray.get(self.rollout_coordinator.set_rollout_instance_model_version.remote(
@@ -532,7 +561,14 @@ class PSManager(RequestStatusTracker):
     # ------- PS NIXL CONTROL PLANE -------
     
     def init_nixl_server(self, expected_clients: int):
-        """Initialize the nixl server."""
+        """Initialize the NIXL server for distributed communication.
+        
+        Args:
+            expected_clients (int): Number of expected NIXL clients to connect
+            
+        Raises:
+            ValueError: If server_mode is invalid or deprecated
+        """
         self.expected_clients = expected_clients
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
@@ -545,7 +581,15 @@ class PSManager(RequestStatusTracker):
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         
     def nixl_protocol(self):
-        """Connect to the nixl clients and sync the client shardings/infos/comm_plan/temp_mappings to all clients."""
+        """Execute the NIXL protocol for distributed communication setup.
+        
+        This method orchestrates the complete NIXL protocol workflow:
+        1. Wait for client shardings and create unified sharding
+        2. Wait for client infos and create communication plan  
+        3. Wait for client temp mappings and notify all clients
+        
+        The protocol ensures all NIXL clients are properly coordinated.
+        """
         psrl_logger.info(f"nixl server protocol step 1: waiting for {self.expected_clients} clients to connect and send sharding")
         self.nixl_meta_server.wait_for_client_shardings(self.expected_clients)
         psrl_logger.info(f"nixl server protocol step 2: make unified sharding")
@@ -565,7 +609,14 @@ class PSManager(RequestStatusTracker):
         psrl_logger.info(f"nixl server protocol done.")
     
     def bind_ps_worker_group(self, ps_worker_group: PSWorkerGroup):
-        """Bind the PS worker group to the PSManager."""
+        """Bind the PS worker group to the PSManager.
+        
+        This method establishes the connection between the PSManager and the
+        PS worker group, enabling distributed model storage and retrieval.
+        
+        Args:
+            ps_worker_group (PSWorkerGroup): The PS worker group to bind
+        """
         self.ps_worker_group = ps_worker_group
         ps_nixl_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_storage_client_name")
         self.ps_nixl_storage_client_names = ray.get(ps_nixl_storage_client_name_futures)
@@ -680,7 +731,6 @@ class PSManager(RequestStatusTracker):
 
         log_single_event(f"Rollout instance {rollout_instance_id} pulling latest model with version tag {self.model_store.version_tag} (ref)", psrl_logger, event_type=EventType.PULL)
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
-        psrl_logger.debug(f"Returning model state dict ref for rollout instance {rollout_instance_id} with version tag {self.model_store.version_tag}")
         return self.model_store.model_state_dict_ref
     
     def pull_model_state_dict_nixl(self, rollout_instance_id: Union[str, int]):

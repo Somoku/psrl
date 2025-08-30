@@ -51,7 +51,7 @@ def run_ppo(config) -> None:
                     "TOKENIZERS_PARALLELISM": "false", 
                     "NCCL_DEBUG": "WARN", 
                     "NCCL_ALGO": "Ring",
-                    "VLLM_LOGGING_LEVEL": "INFO",
+                    "VLLM_LOGGING_LEVEL": "WARN",
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
                     "PSRL_LOGGING_PATH": config.psrl.logging_path,
@@ -112,13 +112,13 @@ class TaskRunner:
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Define worker classes based on the actor strategy.
+        from psrl.workers.gen.gen_worker import PSRL_GenWorker
         if config.train_actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
             assert config.critic.strategy in ["fsdp", "fsdp2"], \
                 "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.fsdp_train_worker import PSRL_FSDPTrainWorker as PSRL_TrainWorker
-            from psrl.workers.gen.fsdp_gen_worker import PSRL_FSDPGenWorker as PSRL_GenWorker
 
             ray_worker_group_cls = RayWorkerGroup
         elif config.train_actor_rollout_ref.actor.strategy == "megatron":
@@ -127,7 +127,6 @@ class TaskRunner:
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.megatron_train_worker import PSRL_MegatronTrainWorker as PSRL_TrainWorker
-            from psrl.workers.gen.megatron_gen_worker import PSRL_MegatronGenWorker as PSRL_GenWorker
 
             ray_worker_group_cls = NVMegatronRayWorkerGroup
         else:

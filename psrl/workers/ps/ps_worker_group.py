@@ -6,9 +6,17 @@ from dataclasses import dataclass
 
 
 def deep_update(orig: Dict[Any, Any], new: Dict[Any, Any]) -> Dict[Any, Any]:
-    """
-    Recursively merge new into orig, where if both are dict, merge them recursively.
-    Otherwise, directly overwrite orig with new.
+    """Recursively merge two dictionaries.
+    
+    If both orig and new have the same key and both values are dictionaries,
+    merge them recursively. Otherwise, overwrite orig with new.
+    
+    Args:
+        orig (Dict[Any, Any]): The original dictionary to update
+        new (Dict[Any, Any]): The new dictionary to merge in
+        
+    Returns:
+        Dict[Any, Any]: The updated original dictionary
     """
     for key, val in new.items():
         if (
@@ -24,14 +32,31 @@ def deep_update(orig: Dict[Any, Any], new: Dict[Any, Any]) -> Dict[Any, Any]:
 
 @dataclass
 class PSResourceSpec:
-    """
-    A specification for a PS worker.
+    """Specification for a PS worker resource allocation.
+    
+    This class defines where a PS worker should be deployed, including
+    the target node and optional GPU binding.
+    
+    Attributes:
+        node_ip (Optional[str]): IP address of the target node
+        node_id (Optional[str]): Ray node ID of the target node  
+        attached_gpu_id (Optional[int]): GPU ID to bind the worker to, None for CPU-only
     """
     node_ip: Optional[str] = None # ip of the node
     node_id: Optional[str] = None # ray id of the node
     attached_gpu_id: Optional[int] = None # if attached_gpu_id is not None, the actor will be binded to the attached GPU, otherwise it will be binded to the CPU only
     
     def __init__(self, node_ip: Optional[str] = None, node_id: Optional[str] = None, attached_gpu_id: Optional[int] = None):
+        """Initialize PSResourceSpec with node and GPU information.
+        
+        Either node_ip or node_id must be provided. If only one is given,
+        the other will be automatically resolved using Ray's node information.
+        
+        Args:
+            node_ip (Optional[str]): IP address of the target node
+            node_id (Optional[str]): Ray node ID of the target node
+            attached_gpu_id (Optional[int]): GPU ID to bind the worker to
+        """
         if node_ip is None and node_id is None:
             raise ValueError("node_ip or node_id must be set")
         
@@ -73,7 +98,7 @@ class PSClassWithInitArgs:
         """Update the PS actor creation options.
 
         Args:
-            options: Dictionary of options to update
+            options (Dict): Dictionary of options to update. Will be merged with existing options
         """
         deep_update(self._options, options)
 
@@ -82,6 +107,15 @@ class PSClassWithInitArgs:
         target_node_id: str,
         attached_gpu_id: Optional[int] = None
     ) -> Any:
+        """Create and deploy a PS actor on the specified node.
+        
+        Args:
+            target_node_id (str): Ray node ID where the actor should be deployed
+            attached_gpu_id (Optional[int]): GPU ID to bind the actor to
+            
+        Returns:
+            Any: Ray actor handle for the created PS worker
+        """
         num_gpus = 0.5 if attached_gpu_id is not None else 0
         options = {
             "num_cpus": 0, 
@@ -103,6 +137,11 @@ class PSClassWithInitArgs:
         
 
 class PSWorkerGroup:
+    """Group of PS workers for distributed parameter server operations.
+    
+    This class manages a collection of PS workers deployed across multiple nodes,
+    providing methods to execute operations on all workers simultaneously.
+    """
     def __init__(
         self, 
         resource_pool: PSResourcePool,

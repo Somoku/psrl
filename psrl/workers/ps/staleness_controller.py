@@ -11,16 +11,15 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class EntryCategory(enum.Enum):
-    """
-    Enum for the category of an entry in the buffer.
-    EMPTY: The entry is empty and available for reservation.
-    RESERVED: The entry is reserved for a request but not yet occupied.
-    OCCUPIED: The entry is occupied with data.
+    """Enum for the category of an entry in the buffer.
+    
+    EMPTY: The entry is empty and available for reservation
+    RESERVED: The entry is reserved for a request but not yet occupied
+    OCCUPIED: The entry is occupied with data and available for training
     """
     EMPTY = 0
     RESERVED = 1
-    STORED = 2
-    OCCUPIED = 3
+    OCCUPIED = 2
 
 @dataclass
 class EntryInfo:
@@ -67,25 +66,26 @@ class Entry:
     entry_info: Optional[EntryInfo] = None
 
 class BufferStatus(enum.Enum):
-    """
-    Enum for the status of a buffer.
-    READY: All entries are OCCUPIED.
-    STUCK: Mixed OCCUPIED and RESERVED with no EMPTY slots.
-    PENDING: Has at least one EMPTY slot.
+    """Enum for the status of a buffer.
+    
+    READY: All entries are OCCUPIED and the buffer is ready for training
+    STUCK: Mixed OCCUPIED and RESERVED entries with no EMPTY slots  
+    PENDING: Has at least one EMPTY slot and is still accepting new entries
     """
     READY = 0    # All entries are OCCUPIED
     STUCK = 1    # Mixed OCCUPIED and RESERVED with no EMPTY slots
     PENDING = 2  # Has at least one EMPTY slot
 
 class StalenessBuffer:
-    """
-    Buffer for managing staleness-controlled entries.
+    """Buffer for managing staleness-controlled entries.
 
-    This class manages a fixed-size buffer of entries, each of which can be EMPTY, RESERVED, or OCCUPIED.
-    It provides methods for inserting, deleting, and querying entries, as well as determining the buffer's status.
+    This class manages a fixed-size buffer of entries, each of which can be EMPTY, 
+    RESERVED, or OCCUPIED. It provides methods for inserting, deleting, and querying 
+    entries, as well as determining the buffer's status for training readiness.
 
     Args:
-        num_entries (int): The number of entries in the buffer.
+        num_entries (int): The number of entries in the buffer
+        staleness (int): The staleness tolerance for this buffer
     """
     def __init__(self, num_entries: int, staleness: int):
         self.num_entries = num_entries
@@ -96,11 +96,10 @@ class StalenessBuffer:
         self.staleness = staleness
 
     def get_first_non_occupied(self) -> int:
-        """
-        Returns the index of the first non-occupied entry, or `self.num_entries` if all are OCCUPIED.
+        """Get the index of the first non-occupied entry.
 
         Returns:
-            int: Index of the first non-occupied entry, or `self.num_entries` if none found.
+            int: Index of the first non-occupied entry, or `self.num_entries` if all are OCCUPIED
         """
         for idx in range(self.num_entries):
             if self.entries[idx].category != EntryCategory.OCCUPIED:
@@ -280,7 +279,7 @@ class StalenessInventory:
             return
 
         # Remove entries associated with this buffer from data tracker
-        # TODO: deprecate data_tracker, since we can directly use entry_info in the buffer
+        # TODO(linsh): deprecate data_tracker, since we can directly use entry_info in the buffer
         '''
         entries_to_remove = [
             entry.entry_info for entry in self.buffers[buffer_id].entries
@@ -583,8 +582,7 @@ class StalenessInventory:
         # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
         if entry_info.model_version + self.staleness < target_buffer_id:
-            psrl_logger.debug(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
-            return
+            raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
 
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()

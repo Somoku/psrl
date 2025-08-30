@@ -161,18 +161,18 @@ class CommandExtension:
             Union[int, dict[int, DataProto], None]: If `blocking` is True, returns a CommandEvent or the command result.
             If `blocking` is False, returns the command ID immediately. You can use `synchronize_command` to wait for the command result later.
         """
-        psrl_logger.debug(f"Received command: {command.type} with args: {command.get_args()} and kwargs: {command.get_kwargs()}, blocking={blocking}, timeout={timeout}")
+        psrl_logger.debug(f"Received command: {command.type} with args: "
+                          f"{command.get_args()} and kwargs: {command.get_kwargs()}, "
+                          f"blocking={blocking}, timeout={timeout}")
+        
         command_id = self._command_counter
         self._command_counter += 1
-        
-        psrl_logger.info("Executing command: %s with ID: %d", command.type, command_id)
 
         command_event = CommandEvent(command_id)
         self._command_events[command_id] = command_event
         self._command_results[command_id] = None
         
         command._kwargs["id"] = command_id
-        psrl_logger.info("Command %s with ID %d added to command queue.", command.type, command_id)
         self.command_queue.put(command)
         
         # If not blocking, return the command event immediately
@@ -193,7 +193,7 @@ class CommandExtension:
             command_event.wait()
 
         result = self._command_results.get(command_id, None)
-        psrl_logger.info(f"Command {command_id} completed with result: {result}")
+        psrl_logger.debug(f"Command {command_id} completed with result: {result}")
         if command_id in self._command_results:
             del self._command_results[command_id]
         if command_id in self._command_events:

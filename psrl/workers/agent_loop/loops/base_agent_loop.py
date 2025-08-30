@@ -11,8 +11,6 @@ from psrl.workers.agent_loop.loops.utils import DummyConfig
 from psrl.workers.agent_loop.router import RolloutRouter
 
 class AgentLoopBase(ABC):
-    """An agent loop takes a input message, chat with OpenAI compatible LLM server and interact with various
-    environments."""
 
     _class_initialized = False
 
@@ -24,12 +22,15 @@ class AgentLoopBase(ABC):
         tokenizer: AutoTokenizer,
         **kwargs,
     ):
-        """Initialize agent loop, each sample will have its own loop instance.
+        """Initialize agent loop instance.
+        Base class for agent loops that process requests and interact with LLM servers.
 
         Args:
-            trainer_config (_DummyConfig): trainer config.
-            rollout_router (RolloutRouter): Rollout router to route requests to different LLM servers.
-            tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
+            trainer_config (DummyConfig): Wrapper containing trainer configuration.
+            rollout_router (RolloutRouter): Router for distributing requests to LLM servers.
+            ps_manager_handle (ray.actor.ActorHandle): Handle to parameter server manager.
+            tokenizer (AutoTokenizer): Tokenizer for processing text messages.
+            **kwargs: Additional keyword arguments.
         """
         self.init_class(trainer_config.config, tokenizer, **kwargs)
         self.config = trainer_config.config
@@ -40,12 +41,14 @@ class AgentLoopBase(ABC):
 
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
-        """This is used to do heavy initialization work that should shared across all instances. It's only called once.
+        """Perform heavy initialization work shared across all instances.
+        
+        This method is called only once per class to avoid redundant initialization.
 
         Args:
-            config (DictConfig): trainer config.
-            tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
-            **kwargs: extra kwargs from config file passed in by `hydra.utils.instantiate`.
+            config (DictConfig): Configuration object containing training settings.
+            tokenizer (AutoTokenizer): Tokenizer for processing text messages.
+            **kwargs: Additional keyword arguments from configuration.
         """
         if cls._class_initialized:
             return
@@ -53,4 +56,15 @@ class AgentLoopBase(ABC):
 
     @abstractmethod
     async def run(self, request: DataProto) -> DataProto:
+        """Execute the agent loop for the given request.
+        
+        Args:
+            request (DataProto): Input request to process.
+            
+        Returns:
+            DataProto: Processed response data.
+            
+        Raises:
+            NotImplementedError: Must be implemented by subclasses.
+        """
         raise NotImplementedError

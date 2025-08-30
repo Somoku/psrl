@@ -15,16 +15,25 @@ logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @register("generate_only_agent")
 class GenerateAgentLoop(AgentLoopBase):
-    """Naive agent loop that only do generation."""
+    """Agent loop that performs single-request generation in streaming mode."""
 
     def __init__(self, *args, **kwargs):
+        """Initialize the generation agent loop."""
         super().__init__(*args, **kwargs)
         self.prompt_length = self.config.gen_actor_rollout_ref.rollout.prompt_length
         self.response_length = self.config.gen_actor_rollout_ref.rollout.response_length
 
     async def run(self, request: DataProto) -> DataProto:
-        # with simple_timer("generate_sequences"):
-        output = await self.rollout_router.generate_async(request)
+        """Execute generation for a single request.
+        
+        Args:
+            request (DataProto): Single input request.
+            
+        Returns:
+            DataProto: Generated response with metadata.
+        """
+        with simple_timer("generate_sequences"):
+            output = await self.rollout_router.generate_async(request)
         if output is not None:
             response_ids = output.non_tensor_batch["raw_response_ids"][0]
             response_mask = [1] * len(response_ids)

@@ -15,16 +15,25 @@ logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @register("batch_generate_only_agent")
 class BatchGenerateAgentLoop(AgentLoopBase):
-    """Naive agent loop that only do generation."""
+    """Agent loop that performs batch generation for multiple requests simultaneously."""
 
     def __init__(self, *args, **kwargs):
+        """Initialize the batch generation agent loop."""
         super().__init__(*args, **kwargs)
         self.prompt_length = self.config.gen_actor_rollout_ref.rollout.prompt_length
         self.response_length = self.config.gen_actor_rollout_ref.rollout.response_length
 
     async def run(self, request: DataProto) -> DataProto:
-        # with simple_timer("generate_sequences"):
-        output = self.rollout_router.generate(request)
+        """Execute batch generation for the given requests.
+        
+        Args:
+            request (DataProto): Batch of input requests.
+            
+        Returns:
+            DataProto: Generated responses with metadata.
+        """
+        with simple_timer("generate_sequences"):
+            output = self.rollout_router.generate(request)
         if output is not None:
             batch_size = len(output)
             response_mask_list = []

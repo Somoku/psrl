@@ -18,10 +18,12 @@ PSRL is a post-training framework for LLMs that supports both synchronous and as
 conda create -n psrl python=3.10
 conda activate psrl
 
-# Install all dependencies (including Megatron)
+# Install all dependencies (including NIXL and Megatron)
 # If you have an existing **editable** vLLM or veRL installation,
-# you can pass in VLLM_PATH and VERL_PATH to the script.
-USE_MEGATRON=1 bash scripts/install_env.sh
+# you can pass in VLLM_PATH and VERL_PATH to the `scripts/install_basic.sh`.
+bash scripts/install_basic.sh
+bash scripts/install_nixl.sh
+bash scripts/install_megatron.sh
 
 # Install PSRL
 pip install -e .

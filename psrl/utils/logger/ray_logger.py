@@ -52,11 +52,10 @@ def log_single_event(message: str, psrl_logger: logging.Logger, level: int = log
     
 class DualOutputHandler(logging.Handler):
     """A logger handler that writes to both the original stdout and a file."""
-    def __init__(self, log_prefix):
+    def __init__(self, log_dir, log_prefix):
         super().__init__()
         self.log_prefix = log_prefix
         # Create log file
-        log_dir = os.getenv("PSRL_LOGGING_PATH", "~/psrl_log")
         log_dir = os.path.expanduser(log_dir) 
         os.makedirs(log_dir, exist_ok=True) 
         file_path = os.path.join(log_dir, log_prefix + ".log")

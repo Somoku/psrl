@@ -2,6 +2,7 @@ import ray
 import asyncio
 from collections import deque
 
+
 def add_lock(cls):
     """
     A general class decorator that injects _locked, _waiters, and acquire/release methods into any class.
@@ -37,26 +38,6 @@ def add_lock(cls):
     setattr(cls, "release", release)
     return cls
 
-class AsyncLock:
-    """Asynchronous context manager around a LockActor."""
-    def __init__(self, lock_actor):
-        self._lock = lock_actor
-        
-    async def acquire(self):
-        """Acquire the lock, blocking until it is available."""
-        await self._lock.acquire.remote()
-        
-    async def release(self):
-        """Release the lock."""
-        await self._lock.release.remote()
-
-    async def __aenter__(self):
-        # block until acquired
-        await self.acquire()
-
-    async def __aexit__(self, exc_type, exc, tb):
-        # release regardless of exception
-        await self.release()
 
 class RayLock:
     """Synchronous context manager around a LockActor."""
@@ -78,3 +59,25 @@ class RayLock:
     def __exit__(self, exc_type, exc, tb):
         # release regardless of exception
         self.release()
+        
+
+class AsyncRayLock:
+    """Asynchronous context manager around a LockActor."""
+    def __init__(self, lock_actor):
+        self._lock = lock_actor
+        
+    async def acquire(self):
+        """Acquire the lock, blocking until it is available."""
+        await self._lock.acquire.remote()
+        
+    async def release(self):
+        """Release the lock."""
+        await self._lock.release.remote()
+
+    async def __aenter__(self):
+        # block until acquired
+        await self.acquire()
+
+    async def __aexit__(self, exc_type, exc, tb):
+        # release regardless of exception
+        await self.release()

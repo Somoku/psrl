@@ -87,7 +87,7 @@ class DataProcessor:
         config,
         tokenizer,
         processor,
-        ps_handle,
+        ps_manager_handle,
         rollout_instances_strategy: Dict[int, Tuple[int, int]],
         collate_fn=None,
         reward_fn=None,
@@ -108,7 +108,7 @@ class DataProcessor:
         self.use_rm = use_rm
         self.reward_fn = reward_fn
         
-        self.ps_handle = ps_handle
+        self.ps_manager_handle = ps_manager_handle
 
         self.process_mode = process_mode
         self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
@@ -412,7 +412,7 @@ class DataProcessor:
                                 request_data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                                 # Notify the PS worker to store the request data and add count for its parent request
                                 # If all child requests are completed, occupy the request
-                                futures.append(self.ps_handle.store_and_maybe_occupy_rollout_instance_request.remote(
+                                futures.append(self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
                                     rollout_instance_id=int(rollout_instance_id),
                                     request_id=str(request_id),
                                     data=request_data,
@@ -427,7 +427,7 @@ class DataProcessor:
                         with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
                             futures = []
                             # Occupy the request in the PS worker
-                            futures.append(self.ps_handle.store_and_maybe_occupy_rollout_instance_request.remote(
+                            futures.append(self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
                                 rollout_instance_id=int(rollout_instance_id),
                                 request_id=str(request_id),
                                 data=merge_request_data,
@@ -456,7 +456,7 @@ class DataProcessor:
                     with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
                         futures = []
                         # Occupy the request in the PS worker
-                        futures.append(self.ps_handle.occupy_rollout_instance_request.remote(
+                        futures.append(self.ps_manager_handle.occupy_rollout_instance_request.remote(
                             rollout_instance_id=int(rollout_instance_id),
                             request_id=str(request_id),
                             data=request_data,

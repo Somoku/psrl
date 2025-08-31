@@ -21,7 +21,6 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
 from verl import DataProto
-from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -176,7 +175,6 @@ class PSRL_vLLMRollout(BaseRollout):
             # Configure vLLM for tensor/pipeline parallelism within Ray
             # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
             distributed_executor_backend = "ray"
         elif config.mode == "sync":
             distributed_executor_backend = "external_launcher"
@@ -187,7 +185,7 @@ class PSRL_vLLMRollout(BaseRollout):
             self.inference_engine = AsyncLLM.from_engine_args(
                 AsyncEngineArgs(
                     model=model_path,
-                    enable_sleep_mode=True,
+                    # enable_sleep_mode=True,
                     tensor_parallel_size=tensor_parallel_size,
                     pipeline_parallel_size=pipeline_parallel_size,
                     distributed_executor_backend=distributed_executor_backend,
@@ -212,10 +210,9 @@ class PSRL_vLLMRollout(BaseRollout):
         else:
             if pipeline_parallel_size > 1:
                 raise NotImplementedError("Pipeline parallel is not supported in synchronous LLM rollout yet.")
-
             self.inference_engine = LLM(
                 model=model_path,
-                enable_sleep_mode=True,
+                # enable_sleep_mode=True,
                 tensor_parallel_size=tensor_parallel_size,
                 distributed_executor_backend=distributed_executor_backend,
                 dtype=config.dtype,
@@ -236,9 +233,11 @@ class PSRL_vLLMRollout(BaseRollout):
                 **engine_kwargs,
             )
 
+        # NOTE(lhy): sleep mode is not supported when using NIXL
+        # Because it will cause illegal memory registration
         # Offload vllm model to reduce peak memory usage
-        if load_format == "dummy":
-            self.inference_engine.sleep(level=1)
+        # if load_format == "dummy":
+        #     self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,
@@ -319,7 +318,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 "n": 1,  # if greedy, only 1 response
             }
         elif is_validate:
-            # TODO: try **
+            # TODO(verl): try **
             kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
@@ -457,7 +456,7 @@ class PSRL_vLLMRollout(BaseRollout):
                     outputs.append(output)
         return sorted(outputs, key=lambda x: int(x.request_id))
     
-    # TODO: align attention mask
+    # TODO(lhy): align attention mask
     @torch.no_grad()
     def step(self) -> list[Union[RequestOutput, PoolingRequestOutput]]:
         return self.inference_engine.llm_engine.step()

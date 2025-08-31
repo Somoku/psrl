@@ -1,4 +1,5 @@
 psrl:
+  ps_manager_ip: 127.0.0.1
   staleness: 0
   staleness_buffer_entries: 512
   rollout_n: ${gen_actor_rollout_ref.rollout.n}
@@ -23,6 +24,11 @@ psrl:
       rollout_ngpus_per_node_per_instance: []
       tensor_model_parallel_size_per_instance: [] # Tensor model parallel size for each rollout instance.
       pipeline_model_parallel_size_per_instance: [] # Pipeline model parallel size for each rollout instance.
+  nixl:
+    server_mode: meta_server
+    server_ip: ${psrl.ps_manager_ip}
+    server_port: 23456
+    max_pinned_temp_memory_slots: 4
 
 data:
   tokenizer: null
@@ -38,7 +44,7 @@ data:
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
   return_raw_chat: False
   return_full_prompt: False
-  shuffle: True
+  shuffle: False
   validation_shuffle: False
   filter_overlong_prompts: False # for large-scale dataset, filtering overlong prompts could be timeconsuming. You cat set the filter_overlong_prompts_workers to use multiprocessing to speed up.
   filter_overlong_prompts_workers: 1
@@ -54,7 +60,7 @@ train_actor_rollout_ref:
   hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
-    use_shm: False
+    use_shm: True
     external_lib: null
     override_config: { }
     enable_gradient_checkpointing: False
@@ -69,7 +75,7 @@ train_actor_rollout_ref:
       impl_backend: torch
     trust_remote_code: False
   actor:
-    strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
+    strategy: fsdp2  # [fsdp, fsdp2]
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: null
@@ -116,6 +122,10 @@ train_actor_rollout_ref:
       total_training_steps: -1  # must be override by program
       weight_decay: 0.01
     fsdp_config:
+      mixed_precision:
+        param_dtype: bf16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -128,7 +138,7 @@ train_actor_rollout_ref:
       # before the current forward computation.
       forward_prefetch: False
   ref:
-    strategy: fsdp
+    strategy: fsdp2
     fsdp_config:
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
@@ -213,15 +223,7 @@ gen_actor_rollout_ref:
   model:
     path: ${train_actor_rollout_ref.model.path}
     external_lib: null
-  # for compatibility with verl
-  actor:
-    strategy: fsdp  # [fsdp, fsdp2], This is for backward-compatibility
-    ulysses_sequence_parallel_size: 1 # sp size
-    fsdp_config:
-      fsdp_size: -1
-      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
-      # before the current forward computation.
-      forward_prefetch: False
+    trust_remote_code: ${train_actor_rollout_ref.model.trust_remote_code}
   rollout:
     ### Config for streaming rollout ###
     max_inflight_requests: 512 # Max in-flight requests for each rollout worker
@@ -236,7 +238,7 @@ gen_actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: bfloat16 # should align with FSDP
+    dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -293,7 +295,7 @@ gen_actor_rollout_ref:
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
-  strategy: fsdp # [fsdp, fsdp2]
+  strategy: fsdp2 # [fsdp, fsdp2]
   optim:
     lr: 1e-5
     lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
@@ -416,7 +418,7 @@ trainer:
   critic_warmup: 0
   default_hdfs_dir: null
   del_local_ckpt_after_load: False
-  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_local_dir: ${psrl.logging_path}/checkpoints/${trainer.project_name}/${trainer.experiment_name}
   max_actor_ckpt_to_keep: null
   max_critic_ckpt_to_keep: null
   # The timeout for ray worker group to wait for the register center to be ready

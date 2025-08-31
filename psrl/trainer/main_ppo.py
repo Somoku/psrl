@@ -14,7 +14,7 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 
-from psrl.workers.ps import PSRL_PSWorker
+
 from psrl.trainer.ppo.ray_trainer import PSRL_ResourcePoolManager, PSRL_RayPPOTrainer, PSRL_Role
 
 psrl_logger = logging.getLogger(__file__)
@@ -91,7 +91,7 @@ class TaskRunner:
             from verl.single_controller.ray import RayWorkerGroup
             from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.fsdp_train_worker import PSRL_FSDPTrainWorker as PSRL_TrainWorker
-            from psrl.workers.gen.fsdp_gen_worker import PSRL_FSDPGenWorker as PSRL_GenWorker
+            from psrl.workers.gen.gen_worker import PSRL_GenWorker
 
             ray_worker_group_cls = RayWorkerGroup
         elif config.train_actor_rollout_ref.actor.strategy == "megatron":
@@ -99,7 +99,7 @@ class TaskRunner:
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.megatron_train_worker import PSRL_MegatronTrainWorker as PSRL_TrainWorker
-            from psrl.workers.gen.megatron_gen_worker import PSRL_MegatronGenWorker as PSRL_GenWorker
+            from psrl.workers.gen.gen_worker import PSRL_GenWorker
 
             ray_worker_group_cls = NVMegatronRayWorkerGroup
         else:
@@ -109,13 +109,16 @@ class TaskRunner:
         deployment_config = config.psrl.deployment
         rollout_pool_id_list = [f'rollout_pool_{i}' for i in range(deployment_config.n_rollout_instances)]
         train_pool_id = 'train_pool'
-        ps_pool_id = 'ps_pool'
+        # PS pool is not used, we now use self-defined PS worker group
+        # ps_pool_id = 'ps_pool'
+        
         # format: {pool_id: [ngpus_per_node] * nnodes}
         # nnodes will be the number of ray placement groups
         # and ngpus_per_node will be the number of ray bundles (currently all equals to {"CPU": self.max_colocate_count, "GPU": 1}) in each placement group
+        # For now, PS nodes are colocated with rollout nodes (on CPUs)
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
-            ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,
+            # ps_pool_id: [deployment_config.ps_ngpus_per_node] * deployment_config.ps_nnodes,
         }
         if deployment_config.heterogeneous_rollout.enable:
             heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
@@ -139,14 +142,14 @@ class TaskRunner:
             PSRL_Role.Rollout: ray.remote(PSRL_GenWorker),
             PSRL_Role.Actor: ray.remote(PSRL_TrainWorker),
             PSRL_Role.Critic: ray.remote(CriticWorker),
-            PSRL_Role.ParameterServer: ray.remote(PSRL_PSWorker)
+            # PSRL_Role.ParameterServer: ray.remote(PSRL_PSWorker)
         }
         # multiple instances mapping
         mapping = {
             PSRL_Role.Rollout: rollout_pool_id_list,
             PSRL_Role.Actor: [train_pool_id],
             PSRL_Role.Critic: [train_pool_id],
-            PSRL_Role.ParameterServer: [ps_pool_id]
+            # PSRL_Role.ParameterServer: [ps_pool_id]
         }
 
         # we should adopt a multi-source reward function here

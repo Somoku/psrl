@@ -22,6 +22,7 @@ from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_event
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
+
 class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
     def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, train_interface: TrainInterface) -> None:
         super().__init__(config, role)
@@ -46,14 +47,14 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
         """
         return self.rank == 0
         
-    def push_model_cpu(self) -> None:
+    def ray_push_model(self) -> None:
         """
         Push the model weights to the PS. In 'cpu' mode, push the full state dict. In 'cpu_ref' mode, push a ray object_ref.
         In 'cpu' mode, the PS worker will block on large model transfer (potential bottleneck).
         In 'cpu_ref' mode, only the train worker blocks on ray.put, PS worker is non-blocking.
         """
-        ps_handle = self.train_interface.ps_handle
-        curr_ps_model_version = ray.get(ps_handle.get_ps_model_version.remote())
+        ps_manager_handle = self.train_interface.ps_manager_handle
+        curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
         psrl_logger.info(f"Gathering the full state dict on the CPU of the representative rank.")
@@ -76,16 +77,27 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
             if self.psrl_config.ps_mode == "cpu":
                 # In 'cpu' mode, push the full state dict (PS worker will block on transfer)
                 # But the training side does not need to wait for the push to complete, as it can be overlapped with the next-iteration training
-                self.train_interface.ps_handle.push_model_state_dict_cpu.remote(next_ps_model_version, full_state_dict)
+                ps_manager_handle.push_model_state_dict_cpu.remote(next_ps_model_version, full_state_dict)
             elif self.psrl_config.ps_mode == "cpu_ref":
                 # In 'cpu_ref' mode, push a ray object_ref (PS worker is non-blocking)
                 # But the training side needs to wait for the push to complete, as `ray.put` is blocking
                 object_ref = ray.put(full_state_dict)  # This blocks until the state dict is in the object store
-                self.train_interface.ps_handle.push_model_state_dict_cpu_ref_list.remote(next_ps_model_version, [object_ref]) # Tricky part: manually wrap the object_ref in a list to avoid ray dereferencing the full state dict
+                ps_manager_handle.push_model_state_dict_cpu_ref_list.remote(next_ps_model_version, [object_ref]) # Tricky part: manually wrap the object_ref in a list to avoid ray dereferencing the full state dict
             else:
                 raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         else:
             assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
+    
+    def push_model(self):
+        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+            self.ray_push_model()
+        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            self.nixl_push_model()
+            # TODO(lhy): wait for the push to complete before the next iteration optimizer update
+            # This will enable the NIXL push to be overlapped with the next iteration training
+            self.wait_for_nixl_push_completion()
+        else:
+            raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
@@ -124,13 +136,9 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
                 
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
-        # The model weights are pushed to the PS via CPU
-        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
-                output = super().update_actor(data)
-            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-                self.push_model_cpu()
-            return output
-        else:
-            raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-            
+        with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
+            output = super().update_actor(data)
+        with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+            self.push_model()
+        return output
+        

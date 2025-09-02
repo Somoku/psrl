@@ -229,7 +229,9 @@ class NIXLMetaServer:
             shard_mesh_list = []
             for client_name, sharding_dict in self.client_sharding_dicts.items():
                 if key not in sharding_dict:
-                    raise RuntimeError(f"Key {key} not found in sharding of client {client_name}.")
+                    # raise RuntimeError(f"Key {key} not found in sharding of client {client_name}.")
+                    # This handle the case that some clients do not have the key (pipeline parallelism), but we can still make the unified sharding
+                    sharding_dict[key] = NIXLSharding.empty()
                 shard_mesh_list.append(sharding_dict[key].shard_mesh)
             finest_shard_mesh = NIXLSharding.find_finest_shard_mesh(shard_mesh_list)
             for client_name, sharding_dict in self.client_sharding_dicts.items():

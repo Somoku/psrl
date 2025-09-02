@@ -25,6 +25,7 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
@@ -124,6 +125,7 @@ class PSRL_vLLMRollout(BaseRollout):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
+        # NOTE(lhy): why train_tp here in the gen rollout?
         if kwargs.get("train_tp") is not None:
             # deployed with megatron
             import os
@@ -156,8 +158,6 @@ class PSRL_vLLMRollout(BaseRollout):
 
         trust_remote_code = kwargs.get("trust_remote_code", False)
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
-        if config.mode == "psrl_async":
-            load_format = "auto"
 
         lora_kwargs = kwargs.pop("lora_kwargs", {})
         self.lora_kwargs = lora_kwargs
@@ -208,12 +208,11 @@ class PSRL_vLLMRollout(BaseRollout):
                 )
             )
         else:
-            if pipeline_parallel_size > 1:
-                raise NotImplementedError("Pipeline parallel is not supported in synchronous LLM rollout yet.")
             self.inference_engine = LLM(
                 model=model_path,
                 # enable_sleep_mode=True,
                 tensor_parallel_size=tensor_parallel_size,
+                pipeline_parallel_size=pipeline_parallel_size,
                 distributed_executor_backend=distributed_executor_backend,
                 dtype=config.dtype,
                 enforce_eager=config.enforce_eager,
@@ -235,9 +234,11 @@ class PSRL_vLLMRollout(BaseRollout):
 
         # NOTE(lhy): sleep mode is not supported when using NIXL
         # Because it will cause illegal memory registration
+        '''
         # Offload vllm model to reduce peak memory usage
-        # if load_format == "dummy":
-        #     self.inference_engine.sleep(level=1)
+        if load_format == "dummy":
+            self.inference_engine.sleep(level=1)
+        '''
 
         kwargs = dict(
             n=1,

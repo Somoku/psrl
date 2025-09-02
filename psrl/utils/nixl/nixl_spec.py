@@ -27,13 +27,13 @@ def gcd(a, b):
 @dataclass
 class NIXLSharding:
     """Sharding of a global tensor"""
-    # Total number of shards, a dict of ints, key is the shard dimension, value is the number of shards 
+    # Shard mesh from a global perspective, a dict of ints, key is the shard dimension, value is the number of shards 
     # e.g., {0: 2, 1: 8} for 2D sharding, meaning the first dimension has 2 shards and the second dimension has 8 shards
     shard_mesh: OrderedDict[int, int]  
     # Shard mesh from a local perspective, a dict of ints, key is the shard dimension, value is the number of shards 
     # e.g., {0: 1, 1: 1} for 2D sharding, meaning the local tensor is already the finest-grained shard, no need to split
     _local_shard_mesh: OrderedDict[int, int]           
-    # Current shard indices, a list of tuples of ints
+    # Shard indices from a global perspective, a list of tuples of ints
     # e.g., [(0, 0), (0, 1), ..., (0, 7)] for 2D sharding, meaning it contains 8 shards in the first row
     shard_indices: List[Tuple[int, ...]]   
 
@@ -51,6 +51,11 @@ class NIXLSharding:
         new_obj.shard_mesh = deepcopy(self.shard_mesh, memo)
         new_obj.shard_indices = deepcopy(self.shard_indices, memo)
         return new_obj
+    
+    @property
+    def is_empty(self) -> bool:
+        """Check if the sharding is empty"""
+        return not self.shard_indices
         
     def is_contiguous_sharding(self) -> bool:
         """Check if the sharding is contiguous"""
@@ -67,10 +72,18 @@ class NIXLSharding:
         
     @staticmethod
     def default():
-        """Default sharding"""
+        """Default sharding (full tensor)"""
         return NIXLSharding(
             shard_mesh=OrderedDict([(0, 1)]),
             shard_indices=[(0,)]
+        )
+    
+    @staticmethod   
+    def empty():
+        """Empty sharding (no shard)"""
+        return NIXLSharding(
+            shard_mesh=OrderedDict([(0, 1)]),
+            shard_indices=[]
         )
         
     def _validate_and_set_local_shard_mesh(self) -> None:
@@ -78,7 +91,7 @@ class NIXLSharding:
         Validate and set the number of shards for each dimension.
         """
         # Check if the shard_indices is not empty
-        if not self.shard_indices:
+        if self.is_empty:
             self._local_shard_mesh = OrderedDict()
             return
         
@@ -136,6 +149,9 @@ class NIXLSharding:
         Returns:
             A list of tensors, each tensor is a local shard of the original tensor
         """
+        if self.is_empty:
+            return []
+        
         for dim, shard_mesh_at_dim in self._local_shard_mesh.items():
             if dim >= tensor.dim():
                 raise ValueError(f"Dimension {dim} is out of range for tensor with {tensor.dim()} dimensions")
@@ -267,7 +283,7 @@ class NIXLSharding:
         Returns:
             List of new shard indices in the finer-grained coordinate system
         """
-        if not self.shard_indices:
+        if self.is_empty:
             return []
         
         new_shard_indices = []
@@ -448,11 +464,7 @@ class NIXLClientInfo:
     tensor_infos: Dict[str, NIXLTensorInfo]  # key -> TensorDescInfo
     meta: bytes  # agent metadata
 
-    def get_tensor_desc(self, agent, key, local_pos: int = 0):
-        """Get tensor descriptor for specific key and shard"""
-        return self.tensor_infos[key].get_desc(agent, local_pos)
-
-    def get_tensor_desc_info(self, key):
+    def get_tensor_info(self, key):
         """Get tensor descriptor info for specific key"""
         return self.tensor_infos[key]
 

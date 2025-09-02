@@ -125,7 +125,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     data.truncation='error' \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name='psrl_megatron_ppo_test' \
     trainer.experiment_name='hetero_stream' \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \

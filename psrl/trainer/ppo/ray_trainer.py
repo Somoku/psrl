@@ -105,7 +105,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.ref_in_actor = config.train_actor_rollout_ref.model.get("lora_rank", 0) > 0
 
         # Build logger
-        self.log_prefix = f"Main_Ray_Trainer"
+        self.log_prefix = f"MainRayTrainer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized major ray trainer (single controller).")
 

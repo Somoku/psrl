@@ -62,9 +62,9 @@ class NIXLStorageClient:
         self.nixl_interface = nixl_interface
         
         # Initialize NIXL agent
-        self.client_port = 0 if self.nixl_interface.port_scanner is None else \
-            ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
         if binded_agent is None:
+            self.client_port = 0 if self.nixl_interface.port_scanner is None else \
+                ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
             self.agent = nixl_agent(
                 self.client_name,
                 nixl_agent_config(True, True, self.client_port)
@@ -530,8 +530,8 @@ class NIXLStorageClient:
             raise RuntimeError("client_read only valid in meta_server mode")
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
-        remote_info = self._all_client_infos[target_client].get_tensor_desc_info(key)
-        local_info = self.local_client_info.get_tensor_desc_info(key)
+        remote_info = self._all_client_infos[target_client].get_tensor_info(key)
+        local_info = self.local_client_info.get_tensor_info(key)
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PULL_SIDE:
             pull_plan = plan.get_pull_plan(self.client_name, key)
@@ -607,8 +607,8 @@ class NIXLStorageClient:
             raise RuntimeError("client_write only valid in meta_server mode")
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
-        remote_info = self._all_client_infos[target_client].get_tensor_desc_info(key)
-        local_info = self.local_client_info.get_tensor_desc_info(key)
+        remote_info = self._all_client_infos[target_client].get_tensor_info(key)
+        local_info = self.local_client_info.get_tensor_info(key)
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PUSH_SIDE:
             push_plan = plan.get_push_plan(self.client_name, key)
@@ -707,7 +707,7 @@ class NIXLStorageClient:
                 time.sleep(0.05)
         elif self.mode == "meta_server":
             # Shard tag, wait for all shards
-            info = self.local_client_info.get_tensor_desc_info(key)
+            info = self.local_client_info.get_tensor_info(key)
             for shard_idx in info.sharding.shard_indices:
                 handle = self.xfer_handles.get(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
                 if handle is None:

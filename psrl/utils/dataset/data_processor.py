@@ -17,10 +17,12 @@ from verl.utils.import_utils import load_extern_type
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 
-from psrl.utils.logger import log_dual_events, EventType
+from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
+
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):
     """Create a dataset.
@@ -80,6 +82,8 @@ class DatasetType:
     test: str = "test"
 
 
+# NOTE(lhy): ray.remote must be declared here
+# otherwise their will be weird bugs (NCCL broadcast/all-gather hangs, randomly crashed) during vllm generation
 @ray.remote
 class DataProcessor:
     def __init__(
@@ -129,7 +133,11 @@ class DataProcessor:
         
         self._train_batch_idx = 0
         
+        # Build logger
+        self.log_prefix = f"DataProcessor"
+        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"DataProcessor initialized with process_mode={self.process_mode}, data_queue_size={self.data_queue_size}")
+        
         self._create_dataloader()
 
     def build_train_and_val_dataset(self) -> None:
@@ -385,7 +393,7 @@ class DataProcessor:
                     if self.use_rm:
                         pass
                     elif self.config.reward_model.launch_reward_fn_async:
-                        with log_dual_events("Launch async reward model score", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events("Launch async reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                             future_reward = compute_reward_async.remote(reward_input, self.config, self.tokenizer)
                             merge_request_data.union(reward_input)
                             if self.config.psrl.log_prob.enable_inference_engine_log_prob:
@@ -393,7 +401,7 @@ class DataProcessor:
                             else:
                                 merge_request_data.non_tensor_batch["future_reward"] = np.array([future_reward])
                     else:
-                        with log_dual_events("Compute reward model score", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events("Compute reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                             reward_tensor, reward_extra_infos_dict = compute_reward(reward_input, self.reward_fn)
                             merge_request_data.union(reward_input)
                             merge_request_data.batch["reward"] = reward_tensor
@@ -421,10 +429,10 @@ class DataProcessor:
                             else:
                                 unfinished_reward_buffer.append((request_data, future_reward))
                         future_reward_buffer = unfinished_reward_buffer
-                        with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events("Occupy requests", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                             ray.get(futures)
                     else:
-                        with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
+                        with log_dual_events("Occupy requests", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                             futures = []
                             # Occupy the request in the PS worker
                             futures.append(self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
@@ -453,7 +461,7 @@ class DataProcessor:
                     else:
                         sample_id = request_data.non_tensor_batch["uid"][0]
                     request_id = request_data.non_tensor_batch["uid"][0]
-                    with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
+                    with log_dual_events("Occupy requests", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                         futures = []
                         # Occupy the request in the PS worker
                         futures.append(self.ps_manager_handle.occupy_rollout_instance_request.remote(

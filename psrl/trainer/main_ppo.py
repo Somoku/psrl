@@ -43,6 +43,7 @@ def run_ppo(config) -> None:
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true", 
                     "NCCL_DEBUG": "WARN", 
+                    "VLLM_USE_V1": "1",
                     "VLLM_LOGGING_LEVEL": "WARN",
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851

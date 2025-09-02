@@ -74,7 +74,7 @@ class MetaServerActor:
 @ray.remote(num_cpus=1)
 class TrainClientActor:
     def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, ps_for_push_worker_handles):
-        os.environ["MASTER_ADDR"] = psrl_config.nixl.server_ip
+        os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -145,9 +145,11 @@ class TrainClientActor:
         return True
     
     def wait_push_done(self, ps_client_name):
+        futures = []
         for key in self.state_dict_keys:
             self.client.wait(key, b"train_push", "WRITE", target_client=ps_client_name)
-            self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key)
+            futures.append(self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key))
+        ray.get(futures[-1])
         return True
     
     def shutdown(self):
@@ -158,7 +160,7 @@ class TrainClientActor:
 class GenClientActor:
     def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
         from vllm import LLM
-        os.environ["MASTER_ADDR"] = psrl_config.nixl.server_ip
+        os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -170,10 +172,12 @@ class GenClientActor:
         torch.manual_seed(42)
         os.environ["LOCAL_RANK"] = str(0)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
+        assert world_size % 4 == 0, f"world_size {world_size} is not divisible by 4"
         llm = LLM(
             model=QWEN_MODEL_PATH,
             dtype="bfloat16",
-            tensor_parallel_size=world_size,
+            tensor_parallel_size=world_size // 2,
+            pipeline_parallel_size=world_size // 2,
             distributed_executor_backend="external_launcher",
             enforce_eager=True,
             disable_custom_all_reduce=True,
@@ -181,7 +185,9 @@ class GenClientActor:
             seed=42,
         )
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+        self.print(f"local rank {rank} model: {self.model}")
         self.rank = rank
+        self.tp_rank = rank % 2
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
@@ -200,7 +206,7 @@ class GenClientActor:
     def protocol(self):
         self.print("step0: convert_vllm_inplace")
         param_mapping = create_parameter_mapping(type(self.model), copy_to_local(QWEN_MODEL_PATH))
-        state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.rank)
+        state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.tp_rank)
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -211,6 +217,7 @@ class GenClientActor:
         self.client.send_local_sharding(sharding)
         self.print("step3: wait_for_server_sharding")
         self.unified_sharding = self.client.wait_for_server_sharding()
+        # self.print(f"unified_sharding: {self.unified_sharding}")
         self.print("step4: register_local_tensors")
         self.client.register_local_tensors(self.state_dict, self.unified_sharding)
         self.print("step5: send_local_info")
@@ -267,8 +274,8 @@ def test_nixl_e2e():
     backend = "nccl"
     torch_port_train = 29502
     torch_port_gen = 29503
-    num_train = 4
-    num_gen = 2
+    num_train = 8
+    num_gen = 4
     num_ps = 2
     
     psrl_config = OmegaConf.create({

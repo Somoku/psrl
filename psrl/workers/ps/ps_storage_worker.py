@@ -73,7 +73,7 @@ class PSStorageWorker:
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
-        psrl_logger.info(f"NIXL multi storage clients initialized on ports {self.nixl_multi_storage_clients.multi_clients[0].client_port} and {self.nixl_multi_storage_clients.multi_clients[1].client_port}.")
+        psrl_logger.info(f"NIXL multi storage clients initialized on port {self.nixl_multi_storage_clients.client_port}.")
         
     def _nixl_protocol_phase1(self):
         """Execute protocol phase 1: from step 0 to step 3 (before register_local_tensors)."""

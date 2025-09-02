@@ -97,6 +97,8 @@ class CommunicationPlanner:
                 pull_clients.append(client_name)
             elif client_info.type == NIXLClientType.PS_FOR_PULL:
                 ps_for_pull_clients.append(client_name)
+            else:
+                raise ValueError(f"Unknown client type: {client_info.type}")
         
         # Initialize communication plans
         push_to_ps_plan = {client: {} for client in push_clients}
@@ -246,7 +248,7 @@ class CommunicationPlanner:
                         break
                 
                 # Verify all shards are assigned
-                assert assigned_shards == needed_shards, f"Not all shards assigned for key {key} on PS client {target_client}, \
+                assert assigned_shards == needed_shards, f"Not all shards assigned for key {key} on target client {target_client}, \
                     needed_shards: {needed_shards}, assigned_shards: {assigned_shards}"
     
     def _get_link_type_for_test(self, client1: str, client2: str):

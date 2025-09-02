@@ -196,12 +196,12 @@ class PSRL_GenWorker(Worker):
         if self.config.rollout.mode == "sync":
             self.rollout.inference_engine.collective_rpc(
                 "nixl_protocol", 
-                args=(self.config, self.rank)
+                args=(self.config, self.get_instance_local_tp_rank())
             )
         elif self.config.rollout.mode == "psrl_async":
             await self.rollout.inference_engine.collective_rpc(
                 "nixl_protocol", 
-                args=(self.config, self.rank)
+                args=(self.config, self.get_instance_local_tp_rank())
             )
         else:
             raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
@@ -232,6 +232,17 @@ class PSRL_GenWorker(Worker):
         It is just the global rank in the current implementation (i.e., DP=1).
         """
         return self.rank
+    
+    def get_instance_local_tp_rank(self) -> int:
+        """
+        Get the local tp rank of the rollout instance.
+        """
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+        tp_rank = self.rank % self.config.rollout.get("tensor_model_parallel_size", 1)
+        if self.rollout:
+            vllm_tp_rank = get_tensor_model_parallel_rank()
+            assert tp_rank == vllm_tp_rank, "The tp rank of the rollout instance is not consistent with the vllm tp rank."
+        return tp_rank
     
     def get_instance_id(self) -> int:
         """
@@ -264,8 +275,8 @@ class PSRL_GenWorker(Worker):
             return val_tensor.item()
         
     def _build_rollout(self, trust_remote_code=False):
-        tp = self.config.rollout.tensor_model_parallel_size
-        pp = self.config.rollout.pipeline_model_parallel_size
+        tp = self.config.rollout.get("tensor_model_parallel_size", 1)
+        pp = self.config.rollout.get("pipeline_model_parallel_size", 1)
         assert self.world_size == tp * pp, "Only support dp=1 for now"
         self.rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(1, pp, tp), mesh_dim_names=["dp", "pp", "infer_tp"])
         rollout_name = self.config.rollout.name

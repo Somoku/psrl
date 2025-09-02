@@ -223,16 +223,18 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker):
         # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                psrl_logger.debug(f"Starting to wait for {len(wait_operations)} NIXL operations...")
+                psrl_logger.info(f"Starting to wait for {len(wait_operations)} NIXL operations...")
+                futures = []
                 for key, target_client_name in wait_operations:
                     self.nixl_storage_client.wait(key, b"train_push", "WRITE", target_client=target_client_name)
                     psrl_logger.debug(f"Wait completed for key {key} to target {target_client_name}")
                     ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
-                    ps_worker_handle.transfer_train_to_gen.remote(key)
+                    futures.append(ps_worker_handle.transfer_train_to_gen.remote(key))
                     psrl_logger.debug(f"Transfer {key} from train to gen in target {target_client_name}")
-                psrl_logger.debug("All NIXL wait operations completed successfully.")
+                ray.get(futures)
                 ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
                 self.nixl_wait_completed.set()
+                psrl_logger.info(f"All NIXL wait operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
             except Exception as e:
                 psrl_logger.error(f"Error in NIXL wait thread: {e}")
                 # Don't set the event on error, so wait_for_nixl_push_completion can detect failure

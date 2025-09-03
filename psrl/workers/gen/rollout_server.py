@@ -52,6 +52,24 @@ class RolloutServer:
 
         self._command_results = {}
         self._command_counter = 0
+        
+    def init_nixl_client(self):
+        futures = []
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            if self.rank_0_is_model_owner:
+                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_nixl_client"))
+            else:
+                futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
+        ray.get(futures)
+        
+    def nixl_protocol(self):
+        futures = []
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            if self.rank_0_is_model_owner:
+                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("nixl_protocol"))
+            else:
+                futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
+        ray.get(futures)
     
     def start_server(self):
         if self._running:

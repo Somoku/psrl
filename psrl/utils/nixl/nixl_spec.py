@@ -458,8 +458,8 @@ class NIXLClientType(Enum):
 class NIXLClientInfo:
     """Client information for communication planning"""
     name: str
-    ip: str
-    gpu_id: int
+    node_ip: str    
+    node_gpu_id: int
     type: NIXLClientType
     tensor_infos: Dict[str, NIXLTensorInfo]  # key -> TensorDescInfo
     meta: bytes  # agent metadata
@@ -480,6 +480,6 @@ class NIXLClientInfo:
 
 @dataclass
 class NIXLInterface:
-    port_scanner: Optional[ray.ObjectRef] = None
+    port_scanner: Optional[ray.actor.ActorHandle] = None
     # comm_planner: Optional[Any] = None # CommunicationPlanner instance, but import CommunicationPlanner here will cause circular import
 

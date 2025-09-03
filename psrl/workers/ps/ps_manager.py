@@ -410,7 +410,7 @@ class PSManager:
         self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
         self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
 
-    def get_ps_worker_handle(self, client_name: str) -> ray.ObjectRef:
+    def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:
         """Get the PS worker handle by the client name."""
         assert self.ps_worker_group is not None, "The PS worker group must be initialized before calling get_ps_worker_handle."
         worker = self.ps_worker_group.distinguish_worker_by_method(

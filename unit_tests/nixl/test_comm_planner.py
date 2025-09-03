@@ -70,8 +70,8 @@ def test_communication_planner():
     # Client A: Same node as PS, same GPU (LOCAL)
     clients["push_A"] = NIXLClientInfo(
         name="push_A",
-        ip="192.168.1.1",
-        gpu_id=0,
+        node_ip="192.168.1.1",
+        node_gpu_id=0,
         type=NIXLClientType.PUSH_SIDE,
         tensor_infos={"weight": create_test_tensor_desc_info_1()},
         meta=b"push_meta_A"
@@ -80,8 +80,8 @@ def test_communication_planner():
     # Client B: Same node as PS, different GPU (NVLINK)
     clients["push_B"] = NIXLClientInfo(
         name="push_B",
-        ip="192.168.1.1",
-        gpu_id=1,
+        node_ip="192.168.1.1",
+        node_gpu_id=1,
         type=NIXLClientType.PUSH_SIDE,
         tensor_infos={"weight": create_test_tensor_desc_info_2()},
         meta=b"push_meta_B"
@@ -90,8 +90,8 @@ def test_communication_planner():
     # Client C: Same node as PS, CPU (PCIE)
     clients["push_C"] = NIXLClientInfo(
         name="push_C",
-        ip="192.168.1.1",
-        gpu_id=-1,
+        node_ip="192.168.1.1",
+        node_gpu_id=-1,
         type=NIXLClientType.PUSH_SIDE,
         tensor_infos={"weight": create_test_tensor_desc_info_1()},
         meta=b"push_meta_C"
@@ -100,8 +100,8 @@ def test_communication_planner():
     # Client D: Different node (IB)
     clients["push_D"] = NIXLClientInfo(
         name="push_D",
-        ip="192.168.1.2",
-        gpu_id=0,
+        node_ip="192.168.1.2",
+        node_gpu_id=0,
         type=NIXLClientType.PUSH_SIDE,
         tensor_infos={"weight": create_test_tensor_desc_info_3()},
         meta=b"push_meta_D"
@@ -110,8 +110,8 @@ def test_communication_planner():
     # PS clients
     clients["ps_1"] = NIXLClientInfo(
         name="ps_1",
-        ip="192.168.1.1",
-        gpu_id=0,
+        node_ip="192.168.1.1",
+        node_gpu_id=0,
         type=NIXLClientType.PS,
         tensor_infos={"weight": create_test_tensor_desc_info_3()},
         meta=b"ps_meta_1"
@@ -120,8 +120,8 @@ def test_communication_planner():
     # PULL_SIDE clients
     clients["pull_1"] = NIXLClientInfo(
         name="pull_1",
-        ip="192.168.1.3",
-        gpu_id=0,
+        node_ip="192.168.1.3",
+        node_gpu_id=0,
         type=NIXLClientType.PULL_SIDE,
         tensor_infos={"weight": create_test_tensor_desc_info_1()},
         meta=b"pull_meta_1"

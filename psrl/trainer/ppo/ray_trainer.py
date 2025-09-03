@@ -328,7 +328,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             data_queue,
             rollout_queue,
         )
-        ray.get(self.rollout_server.start_server.remote())
 
     # We use the training side to do val so that val and generation can overlap
     def _validate(self):
@@ -671,6 +670,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         psrl_logger.info("All workers' models initialized successfully!")
         
+        # start data processor
+        psrl_logger.info("Starting data processor...")
+        self.start_data_processor()
+        data_queue = ray.get(self.data_processor.get_data_queue.remote())
+        rollout_queue = ray.get(self.data_processor.get_rollout_queue.remote())
+        psrl_logger.info("Data processor started successfully.")
+        
+        # start rollout server
+        psrl_logger.info("Starting rollout server...")
+        self.start_rollout_server(data_queue, rollout_queue)
+        psrl_logger.info("Rollout server started successfully.")
+        
         # initialize NIXL
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             with log_dual_events(f"Initializing NIXL clients", psrl_logger, event_type=EventType.INIT):
@@ -681,8 +692,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
                 futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
                 futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
-                for i in range(self.config.psrl.deployment.n_rollout_instances):
-                    futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
+                futures.append(self.rollout_server.init_nixl_client.remote())
                 ray.get(futures)
             
             with log_dual_events(f"Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
@@ -690,8 +700,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 futures.append(self.ps_manager_handle.nixl_protocol.remote())
                 futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
                 futures.extend(self.actor_wg.execute_all_async("nixl_protocol"))
-                for i in range(self.config.psrl.deployment.n_rollout_instances):
-                    futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
+                futures.append(self.rollout_server.nixl_protocol.remote())
                 ray.get(futures)
             
             psrl_logger.info("Binding PS worker group")
@@ -829,12 +838,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if self.config.trainer.get("val_only", False):
                 return
 
-        psrl_logger.info("Starting data processor...")
-        self.start_data_processor()
-        data_queue = ray.get(self.data_processor.get_data_queue.remote())
-        rollout_queue = ray.get(self.data_processor.get_rollout_queue.remote())
-        psrl_logger.info("Data processor started successfully.")
-
         # add tqdm
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -843,9 +846,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         last_val_metrics = None
 
         # rollout instances keep generating sequences in their busy loop
-        psrl_logger.info("Starting rollout server...")
-        self.start_rollout_server(data_queue, rollout_queue)
-        psrl_logger.info("Rollout server started successfully.")
+        ray.get(self.rollout_server.start_server.remote())
         
         # busy loop for training
         while True:

@@ -173,12 +173,12 @@ class PSRL_GenWorker(Worker):
             if self.config.rollout.mode == "sync":
                 self.rollout.inference_engine.collective_rpc(
                     "init_nixl_client", 
-                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id(), self.get_instance_local_rank()),
+                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id()),
                 )
             elif self.config.rollout.mode == "psrl_async":
                 await self.rollout.inference_engine.collective_rpc(
                     "init_nixl_client", 
-                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id(), self.get_instance_local_rank()),
+                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id()),
                 )
             else:
                 raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
@@ -196,12 +196,12 @@ class PSRL_GenWorker(Worker):
         if self.config.rollout.mode == "sync":
             self.rollout.inference_engine.collective_rpc(
                 "nixl_protocol", 
-                args=(self.config, self.get_instance_local_tp_rank())
+                args=(self.config,),
             )
         elif self.config.rollout.mode == "psrl_async":
             await self.rollout.inference_engine.collective_rpc(
                 "nixl_protocol", 
-                args=(self.config, self.get_instance_local_tp_rank())
+                args=(self.config,),
             )
         else:
             raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
@@ -237,9 +237,9 @@ class PSRL_GenWorker(Worker):
         """
         Get the local tp rank of the rollout instance.
         """
-        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         tp_rank = self.rank % self.config.rollout.get("tensor_model_parallel_size", 1)
-        if self.rollout:
+        if self.config.rollout.mode == "sync" and self.rollout:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
             vllm_tp_rank = get_tensor_model_parallel_rank()
             assert tp_rank == vllm_tp_rank, "The tp rank of the rollout instance is not consistent with the vllm tp rank."
         return tp_rank

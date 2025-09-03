@@ -76,7 +76,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker):
         self.unified_sharding_dict = None
         self._cached_ps_nixl_agent_names = None
         self._cached_ps_nixl_train_storage_client_names = None
-        self._cached_ps_worker_handles: Dict[str, ray.ObjectRef] = {}
+        self._cached_ps_worker_handles: Dict[str, ray.actor.ActorHandle] = {}
         # NIXL wait threads
         self.nixl_wait_thread = None  # Single thread for all wait operations
         self.nixl_wait_thread_lock = threading.Lock()

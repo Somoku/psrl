@@ -53,7 +53,8 @@ class NIXLStorageClient:
         self.server_name = server_name
         if use_gpu:
             assert torch.cuda.is_available(), "CUDA is not available."
-        self.device = torch.device("cuda:0" if use_gpu else "cpu")
+        # self.device = torch.device("cuda:0" if use_gpu else "cpu")
+        self.device = torch.device(f"cuda:{torch.cuda.current_device()}" if use_gpu else "cpu")
         self.client_type = client_type
         self.mode = nixl_config.server_mode  # "storage_server" or "meta_server"
         self.server_ip = nixl_config.server_ip
@@ -313,8 +314,8 @@ class NIXLStorageClient:
         # Create the client info
         self.local_client_info = NIXLClientInfo(
             name=self.client_name,
-            ip=get_local_ip(),
-            gpu_id=get_local_gpu_id(),
+            node_ip=get_local_ip(),
+            node_gpu_id=get_local_gpu_id(),
             type=self.client_type,
             tensor_infos=tensor_infos,
             meta=self.agent.get_agent_metadata()

@@ -7,7 +7,7 @@ PUSH_SIDE to PS and PULL_SIDE from PS communication plans.
 """
 
 import pickle
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
 
@@ -21,11 +21,11 @@ class NIXLCommPlan:
     
     # PUSH_SIDE -> PS write plan
     # {push_client: {key: {ps_client: [shard_indices]}}}
-    push_to_ps_plan: Dict[str, Dict[str, Dict[str, List[int]]]]
+    push_to_ps_plan: Dict[str, Dict[str, Dict[str, List[Tuple[int, ...]]]]]
     
     # PULL_SIDE <- PS read plan
     # {pull_client: {key: {ps_client: [shard_indices]}}}
-    pull_from_ps_plan: Dict[str, Dict[str, Dict[str, List[int]]]]
+    pull_from_ps_plan: Dict[str, Dict[str, Dict[str, List[Tuple[int, ...]]]]]
     
     def serialize(self):
         """Serialize communication plan"""
@@ -36,15 +36,15 @@ class NIXLCommPlan:
         """Deserialize communication plan"""
         return pickle.loads(data)
     
-    def get_push_plan(self, push_client: str, key: str) -> Dict[str, List[int]]:
+    def get_push_plan(self, push_client: str, key: str) -> Dict[str, List[Tuple[int, ...]]]:
         """Get write plan for specific PUSH_SIDE client and key"""
         return self.push_to_ps_plan.get(push_client, {}).get(key, {})
     
-    def get_pull_plan(self, pull_client: str, key: str) -> Dict[str, List[int]]:
+    def get_pull_plan(self, pull_client: str, key: str) -> Dict[str, List[Tuple[int, ...]]]:
         """Get read plan for specific PULL_SIDE client and key"""
         return self.pull_from_ps_plan.get(pull_client, {}).get(key, {})
     
-    def get_ps_write_plan(self, ps_client: str, key: str) -> Dict[str, List[int]]:
+    def get_ps_write_plan(self, ps_client: str, key: str) -> Dict[str, List[Tuple[int, ...]]]:
         """Get write plan for specific PS client and key (receiving from PUSH_SIDE)"""
         result = {}
         for push_client, key_plans in self.push_to_ps_plan.items():
@@ -52,7 +52,7 @@ class NIXLCommPlan:
                 result[push_client] = key_plans[key][ps_client]
         return result
     
-    def get_ps_read_plan(self, ps_client: str, key: str) -> Dict[str, List[int]]:
+    def get_ps_read_plan(self, ps_client: str, key: str) -> Dict[str, List[Tuple[int, ...]]]:
         """Get read plan for specific PS client and key (sending to PULL_SIDE)"""
         result = {}
         for pull_client, key_plans in self.pull_from_ps_plan.items():
@@ -80,7 +80,7 @@ class CommunicationPlanner:
         """
         # Register all clients to network topology
         for client_name, client_info in clients.items():
-            GLOBAL_TOPOLOGY.register_client(client_name, client_info.ip, client_info.gpu_id)
+            GLOBAL_TOPOLOGY.register_client(client_name, client_info.node_ip, client_info.node_gpu_id)
         
         # Classify clients
         push_clients = []
@@ -122,7 +122,7 @@ class CommunicationPlanner:
         clients: Dict[str, NIXLClientInfo], 
         push_clients: List[str], 
         ps_for_push_clients: List[str],
-        push_to_ps_plan: Dict[str, Dict[str, Dict[str, List[int]]]],
+        push_to_ps_plan: Dict[str, Dict[str, Dict[str, List[Tuple[int, ...]]]]],
     ):
         """Generate PUSH_SIDE to PS write plan with load balancing"""
         self._make_comm_plan_generic(
@@ -138,7 +138,7 @@ class CommunicationPlanner:
         clients: Dict[str, NIXLClientInfo],
         pull_clients: List[str], 
         ps_for_pull_clients: List[str],
-        pull_from_ps_plan: Dict[str, Dict[str, Dict[str, List[int]]]]
+        pull_from_ps_plan: Dict[str, Dict[str, Dict[str, List[Tuple[int, ...]]]]]
     ):
         """Generate PULL_SIDE from PS read plan with load balancing"""
         self._make_comm_plan_generic(
@@ -154,7 +154,7 @@ class CommunicationPlanner:
         clients: Dict[str, NIXLClientInfo],
         source_clients: List[str],
         target_clients: List[str],
-        comm_plan: Dict[str, Dict[str, Dict[str, List[int]]]],
+        comm_plan: Dict[str, Dict[str, Dict[str, List[Tuple[int, ...]]]]],
         is_push_to_ps: bool
     ):
         """

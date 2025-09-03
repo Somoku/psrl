@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List
+from typing import List, Union
 from omegaconf import DictConfig
 
 import vllm
@@ -70,13 +70,28 @@ class vLLMWorkerExtension:
     
     # ----------------------------- NIXL Related -----------------------------
     # Because the model is on another process since vllm V1, we must call the nixl methods via rpc
-    def init_nixl_client(self, nixl_config: DictConfig, nixl_interface: NIXLInterface, instance_id: int, instance_local_rank: int):
+    def get_instance_local_rank(self):
+        from vllm.distributed.parallel_state import get_world_group
+        return get_world_group().rank
+        
+    def get_instance_local_tp_rank(self):
+        from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+        return get_tensor_model_parallel_rank()
+    
+    def init_nixl_client(self, nixl_config: DictConfig, nixl_interface_after_rpc: Union[dict, NIXLInterface], instance_id: int):
+        # Reconstruct the nixl_interface (the RPC call serializes the nixl_interface to a dict)
+        if isinstance(nixl_interface_after_rpc, dict):
+            nixl_interface = NIXLInterface(
+                port_scanner=nixl_interface_after_rpc['port_scanner']
+            )
+        else:
+            nixl_interface = nixl_interface_after_rpc
         # NIXL attributes
         self.unified_state_dict = None
         self.unified_sharding_dict = None
         # Initialize the NIXL client
         self.nixl_storage_client = NIXLStorageClient(
-            client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{instance_local_rank}",
+            client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{self.get_instance_local_rank()}",
             server_name=GLOBAL_META_SERVER_NAME,
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
@@ -85,12 +100,12 @@ class vLLMWorkerExtension:
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
     
-    def nixl_protocol(self, config: DictConfig, tp_rank: int):
+    def nixl_protocol(self, config: DictConfig):
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info(f"nixl client protocol step 0: convert_vllm_inplace")
         vllm_model = self.model_runner.model
         param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
-        unified_state_dict, local_sharding_dict = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=tp_rank)
+        unified_state_dict, local_sharding_dict = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank())
         psrl_logger.info(f"nixl client protocol step 1: connect_to_server")
         self.nixl_storage_client.connect_to_server()
         psrl_logger.info(f"nixl client protocol step 2: send_local_sharding")

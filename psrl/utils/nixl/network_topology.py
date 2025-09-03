@@ -1,5 +1,6 @@
 import os
 import socket
+import torch
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
@@ -7,7 +8,7 @@ from enum import Enum
 
 def get_local_ip() -> str:
     """
-    Get the local IP address of the machine.
+    Get the local IP address of the node.
     """
     if os.environ.get("LOCAL_NODE_IP") is not None:
         return os.environ.get("LOCAL_NODE_IP")
@@ -17,15 +18,15 @@ def get_local_ip() -> str:
     
 def get_local_gpu_id() -> int:
     """
-    Get the local GPU ID of the machine.
+    Get the current GPU ID of the node.
     """
     if os.environ.get("CUDA_VISIBLE_DEVICES", None) is not None:
         gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES").split(",")
-        assert len(gpu_ids) == 1, "Only one GPU is supported for a single worker"
         if gpu_ids[0] == "":
             return -1
-        else:
-            return int(gpu_ids[0])
+        local_gpu_id = torch.cuda.current_device()
+        assert len(gpu_ids) > local_gpu_id, f"GPU ID is out of range, current local GPU ID is {local_gpu_id}, but only {gpu_ids} GPUs are available"
+        return int(gpu_ids[local_gpu_id])
     else: 
         return -1
 
@@ -52,7 +53,7 @@ class NetworkTopology:
     
     def __init__(self):
         self._links: Dict[Tuple[str, str], NetworkLink] = {}
-        self._client_positions: Dict[str, Tuple[str, int]] = {}  # client_name -> (node_ip, gpu_id)
+        self._client_positions: Dict[str, Tuple[str, int]] = {}  # client_name -> (node_ip, node_gpu_id)
         self._init_default_topology()
     
     def _init_default_topology(self):
@@ -67,9 +68,9 @@ class NetworkTopology:
             LinkType.LOCAL: NetworkLink(LinkType.LOCAL, 1000.0, 0.1),   # Local memory copy
         }
     
-    def register_client(self, client_name: str, node_ip: str, gpu_id: int):
+    def register_client(self, client_name: str, node_ip: str, node_gpu_id: int):
         """Register client and its node location"""
-        self._client_positions[client_name] = (node_ip, gpu_id)
+        self._client_positions[client_name] = (node_ip, node_gpu_id)
     
     def get_link(self, client1: str, client2: str) -> NetworkLink:
         """Get network connection information between two clients"""

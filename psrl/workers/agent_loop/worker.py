@@ -244,7 +244,7 @@ class PSRL_AgentLoopWorker:
         # prompts
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
-            [{"input_ids": input.batch["input_ids"]} for input in inputs],
+            [{"input_ids": _input.batch["input_ids"]} for _input in inputs],
             padding="max_length",
             max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
             return_tensors="pt",

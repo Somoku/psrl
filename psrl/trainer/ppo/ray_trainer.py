@@ -1431,6 +1431,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 break
 
         # Stop all components
+        psrl_logger.info("Stopping all data pipeline components...")
         self.stop_reward_server()
         self.stop_agent_loop_manager()
         self.stop_rollout_coordinator()

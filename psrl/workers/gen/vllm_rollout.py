@@ -589,18 +589,15 @@ class PSRL_vLLMRollout(BaseRollout):
         with self.update_sampling_params(**kwargs):
             tasks = []
             for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(zip(vllm_inputs, sample_ids, curr_response_unpadded_len)):
-                partial_kwargs = dict(
-                    max_tokens=self.config.response_length - curr_response_len,
-                )
-                with self.update_sampling_params(**partial_kwargs):
-                    tasks.append(
-                        self.generate_sequence_task(
-                            prompt_idx,
-                            vllm_input,
-                            self.sampling_params,
-                            str(sample_id),
-                        )
+                tasks.append(
+                    self.generate_sequence_task(
+                        prompt_idx,
+                        vllm_input,
+                        sampling_params=self.sampling_params,
+                        uid=str(sample_id),
+                        max_tokens=self.config.response_length - curr_response_len,
                     )
+                )
         
             completed_rollout = []
             for completed_task in asyncio.as_completed(tasks):
@@ -613,6 +610,9 @@ class PSRL_vLLMRollout(BaseRollout):
     @torch.no_grad()
     def raw_generate_sequences(self, prompts: DataProto, **kwargs):
         """Generate sequences from the prompts using vLLM without post-processing."""
+        assert "response_unpadded_len" not in prompts.non_tensor_batch, \
+            "partial rollout is currently not supported in sync mode"
+
         vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -638,18 +638,15 @@ class PSRL_vLLMRollout(BaseRollout):
         with self.update_sampling_params(**kwargs):
             tasks = []
             for prompt_idx, (vllm_input, sample_id, curr_response_len) in enumerate(zip(vllm_inputs, sample_ids, curr_response_unpadded_len)):
-                partial_kwargs = dict(
-                    max_tokens=self.config.response_length - curr_response_len,
-                )
-                with self.update_sampling_params(**partial_kwargs):
-                    tasks.append(
-                        self.generate_sequence_task(
-                            prompt_idx,
-                            vllm_input,
-                            self.sampling_params,
-                            str(sample_id),
-                        )
+                tasks.append(
+                    self.generate_sequence_task(
+                        prompt_idx,
+                        vllm_input,
+                        sampling_params=self.sampling_params,
+                        uid=str(sample_id),
+                        max_tokens=self.config.response_length - curr_response_len,
                     )
+                )
         
             vllm_outputs = []
             for completed_task in asyncio.as_completed(tasks):
@@ -662,8 +659,9 @@ class PSRL_vLLMRollout(BaseRollout):
         self,
         idx: int,
         prompt_tokens: Union[Dict[str, Any], List[int]],
-        sampling_params: SamplingParams = None,
-        uid: Optional[str] = None
+        sampling_params: Optional[SamplingParams] = None,
+        uid: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> Tuple[int, RequestOutput]:
         """
         Generate a single sequence asynchronously using vLLM.
@@ -684,6 +682,8 @@ class PSRL_vLLMRollout(BaseRollout):
             sampling_params = self.sampling_params
         if isinstance(prompt_tokens, list):
             prompt_tokens = {'prompt_token_ids': prompt_tokens}
+        if max_tokens is not None:
+            setattr(sampling_params, "max_tokens", int(max_tokens))
 
         task = self.inference_engine.generate(
             prompt=TokensPrompt(**prompt_tokens),

@@ -261,7 +261,11 @@ class PSManager(RequestStatusTracker):
         
             # Notify the request status manager to abort requests
             # whose version_tag is equal to `min_ready_buffer_id - S`
-            if max_ready_buffer_id >= self.psrl_config.staleness:
+            # TODO(linsh): optimize the abort logic to avoid frequent aborts
+            if (
+                self.psrl_config.redundant_rollout.enable and
+                max_ready_buffer_id >= self.psrl_config.staleness
+            ):
                 # Abort requests with version_tag equal to `min_ready_buffer_id - S`
                 version_to_abort = max_ready_buffer_id - self.psrl_config.staleness
                 psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")

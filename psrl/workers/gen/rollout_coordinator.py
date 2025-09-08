@@ -143,7 +143,8 @@ class RolloutCoordinator(CommandExtension):
         self.background_running = False
         
         for thread in self._threads:
-            thread.join()
+            # NOTE(linsh): engine status sync thread maybe stuck in ray.get()
+            thread.join(timeout=60)
         
         self._threads.clear()
     
@@ -385,7 +386,7 @@ class RolloutCoordinator(CommandExtension):
                     
                     # Pull model
                     if self.rank_0_is_model_owner:
-                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model")
+                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model_async")
                     else:
                         future = self.rollout_wg_list[instance_id].execute_all_async("pull_model")
                     ray.get(future)

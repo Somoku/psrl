@@ -15,13 +15,10 @@ GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 TRAIN_TP=1 # TP in the training side for validation
 
-NNODES=3
+NNODES=2
 NGPUS_PER_NODE=8
 
-PS_NNODES=1
-PS_NGPUS_PER_NODE=${NGPUS_PER_NODE} 
-
-GEN_NNODES=$(( ${NNODES} - ${PS_NNODES} )) # Number of nodes for generation
+GEN_NNODES=${NNODES}  # Number of nodes for generation
 GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance]
@@ -35,10 +32,9 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-# bash $HOME/kill.sh 3
-
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
-    psrl.staleness=0 \
+    psrl.ps_manager_ip=${LOCAL_IP} \
+    psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=stream \
     psrl.ps_mode=cpu_ref \
@@ -50,13 +46,13 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.deployment.ps_nnodes=${PS_NNODES} \
-    psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
+    psrl.nixl.server_mode=meta_server \
+    psrl.nixl.server_port=23456 \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.enable=False \
     psrl.partial_rollout.threshold=96 \
     psrl.partial_rollout.interrupt_as_prompt=False \
-    psrl.redundant_rollout.enable=True \
+    psrl.redundant_rollout.enable=False \
     psrl.redundant_rollout.redundant_global_batch_size=${REDUNDANT_BATCH_SIZE} \
     psrl.redundant_rollout.redundant_rollout_n=1 \
     \
@@ -64,21 +60,21 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.load_format=dummy_dtensor \
     gen_actor_rollout_ref.rollout.max_inflight_requests=32 \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
-    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.n=1 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
-    gen_actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
+    gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
+    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.rollout.n=1 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    train_actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
+    train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -99,8 +95,8 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
     data.train_batch_size=${GLOBAL_BATCH_SIZE} \
-    data.max_prompt_length=1024 \
-    data.max_response_length=512 \
+    data.max_prompt_length=128 \
+    data.max_response_length=128 \
     data.filter_overlong_prompts=True \
     data.truncation='error' \
     trainer.critic_warmup=0 \

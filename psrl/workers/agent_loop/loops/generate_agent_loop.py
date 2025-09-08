@@ -32,8 +32,9 @@ class GenerateAgentLoop(AgentLoopBase):
         Returns:
             DataProto: Generated response with metadata.
         """
-        with simple_timer("generate_sequences"):
-            output = await self.rollout_router.generate_async(request)
+        # TODO(linsh): add profiling
+        # with simple_timer("generate_sequences"):
+        output = await self.rollout_router.generate_async(request)
         if output is not None:
             response_ids = output.non_tensor_batch["raw_response_ids"][0]
             response_mask = [1] * len(response_ids)

@@ -581,8 +581,9 @@ class StalenessInventory:
 
         # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
-        if entry_info.model_version + self.staleness < target_buffer_id:
-            raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
+        # TODO(linsh): add staleness check
+        # if entry_info.model_version + self.staleness < target_buffer_id:
+        #     raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
 
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()

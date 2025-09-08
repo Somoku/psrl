@@ -15,8 +15,6 @@ psrl:
     rollout_ngpus_per_node_per_instance: 1
     train_nnodes: 1
     train_ngpus_per_node: 1
-    ps_nnodes: 1
-    ps_ngpus_per_node: 1
     heterogeneous_rollout:
       enable: False # Whether to enable heterogeneous strategies for different rollout instances.
       n_rollout_instances: ${psrl.deployment.n_rollout_instances}

@@ -32,8 +32,9 @@ class BatchGenerateAgentLoop(AgentLoopBase):
         Returns:
             DataProto: Generated responses with metadata.
         """
-        with simple_timer("generate_sequences"):
-            output = self.rollout_router.generate(request)
+        # TODO(linsh): add profiling
+        # with simple_timer("generate_sequences"):
+        output = self.rollout_router.generate(request)
         if output is not None:
             batch_size = len(output)
             response_mask_list = []

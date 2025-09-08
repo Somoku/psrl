@@ -15,19 +15,27 @@ from verl.utils.megatron_utils import (
 )
 from verl.workers.megatron_workers import ActorRolloutRefWorker
 
-from psrl.workers.train import TrainInterface
+from psrl.workers.train import TrainInterface, PSRL_BaseTrainWorker
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
+from psrl.utils.nixl import NIXLInterface
 
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
-class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
-    def __init__(self, config: DictConfig, role: str, psrl_config: DictConfig, train_interface: TrainInterface) -> None:
-        super().__init__(config, role)
-        self.psrl_config = psrl_config
-        self.train_interface = train_interface
+class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
+    def __init__(
+        self, 
+        config: DictConfig, 
+        role: str, 
+        psrl_config: DictConfig, 
+        train_interface: TrainInterface,
+        nixl_interface: NIXLInterface
+    ) -> None:
+        ActorRolloutRefWorker.__init__(self, config, role)
+        PSRL_BaseTrainWorker.__init__(self, psrl_config, train_interface, nixl_interface)
+        
         self.layer_name_mapping = {
             "qkv_layer_name": "self_attention.linear_qkv.",
             "gate_proj_layer_name": "linear_fc1.",
@@ -36,7 +44,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
         
         # Build logger
         self.log_prefix = f"TrainWorker_R{self.rank}"
-        psrl_logger.addHandler(DualOutputHandler(self.log_prefix))
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         
     @property   
@@ -88,21 +96,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
         else:
             assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
     
-    def push_model(self):
-        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            self.ray_push_model()
-        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            self.nixl_push_model()
-            # TODO(lhy): wait for the push to complete before the next iteration optimizer update
-            # This will enable the NIXL push to be overlapped with the next iteration training
-            self.wait_for_nixl_push_completion()
-        else:
-            raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-    
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
-            super().init_model()
+            ActorRolloutRefWorker.init_model(self)
     
     # The log_prob in training side is only used when there is a proxy policy    
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
@@ -137,8 +134,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
-            output = super().update_actor(data)
+            output = ActorRolloutRefWorker.update_actor(self, data)
         with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-            self.push_model()
+            PSRL_BaseTrainWorker.push_model(self)
         return output
         

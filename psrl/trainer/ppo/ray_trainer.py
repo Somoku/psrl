@@ -97,7 +97,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = PSRL_Role.RefPolicy in role_worker_mapping
         self.use_rm = PSRL_Role.RewardModel in role_worker_mapping
-        self.ray_worker_group_cls = ray_worker_group_cls
+        self.ray_worker_group_cls = ray_worker_group_cls # NOTE(lhy): ray_worker_group_cls is used only in train side
         self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
         
@@ -547,6 +547,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # NOTE(lhy): in newest verl, we can use `create_colocated_worker_cls_fused` to create a fused worker group and low-level APIs can also be used
             if len(class_dict) == 1:
                 role = next(iter(class_dict.keys()))
+                if "rollout" in role:
+                    return {role: RayWorkerGroup(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=class_dict[role],
+                        **wg_kwargs
+                    )}
                 return {role: self.ray_worker_group_cls(
                     resource_pool=resource_pool,
                     ray_cls_with_init=class_dict[role],

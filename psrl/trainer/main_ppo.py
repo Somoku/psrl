@@ -97,12 +97,13 @@ class TaskRunner:
             ray_worker_group_cls = RayWorkerGroup
         elif config.train_actor_rollout_ref.actor.strategy == "megatron":
             assert config.train_actor_rollout_ref.actor.strategy == config.critic.strategy
-            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+            # from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+            from psrl.workers.train.refactored_megatron_worker_group import RefactoredNVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.megatron_train_worker import PSRL_MegatronTrainWorker as PSRL_TrainWorker
             from psrl.workers.gen.gen_worker import PSRL_GenWorker
 
-            ray_worker_group_cls = NVMegatronRayWorkerGroup
+            ray_worker_group_cls = RefactoredNVMegatronRayWorkerGroup
         else:
             raise NotImplementedError(f"Unsupported strategy: {config.train_actor_rollout_ref.actor.strategy}. "
                                         "Currently only 'fsdp', 'fsdp2', and 'megatron' are supported.")

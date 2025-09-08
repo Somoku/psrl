@@ -7,7 +7,7 @@ MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=16
 GEN_TP_SIZES=(2 1 1 2)
 GEN_PP_SIZES=(1 2 2 1)
-TRAIN_TP=2 # TP in the training side for validation
+VAL_TP=2 # TP in the training side for validation
 
 NNODES=2
 NGPUS_PER_NODE=8
@@ -73,7 +73,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.n=1 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \

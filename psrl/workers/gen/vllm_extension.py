@@ -43,6 +43,7 @@ class vLLMWorkerExtension:
                     yield (name, tensor)
             
             rebuild_weights = rebuild_weights_generator()
+            torch.cuda.synchronize()
             loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
             if blocking:
                 # Ensure all operations are completed before returning
@@ -128,6 +129,7 @@ class vLLMWorkerExtension:
         self.unified_sharding_dict = unified_sharding_dict
 
     def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
+        torch.cuda.synchronize()
         wait_operations = []
         for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
             for key in self.unified_state_dict:

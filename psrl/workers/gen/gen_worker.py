@@ -108,7 +108,7 @@ class PSRL_GenWorker(Worker):
         # Rollout
         self._rollout_running = False
         self._generate_thread = None
-        self.request_queue = queue.Queue()
+        self.request_queue = queue.Queue() # It is thread-safe
         self.active_tasks = set()
         self.version_to_active_tasks: dict[int, set[asyncio.Task]] = {}
 
@@ -140,12 +140,11 @@ class PSRL_GenWorker(Worker):
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         if self.psrl_config.gen_mode == "batch":
-            self.request_num_queue = queue.Queue()
+            self.request_num_queue = queue.Queue() # It is thread-safe
         else:
             assert self.config.rollout.mode == "psrl_async", \
                 "Only support psrl_async mode for stream generation, please set rollout.mode to psrl_async in the config."
 
-        self._request_queue_lock = threading.Lock()
         self._async_interrupt_event = asyncio.Event()
         self._async_resume_event = asyncio.Event()
         self._generate_loop = None
@@ -340,6 +339,7 @@ class PSRL_GenWorker(Worker):
                 # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
                 object_ref = ray.get(ps_manager_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
                 model_state_dict_cpu = ray.get(object_ref)  # This blocks until the state dict is available in the object store
+            torch.cuda.synchronize()
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
             model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))
@@ -628,8 +628,7 @@ class PSRL_GenWorker(Worker):
                 if len(self.active_tasks) < max_inflight_requests:
                     request_data = None
                     try:
-                        with self._request_queue_lock:
-                            request_data = self.request_queue.get(block=False)
+                        request_data = self.request_queue.get(block=False)
                         if request_data is None:
                             psrl_logger.info(f"[TRACE] Rank {self.rank}: Received end signal")
                             stop_add_request = True
@@ -760,18 +759,15 @@ class PSRL_GenWorker(Worker):
                     if request_num == 0:
                         psrl_logger.info("Received request_num 0, skipping generation.")
                         continue
-
                     assert request_num > 0, f"Received invalid request_num: {request_num}, should be greater than 0."
-                    
                     requests = []
-                    with self._request_queue_lock:
-                        for _ in range(request_num):
-                            # Get the next request from the request queue
-                            try:
-                                request = self.request_queue.get_nowait()
-                            except queue.Empty:
-                                raise ValueError("Request queue is empty, cannot get next request.")
-                            requests.append(request)
+                    for _ in range(request_num):
+                        # Get the next request from the request queue
+                        try:
+                            request = self.request_queue.get(timeout=30)
+                        except queue.Empty:
+                            raise ValueError("Request queue is empty after 30 seconds, cannot get next request.")
+                        requests.append(request)
                     batch_data = DataProto.concat(requests)
                     psrl_logger.info(f"Begin round {round} batch with {len(batch_data)} requests for batch generation.")
                     self.batch_gen(batch_data, rollout_queue)
@@ -834,24 +830,23 @@ class PSRL_GenWorker(Worker):
             self._async_interrupt_event.set()
             self._async_resume_event.clear()
         
-        with self._request_queue_lock:
-            psrl_logger.debug(f"Interrupting all requests, current queue size: {self.request_queue.qsize()}")
-            interrupted_requests = []
-            while not self.request_queue.empty():
-                try:
-                    request = self.request_queue.get_nowait()
-                    if request is None:
-                        break
-                    request.meta_info["interrupted"] = True
-                    interrupted_requests.append(request)
-                except queue.Empty:
+        psrl_logger.debug(f"Interrupting all requests, current queue size: {self.request_queue.qsize()}")
+        interrupted_requests = []
+        while not self.request_queue.empty():
+            try:
+                request = self.request_queue.get_nowait()
+                if request is None:
                     break
-            
-            # TODO(ls): implement replay buffer and refactor this part
-            for request in interrupted_requests:
-                rollout_queue.put(request)
-            
-            psrl_logger.debug(f"Interrupted {len(interrupted_requests)} requests, current queue size: {self.request_queue.qsize()}")
+                request.meta_info["interrupted"] = True
+                interrupted_requests.append(request)
+            except queue.Empty:
+                break
+        
+        # TODO(ls): implement replay buffer and refactor this part
+        for request in interrupted_requests:
+            rollout_queue.put(request)
+        
+        psrl_logger.debug(f"Interrupted {len(interrupted_requests)} requests, current queue size: {self.request_queue.qsize()}")
 
         if self._generate_thread and self._generate_thread.is_alive() and self._generate_loop:
             future = asyncio.run_coroutine_threadsafe(
@@ -882,15 +877,13 @@ class PSRL_GenWorker(Worker):
         if isinstance(requests, DataProto):
             if len(requests) > 0:
                 requests = [requests[i:i+1] for i in range(len(requests))]
-                with self._request_queue_lock:
-                    if self.psrl_config.gen_mode == "batch":
-                        self.request_num_queue.put(len(requests))
-                    for request in requests:
-                        self.request_queue.put(request)
-        elif requests is None:
-            with self._request_queue_lock:
                 if self.psrl_config.gen_mode == "batch":
-                    self.request_num_queue.put(None)
-                self.request_queue.put(requests)
+                    self.request_num_queue.put(len(requests))
+                for request in requests:
+                    self.request_queue.put(request)
+        elif requests is None:
+            if self.psrl_config.gen_mode == "batch":
+                self.request_num_queue.put(None)
+            self.request_queue.put(requests)
         else:
             raise ValueError(f"Unsupported request type: {type(requests)}. Expected DataProto or None.")

@@ -191,10 +191,8 @@ class DataProcessor:
         self.build_val_dataloader()
         
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
         if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
+            total_training_steps = min(total_training_steps, self.config.trainer.total_training_steps)
         self.total_training_steps = total_training_steps
 
     def save_train_dataloader(self, dataloader_local_path: str) -> None:
@@ -280,71 +278,74 @@ class DataProcessor:
         while True:
             try:
                 batch_dict = next(self.train_dataloader_iter)
-                self._train_batch_idx += 1
-                batch_size = len(batch_dict[list(batch_dict.keys())[0]])
-                sample_ids = [f"b{self._train_batch_idx}_s{i}" for i in range(batch_size)]
-                if self.config.gen_actor_rollout_ref.rollout.n > 1:
-                    batch_dict['parent_id'] = np.array(sample_ids)
-                else:
-                    batch_dict['uid'] = np.array(sample_ids)
-                meta_info = {
-                    'batch_idx': self._train_batch_idx,
-                }
-                
-                batch_dict = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
-                
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                meta_info_keys_to_pop = []
-                if "multi_modal_inputs" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
-                if "raw_prompt" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if self.config.gen_actor_rollout_ref.rollout.n > 1:
-                    non_tensor_batch_keys_to_pop.append("parent_id")
-                else:
-                    non_tensor_batch_keys_to_pop.append("uid")
-                if "do_sample" in batch_dict.meta_info:
-                    meta_info_keys_to_pop.append("do_sample")
-                gen_batch = batch_dict.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                    meta_info_keys=meta_info_keys_to_pop,
-                )
-                
-                for i in range(batch_size):
-                    self.rollout_request_buffer[sample_ids[i]] = batch_dict[i:i+1]
-                
-                if self.rollout_n > 1:
-                    gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
-                    uid_list = []
-                    for i in range(batch_size):
-                        for j in range(self.rollout_n):
-                            child_id = f"{sample_ids[i]}_r{j}"
-                            uid_list.append(child_id)
-                    gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
-                
-                if self.process_mode == "stream":
-                    batch_size = len(gen_batch)
-                    for i in range(batch_size):
-                        self.data_queue.put(gen_batch[i:i+1])
-                else:
-                    self.data_queue.put(gen_batch)
-                
-                if self._train_batch_idx > self.total_training_steps:
-                    break
-
             except StopIteration:
                 curr_epoch = self._train_batch_idx // len(self.train_dataloader)
                 if curr_epoch >= total_epochs:
-                    psrl_logger.info("All training epochs completed.")
+                    psrl_logger.info(f"All training epochs completed. Epoch: {curr_epoch}, total batches: {self._train_batch_idx}")
                     break
                 else:
                     self.train_dataloader_iter = iter(self.train_dataloader)
+                    continue
+                    
+            self._train_batch_idx += 1
+            psrl_logger.info(f"Processing batch {self._train_batch_idx}")
+            batch_size = len(batch_dict[list(batch_dict.keys())[0]])
+            sample_ids = [f"b{self._train_batch_idx}_s{i}" for i in range(batch_size)]
+            if self.config.gen_actor_rollout_ref.rollout.n > 1:
+                batch_dict['parent_id'] = np.array(sample_ids)
+            else:
+                batch_dict['uid'] = np.array(sample_ids)
+            meta_info = {
+                'batch_idx': self._train_batch_idx,
+            }
+            
+            batch_dict = DataProto.from_single_dict(batch_dict, meta_info=meta_info)
+            
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            meta_info_keys_to_pop = []
+            if "multi_modal_inputs" in batch_dict.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+            if "raw_prompt" in batch_dict.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            if "tools_kwargs" in batch_dict.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            if self.config.gen_actor_rollout_ref.rollout.n > 1:
+                non_tensor_batch_keys_to_pop.append("parent_id")
+            else:
+                non_tensor_batch_keys_to_pop.append("uid")
+            if "do_sample" in batch_dict.meta_info:
+                meta_info_keys_to_pop.append("do_sample")
+            gen_batch = batch_dict.pop(
+                batch_keys=batch_keys_to_pop,
+                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                meta_info_keys=meta_info_keys_to_pop,
+            )
+            
+            for i in range(batch_size):
+                self.rollout_request_buffer[sample_ids[i]] = batch_dict[i:i+1]
+            
+            if self.rollout_n > 1:
+                gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
+                uid_list = []
+                for i in range(batch_size):
+                    for j in range(self.rollout_n):
+                        child_id = f"{sample_ids[i]}_r{j}"
+                        uid_list.append(child_id)
+                gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
+            
+            if self.process_mode == "stream":
+                batch_size = len(gen_batch)
+                for i in range(batch_size):
+                    self.data_queue.put(gen_batch[i:i+1])
+            else:
+                self.data_queue.put(gen_batch)
+            
+            if self._train_batch_idx > self.total_training_steps:
+                break
+            
         # Signal end of data processing
-        psrl_logger.info("Data processing completed, sending shutdown signal to reward computation thread.")
+        psrl_logger.info("Data processing completed.")
         self.data_queue.put(None)
     
     def compute_reward(self):

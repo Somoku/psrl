@@ -227,7 +227,6 @@ gen_actor_rollout_ref:
   rollout:
     ### Config for streaming rollout ###
     max_inflight_requests: 512 # Max in-flight requests for each rollout worker
-
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM, psrl_async: AsyncLLMEngine
     chat_scheduler: null # async chat scheduler, e.g examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler
@@ -269,13 +268,6 @@ gen_actor_rollout_ref:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
       sglang:
         attention_backend: null # The attention backend for sglang engine. Options: flashinfer, triton, flashmla, null for default.
-    val_kwargs:
-      # sampling parameters for validation
-      top_k: -1 # 0 for hf rollout, -1 for vllm rollout
-      top_p: 1.0
-      temperature: 0
-      n: 1
-      do_sample: False # default eager for validation
     multi_turn: 
       enable: False  # should set rollout.name to sglang_async if True
       max_turns: null  # null for no limit (default max_length // 3)
@@ -295,7 +287,7 @@ gen_actor_rollout_ref:
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
-  strategy: fsdp2 # [fsdp, fsdp2]
+  strategy: ${train_actor_rollout_ref.actor.strategy} # [fsdp, fsdp2]
   optim:
     lr: 1e-5
     lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
@@ -304,7 +296,7 @@ critic:
     total_training_steps: -1  # must be override by program
     weight_decay: 0.01
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: ${train_actor_rollout_ref.model.path}
     use_shm: False
     tokenizer_path: ${train_actor_rollout_ref.model.path}
     override_config: { }

@@ -4,7 +4,6 @@ import uuid
 import asyncio
 
 import numpy as np
-from deprecated import deprecated
 from contextlib import contextmanager
 from copy import deepcopy
 from collections.abc import Sequence
@@ -28,6 +27,7 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
+from psrl.utils.logger import deprecated
 from psrl.workers.gen import StatCollector
 
 psrl_logger = logging.getLogger(__file__)
@@ -129,15 +129,6 @@ class PSRL_vLLMRollout(BaseRollout):
                 return
 
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
-
-        if kwargs.get("train_tp") is not None:
-            # deployed with megatron
-            import os
-
-            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
-            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
-            vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
-        
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
         
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
@@ -171,7 +162,6 @@ class PSRL_vLLMRollout(BaseRollout):
             # Configure vLLM for tensor/pipeline parallelism within Ray
             # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
             distributed_executor_backend = "ray"
         elif config.mode == "sync":
             distributed_executor_backend = "external_launcher"
@@ -216,9 +206,13 @@ class PSRL_vLLMRollout(BaseRollout):
         else:
             self.inference_engine = LLM(**llm_kwargs)
 
+        # NOTE(lhy): sleep mode is not supported when using NIXL
+        # Because it will cause illegal memory registration
+        '''
         # Offload vllm model to reduce peak memory usage
         if load_format == "dummy" and config.free_cache_engine:
             self.inference_engine.sleep(level=1)
+        '''
 
         kwargs = dict(
             n=1,

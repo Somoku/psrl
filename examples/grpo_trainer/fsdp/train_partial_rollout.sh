@@ -16,7 +16,7 @@ REDUNDANT_ROLLOUT_N=4
 
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
-TRAIN_TP=1 # TP in the training side for validation
+VAL_TP=1 # TP in the training side for validation
 
 NNODES=3
 NGPUS_PER_NODE=8
@@ -64,7 +64,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.redundant_rollout.redundant_rollout_n=${REDUNDANT_ROLLOUT_N} \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.max_inflight_requests=32 \
     gen_actor_rollout_ref.rollout.mode=sync \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -77,7 +76,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.n=$ALG_ROLLOUT_N \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=16384 \

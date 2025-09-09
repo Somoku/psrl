@@ -8,15 +8,15 @@ from psrl.utils.nixl.server_client import NIXLMetaServer, NIXLStorageClient
 
 @ray.remote
 class MetaServerActor:
-    def __init__(self, server_name, listen_ip, listen_port, expected_clients):
+    def __init__(self, server_name, listen_ip, listen_port, expected_agents):
         self.server = NIXLMetaServer(server_name, listen_ip, listen_port)
-        self.expected_clients = expected_clients
+        self.expected_agents = expected_agents
 
     def init_is_ready(self):
         return True
 
     def wait_for_client_infos(self):
-        self.server.wait_for_client_infos(self.expected_clients)
+        self.server.wait_for_client_infos(self.expected_agents)
         return True
 
     def notify_all_client_infos_and_comm_plan(self):
@@ -72,7 +72,7 @@ def test_nixl_meta_comm():
     listen_ip = "29.210.128.48"
     listen_port = 23458
     state_dict_data = {"a": [1.0, 2.0, 3.0], "b": [4.0, 5.0, 6.0]}
-    num_clients = 2
+    num_agents = 2
     server_name = "meta_server"
     client_name = "client"
 
@@ -85,13 +85,13 @@ def test_nixl_meta_comm():
             node_id=ip_to_node_id[listen_ip],
             soft=False
         )
-    ).remote(server_name, listen_ip, listen_port, num_clients)
+    ).remote(server_name, listen_ip, listen_port, num_agents)
     ray.get(server.init_is_ready.remote())
 
     # Start clients
     print("Starting clients")
     clients = []
-    for i in range(num_clients):
+    for i in range(num_agents):
         client = MetaClientActor.remote(f"{client_name}_{i}", server_name, listen_ip, listen_port, state_dict_data)
         clients.append(client)
 

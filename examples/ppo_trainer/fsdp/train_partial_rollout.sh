@@ -4,16 +4,16 @@ set -x
 PSRL_WORKSPACE=/jizhicfs/johnnyslin
 source ${PSRL_WORKSPACE}/env/verl_H20.sh
 
-export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
-
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
+
+LOCAL_IP=28.59.80.224
+
 GLOBAL_BATCH_SIZE=64
-REDUNDANT_BATCH_SIZE=64
 
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
-TRAIN_TP=1 # TP in the training side for validation
+VAL_TP=2 # TP in the training side for validation
 
 NNODES=2
 NGPUS_PER_NODE=8
@@ -49,16 +49,11 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
     \
-    psrl.partial_rollout.enable=False \
+    psrl.partial_rollout.enable=True \
     psrl.partial_rollout.threshold=96 \
     psrl.partial_rollout.interrupt_as_prompt=False \
-    psrl.redundant_rollout.enable=False \
-    psrl.redundant_rollout.redundant_global_batch_size=${REDUNDANT_BATCH_SIZE} \
-    psrl.redundant_rollout.redundant_rollout_n=1 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.load_format=dummy_dtensor \
-    gen_actor_rollout_ref.rollout.max_inflight_requests=32 \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -71,7 +66,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
-    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${TRAIN_TP} \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.n=1 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
@@ -108,5 +103,3 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-stream.log
-
-# bash $HOME/occupy.sh 3

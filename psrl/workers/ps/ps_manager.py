@@ -106,10 +106,12 @@ class PSManager(RequestStatusTracker):
         self.rollout_request_tracker: Dict[Union[str, int], List[EntryInfo]] = {} # Maps parent request ids to "occupied" child entries
 
         # NIXL related attributes
-        self.expected_clients = 0
+        self.expected_agents = 0
         self.nixl_meta_server: Optional[NIXLMetaServer] = None
         self.ps_worker_group: Optional[PSWorkerGroup] = None
-        self.ps_nixl_storage_client_names: Optional[List[str]] = None
+        self.ps_nixl_agent_names: Optional[List[str]] = None
+        self.ps_nixl_train_storage_client_names: Optional[List[str]] = None
+        self.ps_nixl_gen_storage_client_names: Optional[List[str]] = None
             
         # Build logger
         self.log_prefix = f"PSManager"
@@ -447,7 +449,7 @@ class PSManager(RequestStatusTracker):
         self,
         buffer_id: int
     ) -> DataProto:
-        """Waiting for the training batch in the specified buffer."""
+        """Await a training batch for a specific buffer ID."""
         self.staleness_inventory.ensure_buffer_exists(buffer_id)
         
         if self.staleness_inventory.get_buffer_status(buffer_id) == BufferStatus.READY:
@@ -510,14 +512,13 @@ class PSManager(RequestStatusTracker):
         """
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
-        return self.rollout_instance_tracker[rollout_instance_id].version_tag
+        return tag_to_int(self.rollout_instance_tracker[rollout_instance_id].version_tag)
         
     def get_ps_model_version(self) -> int:
         """Get the current model version."""
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
-        
-        return self.model_store.version_tag
+        return tag_to_int(self.model_store.version_tag)
     
     def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: Union[str, int]):
         """Update the rollout instance model version to the latest model version."""
@@ -587,6 +588,7 @@ class PSManager(RequestStatusTracker):
     def nixl_protocol(self):
         """Execute the NIXL protocol for distributed communication setup.
         
+        Connect to the nixl clients and sync the client shardings/infos/comm_plan/temp_mappings to all clients.
         This method orchestrates the complete NIXL protocol workflow:
         1. Wait for client shardings and create unified sharding
         2. Wait for client infos and create communication plan  
@@ -600,14 +602,14 @@ class PSManager(RequestStatusTracker):
         self.nixl_meta_server.make_unified_sharding()
         psrl_logger.info(f"nixl server protocol step 3: notify all client shardings")
         self.nixl_meta_server.notify_all_client_shardings()
-        psrl_logger.info(f"nixl server protocol step 4: waiting for {self.expected_clients} clients to send infos")
-        self.nixl_meta_server.wait_for_client_infos(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 4: waiting for {self.expected_agents} agents to send infos")
+        self.nixl_meta_server.wait_for_client_infos(self.expected_agents)
         psrl_logger.info(f"nixl server protocol step 5: make comm plan")
         self.nixl_meta_server.make_comm_plan()
         psrl_logger.info(f"nixl server protocol step 6: notify all client infos and the global comm plan")
         self.nixl_meta_server.notify_all_client_infos_and_comm_plan()
-        psrl_logger.info(f"nixl server protocol step 7: waiting for {self.expected_clients} clients to send temp mappings")
-        self.nixl_meta_server.wait_for_client_temp_mappings(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 7: waiting for {self.expected_agents} agents to send temp mappings")
+        self.nixl_meta_server.wait_for_client_temp_mappings(self.expected_agents)
         psrl_logger.info(f"nixl server protocol step 8: notify all client temp mappings")
         self.nixl_meta_server.notify_all_client_temp_mappings()
         psrl_logger.info(f"nixl server protocol done.")
@@ -622,13 +624,35 @@ class PSManager(RequestStatusTracker):
             ps_worker_group (PSWorkerGroup): The PS worker group to bind
         """
         self.ps_worker_group = ps_worker_group
-        ps_nixl_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_storage_client_name")
-        self.ps_nixl_storage_client_names = ray.get(ps_nixl_storage_client_name_futures)
+        ps_nixl_agent_name_futures = self.ps_worker_group.execute_all_async("get_nixl_agent_name")
+        ps_nixl_train_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_train_storage_client_name")
+        ps_nixl_gen_storage_client_name_futures = self.ps_worker_group.execute_all_async("get_nixl_gen_storage_client_name")
+        self.ps_nixl_agent_names = ray.get(ps_nixl_agent_name_futures)
+        self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
+        self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
 
-    def get_ps_nixl_storage_client_names(self) -> List[str]:
-        """Get the NIXL storage client names of the PS worker group."""
-        assert self.ps_nixl_storage_client_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_storage_client_names."
-        return self.ps_nixl_storage_client_names  
+    def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:
+        """Get the PS worker handle by the client name."""
+        assert self.ps_worker_group is not None, "The PS worker group must be initialized before calling get_ps_worker_handle."
+        worker = self.ps_worker_group.distinguish_worker_by_method(
+            lambda worker: client_name == ray.get(worker.get_nixl_train_storage_client_name.remote()) or client_name == ray.get(worker.get_nixl_gen_storage_client_name.remote())
+        )
+        return worker
+    
+    def get_ps_nixl_agent_names(self) -> List[str]:
+        """Get the NIXL agent name of the PS worker group."""
+        assert self.ps_nixl_agent_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_agent_names."
+        return self.ps_nixl_agent_names
+
+    def get_ps_nixl_train_storage_client_names(self) -> List[str]:
+        """Get the NIXL train storage client name of the PS worker group."""
+        assert self.ps_nixl_train_storage_client_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_train_storage_client_name."
+        return self.ps_nixl_train_storage_client_names
+    
+    def get_ps_nixl_gen_storage_client_names(self) -> List[str]:
+        """Get the NIXL gen storage client name of the PS worker group."""
+        assert self.ps_nixl_gen_storage_client_names is not None, "The PS worker group must be initialized before calling get_ps_nixl_gen_storage_client_name."
+        return self.ps_nixl_gen_storage_client_names
             
     # ------- MODEL PUSH/PULL -------
     # Now we separate the control plane and data plane (ps_model = "nixl_cpu" or "nixl_gpu"), all the dataflow is handled by PSWorkerGroup.

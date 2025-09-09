@@ -50,6 +50,7 @@ def run_ppo(config) -> None:
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "false", 
                     "NCCL_DEBUG": "WARN", 
+                    "VLLM_USE_V1": "1",
                     "VLLM_LOGGING_LEVEL": "WARN",
                     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
                     "VLLM_DISABLE_COMPILE_CACHE": "1", # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
@@ -123,11 +124,12 @@ class TaskRunner:
         elif config.train_actor_rollout_ref.actor.strategy == "megatron":
             assert config.train_actor_rollout_ref.actor.strategy == config.critic.strategy, \
                 "Critic strategy must be the same as actor strategy: 'megatron'."
-            from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+            # from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+            from psrl.workers.train.refactored_megatron_worker_group import RefactoredNVMegatronRayWorkerGroup
             from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
             from psrl.workers.train.megatron_train_worker import PSRL_MegatronTrainWorker as PSRL_TrainWorker
 
-            ray_worker_group_cls = NVMegatronRayWorkerGroup
+            ray_worker_group_cls = RefactoredNVMegatronRayWorkerGroup
         else:
             raise NotImplementedError(f"Unsupported strategy: {config.train_actor_rollout_ref.actor.strategy}. "
                                         "Currently only 'fsdp', 'fsdp2', and 'megatron' are supported.")

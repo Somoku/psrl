@@ -1,4 +1,5 @@
 psrl:
+  ps_manager_ip: 127.0.0.1
   staleness: 0
   staleness_buffer_entries: 512
   rollout_n: ${gen_actor_rollout_ref.rollout.n}
@@ -23,6 +24,11 @@ psrl:
       rollout_ngpus_per_node_per_instance: []
       tensor_model_parallel_size_per_instance: [] # Tensor model parallel size for each rollout instance.
       pipeline_model_parallel_size_per_instance: [] # Pipeline model parallel size for each rollout instance.
+  nixl:
+    server_mode: meta_server
+    server_ip: ${psrl.ps_manager_ip}
+    server_port: 23456
+    max_pinned_temp_memory_slots: 4
 
 data:
   tokenizer: null
@@ -67,7 +73,7 @@ train_actor_rollout_ref:
     custom_chat_template: null
     external_lib: null
     override_config:
-      model_config: {}
+      model_config: { }
       moe_config:
         freeze_moe_router: False
     use_fused_kernels: False # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
@@ -247,7 +253,6 @@ train_actor_rollout_ref:
       temperature: 0
       n: 1
       do_sample: False # default eager for validation
-
     # Multi-turn interaction config for tools or chat.
     multi_turn:
       enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
@@ -300,36 +305,38 @@ train_actor_rollout_ref:
 
 gen_actor_rollout_ref:
   hybrid_engine: False
-  nccl_timeout: 600 # seconds, default is 10 minutes for torch, you can set it to a larger value if you have long-running operations like 32B or 72B model using megatron
   model:
-    path: ~/models/deepseek-llm-7b-chat
-    custom_chat_template: null
+    path: ${train_actor_rollout_ref.model.path}
     external_lib: null
     override_config:
       model_config: {}
       moe_config:
         freeze_moe_router: False
     use_fused_kernels: False # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
-    trust_remote_code: False
+    trust_remote_code: ${train_actor_rollout_ref.model.trust_remote_code}
   rollout:
     ### Config for streaming rollout ###
-    max_inflight_requests: 512 # Max in-flight requests for each rollout worker
-
+    max_inflight_requests: 512 # (deprecated) Max in-flight requests for each rollout worker
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM, psrl_async: AsyncLLMEngine
+    chat_scheduler: null # async chat scheduler, e.g examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1
-    prompt_length: ${data.max_prompt_length}  # for xperf_gpt
+    use_fire_sampling: False # https://arxiv.org/abs/2410.21236
+    prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: bfloat16 # should align with FSDP
+    dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
     free_cache_engine: True
+    # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
+    # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
     load_format: auto
-    tensor_model_parallel_size: 1
+    layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
+    tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 1
     max_num_batched_tokens: 8192
     max_model_len: null
@@ -340,19 +347,15 @@ gen_actor_rollout_ref:
     log_prob_use_dynamic_bsz: ${train_actor_rollout_ref.actor.use_dynamic_bsz}
     log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     disable_log_stats: True
-    enable_chunked_prefill: False # could get higher throughput
+    enable_chunked_prefill: True # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
     # for hf rollout
     do_sample: True
-    layer_name_map:
-      qkv_layer_name: qkv
-      gate_proj_layer_name: gate_up
     # number of responses (i.e. num sample times)
-    n: 1
+    n: 1 # > 1 for grpo
     use_post_sampling_logprobs: True
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
-        disable_mm_preprocessor_cache: False # whether to disable the preprocessor cache for multimodel models.
       sglang:
         attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
     val_kwargs:
@@ -434,10 +437,10 @@ critic:
     lr_wsd_decay_steps: null
     use_checkpoint_opt_param_scheduler: False # use checkpoint optimizer parameter scheduler
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: ${train_actor_rollout_ref.model.path}
     tokenizer_path: ${train_actor_rollout_ref.model.path}
     override_config:
-      model_config: {}
+      model_config: { }
       moe_config:
         freeze_moe_router: False
     external_lib: ${train_actor_rollout_ref.model.external_lib}
@@ -502,7 +505,7 @@ reward_model:
     use_dist_checkpointing: False
     dist_checkpointing_path: null
     seed: ${train_actor_rollout_ref.actor.megatron.seed}
-    override_transformer_config: {}
+    override_transformer_config: { }
     use_mbridge: ${train_actor_rollout_ref.actor.megatron.use_mbridge}
   model:
     input_tokenizer: ${train_actor_rollout_ref.model.path}  # set this to null if the chat template is identical

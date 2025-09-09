@@ -4,8 +4,6 @@ set -x
 PSRL_WORKSPACE=/jizhicfs/johnnyslin
 source ${PSRL_WORKSPACE}/env/verl_H20.sh
 
-export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
-
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 GLOBAL_BATCH_SIZE=512
@@ -35,8 +33,6 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-# bash $HOME/kill.sh 3
-
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
@@ -61,7 +57,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.redundant_rollout.redundant_rollout_n=1 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.max_inflight_requests=32 \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -111,5 +106,3 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-stream.log
-
-# bash $HOME/occupy.sh 3

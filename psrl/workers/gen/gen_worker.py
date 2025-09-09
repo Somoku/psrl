@@ -4,14 +4,16 @@ import asyncio
 import threading
 import logging
 import numpy as np
-from omegaconf import DictConfig
-from typing import Any, Optional, List
+from omegaconf import DictConfig, OmegaConf
+from dataclasses import dataclass
+from typing import Any, Callable, ClassVar, Optional, Union, List
 from collections import deque, defaultdict
 from transformers import AutoConfig
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import init_device_mesh
 from torch.multiprocessing.reductions import reduce_tensor
 
 import ray
@@ -23,21 +25,28 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_tokenizer
 from verl.utils.device import get_torch_device, get_device_name
 from verl.utils.fs import copy_to_local
-from verl.utils.model import get_generation_config
+from verl.utils.model import get_generation_config, update_model_config
 from verl.utils.debug import log_gpu_memory_usage
-from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
+from psrl.utils.ray import RayLock, AsyncRayLock
 from psrl.utils.server.command import CommandType, Command
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType, deprecated
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, deprecated, EventType
 from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_GEN_CLIENT_NAME
-from psrl.workers.gen import PSRL_vLLMRollout, GenInterface
+from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.ps.request_status_tracker import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+@dataclass
+class GenInterface:
+    """Info for the PSRL GenWorker."""
+    rollout_instance_id: int
+    ps_manager_handle: ray.actor.ActorHandle
+
 class PSRL_GenWorker(Worker):
+
     @staticmethod
     def configure_worker(
         config,
@@ -93,7 +102,6 @@ class PSRL_GenWorker(Worker):
             resources["num_gpus"] = 0
             resources["num_cpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
-
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
         return resources, env_vars, init_kwargs
@@ -174,6 +182,10 @@ class PSRL_GenWorker(Worker):
         self.nixl_storage_client = None
         self.unified_state_dict = None
         self.unified_sharding_dict = None
+        
+        # NIXL cache
+        self._cached_ps_nixl_agent_names = None
+        self._cached_ps_nixl_gen_storage_client_names = None
 
         # For async model pulling
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
@@ -196,57 +208,59 @@ class PSRL_GenWorker(Worker):
             world_size = int(os.environ.get("WORLD_SIZE", 1))
             dist.init_process_group(backend="cpu:gloo,cuda:nccl" if is_cuda_available else "cpu:gloo,npu:hccl", rank=rank, world_size=world_size)
 
-    def init_nixl_client(self):
+    async def init_nixl_client(self):
+        """
+        Initialize the NIXL client.
+        This is implemented via rpc call in the vLLM extension.
+        """
         assert self.rollout, "Rollout must be initialized before calling init_nixl_client."
-        """Initialize the NIXL client."""
+        psrl_logger.info(f"NIXL client initialization begin via rpc call.")
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{self.get_instance_id()}_R{self.get_instance_local_rank()}",
-                server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=True,
-                client_type=NIXLClientType.PULL_SIDE,
-                nixl_config=self.psrl_config.nixl,  
-                nixl_interface=self.nixl_interface
-            )
+            if self.config.rollout.mode == "sync":
+                self.rollout.inference_engine.collective_rpc(
+                    "init_nixl_client", 
+                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id()),
+                )
+            elif self.config.rollout.mode == "psrl_async":
+                await self.rollout.inference_engine.collective_rpc(
+                    "init_nixl_client", 
+                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id()),
+                )
+            else:
+                raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
-        psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
-
-    def nixl_protocol(self):
-        # Register the state dict and sharding dict to the NIXL client
-        psrl_logger.info(f"nixl client protocol step 0: convert_vllm_inplace")
-        vllm_model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-        param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(self.config.model.path))
-        unified_state_dict, local_sharding_dict = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=self.rank)
-        psrl_logger.info(f"nixl client protocol step 1: connect_to_server")
-        self.nixl_storage_client.connect_to_server()
-        psrl_logger.info(f"nixl client protocol step 2: send_local_sharding")
-        self.nixl_storage_client.send_local_sharding(local_sharding_dict)
-        psrl_logger.info(f"nixl client protocol step 3: wait_for_server_sharding")
-        unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
-        # psrl_logger.info(f"unified_sharding_dict: {unified_sharding_dict}")
-        psrl_logger.info(f"nixl client protocol step 4: register_local_tensors")
-        self.nixl_storage_client.register_local_tensors(unified_state_dict, unified_sharding_dict)
-        psrl_logger.info(f"nixl client protocol step 5: send_local_info")
-        self.nixl_storage_client.send_local_info()
-        psrl_logger.info(f"nixl client protocol step 6: wait_for_server_info")
-        self.nixl_storage_client.wait_for_server_info()
-        psrl_logger.info(f"nixl client protocol step 7: send_local_temp_mapping")
-        self.nixl_storage_client.send_local_temp_mapping()
-        psrl_logger.info(f"nixl client protocol step 8: wait_for_server_temp_mappings")
-        self.nixl_storage_client.wait_for_server_temp_mappings()
-        psrl_logger.info(f"nixl client protocol done.")
-        self.unified_state_dict = unified_state_dict
-        self.unified_sharding_dict = unified_sharding_dict
+        psrl_logger.info(f"NIXL client initialized via rpc call.")
+        
+    async def nixl_protocol(self):
+        """
+        Register the state dict and sharding dict to the NIXL client.
+        This is implemented via rpc call in the vLLM extension.
+        """
+        assert self.rollout, "Rollout must be initialized before calling nixl_protocol."
+        psrl_logger.info(f"NIXL protocol begin via rpc call.")
+        if self.config.rollout.mode == "sync":
+            self.rollout.inference_engine.collective_rpc(
+                "nixl_protocol", 
+                args=(self.config,),
+            )
+        elif self.config.rollout.mode == "psrl_async":
+            await self.rollout.inference_engine.collective_rpc(
+                "nixl_protocol", 
+                args=(self.config,),
+            )
+        else:
+            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+        psrl_logger.info(f"NIXL protocol done via rpc call.")
 
     def get_node_id(self) -> str:
         """
         Get the node id of the rollout instance.
         """
         return ray.get_runtime_context().get_node_id()
-
+    
     def get_instance_representative_rank(self) -> int:
         """
         The representative rank is the rank 0 of the rollout instance in current implementation (i.e., DP=1).
@@ -266,6 +280,17 @@ class PSRL_GenWorker(Worker):
         It is just the global rank in the current implementation (i.e., DP=1).
         """
         return self.rank
+    
+    def get_instance_local_tp_rank(self) -> int:
+        """
+        Get the local tp rank of the rollout instance.
+        """
+        tp_rank = self.rank % self.config.rollout.get("tensor_model_parallel_size", 1)
+        if self.config.rollout.mode == "sync" and self.rollout:
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+            vllm_tp_rank = get_tensor_model_parallel_rank()
+            assert tp_rank == vllm_tp_rank, "The tp rank of the rollout instance is not consistent with the vllm tp rank."
+        return tp_rank
     
     def get_instance_id(self) -> int:
         """
@@ -313,8 +338,8 @@ class PSRL_GenWorker(Worker):
 
         self._build_distributed()
 
-        tp = self.config.rollout.tensor_model_parallel_size
-        pp = self.config.rollout.pipeline_model_parallel_size
+        tp = self.config.rollout.get("tensor_model_parallel_size", 1)
+        pp = self.config.rollout.get("pipeline_model_parallel_size", 1)
         assert self.world_size == tp * pp, "Only support dp=1 for now"
         
         self.rollout_device_mesh = init_device_mesh(
@@ -331,9 +356,25 @@ class PSRL_GenWorker(Worker):
             if self._is_lora
             else {}
         )
-        self.actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        # Get the tokenizer
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
+        
+        # Get the model config
+        self.model_hf_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        # patch for kimi-vl
+        if getattr(self.model_hf_config, "model_type", None) == "kimi_vl":
+            self.model_hf_config.text_config.topk_method = "greedy"
+        override_config_kwargs = {
+            "bos_token_id": self.tokenizer.bos_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+        override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
+        override_config_kwargs.update(override_model_config)
+        update_model_config(self.model_hf_config, override_config_kwargs=override_config_kwargs)
+        if self.rank == 0:
+            psrl_logger.info(f"Model config after override: {self.model_hf_config}")
         rollout = PSRL_vLLMRollout(
             model_path=local_path,
             config=self.config.rollout,
@@ -372,10 +413,11 @@ class PSRL_GenWorker(Worker):
                 # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
                 object_ref = ray.get(ps_manager_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
                 model_state_dict_cpu = ray.get(object_ref)  # This blocks until the state dict is available in the object store
+            torch.cuda.synchronize()
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
             model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))
-            # Question: Do we need to clear the cache after loading the model?
+            # NOTE(lhy): Do we need to clear the cache after loading the model?
             # get_torch_device().empty_cache()
             torch.cuda.synchronize()
         else:
@@ -400,17 +442,12 @@ class PSRL_GenWorker(Worker):
                 model_state_dict_cpu = await object_ref  # This blocks until the state dict is available in the object store
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
-            # NOTE: transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
+            # NOTE(linsh): transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
             params_to_load = [(name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in model_state_dict_cpu.items()]
-            try:
-                loaded_params = await self.rollout.inference_engine.collective_rpc(
-                    "load_weights",
-                    args=(params_to_load,),
-                )
-            except Exception as e:
-                psrl_logger.error(f"Failed to load model parameters: {e}")
-                raise e
-
+            loaded_params = await self.rollout.inference_engine.collective_rpc(
+                "load_weights",
+                args=(params_to_load,),
+            )
             if loaded_params is None:
                 psrl_logger.error(f"Worker failed to update weights. Result: {loaded_params}")
                 raise
@@ -420,61 +457,57 @@ class PSRL_GenWorker(Worker):
     def nixl_pull_model(self) -> None:
         """
         Pull the model state dict from PS via NIXL and update the rollout model weights.
+        This is implemented via rpc call in the vLLM extension.
         """
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
-
         ps_manager_handle = self.gen_interface.ps_manager_handle
-        ps_nixl_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_storage_client_names.remote())
-        wait_operations = []
-        for target_client_name in ps_nixl_storage_client_names: 
-            for key in self.unified_state_dict:
-                self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
-                wait_operations.append((key, target_client_name))
-        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
-        for key, target_client_name in wait_operations:
-            self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+        if self._cached_ps_nixl_agent_names is None:
+            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
+        if self._cached_ps_nixl_gen_storage_client_names is None:
+            self._cached_ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
+        self.rollout.inference_engine.collective_rpc(
+            "nixl_pull_model_core", 
+            args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
+        )
         ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
-
+       
     async def nixl_pull_model_async(self) -> None:
         """
         Pull the model state dict from PS via NIXL and update the rollout model weights.
+        This is implemented via rpc call in the vLLM extension.
         """
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
-
         ps_manager_handle = self.gen_interface.ps_manager_handle
-        ps_nixl_storage_client_names = await ps_manager_handle.get_ps_nixl_storage_client_names.remote()
-        wait_operations = []
-        for target_client_name in ps_nixl_storage_client_names: 
-            for key in self.unified_state_dict:
-                self.nixl_storage_client.client_read(target_client_name, key, b"gen_pull")
-                wait_operations.append((key, target_client_name))
-        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
-        for key, target_client_name in wait_operations:
-            self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+        if self._cached_ps_nixl_agent_names is None:
+            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
+        if self._cached_ps_nixl_gen_storage_client_names is None:
+            self._cached_ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
+        await self.rollout.inference_engine.collective_rpc(
+            "nixl_pull_model_core", 
+            args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
+        )
         ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
+        
+    def pull_model(self) -> None:
+        assert self.config.rollout.mode == "sync", "Only support `sync` mode."
+        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+            self.ray_pull_model()
+        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            self.nixl_pull_model()
+        else:
+            raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+        
+    async def pull_model_async(self) -> None:
+        assert self.config.rollout.mode == "psrl_async", "Only support `psrl_async` mode."
+        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+            await self.ray_pull_model_async()
+        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            await self.nixl_pull_model_async()
+        else:
+            raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
-    def pull_model(self):
-        """
-        Pull the model state dict from PS and update the rollout model weights.
-        """
-        with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
-            if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-                self.ray_pull_model()
-            elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-                self.nixl_pull_model()
-
-    async def pull_model_async(self):
-        """
-        Pull the model state dict from PS and update the rollout model weights in async mode.
-        """
-        with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
-            if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-                await self.ray_pull_model_async()
-            elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-                await self.nixl_pull_model_async()
-    
     def get_prompts_on_device(self, batch: DataProto) -> DataProto:
         """Get generation prompts from the batch and move them to the current device."""    
         # pop those keys for generation
@@ -564,7 +597,8 @@ class PSRL_GenWorker(Worker):
             if self.is_instance_representative_rank:
                 curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
                 needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
-                # RayLock ensures that there won't be race condition when multiple GenWorkers are trying to reserve requests
+                # NOTE(lhy): This is a wrapper for ps_manager_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
+                # By adding  asyncio method to the ps_manager_handle ray actor, we can ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
                 with RayLock(ps_manager_handle):
                     # Filter out the parent_ids for new requests that need to be reserved
                     if self.config.rollout.n > 1:
@@ -633,7 +667,7 @@ class PSRL_GenWorker(Worker):
         with log_dual_events(f"Core generation with model version {actual_model_version}", psrl_logger, event_type=EventType.GEN):
             outputs : DataProto = self.rollout.generate_sequences(prompts)
         
-        # Put the outputs to the rollout queue
+        # Step 4: Put the outputs to the rollout queue
         # This is take place only on the representative rank of the rollout instance
         if self.is_instance_representative_rank:
             rollout_queue.put(outputs)
@@ -653,7 +687,7 @@ class PSRL_GenWorker(Worker):
             replay_buffer (queue.Queue): The buffer to store the generated sequences for replay.
         """
         stop_add_request = False
-        max_inflight_requests = self.config.rollout.max_inflight_requests
+        max_inflight_requests = self.config.rollout.get("max_inflight_requests", 128)
         rollout_instance_id = self.get_instance_id()
         ps_manager_handle = self.gen_interface.ps_manager_handle
         

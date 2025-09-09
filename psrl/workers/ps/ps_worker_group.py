@@ -1,7 +1,7 @@
 import ray
 import os
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Callable
 from dataclasses import dataclass
 
 
@@ -155,6 +155,16 @@ class PSWorkerGroup:
     def world_size(self):
         """Number of workers in the group."""
         return len(self._workers)
+    
+    def distinguish_worker_by_method(self, callable_method: Callable):
+        """Distinguish workers by the callable method.
+        
+        Args:
+            callable_method: A callable method that takes a worker as input and returns a boolean value.
+        """
+        candidates = [worker for worker in self._workers if callable_method(worker)]
+        assert len(candidates) == 1, f"Expected 1 worker, but got {len(candidates)} workers that satisfy the condition"
+        return candidates[0]
         
     def _init_with_resource_pool(self, resource_pool: PSResourcePool, ps_cls_with_init: PSClassWithInitArgs) -> None:
         rank = -1

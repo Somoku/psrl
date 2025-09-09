@@ -78,7 +78,6 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     psrl.deployment.ps_ngpus_per_node=${PS_NGPUS_PER_NODE} \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.max_inflight_requests=512 \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -135,7 +134,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     data.truncation='error' \
     trainer.critic_warmup=0 \
     trainer.val_before_train=False \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name='psrl_megatron_grpo_test' \
     trainer.experiment_name='hetero_stream' \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \

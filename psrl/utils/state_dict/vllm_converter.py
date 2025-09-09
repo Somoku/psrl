@@ -136,7 +136,6 @@ class VllmConverter(BaseConverter):
         Convert vLLM model to unified state dict and generate sharding info.
         Args:
             model: The vLLM model instance
-            tp_rank: tensor parallel rank
         Returns:
             (converted_state_dict, sharding)
         """
@@ -239,6 +238,7 @@ class VllmConverter(BaseConverter):
         """
         tp_size = getattr(module, "tp_size", 1)
         if tp_size > 1:
+            assert tp_size > self.tp_rank, f"Tensor parallel size ({tp_size}) must be greater than tensor parallel rank ({self.tp_rank}), please check the tensor parallel size and rank."
             shard_indices = [(self.tp_rank,)] if self.tp_rank is not None else [(0,)]
             if isinstance(module, (ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, VocabParallelEmbedding)):
                 shard_dim = 0

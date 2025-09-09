@@ -1,11 +1,12 @@
 import os
 import logging
 import enum
-from deprecated import deprecated
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Union, Tuple, Set
 
 from verl import DataProto
+
+from psrl.utils.logger import deprecated
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -599,10 +600,7 @@ class StalenessInventory:
         )
         self._update_buffer_status(target_buffer_id)
 
-    @deprecated(
-        "This method is deprecated and will be removed in future versions. Use the simpler `occupy_data` method instead.",
-        version="0.0.1"
-    )
+    @deprecated("This method is deprecated and will be removed in future versions. Use the simpler `occupy_data` method instead.")
     def occupy_data_with_reserve(
         self, 
         entry_info: EntryInfo, 

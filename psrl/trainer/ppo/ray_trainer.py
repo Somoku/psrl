@@ -39,7 +39,7 @@ from psrl.utils.nixl import NIXLInterface, GLOBAL_PORT_SCANNER
 from psrl.workers.train import TrainInterface
 from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.reward import RewardServer
-from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStorageWorker
+from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStoragePlan, PSStorageWorker
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager
 
@@ -93,7 +93,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.resource_pool_manager = resource_pool_manager
         self.use_reference_policy = PSRL_Role.RefPolicy in role_worker_mapping
         self.use_rm = PSRL_Role.RewardModel in role_worker_mapping
-        self.ray_worker_group_cls = ray_worker_group_cls
+        self.ray_worker_group_cls = ray_worker_group_cls # NOTE(lhy): ray_worker_group_cls is used only in train side
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
@@ -139,7 +139,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             raise ValueError(f"Unsupported advantage estimator: {self.config.algorithm.adv_estimator}")
 
         # Build logger
-        self.log_prefix = f"Main_Ray_Trainer"
+        self.log_prefix = f"MainRayTrainer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized major ray trainer (single controller).")
         
@@ -347,12 +347,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, "PSManager IP and NIXL server IP must be the same"
             assert self.config.train_actor_rollout_ref.actor.strategy != "fsdp", "FSDP1 is not supported for NIXL because it uses flat_param"
-            # TODO(lhy): support bf16 for NIXL
-            # The cast of dtype may be done in the PS storage clients
-            if self.config.train_actor_rollout_ref.actor.strategy == "fsdp2":
-                assert self.config.train_actor_rollout_ref.actor.fsdp_config.mixed_precision.param_dtype == "fp32", "dtype must be fp32 for now"
-            assert self.config.gen_actor_rollout.rollout.dtype == "float32", "dtype must be float32 for now"
-            assert self.config.train_actor_rollout_ref.rollout.dtype == "float32", "dtype must be float32 for now"
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -686,6 +680,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             )
         ).remote(self.config.psrl, self.group_post_process_fn)
         
+        # create nixl interface
         nixl_interface = NIXLInterface(
             port_scanner=GLOBAL_PORT_SCANNER
         )
@@ -758,6 +753,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # NOTE(lhy): in newest verl, we can use `create_colocated_worker_cls_fused` to create a fused worker group and low-level APIs can also be used
             if len(class_dict) == 1:
                 role = next(iter(class_dict.keys()))
+                if "rollout" in role:
+                    return {role: RayWorkerGroup(
+                        resource_pool=resource_pool,
+                        ray_cls_with_init=class_dict[role],
+                        **wg_kwargs
+                    )}
                 return {role: self.ray_worker_group_cls(
                     resource_pool=resource_pool,
                     ray_cls_with_init=class_dict[role],
@@ -866,6 +867,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         # create PS WorkerGroup
         psrl_logger.info("Create PS WorkerGroup")
+        storage_plan = PSStoragePlan(
+            train_model_dtype=torch.float32,
+            gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype
+        )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict 
             # No need to create PS WorkerGroup
@@ -894,6 +899,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     resource_pool=ps_resource_pool,
                     ps_cls_with_init=PSClassWithInitArgs(
                         cls=ray.remote(PSStorageWorker),
+                        storage_plan=storage_plan,
                         model_config=self.config.train_actor_rollout_ref.model,
                         psrl_config=self.config.psrl,
                         nixl_interface=nixl_interface
@@ -936,31 +942,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ray.get(futures)
 
         psrl_logger.info("All workers' models initialized successfully!")
-        
+
+        # start rollout coordinator
+        self.init_rollout_coordinator()
+
         # initialize NIXL
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
-            psrl_logger.info("Initializing NIXL")
-            futures = []
-            expected_clients = self.ps_wg.world_size + \
-                self.actor_wg.world_size + \
-                sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
-            futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_clients))
-            futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
-            futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
-            for i in range(self.config.psrl.deployment.n_rollout_instances):
-                futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
-            ray.get(futures)
-            psrl_logger.info("NIXL initialized successfully!")
+            with log_dual_events(f"Initializing NIXL clients", psrl_logger, event_type=EventType.INIT):
+                futures = []
+                expected_agents = self.ps_wg.world_size + \
+                    self.actor_wg.world_size + \
+                    sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
+                futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
+                futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
+                futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
+                futures.append(self.rollout_coordinator.init_nixl_client.remote())
+                ray.get(futures)
             
-            psrl_logger.info("Executing NIXL protocol")
-            futures = []
-            futures.append(self.ps_manager_handle.nixl_protocol.remote())
-            futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
-            futures.extend(self.actor_wg.execute_all_async("nixl_protocol"))
-            for i in range(self.config.psrl.deployment.n_rollout_instances):
-                futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
-            ray.get(futures)
-            psrl_logger.info("NIXL protocol executed successfully!")
+            with log_dual_events(f"Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
+                futures = []
+                futures.append(self.ps_manager_handle.nixl_protocol.remote())
+                futures.extend(self.ps_wg.execute_all_async("nixl_protocol"))
+                futures.extend(self.actor_wg.execute_all_async("nixl_protocol"))
+                futures.append(self.rollout_coordinator.nixl_protocol.remote())
+                ray.get(futures)
             
             psrl_logger.info("Binding PS worker group")
             self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg)
@@ -1165,7 +1170,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self.init_agent_loop_manager()
 
-        self.init_rollout_coordinator()
         ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):

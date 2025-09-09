@@ -1,5 +1,5 @@
 psrl:
-  ps_manager_ip: 28.59.80.224
+  ps_manager_ip: 127.0.0.1
   staleness: 0
   staleness_buffer_entries: 512
   rollout_n: ${gen_actor_rollout_ref.rollout.n}
@@ -103,7 +103,7 @@ train_actor_rollout_ref:
       impl_backend: torch
     trust_remote_code: False
   actor:
-    strategy: fsdp  # [fsdp, fsdp2]
+    strategy: fsdp2  # [fsdp, fsdp2]
     ppo_mini_batch_size: 256
     ppo_micro_batch_size: null # will be deprecated, use ppo_micro_batch_size_per_gpu
     ppo_micro_batch_size_per_gpu: null
@@ -151,7 +151,7 @@ train_actor_rollout_ref:
       weight_decay: 0.01
     fsdp_config:
       mixed_precision:
-        param_dtype: fp32
+        param_dtype: bf16
         reduce_dtype: fp32
         buffer_dtype: fp32
       wrap_policy:
@@ -166,7 +166,7 @@ train_actor_rollout_ref:
       # before the current forward computation.
       forward_prefetch: False
   ref:
-    strategy: fsdp
+    strategy: fsdp2
     fsdp_config:
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
@@ -308,8 +308,7 @@ gen_actor_rollout_ref:
     use_shm: True
   rollout:
     ### Config for streaming rollout ###
-    max_inflight_requests: 512 # Max in-flight requests for each rollout worker
-
+    max_inflight_requests: 512 # (deprecated) Max in-flight requests for each rollout worker
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM, psrl_async: AsyncLLMEngine
     chat_scheduler: null # async chat scheduler, e.g examples.ppo_trainer.naive_chat_scheduler.NaiveChatCompletionScheduler
@@ -319,7 +318,7 @@ gen_actor_rollout_ref:
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
-    dtype: bfloat16 # should align with FSDP
+    dtype: bfloat16
     gpu_memory_utilization: 0.5
     ignore_eos: False
     enforce_eager: True
@@ -409,7 +408,7 @@ gen_actor_rollout_ref:
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
-  strategy: fsdp # [fsdp, fsdp2]
+  strategy: ${train_actor_rollout_ref.actor.strategy} # [fsdp, fsdp2]
   optim:
     lr: 1e-5
     lr_warmup_steps_ratio: 0.0  # the total steps will be injected during runtime
@@ -418,7 +417,7 @@ critic:
     total_training_steps: -1  # must be override by program
     weight_decay: 0.01
   model:
-    path: ~/models/deepseek-llm-7b-chat
+    path: ${train_actor_rollout_ref.model.path}
     use_shm: True
     tokenizer_path: ${train_actor_rollout_ref.model.path}
     override_config: { }
@@ -467,7 +466,7 @@ critic:
 
 reward_model:
   enable: False
-  strategy: fsdp
+  strategy: fsdp2
   model:
     input_tokenizer: ${train_actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1

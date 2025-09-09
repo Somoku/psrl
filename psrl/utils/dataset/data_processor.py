@@ -25,6 +25,9 @@ class DatasetType:
     val: str = "val"
     test: str = "test"
 
+
+# NOTE(lhy): ray.remote must be declared here
+# otherwise their will be weird bugs (NCCL broadcast/all-gather hangs, randomly crashed) during vllm generation
 @ray.remote
 class DataProcessor:
     def __init__(
@@ -168,10 +171,8 @@ class DataProcessor:
         self.build_val_dataloader()
         
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
         if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
+            total_training_steps = min(total_training_steps, self.config.trainer.total_training_steps)
         self.total_training_steps = total_training_steps
 
     def get_total_training_steps(self):

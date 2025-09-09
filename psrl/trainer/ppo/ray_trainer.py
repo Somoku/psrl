@@ -604,8 +604,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         # create PS WorkerGroup
         psrl_logger.info("Create PS WorkerGroup")
+        train_model_dtype = torch.bfloat16 if self.config.train_actor_rollout_ref.actor.strategy == "megatron" else torch.float32
         storage_plan = PSStoragePlan(
-            train_model_dtype=torch.float32,
+            train_model_dtype=train_model_dtype,
             gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype
         )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":

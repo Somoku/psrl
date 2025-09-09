@@ -21,6 +21,7 @@ from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 
 from verl import DataProto
+from verl.utils.device import get_torch_device
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -208,6 +209,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 )
             )
         else:
+            # get_torch_device().manual_seed(config.get("seed", 0))
             self.inference_engine = LLM(
                 model=model_path,
                 # enable_sleep_mode=True,

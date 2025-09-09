@@ -1,7 +1,7 @@
 import torch
 from typing import Dict, Tuple
 
-from psrl.utils.state_dict.base_converter import BaseConverter
+from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
@@ -17,7 +17,7 @@ class HFConverter(BaseConverter):
         Args:
             model: The HuggingFace model instance
         Returns:
-            (converted_state_dict, sharding)
+            (converted_state_dict, sharding_dict)
         """
         # Extract the state dict from the model
         hf_state_dict = model.state_dict()
@@ -38,7 +38,7 @@ def convert_hf_inplace(model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSh
     Args:
         model: The HuggingFace model instance
     Returns:
-        (converted_state_dict, sharding)
+        (converted_state_dict, sharding_dict)
     """
     converter = HFConverter()
     return converter.convert_state_and_sharding_dict(model)

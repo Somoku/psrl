@@ -40,7 +40,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness=1 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
@@ -107,7 +107,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_nixl' \
-    trainer.experiment_name='megatron+cpu_ref+staleness_1' \
+    trainer.experiment_name='megatron+nixl_cpu+staleness_1' \
     trainer.total_training_steps=500 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \

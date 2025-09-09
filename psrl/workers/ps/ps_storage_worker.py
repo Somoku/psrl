@@ -12,7 +12,7 @@ from accelerate import init_empty_weights
 from verl.utils.fs import copy_to_local
 
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMultiStorageClients, GLOBAL_META_SERVER_NAME, GLOBAL_PS_CLIENT_NAME
-from psrl.utils.state_dict.hf_converter import convert_hf_inplace
+from psrl.utils.converter.hf_converter import convert_hf_inplace
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 
 

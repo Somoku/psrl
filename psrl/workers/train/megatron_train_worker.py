@@ -14,10 +14,12 @@ from verl.utils.megatron_utils import (
     per_tensor_generator,
 )
 from verl.workers.megatron_workers import ActorRolloutRefWorker
+from verl.utils.fs import copy_to_local
 
 from psrl.workers.train import TrainInterface, PSRL_BaseTrainWorker
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
-from psrl.utils.nixl import NIXLInterface
+from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_TRAIN_CLIENT_NAME
+from psrl.utils.converter import convert_megatron_inplace, create_parameter_mapping
 
 
 psrl_logger = logging.getLogger(__file__)
@@ -54,6 +56,49 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         The representative rank is the rank 0 of the PS.
         """
         return self.rank == 0
+       
+    def init_nixl_client(self):
+        """Initialize the NIXL client."""
+        assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
+        if self.psrl_config.nixl.server_mode == "storage_server":
+            raise ValueError("Storage server mode is deprecated.")
+        elif self.psrl_config.nixl.server_mode == "meta_server":
+            self.nixl_storage_client = NIXLStorageClient(
+                client_name=f"{GLOBAL_TRAIN_CLIENT_NAME}_{self.rank}",
+                server_name=GLOBAL_META_SERVER_NAME,
+                use_gpu=True,
+                client_type=NIXLClientType.PUSH_SIDE,
+                nixl_config=self.psrl_config.nixl,
+                nixl_interface=self.nixl_interface
+            )
+        else:
+            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
+        
+    def nixl_protocol(self):
+        # Register the state dict and sharding dict to the NIXL client
+        psrl_logger.info(f"nixl client protocol step 0: convert_megatron_inplace")
+        parameter_mapping = create_parameter_mapping("Megatron", copy_to_local(self.config.model.path))
+        unified_state_dict, local_sharding_dict = convert_megatron_inplace(parameter_mapping, self.actor_module)
+        psrl_logger.info(f"nixl client protocol step 1: connect_to_server")
+        self.nixl_storage_client.connect_to_server()
+        psrl_logger.info(f"nixl client protocol step 2: send_local_sharding")
+        self.nixl_storage_client.send_local_sharding(local_sharding_dict)
+        psrl_logger.info(f"nixl client protocol step 3: wait_for_server_sharding")
+        unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
+        psrl_logger.info(f"nixl client protocol step 4: register_local_tensors")
+        self.nixl_storage_client.register_local_tensors(unified_state_dict, unified_sharding_dict)
+        psrl_logger.info(f"nixl client protocol step 5: send_local_info")
+        self.nixl_storage_client.send_local_info()
+        psrl_logger.info(f"nixl client protocol step 6: wait_for_server_info")
+        self.nixl_storage_client.wait_for_server_info()
+        psrl_logger.info(f"nixl client protocol step 7: send_local_temp_mapping")
+        self.nixl_storage_client.send_local_temp_mapping()
+        psrl_logger.info(f"nixl client protocol step 8: wait_for_server_temp_mappings")
+        self.nixl_storage_client.wait_for_server_temp_mappings()
+        psrl_logger.info(f"nixl client protocol done.")
+        self.unified_state_dict = unified_state_dict
+        self.unified_sharding_dict = unified_sharding_dict    
         
     def ray_push_model(self) -> None:
         """

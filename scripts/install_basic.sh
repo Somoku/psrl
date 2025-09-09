@@ -20,7 +20,7 @@ python -m pip install -v --no-build-isolation -U "git+https://github.com/faceboo
 
 echo "3. Install basic packages"
 python -m pip install "transformers[hf_xet]<4.54.0" accelerate datasets peft hf-transfer matplotlib flask \
-    "numpy<2.0.0" "pyarrow>=15.0.0" pandas paramiko \
+    "numpy<2.0.0" "pyarrow>=15.0.0" pandas paramiko mbridge \
     ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
     pytest py-spy pyext pre-commit ruff meson ninja pynvml requests einops
 

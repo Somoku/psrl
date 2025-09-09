@@ -5,17 +5,22 @@ import torch
 import socket
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
-from transformers import AutoModel, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.util.placement_group import placement_group, PlacementGroupSchedulingStrategy
 from omegaconf import OmegaConf
+from megatron.core import parallel_state as mpu
 
-from verl.utils.fs import copy_to_local
+from verl.workers.megatron_workers import set_random_seed
+from verl.utils.megatron_utils import get_model
+from verl.utils.device import get_device_name
+from verl.models.mcore import init_mcore_model, hf_to_mcore_config
+from verl.utils.torch_dtypes import PrecisionType
 
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PORT_SCANNER
-from psrl.utils.state_dict import convert_fsdp_inplace, convert_vllm_inplace, create_parameter_mapping
+from psrl.utils.converter import convert_fsdp_inplace, convert_vllm_inplace, convert_megatron_inplace, create_parameter_mapping
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
 QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-0.5B-Instruct"
@@ -73,32 +78,38 @@ class MetaServerActor:
 
 @ray.remote(num_cpus=1)
 class TrainClientActor:
-    def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, ps_for_push_worker_handles):
+    def __init__(self, engine_type, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, ps_for_push_worker_handles):
+        assert engine_type in ["fsdp", "megatron"], f"engine {engine_type} is not supported"
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
+        self.engine_type = engine_type
+        self.rank = rank
+        self.world_size = world_size
         self.client_name = f"train_client_{rank}"
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{self.client_name}.log")
         self.print = make_dual_print(log_path, prefix=self.client_name)
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-        torch.manual_seed(42)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
-        model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL_PATH, torch_dtype=torch.float32)
-        # Set all model parameters to 1
-        for p in model.parameters():
-            p.data.fill_(1)
-        model = FSDP(
-            model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            device_id=torch.cuda.current_device(),
-            sync_module_states=False,
-            device_mesh=init_device_mesh("cuda", mesh_shape=(world_size,))
-        )
-        self.model = model
-        self.rank = rank
-        self.world_size = world_size
+        if engine_type == "fsdp":
+            model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL_PATH, torch_dtype=torch.float32)
+            # Set all model parameters to 1
+            for p in model.parameters():
+                p.data.fill_(1)
+            torch.manual_seed(42)
+            self.model = FSDP(
+                model,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                device_id=torch.cuda.current_device(),
+                sync_module_states=False,
+                device_mesh=init_device_mesh("cuda", mesh_shape=(world_size,))
+            )
+        elif engine_type == "megatron":
+            self._init_megatron_parallel()
+            set_random_seed(42)
+            self._init_megatron_model()
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
@@ -109,12 +120,65 @@ class TrainClientActor:
         )
         self.ps_for_push_worker_handles = ps_for_push_worker_handles
     
+    def _init_megatron_parallel(self):
+        """Initialize Megatron parallel state"""
+        mpu.initialize_model_parallel(
+            tensor_model_parallel_size=2,  
+            pipeline_model_parallel_size=2, 
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_model_parallel_split_rank=None,
+            use_sharp=False,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            nccl_communicator_config_path=None,
+        )
+        self.print(f"[Rank {self.rank}] Megatron parallel initialized")
+    
+    def _init_megatron_model(self):
+        """Initialize Megatron model"""
+        # Get HuggingFace config
+        hf_config = AutoConfig.from_pretrained(QWEN_MODEL_PATH, trust_remote_code=False)
+        # Convert to Megatron config
+        dtype = PrecisionType.to_dtype(torch.bfloat16)
+        tf_config = hf_to_mcore_config(hf_config, dtype)
+        self.print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
+        
+        def model_provider(pre_process, post_process):
+            """Model provider function"""
+            model = init_mcore_model(
+                tf_config, 
+                hf_config, 
+                pre_process, 
+                post_process, 
+                share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
+                value=False
+            )
+            model.to(get_device_name())
+            for p in model.parameters():
+                p.data.fill_(1)
+            return model
+        
+        # Initialize Megatron model
+        self.model = get_model(
+            model_provider,
+            wrap_with_ddp=True,
+            use_distributed_optimizer=True,
+        )
+        
+        self.print(f"[Rank {self.rank}] Model initialized: {self.model}")
+    
     def init_finished(self):
         return True
     
     def protocol(self):
-        self.print("step0: convert_fsdp_inplace")
-        state_dict, sharding = convert_fsdp_inplace("fsdp", self.model)
+        self.print("step0: convert_fsdp/megatron_inplace")
+        if self.engine_type == "fsdp":
+            state_dict, sharding = convert_fsdp_inplace("fsdp", self.model)
+        elif self.engine_type == "megatron":
+            parameter_mapping = create_parameter_mapping("Megatron", QWEN_MODEL_PATH)
+            state_dict, sharding = convert_megatron_inplace(parameter_mapping, self.model)
+        # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -205,8 +269,9 @@ class GenClientActor:
 
     def protocol(self):
         self.print("step0: convert_vllm_inplace")
-        param_mapping = create_parameter_mapping(type(self.model), copy_to_local(QWEN_MODEL_PATH))
+        param_mapping = create_parameter_mapping(type(self.model), QWEN_MODEL_PATH)
         state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.tp_rank)
+        # self.print(f"state_dict keys: {list(state_dict.keys())}")
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -246,7 +311,7 @@ class GenClientActor:
     def shutdown(self):
         self.client.shutdown()
 
-def create_ps_worker_group(num_ps, psrl_config, model_path, nixl_interface: NIXLInterface):
+def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, nixl_interface: NIXLInterface):
     model_config = OmegaConf.create({
         "path": model_path, "use_shm": False, "trust_remote_code": False
     })
@@ -257,7 +322,7 @@ def create_ps_worker_group(num_ps, psrl_config, model_path, nixl_interface: NIXL
         for node in nodes
     ])
     storage_plan = PSStoragePlan(
-        train_model_dtype=torch.float32,
+        train_model_dtype=torch.float32 if train_engine_type == "fsdp" else torch.bfloat16,
         gen_model_dtype=torch.bfloat16
     )
     ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), storage_plan, model_config, psrl_config, nixl_interface)
@@ -277,6 +342,7 @@ def test_nixl_e2e():
     num_train = 8
     num_gen = 4
     num_ps = 2
+    train_engine_type = "megatron"
     
     psrl_config = OmegaConf.create({
         "logging_path": log_dir,
@@ -309,7 +375,7 @@ def test_nixl_e2e():
     print(f"[PASS] server init done. time: {end_time - start_time}s")
     
     start_time = time.time()
-    ps_wg = create_ps_worker_group(num_ps,psrl_config, QWEN_MODEL_PATH, nixl_interface)
+    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, QWEN_MODEL_PATH, nixl_interface)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
     ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
@@ -333,7 +399,7 @@ def test_nixl_e2e():
         TrainClientActor.options(
             num_gpus=1,
             # scheduling_strategy=PlacementGroupSchedulingStrategy(train_pg, placement_group_bundle_index=rank)
-        ).remote(rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface, ps_for_push_worker_handles)
+        ).remote(train_engine_type, rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface, ps_for_push_worker_handles)
         for rank in range(num_train)
     ]
     gen_actors = [

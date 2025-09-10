@@ -9,7 +9,8 @@ import torch
 from torch.nn import Parameter
 from typing import Dict
 
-from psrl.utils.converter import convert_vllm_inplace, create_parameter_mapping
+from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 
 def example_with_real_model():
     """Example with a real vLLM model instance, now supports distributed torchrun."""

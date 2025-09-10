@@ -31,7 +31,8 @@ from verl.utils.debug import log_gpu_memory_usage
 from psrl.utils.ray import RayLock, AsyncRayLock
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, deprecated, EventType
-from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
+from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import NIXLInterface
 from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.ps.request_status_tracker import RequestStatus

@@ -125,7 +125,8 @@ class MegatronClient:
     
     def _covert_model(self):
         """Convert model"""
-        from psrl.utils.converter import create_parameter_mapping, convert_megatron_inplace
+        from psrl.utils.converter import create_parameter_mapping
+        from psrl.utils.converter.megatron_converter import convert_megatron_inplace
         
         parameter_mapping = create_parameter_mapping("Megatron", self.model_path)
         unified_state_dict, sharding_dict = convert_megatron_inplace(parameter_mapping, self.model)

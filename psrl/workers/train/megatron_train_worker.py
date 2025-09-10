@@ -20,7 +20,8 @@ from verl.utils.fs import copy_to_local
 from psrl.workers.train import TrainInterface, PSRL_BaseTrainWorker
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, EventType
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_TRAIN_CLIENT_NAME
-from psrl.utils.converter import convert_megatron_inplace, create_parameter_mapping
+from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 
 
 psrl_logger = logging.getLogger(__file__)

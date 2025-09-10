@@ -20,7 +20,10 @@ from verl.models.mcore import init_mcore_model, hf_to_mcore_config
 from verl.utils.torch_dtypes import PrecisionType
 
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMetaServer, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_PORT_SCANNER
-from psrl.utils.converter import convert_fsdp_inplace, convert_vllm_inplace, convert_megatron_inplace, create_parameter_mapping
+from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
+from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
 QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-0.5B-Instruct"

@@ -84,14 +84,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.ref.fsdp_config.param_offload=False \
     \
-    critic.optim.lr=1e-5 \
-    critic.model.use_remove_padding=True \
-    critic.model.path="$MODEL_PATH" \
-    critic.model.enable_gradient_checkpointing=True \
-    critic.ppo_micro_batch_size_per_gpu=1 \
-    critic.model.fsdp_config.param_offload=False \
-    critic.model.fsdp_config.optimizer_offload=False \
-    \
     algorithm.use_kl_in_reward=False \
     algorithm.adv_estimator=grpo \
     data.train_files="$train_files" \

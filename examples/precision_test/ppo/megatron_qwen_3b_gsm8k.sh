@@ -1,5 +1,8 @@
 #!/bin/bash
 
+project_name='psrl_nixl'
+experiment_name='PPO-Qwen2.5-3b-gsm8k-mcore-batch-nixl-staleness_1'
+
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
@@ -41,7 +44,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log//${experiment_name} \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -106,9 +109,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.critic_warmup=0 \
     trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
-    trainer.project_name='psrl_nixl' \
-    trainer.experiment_name='megatron+batch+nixl+staleness_1' \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${experiment_name} \
     trainer.total_training_steps=500 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee megatron_batch_nixl_staleness_1.log
+    trainer.total_epochs=30 2>&1 | tee ${experiment_name}.log

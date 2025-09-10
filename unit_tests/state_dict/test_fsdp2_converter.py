@@ -28,7 +28,7 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
 )
 
-from psrl.utils.converter import convert_fsdp_inplace
+from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 
 
 def example_with_real_model():

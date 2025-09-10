@@ -204,7 +204,7 @@ class PSRL_AgentLoopWorker:
                 inst_status.get("waiting_and_running_queue_size", 0) 
                 for inst_status in instances.values()
             )
-            print(f"Updated engine status: {len(instances)} instances, total queue size: {total_queue_size}")
+            psrl_logger.debug(f"Updated engine status: {len(instances)} instances, total queue size: {total_queue_size}")
         
         # Schedule the async update
         try:

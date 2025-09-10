@@ -14,7 +14,7 @@ from torch.distributed.fsdp.api import ShardingStrategy, StateDictType, FullStat
 from transformers import AutoModel, AutoConfig, AutoModelForCausalLM
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy
 
-from psrl.utils.converter import convert_fsdp_inplace
+from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 
 def auto_wrap(module, recurse, nonwrapped_numel):
     print(f"Wrapping module: {module.__class__.__name__}, recurse: {recurse}, nonwrapped_numel: {nonwrapped_numel}")

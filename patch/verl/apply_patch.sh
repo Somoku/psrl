@@ -38,7 +38,7 @@ list_patches() {
 
 # Function to get verl version
 get_verl_version() {
-    python3 -c "
+    python-c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')
@@ -170,7 +170,7 @@ echo "Using patch file: $(basename "$PATCH_FILE_PATH")"
 echo "Searching verl install path..."
 
 echo "Try to find verl by python import..."
-VERL_PATH=$(python3 -c "
+VERL_PATH=$(python-c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')

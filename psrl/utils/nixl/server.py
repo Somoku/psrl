@@ -57,7 +57,7 @@ class NIXLStorageServer:
             desc_bytes = self.agent.get_serialized_descs(desc)
             self.tensor_infos[key] = NIXLTensorInfo(desc_bytes_list=[desc_bytes], shard_dim=-1, shard_mesh=1, shard_indices=[0])
 
-    def wait_for_client_infos(self, expected_clients: int = 1, timeout: float = 360.0):
+    def wait_for_client_infos(self, expected_clients: int = 1, timeout: float = 60.0):
         """
         Wait for all clients to connect and synchronize metadata.
         """
@@ -127,7 +127,7 @@ class NIXLMetaServer:
         if client_name not in self.connected_clients[agent_name]:
             self.connected_clients[agent_name].append(client_name)
         
-    def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float = 360.0):
+    def wait_for_client_shardings(self, expected_agents: int = 1, timeout: float = 60.0):
         """
         Wait for all agents to connect and send sharding.
         """
@@ -156,7 +156,7 @@ class NIXLMetaServer:
         self._is_all_client_shardings_recved = True
         psrl_logger.info(f"All {len(self.client_sharding_dicts)} clients of {expected_agents} agents sent sharding after {time.time() - start} seconds.")
 
-    def wait_for_client_infos(self, expected_agents: int = 1, timeout: float = 360.0):
+    def wait_for_client_infos(self, expected_agents: int = 1, timeout: float = 60.0):
         """
         Wait for all agents to connect and send client infos.
         """
@@ -185,7 +185,7 @@ class NIXLMetaServer:
         self._is_all_client_infos_recved = True
         psrl_logger.info(f"All {len(self.client_infos)} clients of {expected_agents} agents sent client infos after {time.time() - start} seconds.")
     
-    def wait_for_client_temp_mappings(self, expected_agents: int = 1, timeout: float = 360.0):
+    def wait_for_client_temp_mappings(self, expected_agents: int = 1, timeout: float = 60.0):
         """
         Wait for all agents to send temporary mappings.
         """

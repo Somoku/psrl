@@ -1,14 +1,9 @@
 #!/bin/bash
-set -x
 
-PSRL_WORKSPACE=/jizhicfs/johnnyslin
-source ${PSRL_WORKSPACE}/env/verl_H20.sh
+source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
-
-LOCAL_IP=28.59.80.224
-
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=16
 
 GEN_TP=2 # TP in the generation side

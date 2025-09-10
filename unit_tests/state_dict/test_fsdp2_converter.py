@@ -39,12 +39,13 @@ def example_with_real_model():
     # Read distributed info from environment variables
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    print(f"rank: {rank}, world_size: {world_size}")
+    psrl_workspace = os.environ.get("PSRL_WORKSPACE", "./psrl_workspace")
+    print(f"rank: {rank}, world_size: {world_size}, psrl_workspace: {psrl_workspace}")
     
     # Initialize torch distributed
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
-    model = AutoModelForCausalLM.from_pretrained("/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct")
+    model = AutoModelForCausalLM.from_pretrained(f"{psrl_workspace}/models/Qwen2.5-0.5B-Instruct")
     fsdp_kwargs = {
         "mesh": init_device_mesh("cuda", mesh_shape=(world_size,)),
     }

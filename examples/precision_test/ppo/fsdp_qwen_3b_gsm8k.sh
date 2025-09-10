@@ -5,6 +5,7 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 GLOBAL_BATCH_SIZE=512
+
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 VAL_TP=2 # TP in the training side for validation
@@ -44,11 +45,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
+    gen_actor_rollout_ref.rollout.mode=sync \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.n=1 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
@@ -87,8 +89,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_nixl' \
-    trainer.experiment_name='fsdp+nixl+staleness_1' \
+    trainer.experiment_name='fsdp+batch+nixl+staleness_1' \
     trainer.total_training_steps=500 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee fsdp_psrl.log
+    trainer.total_epochs=30 2>&1 | tee fsdp_batch_nixl_staleness_1.log

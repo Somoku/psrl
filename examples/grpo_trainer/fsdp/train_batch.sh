@@ -1,15 +1,11 @@
 #!/bin/bash
-set -x
 
-PSRL_WORKSPACE=/jizhicfs/johnnyslin
-source ${PSRL_WORKSPACE}/env/verl_H20.sh
+source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
-
-LOCAL_IP=28.59.80.224
-
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=16
+
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 VAL_TP=2 # TP in the training side for validation
@@ -31,12 +27,12 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/grpo_trainer/fsdp/psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \

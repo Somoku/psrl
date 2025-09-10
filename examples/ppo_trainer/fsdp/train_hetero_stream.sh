@@ -1,15 +1,11 @@
 #!/bin/bash
-set -x
 
-PSRL_WORKSPACE=/jizhicfs/johnnyslin
-source ${PSRL_WORKSPACE}/env/verl_H20.sh
+source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-0.5B-Instruct
-
-LOCAL_IP=28.59.80.224
-
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 GLOBAL_BATCH_SIZE=16
+
 GEN_TP_SIZES=(2 1 1 2)
 GEN_PP_SIZES=(1 2 2 1)
 VAL_TP=2 # TP in the training side for validation
@@ -51,7 +47,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=stream \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/fsdp/psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \

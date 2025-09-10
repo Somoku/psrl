@@ -565,16 +565,16 @@ class PSManager(RequestStatusTracker):
      
     # ------- PS NIXL CONTROL PLANE -------
     
-    def init_nixl_server(self, expected_clients: int):
+    def init_nixl_server(self, expected_agents: int):
         """Initialize the NIXL server for distributed communication.
         
         Args:
-            expected_clients (int): Number of expected NIXL clients to connect
+            expected_agents (int): Number of expected NIXL clients to connect
             
         Raises:
             ValueError: If server_mode is invalid or deprecated
         """
-        self.expected_clients = expected_clients
+        self.expected_agents = expected_agents
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
@@ -596,8 +596,8 @@ class PSManager(RequestStatusTracker):
         
         The protocol ensures all NIXL clients are properly coordinated.
         """
-        psrl_logger.info(f"nixl server protocol step 1: waiting for {self.expected_clients} clients to connect and send sharding")
-        self.nixl_meta_server.wait_for_client_shardings(self.expected_clients)
+        psrl_logger.info(f"nixl server protocol step 1: waiting for {self.expected_agents} clients to connect and send sharding")
+        self.nixl_meta_server.wait_for_client_shardings(self.expected_agents)
         psrl_logger.info(f"nixl server protocol step 2: make unified sharding")
         self.nixl_meta_server.make_unified_sharding()
         psrl_logger.info(f"nixl server protocol step 3: notify all client shardings")

@@ -40,7 +40,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness=1 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
@@ -57,7 +57,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.n=1 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
@@ -107,8 +107,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.val_before_train=True \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_nixl' \
-    trainer.experiment_name='megatron+cpu_ref+staleness_1' \
+    trainer.experiment_name='megatron+batch+nixl+staleness_1' \
     trainer.total_training_steps=500 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee megatron_psrl.log
+    trainer.total_epochs=30 2>&1 | tee megatron_batch_nixl_staleness_1.log

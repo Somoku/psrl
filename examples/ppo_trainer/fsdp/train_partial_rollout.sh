@@ -1,14 +1,9 @@
 #!/bin/bash
-set -x
 
-PSRL_WORKSPACE=/jizhicfs/johnnyslin
-source ${PSRL_WORKSPACE}/env/verl_H20.sh
+source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-
-LOCAL_IP=28.59.80.224
-
 GLOBAL_BATCH_SIZE=64
 
 GEN_TP=2 # TP in the generation side
@@ -32,12 +27,12 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python-m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=stream \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/fsdp/psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
@@ -96,10 +91,10 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     data.truncation='error' \
     trainer.critic_warmup=0 \
     trainer.val_before_train=True \
-    trainer.logger=['console','wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name='psrl_fsdp_ppo_test' \
-    trainer.experiment_name='stream' \
+    trainer.experiment_name='partial' \
     trainer.total_training_steps=5 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-stream.log
+    trainer.total_epochs=30 2>&1 | tee psrl_fsdp_ppo_test-partial.log

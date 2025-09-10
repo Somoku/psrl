@@ -1,25 +1,23 @@
 #!/bin/bash
-set -x
 
-PSRL_WORKSPACE=/jizhicfs/johnnyslin
-source ${PSRL_WORKSPACE}/env/verl_H20.sh
-
-export WANDB_API_KEY=8c63c5f4a504550818e34fadd4000eb1de2b3f30
+source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=${PSRL_WORKSPACE}/psrl
 
+# Convert Hugging Face checkpoint to Megatron distributed checkpoint
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-0.5B-Instruct
-python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
+python ${PSRL_PATH}/scripts/converter_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 GLOBAL_BATCH_SIZE=16
+
 GEN_TP=2 # TP in the generation side
 GEN_PP=2 # PP in the generation side
 
 VAL_TP=2 # TP in the training side for validation
-TRAIN_TP=2 # TP in the training side 
-TRAIN_PP=2 # PP in the training side 
+TRAIN_TP=2 # TP in the training side
+TRAIN_PP=2 # PP in the training side
 TRAIN_CP=1 # CP in the training side
 
 NNODES=2
@@ -44,7 +42,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/megatron/psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
@@ -62,14 +60,14 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.n=1 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.n=1 \
-    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
@@ -118,5 +116,3 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.save_freq=100 \
     trainer.test_freq=5 \
     trainer.total_epochs=30 2>&1 | tee psrl_megatron_ppo_test-batch.log
-
-bash $HOME/occupy.sh 3

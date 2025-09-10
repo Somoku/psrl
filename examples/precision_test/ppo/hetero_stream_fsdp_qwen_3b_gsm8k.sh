@@ -5,6 +5,7 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 GLOBAL_BATCH_SIZE=512
+
 GEN_TP_SIZES=(2 1 1 2)
 GEN_PP_SIZES=(1 2 2 1)
 VAL_TP=2 # TP in the training side for validation
@@ -65,7 +66,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
     gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.n=1 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
@@ -104,8 +105,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     trainer.val_before_train=False \
     trainer.logger=['console','wandb'] \
     trainer.project_name='psrl_nixl' \
-    trainer.experiment_name='stream_nixl_staleness_1_bf16' \
+    trainer.experiment_name='fsdp+hetero_stream+nixl+staleness_1' \
     trainer.total_training_steps=500 \
     trainer.save_freq=500 \
     trainer.test_freq=5 \
-    trainer.total_epochs=30 2>&1 | tee stream_nixl_staleness_1_bf16.log
+    trainer.total_epochs=30 2>&1 | tee fsdp_hetero_stream_nixl_staleness_1.log

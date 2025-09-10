@@ -38,7 +38,7 @@ list_patches() {
 
 # Function to get vllm version
 get_vllm_version() {
-    python3 -c "
+    python-c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')
@@ -184,7 +184,7 @@ echo "Searching vllm install path..."
 
 echo "Try to find vllm by python import..."
 
-VLLM_PATH=$(python3 -c "
+VLLM_PATH=$(python-c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')

@@ -16,7 +16,7 @@ from verl.utils.device import get_device_id
 from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
 
 from psrl.utils.nixl import NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_GEN_CLIENT_NAME, NIXLClientType
-from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
+from psrl.utils.converter import create_parameter_mapping, convert_vllm_inplace
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

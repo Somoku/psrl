@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 from megatron.core import parallel_state as mpu
 
 # Import verl utilities
+from verl.workers.megatron_workers import set_random_seed
 from verl.utils.megatron_utils import get_model
 from verl.utils.device import get_device_name
 from verl.models.mcore import init_mcore_model
@@ -18,9 +19,21 @@ from verl.utils.torch_dtypes import PrecisionType
 
 QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE", "/tmp") + "/models/Qwen2.5-0.5B-Instruct"
 
+def make_dual_print(log_path, prefix=None):
+    with open(log_path, "w") as f:
+        pass
+    def dual_print(*args, **kwargs):
+        msg = " ".join(str(a) for a in args)
+        if prefix:
+            msg = f"[{prefix}] {msg}"
+        print(msg, **kwargs)
+        with open(log_path, "a") as f:
+            print(msg, file=f, **kwargs)
+    return dual_print
+
 @ray.remote(num_cpus=1)
 class MegatronClient:
-    def __init__(self, rank, world_size, model_path=QWEN_MODEL_PATH):
+    def __init__(self, rank, world_size, model_path=QWEN_MODEL_PATH, log_dir=None):
         # Set environment variables
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "29500"
@@ -32,26 +45,35 @@ class MegatronClient:
         self.world_size = world_size
         self.model_path = model_path
         
-        print(f"[Rank {rank}] Initializing MegatronClient")
+        log_path = os.path.join(log_dir, f"{self.rank}.log")
+        self.print = make_dual_print(log_path, prefix=f"Rank {self.rank}")
+        
+        self.print(f"[Rank {rank}] Initializing MegatronClient begin")
         
         # Initialize distributed training
         dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
+        # torch.cuda.set_device(0)
         
         # Initialize Megatron parallel state
         self._init_megatron_parallel()
         
+        # Set random seed
+        set_random_seed(0)
+        
         # Initialize model
         self._init_model()
         
-        print(f"[Rank {rank}] Initialization completed")
+        # Convert model
+        self._covert_model()
+        
+        self.print(f"[Rank {rank}] Initialization completed")
     
     def _init_megatron_parallel(self):
         """Initialize Megatron parallel state"""
         mpu.initialize_model_parallel(
-            tensor_model_parallel_size=1,  # No tensor parallelism
-            pipeline_model_parallel_size=1,  # No pipeline parallelism
-            virtual_pipeline_model_parallel_size=None,
+            tensor_model_parallel_size=2,  
+            pipeline_model_parallel_size=2, 
+            virtual_pipeline_model_parallel_size=2,
             pipeline_model_parallel_split_rank=None,
             use_sharp=False,
             context_parallel_size=1,
@@ -59,7 +81,7 @@ class MegatronClient:
             expert_tensor_parallel_size=1,
             nccl_communicator_config_path=None,
         )
-        print(f"[Rank {self.rank}] Megatron parallel initialized")
+        self.print(f"[Rank {self.rank}] Megatron parallel initialized")
     
     def _init_model(self):
         """Initialize Megatron model"""
@@ -76,8 +98,8 @@ class MegatronClient:
         # Convert to Megatron config
         dtype = PrecisionType.to_dtype(torch.bfloat16)
         tf_config = hf_to_mcore_config(hf_config, dtype)
-        
-        print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
+
+        self.print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
         
         def model_provider(pre_process, post_process):
             """Model provider function"""
@@ -96,50 +118,45 @@ class MegatronClient:
         self.model = get_model(
             model_provider,
             wrap_with_ddp=True,
-            use_distributed_optimizer=False,
+            use_distributed_optimizer=True,
         )
         
-        print(f"[Rank {self.rank}] Model initialized with {len(self.model)} modules")
+        self.print(f"[Rank {self.rank}] Model initialized: {self.model}")
     
-    def get_model_info(self):
-        """Get model information"""
-        if hasattr(self, 'model') and self.model:
-            total_params = sum(p.numel() for p in self.model[0].parameters())
-            return {
-                "rank": self.rank,
-                "total_parameters": total_params,
-                "model_type": "megatron",
-                "world_size": self.world_size
-            }
-        return {"error": "Model not initialized"}
+    def _covert_model(self):
+        """Convert model"""
+        from psrl.utils.converter import create_parameter_mapping, convert_megatron_inplace
+        
+        parameter_mapping = create_parameter_mapping("Megatron", self.model_path)
+        unified_state_dict, sharding_dict = convert_megatron_inplace(parameter_mapping, self.model)
+        self.print(f"[Rank {self.rank}] Model converted: {unified_state_dict}")
+        self.print(f"[Rank {self.rank}] Sharding dict: {sharding_dict}")
     
     def shutdown(self):
         """Shutdown client"""
-        print(f"[Rank {self.rank}] Shutting down")
+        self.print(f"[Rank {self.rank}] Shutting down")
         if dist.is_initialized():
             dist.destroy_process_group()
         return True
 
 def test_megatron():
     """Test Megatron client"""
+    log_dir = os.environ.get("PSRL_WORKSPACE") + "/psrl/unit_tests/megatron/log"
+    os.makedirs(log_dir, exist_ok=True)
     ray.init(ignore_reinit_error=True)
     
-    num_workers = 2
+    num_workers = 8
     print(f"Testing MegatronClient with {num_workers} workers")
     
     # Create clients
     clients = [
         MegatronClient.options(num_gpus=1).remote(
             rank=rank, 
-            world_size=num_workers
+            world_size=num_workers,
+            log_dir=log_dir
         )
         for rank in range(num_workers)
     ]
-    
-    # Get model information
-    model_infos = ray.get([client.get_model_info.remote() for client in clients])
-    for info in model_infos:
-        print(f"Model info: {info}")
     
     # Shutdown clients
     ray.get([client.shutdown.remote() for client in clients])

@@ -23,7 +23,7 @@ from verl.utils.fsdp_utils import (
 from psrl.workers.train import TrainInterface, PSRL_BaseTrainWorker
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_TRAIN_CLIENT_NAME
-from psrl.utils.state_dict import convert_fsdp_inplace
+from psrl.utils.converter import convert_fsdp_inplace
 
 
 psrl_logger = logging.getLogger(__file__)

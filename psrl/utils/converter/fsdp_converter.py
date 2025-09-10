@@ -8,7 +8,7 @@ from torch.distributed.fsdp.api import ShardingStrategy, StateDictType
 from verl.utils.fsdp_utils import fsdp_version
 
 from psrl.utils.nixl.nixl_spec import NIXLSharding
-from psrl.utils.state_dict.base_converter import BaseConverter
+from psrl.utils.converter.base_converter import BaseConverter
 
 
 class FSDPConverter(BaseConverter):
@@ -23,7 +23,7 @@ class FSDPConverter(BaseConverter):
         Args:
             model: The FSDP/FSDP2 model instance
         Returns:
-            (converted_state_dict, sharding)
+            (converted_state_dict, sharding_dict)
         """
         # Determine the FSDP strategy and convert accordingly
         # fsdp_state_dict will be (name, DTensor) pairs
@@ -66,7 +66,7 @@ def convert_fsdp_inplace(fsdp_strategy: str, model) -> Tuple[Dict[str, torch.Ten
     Args:
         model: The FSDP/FSDP2 model instance
     Returns:
-        (converted_state_dict, sharding)
+        (converted_state_dict, sharding_dict)
     """
     if fsdp_strategy == "fsdp":
         assert fsdp_version(model) == 1, "FSDP version 1 is expected for 'fsdp' strategy."

@@ -32,7 +32,7 @@ from psrl.utils.ray import RayLock, AsyncRayLock
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, deprecated, EventType
 from psrl.utils.state_dict import create_parameter_mapping, convert_vllm_inplace
-from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_GEN_CLIENT_NAME
+from psrl.utils.nixl import NIXLInterface
 from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.ps.request_status_tracker import RequestStatus
 
@@ -307,8 +307,9 @@ class PSRL_GenWorker(Worker):
         """
         return self.rank == self.get_instance_representative_rank()
     
+    @deprecated("Use _broadcast_val_from_representative_rank instead")
     def _broadcast_int_val_from_representative_rank(self, val: Optional[int] = None) -> None:
-        # TODO(lhy): This is a temporary solution to broadcast the int value from the representive rank to all instance ranks
+        # NOTE(lhy): This is a temporary solution to broadcast the int value from the representative rank to all instance ranks
         # A more general solution is to use the `torch.distributed.broadcast_object_list` (https://pytorch.org/docs/stable/distributed.html#torch.distributed.broadcast_object_list)
         """Broadcast an integer value from the representative rank to all instance ranks."""
         if self.instance_dist_group == None:
@@ -328,7 +329,31 @@ class PSRL_GenWorker(Worker):
         if self.is_instance_representative_rank:
             # Only the representative rank needs to register the rollout instance
             ray.get(self.gen_interface.ps_manager_handle.register_rollout_instance.remote(self.get_instance_id()))
-
+        
+    def _broadcast_val_from_representative_rank(self, val: Optional[Any] = None) -> Any:
+        # Use torch.distributed.broadcast_object_list for generic object broadcasting
+        if self.instance_dist_group is None:
+            # Create the instance distribution group if it doesn't exist
+            self.instance_dist_group = dist.new_group(ranks=self.get_instance_ranks())
+        # Create object list for broadcasting
+        obj_list = [val]
+        if self.is_instance_representative_rank:
+            # Current rank is the representative rank, broadcast object to all instance ranks
+            dist.broadcast_object_list(
+                obj_list,
+                src=self.get_instance_representative_rank(),
+                group=self.instance_dist_group
+            )
+            return val
+        else:
+            # Current rank is not the representative rank, receive object from representative rank
+            dist.broadcast_object_list(
+                obj_list,
+                src=self.get_instance_representative_rank(),
+                group=self.instance_dist_group
+            )
+            return obj_list[0]
+        
     def _build_rollout(self, trust_remote_code=False):
         """
         Build the rollout engine and sharding manager for the PSRL GenWorker.
@@ -375,6 +400,8 @@ class PSRL_GenWorker(Worker):
         update_model_config(self.model_hf_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             psrl_logger.info(f"Model config after override: {self.model_hf_config}")
+
+        psrl_logger.info(f"Building {rollout_name} rollout with seed {self.seed}.")
         rollout = PSRL_vLLMRollout(
             model_path=local_path,
             config=self.config.rollout,
@@ -598,7 +625,7 @@ class PSRL_GenWorker(Worker):
                 curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
                 needed_model_version = curr_rollout_instance_model_version # By default, we will use the current rollout instance model version
                 # NOTE(lhy): This is a wrapper for ps_manager_handle to gurantee the `reserve_num` and `reserve_rollout_instance_request` are merged and called atomically
-                # By adding  asyncio method to the ps_manager_handle ray actor, we can ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
+                # By adding asyncio method to the ps_manager_handle ray actor, we can ensure that there won't be race condition when multiple GenWorkers are trying to reserve requests
                 with RayLock(ps_manager_handle):
                     # Filter out the parent_ids for new requests that need to be reserved
                     if self.config.rollout.n > 1:
@@ -638,10 +665,10 @@ class PSRL_GenWorker(Worker):
                     for request_id, (buffer_ids, entry_ids) in zip(reserve_ids, results):
                         assert buffer_ids is not None and entry_ids is not None, f"Failed to reserve rollout instance {rollout_instance_id} request {request_id}."
                 # Use the pytorch distributed communication here to broadcast the model version
-                self._broadcast_int_val_from_representative_rank(needed_model_version)
+                self._broadcast_val_from_representative_rank(needed_model_version)
             else:
                 # If not the representative rank, we will get the needed_model_version from the representative rank
-                needed_model_version = self._broadcast_int_val_from_representative_rank()
+                needed_model_version = self._broadcast_val_from_representative_rank()
         """
         
         rollout_instance_id = self.get_instance_id()
@@ -670,7 +697,8 @@ class PSRL_GenWorker(Worker):
         # Step 4: Put the outputs to the rollout queue
         # This is take place only on the representative rank of the rollout instance
         if self.is_instance_representative_rank:
-            rollout_queue.put(outputs)
+            with log_dual_events("Put outputs to rollout queue", psrl_logger, event_type=EventType.OTHER):
+                rollout_queue.put(outputs)
 
         # NOTE: Occupy operation is moved to data processor
 
@@ -708,14 +736,14 @@ class PSRL_GenWorker(Worker):
                 self.version_to_task_num[needed_model_version] -= 1
                 if self.version_to_task_num[needed_model_version] == 0:
                     self.version_to_task_num.pop(needed_model_version)
-                    min_version = min(self.version_to_task_num.keys(), default=-1)
-            if (
-                min_version > needed_model_version and
-                not self.require_version_update_event.is_set()
-            ):
-                psrl_logger.debug(f"All tasks for model version {needed_model_version} done, "
-                                    f"waiting for new model version = {min(self.version_to_task_num.keys())}")
-                self.require_version_update_event.set()
+                    if (
+                        self.version_to_task_num and
+                        min(self.version_to_task_num.keys()) > needed_model_version and
+                        not self.require_version_update_event.is_set()
+                    ):
+                        psrl_logger.info(f"All tasks for model version {needed_model_version} done, "
+                                         f"waiting for new model version >= {min(self.version_to_task_num.keys())}")
+                        self.require_version_update_event.set()
         
         # Start the main loop for async generation
         while self._rollout_running:
@@ -890,26 +918,25 @@ class PSRL_GenWorker(Worker):
                 # otherwise, we need to enter the rollout sharding manager for each batch
                 batch_num = 0
                 while True:
-                    # Get request num for the next batch
-                    request_num = self.request_num_queue.get()
-                    if request_num is None:
-                        psrl_logger.info("Received end signal, all data is generated. Stopping generation.")
-                        break
-                    if request_num == 0:
-                        continue
-
-                    assert request_num > 0, f"Received invalid request_num: {request_num}, should be greater than 0."
-                    
-                    requests = []
-                    for _ in range(request_num):
-                        # Get next batch from the request queue
-                        try:
-                            request = self.request_queue.popleft()
-                        except IndexError:
-                            raise ValueError("Request queue is empty, cannot get next request.")
-                        requests.append(request)
-                    batch_data = DataProto.concat(requests)
-                    psrl_logger.debug(f"Begin {batch_num}-batch with {len(batch_data)} requests for batch generation.")
+                    with log_dual_events("Get request", psrl_logger, event_type=EventType.OTHER):
+                        request_num = self.request_num_queue.get()
+                        if request_num is None:
+                            psrl_logger.info("Received end signal, all data is generated. Stopping generation.")
+                            break
+                        if request_num == 0:
+                            psrl_logger.info("Received request_num 0, skipping generation.")
+                            continue
+                        assert request_num > 0, f"Received invalid request_num: {request_num}, should be greater than 0."
+                        requests = []
+                        for _ in range(request_num):
+                            # Get the next request from the request queue
+                            try:
+                                request = self.request_queue.get(timeout=30)
+                            except queue.Empty:
+                                raise ValueError("Request queue is empty after 30 seconds, cannot get next request.")
+                            requests.append(request)
+                        batch_data = DataProto.concat(requests)
+                    psrl_logger.info(f"Begin round {round} batch with {len(batch_data)} requests for batch generation.")
                     self.batch_gen(batch_data, rollout_queue)
                     batch_num += 1
 

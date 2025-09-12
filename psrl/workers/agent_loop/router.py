@@ -289,7 +289,10 @@ class RolloutRouter:
                 else:
                     vllm_output, update_status = await self.rollout_wg_list[gen_worker_idx].execute_all_async("generate_async", request)
                 if vllm_output is None:
-                    await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version)
+                    if self.rank_0_is_model_owner:
+                        await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version)
+                    else:
+                        await self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version)
                     return None
                 
                 request = self._consolidate_responses(request, vllm_output)

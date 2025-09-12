@@ -38,7 +38,7 @@ list_patches() {
 
 # Function to get vllm version
 get_vllm_version() {
-    python-c "
+    python -c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')
@@ -59,14 +59,14 @@ find_patch_file() {
     
     # If version is available, try to find matching patch
     if [ -n "$vllm_version" ]; then
-        echo "Detected vllm version: $vllm_version"
+        echo "Detected vllm version: $vllm_version" >&2
         
         # Try exact version match first
         for patch in "$SCRIPT_DIR"/*.patch; do
             if [ -f "$patch" ]; then
                 local patch_name=$(basename "$patch")
                 if [[ "$patch_name" == *"$vllm_version"* ]]; then
-                    echo "Found exact version match: $patch_name"
+                    echo "Found exact version match: $patch_name" >&2
                     echo "$patch"
                     return 0
                 fi
@@ -79,7 +79,7 @@ find_patch_file() {
             if [ -f "$patch" ]; then
                 local patch_name=$(basename "$patch")
                 if [[ "$patch_name" == *"$major_minor_patch"* ]]; then
-                    echo "Found version match: $patch_name"
+                    echo "Found version match: $patch_name" >&2
                     echo "$patch"
                     return 0
                 fi
@@ -92,7 +92,7 @@ find_patch_file() {
             if [ -f "$patch" ]; then
                 local patch_name=$(basename "$patch")
                 if [[ "$patch_name" == *"$major_minor"* ]]; then
-                    echo "Found version match: $patch_name"
+                    echo "Found version match: $patch_name" >&2
                     echo "$patch"
                     return 0
                 fi
@@ -103,7 +103,7 @@ find_patch_file() {
     # Fall back to latest patch file
     local latest_patch=$(ls -t "$SCRIPT_DIR"/*.patch 2>/dev/null | head -n1)
     if [ -f "$latest_patch" ]; then
-        echo "Using latest patch file: $(basename "$latest_patch")"
+        echo "Using latest patch file: $(basename "$latest_patch")" >&2
         echo "$latest_patch"
         return 0
     fi
@@ -165,6 +165,9 @@ else
     # Auto-detect patch file
     if [ "$AUTO_MODE" = true ]; then
         PATCH_FILE_PATH=$(ls -t "$SCRIPT_DIR"/*.patch 2>/dev/null | head -n1)
+        if [ -n "$PATCH_FILE_PATH" ]; then
+            echo "Using latest patch file: $(basename "$PATCH_FILE_PATH")"
+        fi
     else
         vllm_version=$(get_vllm_version)
         PATCH_FILE_PATH=$(find_patch_file "$vllm_version")
@@ -184,13 +187,17 @@ echo "Searching vllm install path..."
 
 echo "Try to find vllm by python import..."
 
-VLLM_PATH=$(python-c "
+VLLM_PATH=$(python -c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')
-import vllm
-sys.stdout = sys.__stdout__
-print(os.path.dirname(vllm.__file__))
+try:
+    import vllm
+    sys.stdout = sys.__stdout__
+    print(os.path.dirname(vllm.__file__))
+except:
+    sys.stdout = sys.__stdout__
+    print('')
 " 2>/dev/null || echo "")
 
 if [ -n "$VLLM_PATH" ] && [ -d "$VLLM_PATH" ]; then

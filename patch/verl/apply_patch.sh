@@ -38,7 +38,7 @@ list_patches() {
 
 # Function to get verl version
 get_verl_version() {
-    python-c "
+    python -c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')
@@ -59,14 +59,14 @@ find_patch_file() {
     
     # If version is available, try to find matching patch
     if [ -n "$verl_version" ]; then
-        echo "Detected verl version: $verl_version"
+        echo "Detected verl version: $verl_version" >&2
         
         # Try exact version match first
         for patch in "$SCRIPT_DIR"/*.patch; do
             if [ -f "$patch" ]; then
                 local patch_name=$(basename "$patch")
                 if [[ "$patch_name" == *"$verl_version"* ]]; then
-                    echo "Found exact version match: $patch_name"
+                    echo "Found exact version match: $patch_name" >&2
                     echo "$patch"
                     return 0
                 fi
@@ -79,7 +79,7 @@ find_patch_file() {
             if [ -f "$patch" ]; then
                 local patch_name=$(basename "$patch")
                 if [[ "$patch_name" == *"$major_minor"* ]]; then
-                    echo "Found version match: $patch_name"
+                    echo "Found version match: $patch_name" >&2
                     echo "$patch"
                     return 0
                 fi
@@ -90,7 +90,7 @@ find_patch_file() {
     # Fall back to latest patch file
     local latest_patch=$(ls -t "$SCRIPT_DIR"/*.patch 2>/dev/null | head -n1)
     if [ -f "$latest_patch" ]; then
-        echo "Using latest patch file: $(basename "$latest_patch")"
+        echo "Using latest patch file: $(basename "$latest_patch")" >&2
         echo "$latest_patch"
         return 0
     fi
@@ -152,6 +152,9 @@ else
     # Auto-detect patch file
     if [ "$AUTO_MODE" = true ]; then
         PATCH_FILE_PATH=$(ls -t "$SCRIPT_DIR"/*.patch 2>/dev/null | head -n1)
+        if [ -n "$PATCH_FILE_PATH" ]; then
+            echo "Using latest patch file: $(basename "$PATCH_FILE_PATH")"
+        fi
     else
         verl_version=$(get_verl_version)
         PATCH_FILE_PATH=$(find_patch_file "$verl_version")
@@ -170,13 +173,17 @@ echo "Using patch file: $(basename "$PATCH_FILE_PATH")"
 echo "Searching verl install path..."
 
 echo "Try to find verl by python import..."
-VERL_PATH=$(python-c "
+VERL_PATH=$(python -c "
 import sys
 import os
 sys.stdout = open(os.devnull, 'w')
-import verl
-sys.stdout = sys.__stdout__
-print(os.path.dirname(verl.__file__))
+try:
+    import verl
+    sys.stdout = sys.__stdout__
+    print(os.path.dirname(verl.__file__))
+except:
+    sys.stdout = sys.__stdout__
+    print('')
 " 2>/dev/null || echo "")
 
 if [ -n "$VERL_PATH" ] && [ -d "$VERL_PATH" ]; then

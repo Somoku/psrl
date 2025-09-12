@@ -1,6 +1,7 @@
 import os
 import torch
 import logging
+from typing import List
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -67,3 +68,9 @@ def create_rl_sampler(data_config, dataset):
         sampler = SequentialSampler(data_source=dataset)
 
     return sampler
+
+def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
+    # remove the left padding in the prompt token_id
+    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
+    token_ids = prompt_token_ids[non_pad_index:].tolist()
+    return token_ids

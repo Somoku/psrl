@@ -352,7 +352,7 @@ gen_actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
-    use_post_sampling_logprobs: True
+    use_post_sampling_logprobs: False
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB

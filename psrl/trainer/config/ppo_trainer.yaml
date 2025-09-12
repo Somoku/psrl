@@ -343,7 +343,7 @@ gen_actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
-    use_post_sampling_logprobs: True
+    use_post_sampling_logprobs: False
     interrupt_as_prompt: ${psrl.partial_rollout.interrupt_as_prompt}
     multi_stage_wake_up: false # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
     engine_kwargs: # inference engine parameters

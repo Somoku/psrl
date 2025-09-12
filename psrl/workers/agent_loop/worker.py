@@ -19,6 +19,7 @@ from psrl.workers.agent_loop.loops.utils import DummyConfig, AGENT_LOOP_REGISTRY
 from psrl.workers.ps.request_status_tracker import RequestStatus
 from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
+from psrl.utils.dataset.utils import _pre_process_inputs
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -243,8 +244,16 @@ class PSRL_AgentLoopWorker:
 
         # prompts
         self.tokenizer.padding_side = "left"
+        if "raw_prompt_ids" not in inputs.non_tensor_batch:
+            batch_size = len(inputs)
+            raw_prompt_ids = np.array(
+                [_pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i]) for i in range(batch_size)], dtype=object
+            )
+        else:
+            raw_prompt_ids = inputs.non_tensor_batch["raw_prompt_ids"]
+
         prompt_output = self.tokenizer.pad(
-            [{"input_ids": _input.batch["input_ids"]} for _input in inputs],
+            [{"input_ids": raw_prompt_id} for raw_prompt_id in raw_prompt_ids],
             padding="max_length",
             max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
             return_tensors="pt",

@@ -7,8 +7,7 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
-GLOBAL_BATCH_SIZE=1024
-MINI_BATCH_SIZE=256
+GLOBAL_BATCH_SIZE=128
 
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
@@ -65,8 +64,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.n=5 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
-    train_actor_rollout_ref.actor.optim.lr=3e-6 \
-    train_actor_rollout_ref.actor.ppo_mini_batch_size=${MINI_BATCH_SIZE} \
+    train_actor_rollout_ref.actor.optim.lr=1e-6 \
+    train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32 \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \

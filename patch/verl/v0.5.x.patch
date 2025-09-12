@@ -12,10 +12,10 @@ index 39979f84..806aa7ca 100644
              self.batch = self.batch.consolidate()
          torch.save(self.batch, buffer)
 diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
-index 2606a3ef..4705f00a 100644
+index 2606a3ef..c802249c 100644
 --- a/verl/single_controller/base/worker.py
 +++ b/verl/single_controller/base/worker.py
-@@ -101,7 +101,7 @@ class Worker(WorkerHelper):
+@@ -101,25 +101,13 @@ class Worker(WorkerHelper):
          assert isinstance(rank, int), f"rank must be int, instead of {type(rank)}"
  
          if rank == 0:
@@ -24,11 +24,42 @@ index 2606a3ef..4705f00a 100644
              rank_zero_info = {
                  "MASTER_ADDR": master_addr,
                  "MASTER_PORT": master_port,
+             }
+ 
+-            if os.getenv("WG_BACKEND", None) == "ray":
+-                from verl.single_controller.base.register_center.ray import create_worker_group_register_center
+-
+-                self.register_center = create_worker_group_register_center(
+-                    name=register_center_name, info=rank_zero_info
+-                )
+-
+             os.environ.update(rank_zero_info)
+-        else:
+-            self.register_center = ray.get_actor(register_center_name)
+-
+-        # set worker info for node affinity scheduling
+-        ray.get(self.register_center.set_worker_info.remote(rank, ray.get_runtime_context().get_node_id()))
+ 
+     @classmethod
+     def env_keys(cls):
 diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
-index b692206b..d6c8e600 100644
+index b692206b..e1db23b7 100644
 --- a/verl/single_controller/ray/base.py
 +++ b/verl/single_controller/ray/base.py
-@@ -31,6 +31,18 @@ from verl.utils.py_functional import temp_env_var
+@@ -22,15 +22,29 @@ import ray
+ from ray.experimental.state.api import get_actor
+ from ray.util import list_named_actors
+ from ray.util.placement_group import PlacementGroup, placement_group
+-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
++from ray.util.scheduling_strategies import (NodeAffinitySchedulingStrategy,
++                                            PlacementGroupSchedulingStrategy)
+ 
+ from verl.protocol import DataProto, _padding_size_key
+-from verl.single_controller.base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
++from verl.single_controller.base import (ClassWithInitArgs, ResourcePool,
++                                         Worker, WorkerGroup)
+ from verl.single_controller.base.decorator import MAGIC_ATTR, Dispatch
+ from verl.utils.py_functional import temp_env_var
  
  __all__ = ["Worker"]
  
@@ -47,7 +78,7 @@ index b692206b..d6c8e600 100644
  
  def get_random_string(length: int) -> str:
      import random
-@@ -230,12 +242,51 @@ class RayClassWithInitArgs(ClassWithInitArgs):
+@@ -230,12 +244,51 @@ class RayClassWithInitArgs(ClassWithInitArgs):
              options = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=target_node_id, soft=False)}
              return self.cls.options(**options).remote(*self.args, cuda_visible_devices=visible_devices, **self.kwargs)
  
@@ -104,7 +135,7 @@ index b692206b..d6c8e600 100644
  
          if use_gpu and device_name == "cuda":
              options["num_gpus"] = num_gpus
-@@ -356,6 +407,17 @@ class RayWorkerGroup(WorkerGroup):
+@@ -356,6 +409,17 @@ class RayWorkerGroup(WorkerGroup):
          self._world_size = world_size
          # cia.add_kwarg("_world_size", world_size)
          num_gpus = 1 / resource_pool.max_colocate_count
@@ -122,7 +153,7 @@ index b692206b..d6c8e600 100644
  
          rank = -1
          local_world_size = resource_pool.store[0]
-@@ -372,10 +434,9 @@ class RayWorkerGroup(WorkerGroup):
+@@ -372,10 +436,9 @@ class RayWorkerGroup(WorkerGroup):
                      "WG_BACKEND": "ray",
                      "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
                      "RAY_LOCAL_RANK": str(local_rank),
@@ -135,7 +166,7 @@ index b692206b..d6c8e600 100644
  
                  import re
  
-@@ -411,43 +472,6 @@ class RayWorkerGroup(WorkerGroup):
+@@ -411,43 +474,6 @@ class RayWorkerGroup(WorkerGroup):
                  self._workers.append(worker)
                  self._worker_names.append(name)
  
@@ -180,53 +211,10 @@ index b692206b..d6c8e600 100644
      def worker_names(self):
          return self._worker_names
 diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
-index d5cea362..24238f8d 100644
+index d5cea362..49bdf715 100644
 --- a/verl/workers/actor/dp_actor.py
 +++ b/verl/workers/actor/dp_actor.py
-@@ -26,20 +26,26 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
- 
- import verl.utils.torch_functional as verl_F
- from verl import DataProto
--from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
--from verl.utils.device import get_device_name, is_cuda_available, is_npu_available
-+from verl.trainer.ppo.core_algos import (agg_loss, compute_policy_loss,
-+                                         get_policy_loss_fn, kl_penalty)
-+from verl.utils.device import (get_device_name, is_cuda_available,
-+                               is_npu_available)
- from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
- from verl.utils.profiler import GPUMemoryLogger
- from verl.utils.py_functional import append_to_dict
--from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
-+from verl.utils.seqlen_balancing import (prepare_dynamic_batch,
-+                                         restore_dynamic_batch)
- from verl.utils.torch_functional import logprobs_from_logits
--from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
-+from verl.utils.ulysses import (gather_outputs_and_unpad, ulysses_pad,
-+                                ulysses_pad_and_slice_inputs)
- from verl.workers.actor import BasePPOActor
- 
- if is_cuda_available:
--    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-+    from flash_attn.bert_padding import (index_first_axis, pad_input,
-+                                         rearrange, unpad_input)
- elif is_npu_available:
--    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
-+    from transformers.integrations.npu_flash_attention import (
-+        index_first_axis, pad_input, rearrange, unpad_input)
- 
- 
- __all__ = ["DataParallelPPOActor"]
-@@ -125,7 +131,8 @@ class DataParallelPPOActor(BasePPOActor):
-                     ).transpose(0, 1)
- 
-                 if "image_bound" in multi_modal_inputs:
--                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
-+                    from verl.utils.dataset.vision_utils import \
-+                        process_multi_modal_inputs_for_minicpmo
- 
-                     multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
-                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
-@@ -179,6 +186,7 @@ class DataParallelPPOActor(BasePPOActor):
+@@ -179,6 +179,7 @@ class DataParallelPPOActor(BasePPOActor):
  
                  else:
                      logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -235,7 +223,7 @@ index d5cea362..24238f8d 100644
  
                      # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index 4141d986..84d49e62 100644
+index 4141d986..12d46dad 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -113,33 +113,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -338,7 +326,7 @@ index 4141d986..84d49e62 100644
  
          override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
  
-@@ -921,13 +932,22 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -921,13 +932,24 @@ class CriticWorker(Worker, DistProfilerExtension):
          DistProfilerExtension.__init__(
              self, DistProfiler(rank=self.rank, config=omega_conf_to_dataclass(config.get("profiler")))
          )
@@ -356,13 +344,16 @@ index 4141d986..84d49e62 100644
  
          if not torch.distributed.is_initialized():
              torch.distributed.init_process_group(
-                 backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
+-                backend=get_nccl_backend(), init_method=os.environ.get("DIST_INIT_METHOD", None)
++                backend=get_nccl_backend(),
++                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
++                init_method=os.environ.get("DIST_INIT_METHOD", None),
              )
 -        self.config = config
  
          # build device mesh for Ulysses Sequence Parallel
          world_size = torch.distributed.get_world_size()
-@@ -946,10 +966,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -946,10 +968,6 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
  
@@ -373,7 +364,7 @@ index 4141d986..84d49e62 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
-@@ -972,7 +988,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -972,7 +990,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                  f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
                  f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
              )
@@ -381,7 +372,7 @@ index 4141d986..84d49e62 100644
  
      def _build_critic_model_optimizer(self, config):
          # the following line is necessary
-@@ -1171,12 +1186,14 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1171,12 +1188,14 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          return critic_module, critic_optimizer, critic_lr_scheduler
  
@@ -397,7 +388,7 @@ index 4141d986..84d49e62 100644
  
          self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
              self.config
-@@ -1421,7 +1438,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1421,7 +1440,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
              raise NotImplementedError(f"Unknown strategy: {config.strategy}")
          return reward_module
  

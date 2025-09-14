@@ -41,6 +41,16 @@ psrl:
     server_ip: ${psrl.ps_manager_ip}
     server_port: 23456
     max_pinned_temp_memory_slots: 4
+  group_post_process:
+    enable: False # Whether to enable group post-processing
+    name: null # Name of the registered group post-processor to use
+    # Available options: "dynamic_sampling_filter", "no_filter"
+    # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
+  buffer_post_process:
+    enable: False # Whether to enable buffer post-processing
+    name: null # Name of the registered buffer post-processor to use
+    # Available options: "dynamic_sampling_filter", "no_filter"
+    # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
 
 profiler:
   # True for each task has its own database, False for all tasks in one training step share one database.
@@ -522,6 +532,9 @@ algorithm:
   pf_ppo:
     reweight_method: pow # Method for reweighting samples: "pow", "max_min", or "max_random"
     weight_pow: 2.0 # Power used for weight scaling in "pow" method
+  # Group filtering settings for group post-processing
+  filter_groups:
+    metric: null # Metric to use for filtering: null, acc, seq_final_reward, seq_reward...
 
 trainer:
   balance_batch: True

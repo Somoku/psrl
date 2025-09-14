@@ -13,11 +13,10 @@ from verl.utils.fs import copy_to_local
 
 from psrl.utils.nixl import NIXLClientType, NIXLInterface, NIXLMultiStorageClients, GLOBAL_META_SERVER_NAME, GLOBAL_PS_CLIENT_NAME
 from psrl.utils.converter.hf_converter import convert_hf_inplace
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, EventType
+from psrl.utils.logger import get_ps_logger, setup_ps_logger, get_worker_info, log_dual_events, log_single_event, EventType
 
-
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
+# Use the unified PS logger
+psrl_logger = get_ps_logger()
 
 
 # TODO(lhy): Implement the PSStoragePlan
@@ -48,7 +47,7 @@ class PSStorageWorker:
         # Build logger
         self.rank = int(os.environ.get("RANK"))
         self.log_prefix = f"PSStorageWorker_R{self.rank}"
-        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        setup_ps_logger(self.psrl_config.logging_path, self.log_prefix)
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
         
     def init_nixl_client(self):

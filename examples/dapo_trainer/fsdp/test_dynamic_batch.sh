@@ -1,0 +1,155 @@
+#!/bin/bash
+set -xeuo pipefail
+
+project_name='psrl_dapo'
+experiment_name='DAPO-Qwen2.5-0.5b-AIME24-fsdp2-batch-nixl-staleness_0'
+
+source ${PSRL_WORKSPACE}/env/psrl.sh
+
+HOME=${PSRL_WORKSPACE}
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
+TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
+TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
+
+GEN_TP=2 # TP in the generation side
+GEN_PP=1 # PP in the generation side
+VAL_TP=2 # TP in the training side for validation
+
+NNODES=2
+NGPUS_PER_NODE=8
+
+GEN_NNODES=${NNODES} # Number of nodes for generation
+GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
+GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
+GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
+
+TRAIN_NNODES=${NNODES} # Number of nodes for training
+TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
+
+adv_estimator=grpo
+use_kl_in_reward=False
+kl_coef=0.0
+use_kl_loss=False
+kl_loss_coef=0.0
+
+clip_ratio_low=0.2
+clip_ratio_high=0.28
+
+max_prompt_length=1024
+max_response_length=1024
+enable_overlong_buffer=True
+overlong_buffer_len=128
+overlong_penalty_factor=1.0
+
+loss_agg_mode="token-mean"
+
+train_prompt_bsz=16
+n_resp_per_prompt=4
+train_prompt_mini_bsz=16
+
+filter_groups_metric=acc
+
+# Algorithm
+temperature=1.0
+top_p=1.0
+top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+val_top_p=0.7
+
+# Performance Related Parameter
+use_dynamic_bsz=True
+actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
+infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
+offload=False
+
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
+    psrl.ps_manager_ip=${LOCAL_IP} \
+    psrl.staleness=0 \
+    psrl.staleness_buffer_entries=${train_prompt_bsz} \
+    psrl.gen_mode=batch \
+    psrl.ps_mode=cpu_ref \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/fsdp_psrl_log/${experiment_name} \
+    psrl.log_prob.enable_inference_engine_log_prob=True \
+    psrl.log_prob.enable_proxy_log_prob=False \
+    psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
+    psrl.deployment.rollout_nnodes_per_instance=1 \
+    psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.train_nnodes=${TRAIN_NNODES} \
+    psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
+    psrl.nixl.server_mode=meta_server \
+    psrl.nixl.server_port=23456 \
+    psrl.buffer_post_process.enable=True \
+    psrl.buffer_post_process.name=dynamic_sampling_filter \
+    \
+    gen_actor_rollout_ref.model.path="$MODEL_PATH" \
+    +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
+    gen_actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    gen_actor_rollout_ref.rollout.mode=sync \
+    gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
+    gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
+    gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    gen_actor_rollout_ref.rollout.temperature=${temperature} \
+    gen_actor_rollout_ref.rollout.top_p=${top_p} \
+    gen_actor_rollout_ref.rollout.top_k=${top_k} \
+    \
+    train_actor_rollout_ref.model.path="$MODEL_PATH" \
+    train_actor_rollout_ref.model.use_remove_padding=True \
+    +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
+    train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
+    train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
+    train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
+    train_actor_rollout_ref.rollout.val_kwargs.n=1 \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    train_actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+    train_actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+    train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
+    train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    train_actor_rollout_ref.actor.optim.lr=1e-6 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
+    train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    train_actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
+    train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
+    train_actor_rollout_ref.actor.entropy_coeff=0 \
+    train_actor_rollout_ref.actor.grad_clip=1.0 \
+    train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    \
+    reward_model.reward_manager=dapo \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${TEST_FILE}" \
+    data.prompt_key=prompt \
+    data.truncation='left' \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
+    data.train_batch_size=${train_prompt_bsz} \
+    algorithm.adv_estimator=${adv_estimator} \
+    algorithm.use_kl_in_reward=${use_kl_in_reward} \
+    algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.filter_groups.metric=${filter_groups_metric} \
+    trainer.logger=['console'] \
+    trainer.project_name=${project_name} \
+    trainer.experiment_name=${experiment_name} \
+    trainer.val_before_train=True \
+    trainer.total_training_steps=200 \
+    trainer.save_freq=200 \
+    trainer.test_freq=10 \
+    trainer.total_epochs=10 2>&1 | tee ${experiment_name}.log

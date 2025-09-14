@@ -14,6 +14,8 @@ from omegaconf import OmegaConf
 from verl.trainer.ppo.reward import load_reward_manager
 
 from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager
+from psrl.utils.post_processor import load_group_post_processor
+from psrl.utils.post_processor import load_buffer_post_processor
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -215,6 +217,10 @@ class TaskRunner:
         from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
         from verl.utils.dataset.rl_dataset import collate_fn
 
+        # Load post-processor from configuration
+        group_post_process_fn = load_group_post_processor(config)
+        buffer_post_process_fn = load_buffer_post_processor(config)
+
         # Initialize the PPO trainer.
         trainer = PSRL_RayPPOTrainer(
             config=config,
@@ -226,8 +232,8 @@ class TaskRunner:
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
             collate_fn=collate_fn,
-            group_post_process_fn=None,
-            buffer_post_process_fn=None,
+            group_post_process_fn=group_post_process_fn,
+            buffer_post_process_fn=buffer_post_process_fn,
             device_name=config.trainer.device,
         )
         # Initialize the workers of the trainer.

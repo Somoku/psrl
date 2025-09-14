@@ -12,15 +12,15 @@ from dataclasses import dataclass
 from verl import DataProto
 
 from psrl.utils.ray import add_lock
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
+from psrl.utils.logger import get_ps_logger, setup_ps_logger, get_worker_info, log_single_event, EventType, deprecated
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, EntryInfo
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 from psrl.workers.ps.request_status_tracker import RequestStatusTracker
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+# Use the unified PS logger
+psrl_logger = get_ps_logger()
 
 
 # TODO(lhy): may support other tag format
@@ -53,7 +53,12 @@ class ModelStore:
 # TODO(lhy): Ensure PSManager is a singleton
 @add_lock
 class PSManager(RequestStatusTracker):
-    def __init__(self, psrl_config: DictConfig, group_post_process_fn: Optional[callable] = None) -> None:
+    def __init__(
+        self,
+        psrl_config: DictConfig,
+        group_post_process_fn: Optional[callable] = None,
+        buffer_post_process_fn: Optional[callable] = None,
+    ) -> None:
         """Initialize the Parameter Server (PS) Manager.
         
         The PS Manager is responsible for managing model versions, staleness buffers, 
@@ -65,6 +70,8 @@ class PSManager(RequestStatusTracker):
                 rollout_n, staleness buffer entries, staleness limit, etc.
             group_post_process_fn (Optional[callable]): Optional function to post-process 
                 grouped entry data before occupying the buffer
+            buffer_post_process_fn (Optional[callable]): Optional function to post-process 
+                ready buffer data
         """
         RequestStatusTracker.__init__(self)
 
@@ -77,6 +84,7 @@ class PSManager(RequestStatusTracker):
             self.alg_rollout_n = self.rollout_n
         
         self.group_post_process_fn = group_post_process_fn
+        self.buffer_post_process_fn = buffer_post_process_fn
         
         # PS worker specific attributes
         self.rollout_instance_tracker: Dict[Union[str, int], RolloutInstanceStatus] = {}  # Maps rollout instance IDs to their corresponding info
@@ -100,6 +108,7 @@ class PSManager(RequestStatusTracker):
         self.staleness_inventory = StalenessInventory(
             num_entries=entries_per_buffer,
             staleness=self.psrl_config.staleness,
+            buffer_post_process_fn=self.buffer_post_process_fn,
         )
         
         # Track finished child requests for Group Sampling
@@ -115,13 +124,17 @@ class PSManager(RequestStatusTracker):
             
         # Build logger
         self.log_prefix = f"PSManager"
-        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        setup_ps_logger(self.psrl_config.logging_path, self.log_prefix)
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
     @deprecated("It is too slow to get the PS handle by `ray.get_runtime_context()`")
     def get_ps_manager_handle(self):
         """Get the PS handle."""
         return ray.get_runtime_context().current_actor
+
+    def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
+        """Set the reference to the agent loop manager."""
+        self.staleness_inventory.set_agent_loop_manager(agent_loop_manager)
 
     def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
         """Register a new rollout instance with the PS Manager.
@@ -135,23 +148,42 @@ class PSManager(RequestStatusTracker):
         
     # ------- STALENESS INVENTORY MANAGEMENT -------
 
-    def _group_post_processing(self, entry_infos: List[EntryInfo]):
+    def _group_post_process(self, parent_id: int, entry_infos: List[EntryInfo]) -> bool:
         """Apply post-processing function to a group of entry infos.
         
         This method retrieves data from the data pool for each entry, applies
         the group post-processing function, and stores the processed data back.
         
         Args:
+            parent_id (int): The parent request id for the group
             entry_infos (List[EntryInfo]): List of entry info objects to process
-            
-        Raises:
-            AssertionError: If group_post_process_fn is not set
+        
+        Returns:
+            bool: whether the group data is reserved
         """
         assert self.group_post_process_fn is not None, "Group post-processing function is not set."
-        data_list = [self.staleness_inventory.get_from_data_pool(entry_info) for entry_info in entry_infos]
-        processed_data_list = self.group_post_process_fn(data_list)
-        for entry_info, processed_data in zip(entry_infos, processed_data_list):
-            self.staleness_inventory.add_to_data_pool(entry_info, processed_data)
+
+        data_list = [self.staleness_inventory.pop_from_data_pool(entry_info) for entry_info in entry_infos]
+        group_data = DataProto.concat(data_list)
+        processed_group_data = self.group_post_process_fn(group_data)
+        
+        if not processed_group_data:
+            psrl_logger.info(f"Post-processing function returned empty data for parent {parent_id}. Retrying later.")
+            pending_buffers = self.staleness_inventory._buffer_ids_by_status[BufferStatus.PENDING]
+            candidate_ids = list(pending_buffers)
+            if not candidate_ids:
+                waiting_buffer_id = self.staleness_inventory.buffer_id
+            else:
+                waiting_buffer_id = min(candidate_ids)
+
+            # Notify agent loop manager to retry new requests
+            self.staleness_inventory.notify_request_retry(waiting_buffer_id)
+            return False
+        else:
+            processed_group_data_list = processed_group_data.chunk(len(processed_group_data))
+            for entry_info, processed_group_data in zip(entry_infos, processed_group_data_list):
+                self.staleness_inventory.update_to_data_pool(entry_info, processed_group_data)
+            return True
 
     def get_max_reserve_num(self, model_version) -> int:
         """Get the maximum number of entries that can be reserved for a specific model version.
@@ -263,11 +295,7 @@ class PSManager(RequestStatusTracker):
         
             # Notify the request status manager to abort requests
             # whose version_tag is equal to `min_ready_buffer_id - S`
-            # TODO(linsh): optimize the abort logic to avoid frequent aborts
-            if (
-                self.psrl_config.redundant_rollout.enable and
-                max_ready_buffer_id >= self.psrl_config.staleness
-            ):
+            if max_ready_buffer_id >= self.psrl_config.staleness:
                 # Abort requests with version_tag equal to `min_ready_buffer_id - S`
                 version_to_abort = max_ready_buffer_id - self.psrl_config.staleness
                 psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")
@@ -426,15 +454,17 @@ class PSManager(RequestStatusTracker):
                     self.abort_requests(list(abort_child_ids))
                     psrl_logger.debug(f"Successfully aborted {len(abort_child_ids)} child requests")
 
+                reserve_data = True
                 if self.group_post_process_fn:
-                    self._group_post_processing(entry_infos)
+                    reserve_data = self._group_post_process(parent_id, entry_infos)
 
-                psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
-                for i, entry_info in enumerate(entry_infos):
-                    psrl_logger.debug(f"Occupying data for entry_info {i+1}/{len(entry_infos)}: {entry_info}")
-                    self.staleness_inventory.occupy_data(entry_info=entry_info)
+                if reserve_data:
+                    psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
+                    for i, entry_info in enumerate(entry_infos):
+                        psrl_logger.debug(f"Occupying data for entry_info {i+1}/{len(entry_infos)}: {entry_info}")
+                        self.staleness_inventory.occupy_data(entry_info=entry_info)
                 
-                self.try_awake_waiters()
+                    self.try_awake_waiters()
         else:
             # Remove the sample data from the buffer in the request status manager
             self.remove_request_data_from_buffer(request_id)
@@ -523,15 +553,16 @@ class PSManager(RequestStatusTracker):
     def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: Union[str, int]):
         """Update the rollout instance model version to the latest model version."""
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
-
-        self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
         assert self.rollout_coordinator is not None, "Rollout coordinator is not set. Please set it before updating rollout instance model version."
-        # Sync the rollout instance model version in the rollout server
-        ray.get(self.rollout_coordinator.set_rollout_instance_model_version.remote(
-            rollout_instance_id=rollout_instance_id,
-            version_tag=self.model_store.version_tag,
-        ))
-        psrl_logger.debug(f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
+
+        if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
+            self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
+            # Sync the rollout instance model version in the rollout server
+            ray.get(self.rollout_coordinator.set_rollout_instance_model_version.remote(
+                rollout_instance_id=rollout_instance_id,
+                version_tag=self.model_store.version_tag,
+            ))
+            psrl_logger.debug(f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
      
     async def wait_for_ps_model_version(self, target_version: int):
         """

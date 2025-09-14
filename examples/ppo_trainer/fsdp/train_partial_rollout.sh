@@ -27,12 +27,12 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
-PYTHONUNBUFFERED=1 python-m psrl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=stream \
-    psrl.ps_mode=nixl_cpu \
+    psrl.ps_mode=cpu_ref \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/fsdp/psrl_log \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \

@@ -4,6 +4,8 @@ import enum
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Union, Tuple, Set
 
+import ray
+
 from verl import DataProto
 
 from psrl.utils.logger import deprecated
@@ -215,6 +217,14 @@ class StalenessBuffer:
                 raise ValueError("One or more entries have None data. All entries must be occupied.")
             data_list.append(entry.data)
         return DataProto.concat(data_list)
+    
+    def update_all_data(self, data: DataProto):
+        batch_size = len(data)
+        assert batch_size == self.num_entries, \
+            f"Mismatch between buffer size {self.num_entries} and batch size {batch_size} when updating data"
+        data_list = data.chunk(batch_size)
+        for entry, data in zip(self.entries, data_list):
+            entry.data = data
 
 class StalenessInventory:
     """
@@ -245,6 +255,13 @@ class StalenessInventory:
         self._buffer_ids_by_status: Dict[BufferStatus, Set[int]] = {
             status: set() for status in BufferStatus
         }
+
+        # Agent Loop Manager reference
+        self.agent_loop_manager: Optional[ray.actor.ActorHandle] = None
+
+    def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
+        """Set the reference to the agent loop manager."""
+        self.agent_loop_manager = agent_loop_manager
 
     def create_buffer(self, buffer_id: int):
         """
@@ -333,12 +350,45 @@ class StalenessInventory:
                 break
                 
         new_status = buffer.get_status()
+        reserve_buffer = True
         if new_status == BufferStatus.READY:
             if self.buffer_post_process_fn:
-                self.buffer_post_process_fn(buffer)
-        # Update in the new status track
-        self._buffer_ids_by_status[new_status].add(buffer_id)
-     
+                reserve_buffer = self._buffer_post_process(buffer_id, buffer)
+        
+        if reserve_buffer:    
+            # Update in the new status track
+            self._buffer_ids_by_status[new_status].add(buffer_id)
+
+    def _buffer_post_process(self, buffer_id: int, buffer: StalenessBuffer) -> bool:
+        assert self.buffer_post_process_fn is not None, "Buffer post-processing function is not set."
+        
+        buffer_data = buffer.get_all_data()
+        processed_buffer_data = self.buffer_post_process_fn(buffer_data)
+        # NOTE(linsh): Current implementation will retry with new global batch if any sample is filtered
+        if not processed_buffer_data or len(processed_buffer_data) < self.num_entries:
+            psrl_logger.info(f"Post-processing function returned "
+                             f"{len(processed_buffer_data) if processed_buffer_data else 0} requests "
+                             f"for buffer {buffer_id}, less than {self.num_entries}. Retrying later.")
+            uid_of_processed_buffer = processed_buffer_data.non_tensor_batch["uid"].tolist()
+            for entry_id in range(self.num_entries):
+                data = buffer.entries[entry_id].data
+                if int(data.non_tensor_batch["uid"][0]) not in uid_of_processed_buffer:
+                    buffer.delete(entry_id)
+            self._update_buffer_status(buffer_id)
+            pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
+            candidate_ids = list(pending_buffers)
+            if not candidate_ids:
+                waiting_buffer_id = self.buffer_id
+            else:
+                waiting_buffer_id = min(candidate_ids)
+
+            # Notify agent loop manager to retry new requests
+            self.notify_request_retry(waiting_buffer_id)
+            return False
+        else:
+            buffer.update_all_data(processed_buffer_data)
+            return True
+
     def min_ready_buffer_id(self) -> Optional[int]:
         """
         Get the min buffer ID that is in READY state.
@@ -420,6 +470,39 @@ class StalenessInventory:
         assert entry_info not in self.data_pool, f"Data pool already has data for entry info {entry_info}"
 
         self.data_pool[entry_info] = data
+    
+    def update_to_data_pool(
+        self,
+        entry_info: EntryInfo,
+        data: DataProto,
+    ):
+        """
+        Update rollout data to the group data pool for a specific entry.
+
+        Args:
+            entry_info (EntryInfo): The entry metadata.
+            data (DataProto): The data to add.
+        """
+        self.data_pool.pop(entry_info, None)
+        self.data_pool[entry_info] = data
+
+    def pop_from_data_pool(
+        self,
+        entry_info: EntryInfo,
+    ) -> DataProto:
+        """
+        Pop rollout data from the group data pool for a specific entry.
+
+        Args:
+            entry_info (EntryInfo): The entry metadata.
+        Returns:
+            DataProto: The popped data.
+        Raises:
+            AssertionError: If data for the entry does not exist.
+        """
+        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+
+        return self.data_pool.pop(entry_info)
 
     def get_from_data_pool(
         self,
@@ -441,7 +524,7 @@ class StalenessInventory:
 
     def remove_from_data_pool(
         self,
-        entry_info: EntryInfo
+        entry_info: EntryInfo,
     ):
         """
         Delete data from the group data pool for a specific entry.
@@ -583,8 +666,8 @@ class StalenessInventory:
         # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
         # TODO(linsh): add staleness check
-        # if entry_info.model_version + self.staleness < target_buffer_id:
-        #     raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
+        if entry_info.model_version + self.staleness < target_buffer_id:
+            raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
 
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()
@@ -698,4 +781,15 @@ class StalenessInventory:
         data = buffer.get_all_data()
         self.delete_buffer(buffer_id)
         return data
+    
+    def notify_request_retry(self, waiting_buffer_id: int):
+        """
+        Notify the agent loop manager to retry new requests asynchronously.
         
+        Args:
+            waiting_buffer_id (int): The buffer ID that is currently waiting for processing.
+        """
+        assert self.agent_loop_manager is not None, "Agent Loop Manager is not set."
+
+        psrl_logger.debug(f"Notifying agent loop manager to retry new requests for buffer ID {waiting_buffer_id}")
+        ray.get(self.agent_loop_manager.retry_request.remote(waiting_buffer_id))

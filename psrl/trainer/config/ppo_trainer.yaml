@@ -345,13 +345,10 @@ gen_actor_rollout_ref:
     n: 1 # > 1 for grpo
     use_post_sampling_logprobs: False
     interrupt_as_prompt: ${psrl.partial_rollout.interrupt_as_prompt}
-    multi_stage_wake_up: false # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
         disable_mm_preprocessor_cache: False # Whether to disable the preprocessor cache for multimodel models.
-      sglang:
-        attention_backend: null # The attention backend for sglang engine. Options: flashinfer, triton, flashmla, null for default.
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -397,7 +394,6 @@ gen_actor_rollout_ref:
       custom_async_server:
         # Path to the custom async server implementation
         path: null
-
         # Class name of the custom async server class (e.g. AsyncvLLMServer)
         name: null
     status_collection: ${psrl.status_collection}

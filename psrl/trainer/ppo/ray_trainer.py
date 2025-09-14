@@ -146,6 +146,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self._initialize_queue_buffers()
 
         self._validate_config()
+        
+        self._init_ps_manager()
+        
+        # initialize data processor
+        # NOTE(lhy): data processor must be initialized before initializing other workers
+        # so that the total_training_steps can be obtained and the optimizer config (related to weight decay, lr schedule, etc.) can be set
+        # otherwise, it will cause error when running Megatron backend
+        self._init_data_processor()
 
     def _initialize_queue_buffers(self):
         self.process_mode = self.config.psrl.gen_mode
@@ -162,14 +170,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # It holds the data batches that are ready for processing.
         # The size of the queue is determined by the batch size and the process mode.
         # If process_mode is "stream", it will hold multiple requests for streaming processing.
-        # If process_mode is "batch", it will hold a single batch for batch processing.
-        self.data_queue_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n if self.process_mode == "stream" else 1
-        self.data_queue = RayQueue(maxsize=self.data_queue_size)
-        
+        # If process_mode is "batch", it will hold a single batch for batch processing.      
         # Rollout queue is the communication handle between the rollout workers and the data processor (reward module).
         # It holds the rollout data that is ready for reward computation.
-        # The size of the queue is the same as the data queue size.
-        self.rollout_queue = RayQueue(maxsize=self.data_queue_size)
+        # The size of the queue is the same as the whole batch size for streaming mode.
+        # The size of the queue is the same as number of agent workers for batch mode.
+        if self.process_mode == "stream":
+            self.data_queue_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n
+            self.rollout_queue_size = self.data_queue_size
+        else:
+            self.data_queue_size = 1 
+            self.rollout_queue_size = self.config.gen_actor_rollout_ref.rollout.get("agent", {}).get("num_workers", 1)
+        self.data_queue = RayQueue(maxsize=self.data_queue_size)
+        self.rollout_queue = RayQueue(maxsize=self.rollout_queue_size)
 
         # Status queue is used to store the status of the rollout workers.
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
@@ -350,7 +363,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
-    def init_data_processor(self):
+    def _init_ps_manager(self):
+        """Initialize the PS manager for handling model version, requests condition and staleness."""
+        ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
+        assert self.config.psrl.ps_manager_ip in ip_to_node_id, f"PSManager IP {self.config.psrl.ps_manager_ip} not found in ray nodes"
+        psrl_logger.info("Getting the handle of the PSManager")
+        self.ps_manager_handle = ray.remote(PSManager).options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=ip_to_node_id[self.config.psrl.ps_manager_ip],
+                soft=False
+            )
+        ).remote(self.config.psrl, self.group_post_process_fn)
+    
+    def _init_data_processor(self):
         """Initialize the data processor for handling data preprocessing and batching."""
         if self.data_processor is not None:
             return
@@ -458,6 +483,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.reward_server = RewardServer.remote(
             self.config,
             self.tokenizer,
+            self.processor,
             self.ps_manager_handle,
             self.rollout_queue,
             reward_fn=self.reward_fn,
@@ -667,18 +693,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert (
             PSRL_Role.Rollout in self.role_worker_mapping and
             PSRL_Role.Actor in self.role_worker_mapping
-        ), "Rollout, Actor and PS must be in role_worker_mapping." 
-
-        # create PS manager and initialize workergroup 
-        ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
-        assert self.config.psrl.ps_manager_ip in ip_to_node_id, f"PSManager IP {self.config.psrl.ps_manager_ip} not found in ray nodes"
-        psrl_logger.info("Getting the handle of the PSManager")
-        self.ps_manager_handle = ray.remote(PSManager).options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=ip_to_node_id[self.config.psrl.ps_manager_ip],
-                soft=False
-            )
-        ).remote(self.config.psrl, self.group_post_process_fn)
+        ), "Rollout and Actor must be in role_worker_mapping." 
         
         # create nixl interface
         nixl_interface = NIXLInterface(
@@ -790,8 +805,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     future = loop.run_in_executor(executor, create_worker_group, resource_pool, class_dict)
                     return await future
             
-            # Concurrency control within 16 tasks at a time
-            max_concurrent = min(len(tasks), 16)
+            # Concurrency control within max_concurrent tasks at a time
+            # NOTE(lhy): currently set to 1 (the default sync version) to avoid the stuck issue when multiple bundles are trying to be placed at the same time (verl is using STRICT_PACK mode)
+            # To reproduce the issue, you can set it to 16 and run `psrl/examples/precision_test/dapo/megatron_qwen_7b_aime.sh`
+            # where GEN_NNODES=$(( ${NNODES} / 2 )) and TRAIN_NNODES=$(( ${NNODES} / 2 )) 
+            max_concurrent = min(len(tasks), 1)
             semaphore = asyncio.Semaphore(max_concurrent)
             
             async def controlled_create(resource_pool, class_dict):
@@ -895,7 +913,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         attached_gpu_id=None
                     ))
                 ps_resource_pool = PSResourcePool(ps_spec_list=ps_spec_list)
-                psrl_logger.debug(f"PS resource pool: {ps_resource_pool}")
+                psrl_logger.info(f"PS resource pool: {ps_resource_pool}")
                 self.ps_wg = PSWorkerGroup(
                     resource_pool=ps_resource_pool,
                     ps_cls_with_init=PSClassWithInitArgs(
@@ -951,9 +969,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             with log_dual_events(f"Initializing NIXL clients", psrl_logger, event_type=EventType.INIT):
                 futures = []
+                rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())
+                psrl_logger.info(f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, {self.actor_wg.world_size} actor workers, {rollout_world_size} rollout workers")
                 expected_agents = self.ps_wg.world_size + \
                     self.actor_wg.world_size + \
-                    sum([self.rollout_wg_list[i].world_size for i in range(self.config.psrl.deployment.n_rollout_instances)])
+                    rollout_world_size
                 futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
                 futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
                 futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
@@ -1145,9 +1165,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                          self.config.trainer.project_name, self.config.trainer.experiment_name)
 
         self.global_steps = 0
-        
-        # initialize data processor
-        self.init_data_processor()
 
         # load checkpoint before doing anything
         self._load_checkpoint()

@@ -24,6 +24,20 @@ psrl:
       rollout_ngpus_per_node_per_instance: []
       tensor_model_parallel_size_per_instance: [] # Tensor model parallel size for each rollout instance.
       pipeline_model_parallel_size_per_instance: [] # Pipeline model parallel size for each rollout instance.
+  status_collection:
+    enable: True
+    # Engine status sync interval in millisecond (for RolloutCoordinator -> AgentLoopWorkers)
+    engine_status_sync_interval_in_ms: 100  # Sync to agent workers every 0.1 seconds
+  redundant_rollout:
+    enable: False
+    alg_global_batch_size: ${psrl.staleness_buffer_entries}
+    alg_rollout_n: ${psrl.rollout_n}
+    redundant_global_batch_size: null
+    redundant_rollout_n: null
+  partial_rollout:
+    enable: False
+    threshold: null
+    interrupt_as_prompt: False
   nixl:
     server_mode: meta_server
     server_ip: ${psrl.ps_manager_ip}
@@ -353,11 +367,11 @@ gen_actor_rollout_ref:
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
     use_post_sampling_logprobs: False
+    interrupt_as_prompt: ${psrl.partial_rollout.interrupt_as_prompt}
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
-      sglang:
-        attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
+        disable_mm_preprocessor_cache: False # Whether to disable the preprocessor cache for multimodel models.
     val_kwargs:
       # sampling parameters for validation
       top_k: -1 # 0 for hf rollout, -1 for vllm rollout
@@ -365,7 +379,6 @@ gen_actor_rollout_ref:
       temperature: 0
       n: 1
       do_sample: False # default eager for validation
-
     # Multi-turn interaction config for tools or chat.
     multi_turn:
       enable: False  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
@@ -389,7 +402,7 @@ gen_actor_rollout_ref:
       # Qwen/QwQ-32B, Qwen/Qwen3-xxB
       tokenization_sanity_check_mode: strict
     agent:
-      num_workers: 8 # Number of agent loop workers
+      num_workers: 1 # Number of agent loop workers
       # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
       # https://hydra.cc/docs/advanced/instantiate_objects/overview/
       #
@@ -405,16 +418,13 @@ gen_actor_rollout_ref:
       custom_async_server:
         # Path to the custom async server implementation
         path: null
-
         # Class name of the custom async server class (e.g. AsyncvLLMServer)
         name: null
-    # support logging rollout prob for debugging purpose
-    calculate_log_probs: False
-    # Nsight system profiler configs
-    profiler:
-      discrete: False
-      all_ranks: False
-      ranks: []
+    status_collection: ${psrl.status_collection}
+    # trace rollout data
+    trace:
+      backend: null # trace backend, support mlflow, weave
+      token2text: False # whether translate token id to text in output
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}

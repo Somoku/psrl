@@ -81,6 +81,9 @@ class RolloutCoordinator(CommandExtension):
         # Build logger
         self.log_prefix = "RolloutCoordinator"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+        
+    def world_size(self):
+        return sum([rollout_wg.world_size for rollout_wg in self.rollout_wg_list])
 
     def init_nixl_client(self):
         futures = []
@@ -322,7 +325,8 @@ class RolloutCoordinator(CommandExtension):
                         if self.rank_0_is_model_owner:
                             futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", abort_requests))
                         else:
-                            futures.append(self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", abort_requests))
+                            warnings.warn(f"Interrupt requests on instance {instance_id} in SPMD-style may cause undefined behavior, need to check the behavior")
+                            futures.append(self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", abort_requests)[0])
                     if not futures:
                         interrupted_request_num = 0
                     else:
@@ -398,7 +402,8 @@ class RolloutCoordinator(CommandExtension):
                     if self.rank_0_is_model_owner:
                         future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation")
                     else:
-                        future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation")
+                        warnings.warn(f"Interrupt generation on instance {instance_id} in SPMD-style may cause undefined behavior, need to check the behavior")
+                        future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation")[0]
                     interrupted_request_num = ray.get(future)
                     self.instance_running_status[instance_id] = False
                     

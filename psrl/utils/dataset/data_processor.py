@@ -366,6 +366,7 @@ class DataProcessor:
                 
                 # We manually repeat prompts in the generation batch for Group Sampling.
                 # Requests in the batch are unique during generation and synchronized through parent tracker.
+                psrl_logger.info(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
                 if self.rollout_n > 1:
                     gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
                     uid_list = []

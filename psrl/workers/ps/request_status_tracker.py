@@ -1,11 +1,11 @@
 import os
 import logging
 import enum
+import ray
+from omegaconf import DictConfig
 from enum import Enum
 from typing import Union, List, Optional
-
-import ray
-
+from psrl.utils.logger import DualOutputHandler
 from psrl.workers.ps.staleness_controller import EntryInfo
 from psrl.utils.server.command import CommandType, Command
 
@@ -42,7 +42,8 @@ class RequestStatusTracker:
     It is used to track the lifecycle of requests as they move through different stages.
     """
     
-    def __init__(self):
+    def __init__(self, psrl_config: DictConfig):
+        self.psrl_config = psrl_config
         self._request_id_to_status: dict[int, RequestStatus] = {} # Maps request ID to their statuses
         self._request_infos = {}  # Maps request IDs to EntryInfo objects
         # Maps statuses to sets of request IDs for quick access
@@ -58,6 +59,11 @@ class RequestStatusTracker:
         
         # Reward server reference
         self.reward_server: Optional[ray.actor.ActorHandle] = None
+        
+        # Build logger
+        self.log_prefix = f"RequestStatusTracker"
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        psrl_logger.info(f"Initialized RequestStatusTracker.")
 
     def set_rollout_coordinator(self, rollout_coordinator: ray.actor.ActorHandle):
         """Set the reference to the rollout coordinator."""
@@ -180,6 +186,7 @@ class RequestStatusTracker:
         Raises:
             AssertionError: If request is not found or not in correct status
         """
+        psrl_logger.debug(f"Removing train ready request {request_id} from status tracker after reward completion")
         if not isinstance(request_id, list):
             request_id = [request_id]
 
@@ -233,6 +240,7 @@ class RequestStatusTracker:
             model_version (int, optional): The model version of the request. Defaults to -1.
             status (RequestStatus, optional): The initial status of the request. Defaults to RequestStatus.PENDING.
         """
+        psrl_logger.debug(f"Adding request {request_id} to status tracker with status {status}, rollout instance id {rollout_instance_id}, model version {model_version}")
         self._request_infos[request_id] = EntryInfo(
             request_id=request_id,
             rollout_instance_id=rollout_instance_id,
@@ -419,6 +427,7 @@ class RequestStatusTracker:
         Args:
             request_id (List[int], int): The unique identifier of the request to abort.
         """
+        psrl_logger.debug(f"Removing request {request_id} from status tracker")
         if not isinstance(request_id, list):
             request_id = [request_id]
 

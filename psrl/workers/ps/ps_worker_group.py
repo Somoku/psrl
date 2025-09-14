@@ -82,6 +82,11 @@ class PSResourceSpec:
 
 @dataclass
 class PSResourcePool:
+    """A pool of PS resource specifications.
+    
+    This class represents a collection of PSResourceSpec objects that define
+    the resources required for each PS worker.
+    """
     ps_spec_list: List[PSResourceSpec]
 
 

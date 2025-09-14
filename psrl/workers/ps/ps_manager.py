@@ -66,9 +66,8 @@ class PSManager(RequestStatusTracker):
             group_post_process_fn (Optional[callable]): Optional function to post-process 
                 grouped entry data before occupying the buffer
         """
-        RequestStatusTracker.__init__(self)
+        RequestStatusTracker.__init__(self, psrl_config)
 
-        self.psrl_config = psrl_config
         if self.psrl_config.redundant_rollout.enable:
             self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.psrl_config.redundant_rollout.alg_rollout_n

@@ -1,16 +1,17 @@
 import os
 import logging
+import torch
+import ray
 import numpy as np
 from threading import Thread
-
-import torch
-
-import ray
+from tensordict import TensorDict
 
 from verl import DataProto
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import pad_2d_list_to_length
 
+from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
 from psrl.utils.server.command import Command, CommandType, CommandExtension
 from psrl.workers.ps.request_status_tracker import RequestStatus
@@ -24,6 +25,7 @@ class RewardServer(CommandExtension):
         self,
         config,
         tokenizer,
+        processor,
         ps_manager_handle,
         rollout_queue,
         reward_fn=None,
@@ -38,8 +40,9 @@ class RewardServer(CommandExtension):
         Args:
             config: Configuration object containing server settings and hyperparameters
             tokenizer: Tokenizer for processing text data and converting tokens
+            processor: Processor for processing multi-modal data
             ps_manager_handle: Handle to the parameter server for status updates and communication
-            rollout_queue: Queue for receiving rollout data from rollout workers
+            rollout_queue: Queue for receiving rollout data from agent loop workers
             reward_fn (optional): Custom function for computing rewards. Defaults to None
             use_rm (bool): Whether to use a reward model for computing rewards. Defaults to False
         """
@@ -47,6 +50,7 @@ class RewardServer(CommandExtension):
 
         self.config = config
         self.tokenizer = tokenizer
+        self.processor = processor
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
@@ -79,6 +83,7 @@ class RewardServer(CommandExtension):
         # Build logger
         self.log_prefix = "RewardServer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+        psrl_logger.info(f"Initialized RewardServer.")
         
     def start_busy_loop(self):
         """Start the reward server and begin processing requests.
@@ -136,6 +141,128 @@ class RewardServer(CommandExtension):
         """
         if self.reward_paused:
             self.exec_command(Command(CommandType.RESUME))
+            
+    def _pre_process(self, inputs: DataProto) -> DataProto:
+        """Pre-process the generated outputs to create properly formatted tensors.
+        
+        This method handles padding, attention masks, position IDs, and multi-modal inputs
+        to ensure compatibility with the training pipeline.
+        
+        Args:
+            inputs (DataProto): Raw generation outputs.
+            
+        Returns:
+            DataProto: Formatted data ready for training.
+        """
+        # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
+        # prompts: left pad
+        # responses: right pad
+        # input_ids: prompt + response
+        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
+        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
+
+        # prompts
+        self.tokenizer.padding_side = "left"
+        if "raw_prompt_ids" not in inputs.non_tensor_batch:
+            batch_size = len(inputs)
+            raw_prompt_ids = np.array(
+                [_pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i]) for i in range(batch_size)], dtype=object
+            )
+        else:
+            raw_prompt_ids = inputs.non_tensor_batch["raw_prompt_ids"]
+
+        prompt_output = self.tokenizer.pad(
+            [{"input_ids": raw_prompt_id} for raw_prompt_id in raw_prompt_ids],
+            padding="max_length",
+            max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        prompt_ids, prompt_attention_mask = prompt_output["input_ids"], prompt_output["attention_mask"]
+
+        # responses
+        raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
+        assert raw_response_ids is not None, "raw_response_ids must be provided in the input batch"
+        self.tokenizer.padding_side = "right"
+        outputs = self.tokenizer.pad(
+            [{"input_ids": raw_response_id} for raw_response_id in raw_response_ids],
+            padding="max_length",
+            max_length=self.config.gen_actor_rollout_ref.rollout.response_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        response_ids, response_attention_mask = outputs["input_ids"], outputs["attention_mask"]
+
+        # response_mask
+        response_masks = inputs.non_tensor_batch.pop("response_mask", None)
+        assert response_masks is not None, "response_masks must be provided in the input batch"
+        outputs = self.tokenizer.pad(
+            [{"input_ids": response_mask} for response_mask in response_masks],
+            padding="max_length",
+            max_length=self.config.gen_actor_rollout_ref.rollout.response_length,
+            return_tensors="pt",
+            return_attention_mask=False,
+        )
+        response_mask = outputs["input_ids"]
+
+        assert response_ids.shape == response_mask.shape, (
+            f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"
+        )
+        
+        response_mask = response_mask * response_attention_mask
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
+        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+        # Handle multi-modal inputs and position_ids calculation
+        # Only support Qwen2VLImageProcessor for multi-modal processing currently
+        # TODO(verl): support other multi-modal inputs
+        multi_modal_inputs = None
+        if (
+            self.processor is not None
+            and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
+        ):
+            from verl.models.transformers.qwen2_vl import get_rope_index
+
+            images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)
+            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+            multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
+            multi_modal_inputs.pop("input_ids", None)
+            multi_modal_inputs.pop("attention_mask", None)
+
+            # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+            # because np.array() only keeps the keys for BatchFeature.
+            multi_modal_inputs = dict(multi_modal_inputs)
+
+            image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+            video_grid_thw = multi_modal_inputs.get("video_grid_thw")
+            second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
+
+            position_ids = get_rope_index(
+                self.processor,
+                input_ids=input_ids.squeeze(0),
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                attention_mask=attention_mask.squeeze(0),
+            ).unsqueeze(0)  # (1, 3, seq_len)
+        else:
+            position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+
+        batch = TensorDict(
+            {
+                "prompts": prompt_ids,  # [bsz, prompt_length]
+                "responses": response_ids,  # [bsz, response_length]
+                "response_mask": response_mask,  # [bsz, response_length]
+                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
+                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+                "position_ids": position_ids,  # [bsz, prompt_length + response_length]
+            },
+            batch_size=len(input_ids),
+        )
+        non_tensor_batch = inputs.non_tensor_batch
+        if multi_modal_inputs is not None:
+            non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
+
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
     
     def _background_event_handler(self):
         """
@@ -228,12 +355,13 @@ class RewardServer(CommandExtension):
             # Data processing
             # Process requests in the rollout queue
             if not self.rollout_queue.empty() and not self.reward_paused and not self.skipping_rollout_queue:
-                rollout_data = self.rollout_queue.get_nowait()
+                rollout_data = self.rollout_queue.get()
                 
                 assert rollout_data is not None, "Data from rollout queue should not be None"
-                assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
-                
+                # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
+                rollout_data = self._pre_process(rollout_data)
                 request_ids = rollout_data.non_tensor_batch["uid"]
+                print(f"Reward server received request ids: {request_ids}")
                 
                 # Update the request status to REWARD_RUNNING
                 update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))

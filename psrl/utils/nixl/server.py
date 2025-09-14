@@ -156,7 +156,7 @@ class NIXLMetaServer:
         self._is_all_client_shardings_recved = True
         psrl_logger.info(f"All {len(self.client_sharding_dicts)} clients of {expected_agents} agents sent sharding after {time.time() - start} seconds.")
 
-    def wait_for_client_infos(self, expected_agents: int = 1, timeout: float = 60.0):
+    def wait_for_client_infos(self, expected_agents: int = 1, timeout: float = 180.0):
         """
         Wait for all agents to connect and send client infos.
         """

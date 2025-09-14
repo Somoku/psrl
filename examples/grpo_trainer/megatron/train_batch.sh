@@ -56,7 +56,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=sync \
-    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.n=4 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
@@ -89,7 +88,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     critic.optim.lr=1e-5 \
     critic.model.path="$HF_MODEL_PATH" \
-    critic.model.enable_gradient_checkpointing=False \
     critic.ppo_micro_batch_size_per_gpu=1 \
     critic.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     critic.megatron.pipeline_model_parallel_size=${TRAIN_PP} \

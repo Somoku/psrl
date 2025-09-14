@@ -338,6 +338,99 @@ class PSRL_vLLMRollout(BaseRollout):
             }
             
         return vllm_inputs, kwargs
+    
+    def post_process_outputs_lite(
+        self,
+        prompts: DataProto,
+        outputs: Union[Union[RequestOutput, PoolingRequestOutput], list[Union[RequestOutput, PoolingRequestOutput]]],
+    ) -> DataProto:
+        """
+        Post-process vLLM outputs to convert them back into DataProto format.
+        """
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        assert len(outputs) == len(prompts), "Mismatched batch size between prompts and VLLM outputs."
+
+        batch_size = len(prompts)
+        non_tensor_batch = prompts.non_tensor_batch
+
+        response_ids_list = []
+        response_len_list = []
+        interrupted_list = []
+        all_log_prob_list = []
+
+        for i in range(batch_size):
+            vllm_output = outputs[i]
+            assert len(vllm_output.outputs) == 1, "RolloutRouter only supports single request generation."
+
+            response_ids = vllm_output.outputs[0].token_ids
+            response_len = len(response_ids)
+            interrupted = vllm_output.outputs[0].finish_reason == "abort"
+
+            response_ids_list.append(response_ids)
+            response_len_list.append(response_len)
+            interrupted_list.append(interrupted)
+
+            log_prob_list = []
+            # if inference logprobs is required, we need to collect the log probabilities
+            if (
+                self.config.enable_inference_engine_log_prob and
+                hasattr(vllm_output.outputs[0], 'logprobs') and
+                vllm_output.outputs[0].logprobs is not None
+            ):
+                if self.config.interrupt_as_prompt:
+                    curr_response_len = non_tensor_batch.get("response_unpadded_len", 0)
+                    # Collect log probs only when the request finished normally
+                    # The response log probs are collected in two parts:
+                    # 1. The log probs of the accumulated response tokens (in current prompt tokens)
+                    # 2. The log probs of the current response tokens
+                    if not interrupted and curr_response_len > 0:
+                        # partial response log probs from prompt log probs
+                        prompt_token_ids = vllm_output.prompt_token_ids
+                        for i, logprob in enumerate(vllm_output.prompt_logprobs[-curr_response_len:]):
+                            log_prob_list.append(logprob[prompt_token_ids[i - curr_response_len]].logprob)
+                        # new response log probs from decode log probs
+                        for i, logprob in enumerate(vllm_output.outputs[0].logprobs):
+                            log_prob_list.append(logprob[response_ids[i]].logprob)
+                else:
+                    # Response log probs from decode log probs
+                    for i, logprob in enumerate(vllm_output.outputs[0].logprobs):
+                        log_prob_list.append(logprob[response_ids[i]].logprob)
+            all_log_prob_list.append(log_prob_list)
+        
+        # Consolidate batch results
+        if "raw_response_ids" in non_tensor_batch:
+            raw_response_ids = non_tensor_batch["raw_response_ids"]
+        else:
+            raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+
+        raw_response_ids += np.fromiter(response_ids_list, dtype=object)
+        non_tensor_batch["raw_response_ids"] = raw_response_ids
+
+        if "response_unpadded_len" in non_tensor_batch:
+            curr_response_unpadded_len = non_tensor_batch["response_unpadded_len"]
+        else:
+            curr_response_unpadded_len = [0] * batch_size
+        response_unpadded_len = [curr_response_unpadded_len[i] + response_len_list[i] for i in range(batch_size)]
+        non_tensor_batch["response_unpadded_len"] = np.array(response_unpadded_len, dtype=int)
+        non_tensor_batch["interrupted"] = np.array(interrupted_list, dtype=bool)
+
+        # Update rollout_log_probs
+        if self.config.enable_inference_engine_log_prob:
+            if "rollout_log_probs" in non_tensor_batch:
+                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+            else:
+                curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+            curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
+            non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
+
+        batch = TensorDict(
+            {
+                "input_ids": prompts.batch["input_ids"], # [bs, prompt_length]
+            },
+            batch_size=batch_size,
+        )
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
             
     def post_process_outputs(
         self,
@@ -544,7 +637,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 sampling_params=self.sampling_params,
                 use_tqdm=False,
             )
-            return self.post_process_outputs(prompts, outputs)
+            return self.post_process_outputs_lite(prompts, outputs)
     
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
@@ -588,7 +681,7 @@ class PSRL_vLLMRollout(BaseRollout):
             completed_rollout = []
             for completed_task in asyncio.as_completed(tasks):
                 prompt_idx, output = await completed_task
-                completed_rollout.append(self.post_process_outputs(prompts[prompt_idx:prompt_idx+1], output))
+                completed_rollout.append(self.post_process_outputs_lite(prompts[prompt_idx:prompt_idx+1], output))
         
         return DataProto.concat(completed_rollout)
 

@@ -146,7 +146,7 @@ await async_llm.abort(["request_1", "request_2", "request_3"])
 - `verl/single_controller/base/worker.py`: Improved master address/port resolution (v0.5.x)
 - `verl/protocol.py`: Fixed tensordict serialization for empty batches (v0.5.x)
 - `verl/workers/actor/dp_actor.py`: Improved data type handling and imports
-- `verl/workers/megatron_workers.py`: Fixed compatibility issues with disaggregated architectures
+- `verl/workers/megatron_workers.py`: Fixed compatibility issues with disaggregated architectures and non-fused workers (e.g., dapo: only actor, no critic and ref)
 - `verl/workers/fsdp_workers.py`: Enhanced distributed initialization (v0.5.x)
 
 ### vLLM Patches (v0.9.0.1 & v0.10.0)

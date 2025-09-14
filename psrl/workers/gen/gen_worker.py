@@ -397,7 +397,10 @@ class PSRL_GenWorker(Worker):
             "pad_token_id": self.tokenizer.pad_token_id,
         }
         override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
-        override_config_kwargs.update(override_model_config)
+        if isinstance(override_model_config, dict) and "model_config" in override_model_config:
+            override_config_kwargs.update(override_model_config["model_config"]) # Megatron model style
+        else:
+            override_config_kwargs.update(override_model_config) # FSDP model style
         update_model_config(self.model_hf_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             psrl_logger.info(f"Model config after override: {self.model_hf_config}")
@@ -1092,7 +1095,7 @@ class PSRL_GenWorker(Worker):
             self.active_tasks.discard(task)
         return task_done_callback
 
-    async def _generate_async_task(self, request: DataProto, needed_model_version: int):
+    async def _generate_async_task(self, request: DataProto, needed_model_version: int, consolidate: bool = True):
         """
         An async task to generate sequences for a single request.
         This method handles the generation for a single request, managing model versioning
@@ -1148,10 +1151,13 @@ class PSRL_GenWorker(Worker):
             )
             if update_status_success[0]:
                 filtered_result = vllm_output
+                # NOTE(lhy): The DataProto will be huge and slow to transfer using ray, so we postprocess the data here (inside the vllm rollout)
+                if consolidate:
+                    filtered_result = self.rollout.post_process_outputs_lite(request, filtered_result)
                 return filtered_result, update_status
         return None, None
 
-    def generate(self, requests: DataProto):
+    def generate(self, requests: DataProto, consolidate: bool = True, return_only_on_representative_rank: bool = True):
         """
         Generate sequences in batch mode.
         This method handles a batch of generation requests, managing model versioning
@@ -1168,6 +1174,7 @@ class PSRL_GenWorker(Worker):
 
         curr_rollout_instance_model_version = self.curr_rollout_instance_model_version
         request_ids = requests.non_tensor_batch["uid"]
+        psrl_logger.info(f"Rollout instance {rollout_instance_id} is generating requests with request ids: {request_ids}")
         needed_model_versions = requests.non_tensor_batch["version_tag"]
         # assert all version tag in needed_model_versions are equal
         if not all(version == needed_model_versions[0] for version in needed_model_versions):
@@ -1216,24 +1223,31 @@ class PSRL_GenWorker(Worker):
                 with log_dual_events(f"Core generation with model version {self.curr_rollout_instance_model_version}", psrl_logger, event_type=EventType.GEN):
                     vllm_outputs = self.rollout.raw_generate_sequences(filtered_requests)
 
-                vllm_outputs = [vllm_outputs[i] for i in range(len(vllm_outputs))]
+                # vllm_outputs = [vllm_outputs[i] for i in range(len(vllm_outputs))]
 
                 # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
                 # depending on `interrupted` field in the result
-                update_statuses = [RequestStatus.ROLLOUT_INTERRUPTED if vllm_outputs[i].outputs[0].finish_reason == "abort" else RequestStatus.RUNNING for i in range(len(vllm_outputs))]
-                update_status_success = ray.get(self.gen_interface.ps_manager_handle.update_request_status.remote(
-                    request_ids.tolist(),
-                    update_statuses,
-                ))
-                filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-                if filtered_request_idxs:
-                    filtered_result = [vllm_outputs[i] for i in filtered_request_idxs]
-                    return filtered_result, filtered_request_idxs, update_statuses
-                return None, None, None
+                if return_only_on_representative_rank and not self.is_instance_representative_rank:
+                    return None, None, None
+                with log_dual_events(f"Update request status", psrl_logger, event_type=EventType.OTHER):
+                    update_statuses = [RequestStatus.ROLLOUT_INTERRUPTED if vllm_outputs[i].outputs[0].finish_reason == "abort" else RequestStatus.RUNNING for i in range(len(vllm_outputs))]
+                    update_status_success = ray.get(self.gen_interface.ps_manager_handle.update_request_status.remote(
+                        request_ids.tolist(),
+                        update_statuses,
+                    ))
+                    filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
+                    if filtered_request_idxs:
+                        filtered_requests = requests[filtered_request_idxs]
+                        filtered_result = [vllm_outputs[i] for i in filtered_request_idxs]
+                        # NOTE(lhy): The DataProto will be huge and slow to transfer using ray, so we postprocess the data inside the vllm rollout
+                        if consolidate:
+                            filtered_result = self.rollout.post_process_outputs_lite(filtered_requests, filtered_result)
+                        return filtered_result, filtered_request_idxs, update_statuses
+                    return None, None, None
         else:
             raise ValueError(f"Needed model version {needed_model_version} is less than current rollout instance model version {curr_rollout_instance_model_version}. This should not happen.")
 
-    async def generate_async(self, request: DataProto):
+    async def generate_async(self, request: DataProto, consolidate: bool = True):
         """
         Generate sequences asynchronously.
         This method handles a single async generation request, managing model versioning
@@ -1291,7 +1305,7 @@ class PSRL_GenWorker(Worker):
                     
                 await self.wait_on_version_events[needed_model_version].wait()
             task = self._generate_loop.create_task(
-                self._generate_async_task(request, needed_model_version)
+                self._generate_async_task(request, needed_model_version, consolidate=consolidate)
             )
             self.version_to_active_tasks[needed_model_version].add(task)
             self.request_id_to_active_tasks[request_id].add(task)

@@ -54,4 +54,9 @@ NVTE_FRAMEWORK=pytorch python -m pip install --no-deps git+https://github.com/NV
 echo "3. Install Megatron"
 python -m pip install --no-deps git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.12.0rc3
 
+# If you meet a weird bug from triton, please downgrade triton to 3.1.0
+# See https://github.com/volcengine/verl/issues/904
+# echo "4. Downgrade Triton"
+# python -m pip install triton==3.1.0
+
 echo "Successfully installed all packages for Megatron"

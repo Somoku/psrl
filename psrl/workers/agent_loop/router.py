@@ -9,7 +9,7 @@ import ray
 from verl import DataProto
 
 from psrl.workers.ps.request_status_tracker import RequestStatus
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
+from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.workers.agent_loop.route_strategy import (
     RouteStrategyBase, 
     RequestNumBalanceRouteStrategy,
@@ -107,6 +107,8 @@ class RolloutRouter:
             chosen_worker = self.route_strategy.route(request)
         return chosen_worker
 
+    # NOTE(lhy): This method is moved inside the vllm rollout to avoid the DataProto being huge and slow to transfer using ray
+    # see `post_process_outputs_lite` in `vllm_rollout.py`
     def _consolidate_responses(
         self,
         prompts: DataProto,
@@ -227,29 +229,30 @@ class RolloutRouter:
         if filtered_request_idxs:
             requests = requests[filtered_request_idxs]
             request_ids = requests.non_tensor_batch["uid"]
-            needed_model_versions = requests.non_tensor_batch["version_tag"]
             # evenly dispatch to rollout workers
             filtered_requests_list = requests.chunk(self.rollout_wg_size)
             futures = []
-            for i, requests in enumerate(filtered_requests_list):
-                requests.non_tensor_batch["rollout_instance_id"] = np.array([i] * len(requests), dtype=int)
-                futures.extend(
-                    self.rollout_wg_list[i].execute_all_async("generate", requests)
-                )
-            rollout_results = ray.get(futures)
+            with log_dual_events(f"Dispatching {len(requests)} requests to {self.rollout_wg_size} rollout workers evenly and generate in batch", psrl_logger, event_type=EventType.GEN):
+                for i, requests in enumerate(filtered_requests_list):
+                    requests.non_tensor_batch["rollout_instance_id"] = np.array([i] * len(requests), dtype=int)
+                    psrl_logger.debug(f"Dispatching requests to rollout worker {i} with request ids: {requests.non_tensor_batch['uid']}")
+                    futures.append(
+                        self.rollout_wg_list[i].execute_all_async("generate", requests)[0]
+                    )
+                rollout_results = ray.get(futures)
             # Process results as needed
-            results = []
-            for i in range(self.rollout_wg_size):
-                requests = filtered_requests_list[i]
-                vllm_outputs, filtered_request_idxs, update_statuses = rollout_results[i]
-                filtered_requests = requests[filtered_request_idxs]
-                assert (
-                    update_statuses is not None and
-                    all(update_status == RequestStatus.RUNNING for update_status in update_statuses)
-                ), "Interruption is not implemented in batching mode"
-                consolidated_results = self._consolidate_responses(filtered_requests, vllm_outputs)
-                results.append(consolidated_results)
-            return DataProto.concat(results)
+            with log_dual_events(f"Concatenating results from {self.rollout_wg_size} rollout workers", psrl_logger, event_type=EventType.OTHER):
+                results = []
+                for i in range(self.rollout_wg_size):
+                    consolidated_outputs, filtered_request_idxs, update_statuses = rollout_results[i]
+                    psrl_logger.debug(f"Consolidated outputs from rollout worker {i} have request ids: {consolidated_outputs.non_tensor_batch['uid']}")
+                    assert (
+                        update_statuses is not None and
+                        all(update_status == RequestStatus.RUNNING for update_status in update_statuses)
+                    ), "Interruption is not implemented in batching mode"
+                    results.append(consolidated_outputs)
+                return DataProto.concat(results)
+            
         return None
 
     async def generate_async(
@@ -285,17 +288,19 @@ class RolloutRouter:
             continue_generation = True
             while continue_generation:
                 if self.rank_0_is_model_owner:
-                    vllm_output, update_status = await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("generate_async", request)
+                    consolidated_output, update_status = await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("generate_async", request)
                 else:
-                    vllm_output, update_status = await self.rollout_wg_list[gen_worker_idx].execute_all_async("generate_async", request)
-                if vllm_output is None:
+                    consolidated_output_list, update_status_list = await self.rollout_wg_list[gen_worker_idx].execute_all_async("generate_async", request)
+                    consolidated_output = consolidated_output_list[0]
+                    update_status = update_status_list[0]
+                if consolidated_output is None:
                     if self.rank_0_is_model_owner:
                         await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version)
                     else:
                         await self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version)
                     return None
                 
-                request = self._consolidate_responses(request, vllm_output)
+                request = consolidated_output
                 if update_status == RequestStatus.RUNNING:
                     continue_generation = False
                 elif update_status == RequestStatus.ROLLOUT_INTERRUPTED:

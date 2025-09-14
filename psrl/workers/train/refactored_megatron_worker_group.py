@@ -35,7 +35,7 @@ class RefactoredNVMegatronRayWorkerGroup(RayWorkerGroup, MegatronWorkerGroup):
         Returns:
             Dictionary of worker groups keyed by prefix
         """
-        warnings.warn("RefactoredNVMegatronRayWorkerGroup spawn_fused is a workaround for verl 0.4.1.x.")
+        warnings.warn("RefactoredNVMegatronRayWorkerGroup spawn_fused is a workaround for verl 0.4.1.x and 0.5.x.")
         wg_dict = dict()
         for key in prefix_set:
             new_wg = deepcopy(self)

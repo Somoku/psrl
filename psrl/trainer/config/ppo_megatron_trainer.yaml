@@ -86,6 +86,7 @@ train_actor_rollout_ref:
     path: ~/models/deepseek-llm-7b-chat
     custom_chat_template: null
     external_lib: null
+    enable_gradient_checkpointing: False
     override_config:
       model_config: { }
       moe_config:
@@ -184,6 +185,7 @@ train_actor_rollout_ref:
       load_contents: ${train_actor_rollout_ref.actor.checkpoint.save_contents}
     # Nsight system profiler configs
     profiler:
+      _target_: verl.utils.profiler.config.ProfilerConfig
       discrete: False
       all_ranks: False
       ranks: []
@@ -218,6 +220,7 @@ train_actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     # Nsight system profiler configs
     profiler:
+      _target_: verl.utils.profiler.config.ProfilerConfig
       discrete: False
       all_ranks: False
       ranks: []
@@ -313,6 +316,7 @@ train_actor_rollout_ref:
     calculate_log_probs: False
     # Nsight system profiler configs
     profiler:
+      _target_: verl.utils.profiler.config.ProfilerConfig
       discrete: False
       all_ranks: False
       ranks: []
@@ -449,6 +453,7 @@ critic:
   model:
     path: ${train_actor_rollout_ref.model.path}
     tokenizer_path: ${train_actor_rollout_ref.model.path}
+    enable_gradient_checkpointing: False
     override_config:
       model_config: { }
       moe_config:
@@ -495,6 +500,7 @@ critic:
     load_contents: ${critic.checkpoint.save_contents}
   # Nsight system profiler configs
   profiler:
+    _target_: verl.utils.profiler.config.ProfilerConfig
     discrete: False
     all_ranks: False
     ranks: []

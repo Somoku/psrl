@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-Qwen2.5-7B-AIME-megatron-batch-nixl-staleness_0'
+experiment_name='DAPO-Qwen2.5-7B-AIME-mcore-batch-nixl-staleness_0'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 

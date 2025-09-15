@@ -1,7 +1,7 @@
 #!/bin/bash
 
 project_name='psrl_nixl'
-experiment_name='PPO-Qwen2.5-3b-gsm8k-mcore-batch-nixl-staleness_1'
+experiment_name='PPO-Qwen2.5-3b-gsm8k-mcore-batch-nixl-staleness_0'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -40,11 +40,11 @@ test_files="['$gsm8k_test_path']"
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
-    psrl.staleness=1 \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log//${experiment_name} \
+    psrl.ps_mode=cpu_ref \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_inference_engine_log_prob=True \
     psrl.log_prob.enable_proxy_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -63,6 +63,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.n=1 \
@@ -85,6 +86,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     critic.optim.lr=1e-5 \
     critic.model.path="$HF_MODEL_PATH" \
+    critic.model.enable_gradient_checkpointing=True \
     critic.ppo_micro_batch_size_per_gpu=1 \
     critic.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     critic.megatron.pipeline_model_parallel_size=${TRAIN_PP} \

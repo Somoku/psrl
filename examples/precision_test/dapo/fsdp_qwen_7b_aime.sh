@@ -19,13 +19,21 @@ VAL_TP=4 # TP in the training side for validation
 NNODES=4
 NGPUS_PER_NODE=8
 
-GEN_NNODES=${NNODES} # Number of nodes for generation
-GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
+# GEN_NNODES=${NNODES} # Number of nodes for generation
+# GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
+# GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
+# GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
+
+# TRAIN_NNODES=${NNODES} # Number of nodes for training
+# TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
+
+GEN_NNODES=$(( ${NNODES} / 2 )) # Number of nodes for generation
+GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=${NNODES} # Number of nodes for training
-TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
+TRAIN_NNODES=$(( ${NNODES} / 2 )) # Number of nodes for training
+TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
 use_kl_in_reward=False

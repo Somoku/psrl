@@ -1,5 +1,5 @@
 diff --git a/verl/protocol.py b/verl/protocol.py
-index 39979f84..806aa7ca 100644
+index 39979f84..dee263d6 100644
 --- a/verl/protocol.py
 +++ b/verl/protocol.py
 @@ -268,7 +268,7 @@ class DataProto:
@@ -11,6 +11,15 @@ index 39979f84..806aa7ca 100644
              self.batch = self.batch.contiguous()
              self.batch = self.batch.consolidate()
          torch.save(self.batch, buffer)
+@@ -563,7 +563,7 @@ class DataProto:
+         tensors = {}
+         # tensor batch
+         for key in batch_keys:
+-            assert key in self.batch.keys()
++            assert key in self.batch.keys(), f"Key {key} not found in batch keys {self.batch.keys()}"
+             tensors[key] = self.batch.pop(key)
+         non_tensors = {}
+         # non tensor batch
 diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
 index 2606a3ef..e7ee275e 100644
 --- a/verl/single_controller/base/worker.py
@@ -425,9 +434,18 @@ index 4141d986..84d49e62 100644
          # This is used to import external_lib into the huggingface systems
          import_external_libs(self.config.model.get("external_lib", None))
 diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
-index ea32d9d9..1d6d537c 100644
+index ea32d9d9..1249d7e1 100644
 --- a/verl/workers/megatron_workers.py
 +++ b/verl/workers/megatron_workers.py
+@@ -380,7 +380,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         print(f"rollout and sharding manager init done sharding_manager: {sharding_manager}")
+         return rollout, sharding_manager
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         if self.config.model.get("external_lib", None) is not None:
+             # This is used to import external_lib into the huggingface systems
 @@ -494,7 +494,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          log_gpu_memory_usage("After init_model finish", logger=logger)
  
@@ -460,3 +478,20 @@ index ea32d9d9..1d6d537c 100644
      @DistProfiler.annotate(color="blue")
      def compute_log_prob(self, data: DataProto):
          assert self._is_actor
+@@ -850,7 +846,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+         get_torch_device().empty_cache()
+         return critic_module, critic_optimizer, critic_optimizer_scheduler, self.hf_config, optim_config
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # create critic
+ 
+@@ -1097,7 +1093,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+         get_torch_device().empty_cache()
+         return reward_model, self.hf_config
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # create critic

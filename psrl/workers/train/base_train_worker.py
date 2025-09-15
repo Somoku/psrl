@@ -2,6 +2,7 @@ import ray
 import threading
 import logging
 import os
+import torch
 from abc import ABC
 from typing import Dict
 from omegaconf import DictConfig
@@ -185,6 +186,7 @@ class PSRL_BaseTrainWorker(ABC):
             }
             
     def push_model(self):
+        torch.cuda.synchronize()
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":

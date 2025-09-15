@@ -57,7 +57,7 @@ class PSStorageWorker:
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
-            use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
+            self.use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
             # TODO(lhy): maybe support train and gen use different ps mode
             self.agent_name = f"{GLOBAL_PS_CLIENT_NAME}_{self.rank}"
             self.client_for_push_name = f"{self.agent_name}_for_push"
@@ -66,7 +66,7 @@ class PSStorageWorker:
                 agent_name=self.agent_name,
                 multi_client_names=[self.client_for_push_name, self.client_for_pull_name],
                 server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=use_gpu,
+                use_gpu=self.use_gpu,
                 multi_client_types=[NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL],
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface
@@ -200,6 +200,8 @@ class PSStorageWorker:
         matching_keys = self._transfer_key_cache.get(key, [])
         for key_shard_idx_tuple in matching_keys:
             target_original_state_dict[key_shard_idx_tuple].copy_(src_original_state_dict[key_shard_idx_tuple])
+        if self.use_gpu:
+            torch.cuda.synchronize()
 
     def shutdown(self):
         self.nixl_multi_storage_clients.shutdown()

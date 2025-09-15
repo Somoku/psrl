@@ -361,7 +361,7 @@ class RewardServer(CommandExtension):
                 # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
                 rollout_data = self._pre_process(rollout_data)
                 request_ids = rollout_data.non_tensor_batch["uid"]
-                print(f"Reward server received request ids: {request_ids}")
+                # print(f"Reward server received request ids: {request_ids}")
                 
                 # Update the request status to REWARD_RUNNING
                 update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))

@@ -150,7 +150,7 @@ class vLLMWorkerExtension:
         self.unified_sharding_dict = unified_sharding_dict
 
     def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
-        torch.cuda.synchronize()
+        self.cuda_synchronize()
         wait_operations = []
         for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
             for key in self.unified_state_dict:

@@ -444,13 +444,11 @@ class PSRL_GenWorker(Worker):
                 # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
                 object_ref = ray.get(ps_manager_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
                 model_state_dict_cpu = ray.get(object_ref)  # This blocks until the state dict is available in the object store
-            torch.cuda.synchronize()
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
             model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))
             # NOTE(lhy): Do we need to clear the cache after loading the model?
             # get_torch_device().empty_cache()
-            torch.cuda.synchronize()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     

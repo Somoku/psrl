@@ -175,11 +175,14 @@ class PSRL_GenWorker(Worker):
         self.version_to_active_tasks: dict[int, set[asyncio.Task]] = defaultdict(lambda: set())
         self.request_id_to_active_tasks: dict[int, set[asyncio.Task]] = defaultdict(lambda: set())
         self.pending_version_requests: dict[int, List[DataProto]] = defaultdict(lambda: [])
-        self.version_update_event: dict[int, Optional[asyncio.Event]] = {}
-        self.up_to_date_version_event = asyncio.Event()
-        self.up_to_date_version_event.set()
         
-        self.wait_on_version_events: dict[int, Optional[asyncio.Event]] = {}
+        # Version ordering management
+        self.version_ready_events: dict[int, asyncio.Event] = {}  # Events for when a version is ready to execute
+        self.version_completion_events: dict[int, asyncio.Event] = {}  # Events for when a version completes
+        self.current_executing_version: Optional[int] = None  # The version currently being executed
+        
+        # Legacy event for deprecated stream_gen method
+        self.require_version_update_event = asyncio.Event()
 
         # NIXL
         self.nixl_storage_client = None
@@ -1271,12 +1274,14 @@ class PSRL_GenWorker(Worker):
         needed_model_version = int(request.non_tensor_batch["version_tag"][0])
         assert needed_model_version >= curr_rollout_instance_model_version, \
             f"Current rollout instance version should not be less than needed version, but got {curr_rollout_instance_model_version} vs. {needed_model_version}"
+        
+        # Wait for this version to be ready to execute (ensuring sequential execution)
+        await self._wait_for_version_turn(needed_model_version)
+        
+        # Handle model update if needed
         if needed_model_version > curr_rollout_instance_model_version:
-            if needed_model_version not in self.wait_on_version_events:
-                if not self.up_to_date_version_event.is_set():
-                    self.wait_on_version_events[needed_model_version] = asyncio.Event()
-                    await self.wait_on_version_events[needed_model_version].wait()
-
+            async with self.version_task_lock:
+                # Double-check the condition inside the lock to avoid race conditions
                 if self.curr_rollout_instance_model_version < needed_model_version:
                     with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
                         # This will block until the PS worker has the needed model version
@@ -1293,20 +1298,10 @@ class PSRL_GenWorker(Worker):
                     if self.curr_rollout_instance_model_version > needed_model_version:
                         psrl_logger.warning(f"Actual model version for generation is {self.curr_rollout_instance_model_version}, needed model version is {needed_model_version}")
 
-                psrl_logger.debug(f"Trying to set version update event...")
-                if needed_model_version not in self.version_update_event:
-                    self.version_update_event[needed_model_version] = asyncio.Event()
-                self.version_update_event[needed_model_version].set()
-                
-                if self.up_to_date_version_event.is_set():
-                    self.up_to_date_version_event.clear()
-            else:
-                psrl_logger.debug(f"Waiting for version update event...")
-                if needed_model_version not in self.version_update_event:
-                    self.version_update_event[needed_model_version] = asyncio.Event()
-                await self.version_update_event[needed_model_version].wait()
-                psrl_logger.debug(f"Version update event for {needed_model_version=} is set!")
-                self.version_update_event[needed_model_version].clear()
+        # Mark this version as currently executing
+        async with self.version_task_lock:
+            self.current_executing_version = needed_model_version
+
         task = self._generate_loop.create_task(
             self._generate_async_task(request, needed_model_version)
         )
@@ -1330,32 +1325,103 @@ class PSRL_GenWorker(Worker):
             needed_model_version (int): The model version needed for the request.
         """
         psrl_logger.debug(f"Pushing task for request_id {request_id} with needed_model_version {needed_model_version}")
-        self.version_to_task_num[needed_model_version] = self.version_to_task_num.get(needed_model_version, 0) + 1
+        async with self.version_task_lock:
+            self.version_to_task_num[needed_model_version] = self.version_to_task_num.get(needed_model_version, 0) + 1
     
     async def pop_task(self, request_id: int, needed_model_version: int):
         """
         Pop a finished task for the given model version.
-        If there are no more tasks for this model version, it will set the
-        require_version_update_event to wake up the version update event handler.
+        If there are no more tasks for this model version, it will signal the next version to proceed.
         
         Args:
             request_id (int): The ID of the request.
             needed_model_version (int): The model version needed for the request.
         """
         psrl_logger.debug(f"Popping task for request_id {request_id} with needed_model_version {needed_model_version}")
-        if needed_model_version in self.version_to_task_num:
-            self.version_to_task_num[needed_model_version] -= 1
-            if self.version_to_task_num[needed_model_version] == 0:
-                self.version_to_task_num.pop(needed_model_version)
-                self.wait_on_version_events.pop(needed_model_version, None)
-                self.version_update_event.pop(needed_model_version, None)
-                psrl_logger.debug(f"All tasks for model version {needed_model_version} done")
+        async with self.version_task_lock:
+            if needed_model_version in self.version_to_task_num:
+                self.version_to_task_num[needed_model_version] -= 1
+                if self.version_to_task_num[needed_model_version] == 0:
+                    # All tasks for this version are done
+                    self.version_to_task_num.pop(needed_model_version)
+                    psrl_logger.debug(f"All tasks for model version {needed_model_version} done")
+                    
+                    # Clean up events for this version
+                    self.version_ready_events.pop(needed_model_version, None)
+                    self.version_completion_events.pop(needed_model_version, None)
+                    
+                    # Signal the next version to proceed
+                    await self._signal_next_version(needed_model_version)
+            else:
+                psrl_logger.warning(f"Model version {needed_model_version} not found in version_to_task_num.")
 
-                # Awake requests of next version
-                if needed_model_version + 1 in self.wait_on_version_events:
-                    psrl_logger.debug(f"Awake version events for model versions: {needed_model_version + 1}")
-                    self.wait_on_version_events[needed_model_version + 1].set()
-                else:
-                    self.up_to_date_version_event.set()
+    async def _wait_for_version_turn(self, needed_model_version: int):
+        """
+        Wait for this version's turn to execute.
+        Ensures that versions are executed in sequential order.
+        
+        Args:
+            needed_model_version (int): The version that needs to execute
+        """
+        async with self.version_task_lock:
+            # If this is the first version or all previous versions have completed
+            if (self.current_executing_version is None or 
+                needed_model_version <= self.current_executing_version or
+                self._all_previous_versions_completed(needed_model_version)):
+                if self.current_executing_version is not None and needed_model_version < self.current_executing_version:
+                    raise ValueError(f"Needed model version {needed_model_version} is less than current executing version {self.current_executing_version}. This should not happen.")
+                # This version can proceed immediately
+                return
+            
+            # Create an event for this version if it doesn't exist
+            if needed_model_version not in self.version_ready_events:
+                self.version_ready_events[needed_model_version] = asyncio.Event()
+        
+        # Wait for this version's turn
+        psrl_logger.debug(f"Version {needed_model_version} waiting for its turn to execute")
+        await self.version_ready_events[needed_model_version].wait()
+        psrl_logger.debug(f"Version {needed_model_version} can now proceed")
+
+    def _all_previous_versions_completed(self, version: int) -> bool:
+        """
+        Check if all versions before the given version have completed.
+        
+        Args:
+            version (int): The version to check
+            
+        Returns:
+            bool: True if all previous versions have completed
+        """
+        if self.current_executing_version is None:
+            return True
+            
+        # Check if there's a gap between current executing version and needed version
+        for v in range(self.current_executing_version + 1, version):
+            if v in self.version_to_task_num:
+                return False
+        return True
+
+    async def _signal_next_version(self, completed_version: int):
+        """
+        Signal the next version that it can proceed.
+        
+        Args:
+            completed_version (int): The version that just completed
+        """
+        # Find the next version that should be executed
+        next_version = None
+        for version in sorted(self.version_ready_events.keys()):
+            if (version > completed_version and 
+                not self.version_ready_events[version].is_set() and
+                self._all_previous_versions_completed(version)):
+                next_version = version
+                break
+        
+        if next_version is not None:
+            psrl_logger.debug(f"Signaling version {next_version} to proceed after {completed_version} completed")
+            self.version_ready_events[next_version].set()
+            self.current_executing_version = next_version
         else:
-            psrl_logger.warning(f"Model version {needed_model_version} not found in version_to_task_num.")
+            # No pending versions, reset current executing version
+            self.current_executing_version = None
+            psrl_logger.debug(f"No pending versions after {completed_version} completed")

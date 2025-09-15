@@ -9,9 +9,10 @@ import ray
 from verl import DataProto
 
 from psrl.utils.logger import deprecated
+from psrl.utils.logger import get_ps_logger
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+# Use the unified PS logger
+psrl_logger = get_ps_logger()
 
 class EntryCategory(enum.Enum):
     """Enum for the category of an entry in the buffer.

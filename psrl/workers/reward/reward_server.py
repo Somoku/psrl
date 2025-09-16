@@ -19,7 +19,7 @@ from psrl.workers.ps.request_status_tracker import RequestStatus
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-@ray.remote
+
 class RewardServer(CommandExtension):
     def __init__(
         self,
@@ -357,95 +357,97 @@ class RewardServer(CommandExtension):
             if not self.rollout_queue.empty() and not self.reward_paused and not self.skipping_rollout_queue:
                 rollout_data = self.rollout_queue.get()
                 
-                assert rollout_data is not None, "Data from rollout queue should not be None"
-                # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
-                rollout_data = self._pre_process(rollout_data)
-                request_ids = rollout_data.non_tensor_batch["uid"]
-                # print(f"Reward server received request ids: {request_ids}")
-                
-                # Update the request status to REWARD_RUNNING
-                update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))
-                if not update_status_success[0]:
-                    continue
-
-                rollout_data.non_tensor_batch.pop("raw_prompt_ids", None)
-                rollout_data.non_tensor_batch.pop("raw_response_ids", None)
-                
-                # Rollout log probs processing
-                if self.config.psrl.log_prob.enable_inference_engine_log_prob:
-                    device = rollout_data.batch["input_ids"].device
-                    rollout_log_probs = rollout_data.non_tensor_batch.pop("rollout_log_probs", None)
-                    assert rollout_log_probs is not None, "rollout_log_probs should not be None"
-                    rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.gen_actor_rollout_ref.rollout.response_length).to(device)
-                    rollout_log_probs = rollout_log_probs.to(torch.float32)
-                    rollout_data.batch["rollout_log_probs"] = rollout_log_probs
-                
-                if self.rollout_n > 1:
-                    sample_ids = rollout_data.non_tensor_batch["parent_id"]
-                else:
-                    sample_ids = rollout_data.non_tensor_batch["uid"]
-                rollout_instance_ids = rollout_data.non_tensor_batch["rollout_instance_id"]
-                version_tags = rollout_data.non_tensor_batch["version_tag"]
-
-                for i, (sample_id, request_id, rollout_instance_id, version_tag) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids, version_tags)):
-                    request_data = ray.get(self.ps_manager_handle.get_request_data_from_buffer.remote(sample_id))
-                    if request_data is None:
-                        # If request data is None, it means the request has been aborted or not found.
-                        assert self.rollout_n > 1, "Request data should not be None when rollout_n is 1."
+                with log_dual_events("Process rollout data", psrl_logger, event_type=EventType.OTHER):
+                    assert rollout_data is not None, "Data from rollout queue should not be None"
+                    # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
+                    rollout_data = self._pre_process(rollout_data)
+                    request_ids = rollout_data.non_tensor_batch["uid"]
+                    # print(f"Reward server received request ids: {request_ids}")
+                    
+                    # Update the request status to REWARD_RUNNING
+                    update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))
+                    if not update_status_success[0]:
                         continue
-                    response_data = rollout_data[i:i+1]
-                    merge_request_data = response_data.union(request_data)
-                    
-                    batch_keys_to_pop = ["prompts", "attention_mask", "responses"]
-                    non_tensor_batch_keys_to_pop = ["reward_model"]
-                    if "extra_info" in merge_request_data.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("extra_info")
-                    if "data_source" in merge_request_data.non_tensor_batch:
-                        non_tensor_batch_keys_to_pop.append("data_source")
-                        
-                    reward_input = merge_request_data.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                    )
-                    
-                    # Reward computation
-                    if self.use_rm:
-                        pass
-                    elif self.config.reward_model.launch_reward_fn_async:
-                        with log_dual_events("Launch async reward model score", psrl_logger, event_type=EventType.OTHER):
-                            future_reward = compute_reward_async.remote(reward_input, self.config, self.tokenizer)
-                            merge_request_data.union(reward_input)
-                            
-                            if self.config.psrl.log_prob.enable_inference_engine_log_prob:
-                                self.request_id_to_future[request_id] = (merge_request_data, future_reward)
-                                self.reward_futures.append(future_reward)
-                            else:
-                                merge_request_data.non_tensor_batch["reward"] = np.array([future_reward])
-                    else:
-                        with log_dual_events("Compute reward model score", psrl_logger, event_type=EventType.OTHER):
-                            reward_tensor, reward_extra_infos_dict = compute_reward(reward_input, self.reward_fn)
-                            
-                            merge_request_data.union(reward_input)
-                            merge_request_data.batch["reward"] = reward_tensor
-                            merge_request_data.meta_info["reward_extra_info_keys"] = list(reward_extra_infos_dict.keys())
-                            merge_request_data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # Update the request status to REWARD_COMPLETED
-                        update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(int(request_id), RequestStatus.REWARD_COMPLETED))
-                        complete_request_idxs = [
-                            i for i, success in enumerate(update_status_success) if success
-                        ]
+                    rollout_data.non_tensor_batch.pop("raw_prompt_ids", None)
+                    rollout_data.non_tensor_batch.pop("raw_response_ids", None)
+                    
+                    # Rollout log probs processing
+                    if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+                        device = rollout_data.batch["input_ids"].device
+                        rollout_log_probs = rollout_data.non_tensor_batch.pop("rollout_log_probs", None)
+                        assert rollout_log_probs is not None, "rollout_log_probs should not be None"
+                        rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.gen_actor_rollout_ref.rollout.response_length).to(device)
+                        rollout_log_probs = rollout_log_probs.to(torch.float32)
+                        rollout_data.batch["rollout_log_probs"] = rollout_log_probs
+                    
+                    if self.rollout_n > 1:
+                        sample_ids = rollout_data.non_tensor_batch["parent_id"]
+                    else:
+                        sample_ids = rollout_data.non_tensor_batch["uid"]
+                    rollout_instance_ids = rollout_data.non_tensor_batch["rollout_instance_id"]
+                    version_tags = rollout_data.non_tensor_batch["version_tag"]
+
+                with log_dual_events(f"Compute reward for samples {sample_ids} and requests {request_ids}", psrl_logger, event_type=EventType.OTHER):
+                    for i, (sample_id, request_id, rollout_instance_id, version_tag) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids, version_tags)):
+                        request_data = ray.get(self.ps_manager_handle.get_request_data_from_buffer.remote(sample_id))
+                        if request_data is None:
+                            # If request data is None, it means the request has been aborted or not found.
+                            assert self.rollout_n > 1, "Request data should not be None when rollout_n is 1."
+                            continue
+                        response_data = rollout_data[i:i+1]
+                        merge_request_data = response_data.union(request_data)
                         
-                        if complete_request_idxs:
-                            with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
-                                future = self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
-                                    rollout_instance_id=int(rollout_instance_id),
-                                    request_id=int(request_id),
-                                    version_tag=version_tag,
-                                    data=merge_request_data,
-                                    parent_id=sample_id if self.rollout_n > 1 else None,
-                                )
-                                ray.get(future)
+                        batch_keys_to_pop = ["prompts", "attention_mask", "responses"]
+                        non_tensor_batch_keys_to_pop = ["reward_model"]
+                        if "extra_info" in merge_request_data.non_tensor_batch:
+                            non_tensor_batch_keys_to_pop.append("extra_info")
+                        if "data_source" in merge_request_data.non_tensor_batch:
+                            non_tensor_batch_keys_to_pop.append("data_source")
+                            
+                        reward_input = merge_request_data.pop(
+                            batch_keys=batch_keys_to_pop,
+                            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                        )
+                        
+                        # Reward computation
+                        if self.use_rm:
+                            pass
+                        elif self.config.reward_model.launch_reward_fn_async:
+                            with log_dual_events("Launch async reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+                                future_reward = compute_reward_async.remote(reward_input, self.config, self.tokenizer)
+                                merge_request_data.union(reward_input)
+                                
+                                if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+                                    self.request_id_to_future[request_id] = (merge_request_data, future_reward)
+                                    self.reward_futures.append(future_reward)
+                                else:
+                                    merge_request_data.non_tensor_batch["reward"] = np.array([future_reward])
+                        else:
+                            with log_dual_events("Compute reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+                                reward_tensor, reward_extra_infos_dict = compute_reward(reward_input, self.reward_fn)
+                                
+                                merge_request_data.union(reward_input)
+                                merge_request_data.batch["reward"] = reward_tensor
+                                merge_request_data.meta_info["reward_extra_info_keys"] = list(reward_extra_infos_dict.keys())
+                                merge_request_data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+
+                            # Update the request status to REWARD_COMPLETED
+                            update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(int(request_id), RequestStatus.REWARD_COMPLETED))
+                            complete_request_idxs = [
+                                i for i, success in enumerate(update_status_success) if success
+                            ]
+                            
+                            if complete_request_idxs:
+                                with log_dual_events("Occupy requests", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+                                    future = self.ps_manager_handle.store_and_maybe_occupy_rollout_instance_request.remote(
+                                        rollout_instance_id=int(rollout_instance_id),
+                                        request_id=int(request_id),
+                                        version_tag=version_tag,
+                                        data=merge_request_data,
+                                        parent_id=sample_id if self.rollout_n > 1 else None,
+                                    )
+                                    ray.get(future)
 
             # Check if any reward futures are ready
             if (

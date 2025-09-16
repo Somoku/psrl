@@ -360,6 +360,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, "PSManager IP and NIXL server IP must be the same"
             assert self.config.train_actor_rollout_ref.actor.strategy != "fsdp", "FSDP1 is not supported for NIXL because it uses flat_param"
+            
+        # Check log_prob mode
+        if self.config.psrl.log_prob.mode == "rollout":
+            assert self.config.psrl.log_prob.enable_inference_engine_log_prob, "enable_inference_engine_log_prob must be set when using rollout log_prob"
+        elif self.config.psrl.log_prob.mode == "recompute":
+            assert self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, "enable_train_engine_recompute_log_prob must be set when using recompute log_prob"
+        elif self.config.psrl.log_prob.mode == "tis":
+            assert self.config.psrl.log_prob.enable_inference_engine_log_prob and self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, "enable_inference_engine_log_prob and enable_train_engine_recompute_log_prob must be set when using TIS log_prob"
+        else:
+            raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}, must be one of ['rollout', 'recompute', 'tis']")
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -480,7 +490,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert self.data_processor is not None, "Data processor must be initialized before starting reward computation."
         assert self.rollout_coordinator is not None, "Rollout server must be initialized before starting reward computation."
         
-        self.reward_server = RewardServer.remote(
+        self.reward_server = ray.remote(RewardServer).remote(
             self.config,
             self.tokenizer,
             self.processor,
@@ -1268,26 +1278,29 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
                 # compute global_valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
+                batch.meta_info['micro_batch_size'] = self.config.train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                batch.meta_info['max_token_len'] = self.config.train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+                batch.meta_info['use_dynamic_bsz'] = self.config.train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+                batch.meta_info['temperature'] = self.config.gen_actor_rollout_ref.rollout.temperature
                 if self.config.psrl.log_prob.enable_inference_engine_log_prob:
-                    # log probs from vLLM could be buggy
-                    batch.meta_info['micro_batch_size'] = self.config.gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-                    batch.meta_info['max_token_len'] = self.config.gen_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-                    batch.meta_info['use_dynamic_bsz'] = self.config.gen_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-                    batch.meta_info['temperature'] = self.config.gen_actor_rollout_ref.rollout.temperature
+                    # batch.batch["rollout_log_probs"] can be used directly
+                    pass 
+                if self.config.psrl.log_prob.enable_train_engine_recompute_log_prob:
+                    # recompute log_probs in the training side
+                    with marked_timer("recompute_log_prob", timing_raw, color="orange"):
+                        with log_dual_events("Recompute log_prob on training side", psrl_logger, event_type=EventType.OTHER):
+                            recomputed_log_prob = self.actor_wg.compute_log_prob(batch)
+                            batch = batch.union(recomputed_log_prob)
+                            
+                # TODO(lhy): support TIS
+                if self.config.psrl.log_prob.mode == "rollout":
                     batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+                elif self.config.psrl.log_prob.mode == "recompute":
+                    batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
+                elif self.config.psrl.log_prob.mode == "tis":
+                    raise NotImplementedError("TIS is not supported in PSRL yet")
                 else:
-                    # TODO(lhy): support recompute old_log_probs in the training side
-                    raise NotImplementedError("Use training engine to compute log_prob is not supported in PSRL yet, please set enable_inference_engine_log_prob for now.")
-                
-                if self.config.psrl.log_prob.enable_proxy_log_prob:
-                    # compute proxy log_prob
-                    # AReal's algorithms require a proxy policy
-                    with marked_timer("proxy_log_prob", timing_raw, color="orange"):
-                        with log_dual_events("Compute proxy log_prob", psrl_logger, event_type=EventType.OTHER):
-                            proxy_log_prob = self.actor_wg.compute_log_prob(batch)
-                            batch = batch.union(proxy_log_prob)
-                    # TODO(lhy): support AReal's revised PPO
+                    raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}")
 
                 if self.use_reference_policy:
                     # compute reference log_prob

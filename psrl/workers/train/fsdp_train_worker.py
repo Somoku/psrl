@@ -12,7 +12,6 @@ from torch.distributed.fsdp.api import StateDictType, FullStateDictConfig
 from verl import DataProto
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_device_id
-from verl.utils.debug import log_gpu_memory_usage, GPUMemoryLogger
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -73,7 +72,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         nixl_interface: NIXLInterface
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
-        PSRL_BaseTrainWorker.__init__(self, psrl_config, train_interface, nixl_interface)
+        PSRL_BaseTrainWorker.__init__(self, self.rank, self.world_size, psrl_config, train_interface, nixl_interface)
         
         # Build logger
         self.log_prefix = f"TrainWorker_R{self.rank}"
@@ -171,11 +170,10 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             ActorRolloutRefWorker.init_model(self)
     
-    # The log_prob in training side is only used when there is a proxy policy    
+    # The log_prob in training side may need to be recomputed
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    @GPUMemoryLogger(role="compute_log_prob", logger=psrl_logger)
     def compute_log_prob(self, data: DataProto):
-        # NOTE: compared with verl, we replace `old_log_probs` with `proxy_log_probs` in the output.
+        # NOTE(lhy): compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
         assert self._is_actor
@@ -188,19 +186,13 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         is_lora = data.meta_info.pop("is_lora", False)
         adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
         data = data.to(get_device_id())
-        # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
             with adapter_ctx:
                 output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(
-                tensors={"proxy_log_probs": output, "entropys": entropys},
-                meta_info={"temperature": self.config.rollout.temperature},
+                tensors={"recomputed_log_probs": output, "entropys": entropys}
             )
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -213,7 +205,6 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=psrl_logger)
 
         return output
                 

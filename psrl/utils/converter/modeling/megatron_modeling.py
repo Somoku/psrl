@@ -11,8 +11,10 @@ class BridgedMegatronParameterMapping(ParameterMapping):
         self.config = AutoConfig.from_pretrained(config_path)
         # NOTE(lhy): this is a hack to ensure the lm_head can be transformed separately
         # Otherwise we need to handle the complex logic of sharding weight for lm_head and embedding layer
-        if getattr(self.config, "tie_word_embeddings", False):
-            self.config.tie_word_embeddings = False
+        self.original_tie_word_embeddings = getattr(self.config, "tie_word_embeddings", False)
+     
+    def disable_tie_word_embeddings(self):
+        self.config.tie_word_embeddings = False
 
     def get_mappings(self):
         raise ValueError("BridgedMegatronParameterMapping is not used for name transformation, please use mbrige instead")

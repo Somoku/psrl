@@ -3,10 +3,10 @@ import threading
 import logging
 import os
 import torch
-from abc import ABC
 from typing import Dict
 from omegaconf import DictConfig
 from dataclasses import dataclass
+from abc import ABC
 
 from psrl.utils.nixl import NIXLInterface
 
@@ -20,13 +20,17 @@ class TrainInterface:
     """Info for the PSRL TrainWorker."""
     ps_manager_handle: ray.actor.ActorHandle
     
-
+# NOTE(lhy): This class is used to abstract the base train worker for PSRL.
+# It is used to handle the NIXL push and pull operations.
+# Cannot directly call this class, please use the derived classes instead.
 class PSRL_BaseTrainWorker(ABC):
-    def __init__(self, psrl_config: DictConfig, train_interface: TrainInterface, nixl_interface: NIXLInterface):
+    def __init__(self, worker_rank: int, worker_world_size: int, psrl_config: DictConfig, train_interface: TrainInterface, nixl_interface: NIXLInterface):
+        # Basic info
+        self.worker_rank = worker_rank
+        self.worker_world_size = worker_world_size
         self.psrl_config = psrl_config
         self.train_interface = train_interface
         self.nixl_interface = nixl_interface
-        
         # NIXL
         self.nixl_storage_client = None
         self.unified_state_dict = None
@@ -114,7 +118,7 @@ class PSRL_BaseTrainWorker(ABC):
                     futures.append(ps_worker_handle.transfer_train_to_gen.remote(key))
                     psrl_logger.debug(f"Transfer {key} from train to gen in target {target_client_name}")
                 ray.get(futures)
-                ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
+                ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version, self.worker_rank, self.worker_world_size))
                 self.nixl_wait_completed.set()
                 psrl_logger.info(f"All NIXL wait operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
             except Exception as e:
@@ -186,7 +190,6 @@ class PSRL_BaseTrainWorker(ABC):
             }
             
     def push_model(self):
-        torch.cuda.synchronize()
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":

@@ -706,17 +706,26 @@ class PSManager(RequestStatusTracker):
         self._awake_ps_model_version_waiters(version_tag)
         log_single_event(f"Model with version tag {version_tag} (ref) pushed successfully", psrl_logger, event_type=EventType.PUSH)
         
-    def push_model_state_dict_nixl(self, version_tag: Union[str, int]):
+    def push_model_state_dict_nixl(self, version_tag: Union[str, int], push_rank: int, push_world_size: int):
         """
         Record the version tag of the model state dict pushed to the PS via NIXL.
         The actual model state dict is stored in the PS worker group.
         """
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_cpu_ref", "push_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
-        self.model_store = ModelStore(
-            version_tag=version_tag,
-        )
-        self._awake_ps_model_version_waiters(tag_to_int(version_tag))
-        log_single_event(f"Model with version tag {version_tag} (nixl) pushed successfully", psrl_logger, event_type=EventType.PUSH)
+        if not hasattr(self, "_push_rank_cache"):
+            self._push_rank_cache = set()
+            self._push_world_size_cache = push_world_size
+        self._push_rank_cache.add(push_rank)
+        assert self._push_world_size_cache == push_world_size, "push_world_size must be the same for all ranks"
+        # Only when all ranks have pushed the model state dict, we can update the model store
+        if len(self._push_rank_cache) == self._push_world_size_cache:
+            del self._push_rank_cache
+            del self._push_world_size_cache
+            self.model_store = ModelStore(
+                version_tag=version_tag,
+            )
+            self._awake_ps_model_version_waiters(tag_to_int(version_tag))
+            log_single_event(f"Model with version tag {version_tag} (nixl) pushed successfully", psrl_logger, event_type=EventType.PUSH)
 
     def pull_model_state_dict_cpu(
         self,

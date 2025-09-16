@@ -38,7 +38,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/grpo/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_inference_engine_log_prob=True \
-    psrl.log_prob.enable_proxy_log_prob=False \
+    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -49,7 +49,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=sync \
-    gen_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=32 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.n=4 \

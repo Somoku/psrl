@@ -7,7 +7,6 @@ from omegaconf import DictConfig
 from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.debug import log_gpu_memory_usage, GPUMemoryLogger
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
@@ -38,7 +37,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         nixl_interface: NIXLInterface
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
-        PSRL_BaseTrainWorker.__init__(self, psrl_config, train_interface, nixl_interface)
+        PSRL_BaseTrainWorker.__init__(self, self.rank, self.world_size, psrl_config, train_interface, nixl_interface)
         
         self.layer_name_mapping = {
             "qkv_layer_name": "self_attention.linear_qkv.",
@@ -148,30 +147,21 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             ActorRolloutRefWorker.init_model(self)
     
-    # The log_prob in training side is only used when there is a proxy policy    
+    # The log_prob in training side may need to be recomputed    
     @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
-    @GPUMemoryLogger(role="compute_log_prob", logger=psrl_logger)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
             load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-            log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=psrl_logger)
-        # we should always recompute old_log_probs when it is HybridEngine
-        data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-        data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-        data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info["temperature"] = self.config.rollout.temperature
         data = data.to(get_device_id())
         output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
         output = DataProto.from_dict(
-            tensors={"proxy_log_probs": output, "entropys": entropys},
-            meta_info={"temperature": self.config.rollout.temperature},
+            tensors={"recomputed_log_probs": output, "entropys": entropys}
         )
         output = output.to("cpu")
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-            log_gpu_memory_usage("After offload actor params and grad during compute_log_prob", logger=psrl_logger)
         get_torch_device().empty_cache()
         return output
                 
@@ -179,6 +169,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
+        torch.cuda.synchronize()
         with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
             PSRL_BaseTrainWorker.push_model(self)
         return output

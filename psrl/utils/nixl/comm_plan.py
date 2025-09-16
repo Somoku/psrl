@@ -185,7 +185,16 @@ class CommunicationPlanner:
                     source_info = clients[source_client]
                     if key in source_info.tensor_infos:
                         available_source_clients.append(source_client)
-                assert available_source_clients, f"No available key {key} in source clients {source_clients}, which is required by target client {target_client}"
+                if not available_source_clients:
+                    client_keys_info = {}
+                    for source_client in source_clients:
+                        client_keys_info[source_client] = list(clients[source_client].tensor_infos.keys())
+                    error_msg = (
+                        f"No available key {key} in source clients {source_clients}, "
+                        f"which is required by target client {target_client}, "
+                        f"keys of them are {client_keys_info}"
+                    )
+                    raise AssertionError(error_msg)
                 
                 # Get all shards needed by target client
                 needed_shards = set(target_tensor_info.sharding.shard_indices)

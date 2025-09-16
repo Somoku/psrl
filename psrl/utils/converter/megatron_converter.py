@@ -6,9 +6,6 @@ from typing import Optional, Tuple, Dict
 from mbridge import AutoBridge
 from mbridge.core.parallel_states import ParallelStates
 from mbridge.core.util import (
-    broadcast_from_megatron_pp,
-    broadcast_str_from_megatron_pp,
-    get_model,
     unwrap_model,
 )
 
@@ -26,6 +23,7 @@ class MegatronConverter(BaseConverter):
     ):
         self.parameter_mapping = parameter_mapping
         
+        self.parameter_mapping.disable_tie_word_embeddings()
         self.bridge = AutoBridge.from_config(self.parameter_mapping.config) # mbridge will maintain its own mpu
         if mpu is not None:
             assert self.bridge.mpu == mpu, f"Megatron parallel states must be the same, but got external {mpu} and mbridge internal {self.bridge.mpu}"
@@ -84,6 +82,16 @@ class MegatronConverter(BaseConverter):
             for new_param_name, new_param in new_params.items():
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding
+                
+        # NOTE(lhy): a workaround for lm_head
+        # if PP is not used and the word embedding is shared
+        # we manually set the lm_head
+        if self.mpu.pp_size == 1 and self.parameter_mapping.original_tie_word_embeddings:
+            for original_name, new_name in self.bridge._DIRECT_MAPPING.items():
+                if "embed_tokens.weight" in new_name and new_name in converted_state_dict:
+                    converted_state_dict["lm_head.weight"] = converted_state_dict[new_name]
+                    sharding_dict["lm_head.weight"] = sharding_dict[new_name]
+                    break
         
         return converted_state_dict, sharding_dict
     

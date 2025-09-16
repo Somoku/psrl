@@ -27,6 +27,8 @@ from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
 QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-0.5B-Instruct"
+# QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-Math-7B"
+# QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-3B-Instruct"
 
 def make_dual_print(log_path, prefix=None):
     with open(log_path, "w") as f:
@@ -170,6 +172,8 @@ class TrainClientActor:
         )
         
         self.print(f"[Rank {self.rank}] Model initialized: {self.model}")
+        # self.print(f"[Rank {self.rank}] Model state_dict keys: {[submodel.state_dict().keys() for submodel in self.model]}")
+        # self.print(f"[Rank {self.rank}] Model named parameter keys: {[name for submodel in self.model for name, _ in submodel.named_parameters()]}")
     
     def init_finished(self):
         return True
@@ -253,6 +257,12 @@ class GenClientActor:
         )
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
         self.print(f"local rank {rank} model: {self.model}")
+        '''
+        seen_module_prefixes = set()
+        for module_prefix, module in self.model.named_modules():
+            seen_module_prefixes.add(module_prefix)
+        self.print(f"seen_module_prefixes: {seen_module_prefixes}, has lm_head: {'lm_head' in seen_module_prefixes}, has lm_head module: {hasattr(self.model, 'lm_head')}")
+        '''
         self.rank = rank
         self.tp_rank = rank % 2
         self.client = NIXLStorageClient(

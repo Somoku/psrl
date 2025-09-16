@@ -18,8 +18,8 @@ GEN_PP=1 # PP in the generation side
 
 VAL_TP=2 # TP in the training side for validation
 TRAIN_TP=2 # TP in the training side 
-TRAIN_PP=2 # PP in the training side 
-TRAIN_CP=1 # CP in the training side
+TRAIN_PP=1 # PP in the training side 
+TRAIN_CP=2 # CP in the training side
 
 NNODES=2
 NGPUS_PER_NODE=8
@@ -43,10 +43,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=cpu_ref \
+    psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_inference_engine_log_prob=True \
-    psrl.log_prob.enable_proxy_log_prob=False \
+    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -67,7 +67,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.n=1 \
-    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \

@@ -8,7 +8,8 @@ psrl:
   logging_path: ~/psrl_logs
   log_prob:
     enable_inference_engine_log_prob: True
-    enable_proxy_log_prob: False
+    enable_train_engine_recompute_log_prob: False
+    mode: rollout # rollout, recompute, tis
   deployment:
     n_rollout_instances: 1
     rollout_nnodes_per_instance: 1

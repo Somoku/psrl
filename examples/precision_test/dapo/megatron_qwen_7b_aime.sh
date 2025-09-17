@@ -21,18 +21,18 @@ GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
-TRAIN_PP=4 # PP in the training side 
+TRAIN_PP=2 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 
-NNODES=4
+NNODES=12
 NGPUS_PER_NODE=8
 
-GEN_NNODES=$(( ${NNODES} / 2 )) # Number of nodes for generation
+GEN_NNODES=8 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=$(( ${NNODES} / 2 )) # Number of nodes for training
+TRAIN_NNODES=4 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
@@ -49,7 +49,7 @@ overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=512
-n_resp_per_prompt=16
+n_resp_per_prompt=8
 train_prompt_mini_bsz=32
 
 # Algorithm
@@ -62,7 +62,9 @@ val_top_p=0.7
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
-offload=False
+# NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
+# May support this in the future
+offload=True
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -123,7 +125,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
-    train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
@@ -131,7 +133,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
-    train_actor_rollout_ref.actor.megatron.param_offload=${offload} \
+    train_actor_rollout_ref.actor.megatron.param_offload=False \
     train_actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
     train_actor_rollout_ref.actor.megatron.grad_offload=${offload} \
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
@@ -160,7 +162,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.test_freq=10 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \

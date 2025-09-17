@@ -1,13 +1,8 @@
 import ray
 import os
 import logging
-import threading
-from typing import List, Dict
-from omegaconf import DictConfig
-
 import torch
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.api import StateDictType, FullStateDictConfig
+from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.single_controller.base.decorator import Dispatch, register
@@ -27,6 +22,7 @@ from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 def get_fsdp_full_state_dict(model: torch.nn.Module, offload_to_cpu: bool = True, rank0_only: bool = True):
     """
@@ -212,6 +208,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
+        torch.cuda.synchronize()
         with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
             PSRL_BaseTrainWorker.push_model(self)
         return output

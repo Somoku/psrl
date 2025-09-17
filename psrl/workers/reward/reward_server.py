@@ -203,7 +203,7 @@ class RewardServer(CommandExtension):
             return_tensors="pt",
             return_attention_mask=False,
         )
-        response_mask = outputs["input_ids"]
+        response_mask = outputs["input_ids"] # [bsz, response_length], each row is [1, 1, ..., 1, 0, 0, ..., 0] (0 is the padding)
 
         assert response_ids.shape == response_mask.shape, (
             f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"

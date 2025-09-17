@@ -44,6 +44,7 @@ class BatchGenerateAgentLoop(AgentLoopBase):
                 response_mask = [1] * len(response_ids)
                 response_mask_list.append(response_mask[: self.response_length])
                 num_turns_list.append(0)
+            # response mask: bsz * [1, 1, ..., 1] (the num of 1 is the max of response_length and actual length of response_ids)
             output.non_tensor_batch["response_mask"] = np.fromiter(response_mask_list, dtype=object)
             output.non_tensor_batch["__num_turns__"] = np.array(num_turns_list)
 

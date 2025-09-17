@@ -1172,7 +1172,7 @@ class PSRL_GenWorker(Worker):
 
         curr_rollout_instance_model_version = self.curr_rollout_instance_model_version
         request_ids = requests.non_tensor_batch["uid"]
-        psrl_logger.info(f"Rollout instance {rollout_instance_id} is generating requests with request ids: {request_ids}")
+        psrl_logger.debug(f"Rollout instance {rollout_instance_id} is generating requests with request ids: {request_ids}")
         needed_model_versions = requests.non_tensor_batch["version_tag"]
         # assert all version tag in needed_model_versions are equal
         if not all(version == needed_model_versions[0] for version in needed_model_versions):

@@ -111,7 +111,7 @@ class MegatronConverter(BaseConverter):
                     head_size=self.model_info["head_size"],
                     tp_size=self.mpu.tp_size
                 )
-            except AssertionError as e:
+            except Exception as e:
                 raise ValueError(f"Failed to slice qkv parameter {full_name} into {full_hf_names}: {e}")
             out = {}
             for shard_id, full_hf_name in enumerate(full_hf_names):
@@ -128,7 +128,7 @@ class MegatronConverter(BaseConverter):
                     output_sizes=[self.model_info["intermediate_size"], self.model_info["intermediate_size"]],
                     tp_size=self.mpu.tp_size
                 )
-            except AssertionError as e:
+            except Exception as e:
                 raise ValueError(f"Failed to slice gate up proj parameter {full_name} into {full_hf_names}: {e}")
             out = {}
             for shard_id, full_hf_name in enumerate(full_hf_names):

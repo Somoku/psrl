@@ -103,7 +103,7 @@ class VllmConverter(BaseConverter):
                             head_size=self.model_info["head_size"],
                             tp_size=tp_size
                         )
-                    except AssertionError as e:
+                    except Exception as e:
                         raise ValueError(f"Failed to slice qkv parameter {full_name}: {e}")
                     out = {}
                     for hf_name, shard_id in mappings:
@@ -120,7 +120,7 @@ class VllmConverter(BaseConverter):
                             output_sizes=[intermediate_size, intermediate_size],
                             tp_size=tp_size
                         )
-                    except AssertionError as e:
+                    except Exception as e:
                         raise ValueError(f"Failed to slice gate up proj parameter {full_name}: {e}")
                     out = {}
                     for hf_name, shard_id in mappings:

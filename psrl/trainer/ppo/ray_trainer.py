@@ -24,7 +24,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.ray_trainer import WorkerType, AdvantageEstimator, apply_kl_penalty, compute_response_mask, compute_advantage, RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import WorkerType, AdvantageEstimator, apply_kl_penalty, compute_response_mask, RayPPOTrainer
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
@@ -41,7 +41,7 @@ from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.reward import RewardServer
 from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStoragePlan, PSStorageWorker
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
-from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager
+from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager, PSRL_compute_advantage
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -799,6 +799,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
                 return wg_dict.spawn(prefix_set=class_dict.keys())
         
+        '''
         # coroutine version
         async def async_create_worker_groups():
             tasks = []
@@ -841,11 +842,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         async_results = asyncio.run(async_create_worker_groups())
         all_wg.update(async_results)
-        
         '''
+        
         # multi-thread version 
         tasks = []
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+            psrl_logger.info(f"Creating worker group for resource pool: {resource_pool}, classes: {class_dict}")
             if "ps" in class_dict:
                 assert class_dict.keys() == {"ps"}, "PS resource pool should only have PS role."
                 continue
@@ -867,7 +869,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     resource_pool, class_dict = futures[future]
                     psrl_logger.info(f"Error creating worker group for {resource_pool}, class {class_dict}: {str(e)}")
                     raise
-        '''
         
         '''
         # sync version
@@ -1365,7 +1366,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
                         
-                        batch = compute_advantage(
+                        psrl_logger.info(f"Before compute advantage:")
+                        psrl_logger.info(f"batch.batch['token_level_rewards']: {batch.batch['token_level_rewards']}")
+                        psrl_logger.info(f"batch.batch['response_mask']: {batch.batch['response_mask']}")
+                        psrl_logger.info(f"batch.non_tensor_batch['uid']: {batch.non_tensor_batch['uid']}")
+                        psrl_logger.info(f"batch.non_tensor_batch['parent_id']: {batch.non_tensor_batch['parent_id']}")
+                        batch = PSRL_compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,

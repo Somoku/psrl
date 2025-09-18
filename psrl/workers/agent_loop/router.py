@@ -150,7 +150,7 @@ class RolloutRouter:
             log_prob_list = []
             # if inference logprobs is required, we need to collect the log probabilities
             if (
-                self.config.psrl.log_prob.enable_inference_engine_log_prob and
+                self.config.psrl.log_prob.enable_rollout_engine_log_prob and
                 hasattr(vllm_output.outputs[0], 'logprobs') and
                 vllm_output.outputs[0].logprobs is not None
             ):
@@ -192,7 +192,7 @@ class RolloutRouter:
         non_tensor_batch["interrupted"] = np.array(interrupted_list, dtype=bool)
 
         # Update rollout_log_probs
-        if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+        if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:

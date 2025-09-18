@@ -1,0 +1,148 @@
+# IP address of parameter server managaer.
+ps_manager_ip: 127.0.0.1
+
+# Staleness control of training data.
+staleness: 0
+
+# Size of each staleness buffer (i.e. training batch)
+staleness_buffer_entries: 512
+
+# number of responses (i.e. num sample times). > 1 for grpo
+rollout_n: ${oc.select:gen_actor_rollout_ref.rollout.n}
+
+# Generate mode: batch or stream
+gen_mode: batch
+
+# Weight synchronization mode for parameter server: cpu_ref or nixl_cpu
+ps_mode: cpu_ref
+
+# Logging path
+logging_path: ~/psrl_logs
+
+# Config for logprobs
+log_prob:
+
+  # Whether to return logprobs from rollout engines
+  enable_rollout_engine_log_prob: True
+
+  # Whether to use proxy logprobs (AReaL)
+  enable_train_engine_recompute_log_prob: False
+
+  # rollout, recompute, tis
+  mode: rollout
+
+# Worker deployment and resource allocation
+deployment:
+
+  # Number for rollout instances
+  n_rollout_instances: 1
+
+  # Node number for each rollout instance
+  rollout_nnodes_per_instance: 1
+
+  # GPU number for each rollout instance in every node
+  rollout_ngpus_per_node_per_instance: 1
+
+  # Node number for trainer
+  train_nnodes: 1
+
+  # GPU number for trainer in every node
+  train_ngpus_per_node: 1
+  
+  # Rollout with heterogeneous strategies across different instances
+  heterogeneous_rollout:
+
+    # Whether to enable heterogeneous strategies for different rollout instances.
+    enable: False
+
+    # Number for rollout instances
+    n_rollout_instances: ${psrl.deployment.n_rollout_instances}
+
+    # Node number for each rollout instance
+    rollout_nnodes_per_instance: []
+
+    # GPU number for each rollout instance in every node
+    rollout_ngpus_per_node_per_instance: []
+
+    # Tensor model parallel size for each rollout instance.
+    tensor_model_parallel_size_per_instance: []
+
+    # Pipeline model parallel size for each rollout instance.
+    pipeline_model_parallel_size_per_instance: []
+
+# Collect rollout instance status to rollout coordinator for global dp load balance
+status_collection:
+
+  # whether to enable the status collection.
+  enable: True
+
+  # Engine status sync interval in millisecond (for RolloutCoordinator -> AgentLoopWorkers)
+  # Sync to agent workers every 0.1 seconds
+  engine_status_sync_interval_in_ms: 100
+
+# Redundant rollout config
+redundant_rollout:
+
+  # Whether to enable redundant rollout
+  enable: False
+
+  # Global batch size for algorithm requirement
+  alg_global_batch_size: ${psrl.staleness_buffer_entries}
+
+  # Number of responses for algorithm requirement
+  alg_rollout_n: ${psrl.rollout_n}
+
+  # Actual global batch size (>= algorithm requirement)
+  redundant_global_batch_size: null
+
+  # Actual number of responses (>= algorithm requirement)
+  redundant_rollout_n: null
+
+# Partial rollout config
+partial_rollout:
+
+  # Whether to enbale partial rollout
+  enable: False
+
+  # Workload threshold to trigger partial rollout
+  threshold: null
+
+  # Whether view interrupted trajectories as new prompts
+  interrupt_as_prompt: False
+
+# NIXL config for `nixl_cpu` weight synchronization
+nixl:
+
+  # Parameter server mode: storage_server or meta_server
+  server_mode: meta_server
+
+  # Server IP address
+  server_ip: ${psrl.ps_manager_ip}
+
+  # Server port
+  server_port: 23456
+
+  # Pinned temp memory slots num for non-contiguous transfer
+  max_pinned_temp_memory_slots: 4
+
+# Post processor for group requests in streaming mode
+group_post_process:
+
+  # Whether to enable group post-processing
+  enable: False
+
+  # Name of the registered group post-processor to use
+  # Available options: "dynamic_sampling_filter", "no_filter"
+  # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
+  name: null
+
+# Post processor for buffer requests in batch mode
+buffer_post_process:
+
+  # Whether to enable buffer post-processing
+  enable: False
+
+  # Name of the registered buffer post-processor to use
+  # Available options: "dynamic_sampling_filter", "no_filter"
+  # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
+  name: null

@@ -1,0 +1,551 @@
+diff --git a/verl/protocol.py b/verl/protocol.py
+index b412dd45..3b4a3d90 100644
+--- a/verl/protocol.py
++++ b/verl/protocol.py
+@@ -386,7 +386,7 @@ class DataProto:
+             raise TypeError(f"Indexing with {type(item)} is not supported")
+ 
+     def __getstate__(self):
+-        if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None:
++        if version.parse(tensordict.__version__) >= version.parse("0.5.0") and self.batch is not None and len(self.batch.keys()) > 0:
+             batch = self.batch.contiguous().consolidate()
+         else:
+             batch = self.batch
+@@ -704,7 +704,7 @@ class DataProto:
+         tensors = {}
+         # tensor batch
+         for key in batch_keys:
+-            assert key in self.batch.keys()
++            assert key in self.batch.keys(), f"Key {key} not found in batch keys {self.batch.keys()}"
+             tensors[key] = self.batch.pop(key)
+         non_tensors = {}
+         # non tensor batch
+diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
+index 59ab27a9..3b811a61 100644
+--- a/verl/single_controller/base/worker.py
++++ b/verl/single_controller/base/worker.py
+@@ -240,8 +240,7 @@ class Worker(WorkerHelper):
+             # environment variable for each actor, unless
+             # RAY_EXPERIMENTAL_NOSET_*_VISIBLE_DEVICES is set,
+             # so we need to set local rank when the flag is set.
+-            device_name = "NPU" if is_npu_available else "GPU"
+-            local_rank = ray.get_runtime_context().get_accelerator_ids()[device_name][0]
++            local_rank = os.environ.get("RAY_LOCAL_RANK")
+             os.environ["LOCAL_RANK"] = local_rank
+             get_torch_device().set_device(int(local_rank))
+ 
+diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
+index 3c6c1eab..f9072817 100644
+--- a/verl/single_controller/ray/base.py
++++ b/verl/single_controller/ray/base.py
+@@ -237,12 +237,50 @@ class RayClassWithInitArgs(ClassWithInitArgs):
+             options = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=target_node_id, soft=False)}
+             return self.cls.options(**options).remote(*self.args, cuda_visible_devices=visible_devices, **self.kwargs)
+ 
+-        options = {
+-            "scheduling_strategy": PlacementGroupSchedulingStrategy(
+-                placement_group=placement_group, placement_group_bundle_index=placement_group_bundle_idx
+-            )
+-        }
++        options = {}
+         options.update(self._options)
++        if hasattr(self.cls, "configure_worker"):
++            config = self.kwargs.get("config", None)
++            # Specialized for PSRL
++            gen_interface = self.kwargs.get("gen_interface", None)
++            dp_idx = 0
++            if gen_interface is not None:
++                dp_idx = gen_interface.rollout_instance_id
++            # Get complete worker configuration from the worker class
++            # bundle_indices = range(len(placement_group.bundle_specs)) if placement_group_bundle_idx == 0 else None
++            bundle_indices = range(len(placement_group.bundle_specs))
++            resources, env_vars, init_kwargs = self.cls.configure_worker(
++                config=config,
++                num_gpus=num_gpus,
++                dp_idx=dp_idx,
++                bundle_indices=bundle_indices,
++            )
++            
++            # Apply resource configuration
++            if resources and "num_gpus" in resources:
++                num_gpus = resources["num_gpus"]
++            if resources and "num_cpus" in resources:
++                num_cpus = resources["num_cpus"]
++                options["num_cpus"] = num_cpus
++            
++            # Apply environment variables if provided
++            if env_vars:
++                if "runtime_env" not in options:
++                    options["runtime_env"] = {"env_vars": {}}
++                if "env_vars" not in options["runtime_env"]:
++                    options["runtime_env"]["env_vars"] = {}
++                for k, v in env_vars.items():
++                    options["runtime_env"]["env_vars"][k] = v
++
++            # Apply initialization parameters
++            if init_kwargs:
++                self.kwargs.update(init_kwargs)
++        
++        options["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
++            placement_group=placement_group,
++            placement_group_bundle_index=placement_group_bundle_idx,
++            placement_group_capture_child_tasks=True,
++        )
+ 
+         if use_gpu and device_name == "cuda":
+             options["num_gpus"] = num_gpus
+@@ -396,6 +434,7 @@ class RayWorkerGroup(WorkerGroup):
+                     "WG_PREFIX": self.name_prefix,
+                     "WG_BACKEND": "ray",
+                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
++                    "RAY_LOCAL_RANK": str(local_rank),
+                     "MASTER_ADDR": self._master_addr,
+                     "MASTER_PORT": self._master_port,
+                 }
+diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
+index f2e8a6a2..a7c5345c 100644
+--- a/verl/workers/fsdp_workers.py
++++ b/verl/workers/fsdp_workers.py
+@@ -143,43 +143,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         Worker.__init__(self)
+ 
+         self.config = config
+-        import torch.distributed
+-
+-        if not torch.distributed.is_initialized():
+-            rank = int(os.environ.get("RANK", 0))
+-            world_size = int(os.environ.get("WORLD_SIZE", 1))
+-            torch.distributed.init_process_group(
+-                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
+-                rank=rank,
+-                world_size=world_size,
+-                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+-                init_method=os.environ.get("DIST_INIT_METHOD", None),
+-            )
+-
+-        # build device mesh for FSDP
+-        world_size = torch.distributed.get_world_size()
+-        # TODO(sgm): support FSDP hybrid shard for larger model
+-        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+-
+-        # build device mesh for Ulysses Sequence Parallel
+-        self.ulysses_device_mesh = None
+-        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
+-        dp = world_size // self.ulysses_sequence_parallel_size
+-        if self.ulysses_sequence_parallel_size > 1:
+-            self.ulysses_device_mesh = init_device_mesh(
+-                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+-            )
+-
+-        # create training dispatch
+-        if self.ulysses_device_mesh is not None:
+-            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
+-            self._register_dispatch_collect_info(
+-                "actor", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
+-            )
+-        else:
+-            self._register_dispatch_collect_info("actor", dp_rank=self.rank, is_collect=True)
+-
+-        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+         self._lora_rank = self.config.model.get("lora_rank", 0)
+         self._is_lora = self._lora_rank > 0
+ 
+@@ -232,6 +195,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             # TODO: it seems that manual offload is slowly than FSDP offload
+             self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
+ 
++    def _build_distributed(self):
++        import torch.distributed
++
++        if not torch.distributed.is_initialized():
++            rank = int(os.environ.get("RANK", 0))
++            world_size = int(os.environ.get("WORLD_SIZE", 1))
++            torch.distributed.init_process_group(
++                backend=f"cpu:gloo,{get_device_name()}:{get_nccl_backend()}",
++                rank=rank,
++                world_size=world_size,
++                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
++                init_method=os.environ.get("DIST_INIT_METHOD", None),
++            )
++
++        # build device mesh for FSDP
++        world_size = torch.distributed.get_world_size()
++        # TODO(sgm): support FSDP hybrid shard for larger model
++        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
++
++        # build device mesh for Ulysses Sequence Parallel
++        self.ulysses_device_mesh = None
++        self.ulysses_sequence_parallel_size = self.config.actor.get("ulysses_sequence_parallel_size", 1)
++        dp = world_size // self.ulysses_sequence_parallel_size
++        if self.ulysses_sequence_parallel_size > 1:
++            self.ulysses_device_mesh = init_device_mesh(
++                device_name, mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
++            )
++
++        # create training dispatch
++        if self.ulysses_device_mesh is not None:
++            is_collect = self.ulysses_device_mesh["sp"].get_local_rank() == 0
++            self._register_dispatch_collect_info(
++                "actor", dp_rank=self.ulysses_device_mesh["dp"].get_local_rank(), is_collect=is_collect
++            )
++        else:
++            self._register_dispatch_collect_info("actor", dp_rank=self.rank, is_collect=True)
++
++        self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
++
+         # normalize config
+         if self._is_actor:
+             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+@@ -703,12 +705,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         self.gen_random_states = get_torch_device().get_rng_state()
+         get_torch_device().set_rng_state(self.torch_random_states)
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         from verl.workers.actor import DataParallelPPOActor
+ 
+         # This is used to import external_lib into the huggingface systems
+         import_external_libs(self.config.model.get("external_lib", None))
++        
++        self._build_distributed()
+ 
+         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+         use_remove_padding = self.config.model.get("use_remove_padding", False)
+@@ -1093,16 +1097,25 @@ class CriticWorker(Worker, DistProfilerExtension):
+         DistProfilerExtension.__init__(
+             self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+         )
++
++        self.config: FSDPCriticConfig = config
++        
++        # set FSDP offload params
++        self._is_offload_param = self.config.model.fsdp_config.param_offload
++        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
++        
++        self._is_lora = self.config.model.get("lora_rank", 0) > 0
++        self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
++
++    def _build_distributed(self):
+         import torch.distributed
+ 
+-        self.config = config
+         if not torch.distributed.is_initialized():
+             torch.distributed.init_process_group(
+                 backend=get_nccl_backend(),
+                 timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+                 init_method=os.environ.get("DIST_INIT_METHOD", None),
+             )
+-        self.config: FSDPCriticConfig = config
+ 
+         # build device mesh for Ulysses Sequence Parallel
+         world_size = torch.distributed.get_world_size()
+@@ -1130,10 +1143,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+ 
+         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+ 
+-        # set FSDP offload params
+-        self._is_offload_param = self.config.model.fsdp_config.param_offload
+-        self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
+-
+         # normalize config
+         self.config.ppo_mini_batch_size *= self.config.rollout_n
+         self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
+@@ -1156,8 +1165,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+                 f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
+                 f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
+             )
+-        self._is_lora = self.config.model.get("lora_rank", 0) > 0
+-        self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
+ 
+     def _build_critic_model_optimizer(self, config):
+         # the following line is necessary
+@@ -1380,12 +1387,14 @@ class CriticWorker(Worker, DistProfilerExtension):
+ 
+         return critic_module, critic_optimizer, critic_lr_scheduler
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # This is used to import external_lib into the huggingface systems
+         import_external_libs(self.config.model.get("external_lib", None))
+ 
+         from verl.workers.critic import DataParallelPPOCritic
++        
++        self._build_distributed()
+ 
+         self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
+             self.config
+@@ -1520,9 +1529,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+             DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
+         )
+ 
++        self.config = config
++
++        self.use_remove_padding = self.config.model.get("use_remove_padding", False)
++
++    def _build_distributed(self):
+         import torch.distributed
+ 
+-        self.config = config
+         if not torch.distributed.is_initialized():
+             torch.distributed.init_process_group(
+                 backend=get_nccl_backend(),
+@@ -1556,8 +1569,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+         else:
+             self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
+ 
+-        self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+-
+         # normalize config
+         if self.config.micro_batch_size is not None:
+             self.config.micro_batch_size //= torch.distributed.get_world_size()
+@@ -1644,10 +1655,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+             raise NotImplementedError(f"Unknown strategy: {config.strategy}")
+         return reward_module
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # This is used to import external_lib into the huggingface systems
+         import_external_libs(self.config.model.get("external_lib", None))
++        self._build_distributed()
+         self.reward_module = self._build_model(config=self.config)
+ 
+     def _forward_micro_batch(self, micro_batch):
+diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
+index 7def1782..d8909874 100644
+--- a/verl/workers/megatron_workers.py
++++ b/verl/workers/megatron_workers.py
+@@ -179,43 +179,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+             # NPU MindSpeed patch, will be refactored with MindSpeedEngine.
+             repatch(self.config.actor.megatron.get("override_transformer_config", {}))
+ 
+-        # NOTE(sgm): We utilize colocate WorkerGroup by default.
+-        # As a result, Workers for different model share the same process.
+-        # Therefore, we only require one distribute initialization.
+-        # To utilize different parallel strategy in different models:
+-        # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
+-        # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
+-        if not torch.distributed.is_initialized():
+-            set_numa_affinity()
+-            rank = int(os.environ["LOCAL_RANK"])
+-            torch.distributed.init_process_group(
+-                backend=get_nccl_backend(),
+-                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
+-                init_method=os.environ.get("DIST_INIT_METHOD", None),
+-            )
+-            get_torch_device().set_device(rank)
+-
+-            mpu.initialize_model_parallel(
+-                tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
+-                pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
+-                virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
+-                pipeline_model_parallel_split_rank=None,
+-                use_sharp=False,
+-                context_parallel_size=self.config.actor.megatron.context_parallel_size,
+-                expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
+-                expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
+-                nccl_communicator_config_path=None,
+-            )
+-
+-        is_collect = (
+-            mpu.get_tensor_model_parallel_rank() == 0
+-            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+-            and mpu.get_context_parallel_rank() == 0
+-        )
+-        self._register_dispatch_collect_info(
+-            mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
+-        )
+-
+         set_random_seed(seed=self.config.actor.megatron.seed)
+ 
+         self.role = role
+@@ -257,6 +220,44 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         self._is_offload_grad = False
+         self._is_offload_optimizer = False
+ 
++    def _build_distributed(self):
++        # NOTE(sgm): We utilize colocate WorkerGroup by default.
++        # As a result, Workers for different model share the same process.
++        # Therefore, we only require one distribute initialization.
++        # To utilize different parallel strategy in different models:
++        # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
++        # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
++        if not torch.distributed.is_initialized():
++            set_numa_affinity()
++            rank = int(os.environ["LOCAL_RANK"])
++            torch.distributed.init_process_group(
++                backend=get_nccl_backend(),
++                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
++                init_method=os.environ.get("DIST_INIT_METHOD", None),
++            )
++            get_torch_device().set_device(rank)
++
++            mpu.initialize_model_parallel(
++                tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
++                pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
++                virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
++                pipeline_model_parallel_split_rank=None,
++                use_sharp=False,
++                context_parallel_size=self.config.actor.megatron.context_parallel_size,
++                expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
++                expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
++                nccl_communicator_config_path=None,
++            )
++
++        is_collect = (
++            mpu.get_tensor_model_parallel_rank() == 0
++            and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
++            and mpu.get_context_parallel_rank() == 0
++        )
++        self._register_dispatch_collect_info(
++            mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
++        )
++        
+         # normalize config
+         if self._is_actor and self._is_rollout:
+             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+@@ -438,7 +439,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+             loop = asyncio.get_event_loop()
+             loop.run_until_complete(self.trainer_mode())
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         if self.config.model.get("external_lib", None) is not None:
+             # This is used to import external_lib into the huggingface systems
+@@ -448,6 +449,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+ 
+         from verl.utils.torch_dtypes import PrecisionType
+ 
++        self._build_distributed()
++
+         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+         if self._is_actor:
+             override_transformer_config = OmegaConf.to_container(
+@@ -603,7 +606,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         get_torch_device().set_rng_state(self.torch_random_states)
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+-    @GPUMemoryLogger(role="update_actor", logger=logger)
+     @DistProfiler.annotate(color="red")
+     def update_actor(self, data: DataProto):
+         assert self._is_actor
+@@ -646,7 +648,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         return output
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+-    @GPUMemoryLogger(role="generate_sequences", logger=logger)
+     @DistProfiler.annotate(color="red")
+     def generate_sequences(self, prompts: DataProto):
+         assert self._is_rollout
+@@ -696,7 +697,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         return output
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+-    @GPUMemoryLogger(role="compute_ref_log_prob", logger=logger)
+     @DistProfiler.annotate(color="olive")
+     def compute_ref_log_prob(self, data: DataProto):
+         assert self._is_ref
+@@ -718,7 +718,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         return output
+ 
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+-    @GPUMemoryLogger(role="compute_log_prob", logger=logger)
+     @DistProfiler.annotate(color="blue")
+     def compute_log_prob(self, data: DataProto):
+         assert self._is_actor
+@@ -824,6 +823,15 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+         )
+         self.config: McoreCriticConfig = config
+ 
++        set_random_seed(seed=self.config.megatron.seed)
++
++        # set FSDP offload params
++        self._is_offload_param = self.config.megatron.param_offload
++        self._is_offload_optimizer = self.config.megatron.optimizer_offload
++
++        # TODO(sgm): support critic model offload
++
++    def _build_distributed(self):
+         # NOTE(sgm): We utilize colocate WorkerGroup by default.
+         # As a result, Workers for different model share the same process.
+         # Therefore, we only require one distribute initialization.
+@@ -860,13 +868,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+         self._register_dispatch_collect_info(
+             mesh_name="critic", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
+         )
+-
+-        set_random_seed(seed=self.config.megatron.seed)
+-
+-        # set FSDP offload params
+-        self._is_offload_param = self.config.megatron.param_offload
+-        self._is_offload_optimizer = self.config.megatron.optimizer_offload
+-
++        
+         # normalize config
+         self.config.ppo_mini_batch_size *= self.config.rollout_n
+         self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
+@@ -874,8 +876,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+             self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
+             self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
+ 
+-        # TODO(sgm): support critic model offload
+-
+     def _build_critic_model_optimizer(
+         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
+     ):
+@@ -944,7 +944,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+         get_torch_device().empty_cache()
+         return critic_module, critic_optimizer, critic_optimizer_scheduler, self.hf_config, optim_config
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # create critic
+ 
+@@ -955,6 +955,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+             import importlib
+ 
+             importlib.import_module(self.config.model.external_lib)
++        self._build_distributed()
+         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+         override_transformer_config = OmegaConf.to_container(
+             OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
+@@ -1106,6 +1107,9 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+         )
+         self.config = config
+ 
++        set_random_seed(seed=self.config.megatron.seed)
++
++    def _build_distributed(self):
+         # NOTE(sgm): We utilize colocate WorkerGroup by default.
+         # As a result, Workers for different model share the same process.
+         # Therefore, we only require one distribute initialization.
+@@ -1143,8 +1147,6 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+             mesh_name="reward", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
+         )
+ 
+-        set_random_seed(seed=self.config.megatron.seed)
+-
+         # normalize config
+         if self.config.micro_batch_size is not None:
+             self.config.micro_batch_size //= mpu.get_data_parallel_world_size()
+@@ -1192,7 +1194,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+         get_torch_device().empty_cache()
+         return reward_model, self.hf_config
+ 
+-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
++    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+     def init_model(self):
+         # create critic
+ 
+@@ -1203,6 +1205,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+             import importlib
+ 
+             importlib.import_module(self.config.model.external_lib)
++        self._build_distributed()
+         override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
+         override_transformer_config = OmegaConf.to_container(
+             OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))

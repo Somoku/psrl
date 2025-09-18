@@ -373,7 +373,7 @@ class RewardServer(CommandExtension):
                     rollout_data.non_tensor_batch.pop("raw_response_ids", None)
                     
                     # Rollout log probs processing
-                    if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+                    if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
                         device = rollout_data.batch["input_ids"].device
                         rollout_log_probs = rollout_data.non_tensor_batch.pop("rollout_log_probs", None)
                         assert rollout_log_probs is not None, "rollout_log_probs should not be None"
@@ -418,7 +418,7 @@ class RewardServer(CommandExtension):
                                 future_reward = compute_reward_async.remote(reward_input, self.config, self.tokenizer)
                                 merge_request_data.union(reward_input)
                                 
-                                if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+                                if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
                                     self.request_id_to_future[request_id] = (merge_request_data, future_reward)
                                     self.reward_futures.append(future_reward)
                                 else:
@@ -451,7 +451,7 @@ class RewardServer(CommandExtension):
 
             # Check if any reward futures are ready
             if (
-                self.config.psrl.log_prob.enable_inference_engine_log_prob and
+                self.config.psrl.log_prob.enable_rollout_engine_log_prob and
                 self.config.reward_model.launch_reward_fn_async
             ):
                 ready_rewards, self.reward_futures = ray.wait(self.reward_futures)

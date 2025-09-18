@@ -10,16 +10,16 @@ THIRD_PARTY_PATH="$PSRL_PATH/third_party"
 mkdir -p $THIRD_PARTY_PATH
 
 echo "1. Install pytorch and tensordict"
-# python -m pip install --no-cache-dir "torch==2.6.0" "torchvision==0.21.0" "torchaudio==2.6.0" --index-url https://download.pytorch.org/whl/cu124
-python -m pip install --no-cache-dir "torch==2.7.1" "torchvision==0.22.1" "torchaudio==2.7.1" --index-url https://download.pytorch.org/whl/cu128
-python -m pip install --no-cache-dir "tensordict==0.6.2" torchdata
+# python -m pip install --no-cache-dir "torch==2.7.1" "torchvision==0.22.1" "torchaudio==2.7.1" --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir "tensordict==0.10.0" torchdata
 
 echo "2. Install xformers"
 # python -m pip install -v --no-build-isolation -U "git+https://github.com/facebookresearch/xformers.git@v0.0.29.post3#egg=xformers"
 python -m pip install -v --no-build-isolation -U "git+https://github.com/facebookresearch/xformers.git@v0.0.31#egg=xformers"
 
 echo "3. Install basic packages"
-python -m pip install "transformers[hf_xet]<4.54.0" accelerate datasets peft hf-transfer matplotlib flask \
+python -m pip install transformers accelerate datasets peft hf-transfer matplotlib flask \
     "numpy<2.0.0" "pyarrow>=15.0.0" pandas paramiko mbridge \
     ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
     pytest py-spy pyext pre-commit ruff meson ninja pynvml requests einops
@@ -49,28 +49,32 @@ python -m pip install opencv-fixer && \
 echo "7. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    git clone -b v0.10.0 https://github.com/vllm-project/vllm.git
+    git clone -b v0.10.2 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$THIRD_PARTY_PATH/vllm
     popd
 fi
 pushd $VLLM_PATH
+mv $PSRL_PATH/patch/use_existing_torch.py .
 python use_existing_torch.py
+python -m pip install -r requirements/common.txt
+python -m pip install -r requirements/cuda.txt
 python -m pip install -r requirements/build.txt
 python -m pip install --no-build-isolation -e .
 popd
 
 if [ -z "$VERL_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    git clone -b v0.5.x https://github.com/volcengine/verl.git
+    git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     popd
 fi
 pushd $VERL_PATH
+git checkout 5c98ed1
 python -m pip install -e .
 popd
 
 echo "8. Apply patch for vllm and verl"
-pushd $VLLM_PATH/patch/vllm
+pushd $PSRL_PATH/patch/vllm
 bash apply_patch.sh
 popd
 

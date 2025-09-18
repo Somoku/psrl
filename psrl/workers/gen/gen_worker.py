@@ -22,7 +22,7 @@ from ray.util.queue import Queue as RayQueue
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils import hf_tokenizer
+from verl.utils import hf_processor, hf_tokenizer, omega_conf_to_dataclass
 from verl.utils.device import get_torch_device, get_device_name
 from verl.utils.fs import copy_to_local
 from verl.utils.model import get_generation_config, update_model_config
@@ -35,6 +35,7 @@ from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import NIXLInterface
 from psrl.workers.gen import PSRL_vLLMRollout
+from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.ps.request_status_tracker import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -363,6 +364,10 @@ class PSRL_GenWorker(Worker):
         from torch.distributed.device_mesh import init_device_mesh
 
         self._build_distributed()
+        
+        rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
+        model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+        self.model_config = model_config
 
         tp = self.config.rollout.get("tensor_model_parallel_size", 1)
         pp = self.config.rollout.get("pipeline_model_parallel_size", 1)
@@ -377,11 +382,6 @@ class PSRL_GenWorker(Worker):
         # Build the rollout engine
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=psrl_logger)
         local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
-        lora_kwargs = (
-            {"lora_kwargs": {"enable_lora": True, "max_loras": 1, "max_lora_rank": self._lora_rank}}
-            if self._is_lora
-            else {}
-        )
         # Get the tokenizer
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
@@ -405,17 +405,12 @@ class PSRL_GenWorker(Worker):
         if self.rank == 0:
             psrl_logger.info(f"Model config after override: {self.model_hf_config}")
 
+        get_torch_device().manual_seed(self.seed)
+
         psrl_logger.info(f"Building {rollout_name} rollout with seed {self.seed}.")
         rollout = PSRL_vLLMRollout(
-            model_path=local_path,
-            config=self.config.rollout,
-            tokenizer=self.tokenizer,
-            device_mesh=self.rollout_device_mesh,
-            trust_remote_code=trust_remote_code,
-            seed=self.seed,
-            status_queue=self.status_queue,
-            instance_id=self.get_instance_id(),
-            **lora_kwargs,
+            config=rollout_config, model_config=model_config, device_mesh=self.rollout_device_mesh,
+            seed=self.seed, status_queue=self.status_queue, instance_id=self.get_instance_id(),
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
         

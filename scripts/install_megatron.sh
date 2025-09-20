@@ -49,7 +49,7 @@ install_cudnn
 
 echo "2. Install TransformerEngine"
 echo "Notice: TransformerEngine installation can take a long time, please be patient"
-NVTE_FRAMEWORK=pytorch python -m pip install --no-deps git+https://github.com/NVIDIA/TransformerEngine.git@v2.2
+NVTE_FRAMEWORK=pytorch python -m pip install --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.2
 
 echo "3. Install Megatron"
 python -m pip install --no-deps git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.12.0rc3

@@ -54,10 +54,8 @@ if [ -z "$VLLM_PATH" ]; then
     popd
 fi
 pushd $VLLM_PATH
-mv $PSRL_PATH/patch/use_existing_torch.py .
+cp $PSRL_PATH/patch/vllm/use_existing_torch.py .
 python use_existing_torch.py
-python -m pip install -r requirements/common.txt
-python -m pip install -r requirements/cuda.txt
 python -m pip install -r requirements/build.txt
 python -m pip install --no-build-isolation -e .
 popd
@@ -66,10 +64,11 @@ if [ -z "$VERL_PATH" ]; then
     pushd $THIRD_PARTY_PATH
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
+    cd VERL_PATH
+    git checkout 5c98ed1
     popd
 fi
 pushd $VERL_PATH
-git checkout 5c98ed1
 python -m pip install -e .
 popd
 

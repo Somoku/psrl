@@ -76,8 +76,7 @@ sp_size=1
 use_dynamic_bsz=true
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
-offload=true
-gen_tp=1
+offload=false
 entropy_checkpointing=true # This enables entropy recomputation specifically for the entropy calculation, lowering memory usage during training.
 
 PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
@@ -120,7 +119,6 @@ PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.mode=sync \
-    train_actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=true \

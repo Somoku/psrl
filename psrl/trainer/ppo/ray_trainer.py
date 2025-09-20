@@ -603,7 +603,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             # pad to be divisible by dp_size
             size_divisor = (
-                self.actor_wg.world_size
+                self.actor_wg.world_size // self.config.train_actor_rollout_ref.rollout.tensor_model_parallel_size
                 if not self.async_rollout_mode
                 else self.config.train_actor_rollout_ref.rollout.agent.num_workers
             )
@@ -1402,7 +1402,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         psrl_logger.debug(f"batch.batch['token_level_rewards']: {batch.batch['token_level_rewards']}")
                         psrl_logger.debug(f"batch.batch['response_mask']: {batch.batch['response_mask']}")
                         psrl_logger.debug(f"batch.non_tensor_batch['uid']: {batch.non_tensor_batch['uid']}")
-                        psrl_logger.debug(f"batch.non_tensor_batch['parent_id']: {batch.non_tensor_batch['parent_id']}")
+                        if self.rollout_n > 1:
+                            psrl_logger.debug(f"batch.non_tensor_batch['parent_id']: {batch.non_tensor_batch['parent_id']}")
                         batch = PSRL_compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,

@@ -200,7 +200,7 @@ agent:
   _target_: psrl.workers.config.AgentLoopConfig
 
   # Number of agent loop workers
-  num_workers: 8
+  num_workers: 1
 
   # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
   # https://hydra.cc/docs/advanced/instantiate_objects/overview/

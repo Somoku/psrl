@@ -85,7 +85,11 @@ class PSRL_AgentLoopWorker:
             data (DataProto or None): Data to process, or None to signal termination.
         """
         if isinstance(data, DataProto):
-            self.pending_program_queue.append(data)
+            # Prioritize retry requests
+            if "max_version_limit" in data.non_tensor_batch:
+                self.pending_program_queue.appendleft(data)
+            else:
+                self.pending_program_queue.append(data)
         elif data is None:
             self.pending_program_queue.append(None)
         else:

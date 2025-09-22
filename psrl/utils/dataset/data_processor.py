@@ -377,12 +377,16 @@ class DataProcessor:
                 
                 # Record the request status in the request status manager and put the batch into the data queue.
                 if self.process_mode == "stream":
-                    batch_size = len(gen_batch)
-                    for i in range(batch_size):
+                    # Put group-level requests to data queue
+                    parent_ids = gen_batch.non_tensor_batch.get("parent_id", None)
+                    assert parent_ids is not None, "parent_id must be present in non_tensor_batch for stream mode with rollout_n > 1"
+                    unique_parent_ids = np.unique(parent_ids)
+                    for i in unique_parent_ids:
+                        sample_idx = i * self.rollout_n
                         ray.get(self.ps_manager_handle.add_request.remote(
-                            gen_batch.non_tensor_batch["uid"][i],
+                            gen_batch.non_tensor_batch["uid"][sample_idx: (sample_idx + self.rollout_n)].tolist(),
                         ))
-                        self.data_queue.put(gen_batch[i:i+1])
+                        self.data_queue.put(gen_batch[sample_idx: (sample_idx + self.rollout_n)])
                 else:
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))

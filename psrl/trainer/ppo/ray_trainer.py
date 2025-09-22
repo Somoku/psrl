@@ -1225,6 +1225,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self.init_agent_loop_manager()
 
+        ray.get(self.ps_manager_handle.set_agent_loop_manager.remote(self.agent_loop_manager))
         ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):

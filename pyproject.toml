@@ -9,6 +9,9 @@ description = "PSRL is a post-training framework for LLMs that supports both syn
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
+dependencies = [
+    "cachetools>=5.0.0",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",

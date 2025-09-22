@@ -3,6 +3,8 @@ import logging
 import numpy as np
 from tensordict import TensorDict
 from omegaconf import DictConfig
+from typing import List, Optional
+from cachetools import LRUCache
 
 import ray
 
@@ -14,7 +16,7 @@ from psrl.workers.agent_loop.route_strategy import (
     RouteStrategyBase, 
     RequestNumBalanceRouteStrategy,
     get_route_strategy_class,
-    list_available_route_strategies
+    list_available_route_strategies,
 )
 
 psrl_logger = logging.getLogger(__file__)
@@ -37,6 +39,13 @@ class RolloutRouter:
             rollout_wg_list: List of rollout worker groups.
         """
         self.config = config
+        self.staleness = self.config.psrl.staleness
+        if self.config.psrl.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        else:
+            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
+            self.alg_rollout_n = self.rollout_n
         self.ps_manager_handle = ps_manager_handle
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
@@ -51,6 +60,12 @@ class RolloutRouter:
         # and can be accessed via get_engine_status() method
         self.latest_engine_status = {}
         self.status_changed = False
+        
+        # Cache for sample_id to version_tag mapping with LRU eviction
+        # Key: sample_id (uid // self.rollout_n), Value: version_tag
+        cache_size = getattr(self.config.psrl, 'sample_version_cache_size', 64)
+        self.sample_version_cache = LRUCache(maxsize=cache_size)
+        psrl_logger.info(f"Initialized sample version cache with max size: {cache_size}")
         
         # Build logger
         self.log_prefix = f"RolloutRouter"
@@ -83,12 +98,13 @@ class RolloutRouter:
         self.latest_engine_status = engine_status
         self.status_changed = True
 
-    def _choose_gen_worker(self, request: DataProto) -> int:
+    def _choose_gen_worker(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
         """Select the best worker for handling the generation request.
         
         Args:
             request (DataProto): The request to be routed.
-            
+            candidates (Optional[List[int]]): List of candidate worker indices if any.
+
         Returns:
             int: Index of the selected worker.
         """
@@ -100,15 +116,64 @@ class RolloutRouter:
                      for instance_id, status in self.latest_engine_status.get("instances", {}).items()}
                 )
                 self.status_changed = False
-            chosen_worker = self.route_strategy.route(request)
+            chosen_worker = self.route_strategy.route(request, candidates)
             self.latest_engine_status.get("instances", {}).get(chosen_worker, {}).setdefault("waiting_and_running_queue_size", 0)
             self.latest_engine_status.get("instances", {}).get(chosen_worker, {})["waiting_and_running_queue_size"] += 1
         else:
-            chosen_worker = self.route_strategy.route(request)
+            chosen_worker = self.route_strategy.route(request, candidates)
         return chosen_worker
 
-    # NOTE(lhy): This method is moved inside the vllm rollout to avoid the DataProto being huge and slow to transfer using ray
-    # see `post_process_outputs_lite` in `vllm_rollout.py`
+    def _get_cached_version_and_worker(
+        self,
+        sample_id: int,
+        max_version_limit: int,
+        all_rollout_instance_to_version: dict,
+    ) -> (int, int):
+        """Get cached version and worker for a sample, or determine new ones.
+        
+        Args:
+            sample_id (int): Unique identifier of the sample.
+            max_version_limit (int): Maximum allowed version limit.
+            all_rollout_instance_to_version (dict): Available instance to version mapping.
+            
+        Returns:
+            tuple: (version_tag, gen_worker_idx) for the sample.
+        """
+        # Check if we have a cached version for this sample_id
+        cached_version = self.sample_version_cache.get(sample_id)
+        if cached_version is not None:
+            psrl_logger.debug(f"Cache hit for sample_id {sample_id}: version {cached_version}")
+            filtered_rollout_instance_to_version = {
+                instance_id: version 
+                for instance_id, version in all_rollout_instance_to_version.items() 
+                if version == cached_version
+            }
+        else:
+            psrl_logger.debug(f"Cache miss for sample_id {sample_id}")
+            filtered_rollout_instance_to_version = {
+                instance_id: version 
+                for instance_id, version in all_rollout_instance_to_version.items() 
+                if max_version_limit - self.staleness <= version <= max_version_limit
+            }
+        
+        if not filtered_rollout_instance_to_version:
+            raise AssertionError(
+                f"No available rollout instance meets the version requirement for "
+                f"sample {sample_id} with max_version_limit {max_version_limit} and staleness {self.staleness}. "
+                f"All instance versions: {all_rollout_instance_to_version} and "
+                f"{'cached_version = ' + str(cached_version) if cached_version is not None else 'no cached version'}"
+            )
+        
+        # Choose a worker from available candidates
+        candidates = list(filtered_rollout_instance_to_version.keys())
+        chosen_worker_idx = candidates[sample_id % len(candidates)]
+        chosen_version = filtered_rollout_instance_to_version[chosen_worker_idx]
+        
+        # Cache the result using LRU cache
+        self.sample_version_cache[sample_id] = chosen_version
+
+        return chosen_version, chosen_worker_idx
+
     def _consolidate_responses(
         self,
         prompts: DataProto,
@@ -221,24 +286,66 @@ class RolloutRouter:
             DataProto or None: Generated results or None if no valid requests.
         """
         request_ids = requests.non_tensor_batch.get("uid", None)
+        if "max_version_limit" in requests.non_tensor_batch:
+            max_version_limit = requests.non_tensor_batch["max_version_limit"][0]
+            assert all(v == max_version_limit for v in requests.non_tensor_batch["max_version_limit"]), "All requests in the batch must have the same max_version_limit."
+            
+            requests.non_tensor_batch.pop("max_version_limit")
+            
+            all_rollout_instance_to_version = ray.get(self.ps_manager_handle.get_all_rollout_instance_model_versions.remote())
+            
+            # Group requests by sample_id and assign versions using cache
+            sample_to_requests = {}
+            for i, uid in enumerate(request_ids):
+                sample_id = uid // self.rollout_n
+                if sample_id not in sample_to_requests:
+                    sample_to_requests[sample_id] = []
+                sample_to_requests[sample_id].append(i)
+            
+            # Assign version and worker for each sample_id
+            requests_list = []
+            for sample_id, request_indices in sample_to_requests.items():
+                needed_model_version, gen_worker_idx = self._get_cached_version_and_worker(
+                    sample_id, max_version_limit, all_rollout_instance_to_version
+                )
+                # Create a sub-batch for this sample_id
+                sample_requests = requests.select_idxs(request_indices)
+                sample_requests.non_tensor_batch["rollout_instance_id"] = np.array([gen_worker_idx] * len(request_indices), dtype=int)
+                sample_requests.non_tensor_batch["version_tag"] = np.array([needed_model_version] * len(request_indices), dtype=int)
+                requests_list.append(sample_requests)
+            
+            requests = DataProto.concat(requests_list)
         update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             RequestStatus.ROLLOUT_DISPATCHED,
+            model_version = requests.non_tensor_batch.get("version_tag", np.array([-1], dtype=int)).tolist(),
         ))
         filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
         if filtered_request_idxs:
             requests = requests[filtered_request_idxs]
             request_ids = requests.non_tensor_batch["uid"]
             # evenly dispatch to rollout workers
-            filtered_requests_list = requests.chunk(self.rollout_wg_size)
             futures = []
             with log_dual_events(f"Dispatching {len(requests)} requests to {self.rollout_wg_size} rollout workers evenly and generate in batch", psrl_logger, event_type=EventType.GEN):
-                for i, requests in enumerate(filtered_requests_list):
-                    requests.non_tensor_batch["rollout_instance_id"] = np.array([i] * len(requests), dtype=int)
-                    psrl_logger.debug(f"Dispatching requests to rollout worker {i} with request ids: {requests.non_tensor_batch['uid']}")
-                    futures.append(
-                        self.rollout_wg_list[i].execute_all_async("generate", requests)[0]
-                    )
+                if "rollout_instance_id" in requests.non_tensor_batch:
+                    rollout_instance_ids = set(requests.non_tensor_batch["rollout_instance_id"].tolist())
+                    instance_to_requests = {}
+                    filtered_requests_list = []
+                    for instance_id in rollout_instance_ids:
+                        filtered_requests = requests.select_idxs(
+                            [i for i, rid in enumerate(requests.non_tensor_batch["rollout_instance_id"]) if rid == instance_id]
+                        )
+                        filtered_requests_list.append(filtered_requests)
+                        futures.extend(
+                            self.rollout_wg_list[instance_id].execute_all_async("generate", filtered_requests)
+                        )
+                else:
+                    filtered_requests_list = requests.chunk(self.rollout_wg_size)
+                    for i, filtered_requests in enumerate(filtered_requests_list):
+                        filtered_requests.non_tensor_batch["rollout_instance_id"] = np.array([i] * len(filtered_requests), dtype=int)
+                        futures.extend(
+                            self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)
+                        )
                 rollout_results = ray.get(futures)
             # Process results as needed
             with log_dual_events(f"Concatenating results from {self.rollout_wg_size} rollout workers", psrl_logger, event_type=EventType.OTHER):
@@ -270,14 +377,30 @@ class RolloutRouter:
         assert len(request) == 1, "RolloutRouter only supports single request generation."
 
         request_ids = request.non_tensor_batch.get("uid", None)
+        if "max_version_limit" in request.non_tensor_batch:
+            max_version_limit = request.non_tensor_batch.pop("max_version_limit")[0]
+            all_rollout_instance_to_version = await self.ps_manager_handle.get_all_rollout_instance_model_versions.remote()
+            
+            # Use cache to get version and worker for this sample
+            sample_id = request_ids[0] // self.rollout_n
+            needed_model_version, gen_worker_idx = self._get_cached_version_and_worker(
+                sample_id, max_version_limit, all_rollout_instance_to_version
+            )
+            
+            request.non_tensor_batch["rollout_instance_id"] = np.array([gen_worker_idx], dtype=int)
+            request.non_tensor_batch["version_tag"] = np.array([needed_model_version], dtype=int)
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             RequestStatus.ROLLOUT_DISPATCHED,
+            model_version=request.non_tensor_batch.get("version_tag", np.array([-1], dtype=int)).tolist(),
         )
         if update_status_success[0]:
             request_id = request.non_tensor_batch["uid"][0]
+            if "rollout_instance_id" in request.non_tensor_batch:
+                gen_worker_idx = request.non_tensor_batch["rollout_instance_id"][0]
+            else:
+                gen_worker_idx = self._choose_gen_worker(request)
             needed_model_version = request.non_tensor_batch["version_tag"][0]
-            gen_worker_idx = self._choose_gen_worker(request)
             request.non_tensor_batch["rollout_instance_id"] = np.array([gen_worker_idx], dtype=int)
             # NOTE(linsh): we use push/pop task to manage the lifecycle of the request in case of interruption
             if self.rank_0_is_model_owner:

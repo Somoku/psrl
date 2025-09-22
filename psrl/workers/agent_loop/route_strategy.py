@@ -1,6 +1,6 @@
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Dict, Type
+from typing import Dict, Type, Optional, List
 
 from verl import DataProto
 
@@ -57,11 +57,12 @@ class RouteStrategyBase(ABC):
         pass
     
     @abstractmethod
-    def route(self, request: DataProto) -> int:
+    def route(self, request: DataProto, candidates: Optional[List[int]]) -> int:
         """Route a request to a specific worker instance.
         
         Args:
             request (DataProto): The request to route.
+            candidates (Optional[List[int]]): List of candidate worker indices if any.
             
         Returns:
             int: Index of the selected worker instance.
@@ -75,8 +76,10 @@ class RandomRouteStrategy(RouteStrategyBase):
     def __init__(self, n_instances: int):
         self.n_instances = n_instances
 
-    def route(self, request: DataProto) -> int:
-        return np.random.randint(0, self.n_instances)
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        return np.random.choice(candidates)
 
 @register_route_strategy("round_robin")
 class RoundRobinRouteStrategy(RouteStrategyBase):
@@ -85,9 +88,13 @@ class RoundRobinRouteStrategy(RouteStrategyBase):
     def __init__(self, n_instances: int):
         self.n_instances = n_instances
         self.curr_idx = 0
-    
-    def route(self, request: DataProto) -> int:
+
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        # choose from candidates in a round-robin manner
         idx = self.curr_idx
+        idx = candidates[idx % len(candidates)]
         self.curr_idx = (self.curr_idx + 1) % self.n_instances
         return idx
 
@@ -114,7 +121,9 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
             assert 0 <= idx < self.n_instances, f"Instance index {idx} out of range [0, {self.n_instances})"
             self.instance_request_counts[idx] = count
 
-    def route(self, request: DataProto) -> int:
-        idx = np.argmin(list(self.instance_request_counts.values()))
-        self.instance_request_counts[idx] += 1
-        return idx
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        idx = np.argmin([self.instance_request_counts[i] for i in candidates])
+        self.instance_request_counts[candidates[idx]] += 1
+        return candidates[idx]

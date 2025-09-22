@@ -103,7 +103,7 @@ index 3c6c1eab..f9072817 100644
                      "MASTER_PORT": self._master_port,
                  }
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index f2e8a6a2..a7c5345c 100644
+index f2e8a6a2..85774624 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -143,43 +143,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -196,13 +196,33 @@ index f2e8a6a2..a7c5345c 100644
          # normalize config
          if self._is_actor:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -703,12 +705,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -554,7 +556,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+ 
+-    def _build_rollout(self, trust_remote_code=False):
++    async def _build_rollout(self, trust_remote_code=False):
+         from torch.distributed.device_mesh import init_device_mesh
+ 
+         # 1. parse rollout and huggingface model config
+@@ -623,8 +625,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         # For sync mode, we directly switch to trainer mode here.
+         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
+         if rollout_config.mode == "sync" and self._is_actor:
+-            loop = asyncio.get_event_loop()
+-            loop.run_until_complete(self.trainer_mode())
++            await self.trainer_mode()
+ 
+     async def rollout_mode(self):
+         """Context switch hybridengine to rollout mode."""
+@@ -703,12 +704,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          self.gen_random_states = get_torch_device().get_rng_state()
          get_torch_device().set_rng_state(self.torch_random_states)
  
 -    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+-    def init_model(self):
 +    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-     def init_model(self):
++    async def init_model(self):
          from verl.workers.actor import DataParallelPPOActor
  
          # This is used to import external_lib into the huggingface systems
@@ -212,7 +232,16 @@ index f2e8a6a2..a7c5345c 100644
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          use_remove_padding = self.config.model.get("use_remove_padding", False)
-@@ -1093,16 +1097,25 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -763,7 +766,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             )
+ 
+         if self._is_rollout:
+-            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
++            await self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+ 
+         if self._is_ref:
+             ref_model_path = self.config.model.path
+@@ -1093,16 +1096,25 @@ class CriticWorker(Worker, DistProfilerExtension):
          DistProfilerExtension.__init__(
              self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
          )
@@ -240,7 +269,7 @@ index f2e8a6a2..a7c5345c 100644
  
          # build device mesh for Ulysses Sequence Parallel
          world_size = torch.distributed.get_world_size()
-@@ -1130,10 +1143,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1130,10 +1142,6 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
  
@@ -251,7 +280,7 @@ index f2e8a6a2..a7c5345c 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
-@@ -1156,8 +1165,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1156,8 +1164,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                  f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
                  f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
              )
@@ -260,7 +289,7 @@ index f2e8a6a2..a7c5345c 100644
  
      def _build_critic_model_optimizer(self, config):
          # the following line is necessary
-@@ -1380,12 +1387,14 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1380,12 +1386,14 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          return critic_module, critic_optimizer, critic_lr_scheduler
  
@@ -276,7 +305,7 @@ index f2e8a6a2..a7c5345c 100644
  
          self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
              self.config
-@@ -1520,9 +1529,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1520,9 +1528,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
              DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
          )
  
@@ -291,7 +320,7 @@ index f2e8a6a2..a7c5345c 100644
          if not torch.distributed.is_initialized():
              torch.distributed.init_process_group(
                  backend=get_nccl_backend(),
-@@ -1556,8 +1569,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1556,8 +1568,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
          else:
              self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
  
@@ -300,7 +329,7 @@ index f2e8a6a2..a7c5345c 100644
          # normalize config
          if self.config.micro_batch_size is not None:
              self.config.micro_batch_size //= torch.distributed.get_world_size()
-@@ -1644,10 +1655,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1644,10 +1654,11 @@ class RewardModelWorker(Worker, DistProfilerExtension):
              raise NotImplementedError(f"Unknown strategy: {config.strategy}")
          return reward_module
  

@@ -162,9 +162,9 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def init_model(self):
+    async def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
-            ActorRolloutRefWorker.init_model(self)
+            await ActorRolloutRefWorker.init_model(self)
     
     # The log_prob in training side may need to be recomputed
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

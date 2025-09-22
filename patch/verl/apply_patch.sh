@@ -185,7 +185,7 @@ find_patch_file() {
                 # Skip commit hash patches for version matching
                 if [[ ! "$patch_basename" =~ ^[a-f0-9]{7,40}$ ]]; then
                     if [[ "$patch_name" == *"$major_minor"* ]]; then
-                        echo "Found version match: $patch_name" > &2
+                        echo "Found version match: $patch_name" >&2
                         echo "$patch"
                         return 0
                     fi
@@ -217,11 +217,11 @@ find_patch_file() {
     
     # Prefer version patches over commit patches
     if [ -n "$latest_version_patch" ]; then
-        echo "Using latest version patch file: $(basename "$latest_version_patch")" > &2
+        echo "Using latest version patch file: $(basename "$latest_version_patch")" >&2
         echo "$latest_version_patch"
         return 0
     elif [ -n "$latest_commit_patch" ]; then
-        echo "Using latest commit patch file: $(basename "$latest_commit_patch")" > &2
+        echo "Using latest commit patch file: $(basename "$latest_commit_patch")" >&2
         echo "$latest_commit_patch"
         return 0
     fi

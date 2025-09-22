@@ -149,7 +149,7 @@ class TrainClientActor:
         tf_config = hf_to_mcore_config(hf_config, dtype)
         self.print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
         
-        def model_provider(pre_process, post_process):
+        def model_provider(pre_process, post_process, vp_stage=None):
             """Model provider function"""
             model = init_mcore_model(
                 tf_config, 
@@ -157,7 +157,8 @@ class TrainClientActor:
                 pre_process, 
                 post_process, 
                 share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
-                value=False
+                value=False,
+                vp_stage=vp_stage,
             )
             model.to(get_device_name())
             for p in model.parameters():

@@ -65,6 +65,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.n=1 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    train_actor_rollout_ref.rollout.max_num_seqs=256 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \

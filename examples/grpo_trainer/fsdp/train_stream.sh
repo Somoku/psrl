@@ -51,6 +51,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.n=4 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    train_actor_rollout_ref.rollout.max_num_seqs=256 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \

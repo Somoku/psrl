@@ -169,7 +169,3 @@ class RolloutConfig(BaseConfig):
     interrupt_as_prompt: bool = False
     
     status_collection: bool = False
-
-    def __post_init__(self):
-        if self.max_num_seqs > self.max_model_len:
-            self.max_num_seqs = self.max_model_len

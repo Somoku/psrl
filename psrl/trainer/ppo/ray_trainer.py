@@ -499,6 +499,62 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Reward server is not initialized, skipping stop operation.")
 
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ):
+        """Log rollout data to disk.
+        Args:
+            batch (DataProto): The batch containing rollout data
+            reward_extra_infos_dict (dict): Additional reward information to log
+            timing_raw (dict): Timing information for profiling
+            rollout_data_dir (str): Directory path to save the rollout data
+        """
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_dict.setdefault(
+                    "request_id",
+                    batch.non_tensor_batch["request_id"].tolist(),
+                )
+
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=sample_gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                dump_path=rollout_data_dir,
+            )
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+
+        generations_to_log = self.config.trainer.log_val_generations
+
+        if generations_to_log == 0:
+            return
+
+        import numpy as np
+
+        # Create tuples of (input, output, score) and sort by input text
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])  # Sort by input text
+
+        # Use fixed random seed for deterministic shuffling
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+
+        # Take first N samples after shuffling
+        samples = samples[:generations_to_log]
+
+        # Log to each configured logger
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
@@ -968,34 +1024,31 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             raise ValueError(f"Invalid PS mode: {self.config.psrl.ps_mode}")
 
-        if self.use_critic:
-            self.critic_wg = all_wg["critic"]
-            critic_futures = self.critic_wg.init_model()
-            ray.get(critic_futures)
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            ref_futures = self.ref_policy_wg.init_model()
-            ray.get(ref_futures)
-
-        if self.use_rm:
-            self.rm_wg = all_wg["rm"]
-            rm_futures = self.rm_wg.init_model()
-            ray.get(rm_futures)
-
-        # Concurrently initialize actor and rollout instances
-        futures = []
-        psrl_logger.info("Initializing actor model")
-        self.actor_wg = all_wg["actor"]
-        actor_futures = self.actor_wg.init_model()
-        futures.extend(actor_futures)
-        
         psrl_logger.info("Initializing models in all rollout instances")
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         # simutaneously init all rollout instances
+        rollout_futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
-            futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
-        ray.get(futures)
+            rollout_futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
+
+        if self.use_critic:
+            self.critic_wg = all_wg["critic"]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = all_wg["ref"]
+            self.ref_policy_wg.init_model()
+
+        if self.use_rm:
+            self.rm_wg = all_wg["rm"]
+            self.rm_wg.init_model()
+
+        # Concurrently initialize actor and rollout instances
+        psrl_logger.info("Initializing actor model")
+        self.actor_wg = all_wg["actor"]
+        self.actor_wg.init_model()
+
+        ray.get(rollout_futures)
 
         psrl_logger.info("All workers' models initialized successfully!")
 

@@ -19,12 +19,13 @@ echo "2. Install xformers"
 python -m pip install -v --no-build-isolation -U "git+https://github.com/facebookresearch/xformers.git@v0.0.31#egg=xformers"
 
 echo "3. Install basic packages"
-python -m pip install transformers accelerate datasets peft hf-transfer matplotlib flask \
-    "numpy<2.0.0" "pyarrow>=15.0.0" pandas paramiko mbridge \
-    ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
+python -m pip install "transformers[hf_xet]>=4.55.4" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
+    "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko \
+    ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
     pytest py-spy pyext pre-commit ruff meson ninja pynvml requests einops
 
-python -m pip install "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
+python -m pip uninstall -y pynvml nvidia-ml-py
+python -m pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
 
 echo "4. Install FlashAttention and FlashInfer"
 # Install flash-attn-2.7.4.post1
@@ -65,7 +66,7 @@ if [ -z "$VERL_PATH" ]; then
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     cd VERL_PATH
-    git checkout 5c98ed1
+    git checkout 3342ff
     popd
 fi
 pushd $VERL_PATH

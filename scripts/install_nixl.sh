@@ -35,7 +35,7 @@ fi
     --with-cuda=$CUDA_PATH          \
     --with-verbs                    \
     --with-dm                       \
-    --enable-mt.                    \
+    --enable-mt                     \
     $MLX_OPTS &&                    \
 make -j $MAX_JOBS &&                \
 make -j $MAX_JOBS install-strip &&  \

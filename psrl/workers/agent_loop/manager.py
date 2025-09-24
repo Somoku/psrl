@@ -185,18 +185,23 @@ class PSRL_AgentLoopManager:
         """
         dispatch_plan = {}
         prompt_to_worker = {}
-        parent_ids = data.non_tensor_batch["parent_id"].tolist()
+        if self.rollout_n > 1:
+            assert "parent_id" in data.non_tensor_batch, "parent_id not found in data"
+            prompt_ids = data.non_tensor_batch["parent_id"].tolist()
+        else:
+            assert "uid" in data.non_tensor_batch, "uid not found in data"
+            prompt_ids = data.non_tensor_batch["uid"].tolist()
         # Round-robin dispatching
-        for i, parent_id in enumerate(parent_ids):
-            if parent_id in prompt_to_worker:
-                worker_index = prompt_to_worker[parent_id]
+        for i, prompt_id in enumerate(prompt_ids):
+            if prompt_id in prompt_to_worker:
+                worker_index = prompt_to_worker[prompt_id]
             else:
-                worker_index = (self._dispatch_idx + parent_id) % len(self.agent_loop_workers)
-                prompt_to_worker[parent_id] = worker_index
+                worker_index = (self._dispatch_idx + prompt_id) % len(self.agent_loop_workers)
+                prompt_to_worker[prompt_id] = worker_index
             if worker_index not in dispatch_plan:
                 dispatch_plan[worker_index] = []
             dispatch_plan[worker_index].append(data[i:(i + 1)])
-            sample_idx = parent_id * self.rollout_n
+            sample_idx = prompt_id * self.rollout_n
         
         # Convert lists to DataProto
         for worker_index, data in dispatch_plan.items():

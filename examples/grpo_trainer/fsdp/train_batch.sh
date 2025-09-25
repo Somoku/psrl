@@ -29,6 +29,7 @@ test_files="['$gsm8k_test_path']"
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
+    psrl.rollout_n=4 \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
@@ -48,7 +49,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.mode=sync \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.n=4 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     \
@@ -57,7 +57,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-    train_actor_rollout_ref.rollout.n=4 \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \

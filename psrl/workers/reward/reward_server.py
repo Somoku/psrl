@@ -3,6 +3,7 @@ import logging
 import torch
 import ray
 import numpy as np
+from typing import Dict, List
 from threading import Thread
 from tensordict import TensorDict
 
@@ -12,7 +13,7 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import pad_2d_list_to_length
 
 from psrl.utils.dataset.utils import _pre_process_inputs
-from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
+from psrl.utils.logger import log_data_protocol, log_dual_events, EventType, DualOutputHandler
 from psrl.utils.server.command import Command, CommandType, CommandExtension
 from psrl.workers.ps.request_status_tracker import RequestStatus
 
@@ -80,10 +81,20 @@ class RewardServer(CommandExtension):
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
         
+        # Data
+        self.request_buffer = {}
+        
         # Build logger
         self.log_prefix = "RewardServer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized RewardServer.")
+        
+    def add_requests(self, sample_id_to_request_data: Dict[int, DataProto]):
+        self.request_buffer.update(sample_id_to_request_data)
+        
+    def remove_requests(self, sample_ids: List[int]):
+        for sample_id in sample_ids:
+            self.request_buffer.pop(sample_id, None)
         
     def start_busy_loop(self):
         """Start the reward server and begin processing requests.
@@ -161,6 +172,8 @@ class RewardServer(CommandExtension):
         # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
 
+        log_data_protocol(inputs, psrl_logger, self.log_prefix + " before preprocess data from rollout queue")
+
         # prompts
         self.tokenizer.padding_side = "left"
         if "raw_prompt_ids" not in inputs.non_tensor_batch:
@@ -203,7 +216,10 @@ class RewardServer(CommandExtension):
             return_tensors="pt",
             return_attention_mask=False,
         )
-        response_mask = outputs["input_ids"] # [bsz, response_length], each row is [1, 1, ..., 1, 0, 0, ..., 0] (0 is the padding)
+        # [bsz, response_length], each row is [1, 1, ..., 1, 0, 0, ..., 0] 
+        # Currently no tool call, it is the same as the response_attention_mask
+        # Only need to note that it exclude the eos token
+        response_mask = outputs["input_ids"] 
 
         assert response_ids.shape == response_mask.shape, (
             f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"
@@ -245,7 +261,7 @@ class RewardServer(CommandExtension):
                 attention_mask=attention_mask.squeeze(0),
             ).unsqueeze(0)  # (1, 3, seq_len)
         else:
-            position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+            position_ids = compute_position_id_with_mask(attention_mask)  
 
         batch = TensorDict(
             {
@@ -258,6 +274,17 @@ class RewardServer(CommandExtension):
             },
             batch_size=len(input_ids),
         )
+        # Rollout log probs processing
+        if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+            device = batch["input_ids"].device
+            rollout_log_probs = inputs.non_tensor_batch.pop("rollout_log_probs", None)
+            assert rollout_log_probs is not None, "rollout_log_probs should not be None"
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.gen_actor_rollout_ref.rollout.response_length).to(device)
+            rollout_log_probs = rollout_log_probs.to(torch.float32)
+            batch["rollout_log_probs"] = rollout_log_probs
+            
+        inputs.non_tensor_batch.pop("raw_prompt_ids", None)
+        inputs.non_tensor_batch.pop("raw_response_ids", None)
         non_tensor_batch = inputs.non_tensor_batch
         if multi_modal_inputs is not None:
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
@@ -361,6 +388,7 @@ class RewardServer(CommandExtension):
                     assert rollout_data is not None, "Data from rollout queue should not be None"
                     # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
                     rollout_data = self._pre_process(rollout_data)
+                    psrl_logger.info(f"Rollout data after pre-process, prompt length: {(rollout_data.batch['prompts'] != self.tokenizer.pad_token_id).sum(dim=-1)}, response length: {(rollout_data.batch['responses'] != self.tokenizer.pad_token_id).sum(dim=-1)}, attention_mask sum: {rollout_data.batch['attention_mask'].sum(dim=-1)}")
                     request_ids = rollout_data.non_tensor_batch["uid"]
                     # print(f"Reward server received request ids: {request_ids}")
                     
@@ -368,18 +396,6 @@ class RewardServer(CommandExtension):
                     update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING))
                     if not update_status_success[0]:
                         continue
-
-                    rollout_data.non_tensor_batch.pop("raw_prompt_ids", None)
-                    rollout_data.non_tensor_batch.pop("raw_response_ids", None)
-                    
-                    # Rollout log probs processing
-                    if self.config.psrl.log_prob.enable_inference_engine_log_prob:
-                        device = rollout_data.batch["input_ids"].device
-                        rollout_log_probs = rollout_data.non_tensor_batch.pop("rollout_log_probs", None)
-                        assert rollout_log_probs is not None, "rollout_log_probs should not be None"
-                        rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.gen_actor_rollout_ref.rollout.response_length).to(device)
-                        rollout_log_probs = rollout_log_probs.to(torch.float32)
-                        rollout_data.batch["rollout_log_probs"] = rollout_log_probs
                     
                     if self.rollout_n > 1:
                         sample_ids = rollout_data.non_tensor_batch["parent_id"]
@@ -390,11 +406,14 @@ class RewardServer(CommandExtension):
 
                 with log_dual_events(f"Compute reward for samples {sample_ids} and requests {request_ids}", psrl_logger, event_type=EventType.OTHER):
                     for i, (sample_id, request_id, rollout_instance_id, version_tag) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids, version_tags)):
-                        request_data = ray.get(self.ps_manager_handle.get_request_data_from_buffer.remote(sample_id))
+                        request_data = self.request_buffer.get(sample_id, None)
+                        assert request_data is not None, "Request data should not be None."
+                        '''
                         if request_data is None:
                             # If request data is None, it means the request has been aborted or not found.
                             assert self.rollout_n > 1, "Request data should not be None when rollout_n is 1."
                             continue
+                        '''
                         response_data = rollout_data[i:i+1]
                         merge_request_data = response_data.union(request_data)
                         
@@ -417,7 +436,7 @@ class RewardServer(CommandExtension):
                             with log_dual_events("Launch async reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                                 future_reward = compute_reward_async.remote(reward_input, self.config, self.tokenizer)
                                 merge_request_data.union(reward_input)
-                                
+                                # TODO(lhy): currently seems that cannot overlap with log prob recomputing.
                                 if self.config.psrl.log_prob.enable_inference_engine_log_prob:
                                     self.request_id_to_future[request_id] = (merge_request_data, future_reward)
                                     self.reward_futures.append(future_reward)
@@ -426,10 +445,8 @@ class RewardServer(CommandExtension):
                         else:
                             with log_dual_events("Compute reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                                 reward_tensor, reward_extra_infos_dict = compute_reward(reward_input, self.reward_fn)
-                                
                                 merge_request_data.union(reward_input)
                                 merge_request_data.batch["reward"] = reward_tensor
-                                merge_request_data.meta_info["reward_extra_info_keys"] = list(reward_extra_infos_dict.keys())
                                 merge_request_data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                             # Update the request status to REWARD_COMPLETED
@@ -450,12 +467,8 @@ class RewardServer(CommandExtension):
                                     ray.get(future)
 
             # Check if any reward futures are ready
-            if (
-                self.config.psrl.log_prob.enable_inference_engine_log_prob and
-                self.config.reward_model.launch_reward_fn_async
-            ):
+            if self.config.reward_model.launch_reward_fn_async:
                 ready_rewards, self.reward_futures = ray.wait(self.reward_futures)
-
                 running_requests = set(self.request_id_to_future.keys())
                 finished_request_data = []
                 
@@ -467,7 +480,6 @@ class RewardServer(CommandExtension):
                         reward_tensor, reward_extra_infos_dict = ray.get(reward_future)
                         
                         request_data.batch["reward"] = reward_tensor
-                        request_data.meta_info["reward_extra_info_keys"] = list(reward_extra_infos_dict.keys())
                         request_data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                         finished_request_data.append(request_data)
                 

@@ -6,7 +6,7 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.device import get_device_id
+from verl.utils.device import get_device_id, get_torch_device
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -159,7 +159,9 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             else:
                 raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         else:
-            assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
+            # assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
+            # FSDP may combined with DDP now (HSDP), so the state dict may not be empty on non-representative workers.
+            pass
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def init_model(self):

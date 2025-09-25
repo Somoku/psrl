@@ -35,16 +35,23 @@ class BatchGenerateAgentLoop(AgentLoopBase):
         # TODO(linsh): add profiling
         # with simple_timer("generate_sequences"):
         output = self.rollout_router.generate(request)
+        assert "eos_token_id" in output.meta_info, "eos_token_id is not in the meta_info"
         if output is not None:
             batch_size = len(output)
             response_mask_list = []
             num_turns_list = []
             for i in range(batch_size):
                 response_ids = output.non_tensor_batch["raw_response_ids"][i]
-                response_mask = [1] * len(response_ids)
-                response_mask_list.append(response_mask[: self.response_length])
+                valid_length = len(response_ids)
+                for idx, token_id in enumerate(response_ids):
+                    if token_id == output.meta_info["eos_token_id"]:
+                        valid_length = idx + 1
+                        break
+                assert valid_length <= self.response_length, "response_mask is longer than the response_length"
+                response_mask = [1] * valid_length
+                response_mask_list.append(response_mask)
                 num_turns_list.append(0)
-            # response mask: bsz * [1, 1, ..., 1] (the num of 1 is the max of response_length and actual length of response_ids)
+            # response mask: bsz * [1, 1, ..., 1] (since no tool call, all the tokens are valid)
             output.non_tensor_batch["response_mask"] = np.fromiter(response_mask_list, dtype=object)
             output.non_tensor_batch["__num_turns__"] = np.array(num_turns_list)
 

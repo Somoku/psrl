@@ -177,6 +177,7 @@ class PSRL_vLLMRollout(BaseRollout):
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            # enable_prefix_caching=False,
             trust_remote_code=trust_remote_code,
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
@@ -210,7 +211,6 @@ class PSRL_vLLMRollout(BaseRollout):
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
-            output_kind=RequestOutputKind.CUMULATIVE,
         )
 
         # we may detokenize the result all together later
@@ -220,7 +220,7 @@ class PSRL_vLLMRollout(BaseRollout):
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)) and k != "seed":
                 kwargs[k] = config.get(k)
-
+        kwargs["n"] = 1  # already repeat in ray_trainer
         psrl_logger.info(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 

@@ -1,8 +1,9 @@
 psrl:
+  colocate: False
   ps_manager_ip: 127.0.0.1
   staleness: 0
   staleness_buffer_entries: 512
-  rollout_n: ${gen_actor_rollout_ref.rollout.n}
+  rollout_n: 1
   gen_mode: batch
   ps_mode: cpu_ref
   logging_path: ~/psrl_logs
@@ -151,10 +152,6 @@ train_actor_rollout_ref:
       total_training_steps: -1  # must be override by program
       weight_decay: 0.01
     fsdp_config:
-      mixed_precision:
-        param_dtype: bf16
-        reduce_dtype: fp32
-        buffer_dtype: fp32
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -193,23 +190,23 @@ train_actor_rollout_ref:
   rollout:
     name: vllm
     mode: sync # sync: LLM, async: AsyncLLM
-    temperature: 1.0
-    top_k: -1 # 0 for hf rollout, -1 for vllm rollout
-    top_p: 1
+    temperature: ${gen_actor_rollout_ref.rollout.temperature}
+    top_k: ${gen_actor_rollout_ref.rollout.top_k} # 0 for hf rollout, -1 for vllm rollout
+    top_p: ${gen_actor_rollout_ref.rollout.top_p}
     prompt_length: ${data.max_prompt_length}  # not use for opensource
     response_length: ${data.max_response_length}
     # for vllm rollout
     dtype: bfloat16 # should align with FSDP
     gpu_memory_utilization: 0.5
     ignore_eos: False
-    enforce_eager: True
-    free_cache_engine: True
+    enforce_eager: ${gen_actor_rollout_ref.rollout.enforce_eager}
+    free_cache_engine: ${gen_actor_rollout_ref.rollout.free_cache_engine}
     load_format: dummy_dtensor  # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
     layered_summon: False # for huge model, layered summon can save memory (prevent OOM) but make it slower
     tensor_model_parallel_size: 2
-    max_num_batched_tokens: 8192
+    max_num_batched_tokens: ${gen_actor_rollout_ref.rollout.max_num_batched_tokens}
     max_model_len: null
-    max_num_seqs: 1024
+    max_num_seqs: ${gen_actor_rollout_ref.rollout.max_num_seqs}
     enable_inference_engine_log_prob: ${psrl.log_prob.enable_inference_engine_log_prob} # Use log prob from inference engine rollout
     log_prob_micro_batch_size: null # will be deprecated, use log_prob_micro_batch_size_per_gpu
     log_prob_micro_batch_size_per_gpu: null
@@ -220,7 +217,7 @@ train_actor_rollout_ref:
     # for hf rollout
     do_sample: True
     # number of responses (i.e. num sample times)
-    n: 1 # > 1 for grpo
+    n: ${psrl.rollout_n} # > 1 for grpo
     multi_stage_wake_up: false # Whether to wake up inference engine in multi-stage. (Wake up model weights first, then resume kv cache)
     engine_kwargs: # inference engine parameters
       vllm:
@@ -257,7 +254,7 @@ train_actor_rollout_ref:
       # Qwen/QwQ-32B, Qwen/Qwen3-xxB
       tokenization_sanity_check_mode: strict
     agent:
-      num_workers: 8 # Number of agent loop workers
+      num_workers: ${gen_actor_rollout_ref.rollout.agent.num_workers} # Number of agent loop workers
       route_strategy: round_robin # Routing strategy: random, round_robin, request_num_balance
       # custom agent loop config path, which should contain list of configs to intialize AgentLoop instances.
       # https://hydra.cc/docs/advanced/instantiate_objects/overview/
@@ -343,7 +340,7 @@ gen_actor_rollout_ref:
     # for hf rollout
     do_sample: True
     # number of responses (i.e. num sample times)
-    n: 1 # > 1 for grpo
+    n: ${psrl.rollout_n} # > 1 for grpo
     use_post_sampling_logprobs: False
     interrupt_as_prompt: ${psrl.partial_rollout.interrupt_as_prompt}
     engine_kwargs: # inference engine parameters
@@ -398,10 +395,26 @@ gen_actor_rollout_ref:
         # Class name of the custom async server class (e.g. AsyncvLLMServer)
         name: null
     status_collection: ${psrl.status_collection}
+    calculate_log_probs: False
     # trace rollout data
     trace:
       backend: null # trace backend, support mlflow, weave
       token2text: False # whether translate token id to text in output
+  actor:
+    strategy: fsdp  # [fsdp, fsdp2]
+    ulysses_sequence_parallel_size: 1 # sp size
+    fsdp_config:
+      wrap_policy:
+        # transformer_layer_cls_to_wrap: None
+        min_num_params: 0
+      param_offload: False
+      optimizer_offload: False
+      offload_policy: False # only for fsdp2, offload param\grad\optimizer during train
+      reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
+      fsdp_size: -1
+      # Only for FSDP1: FSDP1 configuration, prefetch the next forward-pass all-gather
+      # before the current forward computation.
+      forward_prefetch: False
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
@@ -467,7 +480,7 @@ reward_model:
   model:
     input_tokenizer: ${train_actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
-    use_shm: False
+    use_shm: True
     external_lib: ${train_actor_rollout_ref.model.external_lib}
     use_remove_padding: False
     use_fused_kernels: ${train_actor_rollout_ref.model.use_fused_kernels}

@@ -87,6 +87,7 @@ class NIXLStorageClient:
         self._temp_pinned_idx_mapping: Dict[Tuple[str, Tuple[int, ...]], int] = {}  # (key, shard_idx) -> pinned_idx
         self._pinned_slot_running_xfer: Dict[Tuple[torch.Size, torch.dtype, int], tuple] = {} # (shape, dtype, pinned_idx) -> (key, tag, op_type, target_client)
         self._pinned_memory: Optional[Dict[Tuple[torch.Size, torch.dtype], torch.Tensor]] = None
+        self._contiguous_event_cache: Dict[Tuple[str, Tuple[int, ...]], torch.cuda.streams.Event] = {}  # (key, shard_idx) -> cudaEvent
         # A cache to avoid registering the same tensor multiple times
         self._temp_desc_bytes_cache: Dict[Tuple[torch.Size, torch.dtype, Any], bytes] = {}  # (shape, dtype, data_ptr) -> desc_bytes
         
@@ -127,7 +128,8 @@ class NIXLStorageClient:
                     contiguous_tensor = torch.empty(
                         meta_info.shape, 
                         dtype=meta_info.dtype,
-                        device=meta_info.device
+                        device=meta_info.device,
+                        requires_grad=False
                     )
                     contiguous_meta_info = NIXLShardMetaInfo(
                         dtype=contiguous_tensor.dtype,
@@ -214,7 +216,7 @@ class NIXLStorageClient:
             if _uncontiguous_tensor_mapping:
                 self._pinned_memory = {}
                 for (shape, dtype), uncontiguous_tensor_list in _uncontiguous_tensor_mapping.items():
-                    self._pinned_memory[(shape, dtype)] = torch.empty(self.max_pinned_temp_memory_slots, *shape, dtype=dtype, device=self.device)
+                    self._pinned_memory[(shape, dtype)] = torch.empty(self.max_pinned_temp_memory_slots, *shape, dtype=dtype, device=self.device, requires_grad=False)
                     for i, (key, shard_idx, uncontiguous_tensor) in enumerate(uncontiguous_tensor_list):
                         self._temp_pinned_idx_mapping[(key, shard_idx)] = i % self.max_pinned_temp_memory_slots
         
@@ -268,7 +270,8 @@ class NIXLStorageClient:
                     if self.max_pinned_temp_memory_slots is None:
                         # Non-contiguous shard: create temporary contiguous memory
                         # Create a new contiguous tensor with the same shape and dtype
-                        contiguous_tensor = torch.empty_like(local_sharded_tensor)
+                        raise RuntimeError("Non-contiguous shard requires pinned memory, but pinned memory is not enabled.")
+                        contiguous_tensor = torch.empty_like(local_sharded_tensor, requires_grad=False)
                     else:
                         assert self._pinned_memory is not None, "Pinned memory is not initialized."
                         assert (local_sharded_tensor.shape, local_sharded_tensor.dtype) in self._pinned_memory, f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
@@ -392,7 +395,7 @@ class NIXLStorageClient:
         self._unified_sharding_dict_fetched = True
         return self._unified_sharding_dict
         
-    def wait_for_server_info(self, timeout: float = 180.0):
+    def wait_for_server_info(self, timeout: float = 600.0):
         """
         Wait for the server info to be fetched.
         For storage_server mode, wait for the storage server info to be fetched.
@@ -451,7 +454,7 @@ class NIXLStorageClient:
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
-    def wait_for_server_temp_mappings(self, timeout: float = 60.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 600.0):
         """Wait for the server temporary mappings to be fetched."""
         assert self.mode == "meta_server", "wait_for_server_temp_mappings only valid in meta_server mode"
         assert self._is_connected, "Not connected to server"
@@ -470,7 +473,7 @@ class NIXLStorageClient:
 
     # --- storage_server mode read/write  ---
     @deprecated("Use client_read instead")
-    def read(self, key: str, tag: bytes):
+    def read(self, key: str, tag: str):
         """
         Read from the storage server.
         """
@@ -490,7 +493,7 @@ class NIXLStorageClient:
         self.xfer_handles[(key, tag, "READ")] = handle
 
     @deprecated("Use client_write instead")
-    def write(self, key: str, tag: bytes):
+    def write(self, key: str, tag: str):
         """
         Write to the storage server.
         """
@@ -525,7 +528,7 @@ class NIXLStorageClient:
             raise e
         self._target_client_connected[target_client] = True
 
-    def client_read(self, target_agent: str, target_client: str, key: str, tag: bytes, comm_plan: Optional[NIXLCommPlan] = None):
+    def client_read(self, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None) -> List[Tuple[int, ...]]:
         """Read from another client (meta_server mode), supports shard alignment and communication plan."""
         if self.mode != "meta_server":
             raise RuntimeError("client_read only valid in meta_server mode")
@@ -549,6 +552,8 @@ class NIXLStorageClient:
             local_pos = local_info.sharding.shard_indices.index(shard_idx)
             remote_pos = remote_info.sharding.shard_indices.index(shard_idx)
             
+            # For non-contiguous shards, record the running key and shard idx
+            running_key, running_shard_idx = None, None 
             # Get local descriptor (check if it's a temporary one)
             local_desc_bytes = local_info.desc_bytes_list[local_pos]
             if local_desc_bytes is not None:
@@ -567,12 +572,12 @@ class NIXLStorageClient:
                     pinned_idx = self._temp_pinned_idx_mapping[(key, shard_idx)]
                     slot_key = (meta_info.shape, meta_info.dtype, pinned_idx)
                     if slot_key in self._pinned_slot_running_xfer:
-                        running_key, running_tag, running_op_type, running_target_client = self._pinned_slot_running_xfer[slot_key]
+                        running_key, running_tag, running_op_type, running_target_client, running_shard_idx = self._pinned_slot_running_xfer[slot_key]
                         start_time = time.time()
-                        self.wait(running_key, running_tag, running_op_type, target_client=running_target_client)
+                        self.wait(running_key, running_tag, running_op_type, target_client=running_target_client, shard_idx=running_shard_idx)
                         end_time = time.time()
                         psrl_logger.debug(f"{self.client_name} read uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available after {end_time - start_time} seconds")
-                    self._pinned_slot_running_xfer[slot_key] = (key, tag, "READ", target_client)  
+                    self._pinned_slot_running_xfer[slot_key] = (key, tag, "READ", target_client, shard_idx)  
             
             # Get remote descriptor (check if it's a temporary one)
             remote_desc_bytes = remote_info.desc_bytes_list[remote_pos]
@@ -590,6 +595,11 @@ class NIXLStorageClient:
             remote_desc = self.agent.deserialize_descs(remote_desc_bytes).trim()
             # Real xfer
             try:
+                if running_key is not None and running_shard_idx is not None:
+                    assert (running_key, running_shard_idx) in self._contiguous_event_cache, \
+                        f"Running key {running_key} shard {running_shard_idx} not found in contiguous event cache"
+                    self._contiguous_event_cache[(running_key, running_shard_idx)].synchronize()
+                    self._contiguous_event_cache.pop((running_key, running_shard_idx))
                 handle = self.agent.initialize_xfer(
                     "READ", local_desc, remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
                 )
@@ -601,8 +611,9 @@ class NIXLStorageClient:
             if state == "ERR":
                 raise RuntimeError(f"{self.client_name} posting client READ transfer to {target_client} failed for key {key} shard {shard_idx}.")
             self.xfer_handles[make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)] = handle
+        return shards_to_transfer
 
-    def client_write(self, target_agent: str, target_client: str, key: str, tag: bytes, comm_plan: Optional[NIXLCommPlan] = None):
+    def client_write(self, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None) -> List[Tuple[int, ...]]:
         """Write to another client (meta_server mode), supports shard alignment and communication plan."""
         if self.mode != "meta_server":
             raise RuntimeError("client_write only valid in meta_server mode")
@@ -647,14 +658,16 @@ class NIXLStorageClient:
                     pinned_idx = self._temp_pinned_idx_mapping[(key, shard_idx)]
                     slot_key = (meta_info.shape, meta_info.dtype, pinned_idx)
                     if slot_key in self._pinned_slot_running_xfer:
-                        running_key, running_tag, running_op_type, running_target_client = self._pinned_slot_running_xfer[slot_key]
+                        running_key, running_tag, running_op_type, running_target_client, running_shard_idx = self._pinned_slot_running_xfer[slot_key]
                         start_time = time.time()
-                        self.wait(running_key, running_tag, running_op_type, target_client=running_target_client)
+                        self.wait(running_key, running_tag, running_op_type, target_client=running_target_client, shard_idx=running_shard_idx)
                         end_time = time.time()
                         psrl_logger.debug(f"{self.client_name} write uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available after {end_time - start_time} seconds")
-                    self._pinned_slot_running_xfer[slot_key] = (key, tag, "WRITE", target_client)  
+                    self._pinned_slot_running_xfer[slot_key] = (key, tag, "WRITE", target_client, shard_idx)  
                 # Copy data from original non-contiguous tensor to temporary contiguous tensor
-                contiguous_tensor.copy_(original_tensor)
+                self._contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
+                contiguous_tensor.copy_(original_tensor.detach())
+                self._contiguous_event_cache[(key, shard_idx)].record()
                 # Use temporary descriptor
                 local_desc_bytes = self._get_temp_desc_bytes(self.client_name, key, shard_idx)
                 if local_desc_bytes is None:
@@ -676,6 +689,9 @@ class NIXLStorageClient:
             remote_desc = self.agent.deserialize_descs(remote_desc_bytes).trim()
             # Real xfer
             try:
+                if (key, shard_idx) in self._contiguous_event_cache:
+                    self._contiguous_event_cache[(key, shard_idx)].synchronize()
+                    self._contiguous_event_cache.pop((key, shard_idx))
                 handle = self.agent.initialize_xfer(
                     "WRITE", local_desc, remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
                 )
@@ -687,38 +703,48 @@ class NIXLStorageClient:
             if state == "ERR":
                 raise RuntimeError(f"{self.client_name} posting client WRITE transfer to {target_client} failed for key {key} shard {shard_idx}.")
             self.xfer_handles[make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)] = handle
-
-    def wait(self, key: str, tag: bytes, op_type: str, target_client: Optional[str] = None, timeout: float = 60.0):
+        return shards_to_transfer
+    
+    def wait(self, key: str, tag: str, op_type: str, target_client: Optional[str] = None, shard_idx: Optional[int] = None, timeout: float = 60.0):
         """
         Wait for a transfer to be completed.
         """
         if self.mode == "storage_server":
             handle = self.xfer_handles.get((key, tag, op_type))
             if handle is None:
-                raise RuntimeError(f"No handle for ({key}, {tag}, {op_type})")
+                raise RuntimeError(f"No handle for ({key}, {tag}, {op_type}) from {self.client_name}")
             start = time.time()
             while True:
-                state = self.agent.check_xfer_state(handle)
+                try:
+                    state = self.agent.check_xfer_state(handle)
+                except Exception as e:
+                    raise RuntimeError(f"Checking transfer state for ({key}, {tag}, {op_type}) from {self.client_name} failed: {e}")
                 if state == "ERR":
-                    raise RuntimeError(f"Transfer error for ({key}, {tag}, {op_type})")
+                    raise RuntimeError(f"Transfer error for ({key}, {tag}, {op_type}) from {self.client_name}")
                 elif state == "DONE":
                     break
                 if time.time() - start > timeout:
-                    raise TimeoutError(f"Timeout waiting for transfer ({key}, {tag}, {op_type})")
+                    raise TimeoutError(f"Timeout waiting for transfer ({key}, {tag}, {op_type}) from {self.client_name}")
                 time.sleep(0.05)
         elif self.mode == "meta_server":
             # Shard tag, wait for all shards
             info = self.local_client_info.get_tensor_info(key)
-            for shard_idx in info.sharding.shard_indices:
+            waiting_shard_indices = [shard_idx] if shard_idx is not None else info.sharding.shard_indices
+            for shard_idx in waiting_shard_indices:
                 handle = self.xfer_handles.get(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
                 if handle is None:
+                    # print(f"Transfer ({key}, {tag}, {op_type}, shard {shard_idx}) from {self.client_name} to {target_client} not found, continue")
                     continue  # This shard did not do transfer
                 start = time.time()
                 while True:
-                    state = self.agent.check_xfer_state(handle)
+                    try:
+                        state = self.agent.check_xfer_state(handle)
+                    except Exception as e:
+                        raise RuntimeError(f"Checking transfer state for ({key}, {tag}, {op_type}, shard {shard_idx}) from {self.client_name} to {target_client} failed: {e}")
                     if state == "ERR":
-                        raise RuntimeError(f"Transfer error for ({key}, {tag}, {op_type}, shard {shard_idx})")
+                        raise RuntimeError(f"Transfer error for ({key}, {tag}, {op_type}, shard {shard_idx}) from {self.client_name} to {target_client}")
                     elif state == "DONE":
+                        # print(f"Transfer ({key}, {tag}, {op_type}, shard {shard_idx}) from {self.client_name} to {target_client} done, time cost: {time.time() - start} seconds")
                         # For non-contiguous shards, sync data back to original tensor after READ
                         if op_type == "READ":
                             local_pos = info.sharding.shard_indices.index(shard_idx)
@@ -731,12 +757,14 @@ class NIXLStorageClient:
                                 if contiguous_tensor is None:
                                     raise RuntimeError(f"No temporary tensor mapping found for key {key} shard {shard_idx}")
                                 # Copy data from temporary contiguous tensor back to original non-contiguous tensor
+                                self._contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
                                 original_tensor.copy_(contiguous_tensor)
+                                self._contiguous_event_cache[(key, shard_idx)].record()
                         
                         self.xfer_handles.pop(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
                         break
                     if time.time() - start > timeout:
-                        raise TimeoutError(f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx})")
+                        raise TimeoutError(f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx}) from {self.client_name} to {target_client}")
                     time.sleep(0.05)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
@@ -886,17 +914,17 @@ class NIXLMultiStorageClients:
                 client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
                 client._all_temp_mappings_fetched = True
                 
-    def client_read(self, cur_client: str, target_agent: str, target_client: str, key: str, tag: bytes, comm_plan: Optional[NIXLCommPlan] = None):
+    def client_read(self, cur_client: str, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
         client.client_read(target_agent, target_client, key, tag, comm_plan)
                 
-    def client_write(self, cur_client: str, target_agent: str, target_client: str, key: str, tag: bytes, comm_plan: Optional[NIXLCommPlan] = None):
+    def client_write(self, cur_client: str, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
         client.client_write(target_agent, target_client, key, tag, comm_plan)
         
-    def wait(self, cur_client: str, key: str, tag: bytes, op_type: str, target_client: Optional[str] = None, timeout: float = 60.0):
+    def wait(self, cur_client: str, key: str, tag: str, op_type: str, target_client: Optional[str] = None, timeout: float = 60.0):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
         client.wait(key, tag, op_type, target_client, timeout)

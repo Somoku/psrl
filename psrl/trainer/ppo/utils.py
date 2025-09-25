@@ -5,7 +5,7 @@ from verl import DataProto
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager, compute_response_mask
 from verl.single_controller.ray import RayResourcePool
 
 class PSRL_Role(Enum):

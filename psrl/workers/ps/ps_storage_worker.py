@@ -4,7 +4,7 @@ import os
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 from omegaconf import DictConfig
 from accelerate import init_empty_weights
@@ -185,7 +185,7 @@ class PSStorageWorker:
                 self._transfer_key_cache[k] = []
             self._transfer_key_cache[k].append((k, shard_idx))
     
-    def transfer_train_to_gen(self, key: str):
+    def transfer_train_to_gen(self, key: str, shards_to_transfer: Optional[List[Tuple[int, ...]]] = None):
         if self.storage_plan.train_gen_model_share():
             return
         src_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
@@ -199,6 +199,8 @@ class PSStorageWorker:
             self._build_transfer_key_cache(src_original_state_dict)
         matching_keys = self._transfer_key_cache.get(key, [])
         for key_shard_idx_tuple in matching_keys:
+            if shards_to_transfer is not None and key_shard_idx_tuple[1] not in shards_to_transfer:
+                continue
             target_original_state_dict[key_shard_idx_tuple].copy_(src_original_state_dict[key_shard_idx_tuple])
         if self.use_gpu:
             torch.cuda.synchronize()

@@ -2,7 +2,8 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp2-batch-nixl-staleness_0'
+# NOTE(lhy): FSDP1 can only use cpu/cpu_ref mode, cannot use nixl_cpu mode
+experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp1-batch-cpu_ref-staleness_0'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -71,10 +72,10 @@ offload=True
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=1 \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=batch \
-    psrl.ps_mode=nixl_cpu \
+    psrl.ps_mode=cpu_ref \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_inference_engine_log_prob=False \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
@@ -114,7 +115,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    train_actor_rollout_ref.ref.strategy=fsdp2 \
+    train_actor_rollout_ref.ref.strategy=fsdp \
     train_actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     train_actor_rollout_ref.ref.ulysses_sequence_parallel_size=${TRAIN_SP} \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
@@ -128,7 +129,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    train_actor_rollout_ref.actor.strategy=fsdp2 \
+    train_actor_rollout_ref.actor.strategy=fsdp \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=false \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
     train_actor_rollout_ref.actor.ulysses_sequence_parallel_size=${TRAIN_SP} \

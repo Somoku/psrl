@@ -1,8 +1,9 @@
 psrl:
+  colocate: False
   ps_manager_ip: 127.0.0.1
   staleness: 0
   staleness_buffer_entries: 512
-  rollout_n: ${gen_actor_rollout_ref.rollout.n}
+  rollout_n: 1
   gen_mode: batch
   ps_mode: cpu_ref
   logging_path: ~/psrl_logs
@@ -132,7 +133,7 @@ train_actor_rollout_ref:
       lr_warmup_steps: null # Prioritized. None, 0 or Negative values mean delegating to lr_warmup_steps_ratio.
       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
       lr_decay_steps: null
-      lr_decay_style: linear # select from constant/linear/cosine/inverse_square_root
+      lr_decay_style: constant # select from constant/linear/cosine/inverse_square_root
       min_lr: 0.0 # minimum learning rate, default to 0.0
       weight_decay: 0.01
       weight_decay_incr_style: constant # select from constant/linear/cosine
@@ -257,7 +258,7 @@ train_actor_rollout_ref:
       qkv_layer_name: qkv
       gate_proj_layer_name: gate_up
     # number of responses (i.e. num sample times)
-    n: 1
+    n: ${psrl.rollout_n}
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
@@ -370,7 +371,7 @@ gen_actor_rollout_ref:
     # for hf rollout
     do_sample: True
     # number of responses (i.e. num sample times)
-    n: 1 # > 1 for grpo
+    n: ${psrl.rollout_n} # > 1 for grpo
     use_post_sampling_logprobs: False
     interrupt_as_prompt: ${psrl.partial_rollout.interrupt_as_prompt}
     engine_kwargs: # inference engine parameters
@@ -430,6 +431,7 @@ gen_actor_rollout_ref:
     trace:
       backend: null # trace backend, support mlflow, weave
       token2text: False # whether translate token id to text in output
+    calculate_log_probs: False
 
 critic:
   rollout_n: ${train_actor_rollout_ref.rollout.n}
@@ -444,7 +446,7 @@ critic:
     lr_warmup_steps: null # Prioritized. None, 0 or Negative values mean delegating to lr_warmup_steps_ratio.
     lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
     lr_decay_steps: null
-    lr_decay_style: linear # select from constant/linear/cosine/inverse_square_root
+    lr_decay_style: constant # select from constant/linear/cosine/inverse_square_root
     min_lr: 0.0 # minimum learning rate, default to 0.0
     weight_decay: 0.01
     weight_decay_incr_style: constant # select from constant/linear/cosine

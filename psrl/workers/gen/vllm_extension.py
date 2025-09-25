@@ -150,12 +150,14 @@ class vLLMWorkerExtension:
         self.unified_sharding_dict = unified_sharding_dict
 
     def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
-        self.cuda_synchronize()
+        if not hasattr(self, "pull_times"):
+            self.pull_times = 0
+        self.pull_times += 1
         wait_operations = []
         for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
             for key in self.unified_state_dict:
-                self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, b"gen_pull")
+                self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, f"gen_pull_{self.pull_times}")
                 wait_operations.append((key, target_client_name))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
         for key, target_client_name in wait_operations:
-            self.nixl_storage_client.wait(key, b"gen_pull", "READ", target_client=target_client_name)
+            self.nixl_storage_client.wait(key, f"gen_pull_{self.pull_times}", "READ", target_client=target_client_name)

@@ -1,3 +1,6 @@
+# Whether colocate rollout and trian workers
+colocate: False
+
 # IP address of parameter server managaer.
 ps_manager_ip: 127.0.0.1
 
@@ -8,7 +11,7 @@ staleness: 0
 staleness_buffer_entries: 512
 
 # number of responses (i.e. num sample times). > 1 for grpo
-rollout_n: ${oc.select:gen_actor_rollout_ref.rollout.n}
+rollout_n: 1
 
 # Generate mode: batch or stream
 gen_mode: batch

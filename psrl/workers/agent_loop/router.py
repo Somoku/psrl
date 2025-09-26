@@ -337,14 +337,15 @@ class RolloutRouter:
                         )
                         filtered_requests_list.append(filtered_requests)
                         futures.extend(
-                            self.rollout_wg_list[instance_id].execute_all_async("generate", filtered_requests)
+                            self.rollout_wg_list[instance_id].execute_all_async("generate", filtered_requests)[0]
                         )
                 else:
                     filtered_requests_list = requests.chunk(self.rollout_wg_size)
                     for i, filtered_requests in enumerate(filtered_requests_list):
                         filtered_requests.non_tensor_batch["rollout_instance_id"] = np.array([i] * len(filtered_requests), dtype=int)
+                        psrl_logger.debug(f"Dispatching requests to rollout worker {i} with request ids: {filtered_requests.non_tensor_batch['uid']}")
                         futures.extend(
-                            self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)
+                            self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)[0]
                         )
                 rollout_results = ray.get(futures)
             # Process results as needed

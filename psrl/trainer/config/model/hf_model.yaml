@@ -10,7 +10,7 @@ hf_config_path: null
 tokenizer_path: null
 
 # whether to use shared memory for model loading
-use_shm: False
+use_shm: True
 
 # whether to trust remote code.
 trust_remote_code: False

@@ -333,9 +333,12 @@ class PSRL_GenWorker(Worker):
 
     def register_rollout_instance(self):
         """Register the rollout instance in the PS worker."""
+        if hasattr(self, "_is_rollout_instance_registered"):
+            return
         if self.is_instance_representative_rank:
             # Only the representative rank needs to register the rollout instance
             ray.get(self.gen_interface.ps_manager_handle.register_rollout_instance.remote(self.get_instance_id()))
+        self._is_rollout_instance_registered = True
         
     def _broadcast_val_from_representative_rank(self, val: Optional[Any] = None) -> Any:
         # Use torch.distributed.broadcast_object_list for generic object broadcasting
@@ -449,6 +452,7 @@ class PSRL_GenWorker(Worker):
             model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))
             # NOTE(lhy): Do we need to clear the cache after loading the model?
             # get_torch_device().empty_cache()
+            # torch.cuda.synchronize()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
@@ -527,6 +531,8 @@ class PSRL_GenWorker(Worker):
             self.nixl_pull_model()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+        # Important: the prefix cache needs to be cleared after pulling the model
+        self.rollout.inference_engine.reset_prefix_cache()
         
     async def pull_model_async(self) -> None:
         assert self.config.rollout.mode == "psrl_async", "Only support `psrl_async` mode."
@@ -536,7 +542,10 @@ class PSRL_GenWorker(Worker):
             await self.nixl_pull_model_async()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+        # Important: the prefix cache needs to be cleared after pulling the model
+        await self.rollout.inference_engine.reset_prefix_cache()
 
+    @deprecated("It is deprecated and moved to the DataProcessor class.")
     def get_prompts_on_device(self, batch: DataProto) -> DataProto:
         """Get generation prompts from the batch and move them to the current device."""    
         # pop those keys for generation
@@ -908,9 +917,7 @@ class PSRL_GenWorker(Worker):
             replay_buffer (ReplayBuffer): The replay buffer to store the generated sequences.
         """
         # Register the rollout instance in the PS worker
-        if self.is_instance_representative_rank:
-            # Only the representative rank needs to register the rollout instance
-            ray.get(self.gen_interface.ps_manager_handle.register_rollout_instance.remote(self.get_instance_id()))
+        self.register_rollout_instance()
 
         if self.psrl_config.gen_mode == "batch":
             # Batch generation loop

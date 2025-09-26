@@ -441,12 +441,7 @@ class PSManager(RequestStatusTracker):
                 stored_child_ids = set([int(entry_info.request_id) % self.rollout_n for entry_info in entry_infos])
                 abort_child_ids = all_child_ids - stored_child_ids
                 psrl_logger.debug(f"Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
-                
-                # Remove the sample data from the buffer in the request status manager
-                psrl_logger.debug(f"Removing request data of {parent_id} from request status manager buffer")
-                self.remove_request_data_from_buffer(parent_id)
-                psrl_logger.debug(f"Successfully removed request data of {parent_id} from buffer")
-                
+        
                 # Notify the request status manager to abort the child requests
                 if abort_child_ids:
                     psrl_logger.debug(f"Aborting child requests {abort_child_ids} for parent request {parent_id}.")
@@ -465,8 +460,6 @@ class PSManager(RequestStatusTracker):
                 
                     self.try_awake_waiters()
         else:
-            # Remove the sample data from the buffer in the request status manager
-            self.remove_request_data_from_buffer(request_id)
             # Directly occupy data, bypassing storing process
             self.staleness_inventory.occupy_data(
                 entry_info=entry_info,

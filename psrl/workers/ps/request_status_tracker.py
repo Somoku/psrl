@@ -5,10 +5,12 @@ import ray
 from omegaconf import DictConfig
 from enum import Enum
 from typing import Union, List, Optional
+
 from psrl.utils.logger import DualOutputHandler
 from psrl.workers.ps.staleness_controller import EntryInfo
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.logger import get_ps_logger
+from psrl.utils.logger import deprecated
 
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
@@ -53,7 +55,9 @@ class RequestStatusTracker:
         }
         self._abort_request_ids = set() # Set of request IDs that are marked for abortion
         self._running_min_version = 0 # Minimum version of requests that are currently running
-        self.rollout_request_buffer = {}  # Buffer for storing request data during rollout processing
+        
+        # NOTE(lhy): The `rollout_request_buffer` is not used anymore, we should try to keep the ps_manager/request_status tracker only store the meta data!
+        self.rollout_request_buffer = {}  # deprecated: buffer for storing request data during rollout processing
         
         # Rollout coordinator reference
         self.rollout_coordinator: Optional[ray.actor.ActorHandle] = None
@@ -548,6 +552,10 @@ class RequestStatusTracker:
             else:
                 raise KeyError(f"Request ID {req_id} not found.")
 
+    # ------------ Deprecated methods ------------
+    # These methods are not used anymore because they will impact the performance of the ps_manager/request_status tracker
+
+    @deprecated("This method is not used anymore, we should try to keep the ps_manager/request_status tracker only store the meta data!")
     def add_request_data_to_buffer(self, request_data: dict):
         """
         Add request data to the rollout request buffer.
@@ -558,6 +566,7 @@ class RequestStatusTracker:
         for req_id, data in request_data.items():
             self.rollout_request_buffer[req_id] = data
     
+    @deprecated("This method is not used anymore, we should try to keep the ps_manager/request_status tracker only store the meta data!")
     def get_request_data_from_buffer(self, request_id: int) -> Optional[dict]:
         """
         Get request data from the rollout request buffer.
@@ -570,6 +579,7 @@ class RequestStatusTracker:
         """
         return self.rollout_request_buffer.get(request_id, None)
 
+    @deprecated("This method is not used anymore, we should try to keep the ps_manager/request_status tracker only store the meta data!")
     def pop_request_data_from_buffer(self, request_id: int) -> Optional[dict]:
         """
         Pop request data from the rollout request buffer.
@@ -584,6 +594,7 @@ class RequestStatusTracker:
             f"Request ID {request_id} not found in rollout request buffer."
         return self.rollout_request_buffer.pop(request_id, None)
     
+    @deprecated("This method is not used anymore, we should try to keep the ps_manager/request_status tracker only store the meta data!")
     def remove_request_data_from_buffer(self, request_id: int):
         """
         Remove request data from the rollout request buffer.

@@ -50,14 +50,26 @@ class FSDPConverter(BaseConverter):
         Generate sharding info for a parameter.
         Returns a NIXLSharding object.
         """
-        assert len(param.placements) == 1 and param.placements[0].is_shard(0), \
-            f"Expected single shard on dim 0 for {param_name}, got {param.placements}"
-        assert param.device_mesh and param.device_mesh.ndim == 1, \
-            f"Expected 1 dim device mesh for {param_name}, got {param.device_mesh}"
-        kwargs = {
-            "shard_mesh": OrderedDict([(0, param.device_mesh.size())]),
-            "shard_indices": [(param.device_mesh.get_rank(),)]
-        }
+        # FSDP
+        if len(param.placements) == 1:
+            assert param.placements[0].is_shard(dim=0), \
+                f"Expected single shard on dim 0 for {param_name} when using pure FSDP, got {param.placements}"
+            assert param.device_mesh and param.device_mesh.ndim == 1, \
+                f"Expected 1 dim device mesh for {param_name}, got {param.device_mesh}"
+            kwargs = {
+                "shard_mesh": OrderedDict([(0, param.device_mesh.size())]),
+                "shard_indices": [(param.device_mesh.get_rank(),)]
+            }
+        # HSDP
+        else:
+            assert len(param.placements) == 2 and param.placements[0].is_replicate() and param.placements[1].is_shard(dim=0), \
+                f"Expected two shards (first replicate, second shard on dim 0) for {param_name} when using hybrid FSDP, got {param.placements}"
+            assert param.device_mesh and param.device_mesh.ndim == 2, \
+                f"Expected 2 dim device mesh for {param_name}, got {param.device_mesh}"
+            kwargs = {
+                "shard_mesh": OrderedDict([(0, param.device_mesh.size(mesh_dim=1))]),
+                "shard_indices": [(param.device_mesh.get_local_rank(mesh_dim=1),)]
+            }
         return NIXLSharding(**kwargs)
 
 def convert_fsdp_inplace(fsdp_strategy: str, model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:

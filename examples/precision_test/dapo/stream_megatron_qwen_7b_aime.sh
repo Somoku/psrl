@@ -2,32 +2,30 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp2-batch-nixl-staleness_0'
+experiment_name='DAPO-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_0'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
+PSRL_PATH=${PSRL_WORKSPACE}/psrl
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
+python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
+
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
 GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
+
 VAL_TP=4 # TP in the training side for validation
-TRAIN_SP=4 # SP in the training side
-TRAIN_FSDP=32 # FSDP in the training side
+TRAIN_TP=4 # TP in the training side 
+TRAIN_PP=2 # PP in the training side 
+TRAIN_CP=1 # CP in the training side
 
 NNODES=16
 NGPUS_PER_NODE=8
-
-# GEN_NNODES=${NNODES} # Number of nodes for generation
-# GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
-# GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
-# GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
-
-# TRAIN_NNODES=${NNODES} # Number of nodes for training
-# TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
 
 GEN_NNODES=8 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
@@ -60,23 +58,19 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
-# Performance Related Parameter
-use_dynamic_bsz=True
-actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
-infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
 offload=True
 
-PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=1 \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
-    psrl.gen_mode=batch \
+    psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/fsdp_psrl_log/${experiment_name} \
-    psrl.log_prob.enable_rollout_engine_log_prob=False \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
+    psrl.log_prob.enable_inference_engine_log_prob=False \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=recompute \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -87,9 +81,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
     \
-    gen_actor_rollout_ref.model.path="$MODEL_PATH" \
+    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -98,13 +93,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.top_p=${top_p} \
     gen_actor_rollout_ref.rollout.top_k=${top_k} \
     \
-    train_actor_rollout_ref.model.path="$MODEL_PATH" \
-    train_actor_rollout_ref.model.use_remove_padding=True \
-    +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
+    train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
@@ -112,30 +106,34 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
-    train_actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    train_actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    train_actor_rollout_ref.ref.strategy=fsdp2 \
-    train_actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
-    train_actor_rollout_ref.ref.ulysses_sequence_parallel_size=${TRAIN_SP} \
+    train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
+    train_actor_rollout_ref.ref.megatron.param_offload=${offload} \
+    train_actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${TRAIN_TP} \
+    train_actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
+    train_actor_rollout_ref.ref.megatron.context_parallel_size=${TRAIN_CP} \
+    train_actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
+    train_actor_rollout_ref.ref.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
-    train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
-    train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    train_actor_rollout_ref.actor.strategy=fsdp2 \
-    train_actor_rollout_ref.actor.fsdp_config.param_offload=false \
-    train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    train_actor_rollout_ref.actor.ulysses_sequence_parallel_size=${TRAIN_SP} \
-    train_actor_rollout_ref.actor.fsdp_config.fsdp_size=${TRAIN_FSDP} \
-    train_actor_rollout_ref.actor.entropy_coeff=0 \
-    train_actor_rollout_ref.actor.grad_clip=1.0 \
+    train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    train_actor_rollout_ref.actor.megatron.param_offload=False \
+    train_actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
+    train_actor_rollout_ref.actor.megatron.grad_offload=${offload} \
+    train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
+    train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
+    train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
+    train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
+    train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \

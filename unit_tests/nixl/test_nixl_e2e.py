@@ -2,7 +2,8 @@ import os
 import time
 import ray
 import torch
-import socket
+import asyncio
+import math
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -10,8 +11,10 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.util.placement_group import placement_group, PlacementGroupSchedulingStrategy
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 from megatron.core import parallel_state as mpu
+import hydra
+from hydra.core.config_store import ConfigStore
 
 from verl.workers.megatron_workers import set_random_seed
 from verl.utils.megatron_utils import get_model
@@ -26,9 +29,7 @@ from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.workers.ps import PSWorkerGroup, PSClassWithInitArgs, PSResourcePool, PSResourceSpec, PSStorageWorker, PSStoragePlan
 
-QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-0.5B-Instruct"
-# QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-Math-7B"
-# QWEN_MODEL_PATH = os.environ.get("PSRL_WORKSPACE") + "/models/Qwen2.5-3B-Instruct"
+NUM_GPU_PER_NODE = 8
 
 def make_dual_print(log_path, prefix=None):
     with open(log_path, "w") as f:
@@ -43,6 +44,32 @@ def make_dual_print(log_path, prefix=None):
     return dual_print
 
 @ray.remote
+class GlobalStore:
+    def __init__(self):
+        self.train_master_ip = None
+        self.gen_master_ip = None
+        self.train_master_ip_event = asyncio.Event()
+        self.gen_master_ip_event = asyncio.Event()
+
+    async def set_train_master_ip(self, train_master_ip):
+        self.train_master_ip = train_master_ip
+        self.train_master_ip_event.set()
+        
+    async def set_gen_master_ip(self, gen_master_ip):
+        self.gen_master_ip = gen_master_ip
+        self.gen_master_ip_event.set()
+        
+    async def get_train_master_ip(self):
+        if self.train_master_ip is None:
+            await self.train_master_ip_event.wait()
+        return self.train_master_ip
+    
+    async def get_gen_master_ip(self):
+        if self.gen_master_ip is None:
+            await self.gen_master_ip_event.wait()
+        return self.gen_master_ip
+
+@ray.remote
 class MetaServerActor:
     def __init__(self, server_name, psrl_config, expected_agents, log_dir):
         self.server = NIXLMetaServer(server_name, psrl_config.nixl)
@@ -53,6 +80,7 @@ class MetaServerActor:
         self.print = make_dual_print(log_path, prefix=self.client_name)
 
     def init_finished(self):
+        self.print(f"Server init finished on ip {os.environ.get('LOCAL_IP')}")
         return True
 
     def protocol(self):
@@ -83,9 +111,14 @@ class MetaServerActor:
 
 @ray.remote(num_cpus=1)
 class TrainClientActor:
-    def __init__(self, engine_type, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, ps_for_push_worker_handles):
-        assert engine_type in ["fsdp", "megatron"], f"engine {engine_type} is not supported"
-        os.environ["MASTER_ADDR"] = "localhost"
+    def __init__(self, global_store, engine_type, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, ps_for_push_worker_handles, model_path, fsdp_hybrid_config=None, megatron_config=None):
+        assert engine_type in ["fsdp", "fsdp_hybrid", "megatron"], f"engine {engine_type} is not supported"
+        if rank == 0:
+            train_master_ip = os.environ.get("LOCAL_IP")
+            ray.get(global_store.set_train_master_ip.remote(train_master_ip))
+        else:
+            train_master_ip = ray.get(global_store.get_train_master_ip.remote())
+        os.environ["MASTER_ADDR"] = train_master_ip
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -96,25 +129,40 @@ class TrainClientActor:
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{self.client_name}.log")
         self.print = make_dual_print(log_path, prefix=self.client_name)
+        self.print(f"train_master_ip: {train_master_ip}")
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
-        if engine_type == "fsdp":
-            model = AutoModelForCausalLM.from_pretrained(QWEN_MODEL_PATH, torch_dtype=torch.float32)
+        if engine_type == "fsdp" or engine_type == "fsdp_hybrid":
+            model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
             # Set all model parameters to 1
             for p in model.parameters():
                 p.data.fill_(1)
             torch.manual_seed(42)
-            self.model = FSDP(
-                model,
-                sharding_strategy=ShardingStrategy.FULL_SHARD,
-                device_id=torch.cuda.current_device(),
-                sync_module_states=False,
-                device_mesh=init_device_mesh("cuda", mesh_shape=(world_size,))
-            )
+            # FSDP
+            if engine_type == "fsdp":
+                self.model = FSDP(
+                    model,
+                    sharding_strategy=ShardingStrategy.FULL_SHARD,
+                    device_id=torch.cuda.current_device(),
+                    sync_module_states=False,
+                    device_mesh=init_device_mesh("cuda", mesh_shape=(world_size,))
+                )
+            elif engine_type == "fsdp_hybrid":
+                # HSDP
+                ddp_size = fsdp_hybrid_config.get("ddp_size", 2)
+                fsdp_size = fsdp_hybrid_config.get("fsdp_size", 4)
+                assert world_size % (ddp_size * fsdp_size) == 0, f"world_size {world_size} is not divisible by {ddp_size * fsdp_size}"
+                self.model = FSDP(
+                    model,
+                    sharding_strategy=ShardingStrategy.HYBRID_SHARD,
+                    device_id=torch.cuda.current_device(),
+                    sync_module_states=False,
+                    device_mesh=init_device_mesh("cuda", mesh_shape=(ddp_size, fsdp_size))
+                )
         elif engine_type == "megatron":
-            self._init_megatron_parallel()
+            self._init_megatron_parallel(megatron_config)
             set_random_seed(42)
-            self._init_megatron_model()
+            self._init_megatron_model(model_path)
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
@@ -125,24 +173,24 @@ class TrainClientActor:
         )
         self.ps_for_push_worker_handles = ps_for_push_worker_handles
     
-    def _init_megatron_parallel(self):
+    def _init_megatron_parallel(self, megatron_config):
         """Initialize Megatron parallel state"""
         mpu.initialize_model_parallel(
-            tensor_model_parallel_size=2,  
-            pipeline_model_parallel_size=2, 
-            virtual_pipeline_model_parallel_size=2,
+            tensor_model_parallel_size=megatron_config.get("tensor_model_parallel_size", 4),  
+            pipeline_model_parallel_size=megatron_config.get("pipeline_model_parallel_size", 2), 
+            virtual_pipeline_model_parallel_size=megatron_config.get("virtual_pipeline_model_parallel_size", 1),
             use_sharp=False,
-            context_parallel_size=1,
+            context_parallel_size=megatron_config.get("context_parallel_size", 1),
             expert_model_parallel_size=1,
             expert_tensor_parallel_size=1,
             nccl_communicator_config_path=None,
         )
         self.print(f"[Rank {self.rank}] Megatron parallel initialized")
     
-    def _init_megatron_model(self):
+    def _init_megatron_model(self, model_path):
         """Initialize Megatron model"""
         # Get HuggingFace config
-        hf_config = AutoConfig.from_pretrained(QWEN_MODEL_PATH, trust_remote_code=False)
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
         # Convert to Megatron config
         dtype = PrecisionType.to_dtype(torch.bfloat16)
         tf_config = hf_to_mcore_config(hf_config, dtype)
@@ -176,14 +224,15 @@ class TrainClientActor:
         # self.print(f"[Rank {self.rank}] Model named parameter keys: {[name for submodel in self.model for name, _ in submodel.named_parameters()]}")
     
     def init_finished(self):
+        self.print(f"Train client init finished on ip {os.environ.get('LOCAL_IP')}")
         return True
     
-    def protocol(self):
+    def protocol(self, model_path):
         self.print("step0: convert_fsdp/megatron_inplace")
-        if self.engine_type == "fsdp":
+        if self.engine_type == "fsdp" or self.engine_type == "fsdp_hybrid":
             state_dict, sharding = convert_fsdp_inplace("fsdp", self.model)
         elif self.engine_type == "megatron":
-            parameter_mapping = create_parameter_mapping("Megatron", QWEN_MODEL_PATH)
+            parameter_mapping = create_parameter_mapping("Megatron", model_path)
             state_dict, sharding = convert_megatron_inplace(parameter_mapping, self.model)
         # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
@@ -208,20 +257,22 @@ class TrainClientActor:
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
 
-    def push_to_ps(self, ps_agent_name, ps_client_name):
-        for key in self.state_dict_keys:
-            # self.print(f"push {key} to {ps_client_name}")
-            self.client.client_write(ps_agent_name, ps_client_name, key, b"train_push")
-            # self.client.wait(key, b"train_push", "WRITE", target_client=ps_client_name)
-        return True
-    
-    def wait_push_done(self, ps_client_name):
+    def push_to_ps(self, ps_agent_names, ps_client_names):
+        wait_operations = []
+        for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
+            for key in self.state_dict_keys:
+                # self.print(f"push {key} from {self.client_name} to {ps_client_name}")
+                shards_to_transfer = self.client.client_write(ps_agent_name, ps_client_name, key, "train_push")
+                if len(shards_to_transfer) > 0:
+                    wait_operations.append((key, ps_client_name, shards_to_transfer))
         futures = []
-        for key in self.state_dict_keys:
-            self.client.wait(key, b"train_push", "WRITE", target_client=ps_client_name)
-            futures.append(self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key))
-        ray.get(futures[-1])
-        return True
+        for key, ps_client_name, shards_to_transfer in wait_operations:
+            start_time = time.time()
+            self.client.wait(key, "train_push", "WRITE", target_client=ps_client_name)
+            end_time = time.time()
+            # self.print(f"Wait {key} push done from {self.client_name} to {ps_client_name} in {end_time - start_time}s")
+            futures.append(self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key, shards_to_transfer))
+        ray.get(futures)
     
     def shutdown(self):
         self.client.shutdown()
@@ -229,9 +280,14 @@ class TrainClientActor:
 
 @ray.remote(num_cpus=1)
 class GenClientActor:
-    def __init__(self, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface):
+    def __init__(self, global_store, rank, world_size, server_name, psrl_config, backend, torch_port, log_dir, nixl_interface: NIXLInterface, model_path, gen_config):
         from vllm import LLM
-        os.environ["MASTER_ADDR"] = "localhost"
+        if rank == 0:
+            gen_master_ip = os.environ.get("LOCAL_IP")
+            ray.get(global_store.set_gen_master_ip.remote(gen_master_ip))
+        else:
+            gen_master_ip = ray.get(global_store.get_gen_master_ip.remote())
+        os.environ["MASTER_ADDR"] = gen_master_ip
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
@@ -239,16 +295,20 @@ class GenClientActor:
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{self.client_name}.log")
         self.print = make_dual_print(log_path, prefix=self.client_name)
+        self.print(f"gen_master_ip: {gen_master_ip}")
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         torch.manual_seed(42)
         os.environ["LOCAL_RANK"] = str(0)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
-        assert world_size % 4 == 0, f"world_size {world_size} is not divisible by 4"
+        tp_size = gen_config.get("tensor_parallel_size", 2)
+        pp_size = gen_config.get("pipeline_parallel_size", 1)
+        assert world_size % (tp_size * pp_size) == 0, f"world_size {world_size} is not divisible by {tp_size * pp_size}"
         llm = LLM(
-            model=QWEN_MODEL_PATH,
+            model=model_path,
+            # enable_sleep_mode=True,
             dtype="bfloat16",
-            tensor_parallel_size=world_size // 2,
-            pipeline_parallel_size=world_size // 2,
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
             distributed_executor_backend="external_launcher",
             enforce_eager=True,
             disable_custom_all_reduce=True,
@@ -264,7 +324,7 @@ class GenClientActor:
         self.print(f"seen_module_prefixes: {seen_module_prefixes}, has lm_head: {'lm_head' in seen_module_prefixes}, has lm_head module: {hasattr(self.model, 'lm_head')}")
         '''
         self.rank = rank
-        self.tp_rank = rank % 2
+        self.tp_rank = rank % tp_size
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
@@ -275,14 +335,15 @@ class GenClientActor:
         )
         
     def init_finished(self):
+        self.print(f"Gen client init finished on ip {os.environ.get('LOCAL_IP')}")
         return True
     
     def get_state_dict(self):
         return {k: v.cpu() for k, v in self.state_dict.items()}
 
-    def protocol(self):
+    def protocol(self, model_path):
         self.print("step0: convert_vllm_inplace")
-        param_mapping = create_parameter_mapping(type(self.model), QWEN_MODEL_PATH)
+        param_mapping = create_parameter_mapping(type(self.model), model_path)
         state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.tp_rank)
         # self.print(f"state_dict keys: {list(state_dict.keys())}")
         self.state_dict = state_dict
@@ -309,17 +370,19 @@ class GenClientActor:
         self.client.wait_for_server_temp_mappings()
         self.print("protocol done.")
 
-    def pull_from_ps(self, ps_agent_name, ps_client_name):
-        for key in self.state_dict_keys:
-            # self.print(f"pull {key} from {ps_client_name}")
-            self.client.client_read(ps_agent_name, ps_client_name, key, b"gen_pull")
-            # self.client.wait(key, b"gen_pull", "READ", target_client=ps_client_name)
-        return True
-    
-    def wait_pull_done(self, ps_client_name):
-        for key in self.state_dict_keys:
-            self.client.wait(key, b"gen_pull", "READ", target_client=ps_client_name)
-        return True
+    def pull_from_ps(self, ps_agent_names, ps_client_names):
+        wait_operations = []
+        for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
+            for key in self.state_dict_keys:
+                # self.print(f"pull {key} from {ps_client_name}")
+                shards_to_transfer = self.client.client_read(ps_agent_name, ps_client_name, key, "gen_pull")
+                if len(shards_to_transfer) > 0:
+                    wait_operations.append((key, ps_client_name, shards_to_transfer))
+        for key, ps_client_name, shards_to_transfer in wait_operations:
+            start_time = time.time()
+            self.client.wait(key, "gen_pull", "READ", target_client=ps_client_name)
+            end_time = time.time()
+            # self.print(f"Wait {key} pull done from {ps_client_name} to {self.client_name} in {end_time - start_time}s")
     
     def shutdown(self):
         self.client.shutdown()
@@ -329,50 +392,65 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, n
         "path": model_path, "use_shm": False, "trust_remote_code": False
     })
     ray_nodes = ray.nodes()
-    nodes = [ray_nodes[i] for i in range(num_ps)]
+    ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
+    nodes = [ray_nodes_sorted[-i-1] for i in range(num_ps)]
     ps_resource_pool = PSResourcePool([
         PSResourceSpec(node_ip=node["NodeManagerAddress"], node_id=node["NodeID"], attached_gpu_id=None)
         for node in nodes
     ])
     storage_plan = PSStoragePlan(
-        train_model_dtype=torch.float32 if train_engine_type == "fsdp" else torch.bfloat16,
+        train_model_dtype=torch.bfloat16 if train_engine_type == "megatron" else torch.float32,
         gen_model_dtype=torch.bfloat16
     )
     ps_cls_with_init = PSClassWithInitArgs(ray.remote(PSStorageWorker), storage_plan, model_config, psrl_config, nixl_interface)
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
     return ps_wg
 
-def test_nixl_e2e():
-    log_dir = os.environ.get("PSRL_WORKSPACE") + "/psrl/unit_tests/nixl/log"
+@hydra.main(config_path="config", config_name="nixl_e2e", version_base=None)
+def test_nixl_e2e(cfg: DictConfig):
+    log_dir = cfg.logging.path
     os.makedirs(log_dir, exist_ok=True)
     ray.init(ignore_reinit_error=True)
-    listen_ip = os.environ.get("LOCAL_IP")
-    listen_port = 23459
+    listen_ip = cfg.network.listen_ip
+    listen_port = cfg.network.listen_port
+    print(f"meta server listen_ip: {listen_ip}")
     server_name = GLOBAL_META_SERVER_NAME
-    backend = "nccl"
-    torch_port_train = 29502
-    torch_port_gen = 29503
-    num_train = 8
-    num_gen = 4
-    num_ps = 2
-    train_engine_type = "megatron"
+    backend = cfg.network.backend
+    torch_port_train = cfg.network.torch_port_train
+    torch_port_gen = cfg.network.torch_port_gen
+    # Number of train GPUs
+    num_train = cfg.test.num_train
+    # Number of gen GPUs
+    num_gen = cfg.test.num_gen
+    # Number of PS Nodes (align with the number of nodes used for gen)
+    num_ps = math.ceil(num_gen / NUM_GPU_PER_NODE)
+    ray_nodes = ray.nodes()
+    ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
+    # Use the first num_train / NUM_GPU_PER_NODE nodes for train
+    train_nnodes = math.ceil(num_train / NUM_GPU_PER_NODE)
+    train_nodes = [ray_nodes_sorted[i] for i in range(train_nnodes)]
+    # Use the last num_gen / NUM_GPU_PER_NODE nodes for gen
+    gen_nnodes = math.ceil(num_gen / NUM_GPU_PER_NODE)
+    gen_nodes = [ray_nodes_sorted[-i-1] for i in range(gen_nnodes)]
+    # print(f"train_nodes: {train_nodes}, gen_nodes: {gen_nodes}")
+    train_engine_type = cfg.test.train_engine_type
     
     psrl_config = OmegaConf.create({
         "logging_path": log_dir,
         "ps_manager_ip": listen_ip,
         "nixl": {
-            "server_mode": "meta_server",
-            "server_ip": listen_ip,
-            "server_port": listen_port,
-            "max_pinned_temp_memory_slots": 8
+            "server_mode": cfg.nixl.server_mode,
+            "server_ip": cfg.nixl.server_ip,
+            "server_port": cfg.nixl.server_port,
+            "max_pinned_temp_memory_slots": cfg.nixl.max_pinned_temp_memory_slots
         },
-        "ps_mode": "nixl_cpu"
+        "ps_mode": cfg.ps.mode
     })
     
     nixl_interface = NIXLInterface(
         port_scanner=GLOBAL_PORT_SCANNER
     )
-    # nixl_interface = NIXLInterface()
+    global_store = GlobalStore.remote()
     
     start_time = time.time()
     ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
@@ -388,7 +466,7 @@ def test_nixl_e2e():
     print(f"[PASS] server init done. time: {end_time - start_time}s")
     
     start_time = time.time()
-    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, QWEN_MODEL_PATH, nixl_interface)
+    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model.path, nixl_interface)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
     ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
@@ -402,24 +480,29 @@ def test_nixl_e2e():
     end_time = time.time()
     print(f"[PASS] ps init done. time: {end_time - start_time}s")
     
-    # train_pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(num_train)], strategy="PACK")
-    # gen_pg = placement_group([{"CPU": 1, "GPU": 1} for _ in range(num_gen)], strategy="PACK")
-    # ray.get(train_pg.ready())
-    # ray.get(gen_pg.ready())
-    
     start_time = time.time()
+    # Prepare configuration for train actors
+    fsdp_hybrid_config = cfg.test.fsdp_hybrid if train_engine_type == "fsdp_hybrid" else None
+    megatron_config = cfg.test.megatron if train_engine_type == "megatron" else None
+    
     train_actors = [
         TrainClientActor.options(
             num_gpus=1,
-            # scheduling_strategy=PlacementGroupSchedulingStrategy(train_pg, placement_group_bundle_index=rank)
-        ).remote(train_engine_type, rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface, ps_for_push_worker_handles)
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=train_nodes[rank % len(train_nodes)]["NodeID"],
+                soft=False
+            )
+        ).remote(global_store, train_engine_type, rank, num_train, server_name, psrl_config, backend, torch_port_train, log_dir, nixl_interface, ps_for_push_worker_handles, cfg.model.path, fsdp_hybrid_config, megatron_config)
         for rank in range(num_train)
     ]
     gen_actors = [
         GenClientActor.options(
             num_gpus=1,
-            # scheduling_strategy=PlacementGroupSchedulingStrategy(gen_pg, placement_group_bundle_index=rank)
-        ).remote(rank, num_gen, server_name, psrl_config, backend, torch_port_gen, log_dir, nixl_interface)
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=gen_nodes[rank % len(gen_nodes)]["NodeID"],
+                soft=False
+            )
+        ).remote(global_store, rank, num_gen, server_name, psrl_config, backend, torch_port_gen, log_dir, nixl_interface, cfg.model.path, cfg.test.gen)
         for rank in range(num_gen)
     ]
     for i in range(num_train):
@@ -434,9 +517,9 @@ def test_nixl_e2e():
     server.protocol.remote()
     futures = []
     for t in train_actors:
-        futures.append(t.protocol.remote())
+        futures.append(t.protocol.remote(cfg.model.path))
     for g in gen_actors:
-        futures.append(g.protocol.remote())
+        futures.append(g.protocol.remote(cfg.model.path))
     futures.extend(ps_wg.execute_all_async("nixl_protocol"))
     ray.get(futures)
     end_time = time.time()
@@ -445,11 +528,8 @@ def test_nixl_e2e():
     # Each train client pushes to each PS worker
     start_time = time.time()
     futures = []
-    for ps_agent_name, ps_for_push_name in zip(ps_agent_names, ps_for_push_names):
-        for t in train_actors:
-            t.push_to_ps.remote(ps_agent_name, ps_for_push_name)
-        for t in train_actors: 
-            futures.append(t.wait_push_done.remote(ps_for_push_name))
+    for t in train_actors:
+        futures.append(t.push_to_ps.remote(ps_agent_names, ps_for_push_names))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] train push to all ps done. time: {end_time - start_time}s")
@@ -457,11 +537,8 @@ def test_nixl_e2e():
     # Each gen client pulls from each PS worker
     start_time = time.time()
     futures = []
-    for ps_agent_name, ps_for_pull_name in zip(ps_agent_names, ps_for_pull_names):
-        for g in gen_actors:
-            g.pull_from_ps.remote(ps_agent_name, ps_for_pull_name)
-        for g in gen_actors:
-            futures.append(g.wait_pull_done.remote(ps_for_pull_name))
+    for g in gen_actors:
+        futures.append(g.pull_from_ps.remote(ps_agent_names, ps_for_pull_names))
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] gen pull from all ps done. time: {end_time - start_time}s")
@@ -472,6 +549,8 @@ def test_nixl_e2e():
     for gen_idx, state_dict in enumerate(gen_state_dicts):
         for k, v in state_dict.items():
             assert torch.allclose(v, torch.ones_like(v), atol=1e-6), f"[VERIFY] Gen client {gen_idx} param {k} is not all ones: {v}"
+            # print(f"[PASS] Gen client {gen_idx} param {k} is all ones.")
+        print(f"[PASS] Gen client {gen_idx} is all ones.")
     print("[PASS] All GenClientActor parameters are all ones.")
 
     # Shutdown all actors and Ray

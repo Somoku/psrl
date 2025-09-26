@@ -12,10 +12,12 @@ import ray
 from verl import DataProto
 
 from psrl.utils.dataset.utils import create_rl_dataset, create_rl_sampler
-from psrl.utils.logger import DualOutputHandler
+from psrl.utils.logger import DualOutputHandler, log_data_protocol
+
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 @dataclass
 class DatasetType:
@@ -71,6 +73,7 @@ class DataProcessor:
         
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
+        self.reward_server_handle = None # Will be set by the ray trainer
         self.data_queue = data_queue
         
         self.process_mode = process_mode
@@ -94,6 +97,9 @@ class DataProcessor:
         # Create the initial datasets and dataloaders
         self.total_training_steps = None
         self._create_dataloader()
+        
+    def set_reward_server(self, reward_server_handle: ray.actor.ActorHandle):
+        self.reward_server_handle = reward_server_handle
 
     # ------- Dataset and Dataloader Building Methods -------
     def build_train_and_val_dataset(self) -> None:
@@ -315,6 +321,7 @@ class DataProcessor:
         
         The data queue will hold the processed batches, which can be consumed by the rollout server.
         """
+        assert self.reward_server_handle is not None, "Reward server handle is not set. Call `set_reward_server()` first."
         self.train_dataloader_iter = iter(self.train_dataloader)
         total_epochs = self.config.trainer.total_epochs
         
@@ -351,15 +358,19 @@ class DataProcessor:
                 if "do_sample" in batch_dict.meta_info:
                     meta_info_keys_to_pop.append("do_sample")
 
-                gen_batch = batch_dict.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                    meta_info_keys=meta_info_keys_to_pop,
-                )
+                if self.config.psrl.colocate:
+                    gen_batch = batch_dict
+                else:
+                    gen_batch = batch_dict.pop(
+                        batch_keys=batch_keys_to_pop,
+                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                        meta_info_keys=meta_info_keys_to_pop,
+                    )
                 
-                # Store the other batch fields in the request buffer of the ps manager.
+                # Store the other batch fields in the request buffer of the reward server
                 # They will be merged with the reward data.
-                ray.get(self.ps_manager_handle.add_request_data_to_buffer.remote(
+                log_data_protocol(batch_dict, psrl_logger, self.log_prefix + " before adding request data to ps manager")
+                ray.get(self.reward_server_handle.add_requests.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
                 

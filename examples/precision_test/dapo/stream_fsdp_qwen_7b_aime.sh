@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp2-batch-nixl-staleness_0'
+experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp2-stream-nixl-staleness_0'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -71,12 +71,12 @@ offload=True
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=1 \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
-    psrl.gen_mode=batch \
+    psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/fsdp_psrl_log/${experiment_name} \
-    psrl.log_prob.enable_rollout_engine_log_prob=False \
+    psrl.log_prob.enable_inference_engine_log_prob=False \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=recompute \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -88,6 +88,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
+    gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \

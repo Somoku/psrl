@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from abc import ABC
 
 from psrl.utils.nixl import NIXLInterface
+from psrl.utils.logger import DualOutputHandler, get_worker_info
 
 
 psrl_logger = logging.getLogger(__file__)
@@ -42,6 +43,11 @@ class PSRL_BaseTrainWorker(ABC):
         self.nixl_wait_thread = None  # Single thread for all wait operations
         self.nixl_wait_thread_lock = threading.Lock()
         self.nixl_wait_completed = threading.Event()
+        
+        # Build logger
+        self.log_prefix = f"BaseTrainWorker_R{self.rank}"
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        psrl_logger.info(f"Initialized on {get_worker_info()}.")
         
     def get_node_id(self) -> str:
         """
@@ -103,27 +109,29 @@ class PSRL_BaseTrainWorker(ABC):
             if target_client_name not in self._cached_ps_worker_handles:
                 self._cached_ps_worker_handles[target_client_name] = ray.get(ps_manager_handle.get_ps_worker_handle.remote(target_client_name))
             for key in self.unified_state_dict:
-                self.nixl_storage_client.client_write(target_agent_name, target_client_name, key, b"train_push")
-                wait_operations.append((key, target_client_name))
+                shards_to_transfer = self.nixl_storage_client.client_write(target_agent_name, target_client_name, key, f"train_push_{next_ps_model_version}")
+                if len(shards_to_transfer) > 0:
+                    wait_operations.append((key, target_client_name, shards_to_transfer))
         
         # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                psrl_logger.info(f"Starting to wait for {len(wait_operations)} NIXL operations...")
+                psrl_logger.info(f"[NIXL thread]: Starting to wait for {len(wait_operations)} NIXL operations for version {next_ps_model_version}...")
                 futures = []
-                for key, target_client_name in wait_operations:
-                    self.nixl_storage_client.wait(key, b"train_push", "WRITE", target_client=target_client_name)
+                for key, target_client_name, shards_to_transfer in wait_operations:
+                    self.nixl_storage_client.wait(key, f"train_push_{next_ps_model_version}", "WRITE", target_client=target_client_name)
                     psrl_logger.debug(f"Wait completed for key {key} to target {target_client_name}")
                     ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
-                    futures.append(ps_worker_handle.transfer_train_to_gen.remote(key))
-                    psrl_logger.debug(f"Transfer {key} from train to gen in target {target_client_name}")
+                    futures.append(ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer))
+                    psrl_logger.debug(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
+                psrl_logger.info(f"[NIXL thread]: Wait NIXL xfers done, start to wait for {len(futures)} train to gen transfers on the PS...")
                 ray.get(futures)
+                psrl_logger.info(f"[NIXL thread]: Starting to push model tag to the PS...")
                 ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version, self.worker_rank, self.worker_world_size))
                 self.nixl_wait_completed.set()
-                psrl_logger.info(f"All NIXL wait operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
+                psrl_logger.info(f"[NIXL thread]: All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
             except Exception as e:
-                psrl_logger.error(f"Error in NIXL wait thread: {e}")
-                # Don't set the event on error, so wait_for_nixl_push_completion can detect failure
+                raise RuntimeError(f"Error in NIXL wait thread: {e}")
         
         wait_thread = threading.Thread(target=wait_all_operations, daemon=True)
         wait_thread.start()

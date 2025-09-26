@@ -234,7 +234,7 @@ class PSRL_vLLMRollout:
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
                 kwargs[k] = config.get(k)
-
+        kwargs["n"] = 1  # already repeat in ray_trainer
         psrl_logger.info(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 

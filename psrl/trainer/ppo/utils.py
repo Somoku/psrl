@@ -8,7 +8,7 @@ from verl.trainer.ppo.utils import WorkerType
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import ResourcePoolManager, compute_response_mask
 from verl.single_controller.ray import RayResourcePool
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register

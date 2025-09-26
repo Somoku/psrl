@@ -210,6 +210,11 @@ class TaskRunner:
             self.role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[PSRL_Role.RefPolicy] = ["train_pool"]
     
+    def add_dummy_worker(self, config):
+        from psrl.trainer.ppo.utils import PSRL_DummyWorker
+        self.role_worker_mapping[PSRL_Role.DummyPolicy] = ray.remote(PSRL_DummyWorker)
+        self.mapping[PSRL_Role.DummyPolicy] = ["train_pool"]
+    
     def run(self, config):
         """Execute the main PPO training workflow.
 
@@ -244,6 +249,9 @@ class TaskRunner:
         
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
+        
+        # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
+        self.add_dummy_worker(config)
 
         # Download the checkpoint from HDFS to the local machine.
         # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on

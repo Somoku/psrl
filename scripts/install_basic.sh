@@ -10,8 +10,8 @@ THIRD_PARTY_PATH="$PSRL_PATH/third_party"
 mkdir -p $THIRD_PARTY_PATH
 
 echo "1. Install pytorch and tensordict"
-# python -m pip install --no-cache-dir "torch==2.7.1" "torchvision==0.22.1" "torchaudio==2.7.1" --index-url https://download.pytorch.org/whl/cu128
-python -m pip install --no-cache-dir "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir "torch==2.7.1" "torchvision==0.22.1" "torchaudio==2.7.1" --index-url https://download.pytorch.org/whl/cu128
+# python -m pip install --no-cache-dir "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu128
 python -m pip install --no-cache-dir "tensordict==0.10.0" torchdata
 
 echo "2. Install xformers"

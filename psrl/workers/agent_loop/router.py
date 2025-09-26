@@ -322,7 +322,7 @@ class RolloutRouter:
         ))
         filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
         if filtered_request_idxs:
-            requests = requests[filtered_request_idxs]
+            requests = requests.select_idxs(filtered_request_idxs)
             request_ids = requests.non_tensor_batch["uid"]
             # evenly dispatch to rollout workers
             futures = []
@@ -352,6 +352,8 @@ class RolloutRouter:
                 results = []
                 for i in range(self.rollout_wg_size):
                     consolidated_outputs, filtered_request_idxs, update_statuses = rollout_results[i]
+                    if consolidated_outputs is None:
+                        continue
                     psrl_logger.debug(f"Consolidated outputs from rollout worker {i} have request ids: {consolidated_outputs.non_tensor_batch['uid']}")
                     assert (
                         update_statuses is not None and

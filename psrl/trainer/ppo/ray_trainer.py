@@ -26,7 +26,7 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.ray_trainer import AdvantageEstimator, apply_kl_penalty, compute_response_mask, RayPPOTrainer
-from verl.trainer.ppo.utils import WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import reduce_metrics
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -41,7 +41,7 @@ from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.reward import RewardServer
 from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStoragePlan, PSStorageWorker
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
-from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager, PSRL_compute_advantage
+from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager, PSRL_compute_advantage, need_critic, need_reference_policy, need_reward_model
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -848,6 +848,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[PSRL_Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
 
+        if not self.use_critic and not self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.DummyPolicy)
+            dummy_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[PSRL_Role.DummyPolicy], config=self.config.train_actor_rollout_ref, role="dummy")
+            self.resource_pool_to_cls[resource_pool]["dummy"] = dummy_policy_cls
+
         # initialize WorkerGroup
         psrl_logger.info("Initializing WorkerGroup for other roles")
         # NOTE(verl): if you want to use a different resource pool for each role, which can support different parallel size,
@@ -1039,9 +1044,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
 
+        self.rm_wg = None
         if self.use_rm:
             self.rm_wg = all_wg["rm"]
             self.rm_wg.init_model()
+        
+        if not (
+            self.use_critic or
+            (self.use_reference_policy and not self.ref_in_actor)
+        ):
+            # NOTE(linsh): when not using critic or reference policy,
+            # if we directly call `init_model` of actor_wg, Ray will view the fused worker
+            # as an async actor and run `run_async_func_or_coro_in_event_loop`, which will
+            # make it invalid to call async function such as `trainer_mode` in `init_model`.
+            # So here we create a dummy worker group and call its dummy method to avoid this issue.
+            self.dummy_wg = all_wg["dummy"]
+            self.dummy_wg.init_model()
 
         # Concurrently initialize actor and rollout instances
         psrl_logger.info("Initializing actor model")

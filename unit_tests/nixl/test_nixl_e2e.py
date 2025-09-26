@@ -364,7 +364,7 @@ def test_nixl_e2e():
             "server_mode": "meta_server",
             "server_ip": listen_ip,
             "server_port": listen_port,
-            "max_pinned_temp_memory_slots": 4
+            "max_pinned_temp_memory_slots": 8
         },
         "ps_mode": "nixl_cpu"
     })

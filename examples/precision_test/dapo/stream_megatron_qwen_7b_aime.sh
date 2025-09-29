@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_0'
+experiment_name='DAPO-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_2'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -65,14 +65,14 @@ offload=True
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=0 \
+    psrl.staleness=2 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
-    psrl.log_prob.enable_inference_engine_log_prob=False \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=recompute \
+    psrl.log_prob.enable_inference_engine_log_prob=True \
+    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
+    psrl.log_prob.mode=rollout \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \

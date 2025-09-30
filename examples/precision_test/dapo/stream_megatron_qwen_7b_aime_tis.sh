@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_2'
+experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_1'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -40,6 +40,7 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
+tis_imp_ratio_cap=2.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
@@ -65,13 +66,13 @@ offload=True
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=2 \
+    psrl.staleness=1 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
-    psrl.log_prob.enable_inference_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
+    psrl.log_prob.enable_rollout_engine_log_prob=True \
+    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=rollout \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -119,6 +120,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \

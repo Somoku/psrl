@@ -28,8 +28,8 @@ python -m pip uninstall -y pynvml nvidia-ml-py
 python -m pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
 
 echo "4. Install FlashAttention and FlashInfer"
-# Install flash-attn-2.7.4.post1
-python -m pip install --no-cache-dir --no-build-isolation "flash-attn==2.7.4.post1" 
+# Install flash-attn-2.7.2.post1
+python -m pip install --no-cache-dir --no-build-isolation "flash-attn==2.7.2.post1" 
 # Install flashinfer-0.2.7.post1
 python -m pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.2.7.post1"
 

@@ -120,10 +120,13 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_agent_names: Optional[List[str]] = None
         self.ps_nixl_train_storage_client_names: Optional[List[str]] = None
         self.ps_nixl_gen_storage_client_names: Optional[List[str]] = None
-            
+        
+        # The log is now merged with the request status tracker
+        '''    
         # Build logger
         self.log_prefix = f"PSManager"
         setup_ps_logger(self.psrl_config.logging_path, self.log_prefix)
+        '''
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
     @deprecated("It is too slow to get the PS handle by `ray.get_runtime_context()`")

@@ -427,7 +427,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
         
         # Initialize the agent loop manager
-        self.agent_loop_manager = PSRL_AgentLoopManager.remote(
+        self.agent_loop_manager = ray.remote(PSRL_AgentLoopManager).remote(
             self.config,
             self.data_queue,
             self.agent_loop_workers,

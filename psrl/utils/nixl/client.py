@@ -325,7 +325,7 @@ class NIXLStorageClient:
         )
         psrl_logger.debug(f"Local client info is built, temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, temp meta mapping is: {self._temp_meta_mapping}")
         
-    def connect_to_server(self, timeout: float = 60.0):
+    def connect_to_server(self, timeout: float = 600.0):
         """
         Connect to the storage/meta server.
         """
@@ -372,7 +372,7 @@ class NIXLStorageClient:
         assert self._is_connected, "Not connected to server"
         self.agent.send_notif(self.server_name, pickle.dumps({self.client_name: self._temp_desc_bytes_mapping}))
         
-    def wait_for_server_sharding(self, timeout: float = 60.0):
+    def wait_for_server_sharding(self, timeout: float = 600.0):
         """
         Wait for the server sharding to be fetched.
         """
@@ -705,7 +705,7 @@ class NIXLStorageClient:
             self.xfer_handles[make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)] = handle
         return shards_to_transfer
     
-    def wait(self, key: str, tag: str, op_type: str, target_client: Optional[str] = None, shard_idx: Optional[int] = None, timeout: float = 60.0):
+    def wait(self, key: str, tag: str, op_type: str, target_client: Optional[str] = None, shard_idx: Optional[int] = None, timeout: float = 600.0):
         """
         Wait for a transfer to be completed.
         """
@@ -845,7 +845,7 @@ class NIXLMultiStorageClients:
         for client in self.multi_clients:
             client.reallocate_temp_memory()
             
-    def connect_to_server(self, timeout: float = 60.0):
+    def connect_to_server(self, timeout: float = 600.0):
         assert not self._is_connected, "Already connected to server"
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
         self.agent.send_local_metadata(self.server_ip, self.server_port)
@@ -877,7 +877,7 @@ class NIXLMultiStorageClients:
             assert client._temp_desc_bytes_mapping is not None, "Temp desc bytes mapping not registered"
         self.agent.send_notif(self.server_name, pickle.dumps({client.client_name: client._temp_desc_bytes_mapping for client in self.multi_clients}))
         
-    def wait_for_server_sharding(self, timeout: float = 60.0):
+    def wait_for_server_sharding(self, timeout: float = 600.0):
         assert self._is_connected, "Not connected to server"
         start = time.time()
         if self._multi_unified_sharding_dicts_fetched:
@@ -897,7 +897,7 @@ class NIXLMultiStorageClients:
         self._multi_unified_sharding_dicts_fetched = True
         return {client.client_name: client._unified_sharding_dict for client in self.multi_clients}
         
-    def wait_for_server_info(self, timeout: float = 180.0):
+    def wait_for_server_info(self, timeout: float = 600.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_info(timeout)
         if len(self.multi_clients) > 1:
@@ -906,7 +906,7 @@ class NIXLMultiStorageClients:
                 client._comm_plan = self.multi_clients[0]._comm_plan
                 client._all_client_infos_fetched = True
                 
-    def wait_for_server_temp_mappings(self, timeout: float = 180.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 600.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_temp_mappings(timeout)
         if len(self.multi_clients) > 1:
@@ -924,7 +924,7 @@ class NIXLMultiStorageClients:
         client = self.get_client_by_name(cur_client)
         client.client_write(target_agent, target_client, key, tag, comm_plan)
         
-    def wait(self, cur_client: str, key: str, tag: str, op_type: str, target_client: Optional[str] = None, timeout: float = 60.0):
+    def wait(self, cur_client: str, key: str, tag: str, op_type: str, target_client: Optional[str] = None, timeout: float = 600.0):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
         client.wait(key, tag, op_type, target_client, timeout)

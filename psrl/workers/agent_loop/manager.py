@@ -1,22 +1,21 @@
 import os
 import logging
 import asyncio
+import ray
 import numpy as np
 from omegaconf import DictConfig
-
-import ray
 
 from verl import DataProto
 
 from psrl.workers.ps.request_status_tracker import RequestStatus
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-@ray.remote
-class PSRL_AgentLoopManager:
 
+class PSRL_AgentLoopManager:
     def __init__(
         self,
         config: DictConfig,
@@ -95,6 +94,7 @@ class PSRL_AgentLoopManager:
         while not self.stop_busy_loop_task:
             if not self.data_queue.empty():
                 data = self.data_queue.get_nowait()
+                psrl_logger.debug(f"Got {len(data)} requests from data queue")
                 
                 # Receive END signal to stop processing data queue
                 if data is None:
@@ -135,6 +135,7 @@ class PSRL_AgentLoopManager:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
         version_tag = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
+        psrl_logger.debug(f"Setting version tag for request {self._request_counter} (uid={request.non_tensor_batch['uid']}) to {version_tag}")
         self._request_counter += 1
         return version_tag
 

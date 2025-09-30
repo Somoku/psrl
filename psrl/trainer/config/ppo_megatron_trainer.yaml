@@ -22,9 +22,6 @@ defaults:
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
   - ref@train_actor_rollout_ref.ref: megatron_ref
 
-  # Rollout model config.
-  - rollout@train_actor_rollout_ref.rollout: rollout
-
   # Critic model config.
   - critic@critic: megatron_critic
 

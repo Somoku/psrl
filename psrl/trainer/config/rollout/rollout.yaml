@@ -50,6 +50,9 @@ free_cache_engine: True
 # TP size for rollout. Not effective for hf
 tensor_model_parallel_size: 2
 
+# DP size for rollout
+data_parallel_size: 1
+
 # PP size for rollout. Not effective for hf and sync mode
 pipeline_model_parallel_size: 1
 

@@ -336,7 +336,7 @@ echo "Found verl path: $VERL_PATH"
 echo "Check if verl is installed editably..."
 IS_EDITABLE=false
 
-if pip list -e 2>/dev/null | grep -q "verl"; then
+if python -m pip list -e 2>/dev/null | grep -q "verl"; then
     IS_EDITABLE=true
     echo "verl is installed in editable mode."
 fi
@@ -344,7 +344,7 @@ fi
 if [ "$IS_EDITABLE" = false ]; then
     echo "Error: verl is not installed in editable mode."
     echo "Please install verl in editable mode using:"
-    echo "pip install -e /path/to/verl"
+    echo "python -m pip install -e /path/to/verl"
     echo ""
     echo "If you want to apply the patch anyway, please use --force option."
     if [ "$FORCE_MODE" != true ]; then

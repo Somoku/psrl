@@ -17,7 +17,6 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.multiprocessing.reductions import reduce_tensor
 
 import ray
-from ray.util.queue import Queue as RayQueue
 
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -115,7 +114,7 @@ class PSRL_GenWorker(Worker):
         psrl_config: DictConfig,
         gen_interface: GenInterface,
         nixl_interface: NIXLInterface,
-        status_queue: RayQueue, 
+        status_queue,
         **kwargs,
     ) -> None:
         """
@@ -1142,7 +1141,6 @@ class PSRL_GenWorker(Worker):
         )
         if update_status_success[0]:
             # Prepare the request for generation
-            request = request.to(get_torch_device().current_device())
             meta_info = {
                 "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
                 "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
@@ -1229,7 +1227,6 @@ class PSRL_GenWorker(Worker):
             if filtered_request_idxs:
                 filtered_requests = requests[filtered_request_idxs]
                 # Prepare the request for generation
-                filtered_requests = filtered_requests.to(get_torch_device().current_device())
                 meta_info = {
                     "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
                     "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
@@ -1255,7 +1252,7 @@ class PSRL_GenWorker(Worker):
                     ))
                     filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                     if filtered_request_idxs:
-                        filtered_requests = requests[filtered_request_idxs]
+                        filtered_requests = filtered_requests[filtered_request_idxs]
                         filtered_result = [vllm_outputs[i] for i in filtered_request_idxs]
                         # NOTE(lhy): The DataProto will be huge and slow to transfer using ray, so we postprocess the data inside the vllm rollout
                         if consolidate:

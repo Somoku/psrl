@@ -33,7 +33,6 @@ class PSRL_AgentLoopWorker:
         config: DictConfig,
         ps_manager_handle,
         rollout_wg_list,
-        rollout_queue,
     ):
         """Initialize agent loop worker.
 
@@ -57,7 +56,6 @@ class PSRL_AgentLoopWorker:
         )
         self.ps_manager_handle = ps_manager_handle
         self.rollout_wg_list = rollout_wg_list
-        self.rollout_queue = rollout_queue
         
         self.agent_programs = set()
         self.pending_program_queue = deque()
@@ -77,6 +75,14 @@ class PSRL_AgentLoopWorker:
         # TODO(lhy): support >1 workers
         self.log_prefix = f"AgentLoopWorker"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+
+    def set_reward_server(self, reward_server: ray.actor.ActorHandle):
+        """Set the reward server handle for sending processed data.
+        
+        Args:
+            reward_server: Handle to the reward server actor.
+        """
+        self.reward_server = reward_server
 
     def add_agent_program(self, data: DataProto):
         """Add a new agent program to the pending queue for processing.
@@ -202,7 +208,9 @@ class PSRL_AgentLoopWorker:
                     output = output.select_idxs(dispatch_request_idxs)
                     # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into the rollout queue, so we process the data inside the reward server
                     # output = self._post_process(output)
-                    self.rollout_queue.put(output) # Still cost ~17s (scripts in `examples/precision_test/dapo`)
+                    output_ref = ray.put(output)
+                    # NOTE(linsh): wrap the objectref in a dict to avoid implicit `ray.get` operation
+                    self.reward_server.put_data.remote({"data_ref": output_ref}) # Still cost ~17s (scripts in `examples/precision_test/dapo`)
                     '''
                     batch_size = len(output)
                     if batch_size > 1:

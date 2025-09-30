@@ -3,6 +3,7 @@ import logging
 import asyncio
 import ray
 import numpy as np
+from typing import Optional
 from omegaconf import DictConfig
 
 from verl import DataProto
@@ -19,7 +20,7 @@ class PSRL_AgentLoopManager:
     def __init__(
         self,
         config: DictConfig,
-        data_queue,
+        data_queue_size: int,
         agent_loop_workers,
         ps_manager_handle,
     ):
@@ -29,7 +30,7 @@ class PSRL_AgentLoopManager:
 
         Args:
             config (DictConfig): Configuration containing training and rollout settings.
-            data_queue: Queue for receiving input data.
+            data_queue_size (int): Size of the data queue.
             agent_loop_workers: List of agent loop worker instances.
             ps_manager_handle: Handle to the parameter server manager.
         """
@@ -42,7 +43,7 @@ class PSRL_AgentLoopManager:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
 
-        self.data_queue = data_queue
+        self.data_queue = asyncio.Queue(maxsize=data_queue_size)
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
 
@@ -89,11 +90,21 @@ class PSRL_AgentLoopManager:
             futures.append(worker.stop_busy_loop.remote())
         ray.get(futures)
 
+    async def put_data(self, data_ref: dict):
+        """Put objectref of data into the manager's data queue."""
+        await self.data_queue.put(data_ref)
+
+    async def get_data_ref(self) -> dict:
+        """Get data from the manager's data queue."""
+        data_ref = await self.data_queue.get()
+        return data_ref
+
     async def _dispatch_data(self):
         """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_busy_loop_task:
             if not self.data_queue.empty():
-                data = self.data_queue.get_nowait()
+                data_ref = await self.data_queue.get()
+                data = None if data_ref is None else await data_ref["data_ref"]
                 psrl_logger.debug(f"Got {len(data)} requests from data queue")
                 
                 # Receive END signal to stop processing data queue

@@ -165,15 +165,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             self.data_queue_size = 1 
             self.rollout_queue_size = self.config.gen_actor_rollout_ref.rollout.get("agent", {}).get("num_workers", 1)
-        self.data_queue = RayQueue(maxsize=self.data_queue_size)
-        self.rollout_queue = RayQueue(maxsize=self.rollout_queue_size)
 
         # Status queue is used to store the status of the rollout workers.
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
         self.status_queue = RayQueue()
 
         psrl_logger.debug("Initialized data_queue, rollout_queue, and status_queue with sizes: %d, %d, and unlimited respectively.",
-                         self.data_queue_size, self.data_queue_size)
+                         self.data_queue_size, self.rollout_queue_size)
 
     def _validate_config(self):
         config = self.config
@@ -385,7 +383,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
-            self.data_queue,
             collate_fn=self.collate_fn,
             process_mode=self.process_mode,
         )
@@ -429,7 +426,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Initialize the agent loop manager
         self.agent_loop_manager = ray.remote(PSRL_AgentLoopManager).remote(
             self.config,
-            self.data_queue,
+            self.data_queue_size,
             self.agent_loop_workers,
             self.ps_manager_handle,
         )
@@ -484,7 +481,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
-            self.rollout_queue,
+            self.rollout_queue_size,
             reward_fn=self.reward_fn,
             use_rm=self.use_rm,
         )
@@ -996,7 +993,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self.config,
                     self.ps_manager_handle,
                     self.rollout_wg_list,
-                    self.rollout_queue,
                 )
             )
         
@@ -1315,17 +1311,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self.init_agent_loop_manager()
 
-        ray.get(self.ps_manager_handle.set_agent_loop_manager.remote(self.agent_loop_manager))
-        ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         futures = []
+        futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
+        futures.append(self.ps_manager_handle.set_agent_loop_manager.remote(self.agent_loop_manager))
+        futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             futures.extend(self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator))
         ray.get(futures)
         
         self.init_reward_server()
-        ray.get(self.data_processor.set_reward_server.remote(self.reward_server))
-        ray.get(self.ps_manager_handle.set_reward_server.remote(self.reward_server))
-        
+        futures = []
+        futures.append(self.data_processor.set_reward_server.remote(self.reward_server))
+        futures.append(self.ps_manager_handle.set_reward_server.remote(self.reward_server))
+        for agent_loop_worker in self.agent_loop_workers:
+            futures.append(agent_loop_worker.set_reward_server.remote(self.reward_server))
+        ray.get(futures)
+
         # Start data pipeline
         # 1. Start data processor to handle data preprocessing and batching
         psrl_logger.info("Starting data processor...")
@@ -1386,7 +1387,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                         self.global_steps, len(batch) if batch is not None else 0)
                     else:
                         from verl.trainer.ppo.reward import compute_reward
-                        batch = self.data_queue.get()
+                        batch_ref = ray.get(self.agent_loop_manager_handle.get_data_ref.remote())
+                        batch = ray.get(batch_ref) if batch_ref is not None else None
+                        if batch is None:
+                            psrl_logger.info("No more data from agent loop manager, ending training at step %d", self.global_steps)
+                            break
                         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                         if "multi_modal_data" in batch.non_tensor_batch:

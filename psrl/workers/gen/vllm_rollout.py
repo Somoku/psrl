@@ -2,7 +2,7 @@ import logging
 import os
 import uuid
 import asyncio
-
+import torch
 import numpy as np
 from contextlib import contextmanager
 from copy import deepcopy
@@ -10,10 +10,6 @@ from collections.abc import Sequence
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from typing import Any, Dict, Optional, Union, List, Tuple, cast
-
-import torch
-import torch.distributed
-from torch.distributed.device_mesh import DeviceMesh
 
 from vllm import LLM, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -32,21 +28,16 @@ from psrl.utils.logger import deprecated
 from psrl.workers.gen import StatCollector
 from psrl.utils.dataset.utils import _pre_process_inputs
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
-    if isinstance(value, torch.Tensor):
-        return value.repeat_interleave(repeats, dim=0)
-    else:
-        return np.repeat(value, repeats, axis=0)
 
 class PSRL_vLLMRollout:
     def __init__(
         self,
         config: RolloutConfig,
         model_config: HFModelConfig,
-        device_mesh: DeviceMesh,
         **kwargs,
     ):
         """
@@ -65,7 +56,6 @@ class PSRL_vLLMRollout:
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
         model_parallel_size = tensor_parallel_size * pipeline_parallel_size
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         assert pipeline_parallel_size == 1 or config.mode == "psrl_async", "pipeline parallel is only supported in psrl_async mode"
         
         # For async engine and model parallel, we only run the inference engine on the first rank.

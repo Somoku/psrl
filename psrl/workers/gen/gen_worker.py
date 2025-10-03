@@ -3,21 +3,19 @@ import queue
 import asyncio
 import threading
 import logging
+import torch
+import ray
 import numpy as np
+import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
 from dataclasses import dataclass
-from typing import Any, Callable, ClassVar, Optional, Union, List
+from typing import Any, Optional, List
 from collections import deque, defaultdict
 from transformers import AutoConfig
-
-import torch
-import torch.distributed as dist
+from ray.util.queue import Queue as RayQueue
 from torch.distributed.tensor import DTensor
 from torch.distributed.device_mesh import init_device_mesh
 from torch.multiprocessing.reductions import reduce_tensor
-
-import ray
-from ray.util.queue import Queue as RayQueue
 
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -28,18 +26,16 @@ from verl.utils.fs import copy_to_local
 from verl.utils.model import get_generation_config, update_model_config
 from verl.utils.debug import log_gpu_memory_usage
 
-from psrl.utils.ray import RayLock, AsyncRayLock
-from psrl.utils.server.command import CommandType, Command
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, log_begin_event, log_end_event, deprecated, EventType
-from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import NIXLInterface
 from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.ps.request_status_tracker import RequestStatus
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 @dataclass
 class GenInterface:
@@ -47,6 +43,7 @@ class GenInterface:
     rollout_instance_id: int
     ps_manager_handle: ray.actor.ActorHandle
     status_queue: RayQueue
+
 
 class PSRL_GenWorker(Worker):
 
@@ -373,23 +370,23 @@ class PSRL_GenWorker(Worker):
         Build the rollout engine and sharding manager for the PSRL GenWorker.
         NOTE: This method only supports building for one rollout instance at a time.
         """
-        from torch.distributed.device_mesh import init_device_mesh
-
-        self._build_distributed()
-        
+        rollout_name = self.config.rollout.name
+        assert rollout_name == "vllm", "Only support vLLM rollout for now"
         rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         self.model_config = model_config
-
         tp = self.config.rollout.get("tensor_model_parallel_size", 1)
         pp = self.config.rollout.get("pipeline_model_parallel_size", 1)
         assert self.world_size == tp * pp, "Only support dp=1 for now"
-        
-        self.rollout_device_mesh = init_device_mesh(
-            get_device_name(), mesh_shape=(1, pp, tp), mesh_dim_names=["dp", "pp", "infer_tp"]
-        )
-        rollout_name = self.config.rollout.name
-        assert rollout_name == "vllm", "Only support vLLM rollout for now"
+
+        if self.config.rollout.mode == "sync":
+            self._build_distributed()
+        elif self.config.rollout.mode == "psrl_async":
+            # NOTE(lhy): No need to build distributed for psrl_async mode
+            # vllm will handle the distributed communication internally
+            pass
+        else:
+            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
         
         # Build the rollout engine
         log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=psrl_logger)
@@ -421,8 +418,11 @@ class PSRL_GenWorker(Worker):
 
         psrl_logger.info(f"Building {rollout_name} rollout with seed {self.seed}.")
         rollout = PSRL_vLLMRollout(
-            config=rollout_config, model_config=model_config, device_mesh=self.rollout_device_mesh,
-            seed=self.seed, status_queue=self.gen_interface.status_queue, instance_id=self.get_instance_id(),
+            config=rollout_config, 
+            model_config=model_config,
+            seed=self.seed, 
+            status_queue=self.gen_interface.status_queue, 
+            instance_id=self.get_instance_id(),
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
         
@@ -1153,6 +1153,8 @@ class PSRL_GenWorker(Worker):
             if needed_model_version != model_version:
                 psrl_logger.warning(f"Update version_tag of request {request.non_tensor_batch['uid'][0]} "
                                     f"from {needed_model_version} to {model_version} due to inconsistent model pull")
+                # Update version tag in staleness inventory
+                await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(request_ids[0], model_version)
             request.non_tensor_batch["version_tag"] = np.array([model_version], dtype=int)
 
         update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
@@ -1163,7 +1165,6 @@ class PSRL_GenWorker(Worker):
         )
         if update_status_success[0]:
             # Prepare the request for generation
-            request = request.to(get_torch_device().current_device())
             meta_info = {
                 "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
                 "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
@@ -1250,7 +1251,6 @@ class PSRL_GenWorker(Worker):
             if filtered_request_idxs:
                 filtered_requests = requests[filtered_request_idxs]
                 # Prepare the request for generation
-                filtered_requests = filtered_requests.to(get_torch_device().current_device())
                 meta_info = {
                     "eos_token_id": self.generation_config.eos_token_id if self.generation_config is not None else self.tokenizer.eos_token_id,
                     "pad_token_id": self.generation_config.pad_token_id if self.generation_config is not None else self.tokenizer.pad_token_id,
@@ -1276,7 +1276,7 @@ class PSRL_GenWorker(Worker):
                     ))
                     filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                     if filtered_request_idxs:
-                        filtered_requests = requests[filtered_request_idxs]
+                        filtered_requests = filtered_requests[filtered_request_idxs]
                         filtered_result = [vllm_outputs[i] for i in filtered_request_idxs]
                         # NOTE(lhy): The DataProto will be huge and slow to transfer using ray, so we postprocess the data inside the vllm rollout
                         if consolidate:

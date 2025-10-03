@@ -329,26 +329,40 @@ class RolloutRouter:
             # evenly dispatch to rollout workers
             futures = []
             with log_dual_events(f"Dispatching {len(requests)} requests to {self.rollout_wg_size} rollout workers evenly and generate in batch", psrl_logger, event_type=EventType.GEN):
+                filtered_requests_list = []
                 if "rollout_instance_id" in requests.non_tensor_batch:
                     rollout_instance_ids = set(requests.non_tensor_batch["rollout_instance_id"].tolist())
-                    instance_to_requests = {}
-                    filtered_requests_list = []
                     for instance_id in rollout_instance_ids:
                         filtered_requests = requests.select_idxs(
                             [i for i, rid in enumerate(requests.non_tensor_batch["rollout_instance_id"]) if rid == instance_id]
                         )
                         filtered_requests_list.append(filtered_requests)
-                        futures.append(
-                            self.rollout_wg_list[instance_id].execute_all_async("generate", filtered_requests)[0]
-                        )
                 else:
                     filtered_requests_list = requests.chunk(self.rollout_wg_size)
                     for i, filtered_requests in enumerate(filtered_requests_list):
                         filtered_requests.non_tensor_batch["rollout_instance_id"] = np.array([i] * len(filtered_requests), dtype=int)
-                        psrl_logger.debug(f"Dispatching requests to rollout worker {i} with request ids: {filtered_requests.non_tensor_batch['uid']}")
-                        futures.append(
-                            self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)[0]
-                        )
+                # Reserve data in staleness buffer
+                for filtered_requests in filtered_requests_list:
+                    if self.rollout_n > 1:
+                        parent_ids = np.unique(filtered_requests.non_tensor_batch["parent_id"]).tolist()
+                        ray.get(self.ps_manager_handle.reserve_rollout_instance_requests.remote(
+                            rollout_instance_ids=filtered_requests.non_tensor_batch["rollout_instance_id"].tolist(),
+                            request_ids=filtered_requests.non_tensor_batch["uid"].tolist(),
+                            model_versions=filtered_requests.non_tensor_batch["version_tag"].tolist(),
+                            parent_ids=parent_ids,
+                        ))
+                    else:
+                        ray.get(self.ps_manager_handle.reserve_rollout_instance_requests.remote(
+                            rollout_instance_ids=filtered_requests.non_tensor_batch["rollout_instance_id"].tolist(),
+                            request_ids=filtered_requests.non_tensor_batch["uid"].tolist(),
+                            model_versions=filtered_requests.non_tensor_batch["version_tag"].tolist(),
+                        ))
+
+                for i, filtered_requests in enumerate(filtered_requests_list):
+                    psrl_logger.debug(f"Dispatching requests to rollout worker {i} with request ids: {filtered_requests.non_tensor_batch['uid']}")
+                    futures.append(
+                        self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)[0]
+                    )
                 rollout_results = ray.get(futures)
             # Process results as needed
             with log_dual_events(f"Concatenating results from {self.rollout_wg_size} rollout workers", psrl_logger, event_type=EventType.OTHER):
@@ -407,6 +421,20 @@ class RolloutRouter:
                 gen_worker_idx = self._choose_gen_worker(request)
             needed_model_version = request.non_tensor_batch["version_tag"][0]
             request.non_tensor_batch["rollout_instance_id"] = np.array([gen_worker_idx], dtype=int)
+            # Reserve data in staleness buffer
+            if self.rollout_n > 1:
+                await self.ps_manager_handle.reserve_rollout_instance_requests.remote(
+                    rollout_instance_ids=gen_worker_idx,
+                    request_ids=request_id,
+                    model_versions=needed_model_version,
+                    parent_ids=request.non_tensor_batch["parent_id"][0],
+                )
+            else:
+                await self.ps_manager_handle.reserve_rollout_instance_requests.remote(
+                    rollout_instance_ids=gen_worker_idx,
+                    request_ids=request_id,
+                    model_versions=needed_model_version,
+                )
             # NOTE(linsh): we use push/pop task to manage the lifecycle of the request in case of interruption
             if self.rank_0_is_model_owner:
                 await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("push_task", request_id, needed_model_version)

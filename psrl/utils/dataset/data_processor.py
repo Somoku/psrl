@@ -38,7 +38,6 @@ class DataProcessor:
         tokenizer,
         processor,
         ps_manager_handle,
-        data_queue,
         collate_fn=None,
         process_mode="batch",
     ):
@@ -74,7 +73,6 @@ class DataProcessor:
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
         self.reward_server_handle = None # Will be set by the ray trainer
-        self.data_queue = data_queue
         
         self.process_mode = process_mode
         if self.config.psrl.redundant_rollout.enable:
@@ -100,6 +98,9 @@ class DataProcessor:
         
     def set_reward_server(self, reward_server_handle: ray.actor.ActorHandle):
         self.reward_server_handle = reward_server_handle
+
+    def set_agent_loop_manager(self, agent_loop_manager_handle: ray.actor.ActorHandle):
+        self.agent_loop_manager_handle = agent_loop_manager_handle
 
     # ------- Dataset and Dataloader Building Methods -------
     def build_train_and_val_dataset(self) -> None:
@@ -393,13 +394,14 @@ class DataProcessor:
                         ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
                         ))
-                        self.data_queue.put(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
-                        # psrl_logger.debug(f"Put requests with uids {gen_batch.non_tensor_batch['uid'][sample_idx: (sample_idx + self.rollout_n)].tolist()} to data queue")
+                        data_ref =ray.put(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
+                        self.agent_loop_manager_handle.put_data.remote({"data_ref": data_ref})
                 else:
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))
-                    self.data_queue.put(gen_batch)
-                
+                    data_ref = ray.put(gen_batch)
+                    self.agent_loop_manager_handle.put_data.remote({"data_ref": data_ref})
+
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:
                     self.stop_data_process = True
@@ -416,4 +418,4 @@ class DataProcessor:
         
         # Signal end of data processing
         psrl_logger.info("Data processing stopped, sending shutdown signal.")
-        self.data_queue.put(None)
+        self.agent_loop_manager_handle.put_data.remote({"data_ref": None})

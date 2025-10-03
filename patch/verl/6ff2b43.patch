@@ -282,6 +282,53 @@ index 30e32524..64ad17e9 100644
          "CUDA_DEVICE_MAX_CONNECTIONS": "1",
          # To prevent hanging or crash during synchronization of weights between actor and rollout
          # in disaggregated mode. See:
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index 85ced07f..7d5f5f70 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -971,7 +971,7 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
+         inspect.signature(parallel_state.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
+     )
+     extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": vp_stage}
+-    if not parallel_state.is_inside_encoder():
++    if hasattr(parallel_state, "is_inside_encoder") and not parallel_state.is_inside_encoder():
+         pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
+         if pp_decoder_start is not None:
+             pipeline_rank = pipeline_rank - pp_decoder_start
+diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
+index 40e823a5..a4a63896 100644
+--- a/verl/workers/actor/megatron_actor.py
++++ b/verl/workers/actor/megatron_actor.py
+@@ -316,6 +316,13 @@ class MegatronPPOActor(BasePPOActor):
+         ]
+         if self.config.use_kl_loss:
+             select_keys.append("ref_log_prob")
++        if self.config.tis_imp_ratio_cap > 0:
++            assert "rollout_log_probs" in data.batch.keys(), (
++                "Truncated Importance Sampling (TIS) requires to configure "
++                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
++                "and is not currently supported in Server mode (agent loop)."
++            )
++            select_keys.append("rollout_log_probs")
+         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+         if self.has_multi_modal_inputs:
+             data = data.select(select_keys, ["multi_modal_inputs"])
+@@ -426,6 +433,7 @@ class MegatronPPOActor(BasePPOActor):
+             stats = {}
+             if not forward_only:
+                 old_log_prob = data["old_log_probs"]
++                rollout_log_probs = data["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
+                 advantages = data["advantages"]
+ 
+                 entropy_coeff = self.config.entropy_coeff
+@@ -441,6 +449,7 @@ class MegatronPPOActor(BasePPOActor):
+                     response_mask=response_mask,
+                     loss_agg_mode=loss_agg_mode,
+                     config=self.config,
++                    rollout_log_probs=rollout_log_probs,
+                 )
+ 
+                 stats.update(
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
 index 795e79d2..cd74700a 100644
 --- a/verl/workers/fsdp_workers.py
@@ -682,4 +729,3 @@ index 19f6ee80..dffbb120 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          override_transformer_config = OmegaConf.to_container(
              OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
-

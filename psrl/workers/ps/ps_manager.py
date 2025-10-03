@@ -103,9 +103,17 @@ class PSManager(RequestStatusTracker):
         self.max_ready_buffer_id = -1
 
         # Initialize the staleness inventory
-        entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.alg_rollout_n
+        # TODO(linsh): validate the redundant rollout cases
+        if self.psrl_config.redundant_rollout.enable:
+            entries_per_buffer = self.psrl_config.redundant_rollout.redundant_global_batch_size * self.rollout_n
+            ready_entries_per_buffer = self.psrl_config.redundant_rollout.alg_global_batch_size * self.alg_rollout_n
+        else:
+            entries_per_buffer = self.psrl_config.staleness_buffer_entries * self.rollout_n
+            ready_entries_per_buffer = entries_per_buffer
+
         self.staleness_inventory = StalenessInventory(
             num_entries=entries_per_buffer,
+            ready_num_entries=ready_entries_per_buffer,
             staleness=self.psrl_config.staleness,
             buffer_post_process_fn=self.buffer_post_process_fn,
         )
@@ -171,6 +179,8 @@ class PSManager(RequestStatusTracker):
         
         if not processed_group_data:
             psrl_logger.info(f"Post-processing function returned empty data for parent {parent_id}. Retrying later.")
+            # Clear the reserved entries for the group
+            self.staleness_inventory.clear_reserved_entries(entry_infos)
             pending_buffers = self.staleness_inventory._buffer_ids_by_status[BufferStatus.PENDING]
             candidate_ids = list(pending_buffers)
             if not candidate_ids:
@@ -213,15 +223,25 @@ class PSManager(RequestStatusTracker):
             if parent_id not in self.rollout_request_tracker.keys():
                 filter_parent_ids.append(parent_id)
         return filter_parent_ids
-        
-    def reserve_rollout_instance_request(
+
+    def update_request_version_tag(
         self,
-        rollout_instance_id: Union[str, int],
         request_id: Union[str, int],
-        model_version: int,
-        reserve_num: int = 1,
-        by_parent: bool = False,
-    ) -> Tuple[Optional[int], Optional[int]]:
+        new_version_tag: int,
+    ):
+        """Update the version tag of a specific request in the staleness inventory."""
+        self.staleness_inventory.update_request_version_tag(
+            request_id=request_id,
+            new_version_tag=new_version_tag,
+        )
+
+    def reserve_rollout_instance_requests(
+        self,
+        rollout_instance_ids: Union[str, int, List[Union[str, int]]],
+        request_ids: Union[str, int, List[Union[str, int]]],
+        model_versions: Union[int, List[int]],
+        parent_ids: Optional[Union[bool, List[bool]]] = None,
+    ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
         """
         Reserve a request for a specific rollout instance.
         
@@ -231,38 +251,43 @@ class PSManager(RequestStatusTracker):
         Note that the request will be ignored if the group entries have been reserved.
         
         Args:
-            rollout_instance_id (Union[str, int]): The rollout instance id
-            request_id (Union[str, int]): The request id
-            model_version (int): The model version
-            reserve_num (int): The number of entries to reserve (for group sampling)
-            by_parent (bool): Whether to reserve entries by parent request
+            rollout_instance_ids (Union[str, int, List[Union[str, int]]]): The rollout instance ids
+            request_ids (Union[str, int, List[Union[str, int]]]): The request ids
+            model_versions (Union[int, List[int]]): The model versions
+            parent_ids (Optional[Union[bool, List[bool]]]): Whether to reserve entries by parent request
             
         Returns:
-            Tuple[Optional[int], Optional[int]]: The buffer id and entry id
+            Tuple[Optional[List[int]], Optional[List[int]]]: A tuple containing two lists:
+                - List of reserved buffer ids
+                - List of reserved entry ids
+            If reservation fails, returns (None, None).
         """
-        assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
-        if not by_parent:
-            assert reserve_num == 1, "Non-group sampling should reserve one entry per request."
-        else:
-            assert reserve_num == self.rollout_n, "Group sampling should reserve `rollout_n` entries per parent request."
+        if not isinstance(rollout_instance_ids, list):
+            rollout_instance_ids = [rollout_instance_ids]
+        if not isinstance(request_ids, list):
+            request_ids = [request_ids]
+        if not isinstance(model_versions, list):
+            model_versions = [model_versions]
+        if not isinstance(parent_ids, list):
+            parent_ids = [parent_ids]
+        
+        for rollout_instance_id in rollout_instance_ids:
+            assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
+        
+        if parent_ids:
+            assert len(request_ids) == 1 or len(parent_ids) * self.rollout_n == len(request_ids), \
+                f"Length of parent_ids {len(parent_ids)} * rollout_n {self.rollout_n} must equal length of request_ids {len(request_ids)}."
         
         # Initialize the reserved entry and buffer ids
         entry_ids = []
         buffer_ids = []
-        max_staleness_buffer_id = model_version + self.psrl_config.staleness
-        if by_parent:
-            # Group Sampling
-            parent_id = request_id
-            reserve_ids = [parent_id * self.rollout_n + i for i in range(self.rollout_n)]
-            self.rollout_request_tracker.setdefault(parent_id, [])
-        else:
-            reserve_ids = [request_id]
-        for reserve_id in reserve_ids:
+        for rollout_instance_id, request_id, model_version in zip(rollout_instance_ids, request_ids, model_versions):
+            max_staleness_buffer_id = model_version + self.psrl_config.staleness
             # Create an entry in the staleness inventory
             # note that model_version may be a future version of the current rollout instance
             entry_info = EntryInfo(
                 rollout_instance_id=rollout_instance_id,
-                request_id=reserve_id,
+                request_id=request_id,
                 model_version=model_version
             )
         
@@ -270,12 +295,17 @@ class PSManager(RequestStatusTracker):
                 entry_info=entry_info,
                 max_staleness_buffer_id=max_staleness_buffer_id
             )
+            # TODO(lhy): better handle the case where the staleness inventory is full
+            if buffer_id is None or entry_id is None:
+                raise RuntimeError(f"Failed to reserve entry for request {request_id} in rollout instance {rollout_instance_id} "
+                                   f"with model version {model_version}. "
+                                   f"Please check if the staleness inventory is full or the model version is too old.")
+            
             entry_ids.append(entry_id)
             buffer_ids.append(buffer_id)
-        
-        # TODO(lhy): better handle the case where the staleness inventory is full
-        if buffer_ids is None or entry_ids is None:
-            pass
+                
+        for parent_id in parent_ids:
+            self.rollout_request_tracker.setdefault(parent_id, [])
         
         return buffer_ids, entry_ids
 
@@ -301,7 +331,9 @@ class PSManager(RequestStatusTracker):
                 # Abort requests with version_tag equal to `min_ready_buffer_id - S`
                 version_to_abort = max_ready_buffer_id - self.psrl_config.staleness
                 psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")
-                self.abort_requests_of_version(version_to_abort)
+                abort_request_ids = self.abort_requests_of_version(version_to_abort)
+                # Clear the reserved entries for the aborted requests
+                self.staleness_inventory.clear_reserved_entries(abort_request_ids)
                 psrl_logger.debug(f"Abort requests of version {version_to_abort} done")
             
             # Notify the rollout server to check interruption
@@ -381,7 +413,7 @@ class PSManager(RequestStatusTracker):
         # Remove the request from the training ready requests in the request status manager
         self.remove_train_ready_request(request_id)
         
-        self.staleness_inventory.occupy_data(
+        self.staleness_inventory.occupy_data_with_reserve(
             entry_info=entry_info,
             data=data
         )
@@ -449,22 +481,25 @@ class PSManager(RequestStatusTracker):
                 if abort_child_ids:
                     psrl_logger.debug(f"Aborting child requests {abort_child_ids} for parent request {parent_id}.")
                     self.abort_requests(list(abort_child_ids))
+                    # Clear the reserved entries for the aborted requests
+                    abort_entries = [entry_info for entry_info in entry_infos if hash(entry_info) in abort_child_ids]
+                    self.staleness_inventory.clear_reserved_entries(abort_entries)
                     psrl_logger.debug(f"Successfully aborted {len(abort_child_ids)} child requests")
 
-                reserve_data = True
+                occupy_group_data = True
                 if self.group_post_process_fn:
-                    reserve_data = self._group_post_process(parent_id, entry_infos)
+                    occupy_group_data = self._group_post_process(parent_id, entry_infos)
 
-                if reserve_data:
+                if occupy_group_data:
                     psrl_logger.debug(f"Occupying data for {len(entry_infos)} entry_infos")
                     for i, entry_info in enumerate(entry_infos):
                         psrl_logger.debug(f"Occupying data for entry_info {i+1}/{len(entry_infos)}: {entry_info}")
-                        self.staleness_inventory.occupy_data(entry_info=entry_info)
+                        self.staleness_inventory.occupy_data_with_reserve(entry_info=entry_info)
                 
                     self.try_awake_waiters()
         else:
             # Directly occupy data, bypassing storing process
-            self.staleness_inventory.occupy_data(
+            self.staleness_inventory.occupy_data_with_reserve(
                 entry_info=entry_info,
                 data=data,
             )

@@ -3,6 +3,7 @@ import logging
 import torch
 import ray
 import numpy as np
+from queue import Queue
 from typing import Dict, List
 from threading import Thread
 from tensordict import TensorDict
@@ -28,7 +29,7 @@ class RewardServer(CommandExtension):
         tokenizer,
         processor,
         ps_manager_handle,
-        rollout_queue,
+        rollout_queue_size,
         reward_fn=None,
         use_rm=False,
     ):
@@ -43,7 +44,7 @@ class RewardServer(CommandExtension):
             tokenizer: Tokenizer for processing text data and converting tokens
             processor: Processor for processing multi-modal data
             ps_manager_handle: Handle to the parameter server for status updates and communication
-            rollout_queue: Queue for receiving rollout data from agent loop workers
+            rollout_queue_size: Size of the queue for receiving rollout data from agent loop workers
             reward_fn (optional): Custom function for computing rewards. Defaults to None
             use_rm (bool): Whether to use a reward model for computing rewards. Defaults to False
         """
@@ -62,7 +63,7 @@ class RewardServer(CommandExtension):
             f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
 
         # Queues for data transfer between workers
-        self.rollout_queue = rollout_queue
+        self.rollout_queue = Queue(maxsize=rollout_queue_size)
         
         # Server state management
         self.server_running = False
@@ -290,7 +291,18 @@ class RewardServer(CommandExtension):
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-    
+
+    def put_data(self, data_ref: dict):
+        """Put objectref of rollout data into the reward server's processing queue.
+        
+        This method is used by agent loop workers to send generated rollout data
+        to the reward server for reward computation.
+        
+        Args:
+            data_ref (dict): Dictionary containing a reference to the rollout DataProto.
+        """
+        self.rollout_queue.put(data_ref)
+
     def _background_event_handler(self):
         """
         Background event handler for processing commands and rollout data.
@@ -382,7 +394,8 @@ class RewardServer(CommandExtension):
             # Data processing
             # Process requests in the rollout queue
             if not self.rollout_queue.empty() and not self.reward_paused and not self.skipping_rollout_queue:
-                rollout_data = self.rollout_queue.get()
+                rollout_data_ref = self.rollout_queue.get_nowait()
+                rollout_data = ray.get(rollout_data_ref["data_ref"])
                 
                 with log_dual_events("Process rollout data", psrl_logger, event_type=EventType.OTHER):
                     assert rollout_data is not None, "Data from rollout queue should not be None"

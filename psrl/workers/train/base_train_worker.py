@@ -122,10 +122,10 @@ class PSRL_BaseTrainWorker(ABC):
                 futures = []
                 for key, target_client_name, shards_to_transfer in wait_operations:
                     self.nixl_storage_client.wait(key, f"train_push_{next_ps_model_version}", "WRITE", target_client=target_client_name)
-                    psrl_logger.trace(f"Wait completed for key {key} to target {target_client_name}")
+                    psrl_logger.debug(f"Wait completed for key {key} to target {target_client_name}")
                     ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
                     futures.append(ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer))
-                    psrl_logger.trace(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
+                    psrl_logger.debug(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
                 psrl_logger.debug(f"[NIXL thread]: Wait NIXL xfers done, start to wait for {len(futures)} train to gen transfers on the PS...")
                 ray.get(futures)
                 psrl_logger.debug(f"[NIXL thread]: Starting to push model tag to the PS...")

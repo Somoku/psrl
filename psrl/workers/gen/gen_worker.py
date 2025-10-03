@@ -1131,6 +1131,8 @@ class PSRL_GenWorker(Worker):
             if needed_model_version != model_version:
                 psrl_logger.warning(f"Update version_tag of request {request.non_tensor_batch['uid'][0]} "
                                     f"from {needed_model_version} to {model_version} due to inconsistent model pull")
+                # Update version tag in staleness inventory
+                await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(request_ids[0], model_version)
             request.non_tensor_batch["version_tag"] = np.array([model_version], dtype=int)
 
         update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(

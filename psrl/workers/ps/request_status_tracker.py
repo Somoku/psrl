@@ -495,8 +495,8 @@ class RequestStatusTracker:
             set[int]: A set of requests that are dispatched to the specified instance.
         """
         return {info for req_id, info in self._request_infos.items() if info.rollout_instance_id == instance_id}
-    
-    def abort_requests_of_version(self, version: int):
+
+    def abort_requests_of_version(self, version: int) -> list[int]:
         """
         Abort all requests associated with a specific version.
         This method will collect all request IDs that match the specified version
@@ -505,6 +505,8 @@ class RequestStatusTracker:
         
         Args:
             version (int): The version to abort requests for.
+        Returns:
+            list[int]: A list of request IDs that were aborted.
         """
         assert version >= 0, "Version must be a non-negative integer."
 
@@ -517,6 +519,7 @@ class RequestStatusTracker:
         if abort_request_ids:
             psrl_logger.debug(f"Aborting requests of version {version}: {abort_request_ids}")
             self.abort_requests(list(abort_request_ids), blocking=False)
+        return list(abort_request_ids)
 
     def update_request_version(self, request_id: Union[List[int], int], new_version: int):
         """

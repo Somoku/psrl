@@ -192,10 +192,10 @@ class PSRL_AgentLoopWorker:
         
         with log_dual_events(f"Agent loop with {len(requests)} requests", psrl_logger, event_type=EventType.GEN):
             output = await agent_loop.run(requests)
-            assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
         psrl_logger.debug(f"Agent loop {agent_name} completed for requests: {requests.non_tensor_batch['uid']}")
         
         if output is not None:
+            assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
             request_ids = requests.non_tensor_batch["uid"]
             with log_dual_events("Update request status", psrl_logger, event_type=EventType.OTHER):
                 update_status_success = await self.ps_manager_handle.update_request_status.remote(

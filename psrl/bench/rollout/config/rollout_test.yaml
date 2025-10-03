@@ -1,0 +1,80 @@
+# PSRL configuration for simplified rollout testing
+psrl:
+  gen_mode: batch
+  logging_path: ./rollout_test_logs
+  # Compatible with data_processor.py
+  redundant_rollout:
+    enable: true
+    redundant_global_batch_size: ${rollout_test.batch_size}
+    redundant_rollout_n: 1
+    alg_rollout_n: 1
+  deployment:
+    n_rollout_instances: 1
+
+model:
+  path: ~/models/Qwen2.5-Math-7B
+  trust_remote_code: false
+  override_config:
+    model_config: {}
+    moe_config:
+      freeze_moe_router: false
+  use_fused_kernels: false
+  use_remove_padding: false
+
+# Generation model configuration
+rollout:
+  temperature: 0.0
+  top_p: 1.0
+  top_k: -1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  dtype: bfloat16
+  gpu_memory_utilization: 0.95
+  max_model_len: 8192
+  max_num_seqs: 512
+  max_num_batched_tokens: 4096
+  enable_chunked_prefill: false
+  enable_prefix_caching: false
+  nccl_timeout: 600
+  load_format: auto
+  interrupt_as_prompt: false
+  status_collection: false
+  disable_log_stats: false  # Enable stats collection
+  ignore_eos: false  # Disable EOS token will force max length generation
+
+# Data configuration
+data:
+  tokenizer: null
+  train_files: null
+  val_files: null
+  prompt_key: prompt
+  truncation: left
+  max_prompt_length: 2048
+  max_response_length: 8192
+  train_batch_size: ${rollout_test.batch_size}
+  val_batch_size: ${rollout_test.batch_size}
+  shuffle: false
+  validation_shuffle: false
+  trust_remote_code: false
+  reward_fn_key: data_source
+  use_shm: true
+
+trainer:
+  total_epochs: 1
+  total_training_steps: null
+
+# Rollout test specific configuration
+rollout_test:
+  batch_size: 32
+  num_iterations: 10
+  warmup_iterations: 2
+  mode: synthetic  # "synthetic" or "real_data"
+  profile_logs_dir: ./profile_logs
+  profile_log_file: profile
+
+# Ray configuration
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null
+

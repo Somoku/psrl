@@ -359,6 +359,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.colocate:
             assert self.config.psrl.gen_mode == "batch", "gen_mode must be batch when using colocate mode"
             assert self.config.psrl.staleness == 0, "staleness must be 0 when using colocate mode"
+            
+        # Check rollout mode
+        if self.config.psrl.gen_mode == "batch":
+            assert self.config.gen_actor_rollout_ref.rollout.mode == "sync", "rollout mode must be sync when using batch mode"
+        elif self.config.psrl.gen_mode == "stream":
+            assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", "rollout mode must be async when using stream mode"
+        else:
+            raise ValueError(f"Invalid gen_mode: {self.config.psrl.gen_mode}, must be one of ['batch', 'stream']")
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -802,6 +810,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             gen_interface = GenInterface(
                 rollout_instance_id=i,
                 ps_manager_handle=self.ps_manager_handle,
+                status_queue=self.status_queue,
             )
             rollout_config = self.config.gen_actor_rollout_ref
             if self.config.psrl.deployment.heterogeneous_rollout.enable:
@@ -815,7 +824,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 psrl_config=self.config.psrl,
                 gen_interface=gen_interface,
                 nixl_interface=nixl_interface,
-                status_queue=self.status_queue,
             )
             rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
             self.resource_pool_to_cls[rollout_resource_pool][f"rollout_{i}"] = rollout_cls  
@@ -1485,7 +1493,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
                     batch.batch.pop("recomputed_log_probs")
                 elif self.config.psrl.log_prob.mode == "tis":
-                    raise NotImplementedError("TIS is not supported in PSRL yet")
+                    batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
+                    batch.batch.pop("recomputed_log_probs")
                 else:
                     raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}")
 

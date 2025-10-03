@@ -30,7 +30,7 @@ from verl.utils.debug import log_gpu_memory_usage
 
 from psrl.utils.ray import RayLock, AsyncRayLock
 from psrl.utils.server.command import CommandType, Command
-from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, deprecated, EventType
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_dual_events, log_single_event, log_begin_event, log_end_event, deprecated, EventType
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import NIXLInterface
@@ -46,6 +46,7 @@ class GenInterface:
     """Info for the PSRL GenWorker."""
     rollout_instance_id: int
     ps_manager_handle: ray.actor.ActorHandle
+    status_queue: RayQueue
 
 class PSRL_GenWorker(Worker):
 
@@ -115,7 +116,6 @@ class PSRL_GenWorker(Worker):
         psrl_config: DictConfig,
         gen_interface: GenInterface,
         nixl_interface: NIXLInterface,
-        status_queue: RayQueue, 
         **kwargs,
     ) -> None:
         """
@@ -135,8 +135,12 @@ class PSRL_GenWorker(Worker):
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
         self.nixl_interface = nixl_interface
-        self.status_queue = status_queue
         self.instance_dist_group = None
+        
+        if self.psrl_config.redundant_rollout.enable:
+            self.avg_max_active_tasks_len = self.psrl_config.redundant_rollout.redundant_global_batch_size * self.psrl_config.redundant_rollout.redundant_rollout_n // self.psrl_config.deployment.n_rollout_instances
+        else:
+            self.avg_max_active_tasks_len = self.psrl_config.staleness_buffer_entries * self.psrl_config.rollout_n // self.psrl_config.deployment.n_rollout_instances
 
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0
@@ -418,7 +422,7 @@ class PSRL_GenWorker(Worker):
         psrl_logger.info(f"Building {rollout_name} rollout with seed {self.seed}.")
         rollout = PSRL_vLLMRollout(
             config=rollout_config, model_config=model_config, device_mesh=self.rollout_device_mesh,
-            seed=self.seed, status_queue=self.status_queue, instance_id=self.get_instance_id(),
+            seed=self.seed, status_queue=self.gen_interface.status_queue, instance_id=self.get_instance_id(),
         )
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
         
@@ -428,6 +432,22 @@ class PSRL_GenWorker(Worker):
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             self.rollout = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+    
+    def log_active_tasks(self, task_added: bool = False, task_done: bool = False):
+        """
+        Log the active tasks.
+        """
+        assert task_added ^ task_done, "Exactly one of task_added or task_done must be True"
+        active_tasks_len = len(self.active_tasks)
+        psrl_logger.debug(f"Active tasks: {active_tasks_len}")
+        if task_added and active_tasks_len == 1:
+            log_begin_event(f"Core generation with model version {self.current_executing_version}", psrl_logger, event_type=EventType.GEN)
+        if task_done and active_tasks_len == 0:
+            log_end_event(f"Core generation with model version {self.current_executing_version}", psrl_logger, event_type=EventType.GEN)
+        if active_tasks_len == self.avg_max_active_tasks_len:
+            log_single_event(f"Full utilization (active tasks: {active_tasks_len})", psrl_logger, event_type=EventType.OTHER)
+        if active_tasks_len == self.avg_max_active_tasks_len // 8:
+            log_single_event(f"Bad utilization (active tasks: {active_tasks_len})", psrl_logger, event_type=EventType.OTHER)
     
     def ray_pull_model(self) -> None:
         """
@@ -1098,6 +1118,7 @@ class PSRL_GenWorker(Worker):
             self.request_id_to_active_tasks[request_id].discard(task)
             self.version_to_active_tasks[require_version].discard(task)
             self.active_tasks.discard(task)
+            self.log_active_tasks(task_done=True)
         return task_done_callback
 
     async def _generate_async_task(self, request: DataProto, needed_model_version: int, consolidate: bool = True):
@@ -1151,7 +1172,7 @@ class PSRL_GenWorker(Worker):
             request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id] * len(request.batch))
         
             # Start the generation
-            with log_dual_events(f"Core generation with model version {self.curr_rollout_instance_model_version}", psrl_logger, event_type=EventType.GEN):
+            with log_dual_events(f"Core generation with model version {self.curr_rollout_instance_model_version}", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
                 vllm_outputs = await self.rollout.raw_generate_sequences_async(request)
 
             vllm_output = vllm_outputs[0][1] if isinstance(vllm_outputs, list) else vllm_outputs[1]
@@ -1322,6 +1343,7 @@ class PSRL_GenWorker(Worker):
         self.version_to_active_tasks[needed_model_version].add(task)
         self.request_id_to_active_tasks[request_id].add(task)
         self.active_tasks.add(task)
+        self.log_active_tasks(task_added=True)
         task.add_done_callback(self._create_task_done_callback(
             int(request.non_tensor_batch["uid"][0]),
             needed_model_version,

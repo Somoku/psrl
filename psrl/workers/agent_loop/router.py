@@ -57,7 +57,7 @@ class RolloutRouter:
         
         # Engine status tracking
         # NOTE: The engine status will be updated by RolloutCoordinator
-        # and can be accessed via get_engine_status() method
+        # and can be accessed via get_engine_status() method from agent loop worker
         self.latest_engine_status = {}
         self.status_changed = False
         
@@ -95,6 +95,8 @@ class RolloutRouter:
         Args:
             engine_status (dict): Latest engine status information.
         """
+        # NOTE(lhy): This method is called by RolloutCoordinator
+        # Each agent loop worker contains a RolloutRouter, which shares the same engine status
         self.latest_engine_status = engine_status
         self.status_changed = True
 

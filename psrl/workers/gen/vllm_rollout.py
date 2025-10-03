@@ -817,21 +817,3 @@ class PSRL_vLLMRollout:
         if len(request_ids) > 0:
             request_ids = [str(request_id) for request_id in request_ids]
             await self.inference_engine.abort(request_ids)
-
-    async def get_engine_status(self):
-        """
-        Get the current status of the vLLM engine.
-        
-        This method returns information about the engine state, including
-        queue sizes and other operational metrics.
-        
-        Returns:
-            Dictionary containing engine status information
-        """
-        if self.inference_engine is None:
-            return {"status": "not initialized"}
-        
-        status = {
-            "waiting_and_running_queue_size": await self.waiting_and_running_queue_size(),
-        }
-        return status

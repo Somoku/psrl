@@ -138,6 +138,9 @@ class PSRL_AgentLoopWorker:
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences using the specified agent type based on configuration.
         
+        This method only create the task (agent_loop) and add the task to the agent_programs set.
+        But the task is not await here so different agent_loop can be run in parallel.
+        
         Args:
             batch (DataProto): Input batch containing prompts and metadata.
             
@@ -184,19 +187,19 @@ class PSRL_AgentLoopWorker:
             tokenizer=self.tokenizer,
         )
         
-        with log_dual_events(f"Agent loop with {len(requests)} requests", psrl_logger, event_type=EventType.GEN):
+        with log_dual_events(f"Agent loop with {len(requests)} requests", psrl_logger, level=logging.TRACE, event_type=EventType.GEN):
             output = await agent_loop.run(requests)
             assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
         psrl_logger.debug(f"Agent loop {agent_name} completed for requests: {requests.non_tensor_batch['uid']}")
         
         if output is not None:
             request_ids = requests.non_tensor_batch["uid"]
-            with log_dual_events("Update request status", psrl_logger, event_type=EventType.OTHER):
+            with log_dual_events("Update request status", psrl_logger, level=logging.TRACE, event_type=EventType.OTHER):
                 update_status_success = await self.ps_manager_handle.update_request_status.remote(
                     request_ids.tolist(),
                     RequestStatus.COMPLETED,
                 )
-            with log_dual_events("Put requests into rollout queue", psrl_logger, event_type=EventType.OTHER):
+            with log_dual_events("Put requests into rollout queue", psrl_logger, level=logging.TRACE, event_type=EventType.OTHER):
                 dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                 if dispatch_request_idxs:
                     output = output.select_idxs(dispatch_request_idxs)

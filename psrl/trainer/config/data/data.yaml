@@ -46,7 +46,7 @@ return_raw_chat: False
 return_full_prompt: False
 
 # Whether to shuffle the data in the dataloader.
-shuffle: True
+shuffle: False
 
 # num dataloader workers
 dataloader_num_workers: 8

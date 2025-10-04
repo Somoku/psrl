@@ -1565,7 +1565,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
                         
-                        log_data_protocol(batch, psrl_logger, self.log_prefix + " before compute advantage")
+                        log_data_protocol(batch, psrl_logger, self.log_prefix + " before compute advantage", level=logging.DEBUG)
                         batch = PSRL_compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,

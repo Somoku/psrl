@@ -370,14 +370,14 @@ class DataProcessor:
                 
                 # Store the other batch fields in the request buffer of the reward server
                 # They will be merged with the reward data.
-                log_data_protocol(batch_dict, psrl_logger, self.log_prefix + " before adding request data to ps manager")
+                log_data_protocol(batch_dict, psrl_logger, self.log_prefix + " before adding request data to ps manager", level=logging.DEBUG)
                 ray.get(self.reward_server_handle.add_requests.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
                 
                 # We manually repeat prompts in the generation batch for Group Sampling.
                 # Requests in the batch are unique during generation and synchronized through parent tracker.
-                psrl_logger.info(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
+                psrl_logger.debug(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
                 if self.rollout_n > 1:
                     gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
                     uid_list = []

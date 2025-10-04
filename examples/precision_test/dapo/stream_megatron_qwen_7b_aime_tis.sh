@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_2'
+experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_1'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -66,7 +66,7 @@ offload=True
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=2 \
+    psrl.staleness=1 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \

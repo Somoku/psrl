@@ -5,6 +5,7 @@ import threading
 import logging
 import torch
 import ray
+import time
 import numpy as np
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -441,9 +442,11 @@ class PSRL_GenWorker(Worker):
         active_tasks_len = len(self.active_tasks)
         psrl_logger.debug(f"Active tasks: {active_tasks_len}")
         if task_added and active_tasks_len == 1:
-            log_begin_event(f"Core generation with model version {self.current_executing_version}", psrl_logger, event_type=EventType.GEN)
+            self.active_tasks_start_time = time.time()
+            log_begin_event(f"Streaming generate with model version {self.current_executing_version}", psrl_logger, event_type=EventType.GEN)
         if task_done and active_tasks_len == 0:
-            log_end_event(f"Core generation with model version {self.current_executing_version}", psrl_logger, event_type=EventType.GEN)
+            duration = time.time() - self.active_tasks_start_time
+            log_end_event(f"Streaming generate with model version {self.current_executing_version}", psrl_logger, event_type=EventType.GEN, duration=duration)
         if active_tasks_len == self.avg_max_active_tasks_len:
             log_single_event(f"Full utilization (active tasks: {active_tasks_len})", psrl_logger, event_type=EventType.OTHER)
         if active_tasks_len == self.avg_max_active_tasks_len // 8:

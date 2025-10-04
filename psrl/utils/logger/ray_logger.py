@@ -38,6 +38,10 @@ class EventType(Enum):
 
 def _log_with_caller_info(psrl_logger: logging.Logger, level: int, message: str):
     """Log a message with the caller's file and line information."""
+    # Check if the logger is enabled for the given level
+    if not psrl_logger.isEnabledFor(level):
+        return
+    
     # Get the caller's frame (skip this function and the wrapper function)
     frame = inspect.currentframe()
     try:
@@ -69,19 +73,22 @@ def log_dual_events(message: str, psrl_logger: logging.Logger, level: int = logg
         yield  # Execute code within the with block
     finally:
         end_time = time.time()
-        log_end_event(message, psrl_logger, level, event_type)  # Log end tag when exiting
+        log_end_event(message, psrl_logger, level, event_type, end_time - start_time)  # Log end tag when exiting
      
+        
+def log_single_event(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER):
+    _log_with_caller_info(psrl_logger, level, f"[Single Event] {event_type.value} - {message}")     
+
         
 def log_begin_event(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER):
     _log_with_caller_info(psrl_logger, level, f"[Begin Event] {event_type.value} - {message}")
    
     
-def log_end_event(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER):
-    _log_with_caller_info(psrl_logger, level, f"[End Event] {event_type.value} - {message}")
-  
-        
-def log_single_event(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER):
-    _log_with_caller_info(psrl_logger, level, f"[Single Event] {event_type.value} - {message}")
+def log_end_event(message: str, psrl_logger: logging.Logger, level: int = logging.INFO, event_type: EventType = EventType.OTHER, duration: float = None):
+    if duration is None:
+        _log_with_caller_info(psrl_logger, level, f"[End Event] {event_type.value} - {message}")
+    else:
+        _log_with_caller_info(psrl_logger, level, f"[End Event] {event_type.value} - {message} - Time taken: {duration:.2f} seconds")
     
     
 class DualOutputHandler(logging.Handler):

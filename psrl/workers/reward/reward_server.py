@@ -173,7 +173,7 @@ class RewardServer(CommandExtension):
         # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
 
-        log_data_protocol(inputs, psrl_logger, self.log_prefix + " before preprocess data from rollout queue")
+        log_data_protocol(inputs, psrl_logger, self.log_prefix + " before preprocess data from rollout queue", level=logging.DEBUG)
 
         # prompts
         self.tokenizer.padding_side = "left"
@@ -292,6 +292,7 @@ class RewardServer(CommandExtension):
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
+    '''
     def put_data(self, data_ref: dict):
         """Put objectref of rollout data into the reward server's processing queue.
         
@@ -302,6 +303,18 @@ class RewardServer(CommandExtension):
             data_ref (dict): Dictionary containing a reference to the rollout DataProto.
         """
         self.rollout_queue.put(data_ref)
+    '''
+    
+    def put_data(self, data: DataProto):
+        """Put objectref of rollout data into the reward server's processing queue.
+        
+        This method is used by agent loop workers to send generated rollout data
+        to the reward server for reward computation.
+        
+        Args:
+            data (DataProto): DataProto containing the rollout data.
+        """
+        self.rollout_queue.put(data)
 
     def _background_event_handler(self):
         """
@@ -394,10 +407,11 @@ class RewardServer(CommandExtension):
             # Data processing
             # Process requests in the rollout queue
             if not self.rollout_queue.empty() and not self.reward_paused and not self.skipping_rollout_queue:
-                rollout_data_ref = self.rollout_queue.get_nowait()
-                rollout_data = ray.get(rollout_data_ref["data_ref"])
+                # rollout_data_ref = self.rollout_queue.get_nowait()
+                # rollout_data = ray.get(rollout_data_ref["data_ref"])
+                rollout_data = self.rollout_queue.get_nowait()
                 
-                with log_dual_events("Process rollout data", psrl_logger, event_type=EventType.OTHER):
+                with log_dual_events("Process rollout data", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                     assert rollout_data is not None, "Data from rollout queue should not be None"
                     # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
                     rollout_data = self._pre_process(rollout_data)
@@ -420,7 +434,7 @@ class RewardServer(CommandExtension):
                     rollout_instance_ids = rollout_data.non_tensor_batch["rollout_instance_id"]
                     version_tags = rollout_data.non_tensor_batch["version_tag"]
 
-                with log_dual_events(f"Compute reward for samples {sample_ids} and requests {request_ids}", psrl_logger, event_type=EventType.OTHER):
+                with log_dual_events(f"Compute reward for samples {sample_ids} and requests {request_ids}", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                     for i, (sample_id, request_id, rollout_instance_id, version_tag) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids, version_tags)):
                         request_data = self.request_buffer.get(sample_id, None)
                         assert request_data is not None, "Request data should not be None."

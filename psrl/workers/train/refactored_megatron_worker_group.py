@@ -4,7 +4,7 @@ from copy import deepcopy
 
 from verl.single_controller.ray.base import func_generator, RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.base.megatron.worker import DistGlobalInfo, DistRankInfo
-from verl.single_controller.base.megatron.worker_group import MegatronWorkerGroup
+from verl.single_controller.base.megatronworker import MegatronWorkerGroup
 
 
 # NOTE(lhy): NVMegatronRayWorkerGroup is not compatible with FusedWorker

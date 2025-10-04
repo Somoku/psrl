@@ -1,8 +1,8 @@
 import os
+import uuid
 import torch
 import logging
 import asyncio
-import pickle
 import numpy as np
 from collections import defaultdict
 from omegaconf import OmegaConf, open_dict
@@ -25,12 +25,11 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
-from verl.trainer.ppo.ray_trainer import WorkerType, apply_kl_penalty, compute_response_mask, RayPPOTrainer
+from verl.trainer.ppo.ray_trainer import AdvantageEstimator, apply_kl_penalty, compute_response_mask, RayPPOTrainer
+from verl.trainer.ppo.utils import WorkerType
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
-from verl.utils.metric import (
-    reduce_metrics,
-)
+from verl.utils.metric import reduce_metrics
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.utils.debug import marked_timer
@@ -43,7 +42,7 @@ from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.reward import RewardServer
 from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStoragePlan, PSStorageWorker
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
-from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager, PSRL_compute_advantage
+from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager, PSRL_compute_advantage, need_critic, need_reference_policy, need_reward_model
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -56,7 +55,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         tokenizer,
         role_worker_mapping: dict[PSRL_Role, WorkerType],
         resource_pool_manager: PSRL_ResourcePoolManager,
-        ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
         processor=None,
         reward_fn=None,
         val_reward_fn=None,
@@ -93,8 +92,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         
         self.role_worker_mapping = role_worker_mapping
         self.resource_pool_manager = resource_pool_manager
-        self.use_reference_policy = PSRL_Role.RefPolicy in role_worker_mapping
-        self.use_rm = PSRL_Role.RewardModel in role_worker_mapping
+        self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
+        self.use_rm = need_reward_model(self.role_worker_mapping)
+        self.use_critic = need_critic(self.config)
         self.ray_worker_group_cls = ray_worker_group_cls # NOTE(lhy): ray_worker_group_cls is used only in train side
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -121,24 +121,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # kl loss control currently not suppoorted
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
-
-        if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
-            self.use_critic = True
-        elif self.config.algorithm.adv_estimator in [
-            AdvantageEstimator.GRPO,
-            AdvantageEstimator.GRPO_PASSK,
-            AdvantageEstimator.REINFORCE_PLUS_PLUS,
-            # AdvantageEstimator.REMAX,
-            AdvantageEstimator.RLOO,
-            AdvantageEstimator.OPO,
-            AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-        ]:
-            self.use_critic = False
-        elif self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-            # TODO: REMAX need to compute the advantage on input prompts and overlap this process with generation  
-            raise NotImplementedError("REMAX is not implemented yet, please use other advantage estimator")
-        else:
-            raise ValueError(f"Unsupported advantage estimator: {self.config.algorithm.adv_estimator}")
 
         # Build logger
         self.log_prefix = f"MainRayTrainer"
@@ -183,15 +165,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             self.data_queue_size = 1 
             self.rollout_queue_size = self.config.gen_actor_rollout_ref.rollout.get("agent", {}).get("num_workers", 1)
-        self.data_queue = RayQueue(maxsize=self.data_queue_size)
-        self.rollout_queue = RayQueue(maxsize=self.rollout_queue_size)
 
         # Status queue is used to store the status of the rollout workers.
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
         self.status_queue = RayQueue()
 
         psrl_logger.debug("Initialized data_queue, rollout_queue, and status_queue with sizes: %d, %d, and unlimited respectively.",
-                         self.data_queue_size, self.data_queue_size)
+                         self.data_queue_size, self.rollout_queue_size)
 
     def _validate_config(self):
         config = self.config
@@ -365,11 +345,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             
         # Check log_prob mode
         if self.config.psrl.log_prob.mode == "rollout":
-            assert self.config.psrl.log_prob.enable_inference_engine_log_prob, "enable_inference_engine_log_prob must be set when using rollout log_prob"
+            assert self.config.psrl.log_prob.enable_rollout_engine_log_prob, "enable_rollout_engine_log_prob must be set when using rollout log_prob"
         elif self.config.psrl.log_prob.mode == "recompute":
             assert self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, "enable_train_engine_recompute_log_prob must be set when using recompute log_prob"
         elif self.config.psrl.log_prob.mode == "tis":
-            assert self.config.psrl.log_prob.enable_inference_engine_log_prob and self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, "enable_inference_engine_log_prob and enable_train_engine_recompute_log_prob must be set when using TIS log_prob"
+            assert self.config.psrl.log_prob.enable_rollout_engine_log_prob and self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, "enable_rollout_engine_log_prob and enable_train_engine_recompute_log_prob must be set when using TIS log_prob"
         else:
             raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}, must be one of ['rollout', 'recompute', 'tis']")
 
@@ -377,6 +357,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.colocate:
             assert self.config.psrl.gen_mode == "batch", "gen_mode must be batch when using colocate mode"
             assert self.config.psrl.staleness == 0, "staleness must be 0 when using colocate mode"
+            
+        # Check rollout mode
+        if self.config.psrl.gen_mode == "batch":
+            assert self.config.gen_actor_rollout_ref.rollout.mode == "sync", "rollout mode must be sync when using batch mode"
+        elif self.config.psrl.gen_mode == "stream":
+            assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", "rollout mode must be async when using stream mode"
+        else:
+            raise ValueError(f"Invalid gen_mode: {self.config.psrl.gen_mode}, must be one of ['batch', 'stream']")
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -403,7 +391,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
-            self.data_queue,
             collate_fn=self.collate_fn,
             process_mode=self.process_mode,
         )
@@ -445,9 +432,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
         
         # Initialize the agent loop manager
-        self.agent_loop_manager = PSRL_AgentLoopManager.remote(
+        self.agent_loop_manager = ray.remote(PSRL_AgentLoopManager).remote(
             self.config,
-            self.data_queue,
+            self.data_queue_size,
             self.agent_loop_workers,
             self.ps_manager_handle,
         )
@@ -502,7 +489,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
-            self.rollout_queue,
+            self.rollout_queue_size,
             reward_fn=self.reward_fn,
             use_rm=self.use_rm,
         )
@@ -523,6 +510,80 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Reward server is not initialized, skipping stop operation.")
 
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ):
+        """Log rollout data to disk.
+        Args:
+            batch (DataProto): The batch containing rollout data
+            reward_extra_infos_dict (dict): Additional reward information to log
+            timing_raw (dict): Timing information for profiling
+            rollout_data_dir (str): Directory path to save the rollout data
+        """
+        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+            reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_dict.setdefault(
+                    "request_id",
+                    batch.non_tensor_batch["request_id"].tolist(),
+                )
+
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=sample_gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                dump_path=rollout_data_dir,
+            )
+
+    def _maybe_log_val_generations(self, inputs, outputs, scores):
+        """Log a table of validation samples to the configured logger (wandb or swanlab)"""
+
+        generations_to_log = self.config.trainer.log_val_generations
+
+        if generations_to_log == 0:
+            return
+
+        import numpy as np
+
+        # Create tuples of (input, output, score) and sort by input text
+        samples = list(zip(inputs, outputs, scores, strict=True))
+        samples.sort(key=lambda x: x[0])  # Sort by input text
+
+        # Use fixed random seed for deterministic shuffling
+        rng = np.random.RandomState(42)
+        rng.shuffle(samples)
+
+        # Take first N samples after shuffling
+        samples = samples[:generations_to_log]
+
+        # Log to each configured logger
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+
+        # pop those keys for generation
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_model_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        # TODO: check it
+        if self.async_rollout_mode:
+            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
+
     def _validate(self):
         """Validate the model using the validation dataset.
         
@@ -535,8 +596,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
+        sample_gts = []
         sample_scores = []
         sample_turns = []
+        sample_parent_ids = []
 
         batch_count = 0
         while True:
@@ -552,6 +615,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     raise
             test_batch = DataProto.from_single_dict(test_data)
 
+            if "parent_id" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["parent_id"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
             # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.train_actor_rollout_ref.rollout.val_kwargs.n, interleave=True
@@ -566,6 +634,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # TODO(verl): Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
+            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id"])
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -596,7 +670,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             # pad to be divisible by dp_size
             size_divisor = (
-                self.actor_wg.world_size
+                self.actor_wg.world_size // self.config.train_actor_rollout_ref.rollout.tensor_model_parallel_size
                 if not self.async_rollout_mode
                 else self.config.train_actor_rollout_ref.rollout.agent.num_workers
             )
@@ -620,6 +694,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             test_batch.meta_info["validate"] = True
 
             # evaluate using reward_function
+            if self.val_reward_fn is None:
+                raise ValueError("val_reward_fn must be provided for validation.")
             result = self.val_reward_fn(test_batch, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -644,6 +720,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
+                gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
@@ -654,7 +731,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         data_sources = np.concatenate(data_source_lst, axis=0)
 
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_parent_ids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
@@ -700,10 +777,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.trainer, "profile_steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.trainer, "profile_steps")
-            assert OmegaConf.select(self.config.trainer, "worker_nsight_options") is not None, "worker_nsight_options must be set when profile_steps is set"
-            wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(OmegaConf.select(self.config.trainer, "worker_nsight_options"))
+        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
+            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+            # Only require nsight worker options when tool is nsys
+            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
+                assert (
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                    is not None
+                ), "worker_nsight_options must be set when using nsys with profile_steps"
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
+                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+                )
+        wg_kwargs["device_name"] = self.device_name
 
         # create rollout, actor and ps
         # PS need to be created before rollout and actor to pass the ps_manager_handle
@@ -722,6 +807,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             gen_interface = GenInterface(
                 rollout_instance_id=i,
                 ps_manager_handle=self.ps_manager_handle,
+                status_queue=self.status_queue,
             )
             rollout_config = self.config.gen_actor_rollout_ref
             if self.config.psrl.deployment.heterogeneous_rollout.enable:
@@ -735,7 +821,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 psrl_config=self.config.psrl,
                 gen_interface=gen_interface,
                 nixl_interface=nixl_interface,
-                status_queue=self.status_queue,
             )
             rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
             self.resource_pool_to_cls[rollout_resource_pool][f"rollout_{i}"] = rollout_cls  
@@ -768,10 +853,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[resource_pool]["ref"] = ref_policy_cls
 
         # create a reward model if reward_fn is None
+        self.rm_wg = None
         if self.use_rm:
             resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.RewardModel)
             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[PSRL_Role.RewardModel], config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]["rm"] = rm_cls
+
+        if not self.use_critic and not self.use_reference_policy:
+            resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.DummyPolicy)
+            dummy_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[PSRL_Role.DummyPolicy], config=self.config.train_actor_rollout_ref, role="dummy")
+            self.resource_pool_to_cls[resource_pool]["dummy"] = dummy_policy_cls
 
         # initialize WorkerGroup
         psrl_logger.info("Initializing WorkerGroup for other roles")
@@ -910,7 +1001,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self.config,
                     self.ps_manager_handle,
                     self.rollout_wg_list,
-                    self.rollout_queue,
                 )
             )
         
@@ -962,34 +1052,44 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             raise ValueError(f"Invalid PS mode: {self.config.psrl.ps_mode}")
 
-        if self.use_critic:
-            self.critic_wg = all_wg["critic"]
-            critic_futures = self.critic_wg.init_model()
-            ray.get(critic_futures)
-
-        if self.use_reference_policy and not self.ref_in_actor:
-            self.ref_policy_wg = all_wg["ref"]
-            ref_futures = self.ref_policy_wg.init_model()
-            ray.get(ref_futures)
-
-        if self.use_rm:
-            self.rm_wg = all_wg["rm"]
-            rm_futures = self.rm_wg.init_model()
-            ray.get(rm_futures)
-
-        # Concurrently initialize actor and rollout instances
-        futures = []
-        psrl_logger.info("Initializing actor model")
-        self.actor_wg = all_wg["actor"]
-        actor_futures = self.actor_wg.init_model()
-        futures.extend(actor_futures)
-        
         psrl_logger.info("Initializing models in all rollout instances")
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
         # simutaneously init all rollout instances
+        rollout_futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
-            futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
-        ray.get(futures)
+            rollout_futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
+
+        if self.use_critic:
+            self.critic_wg = all_wg["critic"]
+            self.critic_wg.init_model()
+
+        if self.use_reference_policy and not self.ref_in_actor:
+            self.ref_policy_wg = all_wg["ref"]
+            self.ref_policy_wg.init_model()
+
+        self.rm_wg = None
+        if self.use_rm:
+            self.rm_wg = all_wg["rm"]
+            self.rm_wg.init_model()
+        
+        if not (
+            self.use_critic or
+            (self.use_reference_policy and not self.ref_in_actor)
+        ):
+            # NOTE(linsh): when not using critic or reference policy,
+            # if we directly call `init_model` of actor_wg, Ray will view the fused worker
+            # as an async actor and run `run_async_func_or_coro_in_event_loop`, which will
+            # make it invalid to call async function such as `trainer_mode` in `init_model`.
+            # So here we create a dummy worker group and call its dummy method to avoid this issue.
+            self.dummy_wg = all_wg["dummy"]
+            self.dummy_wg.init_model()
+
+        # Concurrently initialize actor and rollout instances
+        psrl_logger.info("Initializing actor model")
+        self.actor_wg = all_wg["actor"]
+        self.actor_wg.init_model()
+
+        ray.get(rollout_futures)
 
         psrl_logger.info("All workers' models initialized successfully!")
 
@@ -1142,11 +1242,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if do_profile:
             self.actor_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy:
-                self.ref_policy_wg.start_profile()
+                self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
-                self.critic_wg.start_profile()
+                self.critic_wg.start_profile(profile_step=self.global_steps)
             if self.use_rm:
-                self.rm_wg.start_profile()
+                self.rm_wg.start_profile(profile_step=self.global_steps)
 
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
@@ -1219,16 +1319,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self.init_agent_loop_manager()
 
-        ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         futures = []
+        futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
+        futures.append(self.ps_manager_handle.set_agent_loop_manager.remote(self.agent_loop_manager))
+        futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             futures.extend(self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator))
         ray.get(futures)
         
         self.init_reward_server()
-        ray.get(self.data_processor.set_reward_server.remote(self.reward_server))
-        ray.get(self.ps_manager_handle.set_reward_server.remote(self.reward_server))
-        
+        futures = []
+        futures.append(self.data_processor.set_reward_server.remote(self.reward_server))
+        futures.append(self.ps_manager_handle.set_reward_server.remote(self.reward_server))
+        for agent_loop_worker in self.agent_loop_workers:
+            futures.append(agent_loop_worker.set_reward_server.remote(self.reward_server))
+        ray.get(futures)
+
         # Start data pipeline
         # 1. Start data processor to handle data preprocessing and batching
         psrl_logger.info("Starting data processor...")
@@ -1261,6 +1367,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         last_val_metrics = None
         self.max_steps_duration = 0
         
+        prev_step_profile = False
+        curr_step_profile = (
+            self.global_steps in self.config.global_profiler.steps
+            if self.config.global_profiler.steps is not None
+            else False
+        )
+        next_step_profile = False
+        
         # busy loop for training
         while True:
             metrics = {}
@@ -1281,7 +1395,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                         self.global_steps, len(batch) if batch is not None else 0)
                     else:
                         from verl.trainer.ppo.reward import compute_reward
-                        batch = self.data_queue.get()
+                        batch_ref = ray.get(self.agent_loop_manager_handle.get_data_ref.remote())
+                        batch = ray.get(batch_ref) if batch_ref is not None else None
+                        if batch is None:
+                            psrl_logger.info("No more data from agent loop manager, ending training at step %d", self.global_steps)
+                            break
                         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                         if "multi_modal_data" in batch.non_tensor_batch:
@@ -1309,14 +1427,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                 
-                # Check profile status and start profiling if needed
-                do_profile = (
-                    self.global_steps in self.config.trainer.profile_steps
-                    if self.config.trainer.profile_steps is not None
-                    else False
-                )
                 with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(do_profile)
+                    self._start_profiling(
+                        not prev_step_profile and curr_step_profile
+                        if self.config.global_profiler.profile_continuous_steps
+                        else curr_step_profile
+                    )
                 
                 if "response_mask" not in batch.batch.keys():
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1335,7 +1451,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 batch.meta_info['max_token_len'] = self.config.train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
                 batch.meta_info['use_dynamic_bsz'] = self.config.train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
                 batch.meta_info['temperature'] = self.config.gen_actor_rollout_ref.rollout.temperature
-                if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+                if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
                     # batch.batch["rollout_log_probs"] can be used directly
                     pass 
                 if self.config.psrl.log_prob.enable_train_engine_recompute_log_prob:
@@ -1382,7 +1498,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
                     batch.batch.pop("recomputed_log_probs")
                 elif self.config.psrl.log_prob.mode == "tis":
-                    raise NotImplementedError("TIS is not supported in PSRL yet")
+                    batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
+                    batch.batch.pop("recomputed_log_probs")
                 else:
                     raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}")
 
@@ -1404,7 +1521,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             batch = batch.union(values)
                 
                 # compute reward model score
-                if self.use_rm:
+                if self.use_rm and "rm_scores" not in batch.batch.keys():
                     with marked_timer("reward", timing_raw, color="yellow"):
                         with log_dual_events("Compute reward model score", psrl_logger, event_type=EventType.OTHER):
                             # compute reward model score
@@ -1448,7 +1565,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
                         
-                        log_data_protocol(batch, psrl_logger, self.log_prefix + " before compute advantage")
+                        log_data_protocol(batch, psrl_logger, self.log_prefix + " before compute advantage", level=logging.DEBUG)
                         batch = PSRL_compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1488,14 +1605,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            sample_gts = [
+                                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None)
+                                for item in batch
+                            ]
                             if "request_id" in batch.non_tensor_batch:
                                 reward_extra_infos_dict.setdefault(
                                     "request_id",
                                     batch.non_tensor_batch["request_id"].tolist(),
                                 )
+
                             self._dump_generations(
                                 inputs=inputs,
                                 outputs=outputs,
+                                gts=sample_gts,
                                 scores=scores,
                                 reward_extra_infos_dict=reward_extra_infos_dict,
                                 dump_path=rollout_data_dir,
@@ -1523,7 +1646,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             self._save_checkpoint()
 
             with marked_timer("stop_profile", timing_raw):
-                self._stop_profiling(do_profile)
+                next_step_profile = (
+                    self.global_steps + 1 in self.config.global_profiler.steps
+                    if self.config.global_profiler.steps is not None
+                    else False
+                )
+                self._stop_profiling(
+                    curr_step_profile and not next_step_profile
+                    if self.config.global_profiler.profile_continuous_steps
+                    else curr_step_profile
+                )
+                prev_step_profile = curr_step_profile
+                curr_step_profile = next_step_profile
             
             steps_duration = timing_raw["step"]
             self.max_steps_duration = max(self.max_steps_duration, steps_duration)
@@ -1546,6 +1680,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             progress_bar.update(1)
             self.global_steps += 1
+            
+            if (
+                hasattr(self.config.train_actor_rollout_ref.actor, "profiler")
+                and self.config.train_actor_rollout_ref.actor.profiler.tool == "torch_memory"
+            ):
+                self.actor_wg.dump_memory_snapshot(
+                    tag=f"post_update_step{self.global_steps}", sub_dir=f"step{self.global_steps}"
+                )
 
             if is_last_step:
                 psrl_logger.info(f"Final validation metrics: {last_val_metrics}")

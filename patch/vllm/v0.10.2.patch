@@ -1,0 +1,55 @@
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index e467f40f6..3e69748ab 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -487,6 +487,16 @@ class AsyncLLM(EngineClient):
+ 
+         self.output_handler = asyncio.create_task(output_handler())
+ 
++    async def abort_all(self) -> int:
++        """Abort all requests in OutputProcessor and EngineCore."""
++        all_request_ids = self.output_processor.abort_all()
++        await self.engine_core.abort_requests_async(all_request_ids)
++
++        if self.log_requests:
++            logger.info("Aborted all requests %s.", ",".join(all_request_ids))
++        
++        return len(all_request_ids)
++
+     async def abort(self, request_id: Union[str, Iterable[str]]) -> None:
+         """Abort RequestId in OutputProcessor and EngineCore."""
+ 
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index 02c8c61cb..fe976e5de 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -311,6 +311,11 @@ class OutputProcessor:
+             assert state.queue is not None
+             state.queue.put(e)
+ 
++    def abort_all(self) -> list[str]:
++        abort_request_ids = list(self.request_states.keys())
++        self.abort_requests(abort_request_ids)
++        return abort_request_ids
++
+     def abort_requests(
+         self,
+         request_ids: Iterable[str],
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 347185d83..cae85eca9 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -680,8 +680,11 @@ class StatLoggerManager:
+                         and issubclass(logger_factory, PrometheusStatLogger)):
+                     prometheus_factory = logger_factory
+                     continue
+-                loggers.append(logger_factory(vllm_config,
+-                                              engine_idx))  # type: ignore
++                if not isinstance(logger_factory, Callable):
++                    loggers.append(logger_factory)
++                else:
++                    loggers.append(logger_factory(vllm_config,
++                                                engine_idx))  # type: ignore
+             self.per_engine_logger_dict[engine_idx] = loggers
+ 
+         # For Prometheus, need to share the metrics between EngineCores.

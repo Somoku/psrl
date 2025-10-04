@@ -1,26 +1,26 @@
 import os
 import logging
 import asyncio
-import numpy as np
-from omegaconf import DictConfig
-
 import ray
+import numpy as np
+from typing import Optional
+from omegaconf import DictConfig
 
 from verl import DataProto
 
 from psrl.workers.ps.request_status_tracker import RequestStatus
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-@ray.remote
-class PSRL_AgentLoopManager:
 
+class PSRL_AgentLoopManager:
     def __init__(
         self,
         config: DictConfig,
-        data_queue,
+        data_queue_size: int,
         agent_loop_workers,
         ps_manager_handle,
     ):
@@ -30,7 +30,7 @@ class PSRL_AgentLoopManager:
 
         Args:
             config (DictConfig): Configuration containing training and rollout settings.
-            data_queue: Queue for receiving input data.
+            data_queue_size (int): Size of the data queue.
             agent_loop_workers: List of agent loop worker instances.
             ps_manager_handle: Handle to the parameter server manager.
         """
@@ -43,7 +43,7 @@ class PSRL_AgentLoopManager:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
 
-        self.data_queue = data_queue
+        self.data_queue = asyncio.Queue(maxsize=data_queue_size)
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
 
@@ -90,11 +90,22 @@ class PSRL_AgentLoopManager:
             futures.append(worker.stop_busy_loop.remote())
         ray.get(futures)
 
+    async def put_data(self, data_ref: dict):
+        """Put objectref of data into the manager's data queue."""
+        await self.data_queue.put(data_ref)
+
+    async def get_data_ref(self) -> dict:
+        """Get data from the manager's data queue."""
+        data_ref = await self.data_queue.get()
+        return data_ref
+
     async def _dispatch_data(self):
         """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_busy_loop_task:
             if not self.data_queue.empty():
-                data = self.data_queue.get_nowait()
+                data_ref = await self.data_queue.get()
+                data = None if data_ref is None else await data_ref["data_ref"]
+                psrl_logger.debug(f"Got {len(data)} requests from data queue")
                 
                 # Receive END signal to stop processing data queue
                 if data is None:
@@ -135,6 +146,7 @@ class PSRL_AgentLoopManager:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
         version_tag = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
+        psrl_logger.debug(f"Setting version tag for request {self._request_counter} (uid={request.non_tensor_batch['uid']}) to {version_tag}")
         self._request_counter += 1
         return version_tag
 
@@ -146,7 +158,10 @@ class PSRL_AgentLoopManager:
 
         # Update request status from PENDING to RUNNING
         request_ids = data.non_tensor_batch["uid"]
-        version_tags = data.non_tensor_batch["version_tag"]
+        if "version_tag" in data.non_tensor_batch:
+            version_tags = data.non_tensor_batch["version_tag"]
+        else:
+            version_tags = data.non_tensor_batch["max_version_limit"]
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             RequestStatus.RUNNING,
@@ -164,7 +179,12 @@ class PSRL_AgentLoopManager:
                 continue
             
             # Dispatch data to the corresponding worker
-            self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data)
+            if self.config.psrl.gen_mode == "stream":
+                # Dispatch `rollout_n` requests
+                for i in range(self.rollout_n):
+                    self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i:i+1])
+            else:
+                self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data)
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
         """Create a dispatch plan for distributing data across workers.
@@ -176,16 +196,53 @@ class PSRL_AgentLoopManager:
             dict[int, DataProto]: Mapping of worker index to assigned data.
         """
         dispatch_plan = {}
-        batch_size = len(data)
-        for i in range(batch_size):
-            # Round-robin dispatching
-            worker_index = (self._dispatch_idx + i) % len(self.agent_loop_workers)
+        prompt_to_worker = {}
+        if self.rollout_n > 1:
+            assert "parent_id" in data.non_tensor_batch, "parent_id not found in data"
+            prompt_ids = data.non_tensor_batch["parent_id"].tolist()
+        else:
+            assert "uid" in data.non_tensor_batch, "uid not found in data"
+            prompt_ids = data.non_tensor_batch["uid"].tolist()
+        # Round-robin dispatching
+        for i, prompt_id in enumerate(prompt_ids):
+            if prompt_id in prompt_to_worker:
+                worker_index = prompt_to_worker[prompt_id]
+            else:
+                worker_index = (self._dispatch_idx + prompt_id) % len(self.agent_loop_workers)
+                prompt_to_worker[prompt_id] = worker_index
             if worker_index not in dispatch_plan:
                 dispatch_plan[worker_index] = []
-            dispatch_plan[worker_index].append(data[i:i+1])
+            dispatch_plan[worker_index].append(data[i:(i + 1)])
+            sample_idx = prompt_id * self.rollout_n
         
         # Convert lists to DataProto
         for worker_index, data in dispatch_plan.items():
             dispatch_plan[worker_index] = DataProto.concat(data)
-        self._dispatch_idx = (self._dispatch_idx + batch_size) % len(self.agent_loop_workers)
+        self._dispatch_idx = (self._dispatch_idx + len(prompt_to_worker)) % len(self.agent_loop_workers)
         return dispatch_plan
+
+    def retry_request(self, buffer_id: int):
+        """Notify the agent loop manager to retry processing requests associated with a specific buffer ID.
+        
+        Args:
+            buffer_id (int): The buffer ID whose requests need to be retried.
+        """
+        if self.running_loop and not self.stop_busy_loop_task:
+            self.running_loop.call_soon_threadsafe(self._retry_request, buffer_id)
+        else:
+            psrl_logger.warning("Busy loop of the agent loop manager has stopped, the retry operation will be skipped")
+
+    def _retry_request(self, max_version_limit: int):
+        """Retry processing requests with a specific version limit."""
+        # Get request from the data queue and re-dispatch among instance with versions in [buffer_id - staleness, buffer_id]
+        retry_num = self.alg_rollout_n if self.config.psrl.gen_mode == "stream" else 1
+        for i in range(retry_num):
+            if not self.data_queue.empty():
+                data = self.data_queue.get_nowait()
+                if data is None:
+                    raise ValueError("Data queue should not contain None when retrying requests.")
+
+                data.non_tensor_batch["max_version_limit"] = np.array([max_version_limit] * len(data), dtype=int)
+                psrl_logger.debug(f"Retrying to dispatch new requests with ids: {data.non_tensor_batch['uid']}")
+
+                asyncio.run_coroutine_threadsafe(self._inner_dispatch_data(data), self.running_loop)

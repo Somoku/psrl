@@ -38,7 +38,6 @@ class DataProcessor:
         tokenizer,
         processor,
         ps_manager_handle,
-        data_queue,
         collate_fn=None,
         process_mode="batch",
     ):
@@ -65,8 +64,7 @@ class DataProcessor:
         self.global_steps = 0
         self._train_sample_idx = 0
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import \
-                collate_fn as default_collate_fn
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
             self.collate_fn = default_collate_fn
         else:
@@ -75,7 +73,6 @@ class DataProcessor:
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
         self.reward_server_handle = None # Will be set by the ray trainer
-        self.data_queue = data_queue
         
         self.process_mode = process_mode
         if self.config.psrl.redundant_rollout.enable:
@@ -101,6 +98,9 @@ class DataProcessor:
         
     def set_reward_server(self, reward_server_handle: ray.actor.ActorHandle):
         self.reward_server_handle = reward_server_handle
+
+    def set_agent_loop_manager(self, agent_loop_manager_handle: ray.actor.ActorHandle):
+        self.agent_loop_manager_handle = agent_loop_manager_handle
 
     # ------- Dataset and Dataloader Building Methods -------
     def build_train_and_val_dataset(self) -> None:
@@ -370,14 +370,14 @@ class DataProcessor:
                 
                 # Store the other batch fields in the request buffer of the reward server
                 # They will be merged with the reward data.
-                log_data_protocol(batch_dict, psrl_logger, self.log_prefix + " before adding request data to ps manager")
+                log_data_protocol(batch_dict, psrl_logger, self.log_prefix + " before adding request data to ps manager", level=logging.DEBUG)
                 ray.get(self.reward_server_handle.add_requests.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
                 
                 # We manually repeat prompts in the generation batch for Group Sampling.
                 # Requests in the batch are unique during generation and synchronized through parent tracker.
-                psrl_logger.info(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
+                psrl_logger.debug(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
                 if self.rollout_n > 1:
                     gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
                     uid_list = []
@@ -389,17 +389,19 @@ class DataProcessor:
                 
                 # Record the request status in the request status manager and put the batch into the data queue.
                 if self.process_mode == "stream":
-                    batch_size = len(gen_batch)
+                    # Put group-level requests to data queue
                     for i in range(batch_size):
                         ray.get(self.ps_manager_handle.add_request.remote(
-                            gen_batch.non_tensor_batch["uid"][i],
+                            gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
                         ))
-                        self.data_queue.put(gen_batch[i:i+1])
+                        data_ref =ray.put(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
+                        self.agent_loop_manager_handle.put_data.remote({"data_ref": data_ref})
                 else:
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))
-                    self.data_queue.put(gen_batch)
-                
+                    data_ref = ray.put(gen_batch)
+                    self.agent_loop_manager_handle.put_data.remote({"data_ref": data_ref})
+
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:
                     self.stop_data_process = True
@@ -416,4 +418,4 @@ class DataProcessor:
         
         # Signal end of data processing
         psrl_logger.info("Data processing stopped, sending shutdown signal.")
-        self.data_queue.put(None)
+        self.agent_loop_manager_handle.put_data.remote({"data_ref": None})

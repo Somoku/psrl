@@ -3,6 +3,7 @@ import logging
 import torch
 import ray
 import numpy as np
+from queue import Queue
 from typing import Dict, List
 from threading import Thread
 from tensordict import TensorDict
@@ -28,7 +29,7 @@ class RewardServer(CommandExtension):
         tokenizer,
         processor,
         ps_manager_handle,
-        rollout_queue,
+        rollout_queue_size,
         reward_fn=None,
         use_rm=False,
     ):
@@ -43,7 +44,7 @@ class RewardServer(CommandExtension):
             tokenizer: Tokenizer for processing text data and converting tokens
             processor: Processor for processing multi-modal data
             ps_manager_handle: Handle to the parameter server for status updates and communication
-            rollout_queue: Queue for receiving rollout data from agent loop workers
+            rollout_queue_size: Size of the queue for receiving rollout data from agent loop workers
             reward_fn (optional): Custom function for computing rewards. Defaults to None
             use_rm (bool): Whether to use a reward model for computing rewards. Defaults to False
         """
@@ -62,7 +63,7 @@ class RewardServer(CommandExtension):
             f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
 
         # Queues for data transfer between workers
-        self.rollout_queue = rollout_queue
+        self.rollout_queue = Queue(maxsize=rollout_queue_size)
         
         # Server state management
         self.server_running = False
@@ -172,7 +173,7 @@ class RewardServer(CommandExtension):
         # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
 
-        log_data_protocol(inputs, psrl_logger, self.log_prefix + " before preprocess data from rollout queue")
+        log_data_protocol(inputs, psrl_logger, self.log_prefix + " before preprocess data from rollout queue", level=logging.DEBUG)
 
         # prompts
         self.tokenizer.padding_side = "left"
@@ -275,7 +276,7 @@ class RewardServer(CommandExtension):
             batch_size=len(input_ids),
         )
         # Rollout log probs processing
-        if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+        if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
             device = batch["input_ids"].device
             rollout_log_probs = inputs.non_tensor_batch.pop("rollout_log_probs", None)
             assert rollout_log_probs is not None, "rollout_log_probs should not be None"
@@ -290,7 +291,31 @@ class RewardServer(CommandExtension):
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+
+    '''
+    def put_data(self, data_ref: dict):
+        """Put objectref of rollout data into the reward server's processing queue.
+        
+        This method is used by agent loop workers to send generated rollout data
+        to the reward server for reward computation.
+        
+        Args:
+            data_ref (dict): Dictionary containing a reference to the rollout DataProto.
+        """
+        self.rollout_queue.put(data_ref)
+    '''
     
+    def put_data(self, data: DataProto):
+        """Put objectref of rollout data into the reward server's processing queue.
+        
+        This method is used by agent loop workers to send generated rollout data
+        to the reward server for reward computation.
+        
+        Args:
+            data (DataProto): DataProto containing the rollout data.
+        """
+        self.rollout_queue.put(data)
+
     def _background_event_handler(self):
         """
         Background event handler for processing commands and rollout data.
@@ -382,13 +407,18 @@ class RewardServer(CommandExtension):
             # Data processing
             # Process requests in the rollout queue
             if not self.rollout_queue.empty() and not self.reward_paused and not self.skipping_rollout_queue:
-                rollout_data = self.rollout_queue.get()
+                # rollout_data_ref = self.rollout_queue.get_nowait()
+                # rollout_data = ray.get(rollout_data_ref["data_ref"])
+                rollout_data = self.rollout_queue.get_nowait()
                 
-                with log_dual_events("Process rollout data", psrl_logger, event_type=EventType.OTHER):
+                with log_dual_events("Process rollout data", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                     assert rollout_data is not None, "Data from rollout queue should not be None"
                     # assert len(rollout_data) == 1, "Rollout data should contain exactly one request"
                     rollout_data = self._pre_process(rollout_data)
-                    psrl_logger.info(f"Rollout data after pre-process, prompt length: {(rollout_data.batch['prompts'] != self.tokenizer.pad_token_id).sum(dim=-1)}, response length: {(rollout_data.batch['responses'] != self.tokenizer.pad_token_id).sum(dim=-1)}, attention_mask sum: {rollout_data.batch['attention_mask'].sum(dim=-1)}")
+                    psrl_logger.debug(f"Rollout data after pre-process, "
+                                      f"prompt length: {(rollout_data.batch['prompts'] != self.tokenizer.pad_token_id).sum(dim=-1)}, "
+                                      f"response length: {(rollout_data.batch['responses'] != self.tokenizer.pad_token_id).sum(dim=-1)}, "
+                                      f"attention_mask sum: {rollout_data.batch['attention_mask'].sum(dim=-1)}")
                     request_ids = rollout_data.non_tensor_batch["uid"]
                     # print(f"Reward server received request ids: {request_ids}")
                     
@@ -404,7 +434,7 @@ class RewardServer(CommandExtension):
                     rollout_instance_ids = rollout_data.non_tensor_batch["rollout_instance_id"]
                     version_tags = rollout_data.non_tensor_batch["version_tag"]
 
-                with log_dual_events(f"Compute reward for samples {sample_ids} and requests {request_ids}", psrl_logger, event_type=EventType.OTHER):
+                with log_dual_events(f"Compute reward for samples {sample_ids} and requests {request_ids}", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                     for i, (sample_id, request_id, rollout_instance_id, version_tag) in enumerate(zip(sample_ids, request_ids, rollout_instance_ids, version_tags)):
                         request_data = self.request_buffer.get(sample_id, None)
                         assert request_data is not None, "Request data should not be None."
@@ -437,7 +467,7 @@ class RewardServer(CommandExtension):
                                 future_reward = compute_reward_async.remote(reward_input, self.config, self.tokenizer)
                                 merge_request_data.union(reward_input)
                                 # TODO(lhy): currently seems that cannot overlap with log prob recomputing.
-                                if self.config.psrl.log_prob.enable_inference_engine_log_prob:
+                                if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
                                     self.request_id_to_future[request_id] = (merge_request_data, future_reward)
                                     self.reward_futures.append(future_reward)
                                 else:

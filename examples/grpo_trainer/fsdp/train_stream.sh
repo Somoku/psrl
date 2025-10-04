@@ -35,7 +35,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/grpo_trainer/fsdp/psrl_log \
-    psrl.log_prob.enable_inference_engine_log_prob=True \
+    psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -51,6 +51,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    train_actor_rollout_ref.rollout.max_num_seqs=256 \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \

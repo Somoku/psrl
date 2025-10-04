@@ -13,6 +13,16 @@ mkdir -p $THIRD_PARTY_PATH/ucx_src
 pushd $THIRD_PARTY_PATH/ucx_src
 git clone -b v1.19.x https://github.com/openucx/ucx.git
 cd ucx
+
+# Checking Mellanox NICs
+MLX_OPTS=""
+if lspci | grep -i mellanox > /dev/null || command -v ibstat > /dev/null; then
+    echo "Mellanox NIC detected, adding Mellanox-specific options"
+    MLX_OPTS="--with-rdmacm \
+              --with-mlx5   \
+              --with-ib-hw-tm"
+fi
+
 ./autogen.sh && ./configure         \
     --prefix=$THIRD_PARTY_PATH/ucx  \
     --enable-shared                 \
@@ -25,7 +35,8 @@ cd ucx
     --with-cuda=$CUDA_PATH          \
     --with-verbs                    \
     --with-dm                       \
-    --enable-mt &&                  \
+    --enable-mt                     \
+    $MLX_OPTS &&                    \
 make -j $MAX_JOBS &&                \
 make -j $MAX_JOBS install-strip &&  \
 ldconfig

@@ -170,10 +170,10 @@ index 39979f84..dee263d6 100644
          non_tensors = {}
          # non tensor batch
 diff --git a/verl/single_controller/base/worker.py b/verl/single_controller/base/worker.py
-index 2606a3ef..e7ee275e 100644
+index 2606a3ef..c802249c 100644
 --- a/verl/single_controller/base/worker.py
 +++ b/verl/single_controller/base/worker.py
-@@ -101,25 +101,12 @@ class Worker(WorkerHelper):
+@@ -101,25 +101,13 @@ class Worker(WorkerHelper):
          assert isinstance(rank, int), f"rank must be int, instead of {type(rank)}"
  
          if rank == 0:
@@ -183,7 +183,7 @@ index 2606a3ef..e7ee275e 100644
                  "MASTER_ADDR": master_addr,
                  "MASTER_PORT": master_port,
              }
--
+ 
 -            if os.getenv("WG_BACKEND", None) == "ray":
 -                from verl.single_controller.base.register_center.ray import create_worker_group_register_center
 -
@@ -387,53 +387,10 @@ index 1181133e..33dc86b9 100644
      },
  }
 diff --git a/verl/workers/actor/dp_actor.py b/verl/workers/actor/dp_actor.py
-index d5cea362..24238f8d 100644
+index d5cea362..49bdf715 100644
 --- a/verl/workers/actor/dp_actor.py
 +++ b/verl/workers/actor/dp_actor.py
-@@ -26,20 +26,26 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
- 
- import verl.utils.torch_functional as verl_F
- from verl import DataProto
--from verl.trainer.ppo.core_algos import agg_loss, compute_policy_loss, get_policy_loss_fn, kl_penalty
--from verl.utils.device import get_device_name, is_cuda_available, is_npu_available
-+from verl.trainer.ppo.core_algos import (agg_loss, compute_policy_loss,
-+                                         get_policy_loss_fn, kl_penalty)
-+from verl.utils.device import (get_device_name, is_cuda_available,
-+                               is_npu_available)
- from verl.utils.fsdp_utils import FSDPModule, fsdp2_clip_grad_norm_
- from verl.utils.profiler import GPUMemoryLogger
- from verl.utils.py_functional import append_to_dict
--from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
-+from verl.utils.seqlen_balancing import (prepare_dynamic_batch,
-+                                         restore_dynamic_batch)
- from verl.utils.torch_functional import logprobs_from_logits
--from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
-+from verl.utils.ulysses import (gather_outputs_and_unpad, ulysses_pad,
-+                                ulysses_pad_and_slice_inputs)
- from verl.workers.actor import BasePPOActor
- 
- if is_cuda_available:
--    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-+    from flash_attn.bert_padding import (index_first_axis, pad_input,
-+                                         rearrange, unpad_input)
- elif is_npu_available:
--    from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
-+    from transformers.integrations.npu_flash_attention import (
-+        index_first_axis, pad_input, rearrange, unpad_input)
- 
- 
- __all__ = ["DataParallelPPOActor"]
-@@ -125,7 +131,8 @@ class DataParallelPPOActor(BasePPOActor):
-                     ).transpose(0, 1)
- 
-                 if "image_bound" in multi_modal_inputs:
--                    from verl.utils.dataset.vision_utils import process_multi_modal_inputs_for_minicpmo
-+                    from verl.utils.dataset.vision_utils import \
-+                        process_multi_modal_inputs_for_minicpmo
- 
-                     multi_modal_inputs = process_multi_modal_inputs_for_minicpmo(
-                         input_ids, attention_mask, position_ids, cu_seqlens, multi_modal_inputs
-@@ -179,6 +186,7 @@ class DataParallelPPOActor(BasePPOActor):
+@@ -179,6 +179,7 @@ class DataParallelPPOActor(BasePPOActor):
  
                  else:
                      logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
@@ -442,7 +399,7 @@ index d5cea362..24238f8d 100644
  
                      # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index 4141d986..84d49e62 100644
+index 4141d986..3926ee8e 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -113,33 +113,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -515,18 +472,7 @@ index 4141d986..84d49e62 100644
          # normalize config
          if self._is_actor:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -242,6 +244,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
-                 self.processor.chat_template = self.config.model.custom_chat_template
-             else:
-                 self.tokenizer.chat_template = self.config.model.custom_chat_template
-+        self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
-+
-+        if self.config.rollout.mode == "psrl_async" and not self._is_actor:
-+            return None, None, None, None
- 
-         torch_dtype = fsdp_config.get("model_dtype", None)
-         if torch_dtype is None:
-@@ -559,12 +565,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -559,12 +561,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
  
          return rollout, rollout_sharding_manager
  
@@ -545,7 +491,7 @@ index 4141d986..84d49e62 100644
  
          override_model_config = OmegaConf.to_container(self.config.model.get("override_config", OmegaConf.create()))
  
-@@ -921,13 +932,22 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -921,13 +928,22 @@ class CriticWorker(Worker, DistProfilerExtension):
          DistProfilerExtension.__init__(
              self, DistProfiler(rank=self.rank, config=omega_conf_to_dataclass(config.get("profiler")))
          )
@@ -569,7 +515,7 @@ index 4141d986..84d49e62 100644
  
          # build device mesh for Ulysses Sequence Parallel
          world_size = torch.distributed.get_world_size()
-@@ -946,10 +966,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -946,10 +962,6 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
  
@@ -580,7 +526,7 @@ index 4141d986..84d49e62 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
-@@ -972,7 +988,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -972,7 +984,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                  f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
                  f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
              )
@@ -588,7 +534,7 @@ index 4141d986..84d49e62 100644
  
      def _build_critic_model_optimizer(self, config):
          # the following line is necessary
-@@ -1171,12 +1186,14 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1171,12 +1182,14 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          return critic_module, critic_optimizer, critic_lr_scheduler
  
@@ -604,7 +550,7 @@ index 4141d986..84d49e62 100644
  
          self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
              self.config
-@@ -1421,7 +1438,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1421,7 +1434,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
              raise NotImplementedError(f"Unknown strategy: {config.strategy}")
          return reward_module
  
@@ -675,3 +621,4 @@ index ea32d9d9..1249d7e1 100644
 +    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
      def init_model(self):
          # create critic
+ 

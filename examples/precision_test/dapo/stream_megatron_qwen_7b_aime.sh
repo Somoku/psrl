@@ -94,7 +94,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.top_k=${top_k} \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \

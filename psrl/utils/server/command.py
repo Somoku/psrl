@@ -4,8 +4,7 @@ import enum
 from enum import Enum
 from typing import Optional, Any
 from threading import Event
-
-from ray.util.queue import Queue as RayQueue
+from queue import Queue
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -145,7 +144,7 @@ class CommandExtension:
         self._command_results = {}
         self._command_events = {}
         self._command_counter = 0
-        self.command_queue = RayQueue()  # For async commands like abort
+        self.command_queue = Queue()  # For async commands like abort
 
     def exec_command(self, command: Command, timeout=None, blocking=True):
         """

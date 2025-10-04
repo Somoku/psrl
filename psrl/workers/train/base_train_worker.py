@@ -45,9 +45,11 @@ class PSRL_BaseTrainWorker(ABC):
         self.nixl_wait_completed = threading.Event()
         
         # Build logger
+        '''
         self.log_prefix = f"BaseTrainWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
-        psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        psrl_logger.debug(f"Initialized on {get_worker_info()}.")
+        '''
         
     def get_node_id(self) -> str:
         """
@@ -94,7 +96,7 @@ class PSRL_BaseTrainWorker(ABC):
             self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
         if self._cached_ps_nixl_train_storage_client_names is None:
             self._cached_ps_nixl_train_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_names.remote())
-        psrl_logger.info(f"Pushing the model to the PS via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients.")
+        psrl_logger.debug(f"Pushing the model to the PS via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients.")
         
         # Clear previous wait thread
         with self.nixl_wait_thread_lock:
@@ -116,7 +118,7 @@ class PSRL_BaseTrainWorker(ABC):
         # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                psrl_logger.info(f"[NIXL thread]: Starting to wait for {len(wait_operations)} NIXL operations for version {next_ps_model_version}...")
+                psrl_logger.debug(f"[NIXL thread]: Starting to wait for {len(wait_operations)} NIXL operations for version {next_ps_model_version}...")
                 futures = []
                 for key, target_client_name, shards_to_transfer in wait_operations:
                     self.nixl_storage_client.wait(key, f"train_push_{next_ps_model_version}", "WRITE", target_client=target_client_name)
@@ -124,12 +126,12 @@ class PSRL_BaseTrainWorker(ABC):
                     ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
                     futures.append(ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer))
                     psrl_logger.debug(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
-                psrl_logger.info(f"[NIXL thread]: Wait NIXL xfers done, start to wait for {len(futures)} train to gen transfers on the PS...")
+                psrl_logger.debug(f"[NIXL thread]: Wait NIXL xfers done, start to wait for {len(futures)} train to gen transfers on the PS...")
                 ray.get(futures)
-                psrl_logger.info(f"[NIXL thread]: Starting to push model tag to the PS...")
+                psrl_logger.debug(f"[NIXL thread]: Starting to push model tag to the PS...")
                 ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version, self.worker_rank, self.worker_world_size))
                 self.nixl_wait_completed.set()
-                psrl_logger.info(f"[NIXL thread]: All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
+                psrl_logger.debug(f"[NIXL thread]: All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
             except Exception as e:
                 raise RuntimeError(f"Error in NIXL wait thread: {e}")
         
@@ -154,7 +156,7 @@ class PSRL_BaseTrainWorker(ABC):
                 psrl_logger.debug("No NIXL wait thread to wait for.")
                 return True
             
-            psrl_logger.info("Waiting for NIXL wait thread to complete...")
+            psrl_logger.debug("Waiting for NIXL wait thread to complete...")
             if timeout is not None:
                 # Use the event to wait with timeout
                 if self.nixl_wait_completed.wait(timeout=timeout):
@@ -163,7 +165,7 @@ class PSRL_BaseTrainWorker(ABC):
                     if self.nixl_wait_thread.is_alive():
                         psrl_logger.warning("NIXL wait thread is still alive after event was set.")
                         return False
-                    psrl_logger.info("NIXL wait thread completed successfully.")
+                    psrl_logger.debug("NIXL wait thread completed successfully.")
                     return True
                 else:
                     psrl_logger.warning("Timeout waiting for NIXL wait thread to complete.")
@@ -174,7 +176,7 @@ class PSRL_BaseTrainWorker(ABC):
                 if self.nixl_wait_thread.is_alive():
                     psrl_logger.warning("NIXL wait thread is still alive after join.")
                     return False
-                psrl_logger.info("NIXL wait thread completed successfully.")
+                psrl_logger.debug("NIXL wait thread completed successfully.")
                 return True
     
     def get_nixl_wait_thread_status(self) -> dict:

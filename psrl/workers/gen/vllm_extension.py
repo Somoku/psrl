@@ -13,7 +13,7 @@ except ImportError:
 
 from verl.utils.fs import copy_to_local
 from verl.utils.device import get_device_id
-from verl.utils.vllm_utils import patch_vllm_moe_model_weight_loader
+from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 
 from psrl.utils.nixl import NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER_NAME, GLOBAL_GEN_CLIENT_NAME, NIXLClientType
 from psrl.utils.converter import create_parameter_mapping
@@ -156,8 +156,9 @@ class vLLMWorkerExtension:
         wait_operations = []
         for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
             for key in self.unified_state_dict:
-                self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, f"gen_pull_{self.pull_times}")
-                wait_operations.append((key, target_client_name))
+                shards_to_transfer = self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, f"gen_pull_{self.pull_times}")
+                if len(shards_to_transfer) > 0:
+                    wait_operations.append((key, target_client_name, shards_to_transfer))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
-        for key, target_client_name in wait_operations:
+        for key, target_client_name, shards_to_transfer in wait_operations:
             self.nixl_storage_client.wait(key, f"gen_pull_{self.pull_times}", "READ", target_client=target_client_name)

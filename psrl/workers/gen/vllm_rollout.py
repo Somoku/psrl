@@ -2,7 +2,7 @@ import logging
 import os
 import uuid
 import asyncio
-
+import torch
 import numpy as np
 from contextlib import contextmanager
 from copy import deepcopy
@@ -10,9 +10,6 @@ from collections.abc import Sequence
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from typing import Any, Dict, Optional, Union, List, Tuple, cast
-
-import torch
-import torch.distributed
 
 from vllm import LLM, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -25,23 +22,24 @@ from vllm.sampling_params import RequestOutputKind
 from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
-from verl.workers.rollout.base import BaseRollout
 
+from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.utils.logger import deprecated
 from psrl.workers.gen import StatCollector
 from psrl.utils.dataset.utils import _pre_process_inputs
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
-    if isinstance(value, torch.Tensor):
-        return value.repeat_interleave(repeats, dim=0)
-    else:
-        return np.repeat(value, repeats, axis=0)
 
-class PSRL_vLLMRollout(BaseRollout):
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, **kwargs):
+class PSRL_vLLMRollout:
+    def __init__(
+        self,
+        config: RolloutConfig,
+        model_config: HFModelConfig,
+        **kwargs,
+    ):
         """
         Initialize PSRL vLLM rollout with specified configuration.
 
@@ -51,57 +49,6 @@ class PSRL_vLLMRollout(BaseRollout):
             tokenizer: Tokenizer instance for the model
             **kwargs: Additional keyword arguments (trust_remote_code, lora_kwargs, etc.)
         """
-       
-        # Monkey patch adapted from NeMo-RL for vLLM to ensure RAY_ADDRESS is set in Ray actors.
-        # (https://github.com/NVIDIA-NeMo/RL/blob/124ca30417dafb5b03ba5c1948f8252ddbce0d06/nemo_rl/models/generation/vllm.py#L203)
-        try:
-            import vllm.utils
-            from vllm.utils import cuda_is_initialized, is_in_ray_actor
-
-            def _patched_maybe_force_spawn():
-                """Patched version of vllm.utils._maybe_force_spawn.
-
-                This patch changes an `elif is_in_ray_actor()` to an `if` statement.
-                This ensures that `os.environ["RAY_ADDRESS"]` is set when running
-                within a Ray actor, even if CUDA has already been initialized.
-                This is crucial for vLLM workers to connect back to the Ray cluster.
-                """
-                import os
-
-                if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
-                    return
-
-                reason = None
-                if cuda_is_initialized():
-                    reason = "CUDA is initialized"
-
-                if is_in_ray_actor():
-                    # even if we choose to spawn, we need to pass the ray address
-                    # to the subprocess so that it knows how to connect to the ray cluster.
-                    # env vars are inherited by subprocesses, even if we use spawn.
-                    import ray
-
-                    os.environ["RAY_ADDRESS"] = ray.get_runtime_context().gcs_address
-                    if reason is None:
-                        reason = "In a Ray actor and can only be spawned"
-
-                if reason is not None:
-                    psrl_logger.warning(
-                        "We must use the `spawn` multiprocessing start method. "
-                        "Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
-                        "See https://docs.vllm.ai/en/latest/getting_started/"
-                        "troubleshooting.html#python-multiprocessing "
-                        "for more information. Reason: %s",
-                        reason,
-                    )
-                    os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-
-            vllm.utils._maybe_force_spawn = _patched_maybe_force_spawn
-            psrl_logger.info("Successfully patched vllm.utils._maybe_force_spawn.")
-        
-        except (ImportError, AttributeError):
-            # vllm not installed or has a different structure, skipping patch.
-            pass
 
         super().__init__()
         self.config = config
@@ -109,7 +56,6 @@ class PSRL_vLLMRollout(BaseRollout):
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
         model_parallel_size = tensor_parallel_size * pipeline_parallel_size
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         assert pipeline_parallel_size == 1 or config.mode == "psrl_async", "pipeline parallel is only supported in psrl_async mode"
         
         # For async engine and model parallel, we only run the inference engine on the first rank.
@@ -119,8 +65,52 @@ class PSRL_vLLMRollout(BaseRollout):
             if os.environ.get("LOCAL_RANK") != '0':
                 self.inference_engine = None
                 return
+        
+        model_path = model_config.local_path
+        tokenizer = model_config.tokenizer
+        model_hf_config = model_config.hf_config
+        trust_remote_code = model_config.trust_remote_code
+        lora_kwargs = (
+            {"enable_lora": True, "max_loras": 1, "max_lora_rank": model_config.lora_rank}
+            if model_config.lora_rank > 0
+            else {}
+        )
 
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+        
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
+        if not rope_scaling_config:
+            max_position_embeddings = None
+            if hasattr(model_hf_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.max_position_embeddings
+            elif hasattr(model_hf_config, "llm_config") and hasattr(
+                model_hf_config.llm_config, "max_position_embeddings"
+            ):
+                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
+            elif hasattr(model_hf_config, "text_config") and hasattr(
+                model_hf_config.text_config, "max_position_embeddings"
+            ):
+                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
+            if max_position_embeddings is None:
+                raise ValueError("max_position_embeddings not found in model_hf_config")
+            assert max_position_embeddings >= config.prompt_length + config.response_length, (
+                "model context length should be greater than total sequence length"
+            )
+        else:
+            # handle type where there's a length extend factor
+            # see https://qwen.readthedocs.io/en/latest/deployment/vllm.html#extended-context-support
+            # for using yarn as an example
+            rope_scaling_factor = rope_scaling_config.get("factor", 1.0)
+
+            assert (
+                model_hf_config.max_position_embeddings * rope_scaling_factor
+                >= config.prompt_length + config.response_length
+            ), (
+                "model context length should be greater than total sequence length, "
+                + f"got rope_scaling_factor={rope_scaling_factor} and "
+                + f"max_position_embeddings={model_hf_config.max_position_embeddings}"
+            )
+        
         max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
         
         if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
@@ -129,18 +119,16 @@ class PSRL_vLLMRollout(BaseRollout):
                              please increase max_num_batched_tokens or disable chunked prefill"
             )
 
-        trust_remote_code = kwargs.get("trust_remote_code", False)
         load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
 
         # LoRA configuration
-        lora_kwargs = kwargs.pop("lora_kwargs", {})
-        self.lora_kwargs = lora_kwargs
-        # copy it to avoid secretly modifying the engine config
-        engine_kwargs = (
-            {}
-            if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs
-            else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        lora_kwargs = (
+            {"enable_lora": True, "max_loras": 1, "max_lora_rank": model_config.lora_rank}
+            if model_config.lora_rank > 0
+            else {}
         )
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = config.get("engine_kwargs", {}).get("vllm", {}) or {}
         
         # For each vLLM engine parameter,
         # - `None` means not setting it, so we pop it, and leave it to vLLM default value
@@ -149,6 +137,19 @@ class PSRL_vLLMRollout(BaseRollout):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
+
+        compilation_config = {}
+
+        cudagraph_capture_sizes = config.get("cudagraph_capture_sizes")
+        # enforce_eager must be False to use cudagraph
+        if not config.enforce_eager and cudagraph_capture_sizes:
+            if isinstance(cudagraph_capture_sizes, ListConfig):
+                compilation_config["compilation_config"] = CompilationConfig(
+                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
+                )
+            else:
+                logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+
 
         if config.mode == "psrl_async" and model_parallel_size > 1:
             # Configure vLLM for tensor/pipeline parallelism within Ray
@@ -162,7 +163,7 @@ class PSRL_vLLMRollout(BaseRollout):
 
         llm_kwargs = dict(
             model=model_path,
-            # enable_sleep_mode=True,
+            enable_sleep_mode=False,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             distributed_executor_backend=distributed_executor_backend,
@@ -172,13 +173,14 @@ class PSRL_vLLMRollout(BaseRollout):
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
+            max_num_seqs=config.max_num_seqs,
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
-            # enable_prefix_caching=False,
+            enable_prefix_caching=config.enable_prefix_caching,
             trust_remote_code=trust_remote_code,
+            logprobs_mode=config.logprobs_mode,
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
             **lora_kwargs,
@@ -211,6 +213,8 @@ class PSRL_vLLMRollout(BaseRollout):
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
+            repetition_penalty=config.get("repetition_penalty", 1.0),
+            output_kind=RequestOutputKind.CUMULATIVE,
         )
 
         # we may detokenize the result all together later
@@ -218,7 +222,7 @@ class PSRL_vLLMRollout(BaseRollout):
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
-            if hasattr(SamplingParams(), str(k)) and k != "seed":
+            if hasattr(SamplingParams(), str(k)) and k != "seed" and k != "n":
                 kwargs[k] = config.get(k)
         kwargs["n"] = 1  # already repeat in ray_trainer
         psrl_logger.info(f"kwargs: {kwargs}")
@@ -374,7 +378,7 @@ class PSRL_vLLMRollout(BaseRollout):
             log_prob_list = []
             # if inference logprobs is required, we need to collect the log probabilities
             if (
-                self.config.enable_inference_engine_log_prob and
+                self.config.enable_rollout_engine_log_prob and
                 hasattr(vllm_output.outputs[0], 'logprobs') and
                 vllm_output.outputs[0].logprobs is not None
             ):
@@ -416,7 +420,7 @@ class PSRL_vLLMRollout(BaseRollout):
         non_tensor_batch["interrupted"] = np.array(interrupted_list, dtype=bool)
 
         # Update rollout_log_probs
-        if self.config.enable_inference_engine_log_prob:
+        if self.config.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:
@@ -480,7 +484,7 @@ class PSRL_vLLMRollout(BaseRollout):
                 interrupted.append(output.outputs[sample_id].finish_reason == "abort")
                 # if inference logprobs is required, we need to collect the log probabilities
                 if (
-                    self.config.enable_inference_engine_log_prob and
+                    self.config.enable_rollout_engine_log_prob and
                     hasattr(output.outputs[sample_id], 'logprobs') and
                     output.outputs[sample_id].logprobs is not None
                 ):
@@ -526,7 +530,7 @@ class PSRL_vLLMRollout(BaseRollout):
         # TODO(linsh): optimize the DataProto construction to packing
         # Here we pad the response to the right side for both interrupted and completed requests.
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-        if self.config.enable_inference_engine_log_prob:
+        if self.config.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:
@@ -783,16 +787,11 @@ class PSRL_vLLMRollout(BaseRollout):
         Returns:
             Number of requests that were interrupted
         """
-        # Get request IDs of all running and waiting requests from the scheduler
-        request_ids_to_abort = await self.inference_engine.waiting_and_running_queue()
-        interrupted_request_num = len(request_ids_to_abort)
-        
+        interrupted_request_num = await self.inference_engine.abort_all()
         if interrupted_request_num > 0:
-            await self.inference_engine.abort(request_ids_to_abort)
-            psrl_logger.debug(f"Interrupted {interrupted_request_num} requests.")
+            psrl_logger.debug(f"Interrupted {interrupted_request_num} requests via abort_all().")
         else:
-            psrl_logger.debug("No requests to interrupt.")
-            
+            psrl_logger.debug("No requests to interrupt via abort_all().")
         return interrupted_request_num
 
     async def interrupt_requests_async(self, request_ids):
@@ -808,21 +807,3 @@ class PSRL_vLLMRollout(BaseRollout):
         if len(request_ids) > 0:
             request_ids = [str(request_id) for request_id in request_ids]
             await self.inference_engine.abort(request_ids)
-
-    async def get_engine_status(self):
-        """
-        Get the current status of the vLLM engine.
-        
-        This method returns information about the engine state, including
-        queue sizes and other operational metrics.
-        
-        Returns:
-            Dictionary containing engine status information
-        """
-        if self.inference_engine is None:
-            return {"status": "not initialized"}
-        
-        status = {
-            "waiting_and_running_queue_size": await self.waiting_and_running_queue_size(),
-        }
-        return status

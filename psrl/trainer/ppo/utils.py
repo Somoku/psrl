@@ -1,12 +1,17 @@
+import warnings
 from enum import Enum
 from typing import Optional
+from omegaconf import DictConfig
 
 from verl import DataProto
+from verl.trainer.ppo.utils import WorkerType
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, compute_response_mask
 from verl.single_controller.ray import RayResourcePool
+from verl.single_controller.base import Worker
+from verl.single_controller.base.decorator import Dispatch, register
 
 class PSRL_Role(Enum):
     Actor = 0
@@ -16,6 +21,7 @@ class PSRL_Role(Enum):
     RefPolicy = 4
     RewardModel = 5
     ActorRolloutRef = 6
+    DummyPolicy = 7
 
 
 class PSRL_ResourcePoolManager(ResourcePoolManager):
@@ -27,7 +33,42 @@ class PSRL_ResourcePoolManager(ResourcePoolManager):
     def get_resource_pool(self, role: PSRL_Role, instance_id: int = 0) -> RayResourcePool:
         """Get the resource pool of the worker_cls for the given instance_id."""
         return self.resource_pool_dict[self.mapping[role][instance_id]]
+
+class PSRL_DummyWorker(Worker):
+    def __init__(self, config: DictConfig, **kwargs):
+        Worker.__init__(self)
+
+        self.config = config
     
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        return
+
+def need_reference_policy(
+    role_worker_mapping: dict[PSRL_Role, WorkerType],
+) -> bool:
+    """Given a role worker mapping, do we need ref policy."""
+    return PSRL_Role.RefPolicy in role_worker_mapping
+
+
+def need_reward_model(
+    role_worker_mapping: dict[PSRL_Role, WorkerType],
+) -> bool:
+    """Given a role worker mapping, do we need reward model."""
+    return PSRL_Role.RewardModel in role_worker_mapping
+
+def need_critic(config: DictConfig) -> bool:
+    """Given a config, do we need critic."""
+    if config.critic.enable is not None:
+        return bool(config.critic.enable)
+    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
+        return True
+    else:
+        warnings.warn(
+            "Disabled critic as algorithm.adv_estimator != gae. If it is not intended, please set critic.enable=True",
+            stacklevel=2,
+        )
+        return False
 
 def PSRL_compute_advantage(
     data: DataProto,

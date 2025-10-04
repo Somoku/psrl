@@ -4,12 +4,15 @@ import enum
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Union, Tuple, Set
 
+import ray
+
 from verl import DataProto
 
 from psrl.utils.logger import deprecated
+from psrl.utils.logger import get_ps_logger
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+# Use the unified PS logger
+psrl_logger = get_ps_logger()
 
 class EntryCategory(enum.Enum):
     """Enum for the category of an entry in the buffer.
@@ -88,8 +91,9 @@ class StalenessBuffer:
         num_entries (int): The number of entries in the buffer
         staleness (int): The staleness tolerance for this buffer
     """
-    def __init__(self, num_entries: int, staleness: int):
+    def __init__(self, num_entries: int, ready_num_entries: int, staleness: int):
         self.num_entries = num_entries
+        self.ready_num_entries = ready_num_entries
         self.entries: List[Entry] = [
             Entry(category=EntryCategory.EMPTY) 
             for _ in range(num_entries)
@@ -178,7 +182,7 @@ class StalenessBuffer:
         first_non_occupied = self.get_first_non_occupied()
         
         # READY state: All entries are occupied
-        if first_non_occupied == self.num_entries:
+        if first_non_occupied == self.ready_num_entries:
             return BufferStatus.READY
         
         # Check for STUCK state
@@ -215,6 +219,14 @@ class StalenessBuffer:
                 raise ValueError("One or more entries have None data. All entries must be occupied.")
             data_list.append(entry.data)
         return DataProto.concat(data_list)
+    
+    def update_all_data(self, data: DataProto):
+        batch_size = len(data)
+        assert batch_size == self.num_entries, \
+            f"Mismatch between buffer size {self.num_entries} and batch size {batch_size} when updating data"
+        data_list = data.chunk(batch_size)
+        for entry, data in zip(self.entries, data_list):
+            entry.data = data
 
 class StalenessInventory:
     """
@@ -229,12 +241,14 @@ class StalenessInventory:
     def __init__(
         self,
         num_entries: int,
+        ready_num_entries: int,
         staleness: int,
         buffer_post_process_fn: Optional[callable] = None,
     ):
         self.staleness = staleness
         self.buffer_id = 0
         self.num_entries = num_entries
+        self.ready_num_entries = ready_num_entries
         self.buffer_post_process_fn = buffer_post_process_fn
 
         self.data_pool: Dict[EntryInfo, DataProto] = {} # Rollout data pool for requests in Group Sampling
@@ -246,6 +260,13 @@ class StalenessInventory:
             status: set() for status in BufferStatus
         }
 
+        # Agent Loop Manager reference
+        self.agent_loop_manager: Optional[ray.actor.ActorHandle] = None
+
+    def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
+        """Set the reference to the agent loop manager."""
+        self.agent_loop_manager = agent_loop_manager
+
     def create_buffer(self, buffer_id: int):
         """
         Create a new buffer with the specified ID and fixed-size.
@@ -255,19 +276,13 @@ class StalenessInventory:
         Raises:
             AssertionError: If the buffer already exists.
         """
-        assert self.buffer_id not in self.buffers, f"Buffer {self.buffer_id} already exists"
+        assert buffer_id == self.buffer_id, f"Buffer ID {buffer_id} must be the next in sequence (current: {self.buffer_id})"
 
-        buffer = StalenessBuffer(self.num_entries, self.staleness)
-        self.buffers[self.buffer_id] = buffer
-        self._update_buffer_status(self.buffer_id)
-        self.buffer_id += 1
-        
-        '''
-        buffer = StalenessBuffer(self.num_entries)
+        buffer = StalenessBuffer(self.num_entries, self.ready_num_entries, self.staleness)
         self.buffers[buffer_id] = buffer
         psrl_logger.debug(f"Created buffer {buffer_id}, current buffer count: {len(self.buffers)}")
         self._update_buffer_status(buffer_id)
-        '''
+        self.buffer_id += 1
 
     def delete_buffer(self, buffer_id: int):
         """
@@ -280,8 +295,6 @@ class StalenessInventory:
             return
 
         # Remove entries associated with this buffer from data tracker
-        # TODO(linsh): deprecate data_tracker, since we can directly use entry_info in the buffer
-        '''
         entries_to_remove = [
             entry.entry_info for entry in self.buffers[buffer_id].entries
         ]
@@ -289,7 +302,6 @@ class StalenessInventory:
             assert entry_info in self.data_tracker, \
                 f"Entry info {entry_info} not found in data tracker"
             del self.data_tracker[entry_info]
-        '''
         # Remove from status tracking
         for status_set in self._buffer_ids_by_status.values():
             status_set.discard(buffer_id)
@@ -333,12 +345,45 @@ class StalenessInventory:
                 break
                 
         new_status = buffer.get_status()
+        reserve_buffer = True
         if new_status == BufferStatus.READY:
             if self.buffer_post_process_fn:
-                self.buffer_post_process_fn(buffer)
-        # Update in the new status track
-        self._buffer_ids_by_status[new_status].add(buffer_id)
-     
+                reserve_buffer = self._buffer_post_process(buffer_id, buffer)
+        
+        if reserve_buffer:    
+            # Update in the new status track
+            self._buffer_ids_by_status[new_status].add(buffer_id)
+
+    def _buffer_post_process(self, buffer_id: int, buffer: StalenessBuffer) -> bool:
+        assert self.buffer_post_process_fn is not None, "Buffer post-processing function is not set."
+        
+        buffer_data = buffer.get_all_data()
+        processed_buffer_data = self.buffer_post_process_fn(buffer_data)
+        # NOTE(linsh): Current implementation will retry with new global batch if any sample is filtered
+        if not processed_buffer_data or len(processed_buffer_data) < self.num_entries:
+            psrl_logger.info(f"Post-processing function returned "
+                             f"{len(processed_buffer_data) if processed_buffer_data else 0} requests "
+                             f"for buffer {buffer_id}, less than {self.num_entries}. Retrying later.")
+            uid_of_processed_buffer = processed_buffer_data.non_tensor_batch["uid"].tolist()
+            for entry_id in range(self.num_entries):
+                data = buffer.entries[entry_id].data
+                if int(data.non_tensor_batch["uid"][0]) not in uid_of_processed_buffer:
+                    buffer.delete(entry_id)
+            self._update_buffer_status(buffer_id)
+            pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
+            candidate_ids = list(pending_buffers)
+            if not candidate_ids:
+                waiting_buffer_id = self.buffer_id
+            else:
+                waiting_buffer_id = min(candidate_ids)
+
+            # Notify agent loop manager to retry new requests
+            self.notify_request_retry(waiting_buffer_id)
+            return False
+        else:
+            buffer.update_all_data(processed_buffer_data)
+            return True
+
     def min_ready_buffer_id(self) -> Optional[int]:
         """
         Get the min buffer ID that is in READY state.
@@ -420,6 +465,39 @@ class StalenessInventory:
         assert entry_info not in self.data_pool, f"Data pool already has data for entry info {entry_info}"
 
         self.data_pool[entry_info] = data
+    
+    def update_to_data_pool(
+        self,
+        entry_info: EntryInfo,
+        data: DataProto,
+    ):
+        """
+        Update rollout data to the group data pool for a specific entry.
+
+        Args:
+            entry_info (EntryInfo): The entry metadata.
+            data (DataProto): The data to add.
+        """
+        self.data_pool.pop(entry_info, None)
+        self.data_pool[entry_info] = data
+
+    def pop_from_data_pool(
+        self,
+        entry_info: EntryInfo,
+    ) -> DataProto:
+        """
+        Pop rollout data from the group data pool for a specific entry.
+
+        Args:
+            entry_info (EntryInfo): The entry metadata.
+        Returns:
+            DataProto: The popped data.
+        Raises:
+            AssertionError: If data for the entry does not exist.
+        """
+        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+
+        return self.data_pool.pop(entry_info)
 
     def get_from_data_pool(
         self,
@@ -441,7 +519,7 @@ class StalenessInventory:
 
     def remove_from_data_pool(
         self,
-        entry_info: EntryInfo
+        entry_info: EntryInfo,
     ):
         """
         Delete data from the group data pool for a specific entry.
@@ -504,52 +582,109 @@ class StalenessInventory:
 
         return target_buffer_id, entry_id
 
-    def old_occupy_data(
+    def update_request_version_tag(
         self,
-        entry_info: EntryInfo,
-        data: Optional[DataProto] = None,
+        request_id: Union[str, int],
+        new_version_tag: int,
     ):
         """
-        Append data to an appropriate buffer, occupying it.
-        NOTE: Since we simplified the reserve process as `set_version_tag` in rollout server,
-        this method is used to occupy the data in the buffer directly, such that the data tracker
-        is not used.
-
+        Update the version tag of a specific request in the data tracker and buffer.
         Args:
-            entry_info (EntryInfo): The entry metadata to occupy.
-            data (Optional[DataProto]): The data to occupy with. If None, will use data from data_pool.
+            request_id (Union[str, int]): The global unique request ID to update.
+            new_version_tag (int): The new model version tag to set.
+        Raises:
+            AssertionError: If the request ID is not found or the new version tag is out of staleness bounds.
         """
-        if data is None:
-            # For group sampling, the rollout data is stored in the group data pool.
-            assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-            data = self.data_pool.pop(entry_info)
-            if data is None:
-                return
-        
-        rollout_instance_id = entry_info.rollout_instance_id
 
-        # Step 2: Get all PENDING buffers within the staleness limit
-        pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
-        candidate_ids = list(pending_buffers)
-        assert candidate_ids, f"No suitable PENDING buffer found."
-
-        # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
-        target_buffer_id = min(candidate_ids)
-        buffer = self.buffers[target_buffer_id]
-        entry_id = buffer.get_first_non_occupied()
-        assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, \
-            "Found non-occupied entry must be EMPTY"
+        entry_to_update = None
+        for entry_info in self.data_tracker.keys():
+            if entry_info.request_id == request_id:
+                entry_to_update = entry_info
+                break
+        assert entry_to_update is not None, f"Request ID {request_id} not found in data tracker"
         
-        # Create entry info and update buffer
-        buffer.insert(
-            entry_id,
-            EntryCategory.OCCUPIED, 
-            data=data, 
-            entry_info=entry_info
+        old_buffer_id, old_entry_id = self.data_tracker[entry_to_update]
+        assert old_buffer_id - self.staleness <= new_version_tag <= old_buffer_id, \
+            f"New version tag {new_version_tag} is not within staleness bounds for request ID {request_id}"
+        
+        new_entry_info = EntryInfo(
+            rollout_instance_id=entry_to_update.rollout_instance_id,
+            request_id=entry_to_update.request_id,
+            model_version=new_version_tag
         )
-        self._update_buffer_status(target_buffer_id)
+        # Update data tracker with new entry info
+        del self.data_tracker[entry_to_update]
+        self.data_tracker[new_entry_info] = (old_buffer_id, old_entry_id)
+        psrl_logger.debug(f"Updated request ID {entry_to_update.request_id} from version tag {entry_to_update.model_version} to {new_version_tag}")
+        # Update entry info in the buffer
+        buffer = self.buffers[old_buffer_id]
+        buffer.entries[old_entry_id].entry_info = new_entry_info
 
-    def occupy_data(
+    def clear_reserved_entries(
+        self,
+        entry_infos: Union[EntryInfo, List[EntryInfo]],
+    ):
+        """
+        Clear RESERVED entries from buffers and update data tracker.
+        It may involve moving other RESERVED entries with the same model version to fill the blanks across buffers.
+        
+        Args:
+            entry_infos (Union[EntryInfo, List[EntryInfo]]): The entry metadata or list of metadata to clear.
+        Raises:
+            AssertionError: If any entry_info is not tracked.
+        """
+
+        if not isinstance(entry_infos, list):
+            entry_infos = [entry_infos]
+        changed_buffer_ids = []
+        for entry_info in entry_infos:
+            if entry_info in self.data_tracker:
+                buffer_id, entry_id = self.data_tracker[entry_info]
+                buffer = self.buffers[buffer_id]
+                # Delete the entry from the buffer
+                buffer.delete(entry_id)
+                del self.data_tracker[entry_info]
+                psrl_logger.debug(f"Cleared RESERVED entry {entry_info} from (buffer {buffer_id}, entry {entry_id})")
+                changed_buffer_ids.append(buffer_id)
+                # Entry movement
+                model_version = entry_info.model_version
+                min_buffer_id = model_version - self.staleness
+                first_reserved_entry_id = None
+                exchange_buffer_id = None
+                for bid in range(min_buffer_id, buffer_id + 1):
+                    if bid not in self.buffers:
+                        continue
+                    b = self.buffers[bid]
+                    for eid, entry in enumerate(b.entries):
+                        if (
+                            entry.category == EntryCategory.RESERVED and
+                            entry.entry_info.model_version == model_version and
+                            entry.entry_info not in entry_infos
+                        ):
+                            first_reserved_entry_id = eid
+                            exchange_buffer_id = bid
+                            break
+                if (
+                    first_reserved_entry_id != None and 
+                    (exchange_buffer_id < buffer_id or first_reserved_entry_id < entry_id)
+                ):
+                    exchange_buffer = self.buffers[exchange_buffer_id]
+                    first_reserved_entry_info = exchange_buffer.entries[first_reserved_entry_id].entry_info
+                    # Move the RESERVED entry to the position of the deleted (i.e., EMPTY) entry
+                    buffer.entries[entry_id] = exchange_buffer.entries[first_reserved_entry_id]
+                    exchange_buffer.delete(first_reserved_entry_id)
+                    # Update data tracker with the new position
+                    if first_reserved_entry_info is not None:
+                        self.data_tracker[first_reserved_entry_info] = (buffer_id, entry_id)
+                        psrl_logger.debug(f"Moved RESERVED entry {first_reserved_entry_info} "
+                                          f"from (buffer {exchange_buffer_id}, entry {first_reserved_entry_id}) "
+                                          f"to (buffer {buffer_id}, entry {entry_id})")
+                    if exchange_buffer_id != buffer_id and exchange_buffer_id not in changed_buffer_ids:
+                        changed_buffer_ids.append(exchange_buffer_id)
+        for buffer_id in set(changed_buffer_ids):
+            self._update_buffer_status(buffer_id)
+
+    def occupy_data_without_reserve(
         self,
         entry_info: EntryInfo,
         data: Optional[DataProto] = None,
@@ -582,9 +717,10 @@ class StalenessInventory:
 
         # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
-        # TODO(linsh): add staleness check
-        # if entry_info.model_version + self.staleness < target_buffer_id:
-        #     raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
+        
+        # Check staleness constraint
+        if entry_info.model_version + self.staleness < target_buffer_id:
+            raise ValueError(f"Entry {entry_info} is too stale for buffer {target_buffer_id} with model version {entry_info.model_version}.")
 
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()
@@ -600,7 +736,6 @@ class StalenessInventory:
         )
         self._update_buffer_status(target_buffer_id)
 
-    @deprecated("This method is deprecated and will be removed in future versions. Use the simpler `occupy_data` method instead.")
     def occupy_data_with_reserve(
         self, 
         entry_info: EntryInfo, 
@@ -624,36 +759,18 @@ class StalenessInventory:
                 return
 
         old_buffer_id, old_entry_id = self.data_tracker[entry_info]
-        old_buffer = self.buffers[old_buffer_id]
 
         # Step 1: Clean up old entry (may cause entry movement)
-        old_buffer.delete(old_entry_id)
-        del self.data_tracker[entry_info]
-        # Caution: this will make an intermediate status for the buffer!
-        # Need to move the smallest RESERVED entry in this buffer (if existed) to the deleted (i.e., EMPTY) entry
-        # Otherwise the RESERVED and EMPTY entries will be criss-crossed in the buffer and hard to manage
-        first_reserved_entry_id = None
-        for entry_id, entry in enumerate(old_buffer.entries):
-            if entry.category == EntryCategory.RESERVED:
-                first_reserved_entry_id = entry_id
-                break
-        if first_reserved_entry_id != None and first_reserved_entry_id < old_entry_id:
-            first_reserved_entry_info = old_buffer.entries[first_reserved_entry_id].entry_info
-            # Move the RESERVED entry to the position of the deleted (i.e., EMPTY) entry
-            old_buffer.entries[old_entry_id] = old_buffer.entries[first_reserved_entry_id]
-            old_buffer.delete(first_reserved_entry_id)
-            # Update data tracker with the new position
-            if first_reserved_entry_info is not None:
-                self.data_tracker[first_reserved_entry_info] = (old_buffer_id, old_entry_id)
-        self._update_buffer_status(old_buffer_id)
+        self.clear_reserved_entries(entry_info)
 
         rollout_instance_id = entry_info.rollout_instance_id
+        model_version = entry_info.model_version
 
         # Step 2: Get all PENDING buffers within the staleness limit
         pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
         candidate_ids = list(pending_buffers)
         candidate_ids = [
-            bid for bid in pending_buffers if bid <= old_buffer_id
+            bid for bid in pending_buffers if bid <= model_version + self.staleness
         ]
 
         assert candidate_ids, f"No suitable PENDING buffer found, but at least buffer {old_buffer_id} should be available for rollout instance {rollout_instance_id}"
@@ -698,4 +815,15 @@ class StalenessInventory:
         data = buffer.get_all_data()
         self.delete_buffer(buffer_id)
         return data
+    
+    def notify_request_retry(self, waiting_buffer_id: int):
+        """
+        Notify the agent loop manager to retry new requests asynchronously.
         
+        Args:
+            waiting_buffer_id (int): The buffer ID that is currently waiting for processing.
+        """
+        assert self.agent_loop_manager is not None, "Agent Loop Manager is not set."
+
+        psrl_logger.debug(f"Notifying agent loop manager to retry new requests for buffer ID {waiting_buffer_id}")
+        ray.get(self.agent_loop_manager.retry_request.remote(waiting_buffer_id))

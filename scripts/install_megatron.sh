@@ -49,10 +49,16 @@ install_cudnn
 
 echo "2. Install TransformerEngine"
 echo "Notice: TransformerEngine installation can take a long time, please be patient"
-NVTE_FRAMEWORK=pytorch python -m pip install --no-deps git+https://github.com/NVIDIA/TransformerEngine.git@v2.2
+NVTE_FRAMEWORK=pytorch python -m pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
 
 echo "3. Install Megatron"
-python -m pip install --no-deps git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.12.0rc3
+python -m pip install --no-deps --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0rc4
+
+echo "4. Install mbridge"
+python -m pip install --no-cache-dir mbridge==v0.15.1
+
+echo "5. Install trl to fix qwen vl"
+python -m pip install --no-cache-dir --no-deps trl
 
 # If you meet a weird bug from triton, please downgrade triton to 3.1.0
 # See https://github.com/volcengine/verl/issues/904

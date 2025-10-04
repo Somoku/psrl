@@ -5,8 +5,8 @@ import torch
 from omegaconf import DictConfig
 
 from verl import DataProto
-from verl.single_controller.base.decorator import Dispatch, register
-from verl.utils.device import get_device_id, get_torch_device
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.utils.device import get_device_id
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.fsdp_utils import (
     fsdp_version,
@@ -163,13 +163,13 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             # FSDP may combined with DDP now (HSDP), so the state dict may not be empty on non-representative workers.
             pass
     
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             ActorRolloutRefWorker.init_model(self)
     
     # The log_prob in training side may need to be recomputed
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_log_prob(self, data: DataProto):
         # NOTE(lhy): compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
@@ -206,7 +206,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
         return output
                 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)

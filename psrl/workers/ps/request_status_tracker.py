@@ -9,10 +9,11 @@ from typing import Union, List, Optional
 from psrl.utils.logger import DualOutputHandler
 from psrl.workers.ps.staleness_controller import EntryInfo
 from psrl.utils.server.command import CommandType, Command
+from psrl.utils.logger import get_ps_logger
 from psrl.utils.logger import deprecated
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+# Use the unified PS logger
+psrl_logger = get_ps_logger()
 
 class RequestStatus(Enum):
     """Represents the status of a request in the system.
@@ -81,8 +82,8 @@ class RequestStatusTracker:
         self,
         request_id: Union[List[int], int],
         status: Union[List[RequestStatus], RequestStatus],
-        model_version: int = -1,
-        rollout_instance_id: int = -1,
+        model_version: Union[List[int], int] = -1,
+        rollout_instance_id: Union[List[int], int] = -1,
     ) -> Union[List[bool], bool]:
         """Update the status of requests.
         
@@ -138,6 +139,8 @@ class RequestStatusTracker:
                                       req_id, request_version, self._running_min_version)
                     request_update_success[i] = False
                     continue
+            else:
+                raise KeyError(f"Request ID {req_id} not found in request info map.")
             
             if req_id in self._request_id_to_status:
                 new_status = status[i]
@@ -230,28 +233,40 @@ class RequestStatusTracker:
     
     def add_request(
         self,
-        request_id: int,
-        rollout_instance_id: int = -1,
-        model_version: int = -1,
-        status: RequestStatus = RequestStatus.PENDING,
+        request_id: Union[List[int], int],
+        rollout_instance_id: Union[List[int], int] = -1,
+        model_version: Union[List[int], int] = -1,
+        status: Union[List[RequestStatus], RequestStatus] = RequestStatus.PENDING,
     ):
         """
-        Add a new request to the status manager.
+        Add new requests to the status manager.
         
         Args:
-            request_id (int): The unique identifier of the request.
-            rollout_instance_id (int, optional): The instance ID of the rollout worker. Defaults to -1.
-            model_version (int, optional): The model version of the request. Defaults to -1.
-            status (RequestStatus, optional): The initial status of the request. Defaults to RequestStatus.PENDING.
+            request_id (Union[List[int], int]): The unique identifier(s) of the request(s).
+            rollout_instance_id (Union[List[int], int], optional): The instance ID(s) of the rollout worker(s). Defaults to -1.
+            model_version (Union[List[int], int], optional): The model version(s) of the request(s). Defaults to -1.
+            status (Union[List[RequestStatus], RequestStatus], optional): The initial status(es) of the request(s). Defaults to RequestStatus.PENDING.
         """
-        psrl_logger.debug(f"Adding request {request_id} to status tracker with status {status}, rollout instance id {rollout_instance_id}, model version {model_version}")
-        self._request_infos[request_id] = EntryInfo(
-            request_id=request_id,
-            rollout_instance_id=rollout_instance_id,
-            model_version=model_version,
-        )
-        self._request_id_to_status[request_id] = status
-        self._status_to_request_ids[status].add(request_id)
+        if not isinstance(request_id, list):
+            request_id = [request_id]
+        if not isinstance(rollout_instance_id, list):
+            rollout_instance_id = [rollout_instance_id] * len(request_id)
+        if not isinstance(model_version, list):
+            model_version = [model_version] * len(request_id)
+        if not isinstance(status, list):
+            status = [status] * len(request_id)
+        
+        assert len(request_id) == len(rollout_instance_id) == len(model_version) == len(status), \
+            "All parameter lists must have the same length."
+        
+        for i, req_id in enumerate(request_id):
+            self._request_infos[req_id] = EntryInfo(
+                request_id=req_id,
+                rollout_instance_id=rollout_instance_id[i],
+                model_version=model_version[i],
+            )
+            self._request_id_to_status[req_id] = status[i]
+            self._status_to_request_ids[status[i]].add(req_id)
     
     def abort_requests(self, request_ids: Union[List[int], int], blocking: bool = False):
         """
@@ -439,10 +454,10 @@ class RequestStatusTracker:
             if req_id in self._request_id_to_status:
                 status = self._request_id_to_status[req_id]
                 self._status_to_request_ids[status].discard(req_id)
-                del self._request_id_to_status[req_id]
+                self._request_id_to_status.pop(req_id)
             
             if req_id in self._request_infos:
-                del self._request_infos[req_id]
+                self._request_infos.pop(req_id)
             
             if req_id in self._abort_request_ids:
                 self._abort_request_ids.remove(req_id)
@@ -480,8 +495,8 @@ class RequestStatusTracker:
             set[int]: A set of requests that are dispatched to the specified instance.
         """
         return {info for req_id, info in self._request_infos.items() if info.rollout_instance_id == instance_id}
-    
-    def abort_requests_of_version(self, version: int):
+
+    def abort_requests_of_version(self, version: int) -> list[int]:
         """
         Abort all requests associated with a specific version.
         This method will collect all request IDs that match the specified version
@@ -490,6 +505,8 @@ class RequestStatusTracker:
         
         Args:
             version (int): The version to abort requests for.
+        Returns:
+            list[int]: A list of request IDs that were aborted.
         """
         assert version >= 0, "Version must be a non-negative integer."
 
@@ -498,9 +515,11 @@ class RequestStatusTracker:
             if info.model_version == version:
                 # If the request version matches, we will abort it
                 abort_request_ids.add(req_id)
-        psrl_logger.debug(f"Aborting requests of version {version}: {abort_request_ids}")
         self._running_min_version = max(self._running_min_version, version + 1)
-        self.abort_requests(list(abort_request_ids), blocking=False)
+        if abort_request_ids:
+            psrl_logger.debug(f"Aborting requests of version {version}: {abort_request_ids}")
+            self.abort_requests(list(abort_request_ids), blocking=False)
+        return list(abort_request_ids)
 
     def update_request_version(self, request_id: Union[List[int], int], new_version: int):
         """

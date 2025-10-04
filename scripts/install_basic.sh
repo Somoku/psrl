@@ -10,25 +10,26 @@ THIRD_PARTY_PATH="$PSRL_PATH/third_party"
 mkdir -p $THIRD_PARTY_PATH
 
 echo "1. Install pytorch and tensordict"
-# python -m pip install --no-cache-dir "torch==2.6.0" "torchvision==0.21.0" "torchaudio==2.6.0" --index-url https://download.pytorch.org/whl/cu124
 python -m pip install --no-cache-dir "torch==2.7.1" "torchvision==0.22.1" "torchaudio==2.7.1" --index-url https://download.pytorch.org/whl/cu128
-python -m pip install --no-cache-dir "tensordict==0.6.2" torchdata
+# python -m pip install --no-cache-dir "torch==2.8.0" "torchvision==0.23.0" "torchaudio==2.8.0" --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --no-cache-dir "tensordict==0.10.0" torchdata
 
 echo "2. Install xformers"
 # python -m pip install -v --no-build-isolation -U "git+https://github.com/facebookresearch/xformers.git@v0.0.29.post3#egg=xformers"
 python -m pip install -v --no-build-isolation -U "git+https://github.com/facebookresearch/xformers.git@v0.0.31#egg=xformers"
 
 echo "3. Install basic packages"
-python -m pip install "transformers[hf_xet]<4.54.0" accelerate datasets peft hf-transfer matplotlib flask \
-    "numpy<2.0.0" "pyarrow>=15.0.0" pandas paramiko mbridge \
-    ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
+python -m pip install "transformers[hf_xet]>=4.55.4" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
+    "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko \
+    ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
     pytest py-spy pyext pre-commit ruff meson ninja pynvml requests einops
 
-python -m pip install "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
+python -m pip uninstall -y pynvml nvidia-ml-py
+python -m pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
 
 echo "4. Install FlashAttention and FlashInfer"
-# Install flash-attn-2.7.4.post1
-python -m pip install --no-cache-dir --no-build-isolation "flash-attn==2.7.4.post1" 
+# Install flash-attn-2.7.2.post1
+python -m pip install --no-cache-dir --no-build-isolation "flash-attn==2.7.2.post1" 
 # Install flashinfer-0.2.7.post1
 python -m pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.2.7.post1"
 
@@ -49,11 +50,12 @@ python -m pip install opencv-fixer && \
 echo "7. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    git clone -b v0.10.0 https://github.com/vllm-project/vllm.git
+    git clone -b v0.10.2 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$THIRD_PARTY_PATH/vllm
     popd
 fi
 pushd $VLLM_PATH
+cp $PSRL_PATH/patch/vllm/use_existing_torch.py .
 python use_existing_torch.py
 python -m pip install -r requirements/build.txt
 python -m pip install --no-build-isolation -e .
@@ -61,8 +63,10 @@ popd
 
 if [ -z "$VERL_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    git clone -b v0.5.x https://github.com/volcengine/verl.git
+    git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
+    cd VERL_PATH
+    git checkout 6ff2b43
     popd
 fi
 pushd $VERL_PATH
@@ -70,7 +74,7 @@ python -m pip install -e .
 popd
 
 echo "8. Apply patch for vllm and verl"
-pushd $VLLM_PATH/patch/vllm
+pushd $PSRL_PATH/patch/vllm
 bash apply_patch.sh
 popd
 

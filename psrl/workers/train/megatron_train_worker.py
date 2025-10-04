@@ -6,7 +6,8 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.utils.memory_utils import aggressive_empty_cache
+from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
@@ -142,13 +143,13 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         else:
             assert len(full_state_dict) == 0, "The model state dict should be empty on non-representative workers."
     
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             ActorRolloutRefWorker.init_model(self)
     
     # The log_prob in training side may need to be recomputed    
-    @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
@@ -162,10 +163,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # clear kv cache
         if self._is_offload_param:
             offload_megatron_model_to_cpu(self.actor_module)
-        get_torch_device().empty_cache()
+        aggressive_empty_cache(force_sync=True)
         return output
-                
-    @register(dispatch_mode=Dispatch.MEGATRON_COMPUTE_PROTO)
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)

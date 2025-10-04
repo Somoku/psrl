@@ -10,25 +10,16 @@ Methods to check:
 
 - `__init__`
 - `compute_log_prob`
-- `update_actor`
 
 ### PSRL_FSDPTrainWorker
 
 Methods to check:
 
-- `__init__`
 - `compute_log_prob`
-- `update_actor`
 
 ## Generation Workers
 
-### PSRL_FSDPGenWorker
-
-Methods to check:
-
-- `_build_rollout`
-
-### PSRL_MegatronGenWorker
+### PSRL_GenWorker
 
 Methods to check:
 
@@ -61,6 +52,10 @@ Methods to check:
 - `_save_checkpoint`
 - `_load_checkpoint`
 - `fit`
+
+### utils
+
+- `compute_advantage`
 
 ## Configuration Files
 

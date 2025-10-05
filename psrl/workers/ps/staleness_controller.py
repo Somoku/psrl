@@ -424,8 +424,8 @@ class StalenessInventory:
         Args:
             max_staleness_buffer_id (int): The maximum buffer ID to ensure exists.
         """
-        curr_max_buffer_id = max(self.buffers.keys(), default=-1)
-        for buffer_id in range(curr_max_buffer_id + 1, max_staleness_buffer_id + 1):
+        next_buffer_id = self.buffer_id
+        for buffer_id in range(next_buffer_id, max_staleness_buffer_id + 1):
             self.create_buffer(buffer_id)
 
     def get_empty_entries_total_num(

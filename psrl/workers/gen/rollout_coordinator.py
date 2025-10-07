@@ -314,7 +314,7 @@ class RolloutCoordinator(CommandExtension):
                     if instance_to_uids is None:
                         raise ValueError("Abort command must contain 'instance_to_uids' in args.")
                     
-                    psrl_logger.debug(f"Received ABORT command with instance_to_uids: {instance_to_uids}")
+                    psrl_logger.info(f"Received ABORT command with instance_to_uids: {instance_to_uids}")
                     futures = []
                     for instance_id, uids in instance_to_uids.items():
                         if not uids:
@@ -334,7 +334,7 @@ class RolloutCoordinator(CommandExtension):
                         interrupted_request_num = np.sum(interrupted_request_nums)
                     
                     result = interrupted_request_num
-                    psrl_logger.debug(f"Received ABORT command, interrupted {interrupted_request_num} requests")
+                    psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
                 elif command_type == CommandType.CHECK_AND_SYNC:
                     if not self.config.psrl.partial_rollout.enable or not self.config.psrl.status_collection.enable:
                         raise ValueError("CHECK_AND_SYNC command is only available when "

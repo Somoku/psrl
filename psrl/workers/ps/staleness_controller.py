@@ -404,6 +404,15 @@ class StalenessInventory:
         ready_buffers = self._buffer_ids_by_status[BufferStatus.READY]
         return max(ready_buffers) if ready_buffers else None
 
+    def ready_buffer_ids(self) -> Set[int]:
+        """
+        Get all buffer IDs that are in READY state.
+
+        Returns:
+            Set[int]: A set of READY buffer IDs.
+        """
+        return self._buffer_ids_by_status[BufferStatus.READY]
+
     def min_not_ready_buffer_id(self) -> Optional[int]:
         """
         Get the smallest buffer ID that is not in READY state (i.e., STUCK or PENDING).

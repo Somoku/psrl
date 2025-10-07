@@ -394,13 +394,11 @@ class DataProcessor:
                         ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
                         ))
-                        data_ref =ray.put(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
-                        self.agent_loop_manager_handle.put_data.remote({"data_ref": data_ref})
+                        self.agent_loop_manager_handle.put_data.remote(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
                 else:
                     for uid in gen_batch.non_tensor_batch["uid"]:
                         ray.get(self.ps_manager_handle.add_request.remote(uid))
-                    data_ref = ray.put(gen_batch)
-                    self.agent_loop_manager_handle.put_data.remote({"data_ref": data_ref})
+                    self.agent_loop_manager_handle.put_data.remote(gen_batch)
 
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:
@@ -418,4 +416,4 @@ class DataProcessor:
         
         # Signal end of data processing
         psrl_logger.info("Data processing stopped, sending shutdown signal.")
-        self.agent_loop_manager_handle.put_data.remote({"data_ref": None})
+        self.agent_loop_manager_handle.put_data.remote(None)

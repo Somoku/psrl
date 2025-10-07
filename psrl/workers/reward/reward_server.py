@@ -291,19 +291,6 @@ class RewardServer(CommandExtension):
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-
-    '''
-    def put_data(self, data_ref: dict):
-        """Put objectref of rollout data into the reward server's processing queue.
-        
-        This method is used by agent loop workers to send generated rollout data
-        to the reward server for reward computation.
-        
-        Args:
-            data_ref (dict): Dictionary containing a reference to the rollout DataProto.
-        """
-        self.rollout_queue.put(data_ref)
-    '''
     
     def put_data(self, data: DataProto):
         """Put objectref of rollout data into the reward server's processing queue.
@@ -407,8 +394,6 @@ class RewardServer(CommandExtension):
             # Data processing
             # Process requests in the rollout queue
             if not self.rollout_queue.empty() and not self.reward_paused and not self.skipping_rollout_queue:
-                # rollout_data_ref = self.rollout_queue.get_nowait()
-                # rollout_data = ray.get(rollout_data_ref["data_ref"])
                 rollout_data = self.rollout_queue.get_nowait()
                 
                 with log_dual_events("Process rollout data", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):

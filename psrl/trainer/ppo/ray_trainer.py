@@ -1395,8 +1395,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                         self.global_steps, len(batch) if batch is not None else 0)
                     else:
                         from verl.trainer.ppo.reward import compute_reward
-                        batch_ref = ray.get(self.agent_loop_manager_handle.get_data_ref.remote())
-                        batch = ray.get(batch_ref) if batch_ref is not None else None
+                        batch = ray.get(self.agent_loop_manager_handle.get_data.remote())
                         if batch is None:
                             psrl_logger.info("No more data from agent loop manager, ending training at step %d", self.global_steps)
                             break

@@ -548,6 +548,8 @@ class PSRL_GenWorker(Worker):
         
     def pull_model(self) -> None:
         assert self.config.rollout.mode == "sync", "Only support `sync` mode."
+        assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks."
+
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_pull_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
@@ -559,6 +561,8 @@ class PSRL_GenWorker(Worker):
         
     async def pull_model_async(self) -> None:
         assert self.config.rollout.mode == "psrl_async", "Only support `psrl_async` mode."
+        assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks: {self.version_to_active_tasks=}"
+
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model_async()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
@@ -1317,8 +1321,8 @@ class PSRL_GenWorker(Worker):
         await self._wait_for_version_turn(needed_model_version)
         
         # Handle model update if needed
-        if needed_model_version > curr_rollout_instance_model_version:
-            async with self.version_task_lock:
+        async with self.version_task_lock:
+            if needed_model_version > self.curr_rollout_instance_model_version:
                 # Double-check the condition inside the lock to avoid race conditions
                 if self.curr_rollout_instance_model_version < needed_model_version:
                     with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
@@ -1335,10 +1339,6 @@ class PSRL_GenWorker(Worker):
                     psrl_logger.debug(f"After pulling model, got version {self.curr_rollout_instance_model_version} for needed {needed_model_version}")
                     if self.curr_rollout_instance_model_version > needed_model_version:
                         psrl_logger.warning(f"Actual model version for generation is {self.curr_rollout_instance_model_version}, needed model version is {needed_model_version}")
-
-        # Mark this version as currently executing
-        async with self.version_task_lock:
-            self.current_executing_version = needed_model_version
 
         task = self._generate_loop.create_task(
             self._generate_async_task(request, needed_model_version)
@@ -1410,6 +1410,7 @@ class PSRL_GenWorker(Worker):
                 if self.current_executing_version is not None and needed_model_version < self.current_executing_version:
                     raise ValueError(f"Needed model version {needed_model_version} is less than current executing version {self.current_executing_version}. This should not happen.")
                 # This version can proceed immediately
+                self.current_executing_version = needed_model_version
                 return
             
             # Create an event for this version if it doesn't exist
@@ -1435,7 +1436,7 @@ class PSRL_GenWorker(Worker):
             return True
             
         # Check if there's a gap between current executing version and needed version
-        for v in range(self.current_executing_version + 1, version):
+        for v in range(self.current_executing_version, version):
             if v in self.version_to_task_num:
                 return False
         return True
@@ -1458,8 +1459,8 @@ class PSRL_GenWorker(Worker):
         
         if next_version is not None:
             psrl_logger.debug(f"Signaling version {next_version} to proceed after {completed_version} completed")
-            self.version_ready_events[next_version].set()
             self.current_executing_version = next_version
+            self.version_ready_events[next_version].set()
         else:
             # No pending versions, reset current executing version
             self.current_executing_version = None

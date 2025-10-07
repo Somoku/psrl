@@ -101,6 +101,8 @@ class PSManager(RequestStatusTracker):
         self.logged_ready_buffer_ids: Set[int] = set()
         
         self.max_ready_buffer_id = -1
+        
+        self.check_interrupt = False
 
         # Initialize the staleness inventory
         # TODO(linsh): validate the redundant rollout cases
@@ -318,36 +320,49 @@ class PSManager(RequestStatusTracker):
         """
         # Check whether there exists ready buffer for training
         max_ready_buffer_id = self.staleness_inventory.max_ready_buffer_id()
+        min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
         if (
             max_ready_buffer_id is not None and
             max_ready_buffer_id > self.max_ready_buffer_id
         ):
             self.max_ready_buffer_id = max_ready_buffer_id
+            self.check_interrupt = True
+        
+        if self.check_interrupt:
             curr_ps_model_version = self.get_ps_model_version()
         
             # Notify the request status manager to abort requests
             # whose version_tag is equal to `min_ready_buffer_id - S`
-            if max_ready_buffer_id >= self.psrl_config.staleness:
-                # Abort requests with version_tag equal to `min_ready_buffer_id - S`
-                version_to_abort = max_ready_buffer_id - self.psrl_config.staleness
-                psrl_logger.debug(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")
-                abort_request_ids = self.abort_requests_of_version(version_to_abort)
-                # Clear the reserved entries for the aborted requests
-                self.staleness_inventory.clear_reserved_entries(abort_request_ids)
-                psrl_logger.debug(f"Abort requests of version {version_to_abort} done")
+            if self.max_ready_buffer_id >= self.psrl_config.staleness:
+                ready_buffer_ids = self.staleness_inventory.ready_buffer_ids()
+                version_to_abort = self.max_ready_buffer_id - self.psrl_config.staleness
+                # NOTE(linsh): The READY order of buffers can not be guaranteed
+                # so we need more strict checks to avoid aborting requests too early.
+                # `curr_ps_model_version - 1` is READY and consumed by training workers
+                # so we need to check from `curr_ps_model_version` to `max_ready_buffer_id`
+                # to ensure all buffers in `[version_to_abort, max_ready_buffer_id]` are READY
+                buffer_range = set(range(max(version_to_abort, curr_ps_model_version), self.max_ready_buffer_id + 1))
+                if buffer_range.issubset(ready_buffer_ids):
+                    # Abort requests with version_tag equal to `min_ready_buffer_id - S`
+                    psrl_logger.info(f"Aborting requests with version tag {version_to_abort} due to ready buffer {max_ready_buffer_id}.")
+                    abort_request_ids = self.abort_requests_of_version(version_to_abort)
+                    # Clear the reserved entries for the aborted requests
+                    self.staleness_inventory.clear_reserved_entries(abort_request_ids)
+                    psrl_logger.info(f"Abort requests of version {version_to_abort} done: {abort_request_ids=}")
             
             # Notify the rollout server to check interruption
             if self.psrl_config.partial_rollout.enable:
-                psrl_logger.debug(f"Start to check and sync for ready buffer {max_ready_buffer_id} with current PS model version {curr_ps_model_version}.")
+                psrl_logger.debug(f"Start to check and sync for ready buffer {self.max_ready_buffer_id} with current PS model version {curr_ps_model_version}.")
                 # Create async task to avoid blocking
                 command = Command(
                     type=CommandType.CHECK_AND_SYNC,
-                    buffer_id=max_ready_buffer_id,
+                    buffer_id=self.max_ready_buffer_id,
                     curr_ps_model_version=curr_ps_model_version,
                 )
                 asyncio.create_task(self.execute_command(self.rollout_coordinator, command, blocking=False))
+            
+            self.check_interrupt = False
         
-        min_ready_buffer_id = self.staleness_inventory.min_ready_buffer_id()
         if min_ready_buffer_id is not None:
             self.process_ready_buffer(min_ready_buffer_id)
 

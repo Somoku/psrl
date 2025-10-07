@@ -211,12 +211,6 @@ class PSRL_AgentLoopWorker:
                     output = output.select_idxs(dispatch_request_idxs)
                     # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into the rollout queue, so we process the data inside the reward server
                     # output = self._post_process(output)
-                    # NOTE(lhy): Use object is slow, don't know why
-                    '''
-                    output_ref = ray.put(output)
-                    # NOTE(linsh): wrap the objectref in a dict to avoid implicit `ray.get` operation
-                    self.reward_server.put_data.remote({"data_ref": output_ref}) # Still cost ~17s (scripts in `examples/precision_test/dapo`)
-                    '''
                     self.reward_server.put_data.remote(output)
                     '''
                     batch_size = len(output)

@@ -281,7 +281,8 @@ class RequestStatusTracker:
         
         request_ids = set(request_ids) # Ensure uniqueness
         filtered_request_ids = [req_id for req_id in request_ids if req_id in self._request_id_to_status]
-        psrl_logger.debug(f"Added requests {filtered_request_ids} to abort set")
+        if filtered_request_ids:
+            psrl_logger.info(f"Added requests {filtered_request_ids} to abort set")
         self._abort_request_ids.update(filtered_request_ids)
         
         # Classify the requests in `request_ids` into their current statuses

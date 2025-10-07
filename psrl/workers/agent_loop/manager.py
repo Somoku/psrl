@@ -90,27 +90,27 @@ class PSRL_AgentLoopManager:
             futures.append(worker.stop_busy_loop.remote())
         ray.get(futures)
 
-    async def put_data(self, data_ref: dict):
+    async def put_data(self, data: DataProto):
         """Put objectref of data into the manager's data queue."""
-        await self.data_queue.put(data_ref)
+        await self.data_queue.put(data)
 
-    async def get_data_ref(self) -> dict:
+    async def get_data(self) -> DataProto:
         """Get data from the manager's data queue."""
-        data_ref = await self.data_queue.get()
-        return data_ref
+        data = await self.data_queue.get()
+        return data
 
     async def _dispatch_data(self):
         """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_busy_loop_task:
             if not self.data_queue.empty():
-                data_ref = await self.data_queue.get()
-                data = None if data_ref is None else await data_ref["data_ref"]
-                psrl_logger.debug(f"Got {len(data)} requests from data queue")
+                data = await self.data_queue.get()
                 
                 # Receive END signal to stop processing data queue
                 if data is None:
                     self.stop_busy_loop_task = True
                     continue
+                
+                psrl_logger.debug(f"Got {len(data)} requests from data queue")
 
                 # Set version tag for each request
                 batch_size = len(data)

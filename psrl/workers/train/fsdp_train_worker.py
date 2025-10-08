@@ -174,37 +174,38 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # NOTE(lhy): compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
         # which is mostly used for ref log_prob calculation
-        assert self._is_actor
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
+            assert self._is_actor
+            if self._is_offload_param:
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        # Support all hardwares
-        from contextlib import nullcontext
+            # Support all hardwares
+            from contextlib import nullcontext
 
-        is_lora = data.meta_info.pop("is_lora", False)
-        adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
-        data = data.to(get_device_id())
-        # perform recompute log_prob
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data)
-            with adapter_ctx:
-                output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(
-                tensors={"recomputed_log_probs": output, "entropys": entropys}
-            )
-            output = self.ulysses_sharding_manager.postprocess_data(output)
+            is_lora = data.meta_info.pop("is_lora", False)
+            adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
+            data = data.to(get_device_id())
+            # perform recompute log_prob
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data)
+                with adapter_ctx:
+                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+                output = DataProto.from_dict(
+                    tensors={"recomputed_log_probs": output, "entropys": entropys}
+                )
+                output = self.ulysses_sharding_manager.postprocess_data(output)
 
-        output = output.to("cpu")
+            output = output.to("cpu")
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
-            self.actor.actor_module._handle.reshard(True)
+            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+            # unshard the root FSDP module
+            if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
+                self.actor.actor_module._handle.reshard(True)
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
-        return output
+            return output
                 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):

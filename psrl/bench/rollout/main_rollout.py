@@ -138,22 +138,19 @@ class SimpleRolloutTester:
         
         # Run performance test
         await self.run_performance_test()
+        
+    def _create_test_data(self) -> List[Dict[str, Any]]:
+        vllm_input_1 = {"prompt_token_ids": [self.tokenizer.pad_token_id] * 1024}
+        vllm_input_2 = {"prompt_token_ids": [self.tokenizer.pad_token_id] * 1024 * 7}
+        return [vllm_input_1] * 64 + [vllm_input_2] * 8
 
     def _create_synthetic_data(self, batch_size: int) -> List[Dict[str, Any]]:
         """Create synthetic test data with consistent prompt length."""
         # Create prompts with consistent length using padding tokens
         prompt_length = self.config.data.max_prompt_length
         
-        # Create a base prompt and pad to desired length
-        base_prompt = "Generate a response to the following request:"
-        base_tokens = self.tokenizer.encode(base_prompt)
-        
         # Pad to desired length
-        if len(base_tokens) < prompt_length:
-            padding_tokens = [self.tokenizer.pad_token_id] * (prompt_length - len(base_tokens))
-            padded_tokens = base_tokens + padding_tokens
-        else:
-            padded_tokens = base_tokens[:prompt_length]
+        padded_tokens = [self.tokenizer.pad_token_id] * prompt_length
         
         # Ensure prompt_token_ids is list[int] as required by vLLM
         if isinstance(padded_tokens, np.ndarray):
@@ -312,7 +309,8 @@ class SimpleRolloutTester:
             start_time = time.time()
             try:
                 if test_mode == "synthetic":
-                    test_prompts = self._create_synthetic_data(batch_size)
+                    test_prompts = self._create_test_data()
+                    # test_prompts = self._create_synthetic_data(batch_size)
                 else:
                     test_prompts = self._get_real_data_batch()
                 

@@ -280,7 +280,7 @@ class StalenessInventory:
 
         buffer = StalenessBuffer(self.num_entries, self.ready_num_entries, self.staleness)
         self.buffers[buffer_id] = buffer
-        psrl_logger.debug(f"Created buffer {buffer_id}, current buffer count: {len(self.buffers)}")
+        psrl_logger.info(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
         self._update_buffer_status(buffer_id)
         self.buffer_id += 1
 
@@ -577,7 +577,7 @@ class StalenessInventory:
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_last_non_reserved()
         assert entry_id != -1 and buffer.entries[entry_id].category == EntryCategory.EMPTY, \
-            "Found non-reserved entry must be EMPTY"
+            f"Found non-reserved entry must be EMPTY, but got {buffer.entries[entry_id]} in (buffer {target_buffer_id}, entry {entry_id})"
 
         # Create entry info and update buffer
         buffer.insert(
@@ -588,6 +588,8 @@ class StalenessInventory:
         )
         self.data_tracker[entry_info] = (target_buffer_id, entry_id)
         self._update_buffer_status(target_buffer_id)
+        
+        psrl_logger.debug(f"[Entry Reserve]: entry {entry_info} reserved in (buffer {target_buffer_id}, entry {entry_id})")
 
         return target_buffer_id, entry_id
 
@@ -624,7 +626,7 @@ class StalenessInventory:
         # Update data tracker with new entry info
         del self.data_tracker[entry_to_update]
         self.data_tracker[new_entry_info] = (old_buffer_id, old_entry_id)
-        psrl_logger.debug(f"Updated request ID {entry_to_update.request_id} from version tag {entry_to_update.model_version} to {new_version_tag}")
+        psrl_logger.debug(f"[Entry Update]: entry {new_entry_info} updated from version tag {entry_to_update.model_version} to {new_version_tag} in (buffer {old_buffer_id}, entry {old_entry_id})")
         # Update entry info in the buffer
         buffer = self.buffers[old_buffer_id]
         buffer.entries[old_entry_id].entry_info = new_entry_info
@@ -653,7 +655,7 @@ class StalenessInventory:
                 # Delete the entry from the buffer
                 buffer.delete(entry_id)
                 del self.data_tracker[entry_info]
-                psrl_logger.debug(f"Cleared RESERVED entry {entry_info} from (buffer {buffer_id}, entry {entry_id})")
+                psrl_logger.debug(f"[Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})")
                 changed_buffer_ids.append(buffer_id)
                 # Entry movement
                 model_version = entry_info.model_version
@@ -673,22 +675,25 @@ class StalenessInventory:
                             first_reserved_entry_id = eid
                             exchange_buffer_id = bid
                             break
+                    # Indicate that we have found the first reserved entry to exchange
+                    if first_reserved_entry_id is not None and exchange_buffer_id is not None:
+                        break
                 if (
                     first_reserved_entry_id != None and 
                     (exchange_buffer_id < buffer_id or first_reserved_entry_id < entry_id)
                 ):
                     exchange_buffer = self.buffers[exchange_buffer_id]
                     first_reserved_entry_info = exchange_buffer.entries[first_reserved_entry_id].entry_info
+                    assert first_reserved_entry_info is not None, f"First reserved entry to move must not be None"
                     # Move the RESERVED entry to the position of the deleted (i.e., EMPTY) entry
                     buffer.entries[entry_id] = exchange_buffer.entries[first_reserved_entry_id]
                     exchange_buffer.delete(first_reserved_entry_id)
                     # Update data tracker with the new position
-                    if first_reserved_entry_info is not None:
-                        self.data_tracker[first_reserved_entry_info] = (buffer_id, entry_id)
-                        psrl_logger.debug(f"Moved RESERVED entry {first_reserved_entry_info} "
-                                          f"from (buffer {exchange_buffer_id}, entry {first_reserved_entry_id}) "
-                                          f"to (buffer {buffer_id}, entry {entry_id})")
-                    if exchange_buffer_id != buffer_id and exchange_buffer_id not in changed_buffer_ids:
+                    self.data_tracker[first_reserved_entry_info] = (buffer_id, entry_id)
+                    psrl_logger.debug(f"[Entry Move]: entry {first_reserved_entry_info} moved "
+                                     f"from (buffer {exchange_buffer_id}, entry {first_reserved_entry_id}) "
+                                     f"to (buffer {buffer_id}, entry {entry_id})")
+                    if exchange_buffer_id not in changed_buffer_ids:
                         changed_buffer_ids.append(exchange_buffer_id)
         for buffer_id in set(changed_buffer_ids):
             self._update_buffer_status(buffer_id)
@@ -734,7 +739,7 @@ class StalenessInventory:
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()
         assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, \
-            "Found non-occupied entry must be EMPTY"
+            f"Found non-occupied entry must be EMPTY, but got {buffer.entries[entry_id]} in (buffer {target_buffer_id}, entry {entry_id})"
         
         # Create entry info and update buffer
         buffer.insert(
@@ -791,7 +796,7 @@ class StalenessInventory:
         buffer = self.buffers[target_buffer_id]
         entry_id = buffer.get_first_non_occupied()
         assert entry_id < buffer.num_entries and buffer.entries[entry_id].category == EntryCategory.EMPTY, \
-            "Found non-occupied entry must be EMPTY"
+            f"Found non-occupied entry must be EMPTY, but got {buffer.entries[entry_id]} in (buffer {target_buffer_id}, entry {entry_id})"
         
         # Create entry info and update buffer
         buffer.insert(
@@ -802,6 +807,8 @@ class StalenessInventory:
         )
         self.data_tracker[entry_info] = (target_buffer_id, entry_id)
         self._update_buffer_status(target_buffer_id)
+        
+        psrl_logger.debug(f"[Entry Occupy]: entry {entry_info} occupied in (buffer {target_buffer_id}, entry {entry_id})")
      
     def consume_buffer(
         self, 
@@ -823,6 +830,7 @@ class StalenessInventory:
         buffer = self.buffers[buffer_id]
         data = buffer.get_all_data()
         self.delete_buffer(buffer_id)
+        psrl_logger.info(f"[Buffer Consume]: buffer {buffer_id} consumed")
         return data
     
     def notify_request_retry(self, waiting_buffer_id: int):
@@ -834,5 +842,5 @@ class StalenessInventory:
         """
         assert self.agent_loop_manager is not None, "Agent Loop Manager is not set."
 
-        psrl_logger.debug(f"Notifying agent loop manager to retry new requests for buffer ID {waiting_buffer_id}")
+        psrl_logger.info(f"Notifying agent loop manager to retry new requests for buffer ID {waiting_buffer_id}")
         ray.get(self.agent_loop_manager.retry_request.remote(waiting_buffer_id))

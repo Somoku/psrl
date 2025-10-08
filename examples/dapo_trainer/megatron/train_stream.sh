@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='psrl_dapo'
-experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_2'
-
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
@@ -24,10 +21,10 @@ TRAIN_TP=4 # TP in the training side
 TRAIN_PP=2 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 
-NNODES=8
+NNODES=6
 NGPUS_PER_NODE=8
 
-GEN_NNODES=4 # Number of nodes for generation
+GEN_NNODES=2 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
@@ -44,9 +41,9 @@ tis_imp_ratio_cap=2.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_response_length=$((1024 * 30))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=$((1024 * 16))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=256
@@ -70,7 +67,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/dapo_trainer/megatron/psrl_log \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=tis \
@@ -123,7 +120,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
@@ -153,11 +150,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
-    trainer.logger='["console","wandb"]' \
-    trainer.project_name="${project_name}" \
-    trainer.experiment_name="${experiment_name}" \
+    trainer.logger='["console"]' \
+    trainer.project_name="psrl_megatron_dapo_tis_test" \
+    trainer.experiment_name="stream" \
     trainer.val_before_train=False \
     trainer.test_freq=10 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=20 2>&1 | tee psrl_megatron_dapo_tis_test-stream.log

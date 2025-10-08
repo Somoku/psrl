@@ -151,20 +151,21 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     # The log_prob in training side may need to be recomputed    
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def compute_log_prob(self, data: DataProto):
-        assert self._is_actor
-        if self._is_offload_param:
-            load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-        data = data.to(get_device_id())
-        output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-        output = DataProto.from_dict(
-            tensors={"recomputed_log_probs": output, "entropys": entropys}
-        )
-        output = output.to("cpu")
-        # clear kv cache
-        if self._is_offload_param:
-            offload_megatron_model_to_cpu(self.actor_module)
-        aggressive_empty_cache(force_sync=True)
-        return output
+        with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
+            assert self._is_actor
+            if self._is_offload_param:
+                load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+            data = data.to(get_device_id())
+            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            output = DataProto.from_dict(
+                tensors={"recomputed_log_probs": output, "entropys": entropys}
+            )
+            output = output.to("cpu")
+            # clear kv cache
+            if self._is_offload_param:
+                offload_megatron_model_to_cpu(self.actor_module)
+            aggressive_empty_cache(force_sync=True)
+            return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):

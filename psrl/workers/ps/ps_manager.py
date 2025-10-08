@@ -325,6 +325,7 @@ class PSManager(RequestStatusTracker):
             max_ready_buffer_id is not None and
             max_ready_buffer_id > self.max_ready_buffer_id
         ):
+            self.log_ready_buffer(max_ready_buffer_id)
             self.max_ready_buffer_id = max_ready_buffer_id
             self.check_interrupt = True
         
@@ -400,10 +401,10 @@ class PSManager(RequestStatusTracker):
         Args:
             min_ready_buffer_id (int): The minimum ready buffer ID to process
         """
-        self.log_ready_buffer(min_ready_buffer_id)
         # If there are ready buffers, wake up the waiters for the minimum ready buffer
         self._awake_training_batch_waiters(min_ready_buffer_id)
 
+    @deprecated("Use `store_and_maybe_occupy_rollout_instance_request` instead.")
     def occupy_rollout_instance_request(
         self,
         rollout_instance_id: Union[str, int],
@@ -607,7 +608,7 @@ class PSManager(RequestStatusTracker):
                 rollout_instance_id=rollout_instance_id,
                 version_tag=self.model_store.version_tag,
             ))
-            psrl_logger.debug(f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
+            psrl_logger.info(f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
      
     async def wait_for_ps_model_version(self, target_version: int):
         """

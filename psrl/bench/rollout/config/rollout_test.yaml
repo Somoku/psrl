@@ -30,7 +30,6 @@ rollout:
   pipeline_parallel_size: 1
   dtype: bfloat16
   gpu_memory_utilization: 0.95
-  max_model_len: 8192
   max_num_seqs: 512
   max_num_batched_tokens: 4096
   enable_chunked_prefill: false

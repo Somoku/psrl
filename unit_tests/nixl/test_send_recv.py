@@ -54,22 +54,15 @@ if __name__ == "__main__":
     # Allocate memory and register with NIXL
     agent = nixl_agent(args.mode, config)
     if args.mode == "target":
-        # 1GB, 10 tensors
-        # tensors = [torch.ones(1024 * 1024 * 1024 // 4, dtype=torch.float32) for _ in range(10)]
-        # tensors = [torch.tensor([[1, 2], [3, 4]])[:, 1] for _ in range(1)]
-        tensors = [torch.ones(1024, dtype=torch.int64) for _ in range(1)]
+        # 0.01GiB, 1000 tensors
+        tensors = [torch.zeros(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for _ in range(1000)]
     else:
-        # 1GB, 10 tensors
-        # tensors = [torch.zeros(1024 * 1024 * 1024 // 4, dtype=torch.float32) for _ in range(10)]
-        # full_tensors = [torch.tensor([[0, 0], [0, 0]]) for _ in range(1)]
-        # tensors = [full_tensors[0][:, 1]]
-        tensors = [torch.zeros(1024, dtype=torch.int64) for _ in range(1)]
+        tensors = [torch.ones(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for _ in range(1000)]
 
     # print(f"{args.mode} Tensors: {tensors}")
 
     start_time = time.time()
-    reg_descs_all = agent.register_memory(tensors)
-    reg_descs = agent.register_memory([tensor[:512] for tensor in tensors])
+    reg_descs = agent.register_memory(tensors)
     end_time = time.time()
     print(f"Register memory time: {end_time - start_time} seconds")
     if not reg_descs:  # Same as reg_descs if successful
@@ -126,15 +119,7 @@ if __name__ == "__main__":
             print("Creating transfer failed.")
             exit()
 
-        for tensor in tensors:
-            for _ in range(10000):
-                tensor.add_(1)
-        # torch.cuda.synchronize()
-        start_time = time.time()
         state = agent.transfer(xfer_handle)
-        for tensor in tensors:
-            for _ in range(10000):
-                tensor.add_(1)
         if state == "ERR":
             print("Posting transfer failed.")
             exit()
@@ -150,12 +135,9 @@ if __name__ == "__main__":
 
     # Verify data after read
     for i, tensor in enumerate(tensors):
-        """
-        if not torch.allclose(tensor, torch.ones(1024 * 1024 * 1024 // 4)):
-            print(f"Data verification failed for tensor {i}.")
+        if not torch.allclose(tensor, torch.ones(1024 ** 3 // 2 // 128, dtype=torch.bfloat16)):
+            print(f"Data verification failed for tensor {i}: {tensor}")
             exit()
-        """
-        print(f"tensor {i}: {tensor}")
     # print(f"{args.mode} Data verification passed - {tensors}")
 
     if args.mode != "target":

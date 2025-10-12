@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='psrl_dapo'
-exp_name='DAPO-TIS-Qwen2.5-32B-AIME-fsdp2-batch-nixl-staleness_0'  # Truncated Importance Sampling (TIS) -> https://fengyao.notion.site/off-policy-rl
+project_name='psrl_dapo_32b'
+experiment_name='DAPO-TIS-Qwen2.5-32B-AIME-fsdp2-stream-nixl-staleness_2'  # Truncated Importance Sampling (TIS) -> https://fengyao.notion.site/off-policy-rl
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -16,7 +16,7 @@ GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 VAL_TP=4 # TP in the training side for validation
 
-NNODES=4
+NNODES=8
 NGPUS_PER_NODE=8
 
 GEN_NNODES=$(( ${NNODES} / 2 )) # Number of nodes for generation
@@ -44,10 +44,9 @@ loss_agg_mode="token-mean"
 enable_filter_groups=True
 filter_groups_metric=acc
 max_num_gen_batches=10
-train_prompt_bsz=512
-# Not used in psrl
-gen_prompt_bsz=$((train_prompt_bsz * 3))
-n_resp_per_prompt=16
+train_prompt_bsz=256
+# Not used in psrl: gen_prompt_bsz=$((train_prompt_bsz * 3))
+n_resp_per_prompt=8
 train_prompt_mini_bsz=32
 
 # Algorithm
@@ -58,10 +57,11 @@ val_top_p=0.7
 
 # Performance Related Parameter
 sp_size=8
+fsdp_size=32
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$((max_prompt_length + max_response_length))
 infer_ppo_max_token_len=$((max_prompt_length + max_response_length))
-offload=False
+offload=True
 
 # Truncated Importance Sampling (TIS) -> https://fengyao.notion.site/off-policy-rl
 
@@ -74,14 +74,15 @@ offload=False
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
-    psrl.staleness=0 \
+    psrl.rollout_n=${n_resp_per_prompt} \
+    psrl.staleness=2 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
-    psrl.gen_mode=batch \
+    psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/fsdp_psrl_log/${experiment_name} \
-    psrl.log_prob.enable_rollout_engine_log_prob=False \
+    psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=recompute \
+    psrl.log_prob.mode=tis \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -91,8 +92,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
+    gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    gen_actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
@@ -116,8 +117,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
-    train_actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    train_actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -130,20 +129,21 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
-    train_actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
+    train_actor_rollout_ref.actor.strategy=fsdp2 \
+    train_actor_rollout_ref.actor.fsdp_config.param_offload=false \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
     train_actor_rollout_ref.actor.ulysses_sequence_parallel_size=${sp_size} \
+    train_actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.grad_clip=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
-    train_actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
-    train_actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
-    train_actor_rollout_ref.actor.fsdp_config.fsdp_size=-1 \
     \
     reward_model.reward_manager=dapo \
-    reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -155,9 +155,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
-    algorithm.filter_groups.enable=${enable_filter_groups} \
-    algorithm.filter_groups.max_num_gen_batches=${max_num_gen_batches} \
-    algorithm.filter_groups.metric=${filter_groups_metric} \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \

@@ -1,10 +1,10 @@
 import os
 import logging
+import time
+import torch
 from typing import List, Union
 from omegaconf import DictConfig
 
-import vllm
-import torch
 try:
     # for torch 2.5+
     from torch.distributed.tensor import DTensor
@@ -118,7 +118,8 @@ class vLLMWorkerExtension:
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=nixl_config,  
-            nixl_interface=nixl_interface
+            nixl_interface=nixl_interface,
+            client_group_id=instance_id
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
     
@@ -154,11 +155,14 @@ class vLLMWorkerExtension:
             self.pull_times = 0
         self.pull_times += 1
         wait_operations = []
-        for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
-            for key in self.unified_state_dict:
+        time_start = time.time()
+        for key in self.unified_state_dict:
+            for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
                 shards_to_transfer = self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, f"gen_pull_{self.pull_times}")
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, target_client_name, shards_to_transfer))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
         for key, target_client_name, shards_to_transfer in wait_operations:
             self.nixl_storage_client.wait(key, f"gen_pull_{self.pull_times}", "READ", target_client=target_client_name)
+        time_end = time.time()
+        psrl_logger.info(f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). time: {time_end - time_start}s")

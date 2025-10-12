@@ -23,9 +23,9 @@ NNODES=1  # Simplified to single node
 NGPUS_PER_NODE=8
 
 # Test parameters
-max_prompt_length=$((1024 * 1))
-max_response_length=$((1024 * 7))
-batch_size=72
+max_prompt_length=$((1024 * 2))
+max_response_length=$((1024 * 6))
+batch_size=${1:-64}
 num_iterations=1
 warmup_iterations=1
 test_mode="synthetic"  # "synthetic" or "real_data"
@@ -37,7 +37,7 @@ top_k=-1
 
 # Run the simplified rollout performance test
 PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/summary_32b \
+    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/summary \
     \
     model.path="$HF_MODEL_PATH" \
     +model.override_config.max_position_embeddings=32768 \
@@ -61,7 +61,7 @@ PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
     rollout_test.num_iterations=${num_iterations} \
     rollout_test.warmup_iterations=${warmup_iterations} \
     rollout_test.mode=${test_mode} \
-    rollout_test.profile_logs_dir=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/details_32b \
+    rollout_test.profile_logs_dir=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/details \
     rollout_test.profile_log_file=Syn_TP${GEN_TP}_PP${GEN_PP}_B${batch_size}_P${max_prompt_length}_R${max_response_length} \
     2>&1 | tee rollout_test.log
 

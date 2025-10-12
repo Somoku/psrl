@@ -58,6 +58,14 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         The representative rank is the rank 0 of the PS.
         """
         return self.rank == 0
+    
+    def get_replica_id(self) -> int:
+        """
+        Get the replica id (dp id) of the train worker.
+        """
+        from megatron.core import parallel_state as mpu
+        assert mpu.is_initialized(), "Megatron is not initialized."
+        return mpu.get_data_parallel_rank()
        
     def init_nixl_client(self):
         """Initialize the NIXL client."""
@@ -71,7 +79,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 use_gpu=True,
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface
+                nixl_interface=self.nixl_interface,
+                client_group_id=self.get_replica_id()
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")

@@ -396,8 +396,7 @@ class DataProcessor:
                         ))
                         self.agent_loop_manager_handle.put_data.remote(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
                 else:
-                    for uid in gen_batch.non_tensor_batch["uid"]:
-                        ray.get(self.ps_manager_handle.add_request.remote(uid))
+                    ray.get(self.ps_manager_handle.add_request.remote(gen_batch.non_tensor_batch["uid"].tolist()))
                     self.agent_loop_manager_handle.put_data.remote(gen_batch)
 
                 self.global_steps += 1

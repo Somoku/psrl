@@ -342,6 +342,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, "PSManager IP and NIXL server IP must be the same"
             assert self.config.train_actor_rollout_ref.actor.strategy != "fsdp", "FSDP1 is not supported for NIXL because it uses flat_param"
+            psrl_logger.info(f"NOTICE: NIXL is enabled. Actor strategy used is {self.config.train_actor_rollout_ref.actor.strategy}")
             
         # Check log_prob mode
         if self.config.psrl.log_prob.mode == "rollout":

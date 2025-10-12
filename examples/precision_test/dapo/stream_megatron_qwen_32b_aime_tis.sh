@@ -2,15 +2,15 @@
 set -xeuo pipefail
 
 project_name='psrl_dapo'
-experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-batch-nixl-staleness_0'
+experiment_name='DAPO-TIS-Qwen2.5-32B-AIME-mcore-stream-nixl-staleness_2'
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=${PSRL_WORKSPACE}/psrl
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
-DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-32B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -20,19 +20,19 @@ GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
-TRAIN_TP=4 # TP in the training side 
+TRAIN_TP=8 # TP in the training side 
 TRAIN_PP=2 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 
-NNODES=16
+NNODES=8
 NGPUS_PER_NODE=8
 
-GEN_NNODES=8 # Number of nodes for generation
+GEN_NNODES=4 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=8 # Number of nodes for training
+TRAIN_NNODES=4 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
@@ -44,12 +44,12 @@ tis_imp_ratio_cap=2.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_response_length=$((1024 * 20))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=512
+train_prompt_bsz=256
 n_resp_per_prompt=8
 train_prompt_mini_bsz=32
 
@@ -66,9 +66,9 @@ offload=True
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=0 \
+    psrl.staleness=2 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
-    psrl.gen_mode=batch \
+    psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
@@ -83,6 +83,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \

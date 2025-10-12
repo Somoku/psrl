@@ -6,7 +6,7 @@ from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 PPO_RAY_RUNTIME_ENV = {
     "env_vars": {
         "TOKENIZERS_PARALLELISM": "false", 
-        "NCCL_DEBUG": "WARN", 
+        "NCCL_DEBUG": "VERSION", 
         "VLLM_USE_V1": "1",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",

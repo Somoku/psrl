@@ -309,8 +309,8 @@ class SimpleRolloutTester:
             start_time = time.time()
             try:
                 if test_mode == "synthetic":
-                    test_prompts = self._create_test_data()
-                    # test_prompts = self._create_synthetic_data(batch_size)
+                    # test_prompts = self._create_test_data()
+                    test_prompts = self._create_synthetic_data(batch_size)
                 else:
                     test_prompts = self._get_real_data_batch()
                 

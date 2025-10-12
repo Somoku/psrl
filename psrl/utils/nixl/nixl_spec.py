@@ -463,6 +463,7 @@ class NIXLClientInfo:
     type: NIXLClientType
     tensor_infos: Dict[str, NIXLTensorInfo]  # key -> TensorDescInfo
     meta: bytes  # agent metadata
+    client_group_id: Optional[int] = None
 
     def get_tensor_info(self, key):
         """Get tensor descriptor info for specific key"""

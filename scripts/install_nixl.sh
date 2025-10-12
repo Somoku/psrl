@@ -47,7 +47,7 @@ rm -rf $THIRD_PARTY_PATH/ucx_src
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-git clone -b release/0.5.1 https://github.com/ai-dynamo/nixl.git
+git clone -b release/0.6.1 https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
 # Disable obj backend

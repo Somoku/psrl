@@ -270,7 +270,7 @@ class PSManager(RequestStatusTracker):
             request_ids = [request_ids]
         if not isinstance(model_versions, list):
             model_versions = [model_versions]
-        if not isinstance(parent_ids, list):
+        if parent_ids is not None and not isinstance(parent_ids, list):
             parent_ids = [parent_ids]
         
         for rollout_instance_id in rollout_instance_ids:
@@ -278,7 +278,7 @@ class PSManager(RequestStatusTracker):
         
         if parent_ids:
             assert len(request_ids) == 1 or len(parent_ids) * self.rollout_n == len(request_ids), \
-                f"Length of parent_ids {len(parent_ids)} * rollout_n {self.rollout_n} must equal length of request_ids {len(request_ids)}."
+                f"Length of parent_ids ({len(parent_ids)}) * rollout_n ({self.rollout_n}) must equal length of request_ids ({len(request_ids)})."
         
         # Initialize the reserved entry and buffer ids
         entry_ids = []
@@ -305,9 +305,10 @@ class PSManager(RequestStatusTracker):
             
             entry_ids.append(entry_id)
             buffer_ids.append(buffer_id)
-                
-        for parent_id in parent_ids:
-            self.rollout_request_tracker.setdefault(parent_id, [])
+            
+        if parent_ids:
+            for parent_id in parent_ids:
+                self.rollout_request_tracker.setdefault(parent_id, [])
         
         return buffer_ids, entry_ids
 

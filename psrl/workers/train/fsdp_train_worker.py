@@ -74,12 +74,6 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         self.log_prefix = f"TrainWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
-     
-    def get_node_id(self) -> str:
-        """
-        Get the node id of the train worker.
-        """
-        return ray.get_runtime_context().get_node_id()
         
     @property   
     def is_train_representative_rank(self) -> bool:
@@ -88,6 +82,15 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         The representative rank is the rank 0 of the PS.
         """
         return self.rank == 0
+    
+    def get_replica_id(self) -> int:
+        """
+        Get the replica id (dp id) of the train worker.
+        """
+        assert hasattr(self, "device_mesh"), "device_mesh is not initialized."
+        if self.device_mesh.ndim <= 1:
+            return 0
+        return self.device_mesh.get_local_rank(mesh_dim=0)
     
     def init_nixl_client(self):
         """Initialize the NIXL client."""
@@ -101,7 +104,8 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 use_gpu=True,
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface
+                nixl_interface=self.nixl_interface,
+                client_group_id=self.get_replica_id()
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")

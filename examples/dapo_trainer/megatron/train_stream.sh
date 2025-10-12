@@ -87,6 +87,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    gen_actor_rollout_ref.rollout.max_num_seqs=$((train_prompt_bsz * n_resp_per_prompt / GEN_INSTANCES)) \
     gen_actor_rollout_ref.rollout.temperature=${temperature} \
     gen_actor_rollout_ref.rollout.top_p=${top_p} \
     gen_actor_rollout_ref.rollout.top_k=${top_k} \

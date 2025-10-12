@@ -47,7 +47,8 @@ class NIXLStorageClient:
         client_type: NIXLClientType,
         nixl_config: DictConfig,
         nixl_interface: NIXLInterface = NIXLInterface(),
-        binded_agent: Optional[nixl_agent] = None
+        binded_agent: Optional[nixl_agent] = None,
+        client_group_id: Optional[int] = None
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -61,6 +62,7 @@ class NIXLStorageClient:
         self.server_port = nixl_config.server_port
         self.max_pinned_temp_memory_slots = nixl_config.max_pinned_temp_memory_slots # None means no pinned temp memory
         self.nixl_interface = nixl_interface
+        self.client_group_id = client_group_id
         
         # Initialize NIXL agent
         if binded_agent is None:
@@ -86,10 +88,8 @@ class NIXLStorageClient:
         # If we use pinned memory, we need to record the mapping from the uncontiguous tensor to the index of the pinned memory
         self._temp_pinned_idx_mapping: Dict[Tuple[str, Tuple[int, ...]], int] = {}  # (key, shard_idx) -> pinned_idx
         self._pinned_slot_running_xfer: Dict[Tuple[torch.Size, torch.dtype, int], tuple] = {} # (shape, dtype, pinned_idx) -> (key, tag, op_type, target_client)
-        self._pinned_memory: Optional[Dict[Tuple[torch.Size, torch.dtype], torch.Tensor]] = None
+        self._pinned_memory: Optional[Dict[Tuple[torch.Size, torch.dtype], List[Tuple[torch.Tensor, bytes]]]] = None
         self._contiguous_event_cache: Dict[Tuple[str, Tuple[int, ...]], torch.cuda.streams.Event] = {}  # (key, shard_idx) -> cudaEvent
-        # A cache to avoid registering the same tensor multiple times
-        self._temp_desc_bytes_cache: Dict[Tuple[torch.Size, torch.dtype, Any], bytes] = {}  # (shape, dtype, data_ptr) -> desc_bytes
         
         # Deprecated: storage_server mode
         self.server_client_info: Optional[NIXLClientInfo] = None
@@ -216,10 +216,21 @@ class NIXLStorageClient:
             if _uncontiguous_tensor_mapping:
                 self._pinned_memory = {}
                 for (shape, dtype), uncontiguous_tensor_list in _uncontiguous_tensor_mapping.items():
-                    self._pinned_memory[(shape, dtype)] = torch.empty(self.max_pinned_temp_memory_slots, *shape, dtype=dtype, device=self.device, requires_grad=False)
+                    self._pinned_memory[(shape, dtype)] = []
+                    for slot_idx in range(self.max_pinned_temp_memory_slots):
+                        memory_slot = torch.empty(*shape, dtype=dtype, device=self.device, requires_grad=False)
+                        try:
+                            temp_desc = self.agent.register_memory([memory_slot])
+                        except Exception as e:
+                            raise RuntimeError(f"{self.client_name} memory registration failed for the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype}) : {e}")
+                        if not temp_desc:
+                            raise RuntimeError(f"{self.client_name} memory registration failed for the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype}).")
+                        temp_desc_bytes = self.agent.get_serialized_descs(temp_desc)
+                        self._pinned_memory[(shape, dtype)].append((memory_slot, temp_desc_bytes))
                     for i, (key, shard_idx, uncontiguous_tensor) in enumerate(uncontiguous_tensor_list):
                         self._temp_pinned_idx_mapping[(key, shard_idx)] = i % self.max_pinned_temp_memory_slots
         
+        # psrl_logger.info(f"{self.client_name}: temp pinned memory mapping is: {self._temp_pinned_idx_mapping}")
         tensor_infos = {}
         for key, tensor in state_dict.items():
             assert key in sharding_dict, f"Key {key} not found in sharding_dict."
@@ -270,28 +281,25 @@ class NIXLStorageClient:
                     if self.max_pinned_temp_memory_slots is None:
                         # Non-contiguous shard: create temporary contiguous memory
                         # Create a new contiguous tensor with the same shape and dtype
-                        raise RuntimeError("Non-contiguous shard requires pinned memory, but pinned memory is not enabled.")
+                        # raise RuntimeError("Non-contiguous shard requires pinned memory, but pinned memory is not enabled.")
                         contiguous_tensor = torch.empty_like(local_sharded_tensor, requires_grad=False)
+                        try:
+                            temp_desc = self.agent.register_memory([contiguous_tensor])
+                        except Exception as e:
+                            raise RuntimeError(f"{self.client_name} memory registration failed for key {key} shard {shard_indices[local_pos]} : {e}")
+                        if not temp_desc:
+                            raise RuntimeError(f"{self.client_name} memory registration failed for key {key} shard {shard_indices[local_pos]}.")
+                        temp_desc_bytes = self.agent.get_serialized_descs(temp_desc)
                     else:
                         assert self._pinned_memory is not None, "Pinned memory is not initialized."
                         assert (local_sharded_tensor.shape, local_sharded_tensor.dtype) in self._pinned_memory, f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
                         assert (key, shard_indices[local_pos]) in self._temp_pinned_idx_mapping, f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
                         # Non-contiguous shard: map to pinned memory
-                        pinned_slot = self._pinned_memory[(local_sharded_tensor.shape, local_sharded_tensor.dtype)][self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]]
+                        pinned_slot, temp_desc_bytes = self._pinned_memory[(local_sharded_tensor.shape, local_sharded_tensor.dtype)][self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]]
                         assert pinned_slot.dtype == local_sharded_tensor.dtype, f"Pinned slot {self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]} has {pinned_slot.dtype} dtype, but the {key} shard {shard_indices[local_pos]} requires {local_sharded_tensor.dtype} dtype."
                         assert pinned_slot.shape == local_sharded_tensor.shape, f"Pinned slot {self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]} has {pinned_slot.shape} shape, but the {key} shard {shard_indices[local_pos]} requires {local_sharded_tensor.shape} shape."
                         contiguous_tensor = pinned_slot
 
-                    # Register the contiguous tensor 
-                    # Use a cache to avoid registering the same tensor multiple times
-                    if (contiguous_tensor.shape, contiguous_tensor.dtype, contiguous_tensor.data_ptr()) in self._temp_desc_bytes_cache:
-                        temp_desc_bytes = self._temp_desc_bytes_cache[(contiguous_tensor.shape, contiguous_tensor.dtype, contiguous_tensor.data_ptr())]
-                    else:
-                        temp_desc = self.agent.register_memory([contiguous_tensor])
-                        if not temp_desc:
-                            raise RuntimeError(f"{self.client_name} memory registration failed for key {key} shard {shard_indices[local_pos]} (contiguous temp).")
-                        temp_desc_bytes = self.agent.get_serialized_descs(temp_desc)
-                        self._temp_desc_bytes_cache[(contiguous_tensor.shape, contiguous_tensor.dtype, contiguous_tensor.data_ptr())] = temp_desc_bytes
                     # Store None in desc_bytes_list to indicate this shard uses temp memory
                     desc_bytes_list.append(None)
                     # Build the contiguous meta info
@@ -321,7 +329,8 @@ class NIXLStorageClient:
             node_gpu_id=get_local_gpu_id(),
             type=self.client_type,
             tensor_infos=tensor_infos,
-            meta=self.agent.get_agent_metadata()
+            meta=self.agent.get_agent_metadata(),
+            client_group_id=self.client_group_id
         )
         psrl_logger.debug(f"Local client info is built, temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, temp meta mapping is: {self._temp_meta_mapping}")
         
@@ -794,7 +803,8 @@ class NIXLMultiStorageClients:
         use_gpu: bool, 
         multi_client_types: List[NIXLClientType], 
         nixl_config: DictConfig, 
-        nixl_interface: NIXLInterface = NIXLInterface()
+        nixl_interface: NIXLInterface = NIXLInterface(),
+        client_group_id: Optional[int] = None
     ):
         self.agent_name = agent_name
         self.multi_client_names = multi_client_names
@@ -825,7 +835,8 @@ class NIXLMultiStorageClients:
                 client_type,
                 nixl_config,
                 nixl_interface,
-                binded_agent=self.agent
+                binded_agent=self.agent,
+                client_group_id=client_group_id
             ))
             
         self._is_connected = False

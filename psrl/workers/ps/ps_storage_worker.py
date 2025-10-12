@@ -25,6 +25,14 @@ psrl_logger = get_ps_logger()
 class PSStoragePlan:
     train_model_dtype: torch.dtype
     gen_model_dtype: torch.dtype
+    storage_style: str = "hf" # ["hf", "hsdp"]
+    hsdp_pattern: Optional[Dict[str, int]] = None # e.g. {"replicate": 1, "fully_shard": 2}
+    
+    def __post_init__(self):
+        if self.storage_style == "hsdp":
+            assert self.hsdp_pattern is not None, "hsdp_pattern is required."
+            assert all(isinstance(value, int) for value in self.hsdp_pattern.values()), "hsdp_pattern values must be integers."
+            assert all(value >= 0 for value in self.hsdp_pattern.values()), "hsdp_pattern values must be non-negative."
     
     def train_gen_model_share(self) -> bool:
         return self.train_model_dtype == self.gen_model_dtype
@@ -49,6 +57,17 @@ class PSStorageWorker:
         self.log_prefix = f"PSStorageWorker_R{self.rank}"
         setup_ps_logger(self.psrl_config.logging_path, self.log_prefix)
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
+     
+    def get_replica_id(self) -> int:
+        """
+        Get the replica id (dp id) of the storage worker.
+        """
+        if self.storage_plan.storage_style == "hf":
+            return self.rank
+        elif self.storage_plan.storage_style == "hsdp":
+            return self.rank // self.storage_plan.hsdp_pattern["fully_shard"]
+        else:
+            raise ValueError(f"Invalid storage style: {self.storage_plan.storage_style}")
         
     def init_nixl_client(self):
         """Initialize the NIXL client."""
@@ -68,7 +87,8 @@ class PSStorageWorker:
                 use_gpu=self.use_gpu,
                 multi_client_types=[NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL],
                 nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface
+                nixl_interface=self.nixl_interface,
+                client_group_id=self.get_replica_id()
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")

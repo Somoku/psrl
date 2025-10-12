@@ -524,7 +524,7 @@ class PSRL_GenWorker(Worker):
             "nixl_pull_model_core", 
             args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
         )
-        ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
+        ray.get(ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id())) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
        
     async def nixl_pull_model_async(self) -> None:
@@ -542,7 +542,7 @@ class PSRL_GenWorker(Worker):
             "nixl_pull_model_core", 
             args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
         )
-        ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
+        await ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
         
     def pull_model(self) -> None:
@@ -1331,9 +1331,11 @@ class PSRL_GenWorker(Worker):
                         await self.pull_model_async()
 
                 self.curr_rollout_instance_model_version = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(rollout_instance_id)
-                psrl_logger.info(f"Request {request_id} begins to use version {self.curr_rollout_instance_model_version} to generate (needed version {needed_model_version})")
+                assert self.curr_rollout_instance_model_version >= needed_model_version, \
+                    f"Current rollout instance model version should not be less than needed version, but got {self.curr_rollout_instance_model_version} vs. {needed_model_version}"
                 if self.curr_rollout_instance_model_version > needed_model_version:
                     psrl_logger.warning(f"Actual model version for generation is {self.curr_rollout_instance_model_version}, needed model version is {needed_model_version}")
+                psrl_logger.info(f"Request {request_id} begins to use version {self.curr_rollout_instance_model_version} to generate")
 
         task = self._generate_loop.create_task(
             self._generate_async_task(request, needed_model_version)

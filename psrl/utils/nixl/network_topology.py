@@ -98,7 +98,10 @@ class NetworkTopology:
                 link_type = LinkType.LOCAL
         else:
             # Cross-node, assume InfiniBand
-            link_type = LinkType.IB
+            if gpu_id1 != -1 and gpu_id2 != -1:
+                link_type = LinkType.IB
+            else:
+                link_type = LinkType.PCIE
         
         link = self._default_links[link_type]
         self._links[key] = link
@@ -119,12 +122,12 @@ class NetworkTopology:
     def get_link_priority(self, client1: str, client2: str) -> int:
         """Get link priority for sorting (higher value = better connection)"""
         link_type = self.get_link_type(client1, client2)
-        # Define priority mapping: LOCAL > NVLINK > PCIE > IB > ETH
+        # Define priority mapping: LOCAL > NVLINK > IB > PCIE >ETH
         priority_map = {
             LinkType.LOCAL: 4,
             LinkType.NVLINK: 3,
-            LinkType.PCIE: 2,
-            LinkType.IB: 1,
+            LinkType.IB: 2,
+            LinkType.PCIE: 1,
             LinkType.ETH: 0
         }
         return priority_map[link_type]

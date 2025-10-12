@@ -2,6 +2,7 @@ from .ray_logger import DualOutputHandler, get_worker_info, log_dual_events, log
 from .data_logger import log_data_protocol
 from .deprecated import deprecated
 from .ps_logger import get_ps_logger, setup_ps_logger
+from .env_logger import log_env_info
 
 __all__ = [
     "DualOutputHandler",
@@ -12,6 +13,7 @@ __all__ = [
     "log_end_event",
     "EventType",
     "log_data_protocol",
+    "log_env_info",
     "deprecated",
     "get_ps_logger",
     "setup_ps_logger",

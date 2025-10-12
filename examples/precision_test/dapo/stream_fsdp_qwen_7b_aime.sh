@@ -16,9 +16,9 @@ GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 VAL_TP=4 # TP in the training side for validation
 TRAIN_SP=4 # SP in the training side
-TRAIN_FSDP=32 # FSDP in the training side
+TRAIN_FSDP=16 # FSDP in the training side
 
-NNODES=16
+NNODES=8
 NGPUS_PER_NODE=8
 
 # GEN_NNODES=${NNODES} # Number of nodes for generation
@@ -29,12 +29,12 @@ NGPUS_PER_NODE=8
 # TRAIN_NNODES=${NNODES} # Number of nodes for training
 # TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
 
-GEN_NNODES=8 # Number of nodes for generation
+GEN_NNODES=4 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=8 # Number of nodes for training
+TRAIN_NNODES=4 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
@@ -113,11 +113,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
-    train_actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
-    train_actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
-    train_actor_rollout_ref.ref.strategy=fsdp2 \
-    train_actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
-    train_actor_rollout_ref.ref.ulysses_sequence_parallel_size=${TRAIN_SP} \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \

@@ -126,6 +126,9 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
+  # NOTE(lhy): Megatron backend doesn't require this since there is no non-contiguous transfer.
+  # For FSDP/HSDP, there is a strange bug (NIXL_ERR_BACKEND) in some larger models (3b/7b) after update dependency in end-to-end test.
+  # However, the unit test can run successfully.
   max_pinned_temp_memory_slots: 8
 
 # Post processor for group requests in streaming mode

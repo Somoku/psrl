@@ -106,13 +106,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
-    train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
-    train_actor_rollout_ref.ref.megatron.param_offload=${offload} \
-    train_actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${TRAIN_TP} \
-    train_actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
-    train_actor_rollout_ref.ref.megatron.context_parallel_size=${TRAIN_CP} \
-    train_actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
-    train_actor_rollout_ref.ref.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \

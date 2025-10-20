@@ -379,7 +379,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 node_id=ip_to_node_id[self.config.psrl.ps_manager_ip],
                 soft=False
             )
-        ).remote(self.config.psrl, self.group_post_process_fn)
+        ).remote(self.config.psrl)
     
     def _init_data_processor(self):
         """Initialize the data processor for handling data preprocessing and batching."""
@@ -490,9 +490,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
+            self.agent_loop_manager,
             self.rollout_queue_size,
             reward_fn=self.reward_fn,
             use_rm=self.use_rm,
+            group_post_process_fn=self.group_post_process_fn,
+            buffer_post_process_fn=self.buffer_post_process_fn,
         )
 
     def start_reward_server(self):
@@ -1322,7 +1325,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         futures = []
         futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
-        futures.append(self.ps_manager_handle.set_agent_loop_manager.remote(self.agent_loop_manager))
         futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             futures.extend(self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator))
@@ -1391,7 +1393,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         # will block until the training batch is ready
                         psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
                         with log_dual_events(f"Wait for training batch {buffer_id}", psrl_logger, event_type=EventType.WAIT):
-                            batch = ray.get(self.ps_manager_handle.wait_for_training_batch.remote(buffer_id)) 
+                            batch = ray.get(self.reward_server.wait_for_training_batch.remote(buffer_id)) 
                         psrl_logger.debug("Received training batch for step %d, batch size: %d", 
                                         self.global_steps, len(batch) if batch is not None else 0)
                     else:

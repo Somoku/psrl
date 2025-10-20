@@ -66,7 +66,6 @@ class Entry:
         entry_info (Optional[EntryInfo]): The metadata of the entry.
     """
     category: EntryCategory
-    data: Optional[DataProto] = None
     entry_info: Optional[EntryInfo] = None
 
 class BufferStatus(enum.Enum):
@@ -127,7 +126,6 @@ class StalenessBuffer:
         self, 
         entry_id: int, 
         category: EntryCategory,
-        data: Optional[DataProto] = None,
         entry_info: Optional[EntryInfo] = None,
     ):
         """
@@ -136,7 +134,6 @@ class StalenessBuffer:
         Args:
             entry_id (int): The index to insert the entry at.
             category (EntryCategory): The category of the entry.
-            data (DataProto, optional): The data to store in the entry.
             entry_info (EntryInfo, optional): The metadata for the entry.
         Raises:
             AssertionError: If entry_id is out of range.
@@ -145,7 +142,6 @@ class StalenessBuffer:
 
         self.entries[entry_id] = Entry(
             category=category,
-            data=data,
             entry_info=entry_info
         )
 
@@ -162,7 +158,6 @@ class StalenessBuffer:
 
         self.entries[entry_id] = Entry(
             category=EntryCategory.EMPTY,
-            data=None,
             entry_info=None
         )
 
@@ -204,29 +199,12 @@ class StalenessBuffer:
         """Count number of EMPTY entries in the buffer"""
         return sum(1 for entry in self.entries if entry.category == EntryCategory.EMPTY)
     
-    def get_all_data(self) -> DataProto:
-        """
-        Get all data in the buffer. All entries must be OCCUPIED (have rollout data).
-
-        Returns:
-            DataProto: Concatenated data from all entries in the buffer.
-        Raises:
-            ValueError: If any entry has not been occupied.
-        """
-        data_list = []
-        for entry in self.entries:
-            if entry.data is None:
-                raise ValueError("One or more entries have None data. All entries must be occupied.")
-            data_list.append(entry.data)
-        return DataProto.concat(data_list)
-    
-    def update_all_data(self, data: DataProto):
-        batch_size = len(data)
-        assert batch_size == self.num_entries, \
-            f"Mismatch between buffer size {self.num_entries} and batch size {batch_size} when updating data"
-        data_list = data.chunk(batch_size)
-        for entry, data in zip(self.entries, data_list):
-            entry.data = data
+    def clear(self):
+        """Clear all entries in the buffer, resetting them to EMPTY."""
+        self.entries = [
+            Entry(category=EntryCategory.EMPTY) 
+            for _ in range(self.num_entries)
+        ]
 
 class StalenessInventory:
     """
@@ -243,15 +221,12 @@ class StalenessInventory:
         num_entries: int,
         ready_num_entries: int,
         staleness: int,
-        buffer_post_process_fn: Optional[callable] = None,
     ):
         self.staleness = staleness
         self.buffer_id = 0
         self.num_entries = num_entries
         self.ready_num_entries = ready_num_entries
-        self.buffer_post_process_fn = buffer_post_process_fn
 
-        self.data_pool: Dict[EntryInfo, DataProto] = {} # Rollout data pool for requests in Group Sampling
         self.buffers: Dict[int, StalenessBuffer] = {}
         self.data_tracker: Dict[EntryInfo, Tuple[int, int]] = {} # Maps entry to location (buffer_id, entry_id)
         # Status tracking for buffer IDs
@@ -259,13 +234,6 @@ class StalenessInventory:
         self._buffer_ids_by_status: Dict[BufferStatus, Set[int]] = {
             status: set() for status in BufferStatus
         }
-
-        # Agent Loop Manager reference
-        self.agent_loop_manager: Optional[ray.actor.ActorHandle] = None
-
-    def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
-        """Set the reference to the agent loop manager."""
-        self.agent_loop_manager = agent_loop_manager
 
     def create_buffer(self, buffer_id: int):
         """
@@ -327,12 +295,25 @@ class StalenessInventory:
                 return status
         raise ValueError(f"Buffer {buffer_id} has no status in inventory")
 
-    def _update_buffer_status(self, buffer_id: int):
+    def get_buffer_entry_infos(self, buffer_id) -> List[EntryInfo]:
+        """Get all entry infos in a specific buffer."""
+        if buffer_id not in self.buffers:
+            raise ValueError(f"Buffer {buffer_id} does not exist")
+        entries = self.buffers[buffer_id].entries
+        entry_infos = []
+        for entry in entries:
+            assert entry.entry_info is not None, f"Entry in buffer {buffer_id} must have entry info"
+            entry_infos.append(entry.entry_info)
+        return entry_infos
+
+    def _update_buffer_status(self, buffer_id: int) -> BufferStatus:
         """
         Update the internal status tracking for a buffer.
 
         Args:
             buffer_id (int): The ID of the buffer to update.
+        Returns:
+            BufferStatus: The new status of the buffer after update.
         """
         if buffer_id not in self.buffers:
             return
@@ -345,44 +326,8 @@ class StalenessInventory:
                 break
                 
         new_status = buffer.get_status()
-        reserve_buffer = True
-        if new_status == BufferStatus.READY:
-            if self.buffer_post_process_fn:
-                reserve_buffer = self._buffer_post_process(buffer_id, buffer)
-        
-        if reserve_buffer:    
-            # Update in the new status track
-            self._buffer_ids_by_status[new_status].add(buffer_id)
-
-    def _buffer_post_process(self, buffer_id: int, buffer: StalenessBuffer) -> bool:
-        assert self.buffer_post_process_fn is not None, "Buffer post-processing function is not set."
-        
-        buffer_data = buffer.get_all_data()
-        processed_buffer_data = self.buffer_post_process_fn(buffer_data)
-        # NOTE(linsh): Current implementation will retry with new global batch if any sample is filtered
-        if not processed_buffer_data or len(processed_buffer_data) < self.num_entries:
-            psrl_logger.info(f"Post-processing function returned "
-                             f"{len(processed_buffer_data) if processed_buffer_data else 0} requests "
-                             f"for buffer {buffer_id}, less than {self.num_entries}. Retrying later.")
-            uid_of_processed_buffer = processed_buffer_data.non_tensor_batch["uid"].tolist()
-            for entry_id in range(self.num_entries):
-                data = buffer.entries[entry_id].data
-                if int(data.non_tensor_batch["uid"][0]) not in uid_of_processed_buffer:
-                    buffer.delete(entry_id)
-            self._update_buffer_status(buffer_id)
-            pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
-            candidate_ids = list(pending_buffers)
-            if not candidate_ids:
-                waiting_buffer_id = self.buffer_id
-            else:
-                waiting_buffer_id = min(candidate_ids)
-
-            # Notify agent loop manager to retry new requests
-            self.notify_request_retry(waiting_buffer_id)
-            return False
-        else:
-            buffer.update_all_data(processed_buffer_data)
-            return True
+        self._buffer_ids_by_status[new_status].add(buffer_id)
+        return new_status
 
     def min_ready_buffer_id(self) -> Optional[int]:
         """
@@ -457,91 +402,6 @@ class StalenessInventory:
             self.buffers[bid].get_empty_entries_num() for bid in pending_buffers if bid <= max_staleness_buffer_id
         )
 
-    def add_to_data_pool(
-        self,
-        entry_info: EntryInfo,
-        data: DataProto,
-    ):
-        """
-        Add rollout data to the group data pool for a specific entry.
-
-        Args:
-            entry_info (EntryInfo): The entry metadata.
-            data (DataProto): The data to add.
-        Raises:
-            AssertionError: If data for the entry already exists.
-        """
-        assert entry_info not in self.data_pool, f"Data pool already has data for entry info {entry_info}"
-
-        self.data_pool[entry_info] = data
-    
-    def update_to_data_pool(
-        self,
-        entry_info: EntryInfo,
-        data: DataProto,
-    ):
-        """
-        Update rollout data to the group data pool for a specific entry.
-
-        Args:
-            entry_info (EntryInfo): The entry metadata.
-            data (DataProto): The data to add.
-        """
-        self.data_pool.pop(entry_info, None)
-        self.data_pool[entry_info] = data
-
-    def pop_from_data_pool(
-        self,
-        entry_info: EntryInfo,
-    ) -> DataProto:
-        """
-        Pop rollout data from the group data pool for a specific entry.
-
-        Args:
-            entry_info (EntryInfo): The entry metadata.
-        Returns:
-            DataProto: The popped data.
-        Raises:
-            AssertionError: If data for the entry does not exist.
-        """
-        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-
-        return self.data_pool.pop(entry_info)
-
-    def get_from_data_pool(
-        self,
-        entry_info: EntryInfo,
-    ) -> DataProto:
-        """
-        Retrieve rollout data from the group data pool for a specific entry.
-
-        Args:
-            entry_info (EntryInfo): The entry metadata.
-        Returns:
-            DataProto: The retrieved data.
-        Raises:
-            AssertionError: If data for the entry does not exist.
-        """
-        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-
-        return self.data_pool[entry_info]
-
-    def remove_from_data_pool(
-        self,
-        entry_info: EntryInfo,
-    ):
-        """
-        Delete data from the group data pool for a specific entry.
-
-        Args:
-            entry_info (EntryInfo): The entry metadata.
-        Raises:
-            AssertionError: If data for the entry does not exist.
-        """
-        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-
-        del self.data_pool[entry_info]
-
     def reserve_data(
         self, 
         entry_info: EntryInfo, 
@@ -583,7 +443,6 @@ class StalenessInventory:
         buffer.insert(
             entry_id, 
             EntryCategory.RESERVED, 
-            data=None, 
             entry_info=entry_info
         )
         self.data_tracker[entry_info] = (target_buffer_id, entry_id)
@@ -630,6 +489,49 @@ class StalenessInventory:
         # Update entry info in the buffer
         buffer = self.buffers[old_buffer_id]
         buffer.entries[old_entry_id].entry_info = new_entry_info
+
+    def clear_buffer(
+        self,
+        buffer_id: int,
+    ):
+        """
+        Clear all entries in the buffer, resetting them to EMPTY and updating the data tracker.
+        
+        Args:
+            buffer_id (int): The ID of the buffer to clear.
+        """
+        entries = self.buffers[buffer_id].entries
+        entry_infos = [entry.entry_info for entry in entries]
+        self.buffers[buffer_id].clear()
+        for entry_info in entry_infos:
+            del self.data_tracker[entry_info]
+        self._update_buffer_status(buffer_id)
+
+    def clear_occupied_entries(
+        self,
+        entry_infos: Union[EntryInfo, List[EntryInfo]],
+    ):
+        """
+        Clear OCCUPIED entries from buffers and update data tracker.
+        
+        Args:
+            entry_infos (Union[EntryInfo, List[EntryInfo]]): The entry metadata or list of metadata to clear.
+        """
+        if not isinstance(entry_infos, list):
+            entry_infos = [entry_infos]
+        updated_buffer_ids = []
+        for entry_info in entry_infos:
+            assert entry_info in self.data_tracker, f"Entry info {entry_info} must be tracked to clear occupied entries"
+            buffer_id, entry_id = self.data_tracker[entry_info]
+            buffer = self.buffers[buffer_id]
+            # Delete the entry from the buffer
+            buffer.delete(entry_id)
+            del self.data_tracker[entry_info]
+            psrl_logger.debug(f"[Entry Clear]: entry {entry_info} cleared from (buffer {buffer_id}, entry {entry_id})")
+            updated_buffer_ids.append(buffer_id)
+        
+        for buffer_id in set(updated_buffer_ids):
+            self._update_buffer_status(buffer_id)
 
     def clear_reserved_entries(
         self,
@@ -698,10 +600,10 @@ class StalenessInventory:
         for buffer_id in set(changed_buffer_ids):
             self._update_buffer_status(buffer_id)
 
+    @deprecated("This method is deprecated. Use `occupy_data_with_reserve` instead.")
     def occupy_data_without_reserve(
         self,
         entry_info: EntryInfo,
-        data: Optional[DataProto] = None,
     ):
         """
         Append data to an appropriate buffer, occupying it.
@@ -711,16 +613,9 @@ class StalenessInventory:
 
         Args:
             entry_info (EntryInfo): The entry metadata to occupy.
-            data (Optional[DataProto]): The data to occupy with. If None, will use data from data_pool.
         """
-        if data is None:
-            # For group sampling, the rollout data is stored in the group data pool.
-            assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-            data = self.data_pool.pop(entry_info)
-            if data is None:
-                return
 
-        # Step 2: Get all PENDING buffers within the staleness limit
+        # Get all PENDING buffers within the staleness limit
         pending_buffers = self._buffer_ids_by_status[BufferStatus.PENDING]
         candidate_ids = list(pending_buffers)
         if not candidate_ids:
@@ -729,7 +624,7 @@ class StalenessInventory:
             candidate_ids = [buffer_id]
         assert candidate_ids, f"No suitable PENDING buffer found."
 
-        # Step 3: Select the lowest PENDING buffer + EMPTY entry to insert
+        # Select the lowest PENDING buffer + EMPTY entry to insert
         target_buffer_id = min(candidate_ids)
         
         # Check staleness constraint
@@ -745,7 +640,6 @@ class StalenessInventory:
         buffer.insert(
             entry_id,
             EntryCategory.OCCUPIED, 
-            data=data, 
             entry_info=entry_info
         )
         self._update_buffer_status(target_buffer_id)
@@ -753,24 +647,19 @@ class StalenessInventory:
     def occupy_data_with_reserve(
         self, 
         entry_info: EntryInfo, 
-        data: Optional[DataProto]=None,
-    ):
+    ) -> Tuple[int, BufferStatus]:
         """
         Move data to the first non-occupied entry in an appropriate buffer, occupying it.
 
         Args:
             entry_info (EntryInfo): The entry metadata to occupy.
             data (Optional[DataProto]): The data to occupy with. If None, will use data from data_pool.
+        Returns:
+            Tuple[int, BufferStatus]: The buffer ID where the entry was occupied and the new buffer status.
         Raises:
             AssertionError: If entry_info is not tracked or data is missing.
         """
         assert entry_info in self.data_tracker, f"Entry info {entry_info} must have existing mapping, but {self.data_tracker=}"
-        if data is None:
-            # For group sampling, the rollout data is stored in the group data pool.
-            assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-            data = self.data_pool.pop(entry_info)
-            if data is None:
-                return
 
         old_buffer_id, old_entry_id = self.data_tracker[entry_info]
 
@@ -802,45 +691,9 @@ class StalenessInventory:
         buffer.insert(
             entry_id, 
             EntryCategory.OCCUPIED, 
-            data=data, 
             entry_info=entry_info
         )
-        self.data_tracker[entry_info] = (target_buffer_id, entry_id)
-        self._update_buffer_status(target_buffer_id)
-        
         psrl_logger.debug(f"[Entry Occupy]: entry {entry_info} occupied in (buffer {target_buffer_id}, entry {entry_id})")
-     
-    def consume_buffer(
-        self, 
-        buffer_id: int
-    ) -> DataProto:
-        """
-        Consume (retrieve and remove) all data from the specified buffer.
-
-        Args:
-            buffer_id (int): The ID of the buffer to consume.
-        Returns:
-            DataProto: The concatenated data from the buffer.
-        Raises:
-            AssertionError: If the buffer is not in READY state.
-        """
-        assert self.get_buffer_status(buffer_id) == BufferStatus.READY, \
-            f"Buffer {buffer_id} must be in READY state to consume data"
-        
-        buffer = self.buffers[buffer_id]
-        data = buffer.get_all_data()
-        self.delete_buffer(buffer_id)
-        psrl_logger.info(f"[Buffer Consume]: buffer {buffer_id} consumed")
-        return data
-    
-    def notify_request_retry(self, waiting_buffer_id: int):
-        """
-        Notify the agent loop manager to retry new requests asynchronously.
-        
-        Args:
-            waiting_buffer_id (int): The buffer ID that is currently waiting for processing.
-        """
-        assert self.agent_loop_manager is not None, "Agent Loop Manager is not set."
-
-        psrl_logger.info(f"Notifying agent loop manager to retry new requests for buffer ID {waiting_buffer_id}")
-        ray.get(self.agent_loop_manager.retry_request.remote(waiting_buffer_id))
+        self.data_tracker[entry_info] = (target_buffer_id, entry_id)
+        buffer_status = self._update_buffer_status(target_buffer_id)
+        return target_buffer_id, buffer_status

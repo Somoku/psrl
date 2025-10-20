@@ -138,6 +138,7 @@ class RewardServer(CommandExtension):
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._background_event_handler())
+        self.busy_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
     
     async def stop_busy_loop(self):
         """Shutdown the reward server gracefully.

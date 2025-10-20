@@ -74,6 +74,7 @@ class PSRL_AgentLoopManager:
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._dispatch_data())
+        self.busy_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
 
     def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""

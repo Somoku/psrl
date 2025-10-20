@@ -190,7 +190,7 @@ class PSRL_vLLMRollout:
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)
             stat_loggers = None
-            if not config.disable_log_stats and self.config.status_collection.enable:
+            if not config.disable_log_stats and config.status_collection:
                 # Use custom stat loggers to collect engine stats
                 vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]

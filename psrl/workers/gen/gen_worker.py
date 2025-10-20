@@ -162,9 +162,6 @@ class PSRL_GenWorker(Worker):
         # Task for version update
         self.version_update_task = None
         
-        # Task for engine status collection
-        self.status_collection_task = None
-        
         # Rollout request management
         self.request_queue = deque()
         if self.psrl_config.gen_mode == "batch":

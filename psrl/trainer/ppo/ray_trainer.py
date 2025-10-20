@@ -485,7 +485,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert self.data_processor is not None, "Data processor must be initialized before starting reward computation."
         assert self.rollout_coordinator is not None, "Rollout server must be initialized before starting reward computation."
         
-        self.reward_server = ray.remote(RewardServer).remote(
+        ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
+        self.reward_server = ray.remote(RewardServer).options(
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=ip_to_node_id[self.config.psrl.reward_service_ip],
+                soft=False
+            )
+        ).remote(
             self.config,
             self.tokenizer,
             self.processor,

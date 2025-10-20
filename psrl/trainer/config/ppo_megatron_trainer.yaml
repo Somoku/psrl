@@ -131,7 +131,7 @@ gen_actor_rollout_ref:
     interrupt_as_prompt: ${oc.select:psrl.partial_rollout.interrupt_as_prompt}
 
     # Whether enable status collection in rollout coordinator
-    status_collection: ${oc.select:psrl.status_collection}
+    status_collection: ${oc.select:psrl.status_collection.enable}
 
     layer_name_map:
       qkv_layer_name: qkv
@@ -200,6 +200,12 @@ algorithm:
 
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
+  
+  # Group filtering settings for group post-processing
+  filter_groups:
+
+    # Metric to use for filtering: null, acc, seq_final_reward, seq_reward...
+    metric: null 
 
 # config for the trainer
 trainer:

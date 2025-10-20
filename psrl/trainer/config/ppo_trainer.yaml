@@ -54,11 +54,6 @@ train_actor_rollout_ref:
 
     # Use log prob from rollout engine rollout
     enable_rollout_engine_log_prob: ${oc.select:psrl.log_prob.enable_rollout_engine_log_prob}
-  
-  # Agent worker config.
-  agent:
-    # Routing strategy: random, round_robin, request_num_balance
-    route_strategy: round_robin
 
 # config for rollout model
 gen_actor_rollout_ref:
@@ -89,7 +84,7 @@ gen_actor_rollout_ref:
     interrupt_as_prompt: ${oc.select:psrl.partial_rollout.interrupt_as_prompt}
 
     # Whether enable status collection in rollout coordinator
-    status_collection: ${oc.select:psrl.status_collection}
+    status_collection: ${oc.select:psrl.status_collection.enable}
 
 # custom reward function definition
 custom_reward_function:

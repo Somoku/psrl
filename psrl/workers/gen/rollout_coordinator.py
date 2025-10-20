@@ -57,6 +57,8 @@ class RolloutCoordinator(CommandExtension):
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
         self.agent_loop_workers = agent_loop_workers
+        self.ps_model_version = 0  # Current model version in the parameter server
+        self.check_partial_rollout = False # Whether to check for partial rollout in the loop
 
         # Stats collection
         self.status_queue = status_queue
@@ -180,106 +182,6 @@ class RolloutCoordinator(CommandExtension):
         old_version = self.instance_to_version.get(rollout_instance_id, None)
         self.instance_to_version[rollout_instance_id] = version_tag
         psrl_logger.debug(f"Updated instance {rollout_instance_id} model version: {old_version} -> {version_tag}")
-
-    def check_interrupt_ability(self, instance_id: int, curr_ps_model_version: int, staleness: int):
-        """
-        Check if the instance can be interrupted based on the current model version and staleness.
-        
-        This method checks if the instance can be interrupted without violating the staleness constraints:
-        (1). The rest child requests of a parent prompt should be sufficient for Group Sampling.
-        (2). The number of valid requests (in group) for each impacted version tag should be sufficient.
-        If the instance can be interrupted, it returns True, otherwise returns False.
-        
-        Args:
-            instance_id (int): The ID of the instance to check.
-            curr_ps_model_version (int): The current model version in the parameter server.
-            staleness (int): The staleness threshold for interrupting requests.
-        
-        Returns:
-            bool: True if the instance can be interrupted, False otherwise.
-        """
-        instance_version = self.instance_to_version.get(instance_id, 0)
-        psrl_logger.debug(f"Checking interrupt ability for instance {instance_id}: "
-                          f"current PS model version={curr_ps_model_version}, instance version={instance_version}, staleness={staleness}")
-        if curr_ps_model_version <= instance_version:
-            return False
-        
-        # Able to interrupt if no requests will be aborted after model update
-        if curr_ps_model_version - instance_version <= staleness:
-            psrl_logger.debug(f"Instance {instance_id} can be safely interrupted: version diff within staleness threshold")
-            return True
-
-        # Collect request IDs of the instance and check if they are stale
-        instance_requests = ray.get(self.ps_manager_handle.get_dispatched_requests_of_instance.remote(instance_id))
-
-        abort_version_to_requests: dict[int, set] = defaultdict(set)
-        abort_parent_to_request_num: dict[int, int] = defaultdict(int)
-        abort_request_ids = set()
-
-        for request in instance_requests:
-            request_id = request.request_id
-            parent_id = request_id // self.rollout_n
-            version_tag = request.model_version
-            
-            # Check if the request is stale
-            if curr_ps_model_version - version_tag > staleness:
-                abort_version_to_requests[version_tag].add(request_id)
-                abort_parent_to_request_num[parent_id] += 1
-                abort_request_ids.add(request_id)
-
-        # Check if the number of rest child requests is sufficient for Group Sampling
-        psrl_logger.debug(f"Checking if remaining child requests are sufficient for Group Sampling")
-        for parent_id, request_num in abort_parent_to_request_num.items():
-            total_child_requests = len(ray.get(self.ps_manager_handle.get_recorded_child_requests.remote(parent_id)))
-            remaining_requests = total_child_requests - request_num
-            psrl_logger.debug(f"Parent {parent_id}: total={total_child_requests}, to_abort={request_num}, remaining={remaining_requests}, required={self.alg_rollout_n}")
-            
-            if remaining_requests < self.alg_rollout_n:
-                psrl_logger.debug(f"Cannot interrupt: parent {parent_id} would have insufficient remaining requests ({remaining_requests} < {self.alg_rollout_n})")
-                return False
-
-        # Check if the number of requests for each impacted version tag is sufficient
-        # If we abort requests of version V, the requests of version [V, V + staleness] should be sufficient
-        psrl_logger.debug(f"Checking if impacted version tags have sufficient requests after abort")
-        impacted_version_tags = set()
-        version_to_requests = {}
-        
-        for version_tag in abort_version_to_requests.keys():
-            psrl_logger.debug(f"Analyzing impact of aborting version {version_tag} requests")
-            for v in range(version_tag, version_tag + staleness + 1):
-                impacted_version_tags.add(v)
-                psrl_logger.debug(f"Version {v} is impacted by aborting version {version_tag}")
-                for src_v in range(max(0, v - staleness), v + 1):
-                    if src_v not in version_to_requests:
-                        version_to_requests[src_v] = ray.get(self.ps_manager_handle.get_requests_ids_of_version.remote(src_v))
-        
-        for version_tag in impacted_version_tags:
-            original_count = len(version_to_requests[version_tag])
-            version_to_requests[version_tag] -= abort_version_to_requests.get(version_tag, set())
-            remaining_count = len(version_to_requests[version_tag])
-            psrl_logger.debug(f"Version {version_tag}: original={original_count}, after abort={remaining_count}")
-            
-            # Classify requests by their parent IDs to ensure we can check the number of valid requests
-            parent_to_child_request_num = defaultdict(int)
-            for request_id in version_to_requests[version_tag]:
-                parent_id = request_id // self.rollout_n
-                parent_to_child_request_num[parent_id] += 1
-            
-            valid_groups = [parent_id for parent_id, child_request_num in parent_to_child_request_num.items() 
-                            if child_request_num >= self.alg_rollout_n]
-            valid_group_request_num = len(valid_groups)
-            psrl_logger.debug(f"Version {version_tag}: found {valid_group_request_num} valid groups after abort")
-            
-            if valid_group_request_num < self.config.psrl.staleness_buffer_entries:
-                psrl_logger.debug(f"Cannot interrupt: version {version_tag} would have insufficient valid groups " +
-                                 f"({valid_group_request_num} < {self.config.psrl.staleness_buffer_entries})")
-                return False
-        
-        # If all checks passed, the instance can be interrupted and requests can be aborted
-        psrl_logger.debug(f"All checks passed, instance {instance_id} can be interrupted")
-        psrl_logger.debug(f"Adding {len(abort_request_ids)} requests to abort list")
-        self._abort_request_ids.update(abort_request_ids)
-        return True
     
     def _command_handler_loop(self):
         """
@@ -287,7 +189,6 @@ class RolloutCoordinator(CommandExtension):
         
         This method continuously processes different types of commands:
         - ABORT: Interrupt specific requests on instances
-        - CHECK_AND_SYNC: Check if instances can be interrupted and sync model versions
         - SYNC: Interrupt instance, pull new model weights, and resume generation
         
         The loop runs until background_running is set to False.
@@ -335,90 +236,25 @@ class RolloutCoordinator(CommandExtension):
                     
                     result = interrupted_request_num
                     psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
-                elif command_type == CommandType.CHECK_AND_SYNC:
-                    if not self.config.psrl.partial_rollout.enable or not self.config.psrl.status_collection.enable:
-                        raise ValueError("CHECK_AND_SYNC command is only available when "
-                                         "partial rollout is enabled and status collection is enabled.")
-                    # This command is used to check whether the instance can be interrupted
-                    # and sync the model version with the parameter server.
-                    curr_ps_model_version = command_args.get("curr_ps_model_version", None)
-                    if curr_ps_model_version is None:
-                        raise ValueError("CHECK command must contain 'curr_ps_model_version' in args.")
-                    
-                    psrl_logger.debug(f"Received CHECK_AND_SYNC command for PS model version {curr_ps_model_version}")
-                    
-                    # Get the workload of each instance (waiting and running queue size)
-                    instance_to_request_num = {}
-                    instance_ids = []
-                    for instance_id in range(self.config.psrl.deployment.n_rollout_instances):
-                        if self.instance_to_version.get(instance_id, 0) == curr_ps_model_version:
-                            continue
-                        instance_ids.append(instance_id)
-                    
-                    for instance_id in instance_ids:
-                        instance_to_request_num[instance_id] = self.instance_engine_status.get(instance_id, {}).get("waiting_and_running_queue_size", 0)
-                    
-                    # Check if the instance can be interrupted based on the current model version
-                    for instance_id, request_num in instance_to_request_num.items():
-                        # Interrupt the instance if the workload is less than the threshold
-                        if request_num > self.config.psrl.partial_rollout.threshold or request_num == 0:
-                            continue
-
-                        psrl_logger.debug(f"Instance {instance_id} workload ({request_num}) is below threshold ({self.config.psrl.partial_rollout.threshold})")
-                        interrupt_as_prompt = self.config.psrl.partial_rollout.interrupt_as_prompt
-                        can_interrupt = self.check_interrupt_ability(instance_id, curr_ps_model_version, self.staleness)
-
-                        if interrupt_as_prompt or can_interrupt:
-                            psrl_logger.debug(f"Instance {instance_id} can be interrupted, current model version: {curr_ps_model_version}")
-                            # Notify the request status manager to abort requests
-                            if self._abort_request_ids:
-                                psrl_logger.debug(f"Aborting {len(self._abort_request_ids)} requests: {list(self._abort_request_ids)[:5]}{'...' if len(self._abort_request_ids) > 5 else ''}")
-                                ray.get(self.ps_manager_handle.abort_requests.remote(list(self._abort_request_ids), blocking=False))
-                                self._abort_request_ids.clear()
-                            else:
-                                psrl_logger.debug("No requests to abort")
-
-                            # Add SYNC command to the command queue to interrupt the instance
-                            # This will stop the instance, pull the model weights from PS, and resume generation.
-                            psrl_logger.debug(f"Queueing SYNC command for instance {instance_id}")
-                            
-                            # Create a SYNC command to interrupt the instance and pull the model
-                            # TODO(linsh): check whether the command should be blocking
-                            self.exec_command(Command(
-                                type=CommandType.SYNC,
-                                instance_id=instance_id,
-                                curr_ps_model_version=curr_ps_model_version,
-                            ), blocking=False)
                 elif command_type == CommandType.SYNC:
                     # Interrupt the instance, pull the model weights from PS and resume generation.
                     instance_id = command_args.get("instance_id", None)
                     curr_ps_model_version = command_args.get("curr_ps_model_version", None)
                     if instance_id is None or curr_ps_model_version is None:
                         raise ValueError("SYNC command must contain 'instance_id' and 'curr_ps_model_version' in args.")
-                    psrl_logger.debug(f"Received SYNC command for instance {instance_id} with PS model version {curr_ps_model_version}")
+                    psrl_logger.info(f"Received SYNC command for instance {instance_id} with PS model version {curr_ps_model_version}")
+                    assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", \
+                        "SYNC command is only supported in 'psrl_async' rollout mode."
                     
-                    # Interrupt the instance
+                    # Sync with PS (interrupt, pull model, and resume generation)
+                    self.instance_running_status[instance_id] = False
                     future = None
                     if self.rank_0_is_model_owner:
-                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation")
+                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("sync_with_ps")
                     else:
-                        warnings.warn(f"Interrupt generation on instance {instance_id} in SPMD-style may cause undefined behavior, need to check the behavior")
-                        future = self.rollout_wg_list[instance_id].execute_all_async("interrupt_generation")[0]
+                        raise ValueError("SYNC command in SPMD-style is not supported yet.")
                     interrupted_request_num = ray.get(future)
-                    self.instance_running_status[instance_id] = False
-                    
-                    # Pull model
-                    if self.rank_0_is_model_owner:
-                        future = self.rollout_wg_list[instance_id].execute_rank_zero_async("pull_model_async")
-                    else:
-                        future = self.rollout_wg_list[instance_id].execute_all_async("pull_model")
-                    ray.get(future)
-                    
-                    # Resume generation
-                    if self.rank_0_is_model_owner:
-                        self.rollout_wg_list[instance_id].execute_rank_zero_async("resume_generation")
-                    else:
-                        self.rollout_wg_list[instance_id].execute_all_async("resume_generation")
+                    psrl_logger.info(f"Synced with PS on instance {instance_id}, interrupted {interrupted_request_num} requests")
                     self.instance_running_status[instance_id] = True
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
@@ -472,9 +308,68 @@ class RolloutCoordinator(CommandExtension):
                 continue
             
             engine_index, request_counts = recv_stats
-            waiting_and_running_queue_size = request_counts[0] + request_counts[1]
-            self.instance_engine_status[engine_index] = {"waiting_and_running_queue_size": waiting_and_running_queue_size}
+            running_queue_size = request_counts[0]
+            waiting_queue_size = request_counts[1]
+            waiting_and_running_queue_size = running_queue_size + waiting_queue_size
+            self.instance_engine_status[engine_index] = {
+                "waiting_and_running_queue_size": waiting_and_running_queue_size,
+                "running_queue_size": running_queue_size,
+                "waiting_queue_size": waiting_queue_size,
+            }
             psrl_logger.debug(f"Updated engine status for instance {engine_index}: {self.instance_engine_status[engine_index]}")
             self.stats_changed = True
+            
+            # partial rollout check
+            if self.config.psrl.partial_rollout.enable and self.check_partial_rollout:
+                continue_to_check = False
+                for instance_id, status in self.instance_engine_status.items():
+                    # Check whether instance is running
+                    if not self.instance_running_status.get(instance_id, False):
+                        continue
+                    # Check whether instance version lags behind PS version
+                    if self.instance_to_version.get(instance_id, 0) == self.ps_model_version:
+                        continue
+                    # Check whether current instance workload is below threshold
+                    # Currently we consider running queue size as the workload metric
+                    running_queue_size = status.get("running_queue_size", 0)
+                    psrl_logger.info(f"Instance {instance_id} (version {self.instance_to_version.get(instance_id, 0)}) "
+                                     f"workload: {running_queue_size}, "
+                                     f"threshold: {self.config.psrl.partial_rollout.threshold}")
+                    if running_queue_size > self.config.psrl.partial_rollout.threshold:
+                        continue_to_check = True
+                        continue
+                    # Check whether instance workload would increase after update
+                    # NOTE(linsh): this step relies on static version tag assignment
+                    inc_request_num = ray.get(self.rollout_wg_list[instance_id].execute_rank_zero_async("get_workload_after_update_to", self.ps_model_version))
+                    if inc_request_num > 0:
+                        psrl_logger.info(f"Instance {instance_id} workload after update would be {inc_request_num + running_queue_size}")
+                        continue_to_check = True
+                        continue
+
+                    # Add SYNC command to the command queue to interrupt the instance
+                    # This will stop the instance, pull the model weights from PS, and resume generation.
+                    psrl_logger.info(f"Queueing SYNC command for instance {instance_id}")
+                    self.exec_command(Command(
+                        type=CommandType.SYNC,
+                        instance_id=instance_id,
+                        curr_ps_model_version=self.ps_model_version,
+                    ), blocking=False)
+                    self.instance_to_version[instance_id] = self.ps_model_version
+                self.check_partial_rollout = continue_to_check
 
         psrl_logger.info("Engine status sync loop stopped.")
+
+    def set_ps_model_version(self, version: int):
+        """
+        Set the current PS model version.
+        
+        This method updates the internal PS model version and notifies any waiters
+        that are waiting for this version or earlier.
+        
+        Args:
+            version (int): The new PS model version to set.
+        """
+        self.ps_model_version = version
+        if self.config.psrl.partial_rollout.enable:
+            self.check_partial_rollout = True
+        psrl_logger.debug(f"Set PS model version to {version}")

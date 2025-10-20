@@ -442,10 +442,11 @@ class RolloutRouter:
                     model_versions=needed_model_version,
                 )
             # NOTE(linsh): we use push/pop task to manage the lifecycle of the request in case of interruption
+            # Important: if not using `ray.get()`, some tasks may not be scheduled in time, leading to deadlock with some tasks not popped
             if self.rank_0_is_model_owner:
-                await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("push_task", request_id, needed_model_version)
+                ray.get(self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("push_task", request_id, needed_model_version))
             else:
-                await self.rollout_wg_list[gen_worker_idx].execute_all_async("push_task", request_id, needed_model_version)
+                ray.get(self.rollout_wg_list[gen_worker_idx].execute_all_async("push_task", request_id, needed_model_version))
             
             continue_generation = True
             while continue_generation:
@@ -457,22 +458,22 @@ class RolloutRouter:
                     update_status = update_status_list[0]
                 if consolidated_output is None:
                     if self.rank_0_is_model_owner:
-                        await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version)
+                        ray.get(self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version))
                     else:
-                        await self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version)
+                        ray.get(self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version))
                     return None
                 
                 request = consolidated_output
                 if update_status == RequestStatus.RUNNING:
-                    continue_generation = False
+                    break
                 elif update_status == RequestStatus.ROLLOUT_INTERRUPTED:
                     continue
     
             psrl_logger.debug(f"Generation completed for request {request_id} on gen worker {gen_worker_idx} with model version {needed_model_version}")
             if self.rank_0_is_model_owner:
-                await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version)
+                ray.get(self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version))
             else:
-                await self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version)     
+                ray.get(self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version))
 
             return request
         return None

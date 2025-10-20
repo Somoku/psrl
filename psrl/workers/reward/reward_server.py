@@ -5,7 +5,7 @@ import torch
 import ray
 import numpy as np
 from queue import Queue
-from typing import Dict, List, Union, Set
+from typing import Dict, List, Union, Set, Tuple, Optional
 from threading import Thread
 from tensordict import TensorDict
 
@@ -73,6 +73,13 @@ class RewardServer(CommandExtension):
             self.alg_rollout_n = self.rollout_n
         assert self.rollout_n >= self.alg_rollout_n, \
             f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
+        
+        if self.config.psrl.redundant_rollout.enable:
+            self.entries_per_buffer = self.config.psrl.redundant_rollout.redundant_global_batch_size
+            self.ready_entries_per_buffer = self.config.psrl.redundant_rollout.alg_global_batch_size
+        else:
+            self.entries_per_buffer = self.config.psrl.staleness_buffer_entries
+            self.ready_entries_per_buffer = self.config.psrl.staleness_buffer_entries
 
         # Queues for data transfer between workers
         self.rollout_queue = asyncio.Queue(maxsize=rollout_queue_size)
@@ -97,8 +104,11 @@ class RewardServer(CommandExtension):
         
         # Data
         self.request_buffer = {} # Maps sample IDs to request DataProto (for merging with rollout data)
-        self.data_pool: Dict[EntryInfo, DataProto] = {} # Maps EntryInfo to stored/occupied DataProto
+        self.data_pool: Dict[int, DataProto] = {} # Maps request_id to stored/occupied DataProto
         self.data_buffers: Dict[int, DataProto] = {} # data of READY buffer in ps manager
+        self.accumulated_buffers: Dict[int, Dict[int, List[EntryInfo]]] = {} # Maps buffer_id to dict of model_version to READY entry_info list
+        self.accumulated_buffer_size: Dict[int, int] = {} # Maps buffer id to current accumulated size
+        self.abort_occupied_entries: Dict[int, List[int]] = {}
         self.max_ready_buffer_id = -1 # Max buffer id that has been processed and logged as READY
         
         # Set of buffer ids that have been logged as ready, to avoid duplicate logging
@@ -539,14 +549,15 @@ class RewardServer(CommandExtension):
         # Add data to the data pool
         for i in range(len(request_data)):
             self.add_to_data_pool(
-                EntryInfo(
-                    rollout_instance_id=int(request_data.non_tensor_batch["rollout_instance_id"][i]),
-                    request_id=int(request_data.non_tensor_batch["uid"][i]),
-                    model_version=request_data.non_tensor_batch["version_tag"][i],
-                ),
+                int(request_data.non_tensor_batch["uid"][i]),
                 request_data[i:i+1]
             )
         
+        retry_buffer_ids = set() # Buffer IDs that need to abort OCCUPY entries and retry
+        ready_buffer_ids = set() # Buffer IDs that are READY after occupation
+        accumulate_entry_data_list = [] # Whether to accumulate data for each prompt entry
+        occupy_futures = []
+        abort_request_ids = []
         # Occupy requests in the PS worker and try to awake waiters if READY buffers are formed
         if self.rollout_n > 1:
             sample_ids = request_data.non_tensor_batch["parent_id"].tolist()
@@ -555,7 +566,8 @@ class RewardServer(CommandExtension):
                     self.rollout_request_tracker[sample_id] = []
                 entry_info = EntryInfo(
                     rollout_instance_id=int(request_data.non_tensor_batch["rollout_instance_id"][i]),
-                    request_id=int(request_data.non_tensor_batch["uid"][i]),
+                    request_idx=int(request_data.non_tensor_batch["uid"][i]) % self.rollout_n,
+                    prompt_id=int(request_data.non_tensor_batch["parent_id"][i]),
                     model_version=request_data.non_tensor_batch["version_tag"][i],
                 )
                 self.rollout_request_tracker[sample_id].append(entry_info)
@@ -564,108 +576,185 @@ class RewardServer(CommandExtension):
 
             # Group post process
             unique_sample_ids = set(sample_ids)
+            prompt_to_occupy_requests = {}
             for sample_id in unique_sample_ids:
                 if len(self.rollout_request_tracker[sample_id]) >= self.alg_rollout_n:
                     psrl_logger.debug(f"Reached/Required: ({len(self.rollout_request_tracker[sample_id])}/{self.alg_rollout_n}) samples for prompt {sample_id}")
                     entry_infos = self.rollout_request_tracker.pop(sample_id)
                     psrl_logger.debug(f"Popped entry_infos from rollout_request_tracker for sample_id {sample_id}, entry count: {len(entry_infos)}")
                     
-                    all_child_ids = set(range(self.rollout_n))
-                    stored_child_ids = set([int(entry_info.request_id) % self.rollout_n for entry_info in entry_infos])
-                    abort_child_ids = all_child_ids - stored_child_ids
+                    all_child_idxs = set(range(self.rollout_n))
+                    stored_child_idxs = {entry_info.request_idx for entry_info in entry_infos}
+                    abort_child_idxs = all_child_idxs - stored_child_idxs
+                    abort_child_ids = [sample_id * self.rollout_n + idx for idx in abort_child_idxs]
+                    stored_child_ids = [sample_id * self.rollout_n + idx for idx in stored_child_idxs]
                     psrl_logger.debug(f"Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
                     
                     # Notify the request status manager to abort the child requests
-                    abort_entries = []
                     if abort_child_ids:
                         psrl_logger.debug(f"Aborting child requests {abort_child_ids} for sample {sample_id}.")
-                        self.ps_manager_handle.abort_requests.remote(list(abort_child_ids))
-                        # Clear the reserved entries for the aborted requests
-                        abort_entries = [entry_info for entry_info in entry_infos if hash(entry_info) in abort_child_ids]
-                    
-                    occupy_group_data = True
+                        ray.get(self.ps_manager_handle.abort_requests.remote(list(abort_child_ids), blocking=False))
+                    # Abort the extra entries beyond alg_rollout_n
+                    abort_request_ids.extend([sample_id * self.rollout_n + entry_info.request_idx for entry_info in entry_infos[self.alg_rollout_n:]])
+
                     alg_entry_infos = entry_infos[:self.alg_rollout_n]
+                    accumulate_group_data = True
                     if self.group_post_process_fn:
-                        occupy_group_data = await self._group_post_process(sample_id, alg_entry_infos)
+                        accumulate_group_data = await self._group_post_process(alg_entry_infos)
                     
-                    if not occupy_group_data:
-                        abort_entries.extend(entry_infos)
+                    if not accumulate_group_data and self.config.psrl.retry_bound == -1:
+                        # Retry immediately and no occupation
+                        # NOTE(linsh): data has been popped from data pool in `_group_post_process`
+                        psrl_logger.info(f"Post-processing function returned empty data for prompt {sample_id}. Retrying immediately.")
+                        # Clear the reserved entries for the group entry
+                        await self.ps_manager_handle.clear_reserved_entries.remote(sample_id)
+                        min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
+
+                        # Notify agent loop manager to retry new requests
+                        self.notify_request_retry(min_pending_buffer)
                     else:
-                        abort_entries.extend(entry_infos[self.alg_rollout_n:])
-                        occupy_futures = []
-                        for entry_info in alg_entry_infos:
-                            occupy_futures.append(
-                                self.ps_manager_handle.maybe_occupy_rollout_instance_request.remote(
-                                    rollout_instance_id=entry_info.rollout_instance_id,
-                                    request_id=entry_info.request_id,
-                                    version_tag=entry_info.model_version,
-                                    parent_id=sample_id
-                            ))
-                        with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
-                            results = await asyncio.gather(*occupy_futures)
-                        
-                        valid_results = [result for result in results if result[0] is not None]
-                        assert len(valid_results) <= 1, "At most one request should succeed in making the buffer READY in group sampling"
-                        
-                        if len(valid_results) > 0:
-                            buffer_id, buffer_entries = valid_results[0]
-                            data_buffer = self.get_buffer_from_data_pool(buffer_entries)
-                            self.data_buffers[buffer_id] = data_buffer
-                            self.try_awake_waiters()
-                    
-                    if abort_entries:
-                        await self.ps_manager_handle.clear_reserved_entries.remote(abort_entries)
-                        self.remove_from_data_pool(abort_entries)
+                        accumulate_entry_data_list.append(accumulate_group_data)
+
+                        prompt_to_occupy_requests[sample_id] = alg_entry_infos
+                        request_ids = [sample_id * self.rollout_n + entry_info.request_idx for entry_info in alg_entry_infos]
+                        occupy_futures.append(self.ps_manager_handle.occupy_rollout_instance_request.remote(
+                            prompt_id=sample_id,
+                            request_ids=request_ids,
+                            accumulate_sample=accumulate_group_data,
+                        ))
         else:
-            occupy_futures = []
             for i in range(len(request_data)):
                 request_data = request_data[i:i+1]
-                request_id = request_data.non_tensor_batch["uid"][0]
-                sample_id = request_data.non_tensor_batch["parent_id"][0] if self.rollout_n > 1 else request_id
-                rollout_instance_id = request_data.non_tensor_batch["rollout_instance_id"][0]
-                version_tag = request_data.non_tensor_batch["version_tag"][0]
-                
-                occupy_futures.append(
-                    self.ps_manager_handle.maybe_occupy_rollout_instance_request.remote(
-                        rollout_instance_id=int(rollout_instance_id),
-                        request_id=int(request_id),
-                        version_tag=version_tag,
-                        parent_id=None,
-                ))
-            with log_dual_events("Occupy requests", psrl_logger, event_type=EventType.OTHER):
-                results = await asyncio.gather(*occupy_futures)
-            for result in results:
-                if result[0] is not None:
-                    buffer_id, buffer_entries = result
-                    data_buffer = self.get_buffer_from_data_pool(buffer_entries)
-                    await self.maybe_add_buffer(buffer_id, data_buffer)
-                    self.try_awake_waiters()
+                request_id = int(request_data.non_tensor_batch["uid"][0])
+                accumulate_data = True
+                accumulate_entry_data_list.append(accumulate_data)
 
-    async def maybe_add_buffer(self, buffer_id, data_buffer):
+                occupy_futures.append(self.ps_manager_handle.occupy_rollout_instance_request.remote(
+                    prompt_id=request_id,
+                    accumulate_sample=accumulate_data,
+                ))
+        
+        with log_dual_events("Occupy requests", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+            results = await asyncio.gather(*occupy_futures)
+
+        for result, accumulate_entry_data in zip(results, accumulate_entry_data_list):
+            buffer_id, occupy_num, prompt_entry_info = result
+            # If occupy failed due to READY status, abort the requests
+            if buffer_id is None:
+                request_ids = prompt_entry_info.get_all_requests(self.rollout_n)
+                psrl_logger.info(f"Failed to occupy prompt {prompt_entry_info}, aborting requests {request_ids}.")
+                abort_request_ids.extend(request_ids)
+                continue
+
+            psrl_logger.debug(f"Successfully occupied prompt {prompt_entry_info} into buffer {buffer_id} with occupy_num {occupy_num}.")
+
+            if self.rollout_n > 1:
+                alg_entry_infos = prompt_to_occupy_requests.pop(prompt_entry_info.prompt_id, None)
+                request_ids = [prompt_entry_info.prompt_id * self.rollout_n + entry_info.request_idx for entry_info in alg_entry_infos]
+            else:
+                request_ids = [prompt_entry_info.prompt_id + prompt_entry_info.request_idx]
+
+            # Accumulate data or mark for abort based on accumulate_entry_data
+            if accumulate_entry_data:
+                if buffer_id not in self.accumulated_buffers:
+                    self.accumulated_buffers[buffer_id] = {}
+                    self.accumulated_buffer_size[buffer_id] = 0
+                model_version = min(prompt_entry_info.model_version) if isinstance(prompt_entry_info.model_version, list) else prompt_entry_info.model_version
+                if model_version not in self.accumulated_buffers[buffer_id]:
+                    self.accumulated_buffers[buffer_id][model_version] = []
+                self.accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
+                self.accumulated_buffer_size[buffer_id] += 1
+                psrl_logger.info(f"Accumulated buffer {buffer_id} size: {self.accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer}")
+            else:
+                abort_request_ids.extend(request_ids)
+                if self.config.psrl.retry_bound >= 0:
+                    if buffer_id not in self.abort_occupied_entries:
+                        self.abort_occupied_entries[buffer_id] = []
+                    self.abort_occupied_entries[buffer_id].append(entry_info.prompt_id)
+            
+            # Check for READY or RETRY buffers
+            if (
+                self.config.psrl.retry_bound >= 0 and
+                self.accumulated_buffer_size[buffer_id] < self.ready_entries_per_buffer and
+                occupy_num == self.entries_per_buffer - self.config.psrl.retry_bound
+            ):
+                retry_buffer_ids.add(buffer_id)
+            elif (
+                self.accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer and
+                buffer_id not in ready_buffer_ids
+            ):
+                psrl_logger.info(f"Add buffer {buffer_id} to ready_buffer_ids with {occupy_num=}")
+                ready_buffer_ids.add(buffer_id)
+        
+        if abort_request_ids:
+            self.remove_from_data_pool(abort_request_ids)
+
+        # Process READY buffers
+        for buffer_id in sorted(list(ready_buffer_ids)):
+            buffer_accumulate_num = self.accumulated_buffer_size[buffer_id]
+            # Collect all prompt entry infos for the buffer
+            prompt_entry_infos = []
+            for model_version in sorted(list(self.accumulated_buffers[buffer_id].keys())):
+                prompt_entry_infos.extend(self.accumulated_buffers[buffer_id][model_version])
+            # Get the data buffer from the data pool
+            data_buffer = self.get_buffer_from_data_pool(prompt_entry_infos)
+            # Apply buffer post-processing if exists and add to data_buffers
+            add_buffer = self.maybe_add_buffer(buffer_id, data_buffer)
+            if add_buffer:
+                psrl_logger.info(f"Buffer {buffer_id} is READY with {len(self.data_buffers[buffer_id])} entries.")
+                self.try_awake_waiters(buffer_id)
+                self.remove_buffer_from_data_pool(prompt_entry_infos)
+                self.accumulated_buffers.pop(buffer_id)
+                self.accumulated_buffer_size.pop(buffer_id)
+        
+        # Process RETRY buffers
+        for retry_buffer_id in retry_buffer_ids:
+            if self.config.psrl.gen_mode == 'batch':
+                assert self.config.psrl.retry_bound == 0, "For batch mode, retry_bound must be 0."
+                await self.ps_manager_handle.clear_buffer.remote(retry_buffer_id)
+                min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
+                # Notify agent loop manager to retry new requests
+                self.notify_request_retry(min_pending_buffer)
+            elif self.config.psrl.retry_bound >= 0:
+                # retry num = retry_ratio * num of failed OCCUPY entries
+                retry_prompt_num = (self.entries_per_buffer - self.config.psrl.retry_bound - self.ready_entries_per_buffer) * self.config.psrl.retry_ratio
+                if retry_prompt_num > 0:
+                    # the last retry_prompt_num prompts to retry
+                    psrl_logger.debug(f"Retrying {retry_prompt_num} prompts from full buffer {retry_buffer_id}.")
+                    # Clear the last `retry_prompt_num` occupied entries for retry with RESERVE
+                    abort_occupied_entries = self.abort_occupied_entries[retry_buffer_id][-retry_prompt_num:]
+                    self.abort_occupied_entries[retry_buffer_id] = self.abort_occupied_entries[retry_buffer_id][:-retry_prompt_num]
+                    await self.ps_manager_handle.clear_occupied_entries.remote(abort_occupied_entries)
+                    min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
+                    # Notify agent loop manager to retry new requests
+                    self.notify_request_retry(min_pending_buffer, retry_prompt_num)
+
+    def maybe_add_buffer(self, buffer_id, data_buffer) -> bool:
         """
         Apply buffer post-processing function if defined and add the buffer to data_buffers.
         
         Args:
             buffer_id (int): The ID of the buffer to be added.
             data_buffer (DataProto): The data buffer to be potentially post-processed and added.
+        Returns:
+            bool: whether the buffer was added to data_buffers.
         """
         add_buffer = True
         if self.buffer_post_process_fn:
-            add_buffer = await self._buffer_post_process(buffer_id, data_buffer)
+            add_buffer, data_buffer = self._buffer_post_process(buffer_id, data_buffer)
         
         if add_buffer:
             self.data_buffers[buffer_id] = data_buffer
-        else:
-            await self.ps_manager_handle.clear_buffer.remote()
+            psrl_logger.debug(f"Buffer {buffer_id} is added to data_buffers after post-processing.")
+        return add_buffer
 
-    async def _group_post_process(self, parent_id: int, entry_infos: List[EntryInfo]) -> bool:
+    async def _group_post_process(self, entry_infos: List[EntryInfo]) -> bool:
         """Apply post-processing function to a group of entry infos.
         
         This method retrieves data from the data pool for each entry, applies
         the group post-processing function, and stores the processed data back.
         
         Args:
-            parent_id (int): The parent request id for the group
             entry_infos (List[EntryInfo]): List of entry info objects to process
         
         Returns:
@@ -673,25 +762,19 @@ class RewardServer(CommandExtension):
         """
         assert self.group_post_process_fn is not None, "Group post-processing function is not set."
 
-        data_list = [self.pop_from_data_pool(entry_info) for entry_info in entry_infos]
+        request_ids = [entry_info.prompt_id * self.rollout_n + entry_info.request_idx for entry_info in entry_infos]
+        data_list = [self.pop_from_data_pool(request_id) for request_id in request_ids]
         group_data = DataProto.concat(data_list)
         processed_group_data = self.group_post_process_fn(group_data)
         
         if not processed_group_data:
-            psrl_logger.info(f"Post-processing function returned empty data for parent {parent_id}. Retrying later.")
-            # Clear the reserved entries for the group
-            await self.ps_manager_handle.clear_reserved_entries.remote(entry_infos)
-            min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
-
-            # Notify agent loop manager to retry new requests
-            self.notify_request_retry(min_pending_buffer)
             return False
         else:
             processed_group_data_list = processed_group_data.chunk(len(processed_group_data))
-            self.update_data_pool({entry_info: processed_group_data for entry_info, processed_group_data in zip(entry_infos, processed_group_data_list)})
+            self.update_data_pool({request_id: processed_group_data for request_id, processed_group_data in zip(request_ids, processed_group_data_list)})
             return True
 
-    async def _buffer_post_process(self, buffer_id: int, buffer_data: DataProto) -> bool:
+    def _buffer_post_process(self, buffer_id: int, buffer_data: DataProto) -> Tuple[bool, Optional[DataProto]]:
         """Apply post-processing function to a full buffer of data.
         
         This method applies the buffer post-processing function to the data
@@ -701,31 +784,80 @@ class RewardServer(CommandExtension):
             buffer_id (int): The ID of the buffer to process
             buffer_data (DataProto): The data in the buffer to be processed
         Returns:
-            bool: whether the buffer data is reserved
+            Tuple[bool, Optional[DataProto]]: A tuple where the first element indicates
+            whether to add the buffer to data_buffers, and the second element is the
+            processed DataProto or None if not added.
         """
         assert self.buffer_post_process_fn is not None, "Buffer post-processing function is not set."
         
         processed_buffer_data = self.buffer_post_process_fn(buffer_data)
-        # NOTE(linsh): Current implementation will retry with new global batch if any sample is filtered
-        if not processed_buffer_data or len(processed_buffer_data) < self.num_entries:
-            psrl_logger.info(f"Post-processing function returned "
-                             f"{len(processed_buffer_data) if processed_buffer_data else 0} requests "
-                             f"for buffer {buffer_id}, less than {self.num_entries}. Retrying later.")
-            uid_of_processed_buffer = processed_buffer_data.non_tensor_batch["uid"].tolist()
-            abort_entries = []
-            for entry_id in range(self.num_entries):
-                data = buffer_data[entry_id:entry_id+1]
-                if int(data.non_tensor_batch["uid"][0]) not in uid_of_processed_buffer:
-                    abort_entries.append(entry_id)
-            await self.ps_manager_handle.clear_occupied_entries.remote(abort_entries)
-            min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
-
-            # Notify agent loop manager to retry new requests
-            self.notify_request_retry(min_pending_buffer)
-            return False
+        if not processed_buffer_data or len(processed_buffer_data) < len(buffer_data):
+            # Clear entries from accumulated_data_buffer
+            self.accumulated_buffers.pop(buffer_id, None)
+            self.accumulated_buffer_size.pop(buffer_id, None)
+            self.accumulated_buffers[buffer_id] = {}
+            self.accumulated_buffer_size[buffer_id] = 0
+            if processed_buffer_data is not None:
+                prompt_entry_infos = self.extract_entry_infos_from_data(processed_buffer_data)
+                for entry_info in prompt_entry_infos:
+                    model_version = min(entry_info.model_version) if isinstance(entry_info.model_version, list) else entry_info.model_version
+                    if model_version not in self.accumulated_buffers[buffer_id]:
+                        self.accumulated_buffers[buffer_id][model_version] = []
+                    self.accumulated_buffers[buffer_id][model_version].append(entry_info)
+                    self.accumulated_buffer_size[buffer_id] += 1
+            return False, None
         else:
-            self.data_buffers[buffer_id] = processed_buffer_data
-            return True
+            return True, processed_buffer_data
+
+    def extract_entry_infos_from_data(self, data: DataProto) -> List[EntryInfo]:
+        """Extract EntryInfo objects from DataProto.
+        
+        This method extracts EntryInfo objects from the non-tensor batch
+        information in the provided DataProto.
+        
+        Args:
+            data (DataProto): The data from which to extract EntryInfo objects
+        Returns:
+            List[EntryInfo]: List of extracted EntryInfo objects
+        """
+        entry_infos = {}
+        if self.rollout_n > 1:
+            parent_ids = data.non_tensor_batch["parent_id"].tolist()
+            rollout_instance_ids = data.non_tensor_batch["rollout_instance_id"].tolist()
+            request_ids = data.non_tensor_batch["uid"].tolist()
+            model_versions = data.non_tensor_batch["version_tag"].tolist()
+            for parent_id, rollout_instance_id, request_id, model_version in zip(parent_ids, rollout_instance_ids, request_ids, model_versions):
+                if parent_id in entry_infos:
+                    entry_info = entry_infos[parent_id]
+                    if isinstance(entry_info.request_idx, list):
+                        entry_info.request_idx.append(request_id % self.rollout_n)
+                    else:
+                        entry_info.request_idx = [entry_info.request_idx, request_id % self.rollout_n]
+                    if isinstance(entry_info.model_version, list):
+                        entry_info.model_version.append(model_version)
+                    else:
+                        entry_info.model_version = [entry_info.model_version, model_version]
+                else:
+                    entry_info = EntryInfo(
+                        rollout_instance_id=rollout_instance_id,
+                        request_idx=request_id % self.rollout_n,
+                        prompt_id=parent_id,
+                        model_version=model_version,
+                    )
+                    entry_infos.append(entry_info)
+        else:
+            request_ids = data.non_tensor_batch["uid"].tolist()
+            model_versions = data.non_tensor_batch["version_tag"].tolist()
+            rollout_instance_ids = data.non_tensor_batch["rollout_instance_id"].tolist()
+            for request_id, model_version, rollout_instance_id in zip(request_ids, model_versions, rollout_instance_ids):
+                entry_info = EntryInfo(
+                    rollout_instance_id=rollout_instance_id,
+                    request_idx=0,
+                    prompt_id=request_id,
+                    model_version=model_version,
+                )
+                entry_infos.append(entry_info)
+        return entry_infos
 
     def log_ready_buffer(self, buffer_id: int):
         """Log the ready buffer."""
@@ -733,7 +865,7 @@ class RewardServer(CommandExtension):
             log_single_event(f"Buffer {buffer_id} is ready", psrl_logger, event_type=EventType.BUFFER_READY)
             self.logged_ready_buffer_ids.add(buffer_id)
 
-    def try_awake_waiters(self):
+    def try_awake_waiters(self, buffer_id: int):
         """Check for ready buffers and wake up waiters.
         
         This method checks if there are any new ready buffers for training and
@@ -741,16 +873,10 @@ class RewardServer(CommandExtension):
         It also sends interruption commands for partial rollout if enabled.
         """
         # Check whether there exists ready buffer for training
-        max_ready_buffer_id = max(self.data_buffers.keys())
-        min_ready_buffer_id = min(self.data_buffers.keys())
-        if (
-            max_ready_buffer_id is not None and
-            max_ready_buffer_id > self.max_ready_buffer_id
-        ):
-            self.log_ready_buffer(max_ready_buffer_id)
-            self.max_ready_buffer_id = max_ready_buffer_id
+        min_ready_buffer_id = min(self.data_buffers.keys(), default=None)
+        self.log_ready_buffer(buffer_id)
         
-        ray.get(self.ps_manager_handle.check_abort_and_interrupt_rollout.remote())
+        ray.get(self.ps_manager_handle.check_staleness_abort.remote(buffer_id))
         
         if min_ready_buffer_id is not None:
             self.process_ready_buffer(min_ready_buffer_id)
@@ -819,17 +945,18 @@ class RewardServer(CommandExtension):
         else:
             psrl_logger.warning(f"No waiters found for buffer {buffer_id} when trying to awake.")
 
-    def notify_request_retry(self, waiting_buffer_id: int):
+    def notify_request_retry(self, waiting_buffer_id: int, retry_num: int = 1):
         """
         Notify the agent loop manager to retry new requests asynchronously.
         
         Args:
             waiting_buffer_id (int): The buffer ID that is currently waiting for processing.
+            retry_num (int): The number of requests to retry.
         """
         assert self.agent_loop_manager is not None, "Agent Loop Manager is not set."
 
         psrl_logger.info(f"Notifying agent loop manager to retry new requests for buffer ID {waiting_buffer_id}")
-        ray.get(self.agent_loop_manager.retry_request.remote(waiting_buffer_id))
+        self.agent_loop_manager.retry_request.remote(waiting_buffer_id, retry_num)
 
     # ------- DATA POOL MANAGEMENT -------
 
@@ -847,7 +974,7 @@ class RewardServer(CommandExtension):
         
         buffer = self.data_buffers.pop(buffer_id, None)
         assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
-        self.ps_manager_handle.delete_buffer.remote(buffer_id)
+        # NOTE(linsh): we will delete buffer during aborting requests of specific versions
         return buffer
 
     def get_buffer_from_data_pool(self, entry_infos: List[EntryInfo]) -> DataProto:
@@ -864,90 +991,121 @@ class RewardServer(CommandExtension):
         """
         data_list = []
         for entry_info in entry_infos:
-            data = self.data_pool.pop(entry_info, None)
-            assert data is not None, f"Buffer for entry {entry_info} not found in data pool."
-            data_list.append(data)
+            prompt_id = entry_info.prompt_id
+            request_idxs = entry_info.request_idx
+            if not isinstance(request_idxs, list):
+                request_idxs = [request_idxs]
+            assert len(request_idxs) == self.alg_rollout_n, \
+                f"EntryInfo for prompt {prompt_id} has {len(request_idxs)} request indices, " \
+                f"expected {self.alg_rollout_n}."
+
+            for request_idx in request_idxs:
+                request_id = prompt_id * self.rollout_n + request_idx
+                data = self.data_pool.get(request_id, None)
+                assert data is not None, \
+                    f"Buffer for request {request_id} (idx {request_idx} for prompt {prompt_id}) " \
+                    f"not found in data pool."
+                data_list.append(data)
         return DataProto.concat(data_list)
+
+    def remove_buffer_from_data_pool(self, entry_infos: List[EntryInfo]):
+        """Remove data buffers from the internal data pool based on entry information.
+        
+        This method is used to delete specific data buffers that have been stored
+        in the reward server's internal data pool.
+        
+        Args:
+            entry_infos (List[EntryInfo]): List of EntryInfo objects specifying which buffers to remove.
+        """
+        for entry_info in entry_infos:
+            prompt_id = entry_info.prompt_id
+            request_idxs = entry_info.request_idx
+            if not isinstance(request_idxs, list):
+                request_idxs = [request_idxs]
+            for request_idx in request_idxs:
+                request_id = prompt_id * self.rollout_n + request_idx
+                if request_id in self.data_pool:
+                    del self.data_pool[request_id]
 
     def add_to_data_pool(
         self,
-        entry_info: EntryInfo,
+        request_id: int,
         data: DataProto,
     ):
         """
         Add rollout data to the group data pool for a specific entry.
 
         Args:
-            entry_info (EntryInfo): The entry metadata.
+            request_id (int): The request ID.
             data (DataProto): The data to add.
         Raises:
             AssertionError: If data for the entry already exists.
         """
-        assert entry_info not in self.data_pool, f"Data pool already has data for entry info {entry_info}"
+        assert request_id not in self.data_pool, f"Data pool already has data for request ID {request_id}"
 
-        self.data_pool[entry_info] = data
+        self.data_pool[request_id] = data
 
-    def update_data_pool(self, entry_info_to_data: Dict[EntryInfo, DataProto]):
+    def update_data_pool(self, entry_info_to_data: Dict[int, DataProto]):
         """Update the internal data pool with new data buffers.
         
         This method adds new data buffers to the reward server's internal data pool,
         which can later be retrieved using get_buffer_from_data_pool().
         
         Args:
-            entry_info_to_data (Dict[EntryInfo, DataProto]): Dictionary mapping EntryInfo objects to their corresponding DataProto buffers.
+            entry_info_to_data (Dict[int, DataProto]): Dictionary mapping request IDs to their corresponding DataProto buffers.
         """
         self.data_pool.update(entry_info_to_data)
     
     def pop_from_data_pool(
         self,
-        entry_info: EntryInfo,
+        request_id: int,
     ) -> DataProto:
         """
         Pop rollout data from the group data pool for a specific entry.
 
         Args:
-            entry_info (EntryInfo): The entry metadata.
+            request_id (int): The request ID.
         Returns:
             DataProto: The popped data.
         Raises:
             AssertionError: If data for the entry does not exist.
         """
-        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+        assert request_id in self.data_pool, f"Data pool must have data for request ID {request_id}"
 
-        return self.data_pool.pop(entry_info)
+        return self.data_pool.pop(request_id)
     
     def get_from_data_pool(
         self,
-        entry_info: EntryInfo,
+        request_id: int,
     ) -> DataProto:
         """
         Retrieve rollout data from the group data pool for a specific entry.
 
         Args:
-            entry_info (EntryInfo): The entry metadata.
+            request_id (int): The request ID.
         Returns:
             DataProto: The retrieved data.
         Raises:
             AssertionError: If data for the entry does not exist.
         """
-        assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
+        assert request_id in self.data_pool, f"Data pool must have data for request ID {request_id}"
 
-        return self.data_pool[entry_info]
+        return self.data_pool[request_id]
     
     def remove_from_data_pool(
         self,
-        entry_infos: Union[EntryInfo, List[EntryInfo]],
+        request_ids: Union[int, List[int]],
     ):
         """
         Delete data from the group data pool for a specific entry.
 
         Args:
-            entry_info (EntryInfo): The entry metadata.
+            request_ids (Union[int, List[int]]): The request ID.
         Raises:
             AssertionError: If data for the entry does not exist.
         """
-        if not isinstance(entry_infos, list):
-            entry_infos = [entry_infos]
-        for entry_info in entry_infos:
-            assert entry_info in self.data_pool, f"Data pool must have data for entry info {entry_info}"
-            del self.data_pool[entry_info]
+        if not isinstance(request_ids, list):
+            request_ids = [request_ids]
+        for request_id in request_ids:
+            assert request_id in self.data_pool, f"Data pool must have data for request ID {request_id}"
+            del self.data_pool[request_id]

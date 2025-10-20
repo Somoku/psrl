@@ -203,8 +203,10 @@ class RequestStatusTracker:
             assert self._request_id_to_status[req_id] == RequestStatus.REWARD_COMPLETED, \
                 f"Request ID {req_id} is not in REWARD_COMPLETED status."
             
-            assert req_id not in self._abort_request_ids, \
-                f"Request ID {req_id} is marked for abortion and cannot be removed."
+            if req_id in self._abort_request_ids:
+                psrl_logger.warning(f"Request ID {req_id} is marked for abortion but is being removed as train ready, "
+                                    f"we will remove it from abort set.")
+                self._abort_request_ids.discard(req_id)
             
             # Remove the request from the status map and request infos
             del self._request_id_to_status[req_id]
@@ -261,14 +263,15 @@ class RequestStatusTracker:
         
         for i, req_id in enumerate(request_id):
             self._request_infos[req_id] = EntryInfo(
-                request_id=req_id,
+                prompt_id=req_id // self.rollout_n,
+                request_idx=req_id % self.rollout_n,
                 rollout_instance_id=rollout_instance_id[i],
                 model_version=model_version[i],
             )
             self._request_id_to_status[req_id] = status[i]
             self._status_to_request_ids[status[i]].add(req_id)
     
-    def abort_requests(self, request_ids: Union[List[int], int], blocking: bool = False):
+    def _abort_requests(self, request_ids: Union[List[int], int], blocking: bool = False):
         """
         Mark requests for abortion.
         
@@ -497,17 +500,15 @@ class RequestStatusTracker:
         """
         return {info for req_id, info in self._request_infos.items() if info.rollout_instance_id == instance_id}
 
-    def abort_requests_of_version(self, version: int) -> list[int]:
+    def get_requests_of_abort_version(self, version: int) -> set[int]:
         """
-        Abort all requests associated with a specific version.
-        This method will collect all request IDs that match the specified version
-        and abort them by `abort_requests` method. It will also set the min running
-        verion to decline future requests with version tag less than it.
+        Get all requests associated with a specific abort version.
         
         Args:
             version (int): The version to abort requests for.
+        
         Returns:
-            list[int]: A list of request IDs that were aborted.
+            set[int]: A set of request IDs that match the specified abort version.
         """
         assert version >= 0, "Version must be a non-negative integer."
 
@@ -517,10 +518,7 @@ class RequestStatusTracker:
                 # If the request version matches, we will abort it
                 abort_request_ids.add(req_id)
         self._running_min_version = max(self._running_min_version, version + 1)
-        if abort_request_ids:
-            psrl_logger.debug(f"Aborting requests of version {version}: {abort_request_ids}")
-            self.abort_requests(list(abort_request_ids), blocking=False)
-        return list(abort_request_ids)
+        return abort_request_ids
 
     def update_request_version(self, request_id: Union[List[int], int], new_version: int):
         """

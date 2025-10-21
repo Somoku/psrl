@@ -7,7 +7,7 @@ experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-staleness_2'
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-PSRL_PATH=${PSRL_WORKSPACE}/psrl
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B

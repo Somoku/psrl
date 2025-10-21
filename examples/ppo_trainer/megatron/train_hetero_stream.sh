@@ -3,7 +3,7 @@
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-PSRL_PATH=${PSRL_WORKSPACE}/psrl
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 # Convert Hugging Face checkpoint to Megatron distributed checkpoint
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct

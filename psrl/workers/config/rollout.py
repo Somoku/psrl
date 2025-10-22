@@ -124,7 +124,7 @@ class RolloutConfig(BaseConfig):
     log_prob_use_dynamic_bsz: bool = False
     log_prob_max_token_len_per_gpu: int = 16384
 
-    disable_log_stats: bool = True
+    disable_log_stats: bool = False
     status_collection: bool = True
 
     multi_stage_wake_up: bool = False

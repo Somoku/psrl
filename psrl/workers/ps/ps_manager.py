@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from verl import DataProto
 
 from psrl.utils.ray import add_lock
-from psrl.utils.logger import get_ps_logger, setup_ps_logger, get_worker_info, log_single_event, EventType, deprecated
+from psrl.utils.logger import get_ps_logger, setup_ps_logger, get_worker_info, log_single_event, EventType, deprecated, log_dual_events
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.workers.ps.staleness_controller import BufferStatus, StalenessInventory, EntryInfo
@@ -281,10 +281,6 @@ class PSManager(RequestStatusTracker):
             
             entry_ids.append(entry_id)
             buffer_ids.append(buffer_id)
-            
-        if parent_ids:
-            for parent_id in parent_ids:
-                self.rollout_request_tracker.setdefault(parent_id, [])
         
         return buffer_ids, entry_ids
 
@@ -377,7 +373,8 @@ class PSManager(RequestStatusTracker):
                 self.abort_versions.add(version_to_abort)
         
         if abort_request_ids:
-            self.abort_requests(list(abort_request_ids), blocking=False)
+            with log_dual_events(f"Abort {len(abort_request_ids)} requests in staleness check", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
+                self.abort_requests(list(abort_request_ids), blocking=True)
 
         # If the buffer has no RESERVE entries after clearing entries, delete it or mark for deletion
         for buffer_id in ready_buffer_ids:
@@ -393,22 +390,6 @@ class PSManager(RequestStatusTracker):
                           f"original ready buffers {ready_buffer_ids}, abort versions {curr_abort_versions}, "
                           f"abort {len(abort_request_ids)} requests. "
                           f"After abortion, current ready buffers {self.staleness_inventory.ready_buffer_ids()}.")
-
-    async def execute_command(self, server, command: Command, blocking: bool = False):
-        """Execute a command on a server asynchronously.
-        
-        Args:
-            server: The server actor to execute the command on
-            command (Command): The command to execute
-            blocking (bool): Whether to wait for command completion
-            
-        Raises:
-            ValueError: If command execution fails
-        """
-        try:
-            await server.exec_command.remote(command, blocking=blocking)
-        except Exception as e:
-            raise ValueError(f"Failed to execute command {command}: {e}")
 
     def occupy_rollout_instance_request(
         self,

@@ -1041,9 +1041,7 @@ class PSRL_GenWorker(Worker):
         psrl_logger.debug(f"Found {len(request_tasks)} active tasks for request IDs: {request_ids}")
         if request_tasks:
             await self.rollout.interrupt_requests_async(request_ids)
-            # Wait for all tasks to finish
-            await asyncio.gather(*request_tasks, return_exceptions=True)
-            psrl_logger.debug(f"Interrupt all tasks done, clearing active tasks for request IDs: {request_ids}")
+            psrl_logger.debug(f"Interrupted requests with IDs: {request_ids}")
         interrupt_request_num = len(request_tasks)
         return interrupt_request_num
     
@@ -1090,7 +1088,7 @@ class PSRL_GenWorker(Worker):
             self._async_interrupt_event.clear()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def sync_with_ps(self):
+    async def sync_with_ps(self, ps_version: int):
         """
         Synchronize the rollout instance with the parameter server.
         
@@ -1102,6 +1100,9 @@ class PSRL_GenWorker(Worker):
         Returns:
             int: The number of requests that were interrupted during the sync process.
         """
+        if self.curr_rollout_instance_model_version >= ps_version:
+            return 0
+
         # Step 1: Interrupt generation
         psrl_logger.info(f"Starting sync_with_ps: interrupting generation on instance {self.get_instance_id()}")
         interrupted_request_num = await self.interrupt_generation()
@@ -1374,14 +1375,14 @@ class PSRL_GenWorker(Worker):
         task = self._generate_loop.create_task(
             self._generate_async_task(request, needed_model_version)
         )
-        self.version_to_active_tasks[needed_model_version].add(task)
-        self.request_id_to_active_tasks[request_id].add(task)
-        self.active_tasks.add(task)
-        self.log_active_tasks(task_added=True)
         task.add_done_callback(self._create_task_done_callback(
             int(request.non_tensor_batch["uid"][0]),
             needed_model_version,
         ))
+        self.version_to_active_tasks[needed_model_version].add(task)
+        self.request_id_to_active_tasks[request_id].add(task)
+        self.active_tasks.add(task)
+        self.log_active_tasks(task_added=True)
         # Wait for the task to finish
         result = await task
         return result

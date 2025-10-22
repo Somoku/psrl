@@ -300,11 +300,12 @@ class RequestStatusTracker:
             elif status in {RequestStatus.REWARD_RUNNING}:
                 abort_requests_for_reward.update(req_ids)
         
+        futures = []
         # Abort requests in rollout stage (ROLLOUT_RUNNING)
         if abort_requests_for_rollout:
             psrl_logger.debug("Aborting requests in rollout stages: %s", abort_requests_for_rollout)
             instance_to_request_ids = self.classify_requests_in_instance(list(abort_requests_for_rollout))
-            ray.get(self.rollout_coordinator.exec_command.remote(
+            futures.append(self.rollout_coordinator.exec_command.remote(
                 Command(
                     type=CommandType.ABORT,
                     instance_to_uids=instance_to_request_ids,
@@ -316,7 +317,7 @@ class RequestStatusTracker:
         # Abort requests in reward stage (REWARD_RUNNING)
         if abort_requests_for_reward:
             psrl_logger.debug("Aborting requests in reward stages: %s", abort_requests_for_reward)
-            ray.get(self.reward_server.exec_command.remote(
+            futures.append(self.reward_server.exec_command.remote(
                 Command(
                     type=CommandType.ABORT,
                     uids=list(abort_requests_for_reward),
@@ -324,6 +325,9 @@ class RequestStatusTracker:
                 blocking=blocking,
             ))
             psrl_logger.debug("Abort command sent to reward server for requests: %s", abort_requests_for_reward)
+        
+        if futures and blocking:
+            ray.get(futures)
     
     def classify_requests_in_status(self, request_ids: Union[List[int], int]) -> dict:
         """

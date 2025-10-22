@@ -536,7 +536,7 @@ class StalenessInventory:
             request_idx_in_list = entry_to_update.request_idx.index(request_idx)
             entry_to_update.model_version[request_idx_in_list] = new_version_tag
         psrl_logger.debug(f"Updated version tag of request idx {request_idx} in entry {entry_to_update} ")
-        min_model_version = entry_to_update.get_entry_version()
+        min_model_version = entry_to_update.entry_info.get_entry_version()
 
         self.buffers[buffer_id].entries[entry_id].entry_info = entry_to_update
         
@@ -664,7 +664,7 @@ class StalenessInventory:
                     b = self.buffers[bid]
                     for eid, entry in enumerate(b.entries):
                         if entry.category == EntryCategory.RESERVED:
-                            entry_model_version = entry.get_entry_version()
+                            entry_model_version = entry.entry_info.get_entry_version()
                             if (
                                 entry_model_version >= buffer_id - self.staleness and
                                 entry_model_version <= buffer_id and

@@ -40,7 +40,7 @@ top_k=-1
 
 # Run the simplified rollout performance test with real data
 PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/summary \
+    psrl.logging_path=${PSRL_PATH}/examples/bench/rollout/summary \
     \
     model.path="$HF_MODEL_PATH" \
     +model.override_config.max_position_embeddings=32768 \

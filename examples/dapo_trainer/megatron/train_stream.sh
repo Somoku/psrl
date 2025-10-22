@@ -67,7 +67,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/dapo_trainer/megatron/psrl_log \
+    psrl.logging_path=${PSRL_PATH}/examples/dapo_trainer/megatron/psrl_log \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=tis \

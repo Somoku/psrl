@@ -521,27 +521,27 @@ class StalenessInventory:
 
         prompt_id = request_id // self.rollout_n
         request_idx = request_id % self.rollout_n
-        entry_to_update = None
+        entry_info_to_update = None
         if prompt_id not in self.data_tracker:
             raise AssertionError(f"Prompt ID {prompt_id} not found in data tracker")
 
         buffer_id, entry_id = self.data_tracker[prompt_id]
-        entry_to_update = self.buffers[buffer_id].entries[entry_id].entry_info
+        entry_info_to_update = self.buffers[buffer_id].entries[entry_id].entry_info
         
-        if isinstance(entry_to_update.model_version, list):
-            request_idx_in_list = entry_to_update.request_idx.index(request_idx)
-            entry_to_update.model_version[request_idx_in_list] = new_version_tag
-        elif entry_to_update.model_version != new_version_tag:
-            entry_to_update.model_version = [entry_to_update.model_version] * len(entry_to_update.request_idx)
-            request_idx_in_list = entry_to_update.request_idx.index(request_idx)
-            entry_to_update.model_version[request_idx_in_list] = new_version_tag
-        psrl_logger.debug(f"Updated version tag of request idx {request_idx} in entry {entry_to_update} ")
-        min_model_version = entry_to_update.entry_info.get_entry_version()
+        if isinstance(entry_info_to_update.model_version, list):
+            request_idx_in_list = entry_info_to_update.request_idx.index(request_idx)
+            entry_info_to_update.model_version[request_idx_in_list] = new_version_tag
+        elif entry_info_to_update.model_version != new_version_tag:
+            entry_info_to_update.model_version = [entry_info_to_update.model_version] * len(entry_info_to_update.request_idx)
+            request_idx_in_list = entry_info_to_update.request_idx.index(request_idx)
+            entry_info_to_update.model_version[request_idx_in_list] = new_version_tag
+        psrl_logger.debug(f"Updated version tag of request idx {request_idx} in entry {entry_info_to_update} ")
+        min_model_version = entry_info_to_update.get_entry_version()
 
-        self.buffers[buffer_id].entries[entry_id].entry_info = entry_to_update
+        self.buffers[buffer_id].entries[entry_id].entry_info = entry_info_to_update
         
-        psrl_logger.debug(f"[Entry Update]: request idx {request_idx} in entry {entry_to_update} updated from "
-                          f"version tag {entry_to_update.model_version} to {new_version_tag} "
+        psrl_logger.debug(f"[Entry Update]: request idx {request_idx} in entry {entry_info_to_update} updated from "
+                          f"version tag {entry_info_to_update.model_version} to {new_version_tag} "
                           f"in (buffer {buffer_id}, entry {entry_id})")
 
     def clear_buffer(

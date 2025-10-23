@@ -1026,9 +1026,6 @@ class PSRL_GenWorker(Worker):
         if not request_ids:
             # Interrupt all requests
             interrupt_request_num = await self.rollout.interrupt_all_requests_async()
-            # Wait for all tasks to finish
-            if self.active_tasks:
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
             psrl_logger.debug(f"Interrupted all {interrupt_request_num} requests")
             return interrupt_request_num
         

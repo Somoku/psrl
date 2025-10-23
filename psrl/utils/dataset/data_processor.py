@@ -88,7 +88,7 @@ class DataProcessor:
         self.data_process_thread = None
         self.stop_data_process = False
         
-        # Build logger
+        # Build loggerz
         self.log_prefix = "DataProcessor"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         

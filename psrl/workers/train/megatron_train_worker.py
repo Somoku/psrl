@@ -8,6 +8,7 @@ from verl import DataProto
 from verl.models.mcore import get_mcore_weight_converter
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.device import get_device_id, get_torch_device
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
@@ -69,7 +70,9 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
        
     def init_nixl_client(self):
         """Initialize the NIXL client."""
-        assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
+        # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
+        # Because in UCX 1.18.0, this may enhance the communication performance
+        # assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
@@ -80,7 +83,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface,
-                client_group_id=self.get_replica_id()
+                # client_group_id=self.get_replica_id()
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
@@ -159,6 +162,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     
     # The log_prob in training side may need to be recomputed    
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @GPUMemoryLogger(role="megatron actor", logger=psrl_logger, level=logging.INFO, log_only_rank_0=False)
     def compute_log_prob(self, data: DataProto):
         with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
             assert self._is_actor
@@ -177,6 +181,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @GPUMemoryLogger(role="megatron actor", logger=psrl_logger, level=logging.INFO, log_only_rank_0=False)
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)

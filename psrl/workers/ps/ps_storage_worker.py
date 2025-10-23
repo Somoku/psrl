@@ -57,6 +57,9 @@ class PSStorageWorker:
         self.log_prefix = f"PSStorageWorker_R{self.rank}"
         setup_ps_logger(self.psrl_config.logging_path, self.log_prefix)
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        
+        # NOTE(lhy): currently hard code the net device to bond1
+        # os.environ["UCX_NET_DEVICES"] = "bond1"
      
     def get_replica_id(self) -> int:
         """
@@ -71,7 +74,9 @@ class PSStorageWorker:
         
     def init_nixl_client(self):
         """Initialize the NIXL client."""
-        assert self.train_meta_hf_model and self.gen_meta_hf_model, "The HuggingFace models must be initialized before calling init_nixl_client."
+        # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
+        # Because in UCX 1.18.0, this may enhance the communication performance
+        # assert self.train_meta_hf_model and self.gen_meta_hf_model, "The HuggingFace models must be initialized before calling init_nixl_client."
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
@@ -88,7 +93,7 @@ class PSStorageWorker:
                 multi_client_types=[NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL],
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface,
-                client_group_id=self.get_replica_id()
+                # client_group_id=self.get_replica_id()
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")

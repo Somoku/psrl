@@ -7,7 +7,7 @@ from collections import defaultdict
 import ray
 
 from psrl.utils.server.command import CommandType, Command, CommandExtension
-from psrl.utils.logger import DualOutputHandler
+from psrl.utils.logger import DualOutputHandler, deprecated
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -84,6 +84,15 @@ class RolloutCoordinator(CommandExtension):
         
     def world_size(self):
         return sum([rollout_wg.world_size for rollout_wg in self.rollout_wg_list])
+
+    def init_model(self):
+        futures = []
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            if self.rank_0_is_model_owner:
+                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_model"))
+            else:
+                futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
+        ray.get(futures)
 
     def init_nixl_client(self):
         futures = []

@@ -26,7 +26,7 @@ class TrainInterface:
 # Cannot directly call this class, please use the derived classes instead.
 class PSRL_BaseTrainWorker(ABC):
     def __init__(self, worker_rank: int, worker_world_size: int, psrl_config: DictConfig, train_interface: TrainInterface, nixl_interface: NIXLInterface):
-        # Basic info
+        # Basic debug
         self.worker_rank = worker_rank
         self.worker_world_size = worker_world_size
         self.psrl_config = psrl_config
@@ -45,12 +45,12 @@ class PSRL_BaseTrainWorker(ABC):
         self.nixl_wait_completed = threading.Event()
         
         # Build logger
-        self.log_prefix = f"BaseTrainWorker_R{self.rank}"
-        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
-        psrl_logger.debug(f"Initialized on {get_worker_info()}.")
+        # self.log_prefix = f"BaseTrainWorker_R{self.rank}"
+        # psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        # psrl_logger.debug(f"Initialized on {get_worker_info()}.")
         
-        # Env info
-        log_env_info(psrl_logger, level=logging.DEBUG)
+        # Env debug
+        # log_env_info(psrl_logger, level=logging.DEBUG)
         
     def get_node_id(self) -> str:
         """
@@ -129,31 +129,33 @@ class PSRL_BaseTrainWorker(ABC):
                     for target_agent_name, target_client_name in zip(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_train_storage_client_names): 
                         if target_client_name not in self._cached_ps_worker_handles:
                             self._cached_ps_worker_handles[target_client_name] = ray.get(ps_manager_handle.get_ps_worker_handle.remote(target_client_name))
-                        psrl_logger.info(f"Pushing key {key} to {target_client_name} for version {next_ps_model_version}")
+                        psrl_logger.debug(f"Pushing key {key} to {target_client_name} for version {next_ps_model_version}")
                         try:
                             shards_to_transfer = self.nixl_storage_client.client_write(target_agent_name, target_client_name, key, f"train_push_{next_ps_model_version}")
+                            # shards_to_transfer = self.nixl_storage_client.client_write(target_agent_name, target_client_name, key, "train_push")
                         except Exception as e:
                             psrl_logger.error(f"Error pushing key {key} to {target_client_name} for version {next_ps_model_version}: {e}")
                             raise e
                         if len(shards_to_transfer) > 0:
                             wait_operations.append((key, target_client_name, shards_to_transfer))
-                    psrl_logger.info(f"Starting to wait for {len(wait_operations)} NIXL operations for version {next_ps_model_version}...")
+                    psrl_logger.debug(f"Starting to wait for {len(wait_operations)} NIXL operations for version {next_ps_model_version}...")
                     for key, target_client_name, shards_to_transfer in wait_operations:
                         try:
                             self.nixl_storage_client.wait(key, f"train_push_{next_ps_model_version}", "WRITE", target_client=target_client_name)
+                            # self.nixl_storage_client.wait(key, "train_push", "WRITE", target_client=target_client_name)
                         except Exception as e:
                             psrl_logger.error(f"Error waiting for key {key} to target {target_client_name} for version {next_ps_model_version}: {e}")
                             raise e
-                        psrl_logger.info(f"Wait completed for key {key} to target {target_client_name}")
+                        psrl_logger.debug(f"Wait completed for key {key} to target {target_client_name}")
                         ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
                         precision_transfer_futures.append(ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer))
-                        psrl_logger.info(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
-                psrl_logger.info(f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} train to gen transfers on the PS...")
+                        psrl_logger.debug(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
+                psrl_logger.debug(f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} train to gen transfers on the PS...")
                 ray.get(precision_transfer_futures)
-                psrl_logger.info(f"Starting to push model tag to the PS...")
+                psrl_logger.debug(f"Starting to push model tag to the PS...")
                 ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version, self.worker_rank, self.worker_world_size))
                 self.nixl_wait_completed.set()
-                psrl_logger.info(f"All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
+                psrl_logger.debug(f"All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
             except Exception as e:
                 raise RuntimeError(f"Error in NIXL wait thread: {e}")
         

@@ -11,7 +11,7 @@ HOME=${PSRL_WORKSPACE}
 PSRL_PATH=${PSRL_WORKSPACE}/psrl
 
 # Model configuration
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B
 
 # Data configuration
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -27,7 +27,7 @@ NGPUS_PER_NODE=8
 
 # Test parameters
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_response_length=$((1024 * 20))
 batch_size=512
 num_iterations=1
 warmup_iterations=1
@@ -45,7 +45,7 @@ PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
     model.path="$HF_MODEL_PATH" \
     +model.override_config.max_position_embeddings=32768 \
     \
-    rollout.gpu_memory_utilization=0.95 \
+    rollout.gpu_memory_utilization=0.5 \
     rollout.tensor_parallel_size=${GEN_TP} \
     rollout.pipeline_parallel_size=${GEN_PP} \
     rollout.enable_chunked_prefill=False \

@@ -137,7 +137,7 @@ class PSManager(RequestStatusTracker):
         self.log_prefix = f"PSManager"
         setup_ps_logger(self.psrl_config.logging_path, self.log_prefix)
         '''
-        psrl_logger.info(f"Initialized on {get_worker_info()}.")
+        psrl_logger.info(f"PSManager initialized on {get_worker_info()}.")
 
     @deprecated("It is too slow to get the PS handle by `ray.get_runtime_context()`")
     def get_ps_manager_handle(self):

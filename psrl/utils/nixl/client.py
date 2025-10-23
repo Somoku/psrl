@@ -1,20 +1,18 @@
-import threading
 import time
-from sympy.core.symbol import Str
 import torch
 import logging
 import os
 import pickle
 import ray
-from copy import deepcopy
-from typing import Dict, Any, Set, Optional, List, Tuple
+import nixl._bindings as nixlBind
 from nixl._api import nixl_agent, nixl_agent_config
+from typing import Dict, Any, Optional, List, Tuple
 from omegaconf import DictConfig
 
-from psrl.utils.logger import deprecated, get_worker_info
+from psrl.utils.logger import deprecated, get_worker_info, DualOutputHandler
 from psrl.utils.nixl.network_topology import get_local_ip, get_local_gpu_id
 from psrl.utils.nixl.nixl_spec import NIXLTensorInfo, NIXLClientType, NIXLClientInfo, NIXLSharding, NIXLShardMetaInfo, NIXLInterface
-from psrl.utils.nixl.comm_plan import NIXLCommPlan, CommunicationPlanner
+from psrl.utils.nixl.comm_plan import NIXLCommPlan
 
 
 psrl_logger = logging.getLogger(__file__)
@@ -22,13 +20,16 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 # Utility function to combine tag, shard_idx, src_client, target_client, key
-def make_xfer_tag(tag: str, src_client: str, target_client: str, key: str, shard_idx: Tuple[int, ...]) -> bytes:
+def make_xfer_tag(tag: str, src_client: str, target_client: str, key: str, shard_idx: Optional[Tuple[int, ...]] = None) -> bytes:
     """
     Combine tag, shard_idx, src_client, target_client, and key into a unique bytes object as message identifier.
     Uses pickle to ensure uniqueness and handle various data types safely.
     """
     # Create a tuple containing all components to ensure uniqueness
-    components = (tag, src_client, target_client, key, shard_idx)
+    if shard_idx == None:
+        components = (tag, src_client, target_client, key)
+    else:
+        components = (tag, src_client, target_client, key, shard_idx)
     
     # Use pickle to serialize the tuple, ensuring unique representation
     return pickle.dumps(components)
@@ -48,7 +49,8 @@ class NIXLStorageClient:
         nixl_config: DictConfig,
         nixl_interface: NIXLInterface = NIXLInterface(),
         binded_agent: Optional[nixl_agent] = None,
-        client_group_id: Optional[int] = None
+        client_group_id: int = -1, # -1 is the default client group
+        logging_path: Optional[str] = None
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -91,6 +93,9 @@ class NIXLStorageClient:
         self._pinned_memory: Optional[Dict[Tuple[torch.Size, torch.dtype], List[Tuple[torch.Tensor, bytes]]]] = None
         self._contiguous_event_cache: Dict[Tuple[str, Tuple[int, ...]], torch.cuda.streams.Event] = {}  # (key, shard_idx) -> cudaEvent
         
+        # Optimization: merge multiple contiguous transfers into one
+        self._cached_xfer_descs = [] # [("READ", local_desc, remote_desc, target_agent, tag, target_client)]
+
         # Deprecated: storage_server mode
         self.server_client_info: Optional[NIXLClientInfo] = None
         self._storage_server_infos_fetched = False
@@ -104,17 +109,31 @@ class NIXLStorageClient:
         self._all_temp_mappings: Dict[str, Dict[Tuple[str, int], bytes]] = {}  # client_name -> temp_desc_mapping
         self._all_temp_mappings_fetched = False
         
+        # logging
+        if logging_path is not None:
+            self.log_prefix = "NIXLStorageClient_" + self.client_name
+            psrl_logger.addHandler(DualOutputHandler(logging_path, self.log_prefix))
+            psrl_logger.info(f"NIXLStorageClient {self.client_name} initialized.")
+        
     def release_temp_memory(self):
         """Release all temporary memory and deregister descriptors"""
-        for _, desc_bytes in self._temp_desc_bytes_cache.items():
+        _cached_deregister_descs = []
+        for _, desc_bytes in self._temp_desc_bytes_mapping.items():
             # Deregister the descriptor
-            desc = self.agent.deserialize_descs(desc_bytes)
-            self.agent.deregister_memory(desc)
+            if desc_bytes in _cached_deregister_descs:
+                continue
+            _cached_deregister_descs.append(desc_bytes)
+            try:
+                desc = self.agent.deserialize_descs(desc_bytes)
+                self.agent.deregister_memory(desc)
+            except Exception as e:
+                psrl_logger.warning(f"Failed to deregister descriptor {desc_bytes}: {e}")
+                raise e
         
         # Clear all temporary mappings
-        self._temp_tensor_mapping.clear()
-        self._temp_desc_bytes_mapping.clear()
-        self._temp_meta_mapping.clear()
+        self._temp_tensor_mapping = {}
+        self._temp_desc_bytes_mapping = {}
+        self._temp_meta_mapping = {}
 
     def reallocate_temp_memory(self):
         """Reallocate temporary memory for non-contiguous shards"""
@@ -128,7 +147,7 @@ class NIXLStorageClient:
                     contiguous_tensor = torch.empty(
                         meta_info.shape, 
                         dtype=meta_info.dtype,
-                        device=meta_info.device,
+                        device=self.device,
                         requires_grad=False
                     )
                     contiguous_meta_info = NIXLShardMetaInfo(
@@ -282,7 +301,7 @@ class NIXLStorageClient:
                         # Non-contiguous shard: create temporary contiguous memory
                         # Create a new contiguous tensor with the same shape and dtype
                         # raise RuntimeError("Non-contiguous shard requires pinned memory, but pinned memory is not enabled.")
-                        contiguous_tensor = torch.empty_like(local_sharded_tensor, requires_grad=False)
+                        contiguous_tensor = torch.empty_like(local_sharded_tensor, device=self.device, requires_grad=False)
                         try:
                             temp_desc = self.agent.register_memory([contiguous_tensor])
                         except Exception as e:
@@ -537,7 +556,7 @@ class NIXLStorageClient:
             raise e
         self._target_client_connected[target_client] = True
 
-    def client_read(self, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None) -> List[Tuple[int, ...]]:
+    def client_read(self, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None, merge_and_cache_xfer: Optional[bool] = False) -> List[Tuple[int, ...]]:
         """Read from another client (meta_server mode), supports shard alignment and communication plan."""
         if self.mode != "meta_server":
             raise RuntimeError("client_read only valid in meta_server mode")
@@ -562,13 +581,14 @@ class NIXLStorageClient:
             remote_pos = remote_info.sharding.shard_indices.index(shard_idx)
             
             # For non-contiguous shards, record the running key and shard idx
-            running_key, running_shard_idx = None, None 
+            is_contiguous, running_key, running_shard_idx = True, None, None 
             # Get local descriptor (check if it's a temporary one)
             local_desc_bytes = local_info.desc_bytes_list[local_pos]
             if local_desc_bytes is not None:
                 assert local_info.shard_meta_infos[local_pos].can_xfer_to(remote_info.shard_meta_infos[remote_pos]), \
                     f"Shard meta info mismatch for key {key} shard {shard_idx}: {local_info.shard_meta_infos[local_pos]} != {remote_info.shard_meta_infos[remote_pos]}"
             else:
+                is_contiguous = False
                 meta_info = self._temp_meta_mapping[(key, shard_idx)]
                 assert meta_info.can_xfer_to(remote_info.shard_meta_infos[remote_pos]), \
                     f"Temporary shard meta info mismatch for key {key} shard {shard_idx}: {meta_info} != {remote_info.shard_meta_infos[remote_pos]}"
@@ -585,7 +605,7 @@ class NIXLStorageClient:
                         start_time = time.time()
                         self.wait(running_key, running_tag, running_op_type, target_client=running_target_client, shard_idx=running_shard_idx)
                         end_time = time.time()
-                        psrl_logger.debug(f"{self.client_name} read uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available after {end_time - start_time} seconds")
+                        # psrl_logger.info(f"{self.client_name} read uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available, time: {end_time - start_time}s")
                     self._pinned_slot_running_xfer[slot_key] = (key, tag, "READ", target_client, shard_idx)  
             
             # Get remote descriptor (check if it's a temporary one)
@@ -602,6 +622,10 @@ class NIXLStorageClient:
                 f"Shard size mismatch for key {key} shard {shard_idx}: {local_info.get_shard_size_bytes(local_pos)} != {remote_info.get_shard_size_bytes(remote_pos)}"
             local_desc = self.agent.deserialize_descs(local_desc_bytes).trim()
             remote_desc = self.agent.deserialize_descs(remote_desc_bytes).trim()
+            # Contiguous xfer can be merged and executed together later
+            if merge_and_cache_xfer and is_contiguous:
+                self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
+                return []
             # Real xfer
             try:
                 if running_key is not None and running_shard_idx is not None:
@@ -609,20 +633,25 @@ class NIXLStorageClient:
                         f"Running key {running_key} shard {running_shard_idx} not found in contiguous event cache"
                     self._contiguous_event_cache[(running_key, running_shard_idx)].synchronize()
                     self._contiguous_event_cache.pop((running_key, running_shard_idx))
-                handle = self.agent.initialize_xfer(
-                    "READ", local_desc, remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
-                )
+                tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                if tag not in self.xfer_handles:
+                    self.xfer_handles[tag] = self.agent.initialize_xfer(
+                        "READ", local_desc, remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                    )
+                handle = self.xfer_handles[tag]
             except Exception as e:
                 raise RuntimeError(f"{self.client_name} creating client READ transfer to {target_client} failed for key {key} shard {shard_idx}: {e}")
             if not handle:
                 raise RuntimeError(f"{self.client_name} creating client READ transfer to {target_client} failed for key {key} shard {shard_idx}.")
+            start_time = time.time()
             state = self.agent.transfer(handle)
+            end_time = time.time()
+            # psrl_logger.info(f"{self.client_name} posted client READ transfer to {target_client} for key {key} shard {shard_idx}, time: {end_time - start_time}s")
             if state == "ERR":
                 raise RuntimeError(f"{self.client_name} posting client READ transfer to {target_client} failed for key {key} shard {shard_idx}.")
-            self.xfer_handles[make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)] = handle
         return shards_to_transfer
 
-    def client_write(self, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None) -> List[Tuple[int, ...]]:
+    def client_write(self, target_agent: str, target_client: str, key: str, tag: str, comm_plan: Optional[NIXLCommPlan] = None, merge_and_cache_xfer: Optional[bool] = False) -> List[Tuple[int, ...]]:
         """Write to another client (meta_server mode), supports shard alignment and communication plan."""
         if self.mode != "meta_server":
             raise RuntimeError("client_write only valid in meta_server mode")
@@ -647,11 +676,13 @@ class NIXLStorageClient:
             remote_pos = remote_info.sharding.shard_indices.index(shard_idx)
             
             # Check if local shard is non-contiguous and needs data copying
+            is_contiguous = True
             local_desc_bytes = local_info.desc_bytes_list[local_pos]
             if local_desc_bytes is not None:
                 assert local_info.shard_meta_infos[local_pos].can_xfer_to(remote_info.shard_meta_infos[remote_pos]), \
                     f"Shard meta info mismatch for key {key} shard {shard_idx}: {local_info.shard_meta_infos[local_pos]} != {remote_info.shard_meta_infos[remote_pos]}"
             else:
+                is_contiguous = False
                 meta_info = self._temp_meta_mapping[(key, shard_idx)]
                 assert meta_info.can_xfer_to(remote_info.shard_meta_infos[remote_pos]), \
                     f"Temporary shard meta info mismatch for key {key} shard {shard_idx}: {meta_info} != {remote_info.shard_meta_infos[remote_pos]}"
@@ -671,7 +702,7 @@ class NIXLStorageClient:
                         start_time = time.time()
                         self.wait(running_key, running_tag, running_op_type, target_client=running_target_client, shard_idx=running_shard_idx)
                         end_time = time.time()
-                        psrl_logger.debug(f"{self.client_name} write uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available after {end_time - start_time} seconds")
+                        psrl_logger.debug(f"{self.client_name} write uncontiguous {(key, shard_idx)}, pinned slot {pinned_idx} is available, time: {end_time - start_time}s")
                     self._pinned_slot_running_xfer[slot_key] = (key, tag, "WRITE", target_client, shard_idx)  
                 # Copy data from original non-contiguous tensor to temporary contiguous tensor
                 self._contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
@@ -696,14 +727,20 @@ class NIXLStorageClient:
                 f"Shard size mismatch for key {key} shard {shard_idx}: {local_info.get_shard_size_bytes(local_pos)} != {remote_info.get_shard_size_bytes(remote_pos)}"
             local_desc = self.agent.deserialize_descs(local_desc_bytes).trim()
             remote_desc = self.agent.deserialize_descs(remote_desc_bytes).trim()
+            if merge_and_cache_xfer and is_contiguous:
+                self._cached_xfer_descs.append(("WRITE", local_desc, remote_desc, target_agent, tag, target_client))
+                return []
             # Real xfer
             try:
                 if (key, shard_idx) in self._contiguous_event_cache:
                     self._contiguous_event_cache[(key, shard_idx)].synchronize()
                     self._contiguous_event_cache.pop((key, shard_idx))
-                handle = self.agent.initialize_xfer(
-                    "WRITE", local_desc, remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
-                )
+                tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                if tag not in self.xfer_handles:
+                    self.xfer_handles[tag] = self.agent.initialize_xfer(
+                        "WRITE", local_desc, remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                    )
+                handle = self.xfer_handles[tag]
             except Exception as e:
                 raise RuntimeError(f"{self.client_name} creating client WRITE transfer to {target_client} failed for key {key} shard {shard_idx}: {e}")
             if not handle:
@@ -711,8 +748,72 @@ class NIXLStorageClient:
             state = self.agent.transfer(handle)
             if state == "ERR":
                 raise RuntimeError(f"{self.client_name} posting client WRITE transfer to {target_client} failed for key {key} shard {shard_idx}.")
-            self.xfer_handles[make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)] = handle
         return shards_to_transfer
+        
+    # NOTE(lhy): This use low-level NIXL API to merge fragmented transfers into a single transfer, which is more efficient than finishing each transfer individually.
+    def merge_and_finish_cached_xfer(self, timeout: float = 600.0):
+        """Merge and finish cached transfers."""
+        if hasattr(self, "_cached_xfer_descs"):
+            _cached_xfer_descs_by_op_type = {}
+            for op_type, local_desc, remote_desc, target_agent, tag, target_client in self._cached_xfer_descs:
+                # Group by op_type, target agent and tag
+                if op_type not in _cached_xfer_descs_by_op_type:
+                    _cached_xfer_descs_by_op_type[op_type] = {}
+                if target_client not in _cached_xfer_descs_by_op_type[op_type]:
+                    _cached_xfer_descs_by_op_type[op_type][target_client] = {}
+                assert local_desc.descCount() == 1 and remote_desc.descCount() == 1, \
+                    f"Local and remote descriptor count should be 1, but found {local_desc.descCount()} and {remote_desc.descCount()} for op type {op_type} target client {target_client} tag {tag}"
+                if tag not in _cached_xfer_descs_by_op_type[op_type][target_client]:
+                    _cached_xfer_descs_by_op_type[op_type][target_client][tag] = [{"mem_type": local_desc.getType(), "descs": [local_desc[0]]}, {"mem_type": remote_desc.getType(), "descs": [remote_desc[0]]}, target_agent]
+                else:
+                    assert _cached_xfer_descs_by_op_type[op_type][target_client][tag][0]["mem_type"] == local_desc.getType() and _cached_xfer_descs_by_op_type[op_type][target_client][tag][1]["mem_type"] == remote_desc.getType(), \
+                        f"Mem type mismatch for op type {op_type} target client {target_client} tag {tag}: {_cached_xfer_descs_by_op_type[op_type][target_client][tag][0]['mem_type']} != {local_desc.getType()} or {_cached_xfer_descs_by_op_type[op_type][target_client][tag][1]['mem_type']} != {remote_desc.getType()}"
+                    _cached_xfer_descs_by_op_type[op_type][target_client][tag][0]["descs"].append(local_desc[0])
+                    _cached_xfer_descs_by_op_type[op_type][target_client][tag][1]["descs"].append(remote_desc[0])
+                    assert target_agent == _cached_xfer_descs_by_op_type[op_type][target_client][tag][2], \
+                        f"Target agent mismatch for op type {op_type} target client {target_client} tag {tag}: {target_agent} != {_cached_xfer_descs_by_op_type[op_type][target_client][tag][2]}"
+            for op_type, target_client_dict in _cached_xfer_descs_by_op_type.items():
+                for target_client, tag_dict in target_client_dict.items():
+                    for tag, xfer_desc_meta in tag_dict.items():
+                        merged_local_desc_dict, merged_remote_desc_dict, target_agent = xfer_desc_meta[0], xfer_desc_meta[1], xfer_desc_meta[2]
+                        try:
+                            merged_local_desc = nixlBind.nixlXferDList(merged_local_desc_dict["mem_type"], merged_local_desc_dict["descs"])
+                            merged_remote_desc = nixlBind.nixlXferDList(merged_remote_desc_dict["mem_type"], merged_remote_desc_dict["descs"])
+                            start_time = time.time()
+                            handle = self.agent.initialize_xfer(
+                                op_type, merged_local_desc, merged_remote_desc, target_agent, make_xfer_tag(tag, self.client_name, target_client, f"merged_xfer_for_{tag}")
+                            )
+                            end_time = time.time()
+                            psrl_logger.debug(f"{self.client_name} created client {op_type} transfer to {target_client} for tag {tag} with {merged_local_desc.descCount()} merged descriptors, time: {end_time - start_time}s")
+                        except Exception as e:
+                            raise RuntimeError(f"{self.client_name} creating client {op_type} transfer to {target_client} failed for tag {tag} with {merged_local_desc.descCount()} merged descriptors: {e}, \
+                                               local desc with type {merged_local_desc.getType()}: {[merged_local_desc[i] for i in range(merged_local_desc.descCount())]}, \
+                                               remote desc with type {merged_remote_desc.getType()}: {[merged_remote_desc[i] for i in range(merged_remote_desc.descCount())]}, \
+                                               target agent: {target_agent}")
+                        if not handle:
+                            raise RuntimeError(f"{self.client_name} creating client {op_type} transfer to {target_client} failed for tag {tag} with {merged_local_desc.descCount()} merged descriptors.")
+                        start_time = time.time()
+                        state = self.agent.transfer(handle)
+                        end_time = time.time()
+                        psrl_logger.info(f"{self.client_name} posted client {op_type} transfer to {target_client} for tag {tag} with {merged_local_desc.descCount()} merged descriptors, time: {end_time - start_time}s")
+                        if state == "ERR":
+                            raise RuntimeError(f"{self.client_name} posting client {op_type} transfer to {target_client} failed for tag {tag} with {merged_local_desc.descCount()} merged descriptors.")
+                        start = time.time()
+                        while True:
+                            try:
+                                state = self.agent.check_xfer_state(handle)
+                            except Exception as e:
+                                raise RuntimeError(f"Checking merged transfer state for ({op_type}, {target_client}, {tag}) from {self.client_name} failed: {e}")
+                            if state == "ERR":
+                                raise RuntimeError(f"Merged transfer error for ({op_type}, {target_client}, {tag}) from {self.client_name}")
+                            elif state == "DONE":
+                                break
+                            if time.time() - start > timeout:
+                                raise TimeoutError(f"Timeout waiting for merged transfer ({op_type}, {target_client}, {tag}) from {self.client_name}")
+                            time.sleep(0.0001)
+                        end = time.time()
+                        psrl_logger.debug(f"{self.client_name} finished client {op_type} transfer to {target_client} for tag {tag} with {merged_local_desc.descCount()} merged descriptors, time: {end - start}s")
+            self._cached_xfer_descs = []
     
     def wait(self, key: str, tag: str, op_type: str, target_client: Optional[str] = None, shard_idx: Optional[int] = None, timeout: float = 600.0):
         """
@@ -734,7 +835,7 @@ class NIXLStorageClient:
                     break
                 if time.time() - start > timeout:
                     raise TimeoutError(f"Timeout waiting for transfer ({key}, {tag}, {op_type}) from {self.client_name}")
-                time.sleep(0.05)
+                time.sleep(0.0001)
         elif self.mode == "meta_server":
             # Shard tag, wait for all shards
             info = self.local_client_info.get_tensor_info(key)
@@ -769,12 +870,13 @@ class NIXLStorageClient:
                                 self._contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
                                 original_tensor.copy_(contiguous_tensor)
                                 self._contiguous_event_cache[(key, shard_idx)].record()
-                        
+                        # NOTE(lhy): can keep the handle for future reuse
+                        # but no obvious performance gain, so we just pop it here
                         self.xfer_handles.pop(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
                         break
                     if time.time() - start > timeout:
                         raise TimeoutError(f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx}) from {self.client_name} to {target_client}")
-                    time.sleep(0.05)
+                    time.sleep(0.0001)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
@@ -804,7 +906,7 @@ class NIXLMultiStorageClients:
         multi_client_types: List[NIXLClientType], 
         nixl_config: DictConfig, 
         nixl_interface: NIXLInterface = NIXLInterface(),
-        client_group_id: Optional[int] = None
+        client_group_id: int = -1, # -1 is the default client group
     ):
         self.agent_name = agent_name
         self.multi_client_names = multi_client_names

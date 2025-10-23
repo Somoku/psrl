@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 
-from processor import make_intertoken_indexed_processor, Processor
+from processor import make_intertoken_indexed_processor, make_prompt_time_indexed_processor, make_generation_time_indexed_processor, Processor
 
 
 def read_jsonl_lines(path: str) -> Iterable[Dict[str, Any]]:
@@ -36,6 +36,7 @@ def read_jsonl_lines(path: str) -> Iterable[Dict[str, Any]]:
                 yield json.loads(raw)
             except Exception as e:
                 print(f"[warn] skip line {i}: invalid json ({e})")
+                raise e
 
 
 def collect_by_processor(path: str, processor: Processor) -> Dict[str, List[Tuple[Any, float]]]:
@@ -49,6 +50,7 @@ def collect_by_processor(path: str, processor: Processor) -> Dict[str, List[Tupl
             keep, values, x = processor(obj)
         except Exception as e:
             print(f"[warn] processor raised error; skipping line: {e}")
+            raise e
             continue
 
         if not keep:
@@ -89,7 +91,7 @@ def plot_series(series: Dict[str, List[Tuple[Any, float]]],
         ys = [p[1] for p in points]
         if isinstance(xs[0], datetime):
             any_datetime = True
-        plt.plot(xs, ys, marker='.', label=label)
+        plt.scatter(xs, ys, marker='.', label=label)
 
     plt.title(title)
     plt.xlabel(xlabel)
@@ -192,6 +194,8 @@ def main():
     # Replace `processor_example` with your own `processor` function if desired.
     # processor = processor_example
     processor = make_intertoken_indexed_processor()
+    processor = make_generation_time_indexed_processor()
+    processor = make_prompt_time_indexed_processor()
 
     series = collect_by_processor(args.jsonl, processor)
     if not series:

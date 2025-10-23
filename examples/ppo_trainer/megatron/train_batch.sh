@@ -13,7 +13,7 @@ python ${PSRL_PATH}/scripts/converter_hf_to_mcore.py --hf_model_path $HF_MODEL_P
 GLOBAL_BATCH_SIZE=16
 
 GEN_TP=2 # TP in the generation side
-GEN_PP=2 # PP in the generation side
+GEN_PP=1 # PP in the generation side
 
 VAL_TP=2 # TP in the training side for validation
 TRAIN_TP=2 # TP in the training side
@@ -107,8 +107,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger=['console'] \
     trainer.project_name='psrl_megatron_ppo_test' \
     trainer.experiment_name='batch' \
-    trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
-    trainer.nnodes=$NNODES \
     trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \

@@ -4,6 +4,7 @@ import ray
 import torch
 import asyncio
 import math
+import sys
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -134,6 +135,20 @@ class TrainClientActor:
         self.print(f"train_master_ip: {train_master_ip}")
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
+        
+        # NOTE(lhy): must create client here before loading the model
+        if engine_type == "megatron":
+            self._init_megatron_parallel(megatron_config)
+        self.client = NIXLStorageClient(
+            client_name=self.client_name,
+            server_name=server_name,
+            use_gpu=True,
+            client_type=NIXLClientType.PUSH_SIDE,
+            nixl_config=psrl_config.nixl,
+            nixl_interface=nixl_interface,
+            client_group_id=self._get_replica_id()
+        )
+        
         if engine_type == "fsdp" or engine_type == "fsdp_hybrid":
             model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
             # Set all model parameters to 1
@@ -162,18 +177,8 @@ class TrainClientActor:
                     device_mesh=init_device_mesh("cuda", mesh_shape=(ddp_size, fsdp_size))
                 )
         elif engine_type == "megatron":
-            self._init_megatron_parallel(megatron_config)
             set_random_seed(42)
             self._init_megatron_model(model_path)
-        self.client = NIXLStorageClient(
-            client_name=self.client_name,
-            server_name=server_name,
-            use_gpu=True,
-            client_type=NIXLClientType.PUSH_SIDE,
-            nixl_config=psrl_config.nixl,
-            nixl_interface=nixl_interface,
-            client_group_id=self._get_replica_id()
-        )
         self.ps_for_push_worker_handles = ps_for_push_worker_handles
         # self._log_env_info()
             
@@ -192,10 +197,13 @@ class TrainClientActor:
     
     def _init_megatron_parallel(self, megatron_config):
         """Initialize Megatron parallel state"""
+        virtual_pipeline_model_parallel_size = megatron_config.get("virtual_pipeline_model_parallel_size", 1)
+        if virtual_pipeline_model_parallel_size == 1:
+            virtual_pipeline_model_parallel_size = None
         mpu.initialize_model_parallel(
             tensor_model_parallel_size=megatron_config.get("tensor_model_parallel_size", 4),  
             pipeline_model_parallel_size=megatron_config.get("pipeline_model_parallel_size", 2), 
-            virtual_pipeline_model_parallel_size=megatron_config.get("virtual_pipeline_model_parallel_size", 1),
+            virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
             use_sharp=False,
             context_parallel_size=megatron_config.get("context_parallel_size", 1),
             expert_model_parallel_size=1,
@@ -275,11 +283,10 @@ class TrainClientActor:
         self.print("protocol done.")
 
     def push_to_ps(self, ps_agent_names, ps_client_names):
-        wait_operations = []
         for key in self.state_dict_keys:
             wait_operations = []
             for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
-                shards_to_transfer = self.client.client_write(ps_agent_name, ps_client_name, key, "train_push")
+                shards_to_transfer = self.client.client_write(ps_agent_name, ps_client_name, key, "train_push", merge_and_cache_xfer=False)
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
                     # self.print(f"Pushing {key} to {ps_client_name}")
@@ -296,6 +303,7 @@ class TrainClientActor:
                 # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
                 futures.append(self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key, shards_to_transfer))
             ray.get(futures)
+        # self.client.merge_and_finish_cached_xfer()
     
     def shutdown(self):
         self.client.shutdown()
@@ -308,6 +316,13 @@ class GenClientActor:
         if rank == 0:
             gen_master_ip = os.environ.get("LOCAL_IP")
             ray.get(global_store.set_gen_master_ip.remote(gen_master_ip))
+            '''
+            os.environ["UCX_LOG_LEVEL"] = "debug"
+            os.environ["NIXL_LOG_LEVEL"] = "debug"
+            f = open(os.path.join(log_dir, "ucx.log"), "w")
+            os.dup2(f.fileno(), sys.stdout.fileno())
+            os.dup2(f.fileno(), sys.stderr.fileno())
+            '''
         else:
             gen_master_ip = ray.get(global_store.get_gen_master_ip.remote())
         os.environ["MASTER_ADDR"] = gen_master_ip
@@ -325,7 +340,22 @@ class GenClientActor:
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
         self.tp_size = gen_config.get("tensor_parallel_size", 2)
         self.pp_size = gen_config.get("pipeline_parallel_size", 1)
+        self.rank = rank
+        self.tp_rank = rank % self.tp_size
         assert world_size % (self.tp_size * self.pp_size) == 0, f"world_size {world_size} is not divisible by {self.tp_size * self.pp_size}"
+        
+        # NOTE(lhy): must create client here before loading the model
+        self.client = NIXLStorageClient(
+            client_name=self.client_name,
+            server_name=server_name,
+            use_gpu=True,
+            client_type=NIXLClientType.PULL_SIDE,
+            nixl_config=psrl_config.nixl,
+            nixl_interface=nixl_interface,
+            client_group_id=self._get_replica_id(),
+            logging_path=log_dir
+        )
+        
         llm = LLM(
             model=model_path,
             # enable_sleep_mode=True,
@@ -339,24 +369,13 @@ class GenClientActor:
             seed=42,
         )
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-        self.print(f"local rank {rank} model: {self.model}")
+        self.print(f"local rank {self.rank} model: {self.model}")
         '''
         seen_module_prefixes = set()
         for module_prefix, module in self.model.named_modules():
             seen_module_prefixes.add(module_prefix)
         self.print(f"seen_module_prefixes: {seen_module_prefixes}, has lm_head: {'lm_head' in seen_module_prefixes}, has lm_head module: {hasattr(self.model, 'lm_head')}")
         '''
-        self.rank = rank
-        self.tp_rank = rank % self.tp_size
-        self.client = NIXLStorageClient(
-            client_name=self.client_name,
-            server_name=server_name,
-            use_gpu=True,
-            client_type=NIXLClientType.PULL_SIDE,
-            nixl_config=psrl_config.nixl,
-            nixl_interface=nixl_interface,
-            client_group_id=self._get_replica_id()
-        )
         
     def _get_replica_id(self):
         return self.rank // (self.tp_size * self.pp_size)
@@ -404,17 +423,22 @@ class GenClientActor:
             for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
                 # self.print(f"pull {key} from {ps_client_name}")
                 start_time = time.time()
-                shards_to_transfer = self.client.client_read(ps_agent_name, ps_client_name, key, "gen_pull")
+                shards_to_transfer = self.client.client_read(ps_agent_name, ps_client_name, key, "gen_pull", merge_and_cache_xfer=True)
                 end_time = time.time()
-                # self.print(f"Read launched for key {key} from {ps_client_name}. time: {end_time - start_time}s")
                 if len(shards_to_transfer) > 0:
+                    # self.print(f"Read launched for (key {key}, shards {shards_to_transfer}) from {ps_client_name}. time: {end_time - start_time}s")
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
         for key, ps_client_name, shards_to_transfer in wait_operations:
             start_time = time.time()
             self.client.wait(key, "gen_pull", "READ", target_client=ps_client_name)
             end_time = time.time()
             # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
+        start_time = time.time()
+        self.client.merge_and_finish_cached_xfer()
+        end_time = time.time()
+        # self.print(f"Finish cached xfer done. time: {end_time - start_time}s")
         total_end_time = time.time()
+        # torch.cuda.synchronize()
         self.print(f"Total pull from ps done: {total_end_time - total_start_time}s")
     
     def shutdown(self):
@@ -443,7 +467,7 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, n
 def test_nixl_e2e(cfg: DictConfig):
     log_dir = cfg.logging.path
     os.makedirs(log_dir, exist_ok=True)
-    ray.init(ignore_reinit_error=True)
+    ray.init(ignore_reinit_error=True, runtime_env={"env_vars": {"PSRL_LOGGING_PATH": log_dir}})
     listen_ip = cfg.network.listen_ip
     listen_port = cfg.network.listen_port
     print(f"meta server listen_ip: {listen_ip}")
@@ -557,6 +581,16 @@ def test_nixl_e2e(cfg: DictConfig):
     ray.get(futures)
     end_time = time.time()
     print(f"[PASS] protocol done. time: {end_time - start_time}s")
+    
+    # Warm-up
+    '''
+    futures = []
+    for g in gen_actors:
+        futures.append(g.pull_from_ps.remote(ps_agent_names, ps_for_pull_names))
+    ray.get(futures)
+    end_time = time.time()
+    print(f"[PASS] Warm-up done. time: {end_time - start_time}s")
+    '''
 
     # Each train client pushes to each PS worker
     start_time = time.time()
@@ -568,6 +602,13 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] train push to all ps done. time: {end_time - start_time}s")
 
     # Each gen client pulls from each PS worker
+    '''
+    for gen_idx, g in enumerate(gen_actors):
+        start_time = time.time()
+        ray.get(g.pull_from_ps.remote(ps_agent_names, ps_for_pull_names))
+        end_time = time.time()
+        print(f"[PASS] gen {gen_idx} pull from all ps done. time: {end_time - start_time}s")
+    '''
     start_time = time.time()
     futures = []
     for g in gen_actors:

@@ -3,7 +3,7 @@
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-PSRL_PATH=${PSRL_WORKSPACE}/psrl
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 # Convert Hugging Face checkpoint to Megatron distributed checkpoint
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
@@ -44,7 +44,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/ppo_trainer/megatron/psrl_log \
+    psrl.logging_path=${PSRL_PATH}/examples/ppo_trainer/megatron/psrl_log \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \

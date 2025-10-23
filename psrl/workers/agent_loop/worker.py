@@ -109,6 +109,7 @@ class PSRL_AgentLoopWorker:
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._launch_agent_loop())
+        self.busy_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
 
     def stop_busy_loop(self):
         """Stop the busy loop and wait for the current task to complete."""
@@ -227,12 +228,12 @@ class PSRL_AgentLoopWorker:
         async def _update_status():
             self.rollout_router.update_engine_status(engine_status)
             # Log some key metrics
-            instances = engine_status.get("instance_engine_status", {})
+            instance_to_status = engine_status.get("instance_engine_status", {})
             total_queue_size = sum(
-                inst_status.get("waiting_and_running_queue_size", 0) 
-                for inst_status in instances.values()
+                inst_status.get("waiting_and_running_queue_size", 0)
+                for inst_status in instance_to_status.values()
             )
-            psrl_logger.debug(f"Updated engine status: {len(instances)} instances, total queue size: {total_queue_size}")
+            psrl_logger.debug(f"Updated engine status: {len(instance_to_status)} instances, total queue size: {total_queue_size}")
         
         # Schedule the async update
         try:

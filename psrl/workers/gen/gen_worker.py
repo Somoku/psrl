@@ -162,9 +162,6 @@ class PSRL_GenWorker(Worker):
         # Task for version update
         self.version_update_task = None
         
-        # Task for engine status collection
-        self.status_collection_task = None
-        
         # Rollout request management
         self.request_queue = deque()
         if self.psrl_config.gen_mode == "batch":
@@ -1031,9 +1028,6 @@ class PSRL_GenWorker(Worker):
         if not request_ids:
             # Interrupt all requests
             interrupt_request_num = await self.rollout.interrupt_all_requests_async()
-            # Wait for all tasks to finish
-            if self.active_tasks:
-                await asyncio.gather(*self.active_tasks, return_exceptions=True)
             psrl_logger.debug(f"Interrupted all {interrupt_request_num} requests")
             return interrupt_request_num
         
@@ -1046,9 +1040,7 @@ class PSRL_GenWorker(Worker):
         psrl_logger.debug(f"Found {len(request_tasks)} active tasks for request IDs: {request_ids}")
         if request_tasks:
             await self.rollout.interrupt_requests_async(request_ids)
-            # Wait for all tasks to finish
-            await asyncio.gather(*request_tasks, return_exceptions=True)
-            psrl_logger.debug(f"Interrupt all tasks done, clearing active tasks for request IDs: {request_ids}")
+            psrl_logger.debug(f"Interrupted requests with IDs: {request_ids}")
         interrupt_request_num = len(request_tasks)
         return interrupt_request_num
     
@@ -1093,6 +1085,42 @@ class PSRL_GenWorker(Worker):
         else:
             self._async_resume_event.set()
             self._async_interrupt_event.clear()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def sync_with_ps(self, ps_version: int):
+        """
+        Synchronize the rollout instance with the parameter server.
+        
+        This method combines three operations into one:
+        1. Interrupt the current generation process
+        2. Pull the latest model weights from the parameter server
+        3. Resume the generation process
+        
+        Returns:
+            int: The number of requests that were interrupted during the sync process.
+        """
+        if self.curr_rollout_instance_model_version >= ps_version:
+            return 0
+
+        # Step 1: Interrupt generation
+        psrl_logger.info(f"Starting sync_with_ps: interrupting generation on instance {self.get_instance_id()}")
+        interrupted_request_num = await self.interrupt_generation()
+        psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
+        
+        # Step 2: Pull model
+        psrl_logger.info(f"Pulling model from PS for instance {self.get_instance_id()}")
+        if self.config.rollout.mode == "psrl_async":
+            await self.pull_model_async()
+        else:
+            self.pull_model()
+        psrl_logger.info(f"Model pulled successfully for instance {self.get_instance_id()}")
+        
+        # Step 3: Resume generation
+        psrl_logger.info(f"Resuming generation on instance {self.get_instance_id()}")
+        self.resume_generation()
+        psrl_logger.info(f"Generation resumed on instance {self.get_instance_id()}")
+        
+        return interrupted_request_num
 
     @deprecated("It is deprecated after we support agent loop.")
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
@@ -1309,8 +1337,12 @@ class PSRL_GenWorker(Worker):
         curr_rollout_instance_model_version = self.curr_rollout_instance_model_version
         request_id = int(request.non_tensor_batch["uid"][0])
         needed_model_version = int(request.non_tensor_batch["version_tag"][0])
-        assert needed_model_version >= curr_rollout_instance_model_version, \
-            f"Current rollout instance version should not be less than needed version, but got {curr_rollout_instance_model_version} vs. {needed_model_version}"
+        if needed_model_version < curr_rollout_instance_model_version:
+            psrl_logger.warning(f"Request {request_id} needed model version {needed_model_version} is less than "
+                                f"current rollout instance model version {curr_rollout_instance_model_version}, "
+                                f"we'll update needed model version to {curr_rollout_instance_model_version}.")
+            needed_model_version = curr_rollout_instance_model_version
+            request.non_tensor_batch["version_tag"] = np.array([needed_model_version], dtype=int)
         
         # Wait for this version to be ready to execute (ensuring sequential execution)
         await self._wait_for_version_turn(needed_model_version)
@@ -1342,14 +1374,14 @@ class PSRL_GenWorker(Worker):
         task = self._generate_loop.create_task(
             self._generate_async_task(request, needed_model_version)
         )
-        self.version_to_active_tasks[needed_model_version].add(task)
-        self.request_id_to_active_tasks[request_id].add(task)
-        self.active_tasks.add(task)
-        self.log_active_tasks(task_added=True)
         task.add_done_callback(self._create_task_done_callback(
             int(request.non_tensor_batch["uid"][0]),
             needed_model_version,
         ))
+        self.version_to_active_tasks[needed_model_version].add(task)
+        self.request_id_to_active_tasks[request_id].add(task)
+        self.active_tasks.add(task)
+        self.log_active_tasks(task_added=True)
         # Wait for the task to finish
         result = await task
         return result
@@ -1448,3 +1480,17 @@ class PSRL_GenWorker(Worker):
         if next_version is not None:
             psrl_logger.debug(f"Signaling version {next_version} to proceed after {completed_version} completed")
             self.version_ready_events[next_version].set()
+
+    def get_workload_after_update_to(self, model_version: int) -> int:
+        """
+        Get the number of tasks waiting for model versions lower than or equal to the given model version.
+        Args:
+            model_version (int): The model version to check against.
+        Returns:
+            int: The number of tasks waiting for curr_rollout_instance_model_version < model versions <= model_version.
+        """
+        workload = 0
+        for version, task_num in self.version_to_task_num.items():
+            if self.curr_rollout_instance_model_version < version <= model_version:
+                workload += task_num
+        return workload

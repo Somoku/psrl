@@ -58,7 +58,12 @@ class RolloutRouter:
         # Engine status tracking
         # NOTE: The engine status will be updated by RolloutCoordinator
         # and can be accessed via get_engine_status() method from agent loop worker
-        self.latest_engine_status = {}
+        self.latest_engine_status = {
+            "timestamp": None,
+            "instance_engine_status": {},
+            "instance_running_status": {},
+            "instance_to_version": {},
+        }
         self.status_changed = False
         
         # Cache for sample_id to version_tag mapping with LRU eviction
@@ -115,12 +120,13 @@ class RolloutRouter:
             if self.status_changed:
                 self.route_strategy.update_instance_request_counts(
                     {instance_id: status.get("waiting_and_running_queue_size", 0)
-                     for instance_id, status in self.latest_engine_status.get("instances", {}).items()}
+                     for instance_id, status in self.latest_engine_status.get("instance_engine_status", {}).items()}
                 )
                 self.status_changed = False
             chosen_worker = self.route_strategy.route(request, candidates)
-            self.latest_engine_status.get("instances", {}).get(chosen_worker, {}).setdefault("waiting_and_running_queue_size", 0)
-            self.latest_engine_status.get("instances", {}).get(chosen_worker, {})["waiting_and_running_queue_size"] += 1
+            if chosen_worker not in self.latest_engine_status["instance_engine_status"]:
+                self.latest_engine_status["instance_engine_status"][chosen_worker] = {"waiting_and_running_queue_size": 0}
+            self.latest_engine_status["instance_engine_status"][chosen_worker]["waiting_and_running_queue_size"] += 1
         else:
             chosen_worker = self.route_strategy.route(request, candidates)
         return chosen_worker
@@ -458,7 +464,7 @@ class RolloutRouter:
                 
                 request = consolidated_output
                 if update_status == RequestStatus.RUNNING:
-                    continue_generation = False
+                    break
                 elif update_status == RequestStatus.ROLLOUT_INTERRUPTED:
                     continue
     
@@ -466,7 +472,7 @@ class RolloutRouter:
             if self.rank_0_is_model_owner:
                 await self.rollout_wg_list[gen_worker_idx].execute_rank_zero_async("pop_task", request_id, needed_model_version)
             else:
-                await self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version)     
+                await self.rollout_wg_list[gen_worker_idx].execute_all_async("pop_task", request_id, needed_model_version)
 
             return request
         return None

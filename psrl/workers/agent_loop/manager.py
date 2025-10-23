@@ -74,21 +74,22 @@ class PSRL_AgentLoopManager:
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._dispatch_data())
+        self.busy_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
 
-    def stop_busy_loop(self):
+    async def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""
         if not self.busy_loop_task or self.busy_loop_task.done():
             return
 
         self.stop_busy_loop_task = True
         # Wait for the background task to finish
-        self.running_loop.run_until_complete(self.busy_loop_task)
+        await self.busy_loop_task
 
         # Stop the busy loop of agent loop workers
         futures = []
         for worker in self.agent_loop_workers:
             futures.append(worker.stop_busy_loop.remote())
-        ray.get(futures)
+        await asyncio.gather(*futures)
 
     async def put_data(self, data: DataProto):
         """Put objectref of data into the manager's data queue."""
@@ -221,28 +222,23 @@ class PSRL_AgentLoopManager:
         self._dispatch_idx = (self._dispatch_idx + len(prompt_to_worker)) % len(self.agent_loop_workers)
         return dispatch_plan
 
-    def retry_request(self, buffer_id: int):
+    async def retry_request(self, max_version_limit: int, retry_num: int):
         """Notify the agent loop manager to retry processing requests associated with a specific buffer ID.
         
         Args:
-            buffer_id (int): The buffer ID whose requests need to be retried.
+            max_version_limit (int): The buffer ID whose requests need to be retried.
+            retry_num (int): The number of retries to attempt.
         """
         if self.running_loop and not self.stop_busy_loop_task:
-            self.running_loop.call_soon_threadsafe(self._retry_request, buffer_id)
+            for _ in range(retry_num):
+                if not self.data_queue.empty():
+                    data = await self.data_queue.get()
+                    if data is None:
+                        raise ValueError("Data queue should not contain None when retrying requests.")
+
+                    data.non_tensor_batch["max_version_limit"] = np.array([max_version_limit] * len(data), dtype=int)
+                    psrl_logger.debug(f"Retrying new requests with max version limit {max_version_limit}, total {len(data)} requests")
+
+                    await self._inner_dispatch_data(data)
         else:
             psrl_logger.warning("Busy loop of the agent loop manager has stopped, the retry operation will be skipped")
-
-    def _retry_request(self, max_version_limit: int):
-        """Retry processing requests with a specific version limit."""
-        # Get request from the data queue and re-dispatch among instance with versions in [buffer_id - staleness, buffer_id]
-        retry_num = self.alg_rollout_n if self.config.psrl.gen_mode == "stream" else 1
-        for i in range(retry_num):
-            if not self.data_queue.empty():
-                data = self.data_queue.get_nowait()
-                if data is None:
-                    raise ValueError("Data queue should not contain None when retrying requests.")
-
-                data.non_tensor_batch["max_version_limit"] = np.array([max_version_limit] * len(data), dtype=int)
-                psrl_logger.debug(f"Retrying to dispatch new requests with ids: {data.non_tensor_batch['uid']}")
-
-                asyncio.run_coroutine_threadsafe(self._inner_dispatch_data(data), self.running_loop)

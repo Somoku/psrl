@@ -7,7 +7,7 @@ experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-batch-nixl-staleness_0'
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-PSRL_PATH=${PSRL_WORKSPACE}/psrl
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
@@ -70,7 +70,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=batch \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=tis \

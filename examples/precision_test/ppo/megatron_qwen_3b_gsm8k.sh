@@ -6,7 +6,7 @@ experiment_name='PPO-Qwen2.5-3b-gsm8k-mcore-batch-nixl-staleness_0'
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
-PSRL_PATH=${PSRL_WORKSPACE}/psrl
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-3B-Instruct
@@ -45,7 +45,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=batch \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_WORKSPACE}/psrl/examples/precision_test/ppo/megatron_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/precision_test/ppo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \

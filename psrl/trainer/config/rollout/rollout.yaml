@@ -95,7 +95,10 @@ log_prob_use_dynamic_bsz: ${oc.select:train_actor_rollout_ref.actor.use_dynamic_
 log_prob_max_token_len_per_gpu: ${oc.select:train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
 
 # disable logging statistics
-disable_log_stats: True
+disable_log_stats: False
+
+# collect rollout instance status
+status_collection: True
 
 # for hf rollout
 # Whether to sample during training rollout. False uses greedy sampling.
@@ -219,6 +222,9 @@ agent:
   #   min_terms: 2
   #   max_terms: 6
   agent_loop_config_path: null
+
+  # Routing strategy: random, round_robin, request_num_balance
+  route_strategy: round_robin
 
   # custom async server configs
   custom_async_server:

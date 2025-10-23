@@ -1,8 +1,13 @@
+import os
+import logging
 import numpy as np
 from abc import ABC, abstractmethod
 from typing import Dict, Type, Optional, List
 
 from verl import DataProto
+
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 _ROUTE_STRATEGY_REGISTRY: Dict[str, Type['RouteStrategyBase']] = {}
 
@@ -125,5 +130,8 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
         if candidates is None:
             candidates = list(range(self.n_instances))
         idx = np.argmin([self.instance_request_counts[i] for i in candidates])
+        psrl_logger.debug(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
+                          f"with workloads {[self.instance_request_counts[i] for i in candidates]}, "
+                          f"selected instance {candidates[idx]} with workload {self.instance_request_counts[candidates[idx]]}")
         self.instance_request_counts[candidates[idx]] += 1
         return candidates[idx]

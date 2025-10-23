@@ -1,10 +1,9 @@
 import os
 import logging
 import enum
+import asyncio
 from enum import Enum
 from typing import Optional, Any
-from threading import Event
-from queue import Queue
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -107,19 +106,27 @@ class Command:
 
 class CommandEvent:
     """
-    A class to handle command events.
+    A class to handle command events using asyncio.Event.
     
     Attributes:
         command_id (int): The ID of the command.
-        event (Event): The event associated with the command.
+        event (asyncio.Event): The asyncio event associated with the command.
     """
-    def __init__(self, command_id: int, event: Optional[Event] = None):
+    def __init__(self, command_id: int, event: Optional[asyncio.Event] = None):
         self.command_id = command_id
-        self.event = event if event is not None else Event()
+        self.event = event if event is not None else asyncio.Event()
 
-    def wait(self, timeout=None):
+    async def wait(self, timeout=None):
         """Wait for the command event to be set."""
-        self.event.wait(timeout)
+        if timeout is not None:
+            try:
+                await asyncio.wait_for(self.event.wait(), timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                return False
+        else:
+            await self.event.wait()
+            return True
 
     def set(self):
         """Set the command event."""
@@ -139,14 +146,14 @@ class CommandEvent:
 class CommandExtension:
     def __init__(self):
         """
-        Initialize the CommandExtension with threading locks to handle command results and events.
+        Initialize the CommandExtension with asyncio queue to handle command results and events.
         """
         self._command_results = {}
         self._command_events = {}
         self._command_counter = 0
-        self.command_queue = Queue()  # For async commands like abort
+        self.command_queue = asyncio.Queue()  # For async commands like abort
 
-    def exec_command(self, command: Command, timeout=None, blocking=True):
+    async def exec_command(self, command: Command, timeout=None, blocking=True):
         """
         Add a command to the command queue and wait for its completion within the specified timeout.
         
@@ -172,7 +179,7 @@ class CommandExtension:
         self._command_results[command_id] = None
         
         command._kwargs["id"] = command_id
-        self.command_queue.put(command)
+        self.command_queue.put_nowait(command)
         
         # If not blocking, return the command event immediately
         if not blocking:
@@ -180,16 +187,13 @@ class CommandExtension:
             return command_id
 
         # Wait for the command to complete
-        if timeout is not None:
-            success = command_event.wait(timeout=timeout)
-            if not success:
-                if command_id in self._command_results:
-                    del self._command_results[command_id]
-                if command_id in self._command_events:
-                    del self._command_events[command_id]
-                return None
-        else:
-            command_event.wait()
+        success = await command_event.wait(timeout=timeout)
+        if not success:
+            if command_id in self._command_results:
+                del self._command_results[command_id]
+            if command_id in self._command_events:
+                del self._command_events[command_id]
+            return None
 
         result = self._command_results.get(command_id, None)
         psrl_logger.debug(f"Command {command_id} completed with result: {result}")
@@ -200,7 +204,7 @@ class CommandExtension:
         
         return result
 
-    def synchronize_command(self, command_id: int, timeout=None):
+    async def synchronize_command(self, command_id: int, timeout=None):
         """
         Wait for a specific command event to be set and return its result.
         
@@ -215,13 +219,10 @@ class CommandExtension:
 
         command_event = self._command_events[command_id]
         
-        if timeout is not None:
-            success = command_event.wait(timeout=timeout)
-            if not success:
-                psrl_logger.warning(f"Command event {command_id} timed out after {timeout} seconds.")
-                return None
-        else:
-            command_event.wait()
+        success = await command_event.wait(timeout=timeout)
+        if not success:
+            psrl_logger.warning(f"Command event {command_id} timed out after {timeout} seconds.")
+            return None
         
         result = self._command_results.get(command_id, None)
         if command_id in self._command_results:

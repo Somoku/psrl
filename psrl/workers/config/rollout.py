@@ -54,6 +54,7 @@ class CustomAsyncServerConfig(BaseConfig):
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
     agent_loop_config_path: Optional[str] = None
+    route_strategy: str = "round_robin"
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
 
 
@@ -123,7 +124,8 @@ class RolloutConfig(BaseConfig):
     log_prob_use_dynamic_bsz: bool = False
     log_prob_max_token_len_per_gpu: int = 16384
 
-    disable_log_stats: bool = True
+    disable_log_stats: bool = False
+    status_collection: bool = True
 
     multi_stage_wake_up: bool = False
     engine_kwargs: dict = field(default_factory=dict)

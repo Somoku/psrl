@@ -4,6 +4,9 @@ colocate: False
 # IP address of parameter server managaer.
 ps_manager_ip: 127.0.0.1
 
+# IP address of reward service.
+reward_service_ip: ${psrl.ps_manager_ip}
+
 # Staleness control of training data.
 staleness: 0
 
@@ -152,3 +155,9 @@ buffer_post_process:
   # Available options: "dynamic_sampling_filter", "no_filter"
   # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
   name: null
+
+# Buffer bound for retry mechanism
+retry_bound: -1
+
+# Ratio over retry bound
+retry_ratio: 1.0

@@ -23,8 +23,8 @@ NNODES=1  # Simplified to single node
 NGPUS_PER_NODE=8
 
 # Test parameters
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 6))
+max_prompt_length=$((1024 * 6))
+max_response_length=$((1024 * 2))
 batch_size=${1:-64}
 num_iterations=1
 warmup_iterations=1

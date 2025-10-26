@@ -65,7 +65,6 @@ class SimpleRolloutTester:
                 self.processor,
                 None,  # No PS manager needed for testing
                 None,  # No data queue needed for testing
-                collate_fn=None,
                 process_mode="batch",
             )
         else:
@@ -199,10 +198,10 @@ class SimpleRolloutTester:
             psrl_logger.error(f"Failed to get real data batch: {e}")
             raise
 
-    async def _generate_batch_async(self, prompts: List[Dict[str, Any]], synthetic) -> List[RequestOutput]:
+    async def _generate_batch_async(self, prompts: List[Dict[str, Any]], synthetic_list: List[bool]) -> List[RequestOutput]:
         """Generate responses for a batch of prompts using AsyncLLM."""
         # Create sampling parameters with EOS token disabled to force max length generation
-        sampling_params = SamplingParams(
+        sampling_params = [SamplingParams(
             temperature=self.config.rollout.temperature,
             top_p=self.config.rollout.get("top_p", 1.0),
             top_k=self.config.rollout.get("top_k", -1),
@@ -210,7 +209,7 @@ class SimpleRolloutTester:
             stop=None,
             # Disable EOS token to force generation to max length
             ignore_eos=True if synthetic else False,
-        )
+        ) for synthetic in synthetic_list]
         
         # Log generation start if stats collector is available
         if self.stats_collector is not None:
@@ -233,7 +232,7 @@ class SimpleRolloutTester:
             final_output = None
             async for output in self.llm.generate(
                 prompt=TokensPrompt(**prompt_data),
-                sampling_params=sampling_params,
+                sampling_params=sampling_params[i],
                 request_id=str(uuid.uuid4()),
             ):
                 final_output = output  # Keep the last output
@@ -276,20 +275,16 @@ class SimpleRolloutTester:
         for i in range(warmup_iterations):
             psrl_logger.info(f"Warmup iteration {i+1}/{warmup_iterations}")
             try:
-                '''
-                if test_mode == "synthetic":
-                    test_prompts = self._create_synthetic_data(batch_size)
-                else:
-                    test_prompts = self._get_real_data_batch()
-                '''
                 # Run a small batch to warm up the model
                 test_prompts = self._create_synthetic_data(16)
+                synthetic_list = [False] * 16
                 
                 # Generate responses
-                results = await self._generate_batch_async(test_prompts, test_mode == "synthetic")
+                results = await self._generate_batch_async(test_prompts, synthetic_list)
                 psrl_logger.debug(f"Warmup iteration {i+1} generated {len(results)} sequences")
             except Exception as e:
                 psrl_logger.warning(f"Warmup failed: {e}")
+                raise e
         
         # Log warmup completion if stats collector is available
         if self.stats_collector is not None:
@@ -311,14 +306,20 @@ class SimpleRolloutTester:
                 if test_mode == "synthetic":
                     # test_prompts = self._create_test_data()
                     test_prompts = self._create_synthetic_data(batch_size)
+                    synthetic_list = [True] * batch_size
                 else:
                     test_prompts = self._get_real_data_batch()
+                    long_prompt = {"prompt_token_ids": [self.tokenizer.pad_token_id] * 1024 * 10}
+                    # test_prompts = [long_prompt] * 32 + test_prompts
+                    # synthetic_list = [True] * 32 + [False] * batch_size
+                    synthetic_list = [False] * batch_size
                 
                 # Generate responses
-                results = await self._generate_batch_async(test_prompts, test_mode == "synthetic")
+                results = await self._generate_batch_async(test_prompts, synthetic_list)
                 psrl_logger.debug(f"Test iteration {i+1} generated {len(results)} sequences")
             except Exception as e:
                 psrl_logger.error(f"Generation failed: {e}")
+                raise e
             
             end_time = time.time()
             iteration_time = end_time - start_time

@@ -40,7 +40,7 @@ class PSRL_DummyWorker(Worker):
 
         self.config = config
     
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def init_model(self):
         return
 

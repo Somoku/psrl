@@ -260,7 +260,7 @@ class CommunicationPlanner:
                             continue
                         
                         # Assign shards
-                        shards_to_assign = list(available_shards)
+                        shards_to_assign = sorted(list(available_shards))
                         assigned_shards.update(shards_to_assign)
                         
                         # Update plan

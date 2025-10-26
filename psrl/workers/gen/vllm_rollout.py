@@ -36,6 +36,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class PSRL_vLLMRollout:
     def __init__(
         self,
+        psrl_config: DictConfig,
         config: RolloutConfig,
         model_config: HFModelConfig,
         **kwargs,
@@ -186,6 +187,18 @@ class PSRL_vLLMRollout:
             **lora_kwargs,
             **engine_kwargs,
         )
+        
+        '''
+        if psrl_config.ps_mode == "nixl_cpu" or psrl_config.ps_mode == "nixl_gpu":
+            llm_kwargs["worker_cls"] = "psrl.workers.gen.vllm_extension.NIXLWorker"
+            assert kwargs.get("nixl_interface") is not None, "nixl_interface must be provided when using NIXL"
+            assert kwargs.get("instance_id") is not None, "instance_id must be provided when using NIXL"
+            llm_kwargs["additional_config"] = {
+                "nixl_config": psrl_config.nixl,
+                "nixl_interface": kwargs.get("nixl_interface"),
+                "instance_id": kwargs.get("instance_id"),
+            }
+        '''
 
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)

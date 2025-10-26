@@ -42,27 +42,22 @@ def _log_with_caller_info(psrl_logger: logging.Logger, level: int, message: str)
     if not psrl_logger.isEnabledFor(level):
         return
     
-    # Get the caller's frame (skip this function and the wrapper function)
-    frame = inspect.currentframe()
+    # Try to use stacklevel to get the caller's file and line information
     try:
-        # Skip current frame and the wrapper function frame
-        caller_frame = frame.f_back.f_back
-        filename = caller_frame.f_code.co_filename
-        lineno = caller_frame.f_lineno
-        
-        # Create a LogRecord with the caller's information
-        record = psrl_logger.makeRecord(
-            name=psrl_logger.name,
-            level=level,
-            fn=filename,
-            lno=lineno,
-            msg=message,
-            args=(),
-            exc_info=None
-        )
-        psrl_logger.handle(record)
-    finally:
-        del frame
+        psrl_logger.log(level, message, stacklevel=3)
+    except TypeError:
+        # If the Python version does not support stacklevel, fall back to the old method
+        frame = inspect.currentframe()
+        try:
+            caller_frame = frame.f_back.f_back
+            pathname = caller_frame.f_code.co_filename
+            lineno = caller_frame.f_lineno
+            record = psrl_logger.makeRecord(
+                psrl_logger.name, level, pathname, lineno, message, (), None
+            )
+            psrl_logger.handle(record)
+        finally:
+            del frame
 
 
 @contextmanager
@@ -99,16 +94,18 @@ class DualOutputHandler(logging.Handler):
         # Create log file
         log_dir = os.path.expanduser(log_dir) 
         os.makedirs(log_dir, exist_ok=True) 
-        file_path = os.path.join(log_dir, log_prefix + ".log")
+        self.file_path = os.path.join(log_dir, log_prefix + ".log")
         # Create handler
-        self.file_handler = logging.FileHandler(file_path, mode='w')
+        self.file_handler = logging.FileHandler(self.file_path, mode='w')
         self.stream_handler = logging.StreamHandler()
         # Define file log formats
         file_log_format = '%(asctime)s - %(filename)s - %(lineno)d - %(message)s'
-        file_formatter = logging.Formatter(file_log_format)
-        self.file_handler.setFormatter(file_formatter)
+        self.file_formatter = logging.Formatter(file_log_format)
+        self.file_handler.setFormatter(self.file_formatter)
 
     def emit(self, record):
+        # formatted_message = self.file_formatter.format(record)
+        # print(formatted_message, file=open(self.file_path, "a"))
         # Emit the original log record to file handler
         self.file_handler.emit(record)
         

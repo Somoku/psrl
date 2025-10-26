@@ -52,6 +52,9 @@ cd nixl
 mkdir -p build
 # Disable obj backend
 sed -i "s/subdir('obj')/# subdir('obj')/" "$THIRD_PARTY_PATH/nixl_src/nixl/src/plugins/meson.build"
+# Disable err handling for ucp (will make NIXL READ slower 10x!)
+echo "Applying nixl patch..."
+git apply $THIRD_PARTY_PATH/../patch/nixl/nixl.patch
 meson setup build \
     --prefix=$THIRD_PARTY_PATH/nixl \
     -Dbuild_docs=false \

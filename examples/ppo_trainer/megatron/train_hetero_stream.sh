@@ -125,8 +125,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger=['console'] \
     trainer.project_name='psrl_megatron_ppo_test' \
     trainer.experiment_name='hetero_stream' \
-    trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
-    trainer.nnodes=$NNODES \
     trainer.total_training_steps=20 \
     trainer.save_freq=100 \
     trainer.test_freq=5 \

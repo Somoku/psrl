@@ -11,6 +11,10 @@ try:
 except ImportError:
     from torch.distributed._tensor import DTensor
 
+# from vllm.v1.worker.gpu_worker import Worker
+# from vllm.config import get_current_vllm_config
+# from vllm.platforms import current_platform
+
 from verl.utils.fs import copy_to_local
 from verl.utils.device import get_device_id
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
@@ -19,8 +23,34 @@ from psrl.utils.nixl import NIXLInterface, NIXLStorageClient, GLOBAL_META_SERVER
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+'''
+class NIXLWorker(Worker):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # We do the device initialization here before building the NIXL client 
+        self.device = torch.device(f"cuda:{self.local_rank}")
+        current_platform.set_device(self.device)
+        current_platform.check_if_supports_dtype(self.model_config.dtype)
+        
+        vllm_config = get_current_vllm_config()
+        assert vllm_config.additional_config is not None, "additional_config must be provided when using NIXL"
+        assert vllm_config.additional_config.get("nixl_config") is not None, "nixl_config must be provided when using NIXL"
+        assert vllm_config.additional_config.get("nixl_interface") is not None, "nixl_interface must be provided when using NIXL"
+        assert vllm_config.additional_config.get("instance_id") is not None, "instance_id must be provided when using NIXL"
+        self.nixl_config = vllm_config.additional_config.get("nixl_config")
+        self.nixl_interface = vllm_config.additional_config.get("nixl_interface")
+        self.instance_id = vllm_config.additional_config.get("instance_id")
+        
+        assert hasattr(self, "init_nixl_client"), "init_nixl_client must be provided when using NIXL"
+        self.init_nixl_client(self.nixl_config, self.nixl_interface, self.instance_id)
+'''
+
 
 class vLLMWorkerExtension:
     def load_weights(self, weights, blocking: bool = True):
@@ -100,7 +130,12 @@ class vLLMWorkerExtension:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
         return get_tensor_model_parallel_rank()
     
-    def init_nixl_client(self, nixl_config: DictConfig, nixl_interface_after_rpc: Union[dict, NIXLInterface], instance_id: int):
+    def init_nixl_client(
+        self, 
+        nixl_config: DictConfig, 
+        nixl_interface_after_rpc: Union[dict, NIXLInterface], 
+        instance_id: int,
+    ):
         # Reconstruct the nixl_interface (the RPC call serializes the nixl_interface to a dict)
         if isinstance(nixl_interface_after_rpc, dict):
             nixl_interface = NIXLInterface(
@@ -119,7 +154,7 @@ class vLLMWorkerExtension:
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=nixl_config,  
             nixl_interface=nixl_interface,
-            client_group_id=instance_id
+            # client_group_id=instance_id,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
     
@@ -159,10 +194,13 @@ class vLLMWorkerExtension:
         for key in self.unified_state_dict:
             for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_gen_storage_client_names): 
                 shards_to_transfer = self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, f"gen_pull_{self.pull_times}")
+                # shards_to_transfer = self.nixl_storage_client.client_read(target_agent_name, target_client_name, key, "gen_pull", merge_and_cache_xfer=False)
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, target_client_name, shards_to_transfer))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
         for key, target_client_name, shards_to_transfer in wait_operations:
             self.nixl_storage_client.wait(key, f"gen_pull_{self.pull_times}", "READ", target_client=target_client_name)
+            # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
+        self.nixl_storage_client.merge_and_finish_cached_xfer()
         time_end = time.time()
         psrl_logger.info(f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). time: {time_end - time_start}s")

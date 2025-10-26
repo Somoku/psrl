@@ -25,7 +25,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", type=str, required=True)
-    parser.add_argument("--port", type=int, default=23456)
+    parser.add_argument("--port", type=int, default=23333)
     parser.add_argument("--cuda", type=int, default=-1)
     parser.add_argument(
         "--mode",
@@ -53,11 +53,12 @@ if __name__ == "__main__":
 
     # Allocate memory and register with NIXL
     agent = nixl_agent(args.mode, config)
+
     if args.mode == "target":
         # 0.01GiB, 1000 tensors
-        tensors = [torch.zeros(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for _ in range(1000)]
+        tensors = [torch.zeros(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for i in range(1000)]
     else:
-        tensors = [torch.ones(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for _ in range(1000)]
+        tensors = [torch.ones(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for i in range(1000)]
 
     # print(f"{args.mode} Tensors: {tensors}")
 
@@ -90,6 +91,7 @@ if __name__ == "__main__":
         # the full python bytes, here it would be just UUID.
         while not agent.check_remote_xfer_done("initiator", b"UUID"):
             continue
+        
     # Initiator code
     else:
         print("Initiator sending to " + args.ip)
@@ -103,6 +105,7 @@ if __name__ == "__main__":
 
         target_descs = agent.deserialize_descs(notifs["target"][0])
         initiator_descs = reg_descs.trim()
+        print(f"Initiator descs count: {initiator_descs.descCount()}")
 
         # Ensure remote metadata has arrived from fetch
         ready = False
@@ -111,18 +114,27 @@ if __name__ == "__main__":
 
         print("Ready for transfer")
 
+        start_time = time.time()
         xfer_handle = agent.initialize_xfer(
-            "WRITE", initiator_descs, target_descs, "target", "UUID"
+            "READ", initiator_descs, target_descs, "target", "UUID"
         )
+        end_time = time.time()
+        print(f"Initialize transfer time: {end_time - start_time} seconds")
 
         if not xfer_handle:
             print("Creating transfer failed.")
             exit()
 
+        start_time = time.time()
         state = agent.transfer(xfer_handle)
+        end_time = time.time()
+        print(f"Post transfer time: {end_time - start_time} seconds")
+        
         if state == "ERR":
             print("Posting transfer failed.")
             exit()
+            
+        start_time = time.time()
         while True:
             state = agent.check_xfer_state(xfer_handle)
             if state == "ERR":
@@ -131,7 +143,7 @@ if __name__ == "__main__":
             elif state == "DONE":
                 break
         end_time = time.time()
-        print(f"Transfer time: {end_time - start_time} seconds")
+        print(f"Wait transfer time: {end_time - start_time} seconds")
 
     # Verify data after read
     for i, tensor in enumerate(tensors):

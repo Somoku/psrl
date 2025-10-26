@@ -1008,6 +1008,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
             )
         
+        psrl_logger.info("Initializing models and NIXL clients")
+        nixl_client_futures = []
+        model_init_futures = []
+        
         # create PS WorkerGroup
         psrl_logger.info("Create PS WorkerGroup")
         train_model_dtype = torch.bfloat16 if self.config.train_actor_rollout_ref.actor.strategy == "megatron" else torch.float32
@@ -1049,7 +1053,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         nixl_interface=nixl_interface
                     )
                 )
-                ray.get(self.ps_wg.execute_all_async("init_model"))
+                if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+                    nixl_client_futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
+                model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
                 psrl_logger.info("PS model initialized successfully!")
             elif self.config.psrl.ps_mode == "nixl_gpu":
                 raise NotImplementedError("PS mode 'nixl_gpu' is not implemented yet")
@@ -1057,11 +1063,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             raise ValueError(f"Invalid PS mode: {self.config.psrl.ps_mode}")
 
         psrl_logger.info("Initializing models in all rollout instances")
-        # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+        # start rollout coordinator
+        self.init_rollout_coordinator()
         # simutaneously init all rollout instances
-        rollout_futures = []
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
-            rollout_futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
+        model_init_futures.append(self.rollout_coordinator.init_model.remote())
+        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -1091,29 +1098,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Concurrently initialize actor and rollout instances
         psrl_logger.info("Initializing actor model")
         self.actor_wg = all_wg["actor"]
+        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            nixl_client_futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
         self.actor_wg.init_model()
 
-        ray.get(rollout_futures)
-
+        ray.get(model_init_futures)
         psrl_logger.info("All workers' models initialized successfully!")
-
-        # start rollout coordinator
-        self.init_rollout_coordinator()
 
         # initialize NIXL
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
-            with log_dual_events(f"Initializing NIXL clients", psrl_logger, event_type=EventType.INIT):
-                futures = []
-                rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())
-                psrl_logger.info(f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, {self.actor_wg.world_size} actor workers, {rollout_world_size} rollout workers")
-                expected_agents = self.ps_wg.world_size + \
-                    self.actor_wg.world_size + \
-                    rollout_world_size
-                futures.append(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
-                futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
-                futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
-                futures.append(self.rollout_coordinator.init_nixl_client.remote())
-                ray.get(futures)
+            ray.get(nixl_client_futures)
+            rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())
+            psrl_logger.info(f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, {self.actor_wg.world_size} actor workers, {rollout_world_size} rollout workers")
+            expected_agents = self.ps_wg.world_size + \
+                self.actor_wg.world_size + \
+                rollout_world_size
+            ray.get(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
             
             with log_dual_events(f"Executing NIXL protocol", psrl_logger, event_type=EventType.INIT):
                 futures = []
@@ -1608,9 +1608,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         with log_dual_events("Update actor", psrl_logger, event_type=EventType.TRAIN):
                             batch.meta_info["multi_turn"] = self.config.gen_actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_wg.update_actor(batch)
-                    psrl_logger.info(f"Update actor ppo_kl: {actor_output.meta_info['metrics']['actor/ppo_kl']}, len: {len(actor_output.meta_info['metrics']['actor/ppo_kl'])}")
-                    psrl_logger.info(f"Update actor pg_loss: {actor_output.meta_info['metrics']['actor/pg_loss']}, len: {len(actor_output.meta_info['metrics']['actor/pg_loss'])}")
-                    psrl_logger.info(f"Update actor grad_norm: {actor_output.meta_info['metrics']['actor/grad_norm']}, len: {len(actor_output.meta_info['metrics']['actor/grad_norm'])}")
+                    # psrl_logger.info(f"Update actor ppo_kl: {actor_output.meta_info['metrics']['actor/ppo_kl']}, len: {len(actor_output.meta_info['metrics']['actor/ppo_kl'])}")
+                    # psrl_logger.info(f"Update actor pg_loss: {actor_output.meta_info['metrics']['actor/pg_loss']}, len: {len(actor_output.meta_info['metrics']['actor/pg_loss'])}")
+                    # psrl_logger.info(f"Update actor grad_norm: {actor_output.meta_info['metrics']['actor/grad_norm']}, len: {len(actor_output.meta_info['metrics']['actor/grad_norm'])}")
                     actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                     metrics.update(actor_output_metrics)
 

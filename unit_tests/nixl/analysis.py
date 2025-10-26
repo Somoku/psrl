@@ -2,7 +2,7 @@ import os
 import re
 import heapq
 
-def extract_top_times_per_file(log_dir: str, k: int = 5):
+def extract_top_times_per_file(log_dir: str, k: int = 20):
     pattern = re.compile(r"time:\s*([0-9.eE+-]+)")
     files = [f for f in os.listdir(log_dir) if os.path.isfile(os.path.join(log_dir, f))]
 
@@ -37,4 +37,4 @@ def extract_top_times_per_file(log_dir: str, k: int = 5):
         print("\n")
 
 if __name__ == "__main__":
-    extract_top_times_per_file(log_dir="./log", k=5)
+    extract_top_times_per_file(log_dir="./log", k=20)

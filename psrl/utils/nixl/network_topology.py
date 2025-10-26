@@ -34,10 +34,11 @@ def get_local_gpu_id() -> int:
 class LinkType(Enum):
     """Network connection types"""
     ETH = "ethernet"       # Ethernet connection
-    IB = "infiniband"      # Cross-node connection
+    IB_PCIE = "ib_pcie"    # Cross-node connection with mixed IB and PCIe
     PCIE = "pcie"          # CPU-GPU connection within same node
+    IB = "infiniband"      # Cross-node connection with only IB
     NVLINK = "nvlink"      # GPU-GPU connection within same node
-    LOCAL = "local"        # Local connection
+    LOCAL = "local"        # Local memory copy
 
 
 @dataclass
@@ -61,11 +62,12 @@ class NetworkTopology:
         # Default bandwidth configuration for 8*H20 machines
         # H20 specs: NVLink 4.0 (900 GB/s bidirectional), PCIe 5.0 x16 (128 GB/s), IB HDR200 (200 Gbps)
         self._default_links = {
-            LinkType.ETH: NetworkLink(LinkType.ETH, 25.0, 20.0),        # 25 Gbps, 20us
-            LinkType.IB: NetworkLink(LinkType.IB, 200.0, 2.0),          # 200 Gbps (HDR200), 2us
-            LinkType.PCIE: NetworkLink(LinkType.PCIE, 128.0, 5.0),      # 128 GB/s (PCIe 5.0 x16), 5us
-            LinkType.NVLINK: NetworkLink(LinkType.NVLINK, 900.0, 0.5),  # 900 GB/s (NVLink 4.0), 0.5us
-            LinkType.LOCAL: NetworkLink(LinkType.LOCAL, 1000.0, 0.1),   # Local memory copy
+            LinkType.ETH: NetworkLink(LinkType.ETH, 25.0, 20.0),         # 25 Gbps, 20us
+            LinkType.IB_PCIE: NetworkLink(LinkType.IB_PCIE, 128.0, 5.0), # 128 GB/s (PCIe 5.0 x16), 5us
+            LinkType.PCIE: NetworkLink(LinkType.PCIE, 128.0, 5.0),       # 128 GB/s (PCIe 5.0 x16), 5us
+            LinkType.IB: NetworkLink(LinkType.IB, 200.0, 2.0),           # 200 Gbps (HDR200), 2us
+            LinkType.NVLINK: NetworkLink(LinkType.NVLINK, 900.0, 0.5),   # 900 GB/s (NVLink 4.0), 0.5us
+            LinkType.LOCAL: NetworkLink(LinkType.LOCAL, 1000.0, 0.1),    # Local memory copy
         }
     
     def register_client(self, client_name: str, node_ip: str, node_gpu_id: int):
@@ -101,7 +103,7 @@ class NetworkTopology:
             if gpu_id1 != -1 and gpu_id2 != -1:
                 link_type = LinkType.IB
             else:
-                link_type = LinkType.PCIE
+                link_type = LinkType.IB_PCIE
         
         link = self._default_links[link_type]
         self._links[key] = link
@@ -122,12 +124,13 @@ class NetworkTopology:
     def get_link_priority(self, client1: str, client2: str) -> int:
         """Get link priority for sorting (higher value = better connection)"""
         link_type = self.get_link_type(client1, client2)
-        # Define priority mapping: LOCAL > NVLINK > IB > PCIE >ETH
+        # Define priority mapping: LOCAL > NVLINK > IB > PCIE > IB_PCIE > ETH
         priority_map = {
-            LinkType.LOCAL: 4,
-            LinkType.NVLINK: 3,
-            LinkType.IB: 2,
-            LinkType.PCIE: 1,
+            LinkType.LOCAL: 5,
+            LinkType.NVLINK: 4,
+            LinkType.IB: 3,
+            LinkType.PCIE: 2,
+            LinkType.IB_PCIE: 1,
             LinkType.ETH: 0
         }
         return priority_map[link_type]

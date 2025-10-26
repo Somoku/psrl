@@ -417,12 +417,14 @@ class PSRL_GenWorker(Worker):
 
         psrl_logger.info(f"Building {rollout_name} rollout with seed {self.seed}.")
         rollout = PSRL_vLLMRollout(
+            psrl_config=self.psrl_config,
             config=rollout_config, 
             model_config=model_config,
             seed=self.seed, 
             status_queue=self.gen_interface.status_queue, 
             instance_id=self.get_instance_id(),
-        )
+            nixl_interface=self.nixl_interface,
+        )   
         log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=psrl_logger)
         
         return rollout

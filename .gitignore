@@ -6,6 +6,7 @@ third_party_old/
 third_party_new/
 
 # General
+**/*.pkl
 **/*.png
 **/*.pt
 **/checkpoints

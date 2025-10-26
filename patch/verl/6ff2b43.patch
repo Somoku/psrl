@@ -295,6 +295,18 @@ index 85ced07f..7d5f5f70 100644
          pp_decoder_start = parallel_state.get_pipeline_model_parallel_decoder_start()
          if pp_decoder_start is not None:
              pipeline_rank = pipeline_rank - pp_decoder_start
+diff --git a/verl/utils/reward_score/__init__.py b/verl/utils/reward_score/__init__.py
+index 6a3c3cb0..b65d94ec 100644
+--- a/verl/utils/reward_score/__init__.py
++++ b/verl/utils/reward_score/__init__.py
+@@ -24,6 +24,7 @@ def default_compute_score(
+     sandbox_fusion_url=None,
+     concurrent_semaphore=None,
+     memory_limit_mb=None,
++    **kwargs,
+ ):
+     """Compute the score for a given solution based on the data source.
+ 
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
 index 40e823a5..a4a63896 100644
 --- a/verl/workers/actor/megatron_actor.py

@@ -1,5 +1,5 @@
-from .reward_server import RewardServer
+from .reward_manager import RewardManager
 
 __all__ = [
-    "RewardServer",
+    "RewardManager",
 ]

@@ -23,9 +23,9 @@ class RequestStatus(Enum):
     ROLLOUT_DISPATCHED: Request is dispatched to a specific Gen Worker, but not yet in the engine request queue
     ROLLOUT_RUNNING: Request is in the engine request queue and is being rolled out
     ROLLOUT_INTERRUPTED: Rollout was interrupted by the user for Partial Rollout, put into replay buffer
+    REWARD_RUNNING: Request is running in the reward manager
+    REWARD_COMPLETED: Request is completed in the reward manager
     COMPLETED: Request is completed (generic completed state)
-    REWARD_RUNNING: Request is running in the reward server
-    REWARD_COMPLETED: Request is completed in the reward server
     """
     
     PENDING = enum.auto()
@@ -33,9 +33,9 @@ class RequestStatus(Enum):
     ROLLOUT_DISPATCHED = enum.auto()
     ROLLOUT_RUNNING = enum.auto()
     ROLLOUT_INTERRUPTED = enum.auto()
-    COMPLETED = enum.auto()
     REWARD_RUNNING = enum.auto()
     REWARD_COMPLETED = enum.auto()
+    COMPLETED = enum.auto()
 
 class RequestStatusTracker:
     """
@@ -62,8 +62,8 @@ class RequestStatusTracker:
         # Rollout coordinator reference
         self.rollout_coordinator: Optional[ray.actor.ActorHandle] = None
         
-        # Reward server reference
-        self.reward_server: Optional[ray.actor.ActorHandle] = None
+        # Reward manager reference
+        self.reward_manager: Optional[ray.actor.ActorHandle] = None
         
         # Build logger
         self.log_prefix = f"RequestStatusTracker"
@@ -74,9 +74,9 @@ class RequestStatusTracker:
         """Set the reference to the rollout coordinator."""
         self.rollout_coordinator = rollout_coordinator
 
-    def set_reward_server(self, reward_server: ray.actor.ActorHandle):
-        """Set the reference to the reward server."""
-        self.reward_server = reward_server
+    def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
+        """Set the reference to the reward manager."""
+        self.reward_manager = reward_manager
 
     def update_request_status(
         self,
@@ -185,7 +185,7 @@ class RequestStatusTracker:
         """Remove requests that are ready for training.
         
         This method removes completed requests from the tracking system
-        after they have been processed by the reward server.
+        after they have been processed by the reward manager.
         
         Args:
             request_id (Union[List[int], int]): The unique identifier(s) of the request(s) to remove
@@ -200,8 +200,8 @@ class RequestStatusTracker:
         for req_id in request_id:
             assert req_id in self._request_id_to_status, f"Request ID {req_id} not found in status map."
             assert req_id in self._request_infos, f"Request ID {req_id} not found in request infos."
-            assert self._request_id_to_status[req_id] == RequestStatus.REWARD_COMPLETED, \
-                f"Request ID {req_id} is not in REWARD_COMPLETED status."
+            assert self._request_id_to_status[req_id] == RequestStatus.COMPLETED, \
+                f"Request ID {req_id} is not in COMPLETED status."
             
             if req_id in self._abort_request_ids:
                 psrl_logger.warning(f"Request ID {req_id} is marked for abortion but is being removed as train ready, "
@@ -211,7 +211,7 @@ class RequestStatusTracker:
             # Remove the request from the status map and request infos
             del self._request_id_to_status[req_id]
             del self._request_infos[req_id]
-            self._status_to_request_ids[RequestStatus.REWARD_COMPLETED].discard(req_id)
+            self._status_to_request_ids[RequestStatus.COMPLETED].discard(req_id)
 
     def get_all_request_statuses(self) -> dict:
         """Get the statuses of all requests currently being tracked.
@@ -317,14 +317,14 @@ class RequestStatusTracker:
         # Abort requests in reward stage (REWARD_RUNNING)
         if abort_requests_for_reward:
             psrl_logger.debug("Aborting requests in reward stages: %s", abort_requests_for_reward)
-            futures.append(self.reward_server.exec_command.remote(
+            futures.append(self.reward_manager.exec_command.remote(
                 Command(
                     type=CommandType.ABORT,
                     uids=list(abort_requests_for_reward),
                 ),
                 blocking=blocking,
             ))
-            psrl_logger.debug("Abort command sent to reward server for requests: %s", abort_requests_for_reward)
+            psrl_logger.debug("Abort command sent to reward manager for requests: %s", abort_requests_for_reward)
         
         if futures and blocking:
             ray.get(futures)

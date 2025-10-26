@@ -2,7 +2,7 @@ import ray
 import threading
 import logging
 import os
-import torch
+import torch.distributed as dist
 from typing import Dict
 from omegaconf import DictConfig
 from dataclasses import dataclass
@@ -111,7 +111,7 @@ class PSRL_BaseTrainWorker(ABC):
             self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
         if self._cached_ps_nixl_train_storage_client_names is None:
             self._cached_ps_nixl_train_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_names.remote())
-        psrl_logger.debug(f"Pushing the model to the PS via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients.")
+        psrl_logger.info(f"Pushing the model to the PS via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients.")
         
         # Clear previous wait thread
         with self.nixl_wait_thread_lock:
@@ -153,9 +153,14 @@ class PSRL_BaseTrainWorker(ABC):
                 psrl_logger.debug(f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} train to gen transfers on the PS...")
                 ray.get(precision_transfer_futures)
                 psrl_logger.debug(f"Starting to push model tag to the PS...")
-                ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version, self.worker_rank, self.worker_world_size))
+                # Ensure all workers have completed the NIXL push operations and precision transfers
+                assert dist.is_initialized(), "Pytorch distributed is not initialized."
+                dist.barrier()
+                if self.worker_rank == 0:
+                    # Only the representative rank pushes the model tag to the PS
+                    ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
                 self.nixl_wait_completed.set()
-                psrl_logger.debug(f"All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
+                psrl_logger.info(f"All NIXL push operations completed, model with version {next_ps_model_version} is successfully pushed to the PS.")
             except Exception as e:
                 raise RuntimeError(f"Error in NIXL wait thread: {e}")
         

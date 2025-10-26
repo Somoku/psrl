@@ -15,7 +15,9 @@ from psrl.utils.logger import deprecated
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
 
-class RequestStatus(Enum):
+# NOTE(lhy): This is the status of the requests in the PSRL system.
+# It is different from the RequestStatus in vLLM, which is the status of the requests in the scheduler.
+class PSRL_RequestStatus(Enum):
     """Represents the status of a request in the system.
     
     PENDING: Request is queued in data queue, waiting for dispatch
@@ -47,11 +49,11 @@ class RequestStatusTracker:
     
     def __init__(self, psrl_config: DictConfig):
         self.psrl_config = psrl_config
-        self._request_id_to_status: dict[int, RequestStatus] = {} # Maps request ID to their statuses
+        self._request_id_to_status: dict[int, PSRL_RequestStatus] = {} # Maps request ID to their statuses
         self._request_infos = {}  # Maps request IDs to EntryInfo objects
         # Maps statuses to sets of request IDs for quick access
         self._status_to_request_ids = {
-            status: set() for status in RequestStatus
+            status: set() for status in PSRL_RequestStatus
         }
         self._abort_request_ids = set() # Set of request IDs that are marked for abortion
         self._running_min_version = 0 # Minimum version of requests that are currently running
@@ -81,7 +83,7 @@ class RequestStatusTracker:
     def update_request_status(
         self,
         request_id: Union[List[int], int],
-        status: Union[List[RequestStatus], RequestStatus],
+        status: Union[List[PSRL_RequestStatus], PSRL_RequestStatus],
         model_version: Union[List[int], int] = -1,
         rollout_instance_id: Union[List[int], int] = -1,
     ) -> Union[List[bool], bool]:
@@ -93,7 +95,7 @@ class RequestStatusTracker:
         
         Args:
             request_id (Union[List[int], int]): The unique identifier(s) of the request(s)
-            status (Union[List[RequestStatus], RequestStatus]): The new status(es) to set
+            status (Union[List[PSRL_RequestStatus], PSRL_RequestStatus]): The new status(es) to set
             model_version (int, optional): The model version of the request. Defaults to -1
             rollout_instance_id (int, optional): The instance ID of the rollout worker. Defaults to -1
         
@@ -114,7 +116,7 @@ class RequestStatusTracker:
         if not isinstance(status, list):
             status = [status] * len(request_id)
         for s in status:
-            if s not in RequestStatus:
+            if s not in PSRL_RequestStatus:
                 raise ValueError(f"Invalid status: {s}")
 
         request_update_success = [True for _ in range(len(request_id))]
@@ -167,7 +169,7 @@ class RequestStatusTracker:
             request_id (Union[List[int], int]): The identifier(s) of the request(s)
         
         Returns:
-            Union[List[RequestStatus], RequestStatus]: The current status(es) of the request(s)
+            Union[List[PSRL_RequestStatus], PSRL_RequestStatus]: The current status(es) of the request(s)
             
         Raises:
             KeyError: If one or more request IDs are not found
@@ -200,7 +202,7 @@ class RequestStatusTracker:
         for req_id in request_id:
             assert req_id in self._request_id_to_status, f"Request ID {req_id} not found in status map."
             assert req_id in self._request_infos, f"Request ID {req_id} not found in request infos."
-            assert self._request_id_to_status[req_id] == RequestStatus.REWARD_COMPLETED, \
+            assert self._request_id_to_status[req_id] == PSRL_RequestStatus.REWARD_COMPLETED, \
                 f"Request ID {req_id} is not in REWARD_COMPLETED status."
             
             if req_id in self._abort_request_ids:
@@ -211,7 +213,7 @@ class RequestStatusTracker:
             # Remove the request from the status map and request infos
             del self._request_id_to_status[req_id]
             del self._request_infos[req_id]
-            self._status_to_request_ids[RequestStatus.REWARD_COMPLETED].discard(req_id)
+            self._status_to_request_ids[PSRL_RequestStatus.REWARD_COMPLETED].discard(req_id)
 
     def get_all_request_statuses(self) -> dict:
         """Get the statuses of all requests currently being tracked.
@@ -221,12 +223,12 @@ class RequestStatusTracker:
         """
         return self._request_id_to_status.copy()
 
-    def get_requests_by_status(self, status: RequestStatus) -> set:
+    def get_requests_by_status(self, status: PSRL_RequestStatus) -> set:
         """
         Get all requests that have a specific status.
         
         Args:
-            status (RequestStatus): The status to filter requests by.
+            status (PSRL_RequestStatus): The status to filter requests by.
         
         Returns:
             set: A set of request ids that match the specified status.
@@ -238,7 +240,7 @@ class RequestStatusTracker:
         request_id: Union[List[int], int],
         rollout_instance_id: Union[List[int], int] = -1,
         model_version: Union[List[int], int] = -1,
-        status: Union[List[RequestStatus], RequestStatus] = RequestStatus.PENDING,
+        status: Union[List[PSRL_RequestStatus], PSRL_RequestStatus] = PSRL_RequestStatus.PENDING,
     ):
         """
         Add new requests to the status manager.
@@ -247,7 +249,7 @@ class RequestStatusTracker:
             request_id (Union[List[int], int]): The unique identifier(s) of the request(s).
             rollout_instance_id (Union[List[int], int], optional): The instance ID(s) of the rollout worker(s). Defaults to -1.
             model_version (Union[List[int], int], optional): The model version(s) of the request(s). Defaults to -1.
-            status (Union[List[RequestStatus], RequestStatus], optional): The initial status(es) of the request(s). Defaults to RequestStatus.PENDING.
+            status (Union[List[PSRL_RequestStatus], PSRL_RequestStatus], optional): The initial status(es) of the request(s). Defaults to PSRL_RequestStatus.PENDING.
         """
         if not isinstance(request_id, list):
             request_id = [request_id]
@@ -295,9 +297,9 @@ class RequestStatusTracker:
         abort_requests_for_reward = set()
         
         for status, req_ids in status_to_req_ids.items():
-            if status in {RequestStatus.ROLLOUT_RUNNING}:
+            if status in {PSRL_RequestStatus.ROLLOUT_RUNNING}:
                 abort_requests_for_rollout.update(req_ids)
-            elif status in {RequestStatus.REWARD_RUNNING}:
+            elif status in {PSRL_RequestStatus.REWARD_RUNNING}:
                 abort_requests_for_reward.update(req_ids)
         
         futures = []
@@ -475,7 +477,7 @@ class RequestStatusTracker:
         Clear all requests and their statuses.
         """
         self._request_id_to_status.clear()
-        self._status_to_request_ids = {status: set() for status in RequestStatus}
+        self._status_to_request_ids = {status: set() for status in PSRL_RequestStatus}
         self._request_infos.clear()
         self._abort_request_ids.clear()
     

@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 
 from verl import DataProto
 
-from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated
 
 
@@ -165,7 +165,7 @@ class PSRL_AgentLoopManager:
             version_tags = data.non_tensor_batch["max_version_limit"]
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
-            RequestStatus.RUNNING,
+            PSRL_RequestStatus.RUNNING,
             model_version=version_tags.tolist(),
         )
         dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]

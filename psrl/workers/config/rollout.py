@@ -125,7 +125,6 @@ class RolloutConfig(BaseConfig):
     log_prob_max_token_len_per_gpu: int = 16384
 
     disable_log_stats: bool = False
-    status_collection: bool = True
 
     multi_stage_wake_up: bool = False
     engine_kwargs: dict = field(default_factory=dict)
@@ -166,9 +165,3 @@ class RolloutConfig(BaseConfig):
     limit_images: Optional[int] = None
 
     skip_tokenizer_init: bool = False
-    
-    enable_rollout_engine_log_prob: bool = False
-    
-    interrupt_as_prompt: bool = False
-    
-    status_collection: bool = False

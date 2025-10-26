@@ -17,7 +17,7 @@ from verl.utils.torch_functional import pad_2d_list_to_length
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import log_data_protocol, log_single_event, log_dual_events, EventType, DualOutputHandler
 from psrl.utils.server.command import Command, CommandType, CommandExtension
-from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
 
 psrl_logger = logging.getLogger(__file__)
@@ -120,7 +120,7 @@ class RewardServer(CommandExtension):
         self._buffer_waiters: Dict[int, List[asyncio.Future]] = {}  # Maps buffer IDs to a set of futures waiting for that buffer
         
         # Track finished child requests for Group Sampling
-        self.rollout_request_tracker: Dict[Union[str, int], List[EntryInfo]] = {} # Maps parent request ids to "occupied" child entries
+        self.rollout_request_tracker: Dict[int, List[EntryInfo]] = {} # Maps parent request ids to "occupied" child entries
         
         # Agent Loop Manager reference
         self.agent_loop_manager = agent_loop_manager
@@ -403,7 +403,7 @@ class RewardServer(CommandExtension):
                     psrl_logger.debug(f"Aborted {aborted_count} running reward computations")
                     
                     # 2. Remove from the request tracker (update_status)
-                    update_status_success = await self.ps_manager_handle.update_request_status.remote(list(abort_request_uids), RequestStatus.REWARD_COMPLETED)
+                    update_status_success = await self.ps_manager_handle.update_request_status.remote(list(abort_request_uids), PSRL_RequestStatus.REWARD_COMPLETED)
                     assert all(not status for status in update_status_success), "Update status should not be successful for aborted requests."
                     result = aborted_count
                 else:
@@ -445,7 +445,7 @@ class RewardServer(CommandExtension):
                     # print(f"Reward server received request ids: {request_ids}")
                     
                     # Update the request status to REWARD_RUNNING
-                    update_status_success = await self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING)
+                    update_status_success = await self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), PSRL_RequestStatus.REWARD_RUNNING)
                     if not update_status_success[0]:
                         continue
                     
@@ -502,7 +502,7 @@ class RewardServer(CommandExtension):
                                 merge_request_data.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                             # Update the request status to REWARD_COMPLETED
-                            update_status_success = await self.ps_manager_handle.update_request_status.remote(int(request_id), RequestStatus.REWARD_COMPLETED)
+                            update_status_success = await self.ps_manager_handle.update_request_status.remote(int(request_id), PSRL_RequestStatus.REWARD_COMPLETED)
                             complete_request_idxs = [
                                 i for i, success in enumerate(update_status_success) if success
                             ]
@@ -532,7 +532,7 @@ class RewardServer(CommandExtension):
                     request_ids = finished_request_data.non_tensor_batch["uid"]
                     
                     # Update the request status to REWARD_COMPLETED
-                    update_status_success = await self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_COMPLETED)
+                    update_status_success = await self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), PSRL_RequestStatus.REWARD_COMPLETED)
                     complete_request_idxs = [
                         i for i, success in enumerate(update_status_success) if success
                     ]
@@ -670,7 +670,7 @@ class RewardServer(CommandExtension):
                 if buffer_id not in self.accumulated_buffers:
                     self.accumulated_buffers[buffer_id] = {}
                     self.accumulated_buffer_size[buffer_id] = 0
-                model_version = min(prompt_entry_info.model_version) if isinstance(prompt_entry_info.model_version, list) else prompt_entry_info.model_version
+                model_version = prompt_entry_info.get_entry_version()
                 if model_version not in self.accumulated_buffers[buffer_id]:
                     self.accumulated_buffers[buffer_id][model_version] = []
                 self.accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
@@ -702,7 +702,6 @@ class RewardServer(CommandExtension):
 
         # Process READY buffers
         for buffer_id in sorted(list(ready_buffer_ids)):
-            buffer_accumulate_num = self.accumulated_buffer_size[buffer_id]
             # Collect all prompt entry infos for the buffer
             prompt_entry_infos = []
             for model_version in sorted(list(self.accumulated_buffers[buffer_id].keys())):

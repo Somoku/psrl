@@ -1073,6 +1073,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.init_rollout_coordinator()
         # simutaneously init all rollout instances
         model_init_futures.append(self.rollout_coordinator.init_model.remote())
+        # initialize rollout strategy
+        if self.config.psrl.routing_strategy.method == "adaptive":
+            self.rollout_coordinator.init_routing_strategy.remote()
+        # initialize nixl client
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())
 

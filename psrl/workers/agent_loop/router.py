@@ -3,20 +3,20 @@ import logging
 import numpy as np
 from tensordict import TensorDict
 from omegaconf import DictConfig
-from typing import List, Optional
+from typing import List, Optional, Dict
 from cachetools import LRUCache
 
 import ray
 
 from verl import DataProto
 
-from psrl.workers.ps.request_status_tracker import RequestStatus
-from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
+from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
+from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events, deprecated
 from psrl.workers.agent_loop.route_strategy import (
     RouteStrategyBase, 
     RequestNumBalanceRouteStrategy,
     get_route_strategy_class,
-    list_available_route_strategies,
 )
 
 psrl_logger = logging.getLogger(__file__)
@@ -58,12 +58,7 @@ class RolloutRouter:
         # Engine status tracking
         # NOTE: The engine status will be updated by RolloutCoordinator
         # and can be accessed via get_engine_status() method from agent loop worker
-        self.latest_engine_status = {
-            "timestamp": None,
-            "instance_engine_status": {},
-            "instance_running_status": {},
-            "instance_to_version": {},
-        }
+        self.latest_instance_to_engine_status = Dict[int, EngineStats] # {instance_id: engine_stats}
         self.status_changed = False
         
         # Cache for sample_id to version_tag mapping with LRU eviction
@@ -94,15 +89,15 @@ class RolloutRouter:
             from psrl.workers.agent_loop.route_strategy import RoundRobinRouteStrategy
             self.route_strategy: RouteStrategyBase = RoundRobinRouteStrategy(self.rollout_wg_size)
 
-    def update_engine_status(self, engine_status: dict):
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
         """Update the engine status with latest information from coordinator.
         
         Args:
-            engine_status (dict): Latest engine status information.
+            instance_to_engine_status (dict[int, EngineStats]): Latest engine status information.
         """
         # NOTE(lhy): This method is called by RolloutCoordinator
         # Each agent loop worker contains a RolloutRouter, which shares the same engine status
-        self.latest_engine_status = engine_status
+        self.latest_instance_to_engine_status = instance_to_engine_status
         self.status_changed = True
 
     def _choose_gen_worker(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
@@ -119,14 +114,17 @@ class RolloutRouter:
             assert self.config.psrl.status_collection.enable, "RequestNumBalanceRouteStrategy requires status collection to be enabled."
             if self.status_changed:
                 self.route_strategy.update_instance_request_counts(
-                    {instance_id: status.get("waiting_and_running_queue_size", 0)
-                     for instance_id, status in self.latest_engine_status.get("instance_engine_status", {}).items()}
+                    {instance_id: engine_stats.get_waiting_and_running_queue_size() for instance_id, engine_stats in self.latest_instance_to_engine_status.items()}
                 )
                 self.status_changed = False
             chosen_worker = self.route_strategy.route(request, candidates)
-            if chosen_worker not in self.latest_engine_status["instance_engine_status"]:
-                self.latest_engine_status["instance_engine_status"][chosen_worker] = {"waiting_and_running_queue_size": 0}
-            self.latest_engine_status["instance_engine_status"][chosen_worker]["waiting_and_running_queue_size"] += 1
+            if chosen_worker not in self.latest_instance_to_engine_status:
+                self.latest_instance_to_engine_status[chosen_worker] = EngineStats(
+                    instance_id=chosen_worker,
+                    model_version=-1, # -1 means not initialized
+                    snapshot={},
+                )
+            self.latest_instance_to_engine_status[chosen_worker].increment_waiting_and_running_queue_size()
         else:
             chosen_worker = self.route_strategy.route(request, candidates)
         return chosen_worker
@@ -182,6 +180,7 @@ class RolloutRouter:
 
         return chosen_version, chosen_worker_idx
 
+    @deprecated("It is moved to the `post_process_outputs_lite` inside vllm rollout now")
     def _consolidate_responses(
         self,
         prompts: DataProto,
@@ -295,6 +294,7 @@ class RolloutRouter:
         """
         request_ids = requests.non_tensor_batch.get("uid", None)
         if "max_version_limit" in requests.non_tensor_batch:
+            # Indicate that these requests are retry requests
             max_version_limit = requests.non_tensor_batch["max_version_limit"][0]
             assert all(v == max_version_limit for v in requests.non_tensor_batch["max_version_limit"]), "All requests in the batch must have the same max_version_limit."
             
@@ -319,13 +319,13 @@ class RolloutRouter:
                 # Create a sub-batch for this sample_id
                 sample_requests = requests.select_idxs(request_indices)
                 sample_requests.non_tensor_batch["rollout_instance_id"] = np.array([gen_worker_idx] * len(request_indices), dtype=int)
-                sample_requests.non_tensor_batch["version_tag"] = np.array([needed_model_version] * len(request_indices), dtype=int)
+                sample_requests.non_tensor_batch["version_tag"] = np.array([needed_model_version] * len(request_indices), dtype=int) # Refactor the version tag (previouly is assigned by uid in agent loop manager)
                 requests_list.append(sample_requests)
             
             requests = DataProto.concat(requests_list)
         update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
-            RequestStatus.ROLLOUT_DISPATCHED,
+            PSRL_RequestStatus.ROLLOUT_DISPATCHED,
             model_version = requests.non_tensor_batch.get("version_tag", np.array([-1], dtype=int)).tolist(),
         ))
         filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
@@ -380,7 +380,7 @@ class RolloutRouter:
                     psrl_logger.debug(f"Consolidated outputs from rollout worker {i} have request ids: {consolidated_outputs.non_tensor_batch['uid']}")
                     assert (
                         update_statuses is not None and
-                        all(update_status == RequestStatus.RUNNING for update_status in update_statuses)
+                        all(update_status == PSRL_RequestStatus.RUNNING for update_status in update_statuses)
                     ), "Interruption is not implemented in batching mode"
                     results.append(consolidated_outputs)
                 return DataProto.concat(results)
@@ -403,6 +403,7 @@ class RolloutRouter:
 
         request_ids = request.non_tensor_batch.get("uid", None)
         if "max_version_limit" in request.non_tensor_batch:
+            # Indicate that this request is retry
             max_version_limit = request.non_tensor_batch.pop("max_version_limit")[0]
             all_rollout_instance_to_version = await self.ps_manager_handle.get_all_rollout_instance_model_versions.remote()
             
@@ -413,10 +414,10 @@ class RolloutRouter:
             )
             
             request.non_tensor_batch["rollout_instance_id"] = np.array([gen_worker_idx], dtype=int)
-            request.non_tensor_batch["version_tag"] = np.array([needed_model_version], dtype=int)
+            request.non_tensor_batch["version_tag"] = np.array([needed_model_version], dtype=int) # Refactor the version tag (previouly is assigned by uid in agent loop manager)
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
-            RequestStatus.ROLLOUT_DISPATCHED,
+            PSRL_RequestStatus.ROLLOUT_DISPATCHED,
             model_version=request.non_tensor_batch.get("version_tag", np.array([-1], dtype=int)).tolist(),
         )
         if update_status_success[0]:
@@ -463,9 +464,9 @@ class RolloutRouter:
                     return None
                 
                 request = consolidated_output
-                if update_status == RequestStatus.RUNNING:
+                if update_status == PSRL_RequestStatus.RUNNING:
                     break
-                elif update_status == RequestStatus.ROLLOUT_INTERRUPTED:
+                elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
                     continue
     
             psrl_logger.debug(f"Generation completed for request {request_id} on gen worker {gen_worker_idx} with model version {needed_model_version}")

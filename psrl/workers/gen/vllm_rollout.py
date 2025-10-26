@@ -30,7 +30,7 @@ from psrl.utils.dataset.utils import _pre_process_inputs
 
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARNWARN"))
 
 
 class PSRL_vLLMRollout:
@@ -52,7 +52,9 @@ class PSRL_vLLMRollout:
         """
 
         super().__init__()
+        self.psrl_config = psrl_config
         self.config = config
+        self.stat_collector = None
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
@@ -199,19 +201,30 @@ class PSRL_vLLMRollout:
                 "instance_id": kwargs.get("instance_id"),
             }
         '''
+        
+        if psrl_config.routing_strategy.method == "adaptive":
+            llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
+            llm_kwargs["additional_config"] = {
+                "max_num_waiting_reqs": psrl_config.routing_strategy.max_num_waiting_reqs,
+                "max_model_len_used_in_estimation": max_model_len * psrl_config.routing_strategy.max_concurrent_seqs_per_instance,
+            }
 
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)
             stat_loggers = None
-            if not config.disable_log_stats and config.status_collection:
+            if not config.disable_log_stats and psrl_config.status_collection.enable:
+                psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
                 # Use custom stat loggers to collect engine stats
                 vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]
-                stat_logger = StatCollector(vllm_config, engine_index=kwargs.get("instance_id", 0))
-                stat_logger.init_output_queue(status_queue)
-                stat_loggers = [stat_logger]
+                self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
+                self.stat_collector.init_output_queue(status_queue)
+                self.stat_collector.set_model_version(0)
+                stat_loggers = [self.stat_collector]
+            psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
             self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)
         else:
+            psrl_logger.info(f"Initialize LLM for rollout instance {kwargs.get('instance_id', 0)}")
             self.inference_engine = LLM(**llm_kwargs)
 
         # NOTE(lhy): sleep mode is not supported when using NIXL
@@ -351,7 +364,7 @@ class PSRL_vLLMRollout:
         else:
             kwargs = {
                 "n": 1, # we repeat the request manually to support partial rollout
-                "prompt_logprobs": 0 if self.config.interrupt_as_prompt else None,
+                "prompt_logprobs": 0 if self.psrl_config.partial_rollout.interrupt_as_prompt else None,
             }
             
         return vllm_inputs, kwargs
@@ -391,11 +404,11 @@ class PSRL_vLLMRollout:
             log_prob_list = []
             # if inference logprobs is required, we need to collect the log probabilities
             if (
-                self.config.enable_rollout_engine_log_prob and
+                self.psrl_config.log_prob.enable_rollout_engine_log_prob and
                 hasattr(vllm_output.outputs[0], 'logprobs') and
                 vllm_output.outputs[0].logprobs is not None
             ):
-                if self.config.interrupt_as_prompt:
+                if self.psrl_config.partial_rollout.interrupt_as_prompt:
                     curr_response_len = non_tensor_batch.get("response_unpadded_len", 0)
                     # Collect log probs only when the request finished normally
                     # The response log probs are collected in two parts:
@@ -433,7 +446,7 @@ class PSRL_vLLMRollout:
         non_tensor_batch["interrupted"] = np.array(interrupted_list, dtype=bool)
 
         # Update rollout_log_probs
-        if self.config.enable_rollout_engine_log_prob:
+        if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:
@@ -497,12 +510,12 @@ class PSRL_vLLMRollout:
                 interrupted.append(output.outputs[sample_id].finish_reason == "abort")
                 # if inference logprobs is required, we need to collect the log probabilities
                 if (
-                    self.config.enable_rollout_engine_log_prob and
+                    self.psrl_config.log_prob.enable_rollout_engine_log_prob and
                     hasattr(output.outputs[sample_id], 'logprobs') and
                     output.outputs[sample_id].logprobs is not None
                 ):
                     log_prob_list = []
-                    if self.config.interrupt_as_prompt:
+                    if self.psrl_config.partial_rollout.interrupt_as_prompt:
                         curr_response_len = non_tensor_batch.get("response_unpadded_len", 0)
                         # Collect log probs only when the request finished normally
                         # The response log probs are collected in two parts:
@@ -543,7 +556,7 @@ class PSRL_vLLMRollout:
         # TODO(linsh): optimize the DataProto construction to packing
         # Here we pad the response to the right side for both interrupted and completed requests.
         response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-        if self.config.enable_rollout_engine_log_prob:
+        if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
                 curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
             else:

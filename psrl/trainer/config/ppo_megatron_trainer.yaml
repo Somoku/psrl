@@ -74,9 +74,6 @@ train_actor_rollout_ref:
   # Rollout instance config.
   rollout:
 
-    # Use log prob from rollout engine rollout
-    enable_rollout_engine_log_prob: ${oc.select:psrl.log_prob.enable_rollout_engine_log_prob}
-
     layer_name_map:
       qkv_layer_name: qkv
       gate_proj_layer_name: gate_up
@@ -123,15 +120,6 @@ gen_actor_rollout_ref:
     # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
     # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
     load_format: auto
-
-    # Use log prob from rollout engine rollout
-    enable_rollout_engine_log_prob: ${oc.select:psrl.log_prob.enable_rollout_engine_log_prob}
-
-    # Whether view interrupted trajectories as new prompts
-    interrupt_as_prompt: ${oc.select:psrl.partial_rollout.interrupt_as_prompt}
-
-    # Whether enable status collection in rollout coordinator
-    status_collection: ${oc.select:psrl.status_collection.enable}
 
     layer_name_map:
       qkv_layer_name: qkv

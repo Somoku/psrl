@@ -15,8 +15,9 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 
+from psrl.workers.gen.stats_collector import EngineStats
 from psrl.workers.agent_loop.loops.utils import DummyConfig, AGENT_LOOP_REGISTRY
-from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.utils.logger import DualOutputHandler, log_dual_events, EventType
 from psrl.utils.dataset.utils import _pre_process_inputs
@@ -204,7 +205,7 @@ class PSRL_AgentLoopWorker:
             with log_dual_events("Update request status", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                 update_status_success = await self.ps_manager_handle.update_request_status.remote(
                     request_ids.tolist(),
-                    RequestStatus.COMPLETED,
+                    PSRL_RequestStatus.COMPLETED,
                 )
             with log_dual_events("Put requests into rollout queue", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                 dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
@@ -223,17 +224,12 @@ class PSRL_AgentLoopWorker:
                         self.rollout_queue.put(output)
                     '''
 
-    def update_engine_status(self, engine_status: dict):
-        """Update the engine status received from RolloutCoordinator."""
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
+        """Update the instance to engine status received from RolloutCoordinator."""
         async def _update_status():
-            self.rollout_router.update_engine_status(engine_status)
-            # Log some key metrics
-            instance_to_status = engine_status.get("instance_engine_status", {})
-            total_queue_size = sum(
-                inst_status.get("waiting_and_running_queue_size", 0)
-                for inst_status in instance_to_status.values()
-            )
-            psrl_logger.debug(f"Updated engine status: {len(instance_to_status)} instances, total queue size: {total_queue_size}")
+            self.rollout_router.update_instance_to_engine_status(instance_to_engine_status)
+            # May log some stats here
+            # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")
         
         # Schedule the async update
         try:
@@ -243,13 +239,13 @@ class PSRL_AgentLoopWorker:
             # If no event loop is running, create one
             asyncio.run(_update_status())
 
-    def get_engine_status(self):
-        """Get the latest engine status from the rollout router.
+    def get_instance_to_engine_status(self):
+        """Get the latest instance to engine status from the rollout router.
         
         Returns:
-            dict: Current engine status information.
+            dict[int, EngineStats]: Current instance to engine status information.
         """
-        return self.rollout_router.latest_engine_status
+        return self.rollout_router.latest_instance_to_engine_status
 
     # NOTE(lhy): This method is moved to the reward server
     def _post_process(self, inputs: DataProto) -> DataProto:

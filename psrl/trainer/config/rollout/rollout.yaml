@@ -95,7 +95,7 @@ log_prob_use_dynamic_bsz: ${oc.select:train_actor_rollout_ref.actor.use_dynamic_
 log_prob_max_token_len_per_gpu: ${oc.select:train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
 
 # disable logging statistics
-disable_log_stats: True
+disable_log_stats: False
 
 # collect rollout instance status
 status_collection: True

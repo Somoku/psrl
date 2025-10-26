@@ -98,6 +98,8 @@ class RewardServer(CommandExtension):
         self.running_loop = None
         self.busy_loop_task = None
         self.stop_busy_loop_task = False
+        self.command_loop_task = None
+        self.stop_command_loop_task = False
         
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
@@ -147,7 +149,9 @@ class RewardServer(CommandExtension):
 
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
+        self.command_loop_task = self.running_loop.create_task(self._command_event_handler())
         self.busy_loop_task = self.running_loop.create_task(self._background_event_handler())
+        self.command_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
         self.busy_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
     
     async def stop_busy_loop(self):
@@ -160,26 +164,27 @@ class RewardServer(CommandExtension):
             return
 
         self.stop_busy_loop_task = True
+        self.stop_command_loop_task = True
         # Wait for the background task to finish
-        await self.busy_loop_task
+        await asyncio.gather(self.busy_loop_task, self.command_loop_task)
 
-    def stop_server(self):
+    async def stop_server(self):
         """Stop the reward server and pause reward processing.
         
         This method sends a STOP command to pause reward processing
         without shutting down the server completely.
         """
         if not self.reward_paused:
-            self.exec_command(Command(CommandType.STOP))
+            await self.exec_command(Command(CommandType.STOP))
 
-    def resume_server(self):
+    async def resume_server(self):
         """Resume the reward server if it was paused.
         
         This method sends a RESUME command to restart reward processing
         after it was paused by stop_server().
         """
         if self.reward_paused:
-            self.exec_command(Command(CommandType.RESUME))
+            await self.exec_command(Command(CommandType.RESUME))
             
     def _pre_process(self, inputs: DataProto) -> DataProto:
         """Pre-process the generated outputs to create properly formatted tensors.
@@ -330,17 +335,8 @@ class RewardServer(CommandExtension):
         """
         await self.rollout_queue.put(data)
 
-    async def _background_event_handler(self):
-        """
-        Background event handler for processing commands and rollout data.
-        
-        This method runs in a separate process and handles:
-        1. Command processing (ABORT, STOP, RESUME, etc.)
-        2. Rollout data processing from the rollout queue (logprobs, etc.)
-        3. Reward computation and status updates.
-        4. Occupy requests in the PS worker.
-        """
-        while not self.stop_busy_loop_task:
+    async def _command_event_handler(self):
+        while not self.stop_command_loop_task:
             # Command processing
             if not self.command_queue.empty():
                 # Get command from the queue
@@ -389,7 +385,6 @@ class RewardServer(CommandExtension):
                     # Step 2. Get requests from uids
                     if uids is not None:
                         uids = set(uids)
-                        psrl_logger.debug(f"Adding {len(uids)} direct uids to abort list")
                         abort_request_uids.update(uids)
 
                     psrl_logger.debug(f"Total of {len(abort_request_uids)} requests to abort")
@@ -417,6 +412,21 @@ class RewardServer(CommandExtension):
                 # Post process the command
                 psrl_logger.debug(f"Completing command {command_id} with result: {result}")
                 self._complete_command(command_id, result)
+            
+            await asyncio.sleep(0)
+        psrl_logger.info("Command event handler of reward server has finished.")
+
+    async def _background_event_handler(self):
+        """
+        Background event handler for processing commands and rollout data.
+        
+        This method runs in a separate process and handles:
+        1. Command processing (ABORT, STOP, RESUME, etc.)
+        2. Rollout data processing from the rollout queue (logprobs, etc.)
+        3. Reward computation and status updates.
+        4. Occupy requests in the PS worker.
+        """
+        while not self.stop_busy_loop_task:
 
             # Data processing
             # Process requests in the rollout queue
@@ -593,7 +603,8 @@ class RewardServer(CommandExtension):
                     # Notify the request status manager to abort the child requests
                     if abort_child_ids:
                         psrl_logger.debug(f"Aborting child requests {abort_child_ids} for sample {sample_id}.")
-                        ray.get(self.ps_manager_handle.abort_requests.remote(list(abort_child_ids), blocking=False))
+                        with log_dual_events(f"Abort {len(abort_child_ids)} requests in reward stage", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
+                            ray.get(self.ps_manager_handle.abort_requests.remote(list(abort_child_ids), blocking=True))
                     # Abort the extra entries beyond alg_rollout_n
                     abort_request_ids.extend([sample_id * self.rollout_n + entry_info.request_idx for entry_info in entry_infos[self.alg_rollout_n:]])
 

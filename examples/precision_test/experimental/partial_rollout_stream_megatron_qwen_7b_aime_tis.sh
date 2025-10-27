@@ -109,9 +109,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.disable_log_stats=false \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    train_actor_rollout_ref.model.use_fused_kernels=True \
+    train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
@@ -132,6 +136,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    train_actor_rollout_ref.actor.use_dynamic_bsz=True \
+    train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \

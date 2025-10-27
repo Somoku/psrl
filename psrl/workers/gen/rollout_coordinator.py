@@ -6,6 +6,7 @@ from collections import defaultdict
 
 import ray
 
+from psrl.workers.gen.stats_collector import EngineStats
 from psrl.utils.server.command import CommandType, Command, CommandExtension
 from psrl.utils.logger import log_data_protocol, log_single_event, log_dual_events, EventType, DualOutputHandler
 
@@ -57,12 +58,10 @@ class RolloutCoordinator(CommandExtension):
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
         self.agent_loop_workers = agent_loop_workers
-        self.ps_model_version = 0  # Current model version in the parameter server
         self.check_partial_rollout = False # Whether to check for partial rollout in the loop
 
         # Stats collection
         self.status_queue = status_queue
-        self.stats_changed = False
         
         # Background event handler
         self.running_loop = None
@@ -71,17 +70,17 @@ class RolloutCoordinator(CommandExtension):
         self.stop_command_handler = False
         self.stop_engine_status_sync = False
         
-        # Instance tracking
-        self.instance_running_status: dict[int, bool] = defaultdict(lambda: False)  # Track if an instance is running
-        self.instance_to_version: dict[int, int] = {}  # Track the model version of each instance
+        # Asyncio event loop order control
+        self._is_init_model = asyncio.Event()
+        self._is_init_nixl_client = asyncio.Event()
+        
+        # Version tracking
+        self.instance_to_latest_stale_model_version: dict[int, int] = {}  # The latest stale model version of each instance
+        self.instance_to_model_version: dict[int, int] = {}  # Track the model version of each instance
+        self.ps_model_version = 0  # Current model version in the parameter server
         
         # Engine status tracking
-        self.instance_engine_status: dict[int, dict] = {}  # Track the latest engine status of each instance
-        # Interval to sync engine status to agent loop workers
-        self.engine_status_sync_interval_in_ms = self.config.psrl.status_collection.engine_status_sync_interval_in_ms
-        self._engine_status_sync_thread = None
-        
-        self._abort_request_ids = set() # Request IDs to be aborted if the instance is interrupted
+        self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
         
         # Build logger
         self.log_prefix = "RolloutCoordinator"
@@ -90,34 +89,51 @@ class RolloutCoordinator(CommandExtension):
     def world_size(self):
         return sum([rollout_wg.world_size for rollout_wg in self.rollout_wg_list])
 
-    def init_model(self):
+    async def init_model(self):
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             if self.rank_0_is_model_owner:
                 futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_model"))
             else:
                 futures.extend(self.rollout_wg_list[i].execute_all_async("init_model"))
-        ray.get(futures)
+        await asyncio.gather(*futures)
+        self._is_init_model.set()
+         
+    async def init_routing_strategy(self):
+        await self._is_init_model.wait()
+        futures = []
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            if self.rank_0_is_model_owner:
+                futures.append(self.rollout_wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
+            else:
+                futures.extend(self.rollout_wg_list[i].execute_all_async("estimate_max_model_len"))
+        max_model_lens = await asyncio.gather(*futures)
+        psrl_logger.info(f"Max model lens: {max_model_lens}")
+        self.max_model_len = max(max_model_lens)
+        # TODO(lhy): use the max model len to budget the request number for each instance
 
-    def init_nixl_client(self):
+    async def init_nixl_client(self):
+        await self._is_init_model.wait()
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             if self.rank_0_is_model_owner:
                 futures.append(self.rollout_wg_list[i].execute_rank_zero_async("init_nixl_client"))
             else:
                 futures.extend(self.rollout_wg_list[i].execute_all_async("init_nixl_client"))
-        ray.get(futures)
+        await asyncio.gather(*futures)
+        self._is_init_nixl_client.set()
         
-    def nixl_protocol(self):
+    async def nixl_protocol(self):
+        await self._is_init_nixl_client.wait()
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             if self.rank_0_is_model_owner:
                 futures.append(self.rollout_wg_list[i].execute_rank_zero_async("nixl_protocol"))
             else:
                 futures.extend(self.rollout_wg_list[i].execute_all_async("nixl_protocol"))
-        ray.get(futures)
+        await asyncio.gather(*futures)
 
-    def start_busy_loop(self):
+    async def start_busy_loop(self):
         """
         Start the background event loops for command handling and status synchronization.
         
@@ -126,6 +142,8 @@ class RolloutCoordinator(CommandExtension):
         2. Starts a background task for handling commands (abort, sync, etc.)
         3. Optionally starts a task for syncing engine status to agent workers
         """
+        await self._is_init_model.wait()
+        
         if self.command_handler_task is not None and not self.command_handler_task.done():
             return
         
@@ -136,8 +154,7 @@ class RolloutCoordinator(CommandExtension):
                 futures.append(self.rollout_wg_list[i].execute_rank_zero_async("register_rollout_instance"))
             else:
                 futures.extend(self.rollout_wg_list[i].execute_all_async("register_rollout_instance"))
-            self.instance_running_status[i] = True
-        ray.get(futures)
+        await asyncio.gather(*futures, return_exceptions=True)
 
         # Start the background tasks
         self.running_loop = asyncio.get_running_loop()
@@ -170,18 +187,6 @@ class RolloutCoordinator(CommandExtension):
         
         # Wait for tasks to finish with timeout
         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-    
-    def set_rollout_instance_model_version(self, rollout_instance_id: int, version_tag: int):
-        """
-        Set the model version for a specific rollout instance.
-        
-        Args:
-            rollout_instance_id (int): The ID of the rollout instance.
-            version_tag (int): The model version tag to set for the instance.
-        """
-        old_version = self.instance_to_version.get(rollout_instance_id, None)
-        self.instance_to_version[rollout_instance_id] = version_tag
-        psrl_logger.debug(f"Updated instance {rollout_instance_id} model version: {old_version} -> {version_tag}")
     
     async def _command_handler_loop(self):
         """
@@ -254,7 +259,6 @@ class RolloutCoordinator(CommandExtension):
                     # Sync with PS (interrupt, pull model, and resume generation)
                     futures = []
                     for instance_id in instance_ids:
-                        self.instance_running_status[instance_id] = False
                         future = None
                         if self.rank_0_is_model_owner:
                             future = self.rollout_wg_list[instance_id].execute_rank_zero_async("sync_with_ps", curr_ps_model_version)
@@ -263,11 +267,10 @@ class RolloutCoordinator(CommandExtension):
                         futures.append(future)
                     # Post process the command result
                     # NOTE(linsh): it's not necessary for engine status sync loop to wait for pulling from PS,
-                    # so we mark the command as complete after setting the instance to stopped.
+                    # so we simply mark the command as complete after.
                     self._complete_command(command_id, result)
                     interrupted_request_nums = await asyncio.gather(*futures)
                     for i, instance_id in enumerate(instance_ids):
-                        self.instance_running_status[instance_id] = True
                         psrl_logger.info(f"Synced with PS on instance {instance_id}, interrupted {interrupted_request_nums[i]} requests")
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
@@ -285,73 +288,41 @@ class RolloutCoordinator(CommandExtension):
         2. Consolidates status information from all instances
         3. Periodically broadcasts consolidated status to all agent loop workers
         4. Ensures agent workers have up-to-date information for decision making
-        """
-        import time
-        
+        """        
         psrl_logger.info("Starting engine status sync loop")
 
-        last_publish_time = 0
         while not self.stop_engine_status_sync:
-            elapsed = int(time.time() * 1000) - last_publish_time
-            wait_for = (self.engine_status_sync_interval_in_ms if self.stats_changed else 4000)
-            timeout_seconds = max(0, wait_for - elapsed) / 1000.0
+            # Wait for the next status update
+            recv_stats = await self.status_queue.get_async(block=True)
+            self.instance_to_engine_status[recv_stats.instance_id] = recv_stats
+            psrl_logger.debug(f"Updated engine status for instance {recv_stats.instance_id}: {self.instance_to_engine_status[recv_stats.instance_id]}")
             
-            try:
-                recv_stats = await self.status_queue.get_async(block=True, timeout=timeout_seconds)
-            except ray.util.queue.Empty:
-                recv_stats = None
-
-            if not recv_stats:
-                # Timeout - publish current stats to agent workers
-                consolidated_stats = {
-                    "timestamp": time.time(),
-                    "instance_engine_status": dict(self.instance_engine_status),
-                    "instance_running_status": dict(self.instance_running_status),
-                    "instance_to_version": dict(self.instance_to_version),
-                }
-                    
-                # Send to all agent loop workers
-                futures = []
-                for agent_worker in self.agent_loop_workers:
-                    futures.append(agent_worker.update_engine_status.remote(consolidated_stats))
-                
-                # Wait for all updates to complete using asyncio
-                await asyncio.gather(*futures)
-
-                last_publish_time = int(time.time() * 1000)
-                self.stats_changed = False
-                continue
-            
-            engine_index, request_counts = recv_stats
-            running_queue_size = request_counts[0]
-            waiting_queue_size = request_counts[1]
-            waiting_and_running_queue_size = running_queue_size + waiting_queue_size
-            self.instance_engine_status[engine_index] = {
-                "waiting_and_running_queue_size": waiting_and_running_queue_size,
-                "running_queue_size": running_queue_size,
-                "waiting_queue_size": waiting_queue_size,
-            }
-            psrl_logger.debug(f"Updated engine status for instance {engine_index}: {self.instance_engine_status[engine_index]}")
-            self.stats_changed = True
+            # Send to all agent loop workers
+            futures = []
+            for agent_worker in self.agent_loop_workers:
+                futures.append(agent_worker.update_instance_to_engine_status.remote(self.instance_to_engine_status))
+            # Wait for all updates to complete using asyncio
+            await asyncio.gather(*futures)
             
             # partial rollout check
             if self.config.psrl.partial_rollout.enable and self.check_partial_rollout:
                 continue_to_check = False
                 sync_instance_ids = []
-                for instance_id, status in self.instance_engine_status.items():
-                    # Check whether instance is running
-                    if not self.instance_running_status.get(instance_id, False):
+                for instance_id, engine_stats in self.instance_to_engine_status.items():
+                    # Check whether the received stats is stale
+                    if engine_stats.model_version == self.instance_to_latest_stale_model_version.get(instance_id, -1):
                         continue
                     # Check whether instance version lags behind PS version
-                    if self.instance_to_version.get(instance_id, 0) == self.ps_model_version:
+                    if self.instance_to_model_version.get(instance_id, 0) == self.ps_model_version:
                         continue
                     # Check whether current instance workload is below threshold
                     # Currently we consider running queue size as the workload metric
-                    running_queue_size = status.get("running_queue_size", 0)
-                    psrl_logger.debug(f"Instance {instance_id} (version {self.instance_to_version.get(instance_id, 0)}) "
+                    running_queue_size = engine_stats.snapshot["scheduler_stats"]["num_running_reqs"]
+                    psrl_logger.debug(f"Instance {instance_id} (version {self.instance_to_model_version.get(instance_id, 0)}) "
                                       f"workload: {running_queue_size}, "
                                       f"threshold: {self.config.psrl.partial_rollout.threshold}")
                     if running_queue_size > self.config.psrl.partial_rollout.threshold or running_queue_size == 0:
+                        psrl_logger.debug(f"Instance {instance_id} (version {self.instance_to_model_version.get(instance_id, 0)}) workload {running_queue_size} is above threshold {self.config.psrl.partial_rollout.threshold}, will not synchronize with PS (version {self.ps_model_version}) this time")
                         continue_to_check = True
                         continue
                     # Check whether instance workload would increase after update
@@ -366,15 +337,19 @@ class RolloutCoordinator(CommandExtension):
 
                 # Add batching SYNC command to the command queue to interrupt the instance
                 # This will stop the instance, pull the model weights from PS, and resume generation.
+                # But this will not block the current loop.
                 if sync_instance_ids:
-                    with log_dual_events(f"Synchronize with PS", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
+                    # NOTE(lhy): we don't need to update the instance version here because the version is updated in the `sync_with_ps` method of the GenWorker
+                    # when calling `pull_model` or `pull_model_async` from the GenWorker, the ps manager will update the instance version.
+                    # However, we need to update the latest stale model version here to avoid stale stats being handled after the synchronization.
+                    with log_dual_events(f"Synchronize rollout instances {sync_instance_ids} with PS (model pull is non-blocking)", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
+                        for instance_id in sync_instance_ids:
+                            self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(instance_id, 0)    
                         await self.exec_command(Command(
                             type=CommandType.SYNC,
                             instance_ids=sync_instance_ids,
                             curr_ps_model_version=self.ps_model_version,
                         ), blocking=True)
-                    for instance_id in sync_instance_ids:
-                        self.instance_to_version[instance_id] = self.ps_model_version
 
                 self.check_partial_rollout = continue_to_check
 
@@ -382,12 +357,12 @@ class RolloutCoordinator(CommandExtension):
 
         psrl_logger.info("Engine status sync loop stopped.")
 
+    # This is called by the PS manager to update the PS model version after pushing
     def set_ps_model_version(self, version: int):
         """
         Set the current PS model version.
         
-        This method updates the internal PS model version and notifies any waiters
-        that are waiting for this version or earlier.
+        This method updates the internal PS model version.
         
         Args:
             version (int): The new PS model version to set.
@@ -396,3 +371,16 @@ class RolloutCoordinator(CommandExtension):
         if self.config.psrl.partial_rollout.enable:
             self.check_partial_rollout = True
         psrl_logger.debug(f"Set PS model version to {version}")
+     
+    # This is called by the PS manager to update the rollout instance model version after pulling
+    def set_rollout_instance_model_version(self, rollout_instance_id: int, version_tag: int):
+        """
+        Set the model version for a specific rollout instance.
+        
+        Args:
+            rollout_instance_id (int): The ID of the rollout instance.
+            version_tag (int): The model version tag to set for the instance.
+        """
+        old_version = self.instance_to_model_version.get(rollout_instance_id, None)
+        self.instance_to_model_version[rollout_instance_id] = version_tag
+        psrl_logger.debug(f"Updated instance {rollout_instance_id} model version: {old_version} -> {version_tag}")

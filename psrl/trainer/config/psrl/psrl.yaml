@@ -82,9 +82,13 @@ status_collection:
   # whether to enable the status collection.
   enable: True
 
-  # Engine status sync interval in millisecond (for RolloutCoordinator -> AgentLoopWorkers)
-  # Sync to agent workers every 0.1 seconds
-  engine_status_sync_interval_in_ms: 100
+  # The level of logging to file
+  # Available options: "none", "prompt", "all"
+  dump_logging_to_file_level: prompt
+
+  # Engine status sync interval in millisecond (vllm engine -> rollout coordinator & agent loop workers & rollout router)
+  # Here 500 means sync every 0.5 seconds
+  engine_status_sync_interval_in_ms: 500
 
 # Redundant rollout config
 redundant_rollout:
@@ -115,6 +119,18 @@ partial_rollout:
 
   # Whether view interrupted trajectories as new prompts
   interrupt_as_prompt: False
+
+routing_strategy:
+
+  # Method for rollout routing
+  # Available options: "fixed" or "adaptive"
+  method: adaptive
+
+  # Max number of waiting requests per instance
+  max_num_waiting_reqs: 0
+
+  # Max concurrent sequences per instance
+  max_concurrent_seqs_per_instance: ${psrl.staleness_buffer_entries}
 
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:

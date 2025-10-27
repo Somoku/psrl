@@ -116,3 +116,24 @@ class DualOutputHandler(logging.Handler):
         
         # Emit the modified record to stream handler
         self.stream_handler.emit(stream_record)
+
+
+class FileOnlyHandler(logging.Handler):
+    """A logger handler that writes only to a file."""
+    def __init__(self, log_dir, log_prefix):
+        super().__init__()
+        self.log_prefix = log_prefix
+        # Create log file
+        log_dir = os.path.expanduser(log_dir) 
+        os.makedirs(log_dir, exist_ok=True) 
+        self.file_path = os.path.join(log_dir, log_prefix + ".log")
+        # Create handler
+        self.file_handler = logging.FileHandler(self.file_path, mode='w')
+        # Define file log formats
+        file_log_format = '%(asctime)s - %(filename)s - %(lineno)d - %(message)s'
+        self.file_formatter = logging.Formatter(file_log_format)
+        self.file_handler.setFormatter(self.file_formatter)
+
+    def emit(self, record):
+        # Emit the log record to file handler only
+        self.file_handler.emit(record)

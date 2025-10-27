@@ -22,20 +22,9 @@ from psrl.workers.ps.request_status_tracker import RequestStatusTracker
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
 
-
-# TODO(lhy): may support other tag format
-def tag_to_int(version_tag: Union[str, int]) -> int:
-    """Convert a version tag to an integer."""
-    if isinstance(version_tag, str):
-        return int(version_tag)
-    elif isinstance(version_tag, int):
-        return version_tag
-    else:
-        raise ValueError(f"Invalid version tag type: {type(version_tag)}. Expected str or int.")
-
 @dataclass
 class RolloutInstanceStatus:
-    version_tag: Union[str, int]
+    version_tag: int
     
 @dataclass
 class ModelStore:
@@ -43,7 +32,7 @@ class ModelStore:
     
     This class holds the model state dictionary (ref) and its version tag.
     """
-    version_tag: Union[str, int]
+    version_tag: int
     # 'cpu' mode will store the actual model weights in `model_state_dict`
     model_state_dict: Optional[Mapping[str, Union[Tensor, DTensor]]] = None
     # 'cpu_ref' mode will store the Ray object reference in `model_state_dict_ref`
@@ -77,7 +66,7 @@ class PSManager(RequestStatusTracker):
             self.alg_rollout_n = self.rollout_n
 
         # PS worker specific attributes
-        self.rollout_instance_tracker: Dict[Union[str, int], RolloutInstanceStatus] = {}  # Maps rollout instance IDs to their corresponding info
+        self.rollout_instance_tracker: Dict[int, RolloutInstanceStatus] = {}  # Maps rollout instance IDs to their corresponding info
         self.model_store: Optional[ModelStore] = None  # The current model store, which contains the model state dict and version tag
         
         # Staleness buffer management
@@ -128,11 +117,11 @@ class PSManager(RequestStatusTracker):
         """Get the PS handle."""
         return ray.get_runtime_context().current_actor
 
-    def register_rollout_instance(self, rollout_instance_id: Union[str, int]):
+    def register_rollout_instance(self, rollout_instance_id: int):
         """Register a new rollout instance with the PS Manager.
         
         Args:
-            rollout_instance_id (Union[str, int]): Unique identifier for the rollout instance
+            rollout_instance_id (int): Unique identifier for the rollout instance
         """
         self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(
             version_tag=0
@@ -154,7 +143,7 @@ class PSManager(RequestStatusTracker):
     
     def update_request_version_tag(
         self,
-        request_id: Union[str, int],
+        request_id: int,
         new_version_tag: int,
     ):
         """Update the version tag of a specific request in the staleness inventory."""
@@ -214,8 +203,8 @@ class PSManager(RequestStatusTracker):
 
     def reserve_rollout_instance_requests(
         self,
-        rollout_instance_ids: Union[str, int, List[Union[str, int]]],
-        request_ids: Union[str, int, List[Union[str, int]]],
+        rollout_instance_ids: Union[int, List[int]],
+        request_ids: Union[int, List[int]],
         model_versions: Union[int, List[int]],
         parent_ids: Optional[Union[bool, List[bool]]] = None,
     ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
@@ -228,8 +217,8 @@ class PSManager(RequestStatusTracker):
         Note that the request will be ignored if the group entries have been reserved.
         
         Args:
-            rollout_instance_ids (Union[str, int, List[Union[str, int]]]): The rollout instance ids
-            request_ids (Union[str, int, List[Union[str, int]]]): The request ids
+            rollout_instance_ids (Union[int, List[int]]): The rollout instance ids
+            request_ids (Union[int, List[int]]): The request ids
             model_versions (Union[int, List[int]]): The model versions
             parent_ids (Optional[Union[bool, List[bool]]]): Whether to reserve entries by parent request
             
@@ -393,7 +382,7 @@ class PSManager(RequestStatusTracker):
 
     def occupy_rollout_instance_request(
         self,
-        prompt_id: Union[str, int],
+        prompt_id: int,
         request_ids: Optional[Union[int, List[int]]] = None,
         accumulate_sample: Optional[bool] = True,
     ) -> Tuple[Optional[int], Optional[BufferStatus], EntryInfo]:
@@ -405,7 +394,7 @@ class PSManager(RequestStatusTracker):
         (2). Collect required `rollout_n` requests for group sampling.
         
         Args:
-            prompt_id (Union[str, int]): The prompt id of the request
+            prompt_id (int): The prompt id of the request
             request_ids (Optional[Union[int, List[int]]]): The request ids to occupy
             accumulate_sample (Optional[bool]): Whether to accumulate samples for group sampling
         Returns:
@@ -436,34 +425,34 @@ class PSManager(RequestStatusTracker):
 
     # ------- MODEL VERSION MANAGEMENT -------
 
-    def get_all_rollout_instance_model_versions(self) -> Dict[Union[str, int], int]:
+    def get_all_rollout_instance_model_versions(self) -> Dict[int, int]:
         """Get all rollout instance model versions.
         
         Returns:
-            Dict[Union[str, int], int]: A dictionary mapping rollout instance IDs to their model versions
+            Dict[int, int]: A dictionary mapping rollout instance IDs to their model versions
         """
         return {instance_id: instance_status.version_tag for instance_id, instance_status in self.rollout_instance_tracker.items()}
 
-    def get_rollout_instance_model_version(self, rollout_instance_id: Union[str, int]) -> int:
+    def get_rollout_instance_model_version(self, rollout_instance_id: int) -> int:
         """Get the model version for a specific rollout instance.
         
         Args:
-            rollout_instance_id (Union[str, int]): The rollout instance id
+            rollout_instance_id (int): The rollout instance id
             
         Returns:
             int: The model version for the specified rollout instance
         """
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
-        return tag_to_int(self.rollout_instance_tracker[rollout_instance_id].version_tag)
+        return self.rollout_instance_tracker[rollout_instance_id].version_tag
         
     def get_ps_model_version(self) -> int:
         """Get the current model version."""
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
-        return tag_to_int(self.model_store.version_tag)
+        return self.model_store.version_tag
     
-    def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: Union[str, int]):
+    def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: int):
         """Update the rollout instance model version to the latest model version."""
         assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         assert self.rollout_coordinator is not None, "Rollout coordinator is not set. Please set it before updating rollout instance model version."
@@ -606,7 +595,7 @@ class PSManager(RequestStatusTracker):
         
     def push_model_state_dict_cpu(
         self,
-        version_tag: Union[str, int],
+        version_tag: int,
         model_state_dict: Optional[Mapping[str, Union[Tensor, DTensor]]]
     ):
         """
@@ -614,7 +603,7 @@ class PSManager(RequestStatusTracker):
         This method will block until the state dict is received by the PS worker (potential bottleneck for large models).
         
         Args:
-            version_tag (Union[str, int]): The version tag of the model
+            version_tag (int): The version tag of the model
             model_state_dict (Optional[Mapping[str, Union[Tensor, DTensor]]]): The model state dict to push
         """
         assert self.psrl_config.ps_mode == "cpu", "push_model_state_dict_cpu should only be used in 'cpu' mode."
@@ -633,7 +622,7 @@ class PSManager(RequestStatusTracker):
     # Only the top-level task/actor arguments are expanded to real values, and ray will not traverse all nested structures to find ObjectRefs. 
     def push_model_state_dict_cpu_ref_list(
         self,
-        version_tag: Union[str, int],
+        version_tag: int,
         model_state_dict_ref_list: List[ray.ObjectRef]
     ):
         """
@@ -641,7 +630,7 @@ class PSManager(RequestStatusTracker):
         This method is non-blocking for the PS worker and only updates metadata (no large data transfer here).
         
         Args:
-            version_tag (Union[str, int]): The version tag of the model
+            version_tag (int): The version tag of the model
             model_state_dict_ref_list (List[ray.ObjectRef]): The list of ray object_refs to push
         """
         assert self.psrl_config.ps_mode == "cpu_ref", "push_model_state_dict_ref should only be used in 'cpu_ref' mode."
@@ -657,39 +646,29 @@ class PSManager(RequestStatusTracker):
         self._awake_ps_model_version_waiters(version_tag)
         log_single_event(f"Model with version tag {version_tag} (ref) pushed successfully", psrl_logger, event_type=EventType.PUSH)
         
-    def push_model_state_dict_nixl(self, version_tag: Union[str, int], push_rank: int, push_world_size: int):
+    def push_model_state_dict_nixl(self, version_tag: int):
         """
         Record the version tag of the model state dict pushed to the PS via NIXL.
         The actual model state dict is stored in the PS worker group.
         """
-        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_cpu_ref", "push_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
-        if not hasattr(self, "_push_rank_cache"):
-            self._push_rank_cache = set()
-            self._push_world_size_cache = push_world_size
-        self._push_rank_cache.add(push_rank)
-        assert self._push_world_size_cache == push_world_size, "push_world_size must be the same for all ranks"
-        # Only when all ranks have pushed the model state dict, we can update the model store
-        if len(self._push_rank_cache) == self._push_world_size_cache:
-            del self._push_rank_cache
-            del self._push_world_size_cache
-            self.model_store = ModelStore(
-                version_tag=version_tag,
-            )
-            if tag_to_int(version_tag) > 0:
-                self.maybe_delete_buffer(tag_to_int(version_tag) - 1)
-            self._awake_ps_model_version_waiters(tag_to_int(version_tag))
-            log_single_event(f"Model with version tag {version_tag} (nixl) pushed successfully", psrl_logger, event_type=EventType.PUSH)
+        self.model_store = ModelStore(
+            version_tag=version_tag,
+        )
+        if version_tag > 0:
+            self.maybe_delete_buffer(version_tag - 1)
+        self._awake_ps_model_version_waiters(version_tag)
+        log_single_event(f"Model with version tag {version_tag} (nixl) pushed successfully", psrl_logger, event_type=EventType.PUSH)
 
     def pull_model_state_dict_cpu(
         self,
-        rollout_instance_id: Union[str, int]
+        rollout_instance_id: int
     ) -> Optional[Mapping[str, Union[Tensor, DTensor]]]:
         """
         Pull the latest model state dict from PS via CPU. Only used in 'cpu' mode.
         This will block until the state dict is transferred (potential bottleneck for large models).
         
         Args:
-            rollout_instance_id (Union[str, int]): The rollout instance id
+            rollout_instance_id (int): The rollout instance id
             
         Returns:
             Optional[Mapping[str, Union[Tensor, DTensor]]]: The model state dict
@@ -703,14 +682,14 @@ class PSManager(RequestStatusTracker):
 
     def pull_model_state_dict_cpu_ref(
         self,
-        rollout_instance_id: Union[str, int]
+        rollout_instance_id: int
     ) -> ray.ObjectRef:
         """
         Return the ray object_ref for the latest model state dict. Only used in 'cpu_ref' mode.
         This is a fast operation (no large data transfer here).
         
         Args:
-            rollout_instance_id (Union[str, int]): The rollout instance id
+            rollout_instance_id (int): The rollout instance id
             
         Returns:
             ray.ObjectRef: The ray object_ref for the latest model state dict
@@ -722,7 +701,7 @@ class PSManager(RequestStatusTracker):
         self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
         return self.model_store.model_state_dict_ref
     
-    def pull_model_state_dict_nixl(self, rollout_instance_id: Union[str, int]):
+    def pull_model_state_dict_nixl(self, rollout_instance_id: int):
         """
         Pull the latest model state dict from PS via NIXL. Only used in 'nixl_cpu' or 'nixl_gpu' mode.
         This only updates the version tag of the model state dict pulled from the PS.

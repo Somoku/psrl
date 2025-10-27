@@ -116,7 +116,7 @@ if __name__ == "__main__":
 
         start_time = time.time()
         xfer_handle = agent.initialize_xfer(
-            "READ", initiator_descs, target_descs, "target", "UUID"
+            "WRITE", initiator_descs, target_descs, "target", "UUID"
         )
         end_time = time.time()
         print(f"Initialize transfer time: {end_time - start_time} seconds")

@@ -18,7 +18,7 @@ from verl.utils.fs import copy_to_local
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import log_data_protocol, log_single_event, log_dual_events, EventType, DualOutputHandler
 from psrl.utils.server.command import Command, CommandType, CommandExtension
-from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.reward.reward_loop import load_reward_loop_manager
 
 psrl_logger = logging.getLogger(__file__)
@@ -300,7 +300,7 @@ class RewardManager(CommandExtension):
                     psrl_logger.debug(f"Aborted {aborted_count} running reward computations")
                     
                     # 2. Remove from the request tracker (update_status)
-                    update_status_success = await self.ps_manager_handle.update_request_status.remote(list(abort_request_uids), RequestStatus.REWARD_COMPLETED)
+                    update_status_success = await self.ps_manager_handle.update_request_status.remote(list(abort_request_uids), PSRL_RequestStatus.REWARD_COMPLETED)
                     assert all(not status for status in update_status_success), "Update status should not be successful for aborted requests."
                     result = aborted_count
                 else:
@@ -336,7 +336,7 @@ class RewardManager(CommandExtension):
             request_ids = reward_inputs.non_tensor_batch["uid"]
             
             # Update the request status to REWARD_RUNNING
-            update_status_success = await self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), RequestStatus.REWARD_RUNNING)
+            update_status_success = await self.ps_manager_handle.update_request_status.remote(request_ids.tolist(), PSRL_RequestStatus.REWARD_RUNNING)
             if not update_status_success[0]:
                 return None
             
@@ -368,7 +368,7 @@ class RewardManager(CommandExtension):
                     with log_dual_events("Compute reward model score", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                         result = await self.reward_loop.run_single(reward_input)
                         # Update the request status to REWARD_COMPLETED
-                        update_status_success = await self.ps_manager_handle.update_request_status.remote(int(request_id), RequestStatus.REWARD_COMPLETED)
+                        update_status_success = await self.ps_manager_handle.update_request_status.remote(int(request_id), PSRL_RequestStatus.REWARD_COMPLETED)
                         complete_request_idxs = [
                             i for i, success in enumerate(update_status_success) if success
                         ]

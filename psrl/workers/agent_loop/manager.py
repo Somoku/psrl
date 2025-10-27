@@ -14,7 +14,7 @@ from verl.utils.torch_functional import pad_2d_list_to_length
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 
-from psrl.workers.ps.request_status_tracker import RequestStatus
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.utils.logger import DualOutputHandler, get_worker_info, log_single_event, EventType, deprecated, log_data_protocol, log_dual_events
 from psrl.workers.ps.staleness_controller import EntryInfo
 from psrl.utils.dataset.utils import _pre_process_inputs
@@ -373,7 +373,7 @@ class PSRL_AgentLoopManager:
             version_tags = data.non_tensor_batch["max_version_limit"]
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
-            RequestStatus.RUNNING,
+            PSRL_RequestStatus.RUNNING,
             model_version=version_tags.tolist(),
         )
         dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
@@ -575,7 +575,7 @@ class PSRL_AgentLoopManager:
                 if buffer_id not in self.accumulated_buffers:
                     self.accumulated_buffers[buffer_id] = {}
                     self.accumulated_buffer_size[buffer_id] = 0
-                model_version = min(prompt_entry_info.model_version) if isinstance(prompt_entry_info.model_version, list) else prompt_entry_info.model_version
+                model_version = prompt_entry_info.get_entry_version()
                 if model_version not in self.accumulated_buffers[buffer_id]:
                     self.accumulated_buffers[buffer_id][model_version] = []
                 self.accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
@@ -607,7 +607,6 @@ class PSRL_AgentLoopManager:
 
         # Process READY buffers
         for buffer_id in sorted(list(ready_buffer_ids)):
-            buffer_accumulate_num = self.accumulated_buffer_size[buffer_id]
             # Collect all prompt entry infos for the buffer
             prompt_entry_infos = []
             for model_version in sorted(list(self.accumulated_buffers[buffer_id].keys())):

@@ -35,15 +35,16 @@ class EntryInfo:
     including the rollout instance ID, request ID, and model version.
 
     Args:
-        rollout_instance_id (Union[str, int]): The ID of the rollout instance this entry belongs to.
-        request_id (Union[str, int]): The global unique request ID.
-        model_version (int): The model version when generating this entry.
+        rollout_instance_id (Union[int, List[int]]): The ID(s) of the rollout instance this entry belongs to.
+        prompt_id (int): The global unique prompt ID.
+        request_id (Union[int, List[int]]): The global unique request ID(s) inside a group.
+        model_version (Union[int, List[int]]): The model version(s) when generating this entry.
     """
-    rollout_instance_id: Union[str, int, List[Union[str, int]]]  # The ID of the rollout instance this entry belongs to
-    prompt_id: Union[str, int] # The global unique prompt ID
+    rollout_instance_id: Union[int, List[int]]  
+    prompt_id: int 
     # The model version when generating this entry, which should be within staleness control
     # (i.e., higher than the final occupied buffer ID minus the staleness limit)
-    request_idx: Union[str, int, List[Union[str, int]]]  # The global unique request ID inside a group
+    request_idx: Union[int, List[int]] 
     model_version: Union[int, List[int]]
 
     def __hash__(self):
@@ -105,6 +106,7 @@ class StalenessBuffer:
 
     Args:
         num_entries (int): The number of entries in the buffer
+        ready_num_entries (int): The number of entries in the buffer that are sufficient for one training batch
         staleness (int): The staleness tolerance for this buffer
     """
     def __init__(self, num_entries: int, ready_num_entries: int, staleness: int):
@@ -239,6 +241,9 @@ class StalenessInventory:
 
     Args:
         num_entries (int): Number of entries per buffer.
+        ready_num_entries (int): The number of entries in the buffer that are sufficient for one training batch
+        staleness (int): The staleness tolerance for this buffer
+        rollout_n (int): The number of rollout instances
     """
     def __init__(
         self,
@@ -507,13 +512,13 @@ class StalenessInventory:
 
     def update_request_version_tag(
         self,
-        request_id: Union[str, int],
+        request_id: int,
         new_version_tag: int,
     ):
         """
         Update the version tag of a specific request in the data tracker and buffer.
         Args:
-            request_id (Union[str, int]): The global unique request ID to update.
+            request_id (int): The global unique request ID to update.
             new_version_tag (int): The new model version tag to set.
         Raises:
             AssertionError: If the request ID is not found or the new version tag is out of staleness bounds.
@@ -838,5 +843,7 @@ class StalenessInventory:
         self.data_tracker[entry_info.prompt_id] = (target_buffer_id, entry_id)
         psrl_logger.debug(f"[Entry Occupy]: entry {entry_info} occupied in (buffer {target_buffer_id}, entry {entry_id})")
         occupy_num = buffer.get_first_non_occupied()
-        buffer_status = self._update_buffer_status(target_buffer_id)
+        self._update_buffer_status(target_buffer_id)
+        # NOTE(lhy): seems occupy_num is exactly entry_id + 1
+        # need to check
         return target_buffer_id, entry_id, occupy_num

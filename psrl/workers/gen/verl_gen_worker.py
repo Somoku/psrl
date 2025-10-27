@@ -36,7 +36,6 @@ from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import NIXLInterface
 from psrl.workers.gen import PSRL_vLLMRollout, GenInterface
-from psrl.workers.ps.request_status_tracker import RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

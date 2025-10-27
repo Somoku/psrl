@@ -39,8 +39,6 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
                 solution_str=response_str,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
-                reward_model_router=self.reward_model_router,
-                reward_model_tokenizer=self.reward_model_tokenizer,
             )
         else:
             result = await self.loop.run_in_executor(
@@ -50,8 +48,6 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
                     solution_str=response_str,
                     ground_truth=ground_truth,
                     extra_info=extra_info,
-                    reward_model_router=self.reward_model_router,
-                    reward_model_tokenizer=self.reward_model_tokenizer,
                 ),
             )
 

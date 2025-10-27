@@ -1067,8 +1067,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.init_rollout_coordinator()
         # simutaneously init all rollout instances
         model_init_futures.append(self.rollout_coordinator.init_model.remote())
-        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
-            nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -1106,6 +1104,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info("All workers' models initialized successfully!")
 
         # initialize NIXL
+        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             ray.get(nixl_client_futures)
             rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())

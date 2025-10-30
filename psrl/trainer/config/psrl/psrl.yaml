@@ -83,12 +83,16 @@ status_collection:
   enable: True
 
   # The level of logging to file
-  # Available options: "none", "prompt", "all"
-  dump_logging_to_file_level: prompt
+  # Available options: "none", "partial_rollout", "prompt", "all"
+  dump_logging_to_file_level: none
 
-  # Engine status sync interval in millisecond (vllm engine -> rollout coordinator & agent loop workers & rollout router)
-  # Here 500 means sync every 0.5 seconds
-  engine_status_sync_interval_in_ms: 500
+  # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
+  # Here 100 means sync every 0.1 second
+  engine_sync_interval_in_ms: 100
+
+  # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
+  # Here 1000 means sync every 0.5 second
+  coordinator_sync_interval_in_ms: 500
 
 # Redundant rollout config
 redundant_rollout:
@@ -123,14 +127,28 @@ partial_rollout:
 routing_strategy:
 
   # Method for rollout routing
-  # Available options: "fixed" or "adaptive"
-  method: adaptive
+  # Available options: "random", "round_robin", "request_num_balance", "throuput_balance"
+  method: round_robin
+
+  # Snapshot staleness threshold in milliseconds
+  # Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
+  snapshot_staleness_threshold_in_ms: 2000
 
   # Max number of waiting requests per instance
   max_num_waiting_reqs: 0
 
-  # Max concurrent sequences per instance
-  max_concurrent_seqs_per_instance: ${psrl.staleness_buffer_entries}
+  # Max estimated concurrent sequences per instance
+  # No need to tune this value, it is only used to estimate the max sequence length that can saturate the KV Cache
+  max_estimated_concurrent_seqs_per_instance: 32768
+
+sync_strategy:
+
+  # Method for model synchronization
+  # Available options: "status_based" or "greedy"
+  method: greedy
+
+  # Check interval in millisecond for model synchronization
+  check_interval_in_ms: 500
 
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:

@@ -166,11 +166,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.data_queue_size = 1 
             self.rollout_queue_size = self.config.gen_actor_rollout_ref.rollout.get("agent", {}).get("num_workers", 1)
 
-        # Status queue is used to store the status of the rollout workers.
+        # Status queues are used to store the status of the rollout instances.
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
-        self.status_queue = RayQueue()
+        # The number of status queues is the same as the number of rollout instances.
+        self.status_queues = [RayQueue() for _ in range(self.config.psrl.deployment.n_rollout_instances)]
 
-        psrl_logger.debug("Initialized data_queue, rollout_queue, and status_queue with sizes: %d, %d, and unlimited respectively.",
+        psrl_logger.debug("Initialized data_queue, rollout_queue, and status_queues with sizes: %d, %d, and unlimited respectively.",
                          self.data_queue_size, self.rollout_queue_size)
 
     def _validate_config(self):
@@ -363,9 +364,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.config.psrl.gen_mode == "batch":
             assert self.config.gen_actor_rollout_ref.rollout.mode == "sync", "rollout mode must be sync when using batch mode"
         elif self.config.psrl.gen_mode == "stream":
-            assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", "rollout mode must be async when using stream mode"
+            assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", "rollout mode must be psrl_async when using stream mode"
         else:
             raise ValueError(f"Invalid gen_mode: {self.config.psrl.gen_mode}, must be one of ['batch', 'stream']")
+        
+        # Check status collection
+        if self.config.psrl.status_collection.enable:
+            assert self.config.psrl.gen_mode == "stream", "gen_mode must be stream when using status collection"
+
+        # Check partial and redundant rollout
+        if self.config.psrl.partial_rollout.enable or self.config.psrl.redundant_rollout.enable:
+            assert self.config.psrl.gen_mode == "stream", "gen_mode must be stream when using partial or redundant rollout"
+
+        # Check routing strategy
+        if self.config.psrl.routing_strategy.method == "request_num_balance" or self.config.psrl.routing_strategy.method == "throughput_balance":
+            assert self.config.psrl.status_collection.enable, "status collection must be enabled when using request num balance or throughput balance routing strategy"
 
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
     
@@ -462,7 +475,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.ps_manager_handle,
             self.rollout_wg_list,
             self.agent_loop_workers,
-            self.status_queue,
+            self.status_queues,
         )
 
     def start_rollout_coordinator(self):
@@ -817,7 +830,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             gen_interface = GenInterface(
                 rollout_instance_id=i,
                 ps_manager_handle=self.ps_manager_handle,
-                status_queue=self.status_queue,
+                status_queue=self.status_queues[i],
             )
             rollout_config = self.config.gen_actor_rollout_ref
             if self.config.psrl.deployment.heterogeneous_rollout.enable:
@@ -1074,8 +1087,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # simutaneously init all rollout instances
         model_init_futures.append(self.rollout_coordinator.init_model.remote())
         # initialize rollout strategy
-        if self.config.psrl.routing_strategy.method == "adaptive":
-            self.rollout_coordinator.init_routing_strategy.remote()
+        self.rollout_coordinator.init_routing_strategy.remote()
         # initialize nixl client
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())

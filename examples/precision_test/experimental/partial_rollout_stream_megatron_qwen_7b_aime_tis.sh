@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='psrl_dapo'
-experiment_name='DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-partial-staleness_2'
+staleness=2
+project_name=psrl_dapo
+experiment_name=DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-partial-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
+# HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
+# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
 HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
 DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
@@ -21,13 +24,13 @@ GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
-TRAIN_PP=2 # PP in the training side 
+TRAIN_PP=1 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 
-NNODES=8
+NNODES=5
 NGPUS_PER_NODE=8
 
-GEN_NNODES=4 # Number of nodes for generation
+GEN_NNODES=1 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
@@ -49,8 +52,8 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
-redundant_train_prompt_bsz=128
+train_prompt_bsz=256
+redundant_train_prompt_bsz=256
 n_resp_per_prompt=8
 redundant_n_resp_per_prompt=8
 train_prompt_mini_bsz=32
@@ -70,7 +73,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.reward_service_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=2 \
+    psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
@@ -95,6 +98,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.partial_rollout.enable=True \
     psrl.partial_rollout.threshold=96 \
     \
+    psrl.routing_strategy.method="round_robin" \
+    psrl.routing_strategy.max_num_waiting_reqs=0 \
+    \
+    psrl.sync_strategy.method="greedy" \
+    \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
@@ -109,7 +117,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.disable_log_stats=false \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    train_actor_rollout_ref.model.use_fused_kernels=True \
+    train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
@@ -124,13 +132,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
-    train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
-    train_actor_rollout_ref.ref.megatron.param_offload=${offload} \
-    train_actor_rollout_ref.ref.megatron.tensor_model_parallel_size=${TRAIN_TP} \
-    train_actor_rollout_ref.ref.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
-    train_actor_rollout_ref.ref.megatron.context_parallel_size=${TRAIN_CP} \
-    train_actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
-    train_actor_rollout_ref.ref.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \

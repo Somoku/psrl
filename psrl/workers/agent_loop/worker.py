@@ -4,6 +4,7 @@ import asyncio
 import hydra
 import torch
 import numpy as np
+from typing import List
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from collections import deque
@@ -195,9 +196,8 @@ class PSRL_AgentLoopWorker:
             tokenizer=self.tokenizer,
         )
         
-        with log_dual_events(f"Agent loop with {len(requests)} requests", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
+        with log_dual_events(f"Agent loop with requests {requests.non_tensor_batch['uid']}", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
             output = await agent_loop.run(requests)
-        psrl_logger.debug(f"Agent loop {agent_name} completed for requests: {requests.non_tensor_batch['uid']}")
         
         if output is not None:
             assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
@@ -224,20 +224,11 @@ class PSRL_AgentLoopWorker:
                         self.rollout_queue.put(output)
                     '''
 
-    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
-        """Update the instance to engine status received from RolloutCoordinator."""
-        async def _update_status():
-            self.rollout_router.update_instance_to_engine_status(instance_to_engine_status)
-            # May log some stats here
-            # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")
-        
-        # Schedule the async update
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_update_status())
-        except RuntimeError:
-            # If no event loop is running, create one
-            asyncio.run(_update_status())
+    def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], currently_syncing_instance_ids: set[int]):
+        """Update the instance status received from RolloutCoordinator."""
+        self.rollout_router.update_instance_status(instance_to_engine_status, currently_syncing_instance_ids)
+        # May log some stats here
+        # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")
 
     def get_instance_to_engine_status(self):
         """Get the latest instance to engine status from the rollout router.

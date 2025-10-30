@@ -33,6 +33,19 @@ class EngineStats:
         num_running_reqs = self.snapshot.get("scheduler_stats", {}).get("num_running_reqs", 0)
         self._waiting_and_running_queue_size = num_waiting_reqs + num_running_reqs
 
+    @staticmethod
+    def get_default_snapshot() -> dict:
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "total_elapsed_time": 0.0,
+            "elapsed_time_since_last_record": 0.0,
+            "scheduler_stats": {
+                "num_running_reqs": 0,
+                "num_waiting_reqs": 0,
+                "kv_cache_usage": 0.0,
+            },
+        }
+
     # mutable operations
     def get_waiting_and_running_queue_size(self) -> int:
         return self._waiting_and_running_queue_size
@@ -64,7 +77,6 @@ class StatCollector(StatLoggerBase):
         self.instance_id = instance_id
         
         self.model_version = 0
-        
         self._begin_record = False
         self.start_time = None
         self.last_record_time = None
@@ -84,15 +96,13 @@ class StatCollector(StatLoggerBase):
         self.start_time = time.time()
         self.last_record_time = self.start_time
         self.last_push_to_queue_time = self.start_time
-    
-    def set_model_version(self, model_version: int):
-        """
-        Set the model version for this engine instance.
         
-        Args:
-            model_version: Model version
-        """
-        self.model_version = model_version
+    def _make_snapshot_after_model_version_update(self) -> dict:
+        curr_time = time.time()
+        snapshot = EngineStats.get_default_snapshot()
+        snapshot["total_elapsed_time"] = curr_time - self.start_time
+        snapshot["elapsed_time_since_last_record"] = curr_time - self.last_record_time
+        return snapshot
 
     def init_output_queue(self, output_queue):
         """
@@ -102,6 +112,23 @@ class StatCollector(StatLoggerBase):
             output_queue: Ray queue for sending status updates to coordinator
         """
         self.output_queue = output_queue
+
+    def record_model_version_update(self, model_version: int):
+        """
+        Set the model version for this engine instance.
+        
+        Args:
+            model_version: Model version
+        """
+        self.model_version = model_version
+        # We force a record to the output queue to ensure the coordinator knows the model version update immediately
+        self.output_queue.put_nowait(EngineStats(
+            instance_id=self.instance_id,
+            model_version=self.model_version,
+            snapshot=self._make_snapshot_after_model_version_update(),
+        ))
+        self.last_record_time = time.time()
+        self.last_push_to_queue_time = self.last_record_time
 
     def record(
         self,
@@ -166,7 +193,7 @@ class StatCollector(StatLoggerBase):
                 psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
         self.last_record_time = curr_time
             
-        if curr_time - self.last_push_to_queue_time >= self.psrl_config.status_collection.engine_status_sync_interval_in_ms / 1000.0:
+        if curr_time - self.last_push_to_queue_time >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0:
             self.output_queue.put_nowait(EngineStats(
                 instance_id=self.instance_id,
                 model_version=self.model_version,

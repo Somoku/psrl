@@ -72,9 +72,6 @@ class PSManager(RequestStatusTracker):
         # Staleness buffer management
         self.staleness_inventory: Optional[StalenessInventory] = None  # The staleness inventory for managing stale entries
         
-        # Waiting lists for model versions
-        self._version_waiters: Dict[int, List[asyncio.Future]] = {}  # Maps version tags to a set of futures waiting for that version
-        
         # Set to track versions to be aborted
         self.abort_versions = set()
         
@@ -141,6 +138,7 @@ class PSManager(RequestStatusTracker):
         max_staleness_buffer_id = model_version + self.psrl_config.staleness
         return self.staleness_inventory.get_empty_entries_total_num(max_staleness_buffer_id)
     
+    # Used when the model version on the rollout instance is ahead of the request version tag (we allow a old version request to be routed to a new version instance)
     def update_request_version_tag(
         self,
         request_id: int,
@@ -150,6 +148,18 @@ class PSManager(RequestStatusTracker):
         self.staleness_inventory.update_request_version_tag(
             request_id=request_id,
             new_version_tag=new_version_tag,
+        )
+     
+    # Used when the request is routed to a new rollout instance (partial rollout)
+    def update_request_instance_id(
+        self,
+        request_id: int,
+        new_instance_id: int,
+    ):
+        """Update the instance id of a specific request in the staleness inventory."""
+        self.staleness_inventory.update_request_instance_id(
+            request_id=request_id,
+            new_instance_id=new_instance_id,
         )
     
     def clear_occupied_entries(
@@ -375,7 +385,7 @@ class PSManager(RequestStatusTracker):
                     psrl_logger.debug(f"Marking buffer {buffer_id} ready for deletion after aborting requests.")
                     self.ready_for_delete_buffer_ids.add(buffer_id)
 
-        psrl_logger.debug(f"Check staleness abort done for buffer {buffer_id}. Current PS model version {curr_ps_model_version}, "
+        psrl_logger.info(f"Check staleness abort done for buffer {buffer_id}. Current PS model version {curr_ps_model_version}, "
                           f"original ready buffers {ready_buffer_ids}, abort versions {curr_abort_versions}, "
                           f"abort {len(abort_request_ids)} requests. "
                           f"After abortion, current ready buffers {self.staleness_inventory.ready_buffer_ids()}.")
@@ -459,44 +469,12 @@ class PSManager(RequestStatusTracker):
 
         if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
             self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
-            # Sync the rollout instance model version in the rollout server
-            ray.get(self.rollout_coordinator.set_rollout_instance_model_version.remote(
+            # Sync the rollout instance model version in the rollout coordinator
+            self.rollout_coordinator.set_rollout_instance_model_version.remote(
                 rollout_instance_id=rollout_instance_id,
                 version_tag=self.model_store.version_tag,
-            ))
+            )
             psrl_logger.info(f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}.")
-     
-    async def wait_for_ps_model_version(self, target_version: int):
-        """
-        Waiting for model weights of the target version in the PS worker.
-        If model current PS model version >= target_version, return immediately.
-        """
-        ps_model_version = self.get_ps_model_version()
-        if ps_model_version >= target_version:
-            if ps_model_version > target_version:
-                psrl_logger.warning(f"PS model version {ps_model_version} is greater than target version {target_version},"
-                                    " which should not happen.")
-            return
-        
-        # Otherwise, create a Future and store it in _version_waiters[target_version],
-        # and await it until set_version wakes it up.
-        fut = asyncio.get_event_loop().create_future()
-        if target_version not in self._version_waiters:
-            self._version_waiters[target_version] = []
-        self._version_waiters[target_version].append(fut)
-        await fut
-        
-    def _awake_ps_model_version_waiters(self, version: int):
-        """Wake up all rollout waiters for this version if any."""
-        # Wake all Futures waiting for this version
-        if version in self._version_waiters:
-            for fut in self._version_waiters[version]:
-                if not fut.done():
-                    fut.set_result(None)
-            # Remove the key after waking all waiters
-            del self._version_waiters[version]
-        # Sync model version to rollout coordinator
-        ray.get(self.rollout_coordinator.set_ps_model_version.remote(version))
 
     # ------- PS NIXL CONTROL PLANE -------
     
@@ -614,8 +592,7 @@ class PSManager(RequestStatusTracker):
         )
         if version_tag > 0:
             self.maybe_delete_buffer(version_tag - 1)
-        # Awake all rollout waiters for this version
-        self._awake_ps_model_version_waiters(version_tag)
+        self.rollout_coordinator.set_ps_model_version.remote(version_tag)
         log_single_event(f"Model with version tag {version_tag} pushed successfully", psrl_logger, event_type=EventType.PUSH)
 
     # NOTE: If you manually wrap ObjectRef in a container (like list/tuple),ray will not recursively dereference all refs inside the container
@@ -642,8 +619,7 @@ class PSManager(RequestStatusTracker):
         )
         if version_tag > 0:
             self.maybe_delete_buffer(version_tag - 1)
-        # Awake all rollout waiters for this version
-        self._awake_ps_model_version_waiters(version_tag)
+        self.rollout_coordinator.set_ps_model_version.remote(version_tag)
         log_single_event(f"Model with version tag {version_tag} (ref) pushed successfully", psrl_logger, event_type=EventType.PUSH)
         
     def push_model_state_dict_nixl(self, version_tag: int):
@@ -656,7 +632,7 @@ class PSManager(RequestStatusTracker):
         )
         if version_tag > 0:
             self.maybe_delete_buffer(version_tag - 1)
-        self._awake_ps_model_version_waiters(version_tag)
+        self.rollout_coordinator.set_ps_model_version.remote(version_tag)
         log_single_event(f"Model with version tag {version_tag} (nixl) pushed successfully", psrl_logger, event_type=EventType.PUSH)
 
     def pull_model_state_dict_cpu(

@@ -202,12 +202,11 @@ class PSRL_vLLMRollout:
             }
         '''
         
-        if psrl_config.routing_strategy.method == "adaptive":
-            llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
-            llm_kwargs["additional_config"] = {
-                "max_num_waiting_reqs": psrl_config.routing_strategy.max_num_waiting_reqs,
-                "max_model_len_used_in_estimation": max_model_len * psrl_config.routing_strategy.max_concurrent_seqs_per_instance,
-            }
+        llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
+        llm_kwargs["additional_config"] = {
+            "max_num_waiting_reqs": psrl_config.routing_strategy.max_num_waiting_reqs,
+            "max_model_len_used_in_estimation": max_model_len * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
+        }
 
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)
@@ -218,8 +217,9 @@ class PSRL_vLLMRollout:
                 vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]
                 self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
+                self.stat_collector.begin_record()
                 self.stat_collector.init_output_queue(status_queue)
-                self.stat_collector.set_model_version(0)
+                self.stat_collector.record_model_version_update(0)
                 stat_loggers = [self.stat_collector]
             psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
             self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)

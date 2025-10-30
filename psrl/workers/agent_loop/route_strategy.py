@@ -1,10 +1,12 @@
 import os
 import logging
 import numpy as np
+from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 from typing import Dict, Type, Optional, List
 
 from verl import DataProto
+from psrl.workers.gen.stats_collector import EngineStats
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -52,14 +54,20 @@ def list_available_route_strategies() -> list:
     return list(_ROUTE_STRATEGY_REGISTRY.keys())
 
 class RouteStrategyBase(ABC):
-    @abstractmethod
-    def __init__(self, n_instances: int):
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         """Initialize with the number of worker instances.
         
         Args:
             n_instances (int): Total number of worker instances.
         """
-        pass
+        self.n_instances = n_instances
+        self.strategy_kwargs = strategy_kwargs
+        self.instance_to_engine_status = {i: EngineStats(
+            instance_id=i,
+            model_version=0,
+            snapshot=EngineStats.get_default_snapshot(),
+        ) for i in range(n_instances)}
+        self.instance_to_time_record = {i: datetime.now() for i in range(n_instances)} # Track the last clock of each instance
     
     @abstractmethod
     def route(self, request: DataProto, candidates: Optional[List[int]]) -> int:
@@ -73,30 +81,72 @@ class RouteStrategyBase(ABC):
             int: Index of the selected worker instance.
         """
         pass
+    
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
+        """Update the engine status with latest information from coordinator.
+        
+        Args:
+            instance_to_engine_status (dict[int, EngineStats]): Latest engine status information.
+        """
+        for i in range(self.n_instances):
+            if i in instance_to_engine_status:
+                self.instance_to_engine_status[i] = instance_to_engine_status[i]
+                
+    def push_request(self, request: DataProto, instance_id: int):
+        """Push a request to a specific worker instance.
+        
+        Args:
+            request (DataProto): The request to push.
+            instance_id (int): The index of the worker instance to push the request to.
+        """
+        self.instance_to_time_record[instance_id] = datetime.now()
+    
+    def pop_request(self, request: DataProto, instance_id: int):
+        """Pop a request from a specific worker instance.
+        
+        Args:
+            request (DataProto): The request to pop.
+            instance_id (int): The index of the worker instance to pop the request from.
+        """
+        self.instance_to_time_record[instance_id] = datetime.now()
+    
+    def is_staled(self, instance_id: int, engine_status: EngineStats) -> bool:
+        """Check if the engine status is stale.
+        
+        Args:
+            instance_id (int): The index of the worker instance.
+            engine_status (EngineStats): The engine status.
+        """
+        snapshot_time = datetime.fromisoformat(engine_status.snapshot["timestamp"])
+        return self.instance_to_time_record[instance_id] - snapshot_time > timedelta(milliseconds=self.strategy_kwargs.get("snapshot_staleness_threshold_in_ms", 100))
 
 @register_route_strategy("random")
 class RandomRouteStrategy(RouteStrategyBase):
     """Randomly selects a worker instance for each request."""
 
-    def __init__(self, n_instances: int):
-        self.n_instances = n_instances
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
 
     def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
         if candidates is None:
             candidates = list(range(self.n_instances))
+        if len(candidates) == 0:
+            return None
         return np.random.choice(candidates)
 
 @register_route_strategy("round_robin")
 class RoundRobinRouteStrategy(RouteStrategyBase):
     """Routes requests in a round-robin fashion across worker instances."""
 
-    def __init__(self, n_instances: int):
-        self.n_instances = n_instances
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
         self.curr_idx = 0
 
     def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
         if candidates is None:
             candidates = list(range(self.n_instances))
+        if len(candidates) == 0:
+            return None
         # choose from candidates in a round-robin manner
         idx = self.curr_idx
         idx = candidates[idx % len(candidates)]
@@ -107,31 +157,48 @@ class RoundRobinRouteStrategy(RouteStrategyBase):
 class RequestNumBalanceRouteStrategy(RouteStrategyBase):
     """Routes requests to the worker instance with the fewest pending requests."""
     
-    def __init__(self, n_instances: int):
-        """Initialize with the number of worker instances.
-        
-        Args:
-            n_instances (int): Total number of worker instances.
-        """
-        self.n_instances = n_instances
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
         self.instance_request_counts = {i: 0 for i in range(n_instances)}
-    
-    def update_instance_request_counts(self, counts: dict[int, int]):
-        """Update the request counts for each worker instance.
-        
-        Args:
-            counts (dict[int, int]): Mapping of instance ID to request count.
-        """
-        for idx, count in counts.items():
-            assert 0 <= idx < self.n_instances, f"Instance index {idx} out of range [0, {self.n_instances})"
-            self.instance_request_counts[idx] = count
 
     def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
         if candidates is None:
             candidates = list(range(self.n_instances))
+        if len(candidates) == 0:
+            return None
         idx = np.argmin([self.instance_request_counts[i] for i in candidates])
         psrl_logger.debug(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
                           f"with workloads {[self.instance_request_counts[i] for i in candidates]}, "
                           f"selected instance {candidates[idx]} with workload {self.instance_request_counts[candidates[idx]]}")
         self.instance_request_counts[candidates[idx]] += 1
         return candidates[idx]
+    
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
+        super().update_instance_to_engine_status(instance_to_engine_status)
+        self.instance_request_counts = {i: engine_stats.get_waiting_and_running_queue_size() for i, engine_stats in instance_to_engine_status.items()}
+
+    def push_request(self, request: DataProto, instance_id: int):
+        super().push_request(request, instance_id)
+        self.instance_request_counts[instance_id] += 1
+    
+    def pop_request(self, request: DataProto, instance_id: int):
+        super().pop_request(request, instance_id)
+        self.instance_request_counts[instance_id] -= 1
+
+@register_route_strategy("throughput_balance")
+class ThroughputBalanceRouteStrategy(RouteStrategyBase):
+    """Routes requests to the worker instance with optimal throughput balance."""
+    
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
+        # TODO(lhy)
+        raise NotImplementedError("ThroughputBalanceRouteStrategy is not implemented")
+    
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        if len(candidates) == 0:
+            return None
+        # TODO(lhy)
+        raise NotImplementedError("ThroughputBalanceRouteStrategy is not implemented")
+

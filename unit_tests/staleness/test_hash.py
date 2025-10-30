@@ -3,8 +3,8 @@ from typing import Union
 
 @dataclass(frozen=True)
 class EntryInfo:
-    rollout_instance_id: Union[str, int]
-    request_id: Union[str, int]
+    rollout_instance_id: int
+    request_id: int
     model_version: int
 
 # Creating instances of EntryInfo

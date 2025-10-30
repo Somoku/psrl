@@ -45,9 +45,9 @@ class PSRL_BaseTrainWorker(ABC):
         self.nixl_wait_completed = threading.Event()
         
         # Build logger
-        # self.log_prefix = f"BaseTrainWorker_R{self.rank}"
-        # psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
-        # psrl_logger.debug(f"Initialized on {get_worker_info()}.")
+        self.log_prefix = f"BaseTrainWorker_R{self.rank}"
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        psrl_logger.debug(f"Initialized on {get_worker_info()}.")
         
         # Env debug
         # log_env_info(psrl_logger, level=logging.DEBUG)
@@ -105,13 +105,14 @@ class PSRL_BaseTrainWorker(ABC):
         assert self.nixl_storage_client is not None, "nixl_storage_client is not initialized."
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "push_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         ps_manager_handle = self.train_interface.ps_manager_handle
+        psrl_logger.info(f"Getting the current PS model version...")
         curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
         next_ps_model_version = curr_ps_model_version + 1
         if self._cached_ps_nixl_agent_names is None:
             self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
         if self._cached_ps_nixl_train_storage_client_names is None:
             self._cached_ps_nixl_train_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_names.remote())
-        psrl_logger.info(f"Pushing the model to the PS via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients.")
+        psrl_logger.info(f"Pushing the model with version {next_ps_model_version} to the PS via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients.")
         
         # Clear previous wait thread
         with self.nixl_wait_thread_lock:
@@ -124,6 +125,7 @@ class PSRL_BaseTrainWorker(ABC):
         def wait_all_operations():
             try:
                 precision_transfer_futures = []
+                psrl_logger.info(f"Starting to push model to the PS via NIXL for version {next_ps_model_version}...")
                 for key in self.unified_state_dict:
                     wait_operations = []
                     for target_agent_name, target_client_name in zip(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_train_storage_client_names): 
@@ -150,12 +152,13 @@ class PSRL_BaseTrainWorker(ABC):
                         ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
                         precision_transfer_futures.append(ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer))
                         psrl_logger.debug(f"Transfer {shards_to_transfer} shards of {key} from train to gen in target {target_client_name}")
-                psrl_logger.debug(f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} train to gen transfers on the PS...")
+                psrl_logger.info(f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} train to gen transfers on the PS...")
                 ray.get(precision_transfer_futures)
-                psrl_logger.debug(f"Starting to push model tag to the PS...")
+                psrl_logger.info(f"Starting to push model tag to the PS...")
                 # Ensure all workers have completed the NIXL push operations and precision transfers
                 assert dist.is_initialized(), "Pytorch distributed is not initialized."
                 dist.barrier()
+                psrl_logger.info(f"Barrier done, now pushing model tag to the PS on the representative rank...")
                 if self.worker_rank == 0:
                     # Only the representative rank pushes the model tag to the PS
                     ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))

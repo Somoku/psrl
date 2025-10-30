@@ -1,5 +1,3 @@
-import os
-import logging
 import enum
 import ray
 from omegaconf import DictConfig
@@ -149,7 +147,7 @@ class RequestStatusTracker:
                 old_status = self._request_id_to_status[req_id]
                 if old_status != new_status:
                     self._status_to_request_ids[old_status].discard(req_id)
-                    psrl_logger.debug("Changed status of request %d: %s -> %s", req_id, old_status.name, new_status.name)
+                    # psrl_logger.info("Changed status of request %d: %s -> %s", req_id, old_status.name, new_status.name)
                 self._status_to_request_ids[new_status].add(req_id)
                 self._request_id_to_status[req_id] = new_status
                 # Update the rollout instance ID if provided

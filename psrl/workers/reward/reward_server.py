@@ -582,7 +582,7 @@ class RewardServer(CommandExtension):
                 )
                 self.rollout_request_tracker[sample_id].append(entry_info)
                 psrl_logger.debug(f"Store data for prompt {sample_id} with info {entry_info}, "
-                                    f"request num: {len(self.rollout_request_tracker[sample_id])}")
+                                  f"request num: {len(self.rollout_request_tracker[sample_id])}")
 
             # Group post process
             unique_sample_ids = set(sample_ids)
@@ -604,7 +604,7 @@ class RewardServer(CommandExtension):
                     if abort_child_ids:
                         psrl_logger.debug(f"Aborting child requests {abort_child_ids} for sample {sample_id}.")
                         with log_dual_events(f"Abort {len(abort_child_ids)} requests in reward stage", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
-                            ray.get(self.ps_manager_handle.abort_requests.remote(list(abort_child_ids), blocking=True))
+                            await self.ps_manager_handle.abort_requests.remote(list(abort_child_ids), blocking=True)
                     # Abort the extra entries beyond alg_rollout_n
                     abort_request_ids.extend([sample_id * self.rollout_n + entry_info.request_idx for entry_info in entry_infos[self.alg_rollout_n:]])
 
@@ -712,7 +712,7 @@ class RewardServer(CommandExtension):
             add_buffer = self.maybe_add_buffer(buffer_id, data_buffer)
             if add_buffer:
                 psrl_logger.info(f"Buffer {buffer_id} is READY with {len(self.data_buffers[buffer_id])} entries.")
-                self.try_awake_waiters(buffer_id)
+                await self.try_awake_waiters(buffer_id)
                 self.remove_buffer_from_data_pool(prompt_entry_infos)
                 self.accumulated_buffers.pop(buffer_id)
                 self.accumulated_buffer_size.pop(buffer_id)
@@ -875,7 +875,7 @@ class RewardServer(CommandExtension):
             log_single_event(f"Buffer {buffer_id} is ready", psrl_logger, event_type=EventType.BUFFER_READY)
             self.logged_ready_buffer_ids.add(buffer_id)
 
-    def try_awake_waiters(self, buffer_id: int):
+    async def try_awake_waiters(self, buffer_id: int):
         """Check for ready buffers and wake up waiters.
         
         This method checks if there are any new ready buffers for training and
@@ -886,31 +886,19 @@ class RewardServer(CommandExtension):
         min_ready_buffer_id = min(self.data_buffers.keys(), default=None)
         self.log_ready_buffer(buffer_id)
         
-        ray.get(self.ps_manager_handle.check_staleness_abort.remote(buffer_id))
+        psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
+        await self.ps_manager_handle.check_staleness_abort.remote(buffer_id)
         
         if min_ready_buffer_id is not None:
-            self.process_ready_buffer(min_ready_buffer_id)
-
-    def process_ready_buffer(self, min_ready_buffer_id: int):
-        """
-        Notify the rollout server to check abortion and interruption when there is a ready buffer.
-        
-        This method is called when a buffer is ready to be processed.
-        - Abortion: when a buffer is full, all requests with version_tag equal to `buffer_id - S` should be aborted.
-        - Interruption: check the workload of each rollout instance and whether the abortion led by interruption will
-        influence the training process, to determine whether to interrupt the rollout instance.
-        
-        Args:
-            min_ready_buffer_id (int): The minimum ready buffer ID to process
-        """
-        # If there are ready buffers, wake up the waiters for the minimum ready buffer
-        self._awake_training_batch_waiters(min_ready_buffer_id)
+            psrl_logger.info(f"Awaking waiters for training batch {min_ready_buffer_id}")
+            self._awake_training_batch_waiters(min_ready_buffer_id)
 
     async def wait_for_training_batch(
         self,
         buffer_id: int
     ) -> DataProto:
         """Await a training batch for a specific buffer ID."""
+        psrl_logger.info(f"Training side called wait_for_training_batch for buffer {buffer_id}.")
         await self.ps_manager_handle.ensure_buffer_exists.remote(buffer_id)
         
         if buffer_id in self.data_buffers:
@@ -950,6 +938,7 @@ class RewardServer(CommandExtension):
             for fut in self._buffer_waiters[buffer_id]:
                 if not fut.done():
                     fut.set_result(buffer_data)
+                    psrl_logger.info(f"Waked up waiter for buffer {buffer_id}.")
             # Remove the key after waking all waiters
             del self._buffer_waiters[buffer_id]
         else:

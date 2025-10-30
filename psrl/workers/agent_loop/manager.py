@@ -126,9 +126,13 @@ class PSRL_AgentLoopManager:
                 max_version_tag = np.max(version_tags)
                 if max_version_tag > self.curr_ps_version_tag:
                     psrl_logger.debug(f"Waiting for ps model version: {max_version_tag}")
-                    await self.ps_manager_handle.wait_for_ps_model_version.remote(max_version_tag)
+                    # Busy polling until the PS worker has the needed model version
+                    while (await self.ps_manager_handle.get_ps_model_version.remote()) < max_version_tag:
+                        await asyncio.sleep(0.5)
                     self.curr_ps_version_tag = max_version_tag
                     psrl_logger.debug(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
+
+                # psrl_logger.debug(f"Dispatching data to agent loop workers, total {len(data)} requests with version tag {data.non_tensor_batch['version_tag']}")
 
                 # Dispatch data to agent loop workers
                 await self._inner_dispatch_data(data)

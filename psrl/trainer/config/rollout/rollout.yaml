@@ -220,9 +220,6 @@ agent:
   #   max_terms: 6
   agent_loop_config_path: null
 
-  # Routing strategy: random, round_robin, request_num_balance
-  route_strategy: round_robin
-
   # custom async server configs
   custom_async_server:
 

@@ -1,7 +1,8 @@
 import os
 import queue
 import asyncio
-import threading
+import uvloop
+import resource
 import logging
 import torch
 import ray
@@ -172,9 +173,7 @@ class PSRL_GenWorker(Worker):
                 "Only support psrl_async mode for stream generation, please set rollout.mode to psrl_async in the config."
 
         # Request management
-        self.version_task_lock = asyncio.Lock()
         self.version_to_task_num: dict[int, int] = {}
-        self.version_to_active_tasks: dict[int, set[asyncio.Task]] = defaultdict(lambda: set())
         self.request_id_to_active_tasks: dict[int, set[asyncio.Task]] = defaultdict(lambda: set())
         self.pending_version_requests: dict[int, List[DataProto]] = defaultdict(lambda: [])
         
@@ -353,13 +352,14 @@ class PSRL_GenWorker(Worker):
             dist.broadcast(val_tensor, src=self.get_instance_representative_rank(), group=self.instance_dist_group)
             return val_tensor.item()
 
-    def register_rollout_instance(self):
+    async def register_rollout_instance(self):
         """Register the rollout instance in the PS worker."""
+        assert self.rollout, "Rollout must be initialized before calling register_rollout_instance."
         if hasattr(self, "_is_rollout_instance_registered"):
             return
         if self.is_instance_representative_rank:
             # Only the representative rank needs to register the rollout instance
-            ray.get(self.gen_interface.ps_manager_handle.register_rollout_instance.remote(self.get_instance_id()))
+            await self.gen_interface.ps_manager_handle.register_rollout_instance.remote(self.get_instance_id())
         self._is_rollout_instance_registered = True
         
     def _broadcast_val_from_representative_rank(self, val: Optional[Any] = None) -> Any:
@@ -457,25 +457,29 @@ class PSRL_GenWorker(Worker):
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             self.rollout = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
-        if self.rollout.stat_collector is not None:
-            self.rollout.stat_collector.begin_record()
         self._is_init_model.set()
+        
+    def get_active_task_num(self) -> int:
+        """
+        Get the number of active tasks.
+        """
+        return len(self.active_tasks)
         
     def log_active_tasks(self, task_added: bool = False, task_done: bool = False):
         """
         Log the active tasks.
         """
         assert task_added ^ task_done, "Exactly one of task_added or task_done must be True"
-        active_tasks_len = len(self.active_tasks)
-        psrl_logger.debug(f"Active tasks: {active_tasks_len}")
-        if task_added and active_tasks_len == 1:
+        active_task_num = self.get_active_task_num()
+        psrl_logger.debug(f"Active tasks: {active_task_num}")
+        if task_added and active_task_num == 1:
             self.active_tasks_start_time = time.time()
             log_begin_event(f"Streaming generate with model version {self.curr_rollout_instance_model_version}", psrl_logger, event_type=EventType.GEN)
-        if task_done and active_tasks_len == 0:
+        if task_done and active_task_num == 0:
             duration = time.time() - self.active_tasks_start_time
             log_end_event(f"Streaming generate with model version {self.curr_rollout_instance_model_version}", psrl_logger, event_type=EventType.GEN, duration=duration)
-        if active_tasks_len % self.log_active_tasks_interval == 0:
-            log_single_event(f"Active tasks: {active_tasks_len} ({active_tasks_len / self.avg_max_active_tasks_len * 100:.2f}%)", psrl_logger, event_type=EventType.OTHER)
+        if active_task_num % self.log_active_tasks_interval == 0:
+            log_single_event(f"Active tasks: {active_task_num} ({active_task_num / self.avg_max_active_tasks_len * 100:.2f}%)", psrl_logger, event_type=EventType.OTHER)
     
     def ray_pull_model(self) -> None:
         """
@@ -508,7 +512,7 @@ class PSRL_GenWorker(Worker):
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
-        In 'cpu_ref' mode, get the ray object_ref and ray.get it (parallel, non-blocking for PS worker).
+        In 'cpu_ref' mode, get the ray object_ref and await it (parallel, non-blocking for PS worker).
         """
         assert self.config.rollout.mode == "psrl_async", "Only support psrl_async mode for async pull model."
         ps_manager_handle = self.gen_interface.ps_manager_handle
@@ -518,7 +522,7 @@ class PSRL_GenWorker(Worker):
                 # In 'cpu' mode, pull the full state dict (PS worker will block on transfer)
                 model_state_dict_cpu = await ps_manager_handle.pull_model_state_dict_cpu.remote(self.get_instance_id())
             elif self.psrl_config.ps_mode == "cpu_ref":
-                # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
+                # In 'cpu_ref' mode, get the object_ref and await it (PS worker is non-blocking)
                 object_ref = await ps_manager_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id())
                 model_state_dict_cpu = await object_ref  # This blocks until the state dict is available in the object store
             # Load the model state dict to the vllm model
@@ -561,9 +565,9 @@ class PSRL_GenWorker(Worker):
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         ps_manager_handle = self.gen_interface.ps_manager_handle
         if self._cached_ps_nixl_agent_names is None:
-            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
+            self._cached_ps_nixl_agent_names = await ps_manager_handle.get_ps_nixl_agent_names.remote()
         if self._cached_ps_nixl_gen_storage_client_names is None:
-            self._cached_ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
+            self._cached_ps_nixl_gen_storage_client_names = await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
         await self.rollout.inference_engine.collective_rpc(
             "nixl_pull_model_core", 
             args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
@@ -586,7 +590,7 @@ class PSRL_GenWorker(Worker):
         
     async def pull_model_async(self) -> None:
         assert self.config.rollout.mode == "psrl_async", "Only support `psrl_async` mode."
-        assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks: {self.version_to_active_tasks=}"
+        assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks"
 
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             await self.ray_pull_model_async()
@@ -703,7 +707,7 @@ class PSRL_GenWorker(Worker):
         if self.curr_rollout_instance_model_version > ps_version:
             psrl_logger.warning(f"Actual model version after pull (partial rollout) is {self.curr_rollout_instance_model_version}, which is higher than the required PS version {ps_version}")
         if self.rollout.stat_collector is not None:
-            self.rollout.stat_collector.set_model_version(self.curr_rollout_instance_model_version)
+            self.rollout.stat_collector.record_model_version_update(self.curr_rollout_instance_model_version)
         
         # Step 3: Resume generation
         psrl_logger.info(f"Resuming generation on instance {self.get_instance_id()}")
@@ -716,7 +720,6 @@ class PSRL_GenWorker(Worker):
         # Remove from the active tasks tracker when the task is done
         def task_done_callback(task):
             self.request_id_to_active_tasks[request_id].discard(task)
-            self.version_to_active_tasks[require_version].discard(task)
             self.active_tasks.discard(task)
             self.log_active_tasks(task_done=True)
         return task_done_callback
@@ -738,15 +741,13 @@ class PSRL_GenWorker(Worker):
         assert self.curr_rollout_instance_model_version >= needed_model_version, \
             f"Rollout model version should not be less than needed version, but got {self.curr_rollout_instance_model_version} for needed {needed_model_version}"
         
-        if self.curr_rollout_instance_model_version > needed_model_version:
-            psrl_logger.warning(f"Actual model version for generation is {self.curr_rollout_instance_model_version}, needed model version is {needed_model_version}")
-        
         # Update the request status to ROLLOUT_RUNNING
         request_ids = request.non_tensor_batch.get("uid", None)
         rollout_instance_id = self.get_instance_id()
         
         # Only update the model version if the request is prompt-only
         if "raw_response_ids" in request.non_tensor_batch:
+            # Indicate it is a partial rollout request, use the original version tag in the request
             model_version = request.non_tensor_batch.get("version_tag", None)[0]
         else:
             model_version = self.curr_rollout_instance_model_version
@@ -782,7 +783,7 @@ class PSRL_GenWorker(Worker):
 
             interrupted = (vllm_output.outputs[0].finish_reason == "abort")
 
-            # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
+            # Update the request status to ROLLOUT_INTERRUPTED or RUNNING,
             # depending on `interrupted` field in the result
             update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED if interrupted else PSRL_RequestStatus.RUNNING
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
@@ -825,8 +826,9 @@ class PSRL_GenWorker(Worker):
             if needed_model_version > curr_rollout_instance_model_version:
 
                 with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
-                    # This will block until the PS worker has the needed model version
-                    ray.get(self.gen_interface.ps_manager_handle.wait_for_ps_model_version.remote(needed_model_version))
+                    # Busy polling until the PS worker has the needed model version
+                    while ray.get(self.gen_interface.ps_manager_handle.get_ps_model_version.remote()) < needed_model_version:
+                        time.sleep(0.5)
 
                 with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
                     self.pull_model()
@@ -840,7 +842,7 @@ class PSRL_GenWorker(Worker):
                 if self.curr_rollout_instance_model_version > needed_model_version:
                     psrl_logger.warning(f"Actual model version for generation is {self.curr_rollout_instance_model_version}, needed model version is {needed_model_version}")
                 if self.rollout.stat_collector is not None:
-                    self.rollout.stat_collector.set_model_version(self.curr_rollout_instance_model_version)
+                    self.rollout.stat_collector.record_model_version_update(self.curr_rollout_instance_model_version)
 
             update_status_success = ray.get(self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
@@ -864,10 +866,11 @@ class PSRL_GenWorker(Worker):
 
                 # vllm_outputs = [vllm_outputs[i] for i in range(len(vllm_outputs))]
 
-                # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
-                # depending on `interrupted` field in the result
                 if return_only_on_representative_rank and not self.is_instance_representative_rank:
                     return None, None, None
+                
+                # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
+                # depending on `interrupted` field in the result
                 with log_dual_events(f"Update request status", psrl_logger, event_type=EventType.OTHER):
                     update_statuses = [PSRL_RequestStatus.ROLLOUT_INTERRUPTED if vllm_outputs[i].outputs[0].finish_reason == "abort" else PSRL_RequestStatus.RUNNING for i in range(len(vllm_outputs))]
                     update_status_success = ray.get(self.gen_interface.ps_manager_handle.update_request_status.remote(
@@ -896,7 +899,6 @@ class PSRL_GenWorker(Worker):
             request (DataProto): The async generation request.
         """
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
-        rollout_instance_id = self.get_instance_id()
 
         # Wait for resuming if the generation is interrupted
         if self._async_interrupt_event and self._async_interrupt_event.is_set():
@@ -906,162 +908,28 @@ class PSRL_GenWorker(Worker):
 
         request_id = int(request.non_tensor_batch["uid"][0])
         needed_model_version = int(request.non_tensor_batch["version_tag"][0])
+        
+        # The router should guarantee the request is assigned to a rollout instance that can directly generate with the needed model version.
+        assert needed_model_version <= self.curr_rollout_instance_model_version, \
+            f"Needed model version {needed_model_version} should not be greater than current rollout instance model version {self.curr_rollout_instance_model_version}."
+        
         # All the partial rollout requests (with version tag less than the current rollout instance model version) should be updated to the current rollout instance model version
         if needed_model_version < self.curr_rollout_instance_model_version:
             psrl_logger.debug(f"Request {request_id} needed model version {needed_model_version} is less than "
                               f"current rollout instance model version {self.curr_rollout_instance_model_version}, "
                               f"we'll update needed model version to {self.curr_rollout_instance_model_version}.")
             needed_model_version = self.curr_rollout_instance_model_version
-            # Note(lhy): The version tag here will not interfere with the version tag in the staleness inventory, it is safe to update.
-            request.non_tensor_batch["version_tag"] = np.array([needed_model_version], dtype=int)
-        
-        # Wait for this version to be ready to execute (ensuring sequential execution)
-        await self._wait_for_version_turn(needed_model_version)
-        
-        # Handle model update if needed
-        # NOTE(lhy): The lock here is needed to guarantee await calls cannot be interrupted by other events in the loop
-        # This avoid redundant pulling of the same model version
-        async with self.version_task_lock:
-            if needed_model_version > self.curr_rollout_instance_model_version:
-                # Double-check the condition inside the lock to avoid race conditions
-                if self.curr_rollout_instance_model_version < needed_model_version:
-                    with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
-                        # This will block until the PS worker has the needed model version
-                        await self.gen_interface.ps_manager_handle.wait_for_ps_model_version.remote(needed_model_version)
-                
-                    with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
-                        await self.pull_model_async()
-
-                # NOTE(lhy): The version obtained from the PS manager is the actual model version after the pull
-                # It may be higher than the required version due to the pushing happens between waiting and pulling
-                self.curr_rollout_instance_model_version = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(rollout_instance_id)
-                assert self.curr_rollout_instance_model_version >= needed_model_version, \
-                    f"Current rollout instance model version should not be less than needed version, but got {self.curr_rollout_instance_model_version} vs. {needed_model_version}"
-                if self.curr_rollout_instance_model_version > needed_model_version:
-                    psrl_logger.warning(f"Actual model version for generation is {self.curr_rollout_instance_model_version}, needed model version is {needed_model_version}")
-                if self.rollout.stat_collector is not None:
-                    self.rollout.stat_collector.set_model_version(self.curr_rollout_instance_model_version)
 
         task = self._generate_loop.create_task(
-            self._generate_async_task(request, needed_model_version)
+            self._generate_async_task(request, needed_model_version, consolidate)
         )
         task.add_done_callback(self._create_task_done_callback(
             int(request.non_tensor_batch["uid"][0]),
             needed_model_version,
         ))
-        self.version_to_active_tasks[needed_model_version].add(task)
         self.request_id_to_active_tasks[request_id].add(task)
         self.active_tasks.add(task)
         self.log_active_tasks(task_added=True)
         # Wait for the task to finish
         result = await task
         return result
-
-    async def push_task(self, request_id: int, needed_model_version: int):
-        """
-        Push a new task for the given model version.
-        
-        Args:
-            request_id (int): The ID of the request.
-            needed_model_version (int): The model version needed for the request.
-        """
-        psrl_logger.debug(f"Pushing task for request_id {request_id} with needed_model_version {needed_model_version}")
-        self.version_to_task_num[needed_model_version] = self.version_to_task_num.get(needed_model_version, 0) + 1
-    
-    async def pop_task(self, request_id: int, needed_model_version: int):
-        """
-        Pop a finished task for the given model version.
-        If there are no more tasks for this model version, it will signal the next version to proceed.
-        
-        Args:
-            request_id (int): The ID of the request.
-            needed_model_version (int): The model version needed for the request.
-        """
-        psrl_logger.debug(f"Popping task for request_id {request_id} with needed_model_version {needed_model_version}")
-        if needed_model_version in self.version_to_task_num:
-            self.version_to_task_num[needed_model_version] -= 1
-            if self.version_to_task_num[needed_model_version] == 0:
-                # All tasks for this version are done
-                self.version_to_task_num.pop(needed_model_version)
-                psrl_logger.debug(f"All tasks for model version {needed_model_version} done")
-                # Clean up events for this version
-                self.version_ready_events.pop(needed_model_version, None)
-                # Signal the next version to proceed
-                await self._signal_next_version(needed_model_version)
-        else:
-            raise RuntimeError(f"Model version {needed_model_version} not found in version_to_task_num.")
-
-    async def _wait_for_version_turn(self, needed_model_version: int):
-        """
-        Wait for this version's turn to execute.
-        Ensures that versions are executed in sequential order.
-        
-        Args:
-            needed_model_version (int): The version that needs to execute
-        """
-        # If this is the first version or all previous versions have completed
-        if (needed_model_version <= self.curr_rollout_instance_model_version or
-            self._all_previous_versions_completed(needed_model_version)):
-            if needed_model_version < self.curr_rollout_instance_model_version:
-                raise ValueError(f"Needed model version {needed_model_version} is less than current executing version {self.curr_rollout_instance_model_version}. This should not happen.")
-            # This version can proceed immediately
-            return
-        
-        # Create an event for this version if it doesn't exist
-        if needed_model_version not in self.version_ready_events:
-            self.version_ready_events[needed_model_version] = asyncio.Event()
-        
-        # Wait for this version's turn
-        psrl_logger.debug(f"Version {needed_model_version} waiting for its turn to execute")
-        await self.version_ready_events[needed_model_version].wait()
-        psrl_logger.debug(f"Version {needed_model_version} can now proceed")
-
-    def _all_previous_versions_completed(self, version: int) -> bool:
-        """
-        Check if all versions before the given version have completed.
-        
-        Args:
-            version (int): The version to check
-            
-        Returns:
-            bool: True if all previous versions have completed
-        """
-        # Check if there's a gap between current executing version and needed version
-        for v in range(self.curr_rollout_instance_model_version, version):
-            if v in self.version_to_task_num:
-                return False
-        return True
-
-    async def _signal_next_version(self, completed_version: int):
-        """
-        Signal the next version that it can proceed.
-        
-        Args:
-            completed_version (int): The version that just completed
-        """
-        # Find the next version that should be executed
-        next_version = None
-        for version in sorted(self.version_ready_events.keys()):
-            if (version > completed_version and 
-                not self.version_ready_events[version].is_set() and
-                self._all_previous_versions_completed(version)):
-                next_version = version
-                break
-        
-        if next_version is not None:
-            psrl_logger.debug(f"Signaling version {next_version} to proceed after {completed_version} completed")
-            self.version_ready_events[next_version].set()
-
-    def get_workload_after_update_to(self, model_version: int) -> int:
-        """
-        Get the number of tasks waiting for model versions lower than or equal to the given model version.
-        Args:
-            model_version (int): The model version to check against.
-        Returns:
-            int: The number of tasks waiting for curr_rollout_instance_model_version < model versions <= model_version.
-        """
-        workload = 0
-        for version, task_num in self.version_to_task_num.items():
-            if self.curr_rollout_instance_model_version < version <= model_version:
-                workload += task_num
-        return workload

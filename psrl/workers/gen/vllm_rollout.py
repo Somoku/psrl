@@ -30,7 +30,7 @@ from psrl.utils.dataset.utils import _pre_process_inputs
 
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARNWARN"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class PSRL_vLLMRollout:

@@ -146,7 +146,8 @@ class TrainClientActor:
             client_type=NIXLClientType.PUSH_SIDE,
             nixl_config=psrl_config.nixl,
             nixl_interface=nixl_interface,
-            client_group_id=self._get_replica_id()
+            client_group_id=self._get_replica_id(),
+            logging_path=log_dir
         )
         
         if engine_type == "fsdp" or engine_type == "fsdp_hybrid":
@@ -283,6 +284,7 @@ class TrainClientActor:
         self.print("protocol done.")
 
     def push_to_ps(self, ps_agent_names, ps_client_names):
+        futures = []
         for key in self.state_dict_keys:
             wait_operations = []
             for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
@@ -290,7 +292,6 @@ class TrainClientActor:
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
                     # self.print(f"Pushing {key} to {ps_client_name}")
-            futures = []
             # self.print(f"Waiting for {len(wait_operations)} push operations")
             for key, ps_client_name, shards_to_transfer in wait_operations:
                 start_time = time.time()
@@ -302,7 +303,7 @@ class TrainClientActor:
                 end_time = time.time()
                 # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
                 futures.append(self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(key, shards_to_transfer))
-            ray.get(futures)
+        ray.get(futures)
         # self.client.merge_and_finish_cached_xfer()
     
     def shutdown(self):

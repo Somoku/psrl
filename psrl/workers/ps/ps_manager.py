@@ -339,7 +339,7 @@ class PSManager(RequestStatusTracker):
 
     def check_staleness_abort(self, buffer_id: int):
         """ Check and interrupt rollout instances if necessary based on ready buffers."""
-        curr_ps_model_version = self.get_ps_model_version()
+        curr_ps_model_version = self.get_ps_model_version(debug_info="ps_manager")
         ready_buffer_ids = self.staleness_inventory.ready_buffer_ids().copy()
         abort_request_ids = set()
         curr_abort_versions = set()
@@ -353,14 +353,18 @@ class PSManager(RequestStatusTracker):
             # to ensure all buffers in `[version_to_abort, version_to_abort + staleness]` are READY
             buffer_range = set(range(max(version_to_abort, curr_ps_model_version), version_to_abort + self.psrl_config.staleness + 1))
             psrl_logger.debug(f"Checking abort for version {version_to_abort}, buffer range {buffer_range} should be ready in {ready_buffer_ids}.")
+            # When `buffer_id` buffer is READY, we need to check related versions [version_to_abort, version_to_abort + staleness]
+            # that may need to be aborted due to the READY status of `buffer_id`.
+            # Because `version_to_abort` can be aborted, for the following continuous buffers,
+            # we only need to check whether `curr_buffer_id + staleness` is READY to decide whether to abort `curr_buffer_id`.
             if buffer_range.issubset(ready_buffer_ids):
                 curr_abort_versions.add(version_to_abort)
-                curr_buffer_id = version_to_abort + 1
-                while curr_buffer_id in self.abort_versions:
-                    if curr_buffer_id + self.psrl_config.staleness + 1 in ready_buffer_ids:
+                for curr_buffer_id in range(version_to_abort + 1, version_to_abort + self.psrl_config.staleness + 1):
+                    if curr_buffer_id + self.psrl_config.staleness in ready_buffer_ids:
                         curr_abort_versions.add(curr_buffer_id)
                         self.abort_versions.discard(curr_buffer_id)
-                        curr_buffer_id += 1
+                    else:
+                        break
                 psrl_logger.info(f"Aborting requests with version tag in {curr_abort_versions} due to ready buffer {buffer_id}.")
                 curr_abort_versions = sorted(list(curr_abort_versions))
                 # Collect requests to abort
@@ -385,7 +389,7 @@ class PSManager(RequestStatusTracker):
                     psrl_logger.debug(f"Marking buffer {buffer_id} ready for deletion after aborting requests.")
                     self.ready_for_delete_buffer_ids.add(buffer_id)
 
-        psrl_logger.info(f"Check staleness abort done for buffer {buffer_id}. Current PS model version {curr_ps_model_version}, "
+        psrl_logger.debug(f"Check staleness abort done for buffer {buffer_id}. Current PS model version {curr_ps_model_version}, "
                           f"original ready buffers {ready_buffer_ids}, abort versions {curr_abort_versions}, "
                           f"abort {len(abort_request_ids)} requests. "
                           f"After abortion, current ready buffers {self.staleness_inventory.ready_buffer_ids()}.")
@@ -456,8 +460,9 @@ class PSManager(RequestStatusTracker):
         
         return self.rollout_instance_tracker[rollout_instance_id].version_tag
         
-    def get_ps_model_version(self) -> int:
+    def get_ps_model_version(self, debug_info: str = None) -> int:
         """Get the current model version."""
+        psrl_logger.info(f"Getting PS model version from model store: {self.model_store}, debug info: {debug_info}.")
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
         return self.model_store.version_tag

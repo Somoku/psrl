@@ -39,7 +39,7 @@ from psrl.utils.logger import DualOutputHandler, log_dual_events, log_single_eve
 from psrl.utils.nixl import NIXLInterface, GLOBAL_PORT_SCANNER
 from psrl.workers.train import TrainInterface
 from psrl.workers.gen import GenInterface, RolloutCoordinator
-from psrl.workers.reward import RewardServer
+from psrl.workers.reward import RewardManager
 from psrl.workers.ps import PSManager, PSWorkerGroup, PSResourceSpec, PSResourcePool, PSClassWithInitArgs, PSStoragePlan, PSStorageWorker
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.trainer.ppo.utils import PSRL_Role, PSRL_ResourcePoolManager, PSRL_compute_advantage, need_critic, need_reference_policy, need_reward_model
@@ -109,7 +109,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.data_processor = None
         self.agent_loop_manager = None
         self.rollout_coordinator = None
-        self.reward_server = None
+        self.reward_manager = None
         
         # Parameter server handle for other workers to access
         self.ps_manager_handle = None
@@ -122,7 +122,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
-        # Build loggerz
+        # Build logger
         self.log_prefix = f"MainRayTrainer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized major ray trainer (single controller).")
@@ -161,18 +161,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # The size of the queue is the same as number of agent workers for batch mode.
         if self.process_mode == "stream":
             self.data_queue_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n
-            self.rollout_queue_size = self.data_queue_size
         else:
             self.data_queue_size = 1 
-            self.rollout_queue_size = self.config.gen_actor_rollout_ref.rollout.get("agent", {}).get("num_workers", 1)
 
         # Status queues are used to store the status of the rollout instances.
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
         # The number of status queues is the same as the number of rollout instances.
         self.status_queues = [RayQueue() for _ in range(self.config.psrl.deployment.n_rollout_instances)]
 
-        psrl_logger.debug("Initialized data_queue, rollout_queue, and status_queues with sizes: %d, %d, and unlimited respectively.",
-                         self.data_queue_size, self.rollout_queue_size)
+        psrl_logger.debug("Initialized data_queue, and status_queue with sizes: %d, and unlimited respectively.",
+                          self.data_queue_size)
 
     def _validate_config(self):
         config = self.config
@@ -451,6 +449,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.data_queue_size,
             self.agent_loop_workers,
             self.ps_manager_handle,
+            group_post_process_fn=self.group_post_process_fn,
+            buffer_post_process_fn=self.buffer_post_process_fn,
         )
     
     def start_agent_loop_manager(self):
@@ -472,7 +472,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def init_rollout_coordinator(self):
         self.rollout_coordinator = RolloutCoordinator.remote(
             self.config,
-            self.ps_manager_handle,
             self.rollout_wg_list,
             self.agent_loop_workers,
             self.status_queues,
@@ -493,13 +492,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
 
-    def init_reward_server(self):
-        """Initialize the reward server for computing rewards during training."""
+    def init_reward_manager(self):
+        """Initialize the reward manager for computing rewards during training."""
         assert self.data_processor is not None, "Data processor must be initialized before starting reward computation."
         assert self.rollout_coordinator is not None, "Rollout server must be initialized before starting reward computation."
         
         ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
-        self.reward_server = ray.remote(RewardServer).options(
+        self.reward_manager = ray.remote(RewardManager).options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ip_to_node_id[self.config.psrl.reward_service_ip],
                 soft=False
@@ -509,29 +508,23 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.processor,
             self.ps_manager_handle,
-            self.agent_loop_manager,
-            self.rollout_queue_size,
-            reward_fn=self.reward_fn,
-            use_rm=self.use_rm,
-            group_post_process_fn=self.group_post_process_fn,
-            buffer_post_process_fn=self.buffer_post_process_fn,
         )
 
-    def start_reward_server(self):
-        """Start the reward server to handle reward computation requests in the background."""
-        assert self.reward_server is not None, "Reward server must be initialized before starting it."
-        
-        ray.get(self.reward_server.start_busy_loop.remote())
+    def start_reward_manager(self):
+        """Start the reward manager to handle reward computation requests in the background."""
+        assert self.reward_manager is not None, "Reward manager must be initialized before starting it."
 
-    def stop_reward_server(self):
-        """Stop the reward server."""
-        if self.reward_server is not None:
-            psrl_logger.debug("Stopping reward server...")
-            ray.get(self.reward_server.stop_busy_loop.remote())
-            self.reward_server = None
-            psrl_logger.debug("Reward server stopped successfully.")
+        ray.get(self.reward_manager.start_busy_loop.remote())
+
+    def stop_reward_manager(self):
+        """Stop the reward manager."""
+        if self.reward_manager is not None:
+            psrl_logger.debug("Stopping reward manager...")
+            ray.get(self.reward_manager.stop_busy_loop.remote())
+            self.reward_manager = None
+            psrl_logger.debug("Reward manager stopped successfully.")
         else:
-            psrl_logger.warning("Reward server is not initialized, skipping stop operation.")
+            psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
 
     def _log_rollout_data(
         self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
@@ -1129,6 +1122,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # initialize NIXL
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())
+        if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             ray.get(nixl_client_futures)
             rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())
             psrl_logger.info(f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, {self.actor_wg.world_size} actor workers, {rollout_world_size} rollout workers")
@@ -1148,6 +1143,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info("Binding PS worker group")
             self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg)
             psrl_logger.info("PS worker group bound successfully!")
+            
+        # Build rollout at train side for evaluation
+        self.actor_wg.build_rollout(trust_remote_code=self.config.train_actor_rollout_ref.model.get("trust_remote_code", False))
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1350,14 +1348,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             futures.extend(self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator))
+        for agent_loop_worker in self.agent_loop_workers:
+            futures.append(agent_loop_worker.set_agent_loop_manager.remote(self.agent_loop_manager))
         ray.get(futures)
         
-        self.init_reward_server()
+        self.init_reward_manager()
         futures = []
-        futures.append(self.data_processor.set_reward_server.remote(self.reward_server))
-        futures.append(self.ps_manager_handle.set_reward_server.remote(self.reward_server))
+        futures.append(self.data_processor.set_reward_manager.remote(self.reward_manager))
+        futures.append(self.ps_manager_handle.set_reward_manager.remote(self.reward_manager))
         for agent_loop_worker in self.agent_loop_workers:
-            futures.append(agent_loop_worker.set_reward_server.remote(self.reward_server))
+            futures.append(agent_loop_worker.set_reward_manager.remote(self.reward_manager))
         ray.get(futures)
 
         # Start data pipeline
@@ -1377,11 +1377,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.start_agent_loop_manager()
             psrl_logger.info("Agent loop manager started successfully.")
 
-            # 4. Start reward server to handle reward computation requests
-            psrl_logger.info("Starting reward server...")
-            self.start_reward_server()
-            psrl_logger.info("Reward server started successfully.")
-            
+            # 4. Start reward manager to handle reward computation requests
+            psrl_logger.info("Starting reward manager...")
+            self.start_reward_manager()
+            psrl_logger.info("Reward manager started successfully.")
+
         psrl_logger.info("All data pipeline components started successfully.")
 
         # add tqdm
@@ -1415,7 +1415,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         # will block until the training batch is ready
                         psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
                         with log_dual_events(f"Wait for training batch {buffer_id}", psrl_logger, event_type=EventType.WAIT):
-                            batch = ray.get(self.reward_server.wait_for_training_batch.remote(buffer_id)) 
+                            batch = ray.get(self.agent_loop_manager.wait_for_training_batch.remote(buffer_id)) 
                         psrl_logger.debug("Received training batch for step %d, batch size: %d", 
                                         self.global_steps, len(batch) if batch is not None else 0)
                     else:
@@ -1513,8 +1513,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                         "training/probs_diff_std": probs_diff_std.detach().item(),
                                     }
                                 )
-                            
-                # TODO(lhy): support TIS
+
                 if self.config.psrl.log_prob.mode == "rollout":
                     batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
                     batch.batch.pop("rollout_log_probs")
@@ -1554,23 +1553,37 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 elif self.config.reward_model.launch_reward_fn_async:
                     # Overlap reward computation with log_prob computation in trainer
                     with marked_timer("async_reward_get", timing_raw, color="yellow"):
-                        with log_dual_events("Get async reward model score", psrl_logger, event_type=EventType.OTHER):
-                            future_rewards = batch.non_tensor_batch.pop("future_reward", None)
-                            assert future_rewards is not None, "Reward tensor must be provided in async mode"
-                            reward_tensor_list = []
+                        with log_dual_events("Wait for async reward model score", psrl_logger, event_type=EventType.OTHER):
+                            request_ids = batch.non_tensor_batch["uid"].tolist()
+                            print(f"Waiting for reward of request_ids: {request_ids}")
+                            assert self.reward_manager is not None, "Reward manager is not initialized"
+                            request_id_to_reward = ray.get(self.reward_manager.wait_for_reward_of_requests.remote(request_ids))
+                        
+                        with log_dual_events("Post process async reward model score", psrl_logger, event_type=EventType.OTHER):
+                            scores = []
                             reward_extra_infos_dict_list = []
-                            for future_reward in future_rewards:
-                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                                reward_tensor_list.append(reward_tensor)
-                                reward_extra_infos_dict_list.append(reward_extra_infos_dict)
-                            reward_tensor = torch.cat(reward_tensor_list, dim=0)
+                            for request_id in request_ids:
+                                reward_score = request_id_to_reward[request_id]["reward_score"]
+                                extra_info = request_id_to_reward[request_id].get("reward_extra_info", {})
+                                scores.append(reward_score)
+                                reward_extra_infos_dict_list.append(extra_info)
+                            
+                            prompt_length = batch.batch["prompts"].size(1)
+                            response_length = batch.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
+                            rm_scores = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
+                            rm_scores[torch.arange(batch.batch["response_mask"].size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+                            reward_tensor = rm_scores  # [bsz, response_length]
+                            
+                            # add reward_extra_info to non_tensor_batch
                             reward_extra_infos_dict = defaultdict(list)
                             for reward_extra_infos in reward_extra_infos_dict_list:
                                 for key, value in reward_extra_infos.items():
+                                    if not isinstance(value, list):
+                                        value = [value]
                                     reward_extra_infos_dict[key].extend(value)
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
                 else:
-                    reward_tensor = batch.batch.pop("reward", None)
+                    reward_tensor = batch.batch.pop("rm_scores", None)
                 
                 batch.batch["token_level_scores"] = reward_tensor
 
@@ -1720,7 +1733,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # Stop all components
         psrl_logger.info("Stopping all data pipeline components...")
-        self.stop_reward_server()
+        self.stop_reward_manager()
         self.stop_agent_loop_manager()
         self.stop_rollout_coordinator()
         self.stop_data_processor()

@@ -9,8 +9,8 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet

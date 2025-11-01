@@ -18,14 +18,14 @@
 import argparse
 import time
 import torch
-
+import os
 from nixl._api import nixl_agent, nixl_agent_config
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ip", type=str, required=True)
-    parser.add_argument("--port", type=int, default=23333)
+    parser.add_argument("--port", type=int, default=29876)
     parser.add_argument("--cuda", type=int, default=-1)
     parser.add_argument(
         "--mode",
@@ -53,6 +53,9 @@ if __name__ == "__main__":
 
     # Allocate memory and register with NIXL
     agent = nixl_agent(args.mode, config)
+
+    for k in sorted(os.environ):
+        print(f"{k}={os.environ[k]}")
 
     if args.mode == "target":
         # 0.01GiB, 1000 tensors

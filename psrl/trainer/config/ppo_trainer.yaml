@@ -51,7 +51,7 @@ train_actor_rollout_ref:
 
     # for huge model, layered summon can save memory (prevent OOM) but make it slower
     layered_summon: False
-    
+
 # config for rollout model
 gen_actor_rollout_ref:
 

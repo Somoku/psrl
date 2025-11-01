@@ -108,6 +108,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface,
                 # client_group_id=self.get_replica_id()
+                logging_path=self.psrl_config.logging_path,
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
@@ -144,7 +145,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         In 'cpu_ref' mode, only the train worker blocks on ray.put, PS worker is non-blocking.
         """
         ps_manager_handle = self.train_interface.ps_manager_handle
-        curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote())
+        curr_ps_model_version = ray.get(ps_manager_handle.get_ps_model_version.remote(debug_info="fsdp_train_worker"))
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
         # assert fsdp_version(self.actor_module_fsdp) == 1, "FSDP version 2 is not supported yet."
@@ -173,6 +174,13 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             ActorRolloutRefWorker.init_model(self)
+            
+    def _build_rollout(self, trust_remote_code: bool = False):
+        pass
+    
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def build_rollout(self, trust_remote_code: bool = False):
+        ActorRolloutRefWorker._build_rollout(self, trust_remote_code=trust_remote_code)
     
     # The log_prob in training side may need to be recomputed
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

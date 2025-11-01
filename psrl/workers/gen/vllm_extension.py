@@ -2,8 +2,7 @@ import os
 import logging
 import time
 import torch
-from copy import deepcopy
-from typing import List, Union
+from typing import List, Union, Optional
 from omegaconf import DictConfig
 
 try:
@@ -137,6 +136,7 @@ class vLLMWorkerExtension:
         nixl_config: DictConfig, 
         nixl_interface_after_rpc: Union[dict, NIXLInterface], 
         instance_id: int,
+        logging_path: Optional[str] = None
     ):
         # Reconstruct the nixl_interface (the RPC call serializes the nixl_interface to a dict)
         if isinstance(nixl_interface_after_rpc, dict):
@@ -157,6 +157,7 @@ class vLLMWorkerExtension:
             nixl_config=nixl_config,  
             nixl_interface=nixl_interface,
             # client_group_id=instance_id,
+            logging_path=logging_path,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
     

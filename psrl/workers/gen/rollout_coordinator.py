@@ -8,7 +8,7 @@ from typing import Set, List
 
 from psrl.workers.gen.stats_collector import EngineStats
 from psrl.utils.server.command import CommandType, Command, CommandExtension
-from psrl.utils.logger import log_dual_events, EventType, DualOutputHandler
+from psrl.utils.logger import log_data_protocol, log_single_event, log_dual_events, EventType, DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -18,7 +18,6 @@ class RolloutCoordinator(CommandExtension):
     def __init__(
         self,
         config,
-        ps_manager_handle,
         rollout_wg_list,
         agent_loop_workers,
         status_queues,
@@ -36,7 +35,6 @@ class RolloutCoordinator(CommandExtension):
         
         Args:
             config: Configuration object containing PSRL settings
-            ps_manager_handle: Handle to the parameter server manager
             rollout_wg_list: List of rollout worker groups
             agent_loop_workers: List of agent loop worker handles
             status_queues: Queues for receiving status updates from different rollout instances
@@ -54,7 +52,6 @@ class RolloutCoordinator(CommandExtension):
         
         self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
         
-        self.ps_manager_handle = ps_manager_handle
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
         assert self.rollout_wg_size == self.config.psrl.deployment.n_rollout_instances, \

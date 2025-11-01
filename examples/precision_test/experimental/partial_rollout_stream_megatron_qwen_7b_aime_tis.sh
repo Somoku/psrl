@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=2
+staleness=1
 project_name=psrl_dapo
 experiment_name=DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-partial-staleness_${staleness}
 
@@ -95,7 +95,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.enable=False \
     psrl.partial_rollout.threshold=96 \
     \
     psrl.routing_strategy.method="round_robin" \

@@ -5,7 +5,7 @@ export PSRL_LOGGING_PATH=${PSRL_WORKSPACE}/psrl/unit_tests/nixl/log
 export PSRL_LOGGING_LEVEL=INFO
 cd ${PSRL_WORKSPACE}/psrl/unit_tests/nixl
 
-CASE=3
+CASE=0
 
 # HSDP 16 GPUs Case
 if [ $CASE -eq 0 ]; then
@@ -13,11 +13,11 @@ if [ $CASE -eq 0 ]; then
         test.num_train=8 \
         test.num_gen=8 \
         test.train_engine_type=fsdp_hybrid \
-        test.fsdp_hybrid.ddp_size=2 \
-        test.fsdp_hybrid.fsdp_size=4 \
+        test.fsdp_hybrid.ddp_size=1 \
+        test.fsdp_hybrid.fsdp_size=8 \
         test.gen.tensor_parallel_size=2 \
         test.gen.pipeline_parallel_size=2 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct \
+        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct \
         2>&1 | tee test_nixl_e2e.log
 fi
 

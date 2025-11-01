@@ -246,12 +246,12 @@ class PSRL_GenWorker(Worker):
             if self.config.rollout.mode == "sync":
                 self.rollout.inference_engine.collective_rpc(
                     "init_nixl_client", 
-                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id()),
+                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id(), self.psrl_config.logging_path),
                 )
             elif self.config.rollout.mode == "psrl_async":
                 await self.rollout.inference_engine.collective_rpc(
                     "init_nixl_client", 
-                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id()),
+                    args=(self.psrl_config.nixl, self.nixl_interface, self.get_instance_id(), self.psrl_config.logging_path),
                 )
             else:
                 raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
@@ -827,8 +827,8 @@ class PSRL_GenWorker(Worker):
 
                 with log_dual_events(f"Wait for model version {needed_model_version}", psrl_logger, event_type=EventType.WAIT):
                     # Busy polling until the PS worker has the needed model version
-                    while ray.get(self.gen_interface.ps_manager_handle.get_ps_model_version.remote()) < needed_model_version:
-                        time.sleep(0.5)
+                    while ray.get(self.gen_interface.ps_manager_handle.get_ps_model_version.remote(debug_info="gen_worker")) < needed_model_version:
+                        time.sleep(1)
 
                 with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
                     self.pull_model()

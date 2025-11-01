@@ -58,6 +58,8 @@ class PSRL_AgentLoopWorker:
         )
         self.ps_manager_handle = ps_manager_handle
         self.rollout_wg_list = rollout_wg_list
+        self.agent_loop_manager = None
+        self.reward_manager = None
         
         self.agent_programs = set()
         self.pending_program_queue = deque()
@@ -78,13 +80,21 @@ class PSRL_AgentLoopWorker:
         self.log_prefix = f"AgentLoopWorker"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
-    def set_reward_server(self, reward_server: ray.actor.ActorHandle):
-        """Set the reward server handle for sending processed data.
+    def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
+        """Set the agent loop manager handle for communication.
         
         Args:
-            reward_server: Handle to the reward server actor.
+            agent_loop_manager: Handle to the agent loop manager actor.
         """
-        self.reward_server = reward_server
+        self.agent_loop_manager = agent_loop_manager
+
+    def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
+        """Set the reward manager handle for sending processed data.
+        
+        Args:
+            reward_manager: Handle to the reward manager actor.
+        """
+        self.reward_manager = reward_manager
 
     def add_agent_program(self, data: DataProto):
         """Add a new agent program to the pending queue for processing.
@@ -130,7 +140,7 @@ class PSRL_AgentLoopWorker:
                 if program is None:
                     self.stop_busy_loop_task = True
                     continue
-                await self.generate_sequences(program)
+                await self.generate_trajectories(program)
             await asyncio.sleep(0)
 
     def _create_task_done_callback(self, task):
@@ -144,8 +154,8 @@ class PSRL_AgentLoopWorker:
                 self.agent_programs.discard(task)
         return task_done_callback
 
-    async def generate_sequences(self, batch: DataProto) -> DataProto:
-        """Generate sequences using the specified agent type based on configuration.
+    async def generate_trajectories(self, batch: DataProto) -> DataProto:
+        """Generate trajectories using the specified agent type based on configuration.
         
         This method only create the task (agent_loop) and add the task to the agent_programs set.
         But the task is not await here so different agent_loop can be run in parallel.
@@ -154,7 +164,7 @@ class PSRL_AgentLoopWorker:
             batch (DataProto): Input batch containing prompts and metadata.
             
         Returns:
-            DataProto: Generated sequences and associated data.
+            DataProto: Generated trajectories and associated data.
         """
         # by default, we assume it's a generation-only agent
         if self.config.psrl.gen_mode == "batch":
@@ -192,6 +202,7 @@ class PSRL_AgentLoopWorker:
             config=agent_loop_config,
             trainer_config=DummyConfig(config=self.config),
             rollout_router=self.rollout_router,
+            reward_manager=self.reward_manager,
             ps_manager_handle=self.ps_manager_handle,
             tokenizer=self.tokenizer,
         )
@@ -207,22 +218,13 @@ class PSRL_AgentLoopWorker:
                     request_ids.tolist(),
                     PSRL_RequestStatus.COMPLETED,
                 )
-            with log_dual_events("Put requests into rollout queue", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+            with log_dual_events(f"Put requests {request_ids} into result queue", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                 dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                 if dispatch_request_idxs:
                     output = output.select_idxs(dispatch_request_idxs)
-                    # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into the rollout queue, so we process the data inside the reward server
+                    # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into the result queue, so we process the data inside the reward manager
                     # output = self._post_process(output)
-                    self.reward_server.put_data.remote(output)
-                    '''
-                    batch_size = len(output)
-                    if batch_size > 1:
-                        single_outputs = output.chunk(batch_size)
-                        for single_output in single_outputs:
-                            self.rollout_queue.put(single_output)
-                    else:
-                        self.rollout_queue.put(output)
-                    '''
+                    await self.agent_loop_manager.put_result.remote(output)
 
     def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], currently_syncing_instance_ids: set[int]):
         """Update the instance status received from RolloutCoordinator."""
@@ -238,7 +240,7 @@ class PSRL_AgentLoopWorker:
         """
         return self.rollout_router.latest_instance_to_engine_status
 
-    # NOTE(lhy): This method is moved to the reward server
+    # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:
         """Post-process the generated outputs to create properly formatted tensors.
         

@@ -32,8 +32,6 @@ class BatchGenerateAgentLoop(AgentLoopBase):
         Returns:
             DataProto: Generated responses with metadata.
         """
-        # TODO(linsh): add profiling
-        # with simple_timer("generate_sequences"):
         output = self.rollout_router.generate(request)
         assert "eos_token_id" in output.meta_info, "eos_token_id is not in the meta_info"
         if output is not None:
@@ -54,5 +52,10 @@ class BatchGenerateAgentLoop(AgentLoopBase):
             # response mask: bsz * [1, 1, ..., 1] (since no tool call, all the tokens are valid)
             output.non_tensor_batch["response_mask"] = np.fromiter(response_mask_list, dtype=object)
             output.non_tensor_batch["__num_turns__"] = np.array(num_turns_list)
+
+        reward_input = output
+        reward_result = await self.reward_manager.compute_score.remote(reward_input)
+        if not self.config.reward_model.launch_reward_fn_async:
+            output = self._post_process_and_merge_reward(reward_result, output)
 
         return output

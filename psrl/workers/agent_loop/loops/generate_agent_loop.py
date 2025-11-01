@@ -32,13 +32,16 @@ class GenerateAgentLoop(AgentLoopBase):
         Returns:
             DataProto: Generated response with metadata.
         """
-        # TODO(linsh): add profiling
-        # with simple_timer("generate_sequences"):
         output = await self.rollout_router.generate_async(request)
         if output is not None:
             response_ids = output.non_tensor_batch["raw_response_ids"][0]
             response_mask = [1] * len(response_ids)
             output.non_tensor_batch["response_mask"] = np.array([response_mask[: self.response_length]])
             output.non_tensor_batch["__num_turns__"] = np.array([0])
+
+        reward_input = output
+        reward_result = await self.reward_manager.compute_score.remote(reward_input)
+        if not self.config.reward_model.launch_reward_fn_async:
+            output = self._post_process_and_merge_reward(reward_result, output)
 
         return output

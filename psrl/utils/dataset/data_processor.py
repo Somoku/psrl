@@ -72,7 +72,7 @@ class DataProcessor:
         
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
-        self.reward_server_handle = None # Will be set by the ray trainer
+        self.reward_manager_handle = None # Will be set by the ray trainer
         
         self.process_mode = process_mode
         if self.config.psrl.redundant_rollout.enable:
@@ -88,7 +88,7 @@ class DataProcessor:
         self.data_process_thread = None
         self.stop_data_process = False
         
-        # Build loggerz
+        # Build logger
         self.log_prefix = "DataProcessor"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         
@@ -96,8 +96,8 @@ class DataProcessor:
         self.total_training_steps = None
         self._create_dataloader()
         
-    def set_reward_server(self, reward_server_handle: ray.actor.ActorHandle):
-        self.reward_server_handle = reward_server_handle
+    def set_reward_manager(self, reward_manager_handle: ray.actor.ActorHandle):
+        self.reward_manager_handle = reward_manager_handle
 
     def set_agent_loop_manager(self, agent_loop_manager_handle: ray.actor.ActorHandle):
         self.agent_loop_manager_handle = agent_loop_manager_handle
@@ -322,7 +322,7 @@ class DataProcessor:
         
         The data queue will hold the processed batches, which can be consumed by the rollout server.
         """
-        assert self.reward_server_handle is not None, "Reward server handle is not set. Call `set_reward_server()` first."
+        assert self.reward_manager_handle is not None, "Reward manager handle is not set. Call `reward_manager_handle()` first."
         self.train_dataloader_iter = iter(self.train_dataloader)
         total_epochs = self.config.trainer.total_epochs
         
@@ -368,10 +368,10 @@ class DataProcessor:
                         meta_info_keys=meta_info_keys_to_pop,
                     )
                 
-                # Store the other batch fields in the request buffer of the reward server
+                # Store the other batch fields in the request buffer of the reward manager
                 # They will be merged with the reward data.
                 log_data_protocol(batch_dict, psrl_logger, self.log_prefix + " before adding request data to ps manager", level=logging.DEBUG)
-                ray.get(self.reward_server_handle.add_requests.remote(
+                ray.get(self.reward_manager_handle.add_requests.remote(
                     {sample_ids[i]: batch_dict[i:i+1] for i in range(batch_size)}
                 ))
                 
@@ -394,10 +394,10 @@ class DataProcessor:
                         ray.get(self.ps_manager_handle.add_request.remote(
                             gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
                         ))
-                        self.agent_loop_manager_handle.put_data.remote(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n])
+                        ray.get(self.agent_loop_manager_handle.put_data.remote(gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n]))
                 else:
                     ray.get(self.ps_manager_handle.add_request.remote(gen_batch.non_tensor_batch["uid"].tolist()))
-                    self.agent_loop_manager_handle.put_data.remote(gen_batch)
+                    ray.get(self.agent_loop_manager_handle.put_data.remote(gen_batch))
 
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:
@@ -412,6 +412,8 @@ class DataProcessor:
                 else:
                     psrl_logger.debug("Reinitializing train_dataloader_iter for next epoch")
                     self.train_dataloader_iter = iter(self.train_dataloader)
+            except Exception as e:
+                psrl_logger.error(f"Exception in data processing thread: {e}", exc_info=True)
         
         # Signal end of data processing
         psrl_logger.info("Data processing stopped, sending shutdown signal.")

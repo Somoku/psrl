@@ -9,7 +9,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from typing import Dict, Any, Optional, List, Tuple
 from omegaconf import DictConfig
 
-from psrl.utils.logger import deprecated, get_worker_info, DualOutputHandler
+from psrl.utils.logger import deprecated, get_worker_info, DualOutputHandler, log_env_info
 from psrl.utils.nixl.network_topology import get_local_ip, get_local_gpu_id
 from psrl.utils.nixl.nixl_spec import NIXLTensorInfo, NIXLClientType, NIXLClientInfo, NIXLSharding, NIXLShardMetaInfo, NIXLInterface
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
@@ -110,10 +110,12 @@ class NIXLStorageClient:
         self._all_temp_mappings_fetched = False
         
         # logging
+        '''
         if logging_path is not None:
             self.log_prefix = "NIXLStorageClient_" + self.client_name
             psrl_logger.addHandler(DualOutputHandler(logging_path, self.log_prefix))
             psrl_logger.info(f"NIXLStorageClient {self.client_name} initialized.")
+        '''
         
     def release_temp_memory(self):
         """Release all temporary memory and deregister descriptors"""
@@ -216,6 +218,7 @@ class NIXLStorageClient:
         # Then we need to find all types (shape and dtype) of uncontiguous tensor and allocate max_pinned_temp_memory_slots times of their size as pinned memory (each pinned memory tensor is like this: [max_pinned_temp_memory_slots, *])
         # Then we enumerate the uncontiguous tensors again and map them with the pinned memory in a round-robin manner (the first uncontiguous tensor map to [0, *], the second to [1, *], the (max_pinned_temp_memory_slots+1)-th to [0, *] again, etc.)
         # We should record a mapping from the uncontiguous tensor to the index of the pinned memory
+        # log_env_info(psrl_logger)
         _uncontiguous_tensor_mapping: Dict[Tuple[Any, Any], List[Tuple[str, Tuple[int, ...], torch.Tensor]]] = {}  # (shape, dtype) -> [key, shard_idx, uncontiguous_tensor]
         if self.max_pinned_temp_memory_slots is not None:
             # Scan the state_dict and find all the tensors that are not contiguous
@@ -238,12 +241,14 @@ class NIXLStorageClient:
                     self._pinned_memory[(shape, dtype)] = []
                     for slot_idx in range(self.max_pinned_temp_memory_slots):
                         memory_slot = torch.empty(*shape, dtype=dtype, device=self.device, requires_grad=False)
+                        # psrl_logger.info(f"{self.client_name} registering memory for the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype})")
                         try:
                             temp_desc = self.agent.register_memory([memory_slot])
                         except Exception as e:
                             raise RuntimeError(f"{self.client_name} memory registration failed for the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype}) : {e}")
                         if not temp_desc:
                             raise RuntimeError(f"{self.client_name} memory registration failed for the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype}).")
+                        # psrl_logger.info(f"{self.client_name} memory registration succeeded for the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype})")
                         temp_desc_bytes = self.agent.get_serialized_descs(temp_desc)
                         self._pinned_memory[(shape, dtype)].append((memory_slot, temp_desc_bytes))
                     for i, (key, shard_idx, uncontiguous_tensor) in enumerate(uncontiguous_tensor_list):

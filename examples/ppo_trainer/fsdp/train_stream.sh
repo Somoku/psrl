@@ -13,13 +13,13 @@ VAL_TP=2 # TP in the training side for validation
 NNODES=2
 NGPUS_PER_NODE=8
 
-GEN_NNODES=${NNODES} # Number of nodes for generation
-GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
+GEN_NNODES=1 # Number of nodes for generation
+GEN_NGPUS_PER_NODE=8 # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance]
 
-TRAIN_NNODES=${NNODES} # Number of nodes for training
-TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
+TRAIN_NNODES=1 # Number of nodes for training
+TRAIN_NGPUS_PER_NODE=8 # Number of GPUs per node for training
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
@@ -27,10 +27,11 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=1 \
-    psrl.staleness=10 \
+    psrl.staleness=0 \
     psrl.staleness_buffer_entries=${GLOBAL_BATCH_SIZE} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \

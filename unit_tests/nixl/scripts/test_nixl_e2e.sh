@@ -5,7 +5,7 @@ export PSRL_LOGGING_PATH=${PSRL_WORKSPACE}/psrl/unit_tests/nixl/log
 export PSRL_LOGGING_LEVEL=INFO
 cd ${PSRL_WORKSPACE}/psrl/unit_tests/nixl
 
-CASE=0
+CASE=1
 
 # HSDP 16 GPUs Case
 if [ $CASE -eq 0 ]; then

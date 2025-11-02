@@ -460,7 +460,6 @@ class PSRL_AgentLoopManager:
         Args:
             request_data (DataProto): DataProto containing the requests to be occupied.
         """
-        
         # Add data to the data pool
         for i in range(len(request_data)):
             self.add_to_data_pool(
@@ -541,8 +540,8 @@ class PSRL_AgentLoopManager:
                         ))
         else:
             for i in range(len(request_data)):
-                request_data = request_data[i:i+1]
-                request_id = int(request_data.non_tensor_batch["uid"][0])
+                request = request_data[i:i+1]
+                request_id = int(request.non_tensor_batch["uid"][0])
                 accumulate_data = True
                 accumulate_entry_data_list.append(accumulate_data)
 

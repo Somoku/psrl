@@ -7,6 +7,7 @@ experiment_name='DAPO-TIS-Qwen2.5-32B-AIME-fsdp2-stream-nixl-staleness_2'  # Tru
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet

@@ -1,7 +1,5 @@
 import ray
-import os
 import logging
-import asyncio
 from collections.abc import Mapping
 from typing import Optional, List, Dict, Union, Tuple, Set
 
@@ -462,7 +460,7 @@ class PSManager(RequestStatusTracker):
         
     def get_ps_model_version(self, debug_info: str = None) -> int:
         """Get the current model version."""
-        psrl_logger.info(f"Getting PS model version from model store: {self.model_store}, debug info: {debug_info}.")
+        psrl_logger.debug(f"Getting PS model version from model store: {self.model_store}, debug info: {debug_info}.")
         if self.model_store is None:
             return 0  # If no model is stored, return version 0
         return self.model_store.version_tag

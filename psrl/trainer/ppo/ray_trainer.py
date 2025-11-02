@@ -365,10 +365,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", "rollout mode must be psrl_async when using stream mode"
         else:
             raise ValueError(f"Invalid gen_mode: {self.config.psrl.gen_mode}, must be one of ['batch', 'stream']")
-        
-        # Check status collection
-        if self.config.psrl.status_collection.enable:
-            assert self.config.psrl.gen_mode == "stream", "gen_mode must be stream when using status collection"
 
         # Check partial and redundant rollout
         if self.config.psrl.partial_rollout.enable or self.config.psrl.redundant_rollout.enable:
@@ -1079,8 +1075,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.init_rollout_coordinator()
         # simutaneously init all rollout instances
         model_init_futures.append(self.rollout_coordinator.init_model.remote())
-        # initialize rollout strategy
-        self.rollout_coordinator.init_routing_strategy.remote()
+        # initialize route strategy
+        self.rollout_coordinator.init_route_strategy.remote()
         # initialize nixl client
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
             nixl_client_futures.append(self.rollout_coordinator.init_nixl_client.remote())
@@ -1145,7 +1141,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info("PS worker group bound successfully!")
             
         # Build rollout at train side for evaluation
+        psrl_logger.info("Building rollout at train side for evaluation")
         self.actor_wg.build_rollout(trust_remote_code=self.config.train_actor_rollout_ref.model.get("trust_remote_code", False))
+        psrl_logger.info("Evaluation rollout built successfully!")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe

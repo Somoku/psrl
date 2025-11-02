@@ -342,9 +342,13 @@ class StatCollector(StatLoggerBase):
         generation_throughputs = [entry["throughput_stats"]["generation_throughput"] 
                                  for entry in self.stats_history 
                                  if "throughput_stats" in entry]
+        pure_generation_latencies = [entry["iteration_stats"]["inter_token_latencies_avg"] 
+                                    for entry in self.stats_history 
+                                    if "iteration_stats" in entry and entry["iteration_stats"]["time_to_first_tokens_avg"] == 0 and entry["iteration_stats"]["inter_token_latencies_avg"] != 0]
         
         avg_prompt_throughput = np.mean(prompt_throughputs) if prompt_throughputs else 0.0
         avg_generation_throughput = np.mean(generation_throughputs) if generation_throughputs else 0.0
+        avg_pure_generation_latency = np.mean(pure_generation_latencies) if pure_generation_latencies else 0.0
         
         # Calculate prefix cache hit rate statistics
         hit_rates = [entry["prefix_cache_stats"]["hit_rate"] 
@@ -360,6 +364,7 @@ class StatCollector(StatLoggerBase):
             "max_running_requests": max_running,
             "avg_kv_cache_usage": avg_kv_cache_usage,
             "max_kv_cache_usage": max_kv_cache_usage,
+            "avg_pure_generation_latency": avg_pure_generation_latency,
             "avg_prompt_throughput": avg_prompt_throughput,
             "avg_generation_throughput": avg_generation_throughput,
             "avg_total_throughput": avg_prompt_throughput + avg_generation_throughput,

@@ -111,7 +111,7 @@ class RolloutCoordinator(CommandExtension):
         await asyncio.gather(*futures)
         self._is_init_model.set()
          
-    async def init_routing_strategy(self):
+    async def init_route_strategy(self):
         await self._is_init_model.wait()
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
@@ -121,8 +121,14 @@ class RolloutCoordinator(CommandExtension):
                 futures.extend(self.rollout_wg_list[i].execute_all_async("estimate_max_model_len"))
         max_model_lens = await asyncio.gather(*futures)
         psrl_logger.info(f"Max model lens: {max_model_lens}")
-        self.max_model_len = max(max_model_lens)
-        # TODO(lhy): use the max model len to budget the request number for each instance
+        instance_to_max_model_len = {i: max(max_model_lens[i]) for i in range(self.config.psrl.deployment.n_rollout_instances)}
+        # Use the max model len to budget the kv cache size for each instance
+        futures = []
+        for agent_worker in self.agent_loop_workers:
+            futures.append(agent_worker.init_route_strategy.remote(
+                instance_to_max_model_len=instance_to_max_model_len,
+            ))
+        await asyncio.gather(*futures)
 
     async def init_nixl_client(self):
         await self._is_init_model.wait()

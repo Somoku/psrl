@@ -8,9 +8,6 @@ from typing import Dict, Type, Optional, List
 from verl import DataProto
 from psrl.workers.gen.stats_collector import EngineStats
 
-psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
-
 _ROUTE_STRATEGY_REGISTRY: Dict[str, Type['RouteStrategyBase']] = {}
 
 def register_route_strategy(name: str):
@@ -68,9 +65,11 @@ class RouteStrategyBase(ABC):
             snapshot=EngineStats.get_default_snapshot(),
         ) for i in range(n_instances)}
         self.instance_to_time_record = {i: datetime.now() for i in range(n_instances)} # Track the last clock of each instance
+        self.logger = strategy_kwargs.get("logger", logging.getLogger(__file__))
+        self.logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
     
     @abstractmethod
-    def route(self, request: DataProto, candidates: Optional[List[int]]) -> int:
+    def route(self, request: DataProto, candidates: Optional[List[int]]) -> Optional[int]:
         """Route a request to a specific worker instance.
         
         Args:
@@ -126,8 +125,9 @@ class RandomRouteStrategy(RouteStrategyBase):
 
     def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         super().__init__(n_instances, strategy_kwargs)
+        self.logger.info("Initialized RandomRouteStrategy")
 
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> Optional[int]:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
@@ -141,8 +141,9 @@ class RoundRobinRouteStrategy(RouteStrategyBase):
     def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         super().__init__(n_instances, strategy_kwargs)
         self.curr_idx = 0
+        self.logger.info("Initialized RoundRobinRouteStrategy")
 
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> Optional[int]:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
@@ -160,30 +161,48 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
     def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         super().__init__(n_instances, strategy_kwargs)
         self.instance_request_counts = {i: 0 for i in range(n_instances)}
+        self.logger.info(f"Initialized RequestNumBalanceRouteStrategy with instance request counts {self.instance_request_counts}")
 
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> Optional[int]:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
             return None
         idx = np.argmin([self.instance_request_counts[i] for i in candidates])
-        psrl_logger.debug(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
+        self.logger.debug(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
                           f"with workloads {[self.instance_request_counts[i] for i in candidates]}, "
                           f"selected instance {candidates[idx]} with workload {self.instance_request_counts[candidates[idx]]}")
+        remaining_request_counts = [self.instance_request_counts[i] for i in candidates if i != candidates[idx]]
+        if len(remaining_request_counts) > 0:
+            remaining_max_request_count = max(remaining_request_counts)
+            if self.instance_request_counts[candidates[idx]] > remaining_max_request_count:
+                # Avoid overload, return None (currently not route to any instance)
+                return None
         self.instance_request_counts[candidates[idx]] += 1
         return candidates[idx]
     
     def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
         super().update_instance_to_engine_status(instance_to_engine_status)
-        self.instance_request_counts = {i: engine_stats.get_waiting_and_running_queue_size() for i, engine_stats in instance_to_engine_status.items()}
+        for i, engine_stats in instance_to_engine_status.items():
+            self.instance_request_counts[i] = engine_stats.get_waiting_and_running_queue_size()
 
     def push_request(self, request: DataProto, instance_id: int):
         super().push_request(request, instance_id)
-        self.instance_request_counts[instance_id] += 1
+        # Do not update the request count here, it has been updated when the request is routed to the instance
     
     def pop_request(self, request: DataProto, instance_id: int):
         super().pop_request(request, instance_id)
         self.instance_request_counts[instance_id] -= 1
+        
+    def is_staled(self, instance_id: int, engine_status: EngineStats) -> bool:
+        if super().is_staled(instance_id, engine_status):
+            return True
+        if engine_status.get_waiting_and_running_queue_size() != self.instance_request_counts[instance_id]:
+            self.logger.debug(f"Instance {instance_id} collected engine status is stale, "
+                              f"waiting and running queue size {engine_status.get_waiting_and_running_queue_size()} "
+                              f"is not equal to the recorded request count {self.instance_request_counts[instance_id]}")
+            return True
+        return False
 
 @register_route_strategy("throughput_balance")
 class ThroughputBalanceRouteStrategy(RouteStrategyBase):

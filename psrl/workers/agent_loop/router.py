@@ -136,17 +136,6 @@ class RolloutRouter:
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
         assert self.rollout_wg_size == self.config.psrl.deployment.n_rollout_instances, "Rollout worker group size must match the number of deployment instances"
-
-        self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
-        
-        # Initialize route strategy
-        self._init_route_strategy()
-        
-        # Cache for sample_id to version_tag mapping with LRU eviction
-        # Key: sample_id (uid // self.rollout_n), Value: version_tag
-        cache_size = getattr(self.config.psrl, 'sample_version_cache_size', 64)
-        self.sample_version_cache = LRUCache(maxsize=cache_size)
-        psrl_logger.info(f"Initialized sample version cache with max size: {cache_size}")
         
         # Build logger
         self.log_prefix = f"RolloutRouter"
@@ -164,13 +153,19 @@ class RolloutRouter:
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized RolloutRouter")
 
-    def _init_route_strategy(self):
-        """Initialize the routing strategy based on configuration."""
+    def init_route_strategy(self, **kwargs):
+        """Initialize the route strategy for the router.
+        
+        Args:
+            **kwargs: Keyword arguments for the route strategy.
+        """
         if self.config.psrl.routing_strategy.method == "request_num_balance" or self.config.psrl.routing_strategy.method == "throuput_balance":
             assert self.config.psrl.status_collection.enable, "Status collection must be enabled when using request num balance or throughput balance routing strategy"
         n_instances = self.rollout_wg_size
         strategy_kwargs = {
             "snapshot_staleness_threshold_in_ms": self.config.psrl.routing_strategy.snapshot_staleness_threshold_in_ms,
+            "logger": psrl_logger,
+            **kwargs,
         }
         try:
             route_strategy_class = get_route_strategy_class(self.config.psrl.routing_strategy.method)
@@ -197,7 +192,7 @@ class RolloutRouter:
         filtered_instance_ids = []
         for instance_id, engine_status in instance_to_engine_status.items():
             if self.route_strategy.is_staled(instance_id, engine_status):
-                psrl_logger.warning(f"Instance {instance_id} collected engine status is stale, skipping")
+                # psrl_logger.warning(f"Instance {instance_id} collected engine status is stale, skipping")
                 continue
             filtered_instance_ids.append(instance_id)
         self.route_strategy.update_instance_to_engine_status({instance_id: instance_to_engine_status[instance_id] for instance_id in filtered_instance_ids})
@@ -233,7 +228,12 @@ class RolloutRouter:
         ]
         '''
         # psrl_logger.info(f"All rollout instance to version: {all_rollout_instance_to_version}")
+        # Filter the rollout instances that can tolerate the needed staleness of the request
         candidates = [i for i, version in all_rollout_instance_to_version.items() if version >= needed_model_version]
+        if "rollout_instance_id" in request.non_tensor_batch and not self.config.psrl.routing_strategy.enable_global_migration:
+            old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
+            assert old_instance_id in candidates, f"Old rollout instance {old_instance_id} is not in the candidates"
+            candidates = [old_instance_id]
         chosen_rollout_instance = self.route_strategy.route(request, candidates)
         return chosen_rollout_instance
 
@@ -545,6 +545,8 @@ class RolloutRouter:
                     break
                 self.priority_queue.pop()
                 # Create a task to process this request
+                if old_instance_id is not None and new_instance_id != old_instance_id and self.config.psrl.routing_strategy.enable_global_migration:
+                    psrl_logger.info(f"Migrating request {request_id} from rollout instance {old_instance_id} to {new_instance_id}")
                 task = asyncio.create_task(self._route_single_request(request, old_instance_id, new_instance_id))
                 task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
             await asyncio.sleep(0)
@@ -608,12 +610,7 @@ class RolloutRouter:
         self.route_strategy.push_request(request, new_instance_id)
         
         # Generate response
-        if self.rank_0_is_model_owner:
-            consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async("generate_async", request)
-        else:
-            consolidated_output_list, update_status_list = await self.rollout_wg_list[new_instance_id].execute_all_async("generate_async", request)
-            consolidated_output = consolidated_output_list[0]
-            update_status = update_status_list[0]
+        consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async("generate_async", request)
             
         # Change engine status 
         self.route_strategy.pop_request(request, new_instance_id)

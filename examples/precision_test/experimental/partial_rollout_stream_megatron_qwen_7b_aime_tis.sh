@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=1
-project_name=psrl_dapo
-experiment_name=DAPO-TIS-Qwen2.5-7B-AIME-mcore-stream-nixl-partial-staleness_${staleness}
+staleness=${1:-1}
+project_name=psrl_partial_exp
+experiment_name=staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-# HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
-# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
-HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
+HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
+DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
+# HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
+# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -27,10 +27,10 @@ TRAIN_TP=4 # TP in the training side
 TRAIN_PP=1 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 
-NNODES=5
+NNODES=6
 NGPUS_PER_NODE=8
 
-GEN_NNODES=1 # Number of nodes for generation
+GEN_NNODES=2 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
@@ -47,13 +47,13 @@ tis_imp_ratio_cap=2.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 8))
+max_response_length=$((1024 * 32))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=256
-redundant_train_prompt_bsz=256
+train_prompt_bsz=32
+redundant_train_prompt_bsz=32
 n_resp_per_prompt=8
 redundant_n_resp_per_prompt=8
 train_prompt_mini_bsz=32
@@ -95,13 +95,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=False \
-    psrl.partial_rollout.threshold=96 \
+    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.threshold=8 \
     \
-    psrl.routing_strategy.method="round_robin" \
+    psrl.routing_strategy.method="request_num_balance" \
     psrl.routing_strategy.max_num_waiting_reqs=0 \
     \
-    psrl.sync_strategy.method="greedy" \
+    psrl.sync_strategy.method="status_based" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
@@ -122,7 +122,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
+    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -139,7 +139,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=True \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
-    train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
@@ -182,4 +182,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=10 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=50 2>&1 | tee ${experiment_name}.log

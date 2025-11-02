@@ -54,8 +54,8 @@ if __name__ == "__main__":
     # Allocate memory and register with NIXL
     agent = nixl_agent(args.mode, config)
 
-    for k in sorted(os.environ):
-        print(f"{k}={os.environ[k]}")
+    # for k in sorted(os.environ):
+    #    print(f"{k}={os.environ[k]}")
 
     if args.mode == "target":
         # 0.01GiB, 1000 tensors

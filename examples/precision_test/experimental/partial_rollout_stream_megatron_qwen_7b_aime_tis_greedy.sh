@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-project_name='psrl_profile'
-experiment_name='DAPO-TIS-Qwen2.5-32B-AIME-mcore-stream-nixl-staleness_2'
+staleness=${1:-1}
+project_name=psrl_partial_exp
+experiment_name=staleness_${staleness}_greedy
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B
-DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-32B
+HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
+DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
+# HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
+# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -20,8 +23,8 @@ GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
-TRAIN_TP=8 # TP in the training side 
-TRAIN_PP=2 # PP in the training side 
+TRAIN_TP=4 # TP in the training side 
+TRAIN_PP=1 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 
 NNODES=6
@@ -44,13 +47,15 @@ tis_imp_ratio_cap=2.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 20))
+max_response_length=$((1024 * 32))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 4))
+overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=256
+train_prompt_bsz=32
+redundant_train_prompt_bsz=32
 n_resp_per_prompt=8
+redundant_n_resp_per_prompt=8
 train_prompt_mini_bsz=32
 
 # Algorithm
@@ -58,6 +63,7 @@ temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
+filter_groups_metric=acc
 
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
@@ -65,12 +71,13 @@ offload=True
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
+    psrl.reward_service_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=2 \
+    psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_PATH}/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/precision_test/experimental/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=tis \
@@ -81,6 +88,20 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
+    psrl.group_post_process.enable=False \
+    psrl.group_post_process.name=dynamic_sampling_filter \
+    \
+    psrl.redundant_rollout.enable=False \
+    psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
+    psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
+    \
+    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.threshold=8 \
+    \
+    psrl.routing_strategy.method="request_num_balance" \
+    psrl.routing_strategy.max_num_waiting_reqs=0 \
+    \
+    psrl.sync_strategy.method="greedy" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
@@ -88,19 +109,20 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    gen_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     gen_actor_rollout_ref.rollout.temperature=${temperature} \
     gen_actor_rollout_ref.rollout.top_p=${top_p} \
     gen_actor_rollout_ref.rollout.top_k=${top_k} \
+    gen_actor_rollout_ref.rollout.disable_log_stats=false \
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    train_actor_rollout_ref.model.use_fused_kernels=True \
+    train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
+    train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -152,6 +174,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.filter_groups.metric=${filter_groups_metric} \
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
@@ -159,4 +182,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=10 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=50 2>&1 | tee ${experiment_name}.log

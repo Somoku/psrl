@@ -226,8 +226,21 @@ class PSRL_AgentLoopWorker:
                     # output = self._post_process(output)
                     await self.agent_loop_manager.put_result.remote(output)
 
+    def init_route_strategy(self, **kwargs):
+        """Initialize the route strategy for the agent loop worker.
+        
+        Args:
+            **kwargs: Keyword arguments for the route strategy.
+        """
+        self.rollout_router.init_route_strategy(**kwargs)
+
     def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], currently_syncing_instance_ids: set[int]):
-        """Update the instance status received from RolloutCoordinator."""
+        """Update the instance status received from RolloutCoordinator.
+        
+        Args:
+            instance_to_engine_status (dict[int, EngineStats]): Dictionary mapping instance ID to the engine status.
+            currently_syncing_instance_ids (set[int]): Set of instance IDs that are currently syncing.
+        """
         self.rollout_router.update_instance_status(instance_to_engine_status, currently_syncing_instance_ids)
         # May log some stats here
         # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")

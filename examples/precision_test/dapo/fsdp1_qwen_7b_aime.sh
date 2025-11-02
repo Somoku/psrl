@@ -8,6 +8,7 @@ experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp1-batch-cpu_ref-staleness_0'
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet

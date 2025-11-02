@@ -83,8 +83,10 @@ status_collection:
   enable: True
 
   # The level of logging to file
-  # Available options: "none", "partial_rollout", "prompt", "all"
-  dump_logging_to_file_level: none
+  # Available options: "none", "partial_rollout", "prompt", "generation", "all"
+  dump_logging_to_file_level: generation
+
+  dump_logging_to_file_interval_in_ms: 2000
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
   # Here 100 means sync every 0.1 second
@@ -128,7 +130,12 @@ routing_strategy:
 
   # Method for rollout routing
   # Available options: "random", "round_robin", "request_num_balance", "throuput_balance"
-  method: round_robin
+  # If using "request_num_balance" or "throuput_balance", you need to enable status collection.
+  method: request_num_balance
+
+  # Whether to enable global migration
+  # If enabled, the router can migrate the partial rollout requests to other instances.
+  enable_global_migration: True
 
   # Snapshot staleness threshold in milliseconds
   # Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
@@ -145,7 +152,7 @@ sync_strategy:
 
   # Method for model synchronization
   # Available options: "status_based" or "greedy"
-  method: greedy
+  method: status_based
 
   # Check interval in millisecond for model synchronization
   check_interval_in_ms: 500
@@ -163,9 +170,6 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  # NOTE(lhy): Megatron backend doesn't require this since there is no non-contiguous transfer.
-  # For FSDP/HSDP, there is a strange bug (NIXL_ERR_BACKEND) in some larger models (3b/7b) after update dependency in end-to-end test.
-  # However, the unit test can run successfully.
   max_pinned_temp_memory_slots: 8
 
 # Post processor for group requests in streaming mode

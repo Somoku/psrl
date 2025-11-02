@@ -11,11 +11,11 @@ HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 # Model configuration
-# HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B-Instruct
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+# HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B-Instruct
 
 # vLLM configuration (simplified - no complex deployment)
-GEN_TP=4  # Tensor parallel size for generation
+GEN_TP=${1:-4}  # Tensor parallel size for generation
 GEN_PP=1  # Pipeline parallel size for generation
 
 # Node configuration
@@ -23,9 +23,9 @@ NNODES=1  # Simplified to single node
 NGPUS_PER_NODE=8
 
 # Test parameters
-max_prompt_length=$((1024 * 6))
-max_response_length=$((1024 * 2))
-batch_size=${1:-64}
+max_prompt_length=${2:-1024}
+max_response_length=16384
+batch_size=${3:-16}
 num_iterations=1
 warmup_iterations=1
 test_mode="synthetic"  # "synthetic" or "real_data"
@@ -37,7 +37,7 @@ top_k=-1
 
 # Run the simplified rollout performance test
 PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
-    psrl.logging_path=${PSRL_PATH}/examples/bench/rollout/summary \
+    psrl.logging_path=${PSRL_PATH}/examples/bench/rollout/exp/summary \
     \
     model.path="$HF_MODEL_PATH" \
     +model.override_config.max_position_embeddings=32768 \
@@ -47,7 +47,7 @@ PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
     rollout.pipeline_parallel_size=${GEN_PP} \
     rollout.enable_chunked_prefill=False \
     rollout.max_num_seqs=${batch_size} \
-    rollout.max_num_batched_tokens=$((max_prompt_length * 32)) \
+    rollout.max_num_batched_tokens=$((max_prompt_length * batch_size)) \
     rollout.temperature=${temperature} \
     rollout.top_p=${top_p} \
     rollout.top_k=${top_k} \
@@ -61,7 +61,7 @@ PYTHONUNBUFFERED=1 python -m psrl.bench.rollout.main_rollout \
     rollout_test.num_iterations=${num_iterations} \
     rollout_test.warmup_iterations=${warmup_iterations} \
     rollout_test.mode=${test_mode} \
-    rollout_test.profile_logs_dir=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/details \
+    rollout_test.profile_logs_dir=${PSRL_WORKSPACE}/psrl/examples/bench/rollout/exp/details \
     rollout_test.profile_log_file=Syn_TP${GEN_TP}_PP${GEN_PP}_B${batch_size}_P${max_prompt_length}_R${max_response_length} \
     2>&1 | tee rollout_test.log
 

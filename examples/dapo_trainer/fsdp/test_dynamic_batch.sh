@@ -7,6 +7,7 @@ experiment_name='DAPO-Qwen2.5-0.5b-AIME24-fsdp2-batch-nixl-staleness_0'
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
 TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet

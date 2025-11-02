@@ -80,6 +80,7 @@ class StatCollector(StatLoggerBase):
         self._begin_record = False
         self.start_time = None
         self.last_record_time = None
+        self.last_dump_to_file_time = None
         self.last_push_to_queue_time = None
         
         # Build logger
@@ -95,6 +96,7 @@ class StatCollector(StatLoggerBase):
         self._begin_record = True
         self.start_time = time.time()
         self.last_record_time = self.start_time
+        self.last_dump_to_file_time = self.start_time
         self.last_push_to_queue_time = self.start_time
         
     def _make_snapshot_after_model_version_update(self) -> dict:
@@ -120,15 +122,21 @@ class StatCollector(StatLoggerBase):
         Args:
             model_version: Model version
         """
+        curr_time = time.time()
         self.model_version = model_version
+        snapshot = self._make_snapshot_after_model_version_update()
         # We force a record to the output queue to ensure the coordinator knows the model version update immediately
         self.output_queue.put_nowait(EngineStats(
             instance_id=self.instance_id,
             model_version=self.model_version,
-            snapshot=self._make_snapshot_after_model_version_update(),
+            snapshot=snapshot,
         ))
-        self.last_record_time = time.time()
-        self.last_push_to_queue_time = self.last_record_time
+        # Dump logging to file if enabled
+        if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
+            psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
+            self.last_dump_to_file_time = curr_time
+        self.last_record_time = curr_time
+        self.last_push_to_queue_time = curr_time
 
     def record(
         self,
@@ -186,14 +194,22 @@ class StatCollector(StatLoggerBase):
             snapshot["iteration_stats"] = iteration_stats_entry
         
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
-            if self.psrl_config.status_collection.dump_logging_to_file_level == "prompt":
-                if iteration_stats and snapshot["iteration_stats"]["num_prompt_reqs"] > 0:
+            if curr_time - self.last_dump_to_file_time >= self.psrl_config.status_collection.dump_logging_to_file_interval_in_ms / 1000.0:
+                if self.psrl_config.status_collection.dump_logging_to_file_level == "prompt":
+                    if iteration_stats and snapshot["iteration_stats"]["num_prompt_reqs"] > 0:
+                        psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
+                elif self.psrl_config.status_collection.dump_logging_to_file_level == "generation":
+                    if iteration_stats and snapshot["iteration_stats"]["num_prompt_reqs"] == 0 and snapshot["iteration_stats"]["num_generation_reqs"] > 0:
+                        psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
+                elif self.psrl_config.status_collection.dump_logging_to_file_level == "all":
                     psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
-            elif self.psrl_config.status_collection.dump_logging_to_file_level == "all":
-                psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
+                else:
+                    raise ValueError(f"Invalid dump logging to file level: {self.psrl_config.status_collection.dump_logging_to_file_level}")
+                self.last_dump_to_file_time = curr_time
         self.last_record_time = curr_time
             
-        if curr_time - self.last_push_to_queue_time >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0:
+        waiting_and_running_queue_size = snapshot["scheduler_stats"]["num_waiting_reqs"] + snapshot["scheduler_stats"]["num_running_reqs"]
+        if waiting_and_running_queue_size == 0 or curr_time - self.last_push_to_queue_time >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0:
             self.output_queue.put_nowait(EngineStats(
                 instance_id=self.instance_id,
                 model_version=self.model_version,

@@ -1,0 +1,302 @@
+Processing directory: ../bench/rollout/7b_exp_wo_attn/details (matching 'TP2')
+Found 9 matching files:
+  - Syn_TP2_PP1_B1_P128_R16384.jsonl
+  - Syn_TP2_PP1_B2_P128_R16384.jsonl
+  - Syn_TP2_PP1_B4_P128_R16384.jsonl
+  - Syn_TP2_PP1_B8_P128_R16384.jsonl
+  - Syn_TP2_PP1_B16_P128_R16384.jsonl
+  - Syn_TP2_PP1_B32_P128_R16384.jsonl
+  - Syn_TP2_PP1_B64_P128_R16384.jsonl
+  - Syn_TP2_PP1_B128_P128_R16384.jsonl
+  - Syn_TP2_PP1_B256_P128_R16384.jsonl
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B1_P128_R16384.jsonl...
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.004011992365121841
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0039168549701571465
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0038374457508325577
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0038370173424482346
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0038419561460614204
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.003842826932668686
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.003783607855439186
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0038214363157749176
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0038099875673651695
+init: kv_cache_usage: 4.710931979379218e-05, inter_token_latencies_avg: 0.0038088373839855194
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B2_P128_R16384.jsonl...
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.004242745228111744
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.003932095132768154
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.003896845504641533
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.0038402359932661057
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.0038181468844413757
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.0038178665563464165
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.0038118772208690643
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.0038325870409607887
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.0038232067599892616
+init: kv_cache_usage: 9.423590387935832e-05, inter_token_latencies_avg: 0.003822416067123413
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B4_P128_R16384.jsonl...
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.004404271952807903
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.003937823697924614
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.0038763564079999924
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.003864385187625885
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.003850436769425869
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.00384527537971735
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.003852645866572857
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.0038646459579467773
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.0038566067814826965
+init: kv_cache_usage: 0.00018853399110752012, inter_token_latencies_avg: 0.003844635561108589
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B8_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.0046573057770729065
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.004091781564056873
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.004013671539723873
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.003986703231930733
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.003962823189795017
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.003964973613619804
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.003966213203966618
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.00397358275949955
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.003980292938649654
+init: kv_cache_usage: 0.0003773050983351123, inter_token_latencies_avg: 0.003953654319047928
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B16_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.0051313648000359535
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.004212566651403904
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.004151859320700169
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.00413166917860508
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.004117770120501518
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.004129668697714806
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.004128959961235523
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.0041292691603302956
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.0041199298575520515
+init: kv_cache_usage: 0.0007555604527066384, inter_token_latencies_avg: 0.004120728932321072
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B32_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.0060827722772955894
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004650556482374668
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004671426489949226
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004619067534804344
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004611567594110966
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004629506729543209
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004605398513376713
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004613236524164677
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004597147926688194
+init: kv_cache_usage: 0.0015149442942358204, inter_token_latencies_avg: 0.004602287895977497
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004786184057593346
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004624497145414352
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.0045805275440216064
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004577469080686569
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004603727720677853
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004604967311024666
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004604607820510864
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004606937989592552
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.004596338607370853
+10%: kv_cache_usage: 0.10015465056336992, inter_token_latencies_avg: 0.0045973677188158035
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B64_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.008184709586203098
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006623058579862118
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006514011882245541
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006486821919679642
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006468761712312698
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006450653076171875
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006473052315413952
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006455082446336746
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006430973298847675
+init: kv_cache_usage: 0.0030472482184707994, inter_token_latencies_avg: 0.006456512957811356
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.0069497013464570045
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006548711098730564
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006501460447907448
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006497672758996487
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006490351632237434
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.0065024010837078094
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006514381617307663
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006493741646409035
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006526310928165913
+10%: kv_cache_usage: 0.10022060807414968, inter_token_latencies_avg: 0.006489461287856102
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B128_P128_R16384.jsonl...
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011942357756197453
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011227056384086609
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011111428961157799
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011085780337452888
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011063539423048496
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011064190417528152
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011091608554124832
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011103939265012741
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.01104900985956192
+init: kv_cache_usage: 0.006165769276057387, inter_token_latencies_avg: 0.011140838265419006
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.01100540068000555
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010905944742262363
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010925202630460262
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010921694338321686
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.01090979389846325
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010909502394497395
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010995382443070412
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.011310704052448273
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010954882018268108
+10%: kv_cache_usage: 0.10002247936715225, inter_token_latencies_avg: 0.010914294049143791
+Processing ../bench/rollout/7b_exp_wo_attn/details/Syn_TP2_PP1_B256_P128_R16384.jsonl...
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.02163061313331127
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.02021877560764551
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.020143448375165462
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.020081729628145695
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.02044669073075056
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.020171917974948883
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.02069446537643671
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.020808901637792587
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.02006427012383938
+init: kv_cache_usage: 0.012626940761891192, inter_token_latencies_avg: 0.02005464117974043
+10%: kv_cache_usage: 0.10068669951278864, inter_token_latencies_avg: 0.0211767740547657
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.020419861190021038
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.020000171847641468
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.01995022315531969
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.019987252540886402
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.019997261464595795
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.020237816497683525
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.020009211264550686
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.019997622817754745
+10%: kv_cache_usage: 0.10101552609512954, inter_token_latencies_avg: 0.01998612191528082
+Saved plot to gen_vs_kv_cache_wo_attn_tp1.png
+Processing directory: ../bench/rollout/7b_exp_with_attn/details (matching 'TP2')
+Found 9 matching files:
+  - Syn_TP2_PP1_B1_P128_R16384.jsonl
+  - Syn_TP2_PP1_B2_P128_R16384.jsonl
+  - Syn_TP2_PP1_B4_P128_R16384.jsonl
+  - Syn_TP2_PP1_B8_P128_R16384.jsonl
+  - Syn_TP2_PP1_B16_P128_R16384.jsonl
+  - Syn_TP2_PP1_B32_P128_R16384.jsonl
+  - Syn_TP2_PP1_B64_P128_R16384.jsonl
+  - Syn_TP2_PP1_B128_P128_R16384.jsonl
+  - Syn_TP2_PP1_B256_P128_R16384.jsonl
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B1_P128_R16384.jsonl...
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004742864519357681
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004582718946039677
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004529238678514957
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004481290467083454
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004467151127755642
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004471762105822563
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004466901533305645
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004491549916565418
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004472110420465469
+init: kv_cache_usage: 4.711030616466605e-05, inter_token_latencies_avg: 0.004505771212279797
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B2_P128_R16384.jsonl...
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.0045912787318229675
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004510031081736088
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004484949633479118
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004483451135456562
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004510180093348026
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004503450356423855
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.00450265035033226
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004492861218750477
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004502509720623493
+init: kv_cache_usage: 9.423097057903451e-05, inter_token_latencies_avg: 0.004479501396417618
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B4_P128_R16384.jsonl...
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.004980787634849548
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.005733581259846687
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.004667365923523903
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.004615668207406998
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.0045949677005410194
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.0045946380123496056
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.004587347619235516
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.004576629027724266
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.00458682794123888
+init: kv_cache_usage: 0.00018850931026537232, inter_token_latencies_avg: 0.004574969410896301
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B8_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.005904246121644974
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004917130805552006
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004793012514710426
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004763494245707989
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.0047599440440535545
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004737214185297489
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004719685763120651
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.00470744539052248
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004701334983110428
+init: kv_cache_usage: 0.0003771963831057379, inter_token_latencies_avg: 0.004700475372374058
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B16_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.0061448002234101295
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.004948219284415245
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.00493462011218071
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.004897501319646835
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.0049244994297623634
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.004926860332489014
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.004910649731755257
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.00491798110306263
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.004907299764454365
+init: kv_cache_usage: 0.0007551285816168596, inter_token_latencies_avg: 0.004911040887236595
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B32_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.006662776693701744
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005467597395181656
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005365858785808086
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005911475978791714
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005350779742002487
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005345250479876995
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005373109132051468
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005330489948391914
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.00572196114808321
+init: kv_cache_usage: 0.0015131216013870574, inter_token_latencies_avg: 0.005596732720732689
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011532759293913841
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011342964135110378
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011265275068581104
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011282074265182018
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011272086761891842
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011335302144289017
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011255016550421715
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011315625160932541
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011351892724633217
+10%: kv_cache_usage: 0.10003415031392016, inter_token_latencies_avg: 0.011343633756041527
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B64_P128_R16384.jsonl...
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.008883974514901638
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.007370629347860813
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.007323532365262508
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.00729623157531023
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.007439259439706802
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.0074309492483735085
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.007310890592634678
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.007319232448935509
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.0072928620502352715
+init: kv_cache_usage: 0.0030379266150851736, inter_token_latencies_avg: 0.007282322272658348
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.013359843753278255
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.012872586958110332
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.012868615798652172
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.012912086211144924
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.012831817381083965
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.013054131530225277
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.013040652498602867
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.012988443486392498
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.01297285407781601
+10%: kv_cache_usage: 0.10025157829781173, inter_token_latencies_avg: 0.013245726935565472
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B128_P128_R16384.jsonl...
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.013524881564080715
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012387847527861595
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012384338304400444
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012300820089876652
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012359429150819778
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012359248474240303
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.01239191833883524
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012339609675109386
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012316560372710228
+init: kv_cache_usage: 0.006123099819283495, inter_token_latencies_avg: 0.012290289625525475
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.01833848375827074
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.01908712461590767
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.018279574811458588
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.01800813153386116
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.018014970235526562
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.018645646050572395
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.018216676078736782
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.017965951934456825
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.018207375891506672
+10%: kv_cache_usage: 0.10001063038163072, inter_token_latencies_avg: 0.018519019708037376
+Processing ../bench/rollout/7b_exp_with_attn/details/Syn_TP2_PP1_B256_P128_R16384.jsonl...
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.023207894526422024
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021752649918198586
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021749199368059635
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021762410178780556
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021764670498669147
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021769938990473747
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021971414797008038
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.022102280519902706
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021839918568730354
+init: kv_cache_usage: 0.012439597224846777, inter_token_latencies_avg: 0.021726470440626144
+10%: kv_cache_usage: 0.10055881003158496, inter_token_latencies_avg: 0.027333994396030903
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.026695759035646915
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.026410547085106373
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.026340587995946407
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.02626021020114422
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.02628161944448948
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.026223041117191315
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.02624770998954773
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.026332208886742592
+10%: kv_cache_usage: 0.1008989552682018, inter_token_latencies_avg: 0.02631260920315981
+Saved plot to gen_vs_kv_cache_with_attn_tp1.png

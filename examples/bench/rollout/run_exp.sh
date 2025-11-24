@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# vllm
+# customized (for profiling)
+export VLLM_DISABLE_ATTN="1" # 0: use attention, 1: forbid the use of the attention
+
 # Experiment runner script
 # Runs rollout tests with different combinations of TP, max_prompt_length, and batch_size
 
@@ -16,9 +20,11 @@ fi
 chmod +x "${ROLLOUT_SCRIPT}"
 
 # Parameter arrays
-TP_VALUES=(1 2 4)
+TP_VALUES=(2 4)
+# TP_VALUES=(1)
 MAX_PROMPT_LENGTH_VALUES=(128)
 BATCH_SIZE_VALUES=(1 2 4 8 16 32 64 128 256)
+# BATCH_SIZE_VALUES=(1 2 4)
 
 # Count total experiments
 total_experiments=$((${#TP_VALUES[@]} * ${#MAX_PROMPT_LENGTH_VALUES[@]} * ${#BATCH_SIZE_VALUES[@]}))
@@ -37,12 +43,6 @@ for tp in "${TP_VALUES[@]}"; do
     for max_prompt_length in "${MAX_PROMPT_LENGTH_VALUES[@]}"; do
         for batch_size in "${BATCH_SIZE_VALUES[@]}"; do
             current_experiment=$((current_experiment + 1))
-
-            # INSERT_YOUR_CODE
-            if [[ "${tp}" == "1" && ( "${batch_size}" == "1" || "${batch_size}" == "2" || "${batch_size}" == "4" ) ]]; then
-                echo "Skipping experiment: TP=1 and batch_size=${batch_size}"
-                continue
-            fi
             
             echo ""
             echo "=========================================="

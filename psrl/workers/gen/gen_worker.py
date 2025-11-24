@@ -1,8 +1,7 @@
 import os
 import queue
 import asyncio
-import uvloop
-import resource
+import warnings
 import logging
 import torch
 import ray
@@ -105,6 +104,9 @@ class PSRL_GenWorker(Worker):
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+        if config.rollout.disable_attn:
+            warnings.warn("CAUTION: you are disabling the attention, this should only be used for analysis purposes, not for training!")
+            env_vars["VLLM_DISABLE_ATTN"] = "1"
         return resources, env_vars, init_kwargs
 
     def __init__(
@@ -501,7 +503,8 @@ class PSRL_GenWorker(Worker):
                 model_state_dict_cpu = ray.get(object_ref)  # This blocks until the state dict is available in the object store
             # Load the model state dict to the vllm model
             # sharding will be handled automatically inside vllm
-            model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))
+            if not self.psrl_config.profile.fix_weight:
+                model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param.to(device, non_blocking=True)) for name, param in model_state_dict_cpu.items()))
             # NOTE(lhy): Do we need to clear the cache after loading the model?
             # get_torch_device().empty_cache()
             # torch.cuda.synchronize()
@@ -529,13 +532,14 @@ class PSRL_GenWorker(Worker):
             # sharding will be handled automatically inside vllm
             # NOTE(linsh): transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
             params_to_load = [(name, reduce_tensor(param.full_tensor()) if isinstance(param, DTensor) else reduce_tensor(param)) for name, param in model_state_dict_cpu.items()]
-            loaded_params = await self.rollout.inference_engine.collective_rpc(
-                "load_weights",
-                args=(params_to_load,),
-            )
-            if loaded_params is None:
-                psrl_logger.error(f"Worker failed to update weights. Result: {loaded_params}")
-                raise
+            if not self.psrl_config.profile.fix_weight:
+                loaded_params = await self.rollout.inference_engine.collective_rpc(
+                    "load_weights",
+                    args=(params_to_load,),
+                )
+                if loaded_params is None:
+                    psrl_logger.error(f"Worker failed to update weights. Result: {loaded_params}")
+                    raise
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
     
@@ -550,10 +554,11 @@ class PSRL_GenWorker(Worker):
             self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
         if self._cached_ps_nixl_gen_storage_client_names is None:
             self._cached_ps_nixl_gen_storage_client_names = ray.get(ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote())
-        self.rollout.inference_engine.collective_rpc(
-            "nixl_pull_model_core", 
-            args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
-        )
+        if not self.psrl_config.profile.fix_weight:
+            self.rollout.inference_engine.collective_rpc(
+                "nixl_pull_model_core", 
+                args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
+            )
         ray.get(ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id())) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
        
@@ -568,10 +573,11 @@ class PSRL_GenWorker(Worker):
             self._cached_ps_nixl_agent_names = await ps_manager_handle.get_ps_nixl_agent_names.remote()
         if self._cached_ps_nixl_gen_storage_client_names is None:
             self._cached_ps_nixl_gen_storage_client_names = await ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
-        await self.rollout.inference_engine.collective_rpc(
-            "nixl_pull_model_core", 
-            args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
-        )
+        if not self.psrl_config.profile.fix_weight:
+            await self.rollout.inference_engine.collective_rpc(
+                "nixl_pull_model_core", 
+                args=(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_gen_storage_client_names)
+            )
         await ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id()) # This only updates the model version
         psrl_logger.info(f"NIXL pull model done.")
         
@@ -651,15 +657,13 @@ class PSRL_GenWorker(Worker):
             self._async_resume_event.clear()
         
         # Interrupt all requests in the engine queue (waiting and running)
-        interrupted_running_request_num = await self.interrupt_all_requests()
+        interrupted_request_num = await self.interrupt_all_requests()
         
         # Wait and clean all tasks in self.active_tasks
         await asyncio.gather(*self.active_tasks, return_exceptions=True)
         self.active_tasks.clear()
 
-        return {
-            "interrupted_running_request_num": interrupted_running_request_num,
-        }
+        return interrupted_request_num
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def resume_generation(self):
@@ -672,12 +676,12 @@ class PSRL_GenWorker(Worker):
             self._async_interrupt_event.clear()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def sync_with_ps(self, ps_version: int):
+    async def sync_with_ps(self, ps_version: int, interrupt_generation: bool = False) -> int:
         """
         Synchronize the rollout instance with the parameter server.
         
         This method combines three operations into one:
-        1. Interrupt the current generation process
+        1. (Optional) Interrupt the current generation process
         2. Pull the latest model weights from the parameter server
         3. Resume the generation process
         
@@ -685,12 +689,16 @@ class PSRL_GenWorker(Worker):
             int: The number of requests that were interrupted during the sync process.
         """
         if self.curr_rollout_instance_model_version >= ps_version:
+            psrl_logger.warning(f"No need to sync with PS for instance {self.get_instance_id()}, current model version {self.curr_rollout_instance_model_version} is greater than or equal to the required PS version {ps_version}")
             return 0
 
         # Step 1: Interrupt generation
-        psrl_logger.info(f"Starting sync_with_ps: interrupting generation on instance {self.get_instance_id()}")
-        interrupted_request_num = await self.interrupt_generation()
-        psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
+        if interrupt_generation:
+            psrl_logger.info(f"Interrupting generation on instance {self.get_instance_id()}")
+            interrupted_request_num = await self.interrupt_generation()
+            psrl_logger.info(f"Interrupted {interrupted_request_num} requests on instance {self.get_instance_id()}")
+        else:
+            assert len(self.active_tasks) == 0, "Should not have any active tasks when syncing with PS, please call `self.interrupt_generation()` in advance or set `interrupt_generation` to False"
         
         # Step 2: Pull model
         with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
@@ -713,8 +721,6 @@ class PSRL_GenWorker(Worker):
         psrl_logger.info(f"Resuming generation on instance {self.get_instance_id()}")
         self.resume_generation()
         psrl_logger.info(f"Generation resumed on instance {self.get_instance_id()}")
-        
-        return interrupted_request_num
 
     def _create_task_done_callback(self, request_id: int, require_version: int):
         # Remove from the active tasks tracker when the task is done
@@ -724,7 +730,7 @@ class PSRL_GenWorker(Worker):
             self.log_active_tasks(task_done=True)
         return task_done_callback
 
-    async def _generate_async_task(self, request: DataProto, needed_model_version: int, consolidate: bool = True):
+    async def _generate_async_task(self, request: DataProto, needed_model_version: int):
         """
         An async task to generate sequences for a single request.
         This method handles the generation for a single request, managing model versioning
@@ -781,21 +787,24 @@ class PSRL_GenWorker(Worker):
             assert len(vllm_output.outputs) == 1, \
                 f"Expected no repeat in generation, got {len(vllm_output.outputs)} outputs."
 
-            interrupted = (vllm_output.outputs[0].finish_reason == "abort")
+            result = self.rollout.post_process_outputs(request, vllm_output)
 
-            # Update the request status to ROLLOUT_INTERRUPTED or RUNNING,
-            # depending on `interrupted` field in the result
-            update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED if interrupted else PSRL_RequestStatus.RUNNING
+            interrupted = result.non_tensor_batch["interrupted"][0]
+            interrupted_by_scheduler = result.non_tensor_batch["interrupted_by_scheduler"][0]
+            
+            # Update the request status to ROLLOUT_INTERRUPTED_BY_SCHEDULER or ROLLOUT_INTERRUPTED or RUNNING,
+            if interrupted_by_scheduler:
+                update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER
+            elif interrupted:
+                update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
+            else:
+                update_status = PSRL_RequestStatus.RUNNING
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
             )
             if update_status_success[0]:
-                filtered_result = vllm_output
-                # NOTE(lhy): The DataProto will be huge and slow to transfer using ray, so we postprocess the data here (inside the vllm rollout)
-                if consolidate:
-                    filtered_result = self.rollout.post_process_outputs_lite(request, filtered_result)
-                return filtered_result, update_status
+                return result, update_status
         return None, None
 
     def generate(self, requests: DataProto, consolidate: bool = True, return_only_on_representative_rank: bool = True):
@@ -808,8 +817,7 @@ class PSRL_GenWorker(Worker):
             requests (DataProto): The batch of generation requests.
         
         Returns:
-            tuple: A tuple containing the generated sequences, the indices of the requests
-                   that were successfully processed, and their corresponding update statuses.
+            tuple: A tuple containing the generated sequences and their corresponding update statuses.
         """
         rollout_instance_id = self.get_instance_id()
 
@@ -867,7 +875,7 @@ class PSRL_GenWorker(Worker):
                 # vllm_outputs = [vllm_outputs[i] for i in range(len(vllm_outputs))]
 
                 if return_only_on_representative_rank and not self.is_instance_representative_rank:
-                    return None, None, None
+                    return None, None
                 
                 # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
                 # depending on `interrupted` field in the result
@@ -881,11 +889,12 @@ class PSRL_GenWorker(Worker):
                     if filtered_request_idxs:
                         filtered_requests = filtered_requests[filtered_request_idxs]
                         filtered_result = [vllm_outputs[i] for i in filtered_request_idxs]
+                        filtered_update_statuses = [update_statuses[i] for i in filtered_request_idxs]
                         # NOTE(lhy): The DataProto will be huge and slow to transfer using ray, so we postprocess the data inside the vllm rollout
                         if consolidate:
-                            filtered_result = self.rollout.post_process_outputs_lite(filtered_requests, filtered_result)
-                        return filtered_result, filtered_request_idxs, update_statuses
-                    return None, None, None
+                            filtered_result = self.rollout.post_process_outputs(filtered_requests, filtered_result)
+                        return filtered_result, filtered_update_statuses
+                    return None, None
         else:
             raise ValueError(f"Needed model version {needed_model_version} is less than current rollout instance model version {curr_rollout_instance_model_version}. This should not happen.")
 
@@ -898,6 +907,7 @@ class PSRL_GenWorker(Worker):
         Args:
             request (DataProto): The async generation request.
         """
+        assert consolidate, "Consolidate must be True for async generation for now. Because the postprocess is need to be done inside the vllm rollout to mark the requests that are interrupted by the scheduler."
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
 
         # Wait for resuming if the generation is interrupted
@@ -921,7 +931,7 @@ class PSRL_GenWorker(Worker):
             needed_model_version = self.curr_rollout_instance_model_version
 
         task = self._generate_loop.create_task(
-            self._generate_async_task(request, needed_model_version, consolidate)
+            self._generate_async_task(request, needed_model_version)
         )
         task.add_done_callback(self._create_task_done_callback(
             int(request.non_tensor_batch["uid"][0]),

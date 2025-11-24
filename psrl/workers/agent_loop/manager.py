@@ -4,6 +4,7 @@ import asyncio
 import ray
 import torch
 import numpy as np
+from collections import Counter
 from typing import Dict, List, Union, Set, Tuple, Optional
 from tensordict import TensorDict
 from omegaconf import DictConfig
@@ -374,7 +375,7 @@ class PSRL_AgentLoopManager:
         if "version_tag" in data.non_tensor_batch:
             version_tags = data.non_tensor_batch["version_tag"]
         else:
-            version_tags = data.non_tensor_batch["max_version_limit"]
+            version_tags = data.non_tensor_batch["min_version_limit"] - self.staleness
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             PSRL_RequestStatus.RUNNING,
@@ -486,7 +487,7 @@ class PSRL_AgentLoopManager:
                 )
                 self.rollout_request_tracker[sample_id].append(entry_info)
                 psrl_logger.debug(f"Store data for prompt {sample_id} with info {entry_info}, "
-                                    f"request num: {len(self.rollout_request_tracker[sample_id])}")
+                                  f"request num: {len(self.rollout_request_tracker[sample_id])}")
 
             # Group post process
             unique_sample_ids = set(sample_ids)
@@ -864,11 +865,14 @@ class PSRL_AgentLoopManager:
         else:
             psrl_logger.warning(f"No waiters found for buffer {buffer_id} when trying to awake.")
 
-    async def retry_request(self, max_version_limit: int, retry_num: int):
+    # TODO(lhy): current logic may cause the request have no place to RESERVE
+    # If other requests OCCUPY the place to RESERVE, the request will have no place to RESERVE
+    # So we may need to reserve here in advance, rather than in the router
+    async def retry_request(self, min_version_limit: int, retry_num: int):
         """Notify the agent loop manager to retry processing requests associated with a specific buffer ID.
         
         Args:
-            max_version_limit (int): The buffer ID whose requests need to be retried.
+            min_version_limit (int): The buffer ID whose requests need to be retried.
             retry_num (int): The number of retries to attempt.
         """
         if self.running_loop and not self.stop_dispatch_task:
@@ -878,8 +882,8 @@ class PSRL_AgentLoopManager:
                     if data is None:
                         raise ValueError("Data queue should not contain None when retrying requests.")
 
-                    data.non_tensor_batch["max_version_limit"] = np.array([max_version_limit] * len(data), dtype=int)
-                    psrl_logger.debug(f"Retrying new requests with max version limit {max_version_limit}, total {len(data)} requests")
+                    data.non_tensor_batch["min_version_limit"] = np.array([min_version_limit] * len(data), dtype=int)
+                    psrl_logger.debug(f"Retrying new requests with max version limit {min_version_limit}, total {len(data)} requests")
 
                     await self._inner_dispatch_data(data)
         else:
@@ -887,6 +891,33 @@ class PSRL_AgentLoopManager:
 
 
     # ------- DATA POOL MANAGEMENT -------
+    
+    def log_buffer(self, buffer_id: int):
+        """Log the buffer version tag distribution and staleness.
+        
+        Args:
+            buffer_id (int): The ID of the buffer to log.
+        """
+        assert buffer_id in self.data_buffers, f"Buffer {buffer_id} not found in data buffers."
+        version_tags = self.data_buffers[buffer_id].non_tensor_batch["version_tag"].tolist()
+        
+        # Count different version_tags
+        version_tag_counts = Counter(version_tags)
+        total_count = len(version_tags)
+        
+        # Calculate staleness for each version_tag
+        staleness_dict = {}
+        for version_tag in version_tag_counts.keys():
+            staleness = buffer_id - version_tag
+            staleness_dict[version_tag] = staleness
+        
+        # Log statistics
+        psrl_logger.info(f"Buffer {buffer_id} version tag distribution:")
+        for version_tag in sorted(version_tag_counts.keys()):
+            count = version_tag_counts[version_tag]
+            percentage = (count / total_count) * 100
+            staleness = staleness_dict[version_tag]
+            psrl_logger.info(f"version_tag={version_tag}: count={count} ({percentage:.2f}%), staleness={staleness}")
 
     def consume_buffer(self, buffer_id: int) -> DataProto:
         """
@@ -900,6 +931,7 @@ class PSRL_AgentLoopManager:
             AssertionError: If the buffer is not in READY state.
         """
         
+        self.log_buffer(buffer_id)
         buffer = self.data_buffers.pop(buffer_id, None)
         assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
         # NOTE(linsh): we will delete buffer during aborting requests of specific versions

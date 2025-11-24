@@ -104,7 +104,7 @@ class PSRL_AgentLoopWorker:
         """
         if isinstance(data, DataProto):
             # Prioritize retry requests
-            if "max_version_limit" in data.non_tensor_batch:
+            if "min_version_limit" in data.non_tensor_batch:
                 self.pending_program_queue.appendleft(data)
             else:
                 self.pending_program_queue.append(data)
@@ -234,24 +234,63 @@ class PSRL_AgentLoopWorker:
         """
         self.rollout_router.init_route_strategy(**kwargs)
 
-    def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], currently_syncing_instance_ids: set[int]):
+    async def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], **kwargs):
         """Update the instance status received from RolloutCoordinator.
         
         Args:
             instance_to_engine_status (dict[int, EngineStats]): Dictionary mapping instance ID to the engine status.
-            currently_syncing_instance_ids (set[int]): Set of instance IDs that are currently syncing.
+            **kwargs: Keyword arguments for the update.
         """
-        self.rollout_router.update_instance_status(instance_to_engine_status, currently_syncing_instance_ids)
+        await self.rollout_router.update_instance_status(instance_to_engine_status, **kwargs)
         # May log some stats here
         # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")
-
-    def get_instance_to_engine_status(self):
-        """Get the latest instance to engine status from the rollout router.
+    
+    async def check_should_sync(self, instance_id: int, ps_model_version: int) -> bool:
+        """Check if the instance should synchronize with PS.
+        
+        Args:
+            instance_id (int): The instance ID to synchronize with.
+            ps_model_version (int): The version of the PS model to synchronize with.
         
         Returns:
-            dict[int, EngineStats]: Current instance to engine status information.
+            bool: True if there is any benefit from synchronization, False otherwise.
         """
-        return self.rollout_router.latest_instance_to_engine_status
+        return await self.rollout_router.check_should_sync(instance_id, ps_model_version)
+
+    async def update_currently_syncing_instances(self, instance_ids: List[int], ps_model_version: int):
+        """Update the currently syncing instances.
+        
+        Args:
+            instance_ids (List[int]): The instance IDs to update.
+            ps_model_version (int): The version of the PS model to update.
+        """
+        await self.rollout_router.update_currently_syncing_instances(instance_ids, ps_model_version)
+
+    async def wait_interrupted_partial_requests_loop_back(self, instance_ids: List[int]):
+        """Wait for the interrupted partial requests to be looped back in the priority queue.
+        
+        Args:
+            instance_ids (List[int]): The instance IDs to wait for.
+        """
+        await self.rollout_router.wait_interrupted_partial_requests_loop_back(instance_ids)
+     
+    def is_routing(self) -> bool:
+        """Check if the router is currently routing requests.
+        
+        Returns:
+            bool: True if the router is currently routing requests, False otherwise.
+        """
+        return self.rollout_router.is_routing()
+        
+    async def interrupt_routing(self):
+        """Interrupt the routing.
+        """
+        await self.rollout_router.interrupt_routing()
+        
+    async def resume_routing(self):
+        """Resume the routing.
+        """
+        await self.rollout_router.resume_routing()
 
     # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:

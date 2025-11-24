@@ -20,18 +20,10 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @dataclass
 class EngineStats:
-    # immutable properties
+    # initial properties
     instance_id: Final[int]
     model_version: Final[int]
     snapshot: Final[dict]
-    
-    # mutable properties
-    _waiting_and_running_queue_size: int = 0  
-
-    def __post_init__(self):
-        num_waiting_reqs = self.snapshot.get("scheduler_stats", {}).get("num_waiting_reqs", 0)
-        num_running_reqs = self.snapshot.get("scheduler_stats", {}).get("num_running_reqs", 0)
-        self._waiting_and_running_queue_size = num_waiting_reqs + num_running_reqs
 
     @staticmethod
     def get_default_snapshot() -> dict:
@@ -40,19 +32,39 @@ class EngineStats:
             "total_elapsed_time": 0.0,
             "elapsed_time_since_last_record": 0.0,
             "scheduler_stats": {
+                "need_to_abort_reqs": None,
+                "req_id_to_prompt_token_num": {},
+                "req_id_to_response_token_num": {},
                 "num_running_reqs": 0,
                 "num_waiting_reqs": 0,
                 "kv_cache_usage": 0.0,
             },
+            "generation_throughput": 0.0,
         }
+     
+    def get_waiting_queue_size(self) -> int:
+        return self.snapshot.get("scheduler_stats", {}).get("num_waiting_reqs", 0)
+  
+    def get_running_queue_size(self) -> int:
+        return self.snapshot.get("scheduler_stats", {}).get("num_running_reqs", 0)
 
-    # mutable operations
     def get_waiting_and_running_queue_size(self) -> int:
-        return self._waiting_and_running_queue_size
+        return self.get_waiting_queue_size() + self.get_running_queue_size()
 
-    def increment_waiting_and_running_queue_size(self) -> None:
-        self._waiting_and_running_queue_size += 1
+    def get_generation_throughput(self) -> float:
+        return self.snapshot.get("generation_throughput", 0.0)
+    
+    def get_kv_cache_utilization(self) -> float:
+        return self.snapshot.get("scheduler_stats", {}).get("kv_cache_usage", 0.0)
+    
+    def get_req_id_to_prompt_token_num(self) -> dict[str, int]:
+        return self.snapshot.get("scheduler_stats", {}).get("req_id_to_prompt_token_num", {})
+    
+    def get_req_id_to_response_token_num(self) -> dict[str, int]:
+        return self.snapshot.get("scheduler_stats", {}).get("req_id_to_response_token_num", {})
         
+    def get_total_token_num(self) -> int:
+        return sum(self.get_req_id_to_prompt_token_num().values()) + sum(self.get_req_id_to_response_token_num().values())
 
 class StatCollector(StatLoggerBase):
     """
@@ -115,6 +127,15 @@ class StatCollector(StatLoggerBase):
         """
         self.output_queue = output_queue
 
+    def init_scheduler_abort_queue(self, scheduler_abort_queue):
+        """
+        Initialize the scheduler abort queue for receiving abort requests.
+        
+        Args:
+            scheduler_abort_queue: Ray queue for receiving abort requests
+        """
+        self.scheduler_abort_queue = scheduler_abort_queue
+
     def record_model_version_update(self, model_version: int):
         """
         Set the model version for this engine instance.
@@ -164,10 +185,14 @@ class StatCollector(StatLoggerBase):
             "total_elapsed_time": curr_time - self.start_time,
             "elapsed_time_since_last_record": curr_time - self.last_record_time,
             "scheduler_stats": {
+                "need_to_abort_reqs": scheduler_stats.need_to_abort_reqs if scheduler_stats.need_to_abort_reqs else None,
+                "req_id_to_prompt_token_num": scheduler_stats.req_id_to_prompt_token_num if scheduler_stats.req_id_to_prompt_token_num else {},
+                "req_id_to_response_token_num": scheduler_stats.req_id_to_response_token_num if scheduler_stats.req_id_to_response_token_num else {},
                 "num_running_reqs": scheduler_stats.num_running_reqs,
                 "num_waiting_reqs": scheduler_stats.num_waiting_reqs,
                 "kv_cache_usage": scheduler_stats.kv_cache_usage,
             },
+            "generation_throughput": 0.0,
         }
        
         if iteration_stats:
@@ -186,11 +211,12 @@ class StatCollector(StatLoggerBase):
                 "num_generation_reqs": num_generation_reqs,
                 "num_preempted_reqs": getattr(iteration_stats, 'num_preempted_reqs', 0),
                 "num_finished_reqs": len(getattr(iteration_stats, 'finished_requests', [])),
-                "max_time_to_first_tokens": np.max(time_to_first_tokens_iter),
-                "max_inter_token_latencies": np.max(inter_token_latencies_iter),
+                # "max_time_to_first_tokens": np.max(time_to_first_tokens_iter),
+                # "max_inter_token_latencies": np.max(inter_token_latencies_iter),
                 "avg_time_to_first_tokens": np.mean(time_to_first_tokens_iter),
                 "avg_inter_token_latencies": np.mean(inter_token_latencies_iter),
             }
+            snapshot["generation_throughput"] = num_generation_reqs / iteration_stats_entry["avg_inter_token_latencies"]
             snapshot["iteration_stats"] = iteration_stats_entry
         
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
@@ -216,6 +242,10 @@ class StatCollector(StatLoggerBase):
                 snapshot=snapshot,
             ))
             self.last_push_to_queue_time = curr_time
+            
+        # Put abort requests to the abort queue if any
+        if self.scheduler_abort_queue is not None and snapshot["scheduler_stats"]["need_to_abort_reqs"] is not None:
+            self.scheduler_abort_queue.put_nowait(snapshot["scheduler_stats"]["need_to_abort_reqs"])
 
     def log_engine_initialized(self):
         """

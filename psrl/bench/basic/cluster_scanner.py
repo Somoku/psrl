@@ -396,8 +396,99 @@ class ClusterScanner:
                     ))
             return nlist
         else:
-            # fallback: try `ip -o link` or `ethtool`? for now return empty list
-            return []
+            # fallback: use /sys/class/infiniband to scan devices
+            rc_ls, ls_out, ls_err = sr.run("ls /sys/class/infiniband 2>/dev/null || true")
+            if rc_ls != 0 or not ls_out.strip():
+                return []
+            
+            devices = [d.strip() for d in ls_out.strip().splitlines() if d.strip()]
+            
+            for device in devices:
+                # Check if device has ports directory
+                rc_ports, ports_out, _ = sr.run(f"ls /sys/class/infiniband/{shlex.quote(device)}/ports 2>/dev/null | head -10 || true")
+                if rc_ports != 0 or not ports_out.strip():
+                    # No ports directory, might be a bond device or device without traditional ports
+                    # Try to get basic info without port
+                    details = {"device": device, "method": "sysfs_fallback", "note": "no_ports_directory"}
+                    nlist.append(NetworkInterfaceInfo(
+                        name=device,
+                        is_up=None,
+                        speed_gbps=None,
+                        link_type="infiniband",
+                        details=details
+                    ))
+                    continue
+                
+                # Parse port numbers
+                port_nums = [p.strip() for p in ports_out.strip().splitlines() if p.strip().isdigit()]
+                if not port_nums:
+                    port_nums = ["1"]  # default to port 1 if parsing fails
+                
+                for port_num in port_nums:
+                    port_path = f"/sys/class/infiniband/{device}/ports/{port_num}"
+                    
+                    # Read rate (format: "X Gbps" or "X Gb/s")
+                    rc_rate, rate_raw, _ = sr.run(f"cat {shlex.quote(port_path)}/rate 2>/dev/null || echo ''")
+                    rate_gbps = _parse_ibstat_rate_to_gbps(rate_raw.strip()) if rate_raw.strip() else None
+                    
+                    # Read state
+                    rc_state, state_raw, _ = sr.run(f"cat {shlex.quote(port_path)}/state 2>/dev/null || echo ''")
+                    state = state_raw.strip() if state_raw.strip() else None
+                    
+                    # Read physical state
+                    rc_phys, phys_raw, _ = sr.run(f"cat {shlex.quote(port_path)}/phys_state 2>/dev/null || echo ''")
+                    physical_state = phys_raw.strip() if phys_raw.strip() else None
+                    
+                    # Read link layer
+                    rc_ll, ll_raw, _ = sr.run(f"cat {shlex.quote(port_path)}/link_layer 2>/dev/null || echo ''")
+                    link_layer = ll_raw.strip() if ll_raw.strip() else None
+                    
+                    # Determine link type
+                    link_type = "unknown"
+                    if link_layer:
+                        ll = link_layer.lower()
+                        if ll.startswith("ether") or "ethernet" in ll:
+                            link_type = "roce"
+                        elif ll.startswith("infin") or "infiniband" in ll:
+                            link_type = "infiniband"
+                        else:
+                            link_type = ll
+                    else:
+                        # Default to infiniband if unknown
+                        link_type = "infiniband"
+                    
+                    # Determine if up
+                    is_up = False
+                    if state and ("active" in state.lower() or "armed" in state.lower()):
+                        is_up = True
+                    if physical_state and "linkup" in physical_state.replace(" ", "").lower():
+                        is_up = True
+                    
+                    # Create interface name (device name with port if multiple ports)
+                    if len(port_nums) > 1:
+                        pseudo_name = f"{device}:{port_num}"
+                    else:
+                        pseudo_name = device
+                    
+                    details = {
+                        "device": device,
+                        "rdma_port": port_num,
+                        "rdma_state": state,
+                        "rdma_physical_state": physical_state,
+                        "rdma_link_layer": link_layer,
+                        "raw_rate": rate_raw.strip() if rate_raw.strip() else None,
+                        "method": "sysfs"
+                    }
+                    
+                    nlist.append(NetworkInterfaceInfo(
+                        name=pseudo_name,
+                        is_up=is_up,
+                        speed_gbps=float(rate_gbps) if (rate_gbps is not None) else None,
+                        link_type=link_type,
+                        details=details
+                    ))
+            
+            return nlist
 
     # -------------------------
     # Basic node scan (only basic info + NVLink parsed into GPUInfo.nvlink)
@@ -713,7 +804,7 @@ class ClusterScanner:
 # Example usage
 # ----------------------------------------
 if __name__ == "__main__":
-    ips = ["29.162.246.148", "28.59.42.208"]
+    ips = ["28.49.53.113", "28.49.55.40"]
     username = "root"
     ssh_port = 36000
     ssh_key = None

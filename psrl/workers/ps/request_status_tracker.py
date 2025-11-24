@@ -33,6 +33,7 @@ class PSRL_RequestStatus(Enum):
     ROLLOUT_DISPATCHED = enum.auto()
     ROLLOUT_RUNNING = enum.auto()
     ROLLOUT_INTERRUPTED = enum.auto()
+    ROLLOUT_INTERRUPTED_BY_SCHEDULER = enum.auto()
     REWARD_RUNNING = enum.auto()
     REWARD_COMPLETED = enum.auto()
     COMPLETED = enum.auto()
@@ -135,8 +136,8 @@ class RequestStatusTracker:
                     self._request_infos[req_id].model_version = model_version[i]
                 request_version = self._request_infos[req_id].model_version
                 if request_version < self._running_min_version:
-                    psrl_logger.debug("Request %d is stale (version %d < %d), cannot update status", 
-                                      req_id, request_version, self._running_min_version)
+                    psrl_logger.warning("Request %d is stale (version %d < %d), cannot update status", 
+                                        req_id, request_version, self._running_min_version)
                     request_update_success[i] = False
                     continue
             else:

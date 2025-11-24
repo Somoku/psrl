@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from typing import Any, Dict, Optional, Union, List, Tuple, cast
+from ray.util.queue import Queue as RayQueue
 
 from vllm import LLM, SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
@@ -204,9 +205,15 @@ class PSRL_vLLMRollout:
         
         llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
         llm_kwargs["additional_config"] = {
-            "max_num_waiting_reqs": psrl_config.routing_strategy.max_num_waiting_reqs,
+            "max_num_waiting_reqs_after_preemption": psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption,
             "max_model_len_used_in_estimation": max_model_len * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
         }
+
+        # Initialize abort queue, events, and request ids for psrl_async mode
+        self.scheduler_abort_queue = RayQueue()
+        self.scheduler_abort_events = {}
+        self.scheduler_abort_requests = set()
+        self._scheduler_abort_processor_task = None
 
         if config.mode == "psrl_async":
             engine_args = AsyncEngineArgs(**llm_kwargs)
@@ -219,6 +226,7 @@ class PSRL_vLLMRollout:
                 self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
                 self.stat_collector.begin_record()
                 self.stat_collector.init_output_queue(status_queue)
+                self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_queue)
                 self.stat_collector.record_model_version_update(0)
                 stat_loggers = [self.stat_collector]
             psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
@@ -255,6 +263,50 @@ class PSRL_vLLMRollout:
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        
+        # Start abort processor task for async mode
+        if config.mode == "psrl_async":
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+            self._scheduler_abort_processor_task = loop.create_task(self._scheduler_abort_processor_loop())
+            self._scheduler_abort_processor_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+    
+    async def _scheduler_abort_processor_loop(self):
+        """Background loop that processes abort requests from the queue."""
+        while True:
+            # Wait for abort request from queue using async method (blocking wait)
+            request_ids = await self.scheduler_abort_queue.get_async(block=True)
+            if request_ids is None:  # Sentinel value to stop the loop
+                break
+                
+            # Create a new event for this abort request
+            for request_id in request_ids:
+                self.scheduler_abort_requests.add(request_id)
+            request_ids_tuple = tuple(request_ids)
+            self.scheduler_abort_events[request_ids_tuple] = asyncio.Event()
+
+            # Process the abort request
+            await self.inference_engine.abort(request_ids)
+            
+            # Signal that this abort request is done and clean up
+            self.scheduler_abort_events[request_ids_tuple].set()
+            del self.scheduler_abort_events[request_ids_tuple]
+            
+    async def _wait_for_all_scheduler_abort_requests_processed(self):
+        """Wait until the abort queue is empty and all pending abort requests are processed."""
+        if self.scheduler_abort_queue is None:
+            return
+        # Wait until queue is empty
+        while not self.scheduler_abort_queue.empty():
+            await asyncio.sleep(0.01)
+        
+        # Wait for all pending abort requests to complete
+        if self.scheduler_abort_events:
+            events = list(self.scheduler_abort_events.values())
+            await asyncio.gather(*[event.wait() for event in events], return_exceptions=True)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -369,27 +421,43 @@ class PSRL_vLLMRollout:
             
         return vllm_inputs, kwargs
     
-    def post_process_outputs_lite(
+    def post_process_outputs(
         self,
         prompts: DataProto,
         outputs: Union[Union[RequestOutput, PoolingRequestOutput], list[Union[RequestOutput, PoolingRequestOutput]]],
     ) -> DataProto:
         """
         Post-process vLLM outputs to convert them back into DataProto format.
+        
+        This method performs several transformations:
+        1. Extract response token IDs, lengths, and interruption status
+        2. Collect log probabilities if required
+        3. Concatenate new response IDs to existing raw response IDs
+        4. Build final DataProto with updated tensors and metadata
+        
+        Args:
+            prompts: Original input DataProto containing prompts
+            outputs: vLLM generation outputs (single output or list of outputs)
+            
+        Returns:
+            Updated DataProto with generated responses and proper formatting
         """
+        
         if not isinstance(outputs, list):
             outputs = [outputs]
         assert len(outputs) == len(prompts), "Mismatched batch size between prompts and VLLM outputs."
 
         batch_size = len(prompts)
         non_tensor_batch = prompts.non_tensor_batch
+        uid_list = non_tensor_batch["uid"].tolist()
 
         response_ids_list = []
         response_len_list = []
         interrupted_list = []
+        interrupted_by_scheduler_list = []
         all_log_prob_list = []
 
-        for i in range(batch_size):
+        for i, uid in enumerate(uid_list):
             vllm_output = outputs[i]
             assert len(vllm_output.outputs) == 1, "RolloutRouter only supports single request generation."
 
@@ -400,6 +468,13 @@ class PSRL_vLLMRollout:
             response_ids_list.append(response_ids)
             response_len_list.append(response_len)
             interrupted_list.append(interrupted)
+            if str(uid) in self.scheduler_abort_requests:
+                assert interrupted, "Requests interrupted by the scheduler should also have finish_reason 'abort'."
+                interrupted_by_scheduler_list.append(True)
+                self.scheduler_abort_requests.remove(str(uid))
+            else:
+                # psrl_logger.info(f"Request {uid} is not interrupted by the scheduler (not in {self.scheduler_abort_requests}). It is interrupted by the synchronization (i.e., partial rollout).")
+                interrupted_by_scheduler_list.append(False)
 
             log_prob_list = []
             # if inference logprobs is required, we need to collect the log probabilities
@@ -444,6 +519,7 @@ class PSRL_vLLMRollout:
         response_unpadded_len = [curr_response_unpadded_len[i] + response_len_list[i] for i in range(batch_size)]
         non_tensor_batch["response_unpadded_len"] = np.array(response_unpadded_len, dtype=int)
         non_tensor_batch["interrupted"] = np.array(interrupted_list, dtype=bool)
+        non_tensor_batch["interrupted_by_scheduler"] = np.array(interrupted_by_scheduler_list, dtype=bool)
 
         # Update rollout_log_probs
         if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
@@ -460,141 +536,6 @@ class PSRL_vLLMRollout:
             },
             batch_size=batch_size,
         )
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
-            
-    def post_process_outputs(
-        self,
-        prompts: DataProto,
-        outputs: Union[Union[RequestOutput, PoolingRequestOutput], list[Union[RequestOutput, PoolingRequestOutput]]],
-    ) -> DataProto:
-        """
-        Post-process vLLM outputs to convert them back into DataProto format.
-        
-        This method performs several transformations:
-        1. Extract response token IDs, lengths, and interruption status
-        2. Collect log probabilities if required
-        3. Concatenate new response IDs to existing raw response IDs
-        4. Apply right-side padding to responses
-        5. Construct proper position IDs and attention masks
-        6. Build final DataProto with updated tensors and metadata
-        
-        Args:
-            prompts: Original input DataProto containing prompts
-            outputs: vLLM generation outputs (single output or list of outputs)
-            
-        Returns:
-            Updated DataProto with generated responses and proper formatting
-        """
-
-        if isinstance(outputs, (RequestOutput, PoolingRequestOutput)):
-            outputs = [outputs]
-        
-        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-        batch_size = idx.size(0)
-        non_tensor_batch = prompts.non_tensor_batch
-        # left-padded attention_mask
-        attention_mask = prompts.batch["attention_mask"]
-        position_ids = prompts.batch["position_ids"]
-        # used to construct attention_mask
-        eos_token_id = prompts.meta_info["eos_token_id"]
-        
-        response = []
-        response_unpadded_len = []
-        interrupted = []
-        rollout_log_probs = []
-        for output in outputs:
-            for sample_id in range(len(output.outputs)):
-                response_ids = output.outputs[sample_id].token_ids
-                response.append(response_ids)
-                response_unpadded_len.append(len(response_ids))
-                interrupted.append(output.outputs[sample_id].finish_reason == "abort")
-                # if inference logprobs is required, we need to collect the log probabilities
-                if (
-                    self.psrl_config.log_prob.enable_rollout_engine_log_prob and
-                    hasattr(output.outputs[sample_id], 'logprobs') and
-                    output.outputs[sample_id].logprobs is not None
-                ):
-                    log_prob_list = []
-                    if self.psrl_config.partial_rollout.interrupt_as_prompt:
-                        curr_response_len = non_tensor_batch.get("response_unpadded_len", 0)
-                        # Collect log probs only when the request finished normally
-                        # The response log probs are collected in two parts:
-                        # 1. The log probs of the accumulated response tokens (in current prompt tokens)
-                        # 2. The log probs of the current response tokens
-                        if output.outputs[sample_id].finish_reason != "abort" and curr_response_len > 0:
-                            # partial response log probs from prompt log probs
-                            prompt_token_ids = output.prompt_token_ids
-                            for i, logprob in enumerate(output.prompt_logprobs[-curr_response_len:]):
-                                log_prob_list.append(logprob[prompt_token_ids[i - curr_response_len]].logprob)
-                            # new response log probs from decode log probs
-                            for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                                log_prob_list.append(logprob[response_ids[i]].logprob)
-                    else:
-                        # Response log probs from decode log probs
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            log_prob_list.append(logprob[response_ids[i]].logprob)
-                    rollout_log_probs.append(log_prob_list)
-
-        non_tensor_batch["interrupted"] = np.array(interrupted, dtype=bool)
-        if "raw_response_ids" in non_tensor_batch:
-            raw_response_ids = non_tensor_batch["raw_response_ids"]
-        else:
-            raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-        # Reconstruct the raw response ids by concatenating the previous raw response ids
-        # with the new response ids.
-        response = raw_response_ids + np.fromiter(response, dtype=object)
-        non_tensor_batch["raw_response_ids"] = response
-        if "response_unpadded_len" in non_tensor_batch:
-            curr_response_unpadded_len = non_tensor_batch["response_unpadded_len"]
-        else:
-            curr_response_unpadded_len = [0] * batch_size
-        response_unpadded_len = [
-            curr_response_unpadded_len[i] + response_unpadded_len[i] for i in range(batch_size)
-        ]
-        non_tensor_batch["response_unpadded_len"] = np.array(response_unpadded_len, dtype=int)
-
-        # TODO(linsh): optimize the DataProto construction to packing
-        # Here we pad the response to the right side for both interrupted and completed requests.
-        response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-        if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
-            if "rollout_log_probs" in non_tensor_batch:
-                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
-            else:
-                curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-            curr_rollout_log_probs += np.fromiter(rollout_log_probs, dtype=object)
-            non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
-
-        seq = torch.cat([idx, response], dim=-1)
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-        if position_ids.dim() == 3:  # qwen2vl mrope
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
-
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(
-            response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype
-        )
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences (including left padding & right padding)
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
-
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
     
     def add_requests(self, prompts: DataProto, **kwargs):
@@ -667,7 +608,7 @@ class PSRL_vLLMRollout:
                 sampling_params=self.sampling_params,
                 use_tqdm=False,
             )
-            return self.post_process_outputs_lite(prompts, outputs)
+            return self.post_process_outputs(prompts, outputs)
     
     @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
     @torch.no_grad()
@@ -711,7 +652,7 @@ class PSRL_vLLMRollout:
             completed_rollout = []
             for completed_task in asyncio.as_completed(tasks):
                 prompt_idx, output = await completed_task
-                completed_rollout.append(self.post_process_outputs_lite(prompts[prompt_idx:prompt_idx+1], output))
+                completed_rollout.append(self.post_process_outputs(prompts[prompt_idx:prompt_idx+1], output))
         
         return DataProto.concat(completed_rollout)
 
@@ -785,8 +726,15 @@ class PSRL_vLLMRollout:
             uid: Unique identifier for the request (optional)
             
         Returns:
-            Tuple of (prompt_index, final_request_output)
+            Tuple of (prompt_idx, final_request_output)
+            prompt_idx is the index of the prompt in the batch
         """
+        # Ensure all abort requests in the queue are processed before starting generation
+        # NOTE(lhy): currently, only the preempted requests are put into the abort queue.
+        # Other requests are aborted (e.g., partial rollout) directly by the scheduler.
+        if self.scheduler_abort_queue is not None:
+            await self._wait_for_all_scheduler_abort_requests_processed()
+        
         if sampling_params is None:
             sampling_params = self.sampling_params
         if isinstance(prompt_tokens, list):
@@ -794,10 +742,11 @@ class PSRL_vLLMRollout:
         if max_tokens is not None:
             setattr(sampling_params, "max_tokens", int(max_tokens))
 
+        request_id = str(uuid.uuid4()) if uid is None else uid
         task = self.inference_engine.generate(
             prompt=TokensPrompt(**prompt_tokens),
             sampling_params=sampling_params,
-            request_id=str(uuid.uuid4()) if uid is None else uid,
+            request_id=request_id,
         )
         async for output in task:
             last_output = output

@@ -83,6 +83,7 @@ class RolloutConfig(BaseConfig):
 
     name: Optional[str] = MISSING
     mode: str = "sync"
+    disable_attn: bool = False
     skip_tokenizer_init: bool = True
 
     temperature: float = 1.0

@@ -1280,15 +1280,24 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.critic_wg.stop_profile()
             if self.use_rm:
                 self.rm_wg.stop_profile()
+                
+    def _get_dp_size(self):
+        # query dispatch info of the actor worker group
+        if "actor" not in self.actor_wg._dispatch_info:
+            self.actor_wg._dispatch_info["actor"] = self.actor_wg._query_dispatch_info("actor")
+            assert len(self.actor_wg._dispatch_info["actor"]) == self.actor_wg.world_size
+        dp_rank_mapping = self.actor_wg._dispatch_info["actor"]
+        dp_size = max(dp_rank_mapping) + 1
+        return dp_size
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen"):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_wg.world_size
+        dp_size = self._get_dp_size()
         global_partition_lst = get_seqlen_balanced_partitions(
-            global_seqlen_lst, k_partitions=world_size, equal_size=True
+            global_seqlen_lst, k_partitions=dp_size, equal_size=True
         )
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])

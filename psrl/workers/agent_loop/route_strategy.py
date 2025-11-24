@@ -1,10 +1,12 @@
 import os
 import logging
+import json
+import time
 import numpy as np
 from datetime import datetime, timedelta
 from abc import ABC, abstractmethod
 from typing import Dict, Type, Optional, List
-
+from math import ceil
 from verl import DataProto
 from psrl.workers.gen.stats_collector import EngineStats
 
@@ -69,15 +71,16 @@ class RouteStrategyBase(ABC):
         self.logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
     
     @abstractmethod
-    def route(self, request: DataProto, candidates: Optional[List[int]]) -> Optional[int]:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None, route_kwargs: Optional[dict] = None) -> Optional[int]:
         """Route a request to a specific worker instance.
         
         Args:
             request (DataProto): The request to route.
             candidates (Optional[List[int]]): List of candidate worker indices if any.
+            route_kwargs (Optional[dict]): Additional keyword arguments for routing.
             
         Returns:
-            int: Index of the selected worker instance.
+            Optional[int]: Index of the selected worker instance. None if no instance is selected.
         """
         pass
     
@@ -118,6 +121,17 @@ class RouteStrategyBase(ABC):
         """
         snapshot_time = datetime.fromisoformat(engine_status.snapshot["timestamp"])
         return self.instance_to_time_record[instance_id] - snapshot_time > timedelta(milliseconds=self.strategy_kwargs.get("snapshot_staleness_threshold_in_ms", 100))
+    
+    def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
+        """Calculate the routing benefit of routing a request to a specific worker instance.
+        
+        Args:
+            request (DataProto): The request to calculate the routing benefit for.
+            instance_id (int): The index of the worker instance to calculate the routing benefit for.
+        """
+        # By default, we return 1 as the routing benefit (meaning it is beneficial to route the request to the instance)
+        # Subclasses can override this method to implement their own routing benefit calculation logic
+        return 1
 
 @register_route_strategy("random")
 class RandomRouteStrategy(RouteStrategyBase):
@@ -127,7 +141,7 @@ class RandomRouteStrategy(RouteStrategyBase):
         super().__init__(n_instances, strategy_kwargs)
         self.logger.info("Initialized RandomRouteStrategy")
 
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> Optional[int]:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None, route_kwargs: Optional[dict] = None) -> Optional[int]:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
@@ -143,7 +157,7 @@ class RoundRobinRouteStrategy(RouteStrategyBase):
         self.curr_idx = 0
         self.logger.info("Initialized RoundRobinRouteStrategy")
 
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> Optional[int]:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None, route_kwargs: Optional[dict] = None) -> Optional[int]:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
@@ -160,24 +174,34 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
     
     def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         super().__init__(n_instances, strategy_kwargs)
+        assert "balanced_concurrent_seqs_per_instance" in strategy_kwargs, "balanced_concurrent_seqs_per_instance is required for RequestNumBalanceRouteStrategy"
+        assert "max_concurrent_seqs_per_instance" in strategy_kwargs, "max_concurrent_seqs_per_instance is required for RequestNumBalanceRouteStrategy"
+        self.balanced_concurrent_seqs_per_instance = strategy_kwargs.get("balanced_concurrent_seqs_per_instance", 64)
+        self.max_concurrent_seqs_per_instance = strategy_kwargs.get("max_concurrent_seqs_per_instance", 64)
         self.instance_request_counts = {i: 0 for i in range(n_instances)}
         self.logger.info(f"Initialized RequestNumBalanceRouteStrategy with instance request counts {self.instance_request_counts}")
 
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> Optional[int]:
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None, route_kwargs: Optional[dict] = None) -> Optional[int]:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
             return None
         idx = np.argmin([self.instance_request_counts[i] for i in candidates])
         self.logger.debug(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
-                          f"with workloads {[self.instance_request_counts[i] for i in candidates]}, "
+                          f"with all instance workloads {self.instance_request_counts}, "
                           f"selected instance {candidates[idx]} with workload {self.instance_request_counts[candidates[idx]]}")
-        remaining_request_counts = [self.instance_request_counts[i] for i in candidates if i != candidates[idx]]
+        '''
+        remaining_request_counts = [self.instance_request_counts[i] for i in range(self.n_instances) if i != candidates[idx]]
         if len(remaining_request_counts) > 0:
             remaining_max_request_count = max(remaining_request_counts)
             if self.instance_request_counts[candidates[idx]] > remaining_max_request_count:
                 # Avoid overload, return None (currently not route to any instance)
                 return None
+        '''
+        if self.instance_request_counts[candidates[idx]] >= min(self.max_concurrent_seqs_per_instance, self.balanced_concurrent_seqs_per_instance):
+            # if self.instance_request_counts[candidates[idx]] >= self.max_concurrent_seqs_per_instance:
+            # Avoid overload, return None (currently not route to any instance)
+            return None
         self.instance_request_counts[candidates[idx]] += 1
         return candidates[idx]
     
@@ -203,21 +227,315 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
                               f"is not equal to the recorded request count {self.instance_request_counts[instance_id]}")
             return True
         return False
-
-@register_route_strategy("throughput_balance")
-class ThroughputBalanceRouteStrategy(RouteStrategyBase):
-    """Routes requests to the worker instance with optimal throughput balance."""
     
+    def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
+        if self.instance_request_counts[instance_id] >= min(self.max_concurrent_seqs_per_instance, self.balanced_concurrent_seqs_per_instance):
+            # Avoid overload, return 0 as the routing benefit
+            return 0
+        return 1
+    
+class CostModelBasedRouteStrategy(RouteStrategyBase):
+    """Routes requests to the worker instance based on the cost model."""
     def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         super().__init__(n_instances, strategy_kwargs)
-        # TODO(lhy)
-        raise NotImplementedError("ThroughputBalanceRouteStrategy is not implemented")
+        assert "sort_candidate_by_indicator" in strategy_kwargs, "sort_candidate_by_indicator is required for CostModelBasedRouteStrategy"
+        assert "logging_interval_in_ms" in strategy_kwargs, "logging_interval_in_ms is required for CostModelBasedRouteStrategy"
+        assert "cost_model_path" in strategy_kwargs, "cost_model_path is required for CostModelBasedRouteStrategy"
+        assert "instance_to_tp_pp" in strategy_kwargs, "instance_to_tp_pp is required for CostModelBasedRouteStrategy"
+        assert "max_num_waiting_reqs_after_preemption" in strategy_kwargs, "max_num_waiting_reqs_after_preemption is required for CostModelBasedRouteStrategy"
+        assert "balanced_concurrent_seqs_per_instance" in strategy_kwargs, "balanced_concurrent_seqs_per_instance is required for CostModelBasedRouteStrategy"
+        assert "max_concurrent_seqs_per_instance" in strategy_kwargs, "max_concurrent_seqs_per_instance is required for CostModelBasedRouteStrategy"
+        assert "delta_throughput_threshold" in strategy_kwargs, "delta_throughput_threshold is required for CostModelBasedRouteStrategy"
+        assert "max_prompt_length" in strategy_kwargs, "max_prompt_length is required for CostModelBasedRouteStrategy"
+        assert "request_budget" in strategy_kwargs, "request_budget is required for CostModelBasedRouteStrategy"
+        assert "instance_to_max_model_len" in strategy_kwargs, "instance_to_max_model_len is required for CostModelBasedRouteStrategy"
+        
+        self.sort_candidate_by_indicator = strategy_kwargs["sort_candidate_by_indicator"]
+        self.last_logging_time = [time.time() for _ in range(n_instances)]
+        self.logging_interval_in_ms = strategy_kwargs["logging_interval_in_ms"]
+        cost_model_path = strategy_kwargs["cost_model_path"]
+        assert os.path.exists(cost_model_path), f"cost_model_path {cost_model_path} does not exist"
+        with open(cost_model_path, "r") as f:
+            self.cost_model = json.load(f)
+        self.instance_to_tp_pp = strategy_kwargs["instance_to_tp_pp"]
+        for tp_pp in self.instance_to_tp_pp.values():
+            assert tp_pp in self.cost_model, f"tp_pp {tp_pp} is not in cost model"
+            cost_model = self.cost_model[tp_pp]
+            assert "other_threshold" in cost_model, "other_threshold is required in cost model"
+            assert "other_latency_b" in cost_model, "other_latency_b is required in cost model"
+            assert "other_latency_k" in cost_model, "other_latency_k is required in cost model"
+            assert "attn_latency_b" in cost_model, "attn_latency_b is required in cost model"
+            assert "attn_latency_k" in cost_model, "attn_latency_k is required in cost model"
+        self.max_num_waiting_reqs_after_preemption = strategy_kwargs["max_num_waiting_reqs_after_preemption"]
+        self.balanced_concurrent_seqs_per_instance = strategy_kwargs["balanced_concurrent_seqs_per_instance"]
+        self.max_concurrent_seqs_per_instance = strategy_kwargs["max_concurrent_seqs_per_instance"]
+        self.delta_throughput_threshold = strategy_kwargs["delta_throughput_threshold"]
+        self.max_prompt_length = strategy_kwargs["max_prompt_length"]
+        self.request_budget = strategy_kwargs["request_budget"]
+        self.instance_to_max_model_len = strategy_kwargs["instance_to_max_model_len"]
+        
+        self.instance_to_request_num = {i: 0 for i in range(n_instances)}
+        self.instance_to_running_request_num = {i: 0 for i in range(n_instances)}
+        self.instance_to_waiting_request_num = {i: 0 for i in range(n_instances)}
+        self.instance_to_token_num = {i: 0 for i in range(n_instances)}
     
-    def route(self, request: DataProto, candidates: Optional[List[int]] = None) -> int:
+    def _get_request_token_num(self, request: DataProto, log_len: bool = False) -> int:
+        assert "raw_prompt_ids" in request.non_tensor_batch, "raw_prompt_ids is required in non_tensor_batch"
+        prompt_token_num = len(request.non_tensor_batch["raw_prompt_ids"][0])
+        if "response_unpadded_len" in request.non_tensor_batch:
+            response_token_num = request.non_tensor_batch["response_unpadded_len"][0]
+        else:
+            response_token_num = 0
+        if log_len: # For debug
+            self.logger.info(f"Request {request.non_tensor_batch['uid'][0]} has {prompt_token_num} prompt tokens and {response_token_num} response tokens")
+        return prompt_token_num + response_token_num
+    
+    def _can_run_directly(self, request: DataProto, instance_id: int) -> bool:
+        if self.instance_to_waiting_request_num[instance_id] > 0:
+            return False
+        # The request will be put into the waiting queue if the token number exceeds the max kv cache capacity
+        new_token_num = self.instance_to_token_num[instance_id] + self._get_request_token_num(request)
+        # if new_token_num > self.instance_to_max_model_len[instance_id] + (self.max_prompt_length + self.request_budget) * self.max_num_waiting_reqs_after_preemption:
+        if new_token_num > self.instance_to_max_model_len[instance_id]:
+            return False
+        return True
+    
+    # Estimate the latency of a request with given request number and token number
+    # The latency is estimated in seconds
+    def _estimate_latency(self, instance_id: int, request_num: int, token_num: int) -> float:
+        tp_pp = self.instance_to_tp_pp[instance_id]
+        cost_model = self.cost_model[tp_pp]
+        other_threshold = cost_model["other_threshold"]
+        other_latency_b = cost_model["other_latency_b"]
+        other_latency_k = cost_model["other_latency_k"]
+        attn_latency_b = cost_model["attn_latency_b"]
+        attn_latency_k = cost_model["attn_latency_k"]
+        return attn_latency_b + attn_latency_k * token_num + max(other_threshold, other_latency_b + other_latency_k * request_num)
+    
+    def _estimate_curr_latency_after_route_request(self, request: DataProto, instance_id: int) -> float:
+        new_running_request_num = self.instance_to_running_request_num[instance_id] + 1
+        new_token_num = self.instance_to_token_num[instance_id] + self._get_request_token_num(request)
+        return self._estimate_latency(instance_id, new_running_request_num, new_token_num)
+    
+    def _estimate_curr_throughput(self, instance_id: int) -> float:
+        return self.instance_to_running_request_num[instance_id] / self._estimate_latency(instance_id, self.instance_to_running_request_num[instance_id], self.instance_to_token_num[instance_id])
+    
+    def _estimate_curr_throughput_after_route_request(self, request: DataProto, instance_id: int) -> float:
+        new_running_request_num = self.instance_to_running_request_num[instance_id] + 1
+        new_token_num = self.instance_to_token_num[instance_id] + self._get_request_token_num(request)
+        return new_running_request_num / self._estimate_latency(instance_id, new_running_request_num, new_token_num)
+
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None, route_kwargs: Optional[dict] = None) -> Optional[int]:
+        raise RuntimeError("CostModelBasedRouteStrategy is an abstract class, please use other inherited classes which implement the route method")
+        
+    def obtain_instance_token_num_from_engine_status(self, instance_id: int, engine_status: EngineStats) -> int:
+        # Faster way to get the token number from the engine status
+        return ceil(engine_status.get_kv_cache_utilization() * self.instance_to_max_model_len[instance_id])
+        # Slower way to get the token number from the engine status
+        # return engine_status.get_total_token_num()
+    
+    def update_instance_to_engine_status(self, instance_to_engine_status: dict[int, EngineStats]):
+        super().update_instance_to_engine_status(instance_to_engine_status)
+        for i, engine_stats in instance_to_engine_status.items():
+            self.instance_to_request_num[i] = engine_stats.get_waiting_and_running_queue_size()
+            self.instance_to_running_request_num[i] = engine_stats.snapshot.get("scheduler_stats", {}).get("num_running_reqs", 0)
+            self.instance_to_waiting_request_num[i] = engine_stats.snapshot.get("scheduler_stats", {}).get("num_waiting_reqs", 0)
+            if time.time() - self.last_logging_time[i] >= self.logging_interval_in_ms / 1000:
+                generation_throughput = engine_stats.get_generation_throughput()
+                self.logger.debug(f"Router collected engine status for instance {i}: "
+                                 f"request num {self.instance_to_request_num[i]}, "
+                                 f"token num change from {self.instance_to_token_num[i]} to {ceil(engine_stats.snapshot.get('scheduler_stats', {}).get('kv_cache_usage', 0.0) * self.instance_to_max_model_len[i])}, "
+                                 f"actual generation latency {self.instance_to_running_request_num[i] / generation_throughput if generation_throughput > 0 else float('nan')}, "
+                                 f"estimated generation latency {self._estimate_latency(i, self.instance_to_running_request_num[i], self.instance_to_token_num[i])}, "
+                                 f"actual generation throughput {generation_throughput}, "
+                                 f"estimated generation throughput {self._estimate_curr_throughput(i)}")
+                self.last_logging_time[i] = time.time()
+            self.instance_to_token_num[i] = self.obtain_instance_token_num_from_engine_status(i, engine_stats)
+            
+    def push_request(self, request: DataProto, instance_id: int):
+        super().push_request(request, instance_id)
+        # Do not update the request count here, it has been updated when the request is routed to the instance
+    
+    def pop_request(self, request: DataProto, instance_id: int):
+        super().pop_request(request, instance_id)
+        self.instance_to_request_num[instance_id] -= 1
+        self.instance_to_running_request_num[instance_id] -= 1
+        self.instance_to_token_num[instance_id] -= self._get_request_token_num(request)
+        
+    def is_staled(self, instance_id: int, engine_status: EngineStats) -> bool:
+        if super().is_staled(instance_id, engine_status):
+            return True
+        if engine_status.get_waiting_and_running_queue_size() != self.instance_to_request_num[instance_id]:
+            self.logger.debug(f"Instance {instance_id} collected engine status is stale, "
+                              f"waiting and running queue size {engine_status.get_waiting_and_running_queue_size()} "
+                              f"is not equal to the recorded request count {self.instance_to_request_num[instance_id]}")
+            return True
+        return False
+
+@register_route_strategy("throughput_optimal")
+class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
+    """Routes requests to the worker instance with optimal throughput."""
+        
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
+        self.logger.info("Initialized ThroughputOptimalRouteStrategy")
+        
+    # We regard the baseline delta throughput (also the max delta throughput) as the throughput after routing a request to an empty instance
+    def _estimate_baseline_delta_throughput(self, request: DataProto, instance_id: int) -> float:
+        return 1 / self._estimate_latency(instance_id, 1, self._get_request_token_num(request))
+    
+    def route(self, request: DataProto, candidates: Optional[List[int]] = None, route_kwargs: Optional[dict] = None) -> int:
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
             return None
-        # TODO(lhy)
-        raise NotImplementedError("ThroughputBalanceRouteStrategy is not implemented")
+        instance_to_version_after_sync = route_kwargs["instance_to_version_after_sync"]
+        candidates_group_by_priority = []
+        
+        # By default, route strategy groups candidates by version and sort them from smallest to largest
+        if not self.sort_candidate_by_indicator:
+            version_to_candidates = {}
+            for candidate in candidates:
+                version = instance_to_version_after_sync.get(candidate, 0)
+                if version not in version_to_candidates:
+                    version_to_candidates[version] = []
+                version_to_candidates[version].append(candidate)
+            
+            # Sort versions from smallest to largest
+            sorted_versions = sorted(version_to_candidates.keys())
+            # For the request with dynamic version tag, we reverse the sorted versions to try to allocate to the latest version first
+            if "version_tag" in request.non_tensor_batch and request.non_tensor_batch["version_tag"][0] == -1:
+                sorted_versions = sorted_versions[::-1]
+            for version in sorted_versions:
+                candidates_group_by_priority.append((version, version_to_candidates[version]))
+        # Group candidates by indicator and sort them from smallest to largest     
+        else:
+            assert "candidate_indicator_list" in route_kwargs, "candidate_indicator_list is required for CostModelBasedRouteStrategy when sort_candidate_by_indicator is False"
+            candidate_indicator_list = route_kwargs["candidate_indicator_list"]
+            assert len(candidate_indicator_list) == len(candidates), f"The number of candidates and candidate indicator list must be the same, but have {len(candidates)} candidates and {len(candidate_indicator_list)} candidate indicator list"
+            indicator_to_candidates = {}
+            for candidate, indicator in zip(candidates, candidate_indicator_list):
+                if indicator not in indicator_to_candidates:
+                    indicator_to_candidates[indicator] = []
+                indicator_to_candidates[indicator].append(candidate)
+            # Sort indicators from smallest to largest
+            for indicator in sorted(indicator_to_candidates.keys()):
+                candidates_group_by_priority.append((indicator, indicator_to_candidates[indicator]))
+        
+        # Process each group of candidates from highest priority to lowest priority
+        for indicator, candidates in candidates_group_by_priority:
+            # Calculate baseline threshold (use first candidate's baseline as reference)
+            baseline_delta_throughput = self._estimate_baseline_delta_throughput(request, candidates[0])
+            threshold = baseline_delta_throughput * self.delta_throughput_threshold
+            best_candidate = None
+            best_delta_throughput = float("-inf")
+            
+            # Find the candidate with maximum delta_throughput in this version group
+            for candidate in candidates:
+                if not self._can_run_directly(request, candidate):
+                    continue
+                estimated_curr_throughput = self._estimate_curr_throughput(candidate)
+                estimated_curr_throughput_after_route_request = self._estimate_curr_throughput_after_route_request(request, candidate)
+                delta_throughput = estimated_curr_throughput_after_route_request - estimated_curr_throughput
+                if delta_throughput > best_delta_throughput:
+                    best_delta_throughput = delta_throughput
+                    best_candidate = candidate
+                    
+            if best_candidate is None:
+                if "rollout_instance_id" in request.non_tensor_batch:
+                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
+                                     f"because none of the candidates can run directly (kv_cache is full), waiting request num is {self.instance_to_waiting_request_num}, running request num is {self.instance_to_running_request_num}, token num is {self.instance_to_token_num}, "
+                                     f"request token num is {self._get_request_token_num(request)}, max model len is {self.instance_to_max_model_len}")
+                else:
+                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
+                                     f"because none of the candidates can run directly (kv_cache is full), waiting request num is {self.instance_to_waiting_request_num}, running request num is {self.instance_to_running_request_num}, token num is {self.instance_to_token_num}, "
+                                     f"request token num is {self._get_request_token_num(request)}, max model len is {self.instance_to_max_model_len}")
+                continue
+            
+            # If this group's best delta_throughput meets the threshold, return it
+            if best_delta_throughput >= threshold and self.instance_to_request_num[best_candidate] < self.max_concurrent_seqs_per_instance:
+                # if best_delta_throughput >= threshold:
+                self.instance_to_request_num[best_candidate] += 1
+                self.instance_to_running_request_num[best_candidate] += 1
+                self.instance_to_token_num[best_candidate] += self._get_request_token_num(request)
+                if "rollout_instance_id" in request.non_tensor_batch:
+                    self.logger.info(f"Candidate in group {candidates} with indicator {indicator} meets the condition for partial rollout request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
+                                     f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
+                                     f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
+                else:
+                    self.logger.info(f"Candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
+                                     f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
+                                     f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
+                return best_candidate
+            else:
+                if "rollout_instance_id" in request.non_tensor_batch:
+                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for partial rollout request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
+                                    f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
+                                    f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
+                else:
+                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
+                                     f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
+                                     f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
+        
+        # If all groups' best delta_throughput are below threshold, return None
+        return None
 
+    def calculate_routing_benefit(self, request: DataProto, instance_id: int) -> float:
+        if not self._can_run_directly(request, instance_id):
+            # If the request cannot be run directly, return 0 as the routing benefit
+            return 0
+        estimated_curr_throughput = self._estimate_curr_throughput(instance_id)
+        estimated_curr_throughput_after_route_request = self._estimate_curr_throughput_after_route_request(request, instance_id)
+        delta_throughput = estimated_curr_throughput_after_route_request - estimated_curr_throughput
+        baseline_delta_throughput = self._estimate_baseline_delta_throughput(request, instance_id) * self.delta_throughput_threshold
+        return delta_throughput \
+            if delta_throughput >= baseline_delta_throughput and self.instance_to_request_num[instance_id] < self.max_concurrent_seqs_per_instance \
+            else 0
+        # return delta_throughput if delta_throughput >= baseline_delta_throughput else 0
+    
+@register_route_strategy("throughput_optimal_with_budget")
+class ThroughputOptimalWithBudgetRouteStrategy(ThroughputOptimalRouteStrategy):
+    """Routes requests to the worker instance with optimal throughput (considering the budget for each request)."""
+        
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
+        self.logger.info("Initialized ThroughputOptimalWithBudgetRouteStrategy")
+        
+    def _get_request_token_num(self, request: DataProto, log_len: bool = False) -> int:
+        assert "raw_prompt_ids" in request.non_tensor_batch, "raw_prompt_ids is required in non_tensor_batch"
+        prompt_token_num = len(request.non_tensor_batch["raw_prompt_ids"][0])
+        if "response_unpadded_len" in request.non_tensor_batch:
+            response_token_num = request.non_tensor_batch["response_unpadded_len"][0]
+        else:
+            response_token_num = 0
+        if log_len: # For debug
+            self.logger.info(f"Request {request.non_tensor_batch['uid'][0]} has {prompt_token_num} prompt tokens and {response_token_num} response tokens")
+        # Adjust the response token number to the nearest multiple of the budget for each request
+        return prompt_token_num + ceil((response_token_num + 1) / self.request_budget) * self.request_budget
+
+    def obtain_instance_token_num_from_engine_status(self, instance_id: int, engine_status: EngineStats) -> int:
+        all_request_prompt_token_num = engine_status.get_req_id_to_prompt_token_num().values()
+        all_request_response_token_num = engine_status.get_req_id_to_response_token_num().values()
+        assert len(all_request_prompt_token_num) == len(all_request_response_token_num), f"The number of prompts and responses must be the same, but have {len(all_request_prompt_token_num)} prompts and {len(all_request_response_token_num)} responses"
+        token_num_with_budget = 0
+        for request_prompt_token_num, request_response_token_num in zip(all_request_prompt_token_num, all_request_response_token_num):
+            token_num_with_budget += request_prompt_token_num
+            token_num_with_budget += ceil((request_response_token_num + 1) / self.request_budget) * self.request_budget
+        return token_num_with_budget
+
+    '''
+    def _get_actual_request_token_num(self, request: DataProto) -> int:
+        assert "raw_prompt_ids" in request.non_tensor_batch, "raw_prompt_ids is required in non_tensor_batch"
+        prompt_token_num = len(request.non_tensor_batch["raw_prompt_ids"][0])
+        if "response_unpadded_len" in request.non_tensor_batch:
+            response_token_num = request.non_tensor_batch["response_unpadded_len"][0]
+        else:
+            response_token_num = 0
+        return prompt_token_num + response_token_num
+    
+    def pop_request(self, request: DataProto, instance_id: int):
+        RouteStrategyBase.pop_request(self, request, instance_id)
+        self.instance_to_request_num[instance_id] -= 1
+        self.instance_to_running_request_num[instance_id] -= 1
+        self.instance_to_token_num[instance_id] -= self._get_actual_request_token_num(request)
+    '''    

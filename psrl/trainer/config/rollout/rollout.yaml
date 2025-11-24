@@ -8,6 +8,9 @@ name: vllm
 # sync: LLM, async: AsyncLLM
 mode: sync
 
+# Whether to disable the attention
+disable_attn: ${oc.select:psrl.profile.disable_attn,False}
+
 # Sampling temperature for rollout.
 temperature: 1.0
 
@@ -63,7 +66,7 @@ max_num_batched_tokens: 8192
 max_model_len: null
 
 # max length of sequences
-max_num_seqs: 1024
+max_num_seqs: ${oc.select:psrl.routing_strategy.max_concurrent_seqs_per_instance,1024}
 
 # may get higher throughput when set to True. When activated, Please increase max_num_batched_tokens or decrease max_model_len.
 enable_chunked_prefill: True

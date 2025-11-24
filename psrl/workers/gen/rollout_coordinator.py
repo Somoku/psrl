@@ -79,7 +79,6 @@ class RolloutCoordinator(CommandExtension):
         self._is_init_nixl_client = asyncio.Event()
         
         # Version tracking
-        self.currently_syncing_instance_ids: Set[int] = set() # The instance ids that are currently being synchronized with PS
         self.instance_to_latest_stale_model_version: dict[int, int] = {}  # The latest stale model version of each instance
         self.instance_to_model_version: dict[int, int] = {}  # Track the model version of each instance
         self.ps_model_version = 0  # Current model version in the parameter server
@@ -278,6 +277,7 @@ class RolloutCoordinator(CommandExtension):
                     # Interrupt the instance, pull the model weights from PS and resume generation.
                     instance_ids = command_args.get("instance_ids", None)
                     curr_ps_model_version = command_args.get("curr_ps_model_version", None)
+                    wait_model_sync = command_args.get("wait_model_sync", False)
                     if not isinstance(instance_ids, list):
                         instance_ids = [instance_ids]
                     if instance_ids is None or curr_ps_model_version is None:
@@ -287,21 +287,34 @@ class RolloutCoordinator(CommandExtension):
                         "SYNC command is only supported in 'psrl_async' rollout mode."
                     
                     # Sync with PS (interrupt, pull model, and resume generation)
-                    futures = []
+                    interrupt_futures = []
+                    sync_futures = []
+                    
                     for instance_id in instance_ids:
-                        future = None
                         if self.rank_0_is_model_owner:
-                            future = self.rollout_wg_list[instance_id].execute_rank_zero_async("sync_with_ps", curr_ps_model_version)
+                            interrupt_future = self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_generation")
                         else:
                             raise ValueError("SYNC command in SPMD-style is not supported yet.")
-                        futures.append(future)
-                    # Post process the command result
-                    # NOTE(linsh): it's not necessary for engine status sync loop to wait for pulling from PS,
-                    # so we simply mark the command as complete after.
-                    self._complete_command(command_id, result)
-                    interrupted_request_nums = await asyncio.gather(*futures)
+                        interrupt_futures.append(interrupt_future)
+                    interrupted_request_nums = await asyncio.gather(*interrupt_futures)  
                     for i, instance_id in enumerate(instance_ids):
-                        psrl_logger.info(f"Synced with PS on instance {instance_id}, interrupted {interrupted_request_nums[i]} requests")
+                        psrl_logger.info(f"Syncing with PS on instance {instance_id}, interrupted {interrupted_request_nums[i]} requests") 
+                    
+                    for instance_id in instance_ids:
+                        if self.rank_0_is_model_owner:
+                            sync_future = self.rollout_wg_list[instance_id].execute_rank_zero_async("sync_with_ps", curr_ps_model_version)
+                        else:
+                            raise ValueError("SYNC command in SPMD-style is not supported yet.")
+                        sync_futures.append(sync_future)
+                        
+                    # Post process the command result
+                    if wait_model_sync:
+                        await asyncio.gather(*sync_futures)
+                        self._complete_command(command_id, interrupted_request_nums)
+                    else:
+                        # NOTE(linsh): sometimes it's not necessary for the caller to wait for pulling from PS
+                        self._complete_command(command_id, interrupted_request_nums)
+                        await asyncio.gather(*sync_futures)  # Wait for the sync to complete
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
             
@@ -328,8 +341,18 @@ class RolloutCoordinator(CommandExtension):
             # Send to all agent loop workers to update the instance status
             # TODO(lhy): change it to a global router
             for agent_worker in self.agent_loop_workers:
-                futures.append(agent_worker.update_instance_status.remote(self.instance_to_engine_status, self.currently_syncing_instance_ids))
+                futures.append(agent_worker.update_instance_status.remote(self.instance_to_engine_status))
             await asyncio.gather(*futures)
+            
+    async def _is_routing(self) -> bool:
+        """Check if any agent loop worker is currently routing requests (i.e., the router is currently routing requests).
+        
+        Returns:
+            bool: True if any agent loop worker is currently routing requests, False otherwise.
+        """
+        is_routing = await asyncio.gather(*[agent_worker.is_routing.remote() for agent_worker in self.agent_loop_workers])
+        # psrl_logger.info(f"Is routing: {is_routing}")
+        return any(is_routing)
     
     async def _greedy_sync_loop(self):
         """
@@ -350,8 +373,6 @@ class RolloutCoordinator(CommandExtension):
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if self.instance_to_model_version.get(instance_id, 0) <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
                     continue
-                else:
-                    self.currently_syncing_instance_ids.discard(instance_id)
                 # Check whether instance version lags behind PS version
                 if self.instance_to_model_version.get(instance_id, 0) == self.ps_model_version:
                     continue
@@ -386,20 +407,25 @@ class RolloutCoordinator(CommandExtension):
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if engine_stats.model_version <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
                     continue
-                else:
-                    self.currently_syncing_instance_ids.discard(instance_id)
+                # We do not synchronize with PS if the router is currently routing requests
+                if (await self._is_routing()):
+                    # psrl_logger.info(f"Skipping synchronization with PS for instance {instance_id} because the router is currently routing requests")
+                    continue
                 # Check whether instance version lags behind PS version
                 if self.instance_to_model_version.get(instance_id, 0) == self.ps_model_version:
                     continue
                 # Check whether current instance workload is empty (forbid partial rollout) or satisfies the partial rollout policy
                 if self.config.psrl.partial_rollout.enable:
-                    if not self.check_partial_rollout(instance_id):
+                    if not (await self.check_should_sync(instance_id)):
                         continue
                 else:
                     if engine_stats.get_waiting_and_running_queue_size() > 0:
                         continue
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
+                # NOTE(lhy): currently, we only synchronize with PS for one instance at a time
+                # But the model pulling time can be overlapped
+                break
 
             if sync_instance_ids:
                 await self.sync_with_ps(sync_instance_ids)
@@ -434,7 +460,7 @@ class RolloutCoordinator(CommandExtension):
         self.instance_to_model_version[rollout_instance_id] = version_tag
         psrl_logger.info(f"Updated instance {rollout_instance_id} model version: {old_version} -> {version_tag}")
 
-    async def sync_with_ps(self, instance_ids: List[int]):
+    async def sync_with_ps(self, instance_ids: List[int], wait_model_sync: bool = False, wait_interrupted_partial_requests_loop_back: bool = True):
         """
         Synchronize with PS for the given instance IDs.
         """
@@ -444,15 +470,21 @@ class RolloutCoordinator(CommandExtension):
         # NOTE(lhy): we don't need to update the instance version here because the version is updated in the `sync_with_ps` method of the GenWorker
         # when calling `pull_model` or `pull_model_async` from the GenWorker, the ps manager will update the instance version.
         # However, we need to update the latest stale model version here to avoid stale stats being handled after the synchronization.
-        with log_dual_events(f"Synchronize rollout instances {instance_ids} with PS (model pull is non-blocking for the coordinator)", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
+        with log_dual_events(f"Synchronize rollout instances {instance_ids} with PS (model pull is {'non-blocking' if not wait_model_sync else 'blocking'} for the coordinator)", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
             for instance_id in instance_ids:
-                self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(instance_id, 0)    
-                self.currently_syncing_instance_ids.add(instance_id)
+                self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(instance_id, 0)   
+            await self.agent_loop_workers[0].interrupt_routing.remote()
+            await self.agent_loop_workers[0].update_currently_syncing_instances.remote(instance_ids, self.ps_model_version) 
             await self.exec_command(Command(
                 type=CommandType.SYNC,
                 instance_ids=instance_ids,
                 curr_ps_model_version=self.ps_model_version,
+                wait_model_sync=wait_model_sync,
             ), blocking=True)
+            if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(instance_ids)
+            psrl_logger.info(f"All interrupted requests have been looped back, resuming routing")
+            await self.agent_loop_workers[0].resume_routing.remote()
             
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
         """
@@ -467,20 +499,13 @@ class RolloutCoordinator(CommandExtension):
         active_task_nums = await asyncio.gather(*futures)
         return all(active_task_num == 0 for active_task_num in active_task_nums)
 
-    def check_partial_rollout(self, instance_id: int) -> bool:
+    async def check_should_sync(self, instance_id: int) -> bool:
         """
-        Check whether to partial rollout for the instance.
+        Check whether to synchronize with PS for the instance.
         """
         assert self.config.psrl.sync_strategy.method == "status_based", "Partial rollout is only supported for status-based sync strategy"
         assert self.config.psrl.status_collection.enable, "Partial rollout is only supported when status collection is enabled"
         assert self.config.psrl.partial_rollout.enable, "Partial rollout is not enabled"
-        # Currently we consider total waiting & running request counts as the workload metric
-        # 1. Check whether workload is above threshold
-        workload = self.instance_to_engine_status[instance_id].get_waiting_and_running_queue_size()
-        psrl_logger.debug(f"Instance {instance_id} (version {self.instance_to_model_version.get(instance_id, 0)}) "
-                          f"workload: {workload}, threshold: {self.config.psrl.partial_rollout.threshold}")
-        if workload > self.config.psrl.partial_rollout.threshold:
-            return False
-        # 2. TODO(lhy): Check whether instance workload would increase after update        
-        
-        return True
+        # TODO(lhy): refactor the router to be a global router
+        # psrl_logger.info(f"Attempting to sync and check for instance {instance_id}, ps model version: {self.ps_model_version}")
+        return await self.agent_loop_workers[0].check_should_sync.remote(instance_id, self.ps_model_version)

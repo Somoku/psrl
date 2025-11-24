@@ -25,6 +25,16 @@ ps_mode: cpu_ref
 # Logging path
 logging_path: ~/psrl_logs
 
+# Config for profile
+profile:
+
+  # Whether to disable the attention in Qwen2.5
+  disable_attn: False
+
+  # Whether to fix the weight of the model
+  # Useful for analysis
+  fix_weight: False
+
 # Config for logprobs
 log_prob:
 
@@ -86,15 +96,16 @@ status_collection:
   # Available options: "none", "partial_rollout", "prompt", "generation", "all"
   dump_logging_to_file_level: generation
 
+  # Logging interval in milliseconds
   dump_logging_to_file_interval_in_ms: 2000
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
-  # Here 100 means sync every 0.1 second
-  engine_sync_interval_in_ms: 100
+  # Here 10 means sync every 0.01 second
+  engine_sync_interval_in_ms: 10
 
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
-  # Here 1000 means sync every 0.5 second
-  coordinator_sync_interval_in_ms: 500
+  # Here 100 means sync every 0.01 second
+  coordinator_sync_interval_in_ms: 10
 
 # Redundant rollout config
 redundant_rollout:
@@ -120,33 +131,58 @@ partial_rollout:
   # Whether to enbale partial rollout
   enable: False
 
-  # Workload threshold to trigger partial rollout
-  threshold: null
-
   # Whether view interrupted trajectories as new prompts
   interrupt_as_prompt: False
 
 routing_strategy:
 
   # Method for rollout routing
-  # Available options: "random", "round_robin", "request_num_balance", "throuput_balance"
-  # If using "request_num_balance" or "throuput_balance", you need to enable status collection.
+  # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"
+  # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
   method: request_num_balance
+
+  # Whether to sort the candidates by indicator 
+  sort_candidate_by_indicator: False
+
+  # Whether to allocate the version tag dynamically (first routing to the instance, then allocate the version tag)
+  enable_dynamic_version_tag: False
+
+  # Whether to enable multiple priority queues for routing requests
+  enable_multi_priority_queue: False
 
   # Whether to enable global migration
   # If enabled, the router can migrate the partial rollout requests to other instances.
-  enable_global_migration: True
+  enable_global_migration: False
+
+  # Whether to enable group sampling on multiple instances
+  enable_group_sampling_on_multi_instances: True
+
+  # Logging interval in milliseconds
+  logging_interval_in_ms: 2000
+
+  # Path to the cost model (a json file)
+  cost_model_path: null
+
+  # Delta throughput threshold to stop request routing to an instance
+  delta_throughput_threshold: 0.5
+
+  # Request budget in tokens for each request
+  # It is used to estimate the length of the response tokens
+  request_budget: 1024
 
   # Snapshot staleness threshold in milliseconds
   # Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
-  snapshot_staleness_threshold_in_ms: 2000
+  snapshot_staleness_threshold_in_ms: 1000
 
-  # Max number of waiting requests per instance
-  max_num_waiting_reqs: 0
+  # Max number of waiting requests per instance after preemption
+  max_num_waiting_reqs_after_preemption: 1000
 
   # Max estimated concurrent sequences per instance
   # No need to tune this value, it is only used to estimate the max sequence length that can saturate the KV Cache
   max_estimated_concurrent_seqs_per_instance: 32768
+
+  # The actual max number of concurrent sequences per instance
+  max_concurrent_seqs_per_instance: 1024
 
 sync_strategy:
 
@@ -154,8 +190,23 @@ sync_strategy:
   # Available options: "status_based" or "greedy"
   method: status_based
 
+  # Indicator for model synchronization
+  # Available options: "request_num", "throughput", "kv_cache", "hypothesis_test"
+  # request_num: we check if the number of requests is lower than the threshold
+  # throughput: we check if the throughput is lower than the threshold
+  # kv_cache: we check if the KV Cache is saturated
+  # hypothesis_test (TODO): we check if there are any benefits from synchronization
+  indicator: request_num
+ 
+  # Workload threshold to trigger model synchronization
+  # When indicator is "request_num", threshold is the number of requests.
+  # When indicator is "throughput", threshold is the throughput.
+  # When indicator is "kv_cache", threshold is the KV Cache utilization.
+  # When indicator is "hypothesis_test", threshold is not used.
+  threshold: null
+
   # Check interval in millisecond for model synchronization
-  check_interval_in_ms: 500
+  check_interval_in_ms: 100
 
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:

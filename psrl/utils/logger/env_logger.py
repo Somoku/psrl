@@ -47,7 +47,7 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
         # Memory allocated and reserved by PyTorch
         try:
             allocated = torch.cuda.memory_allocated(i)
-            reserved  = torch.cuda.memory_reserved(i)
+            reserved = torch.cuda.memory_reserved(i)
             psrl_logger.log(level, f"Device {i}: memory_allocated={allocated/1024**2:.2f} MB, memory_reserved={reserved/1024**2:.2f} MB")
         except Exception as e:
             psrl_logger.log(level, f"Device {i}: memory usage query failed: {e}")

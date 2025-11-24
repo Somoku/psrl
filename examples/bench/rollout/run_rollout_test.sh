@@ -11,8 +11,8 @@ HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
 # Model configuration
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
-# HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B-Instruct
+# HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B-Instruct
 
 # vLLM configuration (simplified - no complex deployment)
 GEN_TP=${1:-4}  # Tensor parallel size for generation

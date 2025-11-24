@@ -1,5 +1,7 @@
 
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 from vllm.distributed.kv_events import KVEventBatch
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -8,9 +10,38 @@ from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_qu
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.core.sched.scheduler import Scheduler
-
+from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.metrics.stats import SchedulerStats
+    
 
 class RolloutScheduler(Scheduler):
+        
+    def make_stats(
+        self,
+        spec_decoding_stats: Optional[SpecDecodingStats] = None,
+    ) -> Optional[SchedulerStats]:
+        if not self.log_stats:
+            return None
+        prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
+        assert prefix_cache_stats is not None
+        req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
+        req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
+        # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
+        # 1. `need_to_abort_reqs` field. This is a set of request IDs that need to be aborted.
+        # 2. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
+        # 3. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
+        return SchedulerStats(
+            need_to_abort_reqs=self.need_to_abort_reqs,
+            req_id_to_prompt_token_num=req_id_to_prompt_token_num,
+            req_id_to_response_token_num=req_id_to_response_token_num,
+            num_running_reqs=len(self.running),
+            num_waiting_reqs=len(self.waiting),
+            kv_cache_usage=self.kv_cache_manager.usage,
+            prefix_cache_stats=prefix_cache_stats,
+            spec_decoding_stats=spec_decoding_stats,
+            num_corrupted_reqs=sum(req.is_output_corrupted
+                                   for req in self.running),
+        )
     
     # NOTE(lhy): The most of the code is copied from the vLLM 10.0.2 scheduler.
     # We refactor the logic of preemption to allow preempted sequences to directly returned as aborted.
@@ -31,6 +62,7 @@ class RolloutScheduler(Scheduler):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+        self.need_to_abort_reqs: list[str] = list()
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -119,15 +151,23 @@ class RolloutScheduler(Scheduler):
 
                     # NOTE(lhy): We examine the number of waiting requests to determine whether to abort the preempted request.
                     # Once aborted, the preempted request will be put back to the rollout router to be scheduled again.
-                    if len(self.waiting) > self.vllm_config.additional_config.get("max_num_waiting_reqs", 0):
+                    max_num_waiting_reqs_after_preemption = self.vllm_config.additional_config.get("max_num_waiting_reqs_after_preemption", 0)
+                    if len(self.waiting) > max_num_waiting_reqs_after_preemption:
+                        '''
                         preempted_req.status = RequestStatus.FINISHED_ABORTED
-                        self._free_request(request)
-                    else:    
-                        self.waiting.prepend_request(preempted_req)
-                        preempted_reqs.append(preempted_req)
-                        if preempted_req == request:
-                            # No more request to preempt. Cannot schedule this request.
-                            break
+                        print(f"Preempted request {preempted_req.request_id} is aborted because of max_num_waiting_reqs_after_preemption is {max_num_waiting_reqs_after_preemption}")
+                        self._free_request(preempted_req)
+                        '''
+                        # NOTE(lhy): the `need_to_abort_reqs` is set and put into the scheduler stats.
+                        # Afterwards inside vllm rollout, the abortion will be performed.
+                        print(f"Preempted request {preempted_req.request_id} is aborted because of max_num_waiting_reqs_after_preemption is {max_num_waiting_reqs_after_preemption}")
+                        self.need_to_abort_reqs.append(preempted_req.request_id)
+                    self.waiting.prepend_request(preempted_req)
+                    preempted_reqs.append(preempted_req)
+                    if preempted_req == request:
+                        # No more request to preempt.
+                        can_schedule = False
+                        break
                 else:
                     # The request can be scheduled.
                     can_schedule = True

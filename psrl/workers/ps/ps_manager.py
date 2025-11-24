@@ -129,7 +129,6 @@ class PSManager(RequestStatusTracker):
         
         Args:
             model_version (int): The model version to reserve entries for
-            
         Returns:
             int: The maximum number of entries that can be reserved for the given model version
         """
@@ -208,16 +207,97 @@ class PSManager(RequestStatusTracker):
     def ensure_buffer_exists(self, buffer_id: int):
         """Ensure a buffer exists in the staleness inventory."""
         self.staleness_inventory.ensure_buffer_exists(buffer_id)
+        
+    def can_reserve_request(
+        self,
+        request_idx: Union[int, List[int]],
+        model_versions: List[int],
+        without_new_reserve_entry: bool = False
+    ) -> List[bool]:
+        """
+        Check whether a request can be reserved for a given group of model versions.
+        
+        Args:
+            request_idx (int): The request index
+            model_versions (List[int]): The model versions that need to be checked
+            without_new_reserve_entry (bool): Whether to check if the request can be reserved without a new reserve entry
+        Returns:
+            List[bool]: Whether the request can be reserved for each model version
+        """
+        if not isinstance(request_idx, list):
+            results = []
+            for model_version in model_versions:
+                entry_info = EntryInfo(
+                    rollout_instance_id=-1, # Not important for this check
+                    prompt_id=request_idx // self.rollout_n,
+                    request_idx=request_idx % self.rollout_n,
+                    model_version=model_version
+                )
+                if without_new_reserve_entry:
+                    results.append(self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version))
+                else:
+                    results.append(self.staleness_inventory.can_reserve_data(entry_info, model_version))
+            return results
+        else:
+            multi_results = []
+            for request_id in request_idx:
+                results = []
+                for model_version in model_versions:
+                    entry_info = EntryInfo(
+                        rollout_instance_id=-1, # Not important for this check
+                        prompt_id=request_id // self.rollout_n,
+                        request_idx=request_id % self.rollout_n,
+                        model_version=model_version
+                    )
+                    if without_new_reserve_entry:
+                        results.append(self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version))
+                    else:
+                        results.append(self.staleness_inventory.can_reserve_data(entry_info, model_version))
+                multi_results.append(results)
+            return multi_results
+        
+    def get_reserve_indicator(
+        self,
+        request_id: int,
+        model_versions: List[int],
+    ) -> List[float]:
+        """
+        Get the indicator of reserving a request for a given model version.
+        indicator = inf: cannot reserve
+        indicator = -inf: can reserve without new reserve entry
+        indicator = -x: can reserve with new reserve entry in x-th pending buffer id
+        
+        Args:
+            request_id (int): The request id
+            model_versions (List[int]): The model versions that need to be checked
+        Returns:
+            List[int]: The indicator of reserving a request for each model version
+        """
+        indicators = []
+        for model_version in model_versions:
+            entry_info = EntryInfo(
+                rollout_instance_id=-1, # Not important for this check
+                prompt_id=request_id // self.rollout_n,
+                request_idx=request_id % self.rollout_n,
+                model_version=model_version
+            )
+            if self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
+                indicators.append(float('-inf'))
+            elif self.staleness_inventory.can_reserve_data(entry_info, model_version):
+                max_pending_buffer_id = self.staleness_inventory.get_max_pending_buffer_id(model_version + self.psrl_config.staleness)
+                indicators.append(-max_pending_buffer_id)
+            else:
+                indicators.append(float('inf'))
+        return indicators
 
     def reserve_rollout_instance_requests(
         self,
         rollout_instance_ids: Union[int, List[int]],
         request_ids: Union[int, List[int]],
         model_versions: Union[int, List[int]],
-        parent_ids: Optional[Union[bool, List[bool]]] = None,
     ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
         """
-        Reserve a request for a specific rollout instance.
+        Reserve requests for specific rollout instances and model versions.
         
         This method will reserve buffer entries for requests in the specified rollout instance,
         without storing actual rollout data in the staleness inventory.
@@ -228,8 +308,6 @@ class PSManager(RequestStatusTracker):
             rollout_instance_ids (Union[int, List[int]]): The rollout instance ids
             request_ids (Union[int, List[int]]): The request ids
             model_versions (Union[int, List[int]]): The model versions
-            parent_ids (Optional[Union[bool, List[bool]]]): Whether to reserve entries by parent request
-            
         Returns:
             Tuple[Optional[List[int]], Optional[List[int]]]: A tuple containing two lists:
                 - List of reserved buffer ids
@@ -242,15 +320,9 @@ class PSManager(RequestStatusTracker):
             request_ids = [request_ids]
         if not isinstance(model_versions, list):
             model_versions = [model_versions]
-        if parent_ids is not None and not isinstance(parent_ids, list):
-            parent_ids = [parent_ids]
         
         for rollout_instance_id in rollout_instance_ids:
-            assert rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
-        
-        if parent_ids:
-            assert len(request_ids) == 1 or len(parent_ids) * self.rollout_n == len(request_ids), \
-                f"Length of parent_ids ({len(parent_ids)}) * rollout_n ({self.rollout_n}) must equal length of request_ids ({len(request_ids)})."
+            assert rollout_instance_id == -1 or rollout_instance_id in self.rollout_instance_tracker, f"Rollout instance {rollout_instance_id} is not registered."
         
         # Initialize the reserved entry and buffer ids
         entry_ids = []

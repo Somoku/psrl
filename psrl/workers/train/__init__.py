@@ -1,4 +1,4 @@
-from .base_train_worker import TrainInterface, PSRL_BaseTrainWorker
+from .base_train_worker import PSRL_BaseTrainWorker, TrainInterface
 
 # NOTE(linsh): Backend-specific worker will be lazily imported
 

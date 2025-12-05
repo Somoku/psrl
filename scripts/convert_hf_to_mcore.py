@@ -16,8 +16,9 @@
 import argparse
 import os
 import warnings
-from contextlib import contextmanager
-from typing import Any, Callable, ContextManager
+from collections.abc import Callable
+from contextlib import AbstractContextManager, contextmanager
+from typing import Any
 
 import torch
 from accelerate import init_empty_weights
@@ -28,16 +29,29 @@ from megatron.core.dist_checkpointing.serialization import StrictHandling
 from megatron.core.models.gpt.gpt_model import ModelType
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from transformers import AutoConfig
-
 from verl.models.mcore import hf_to_mcore_config
 from verl.utils.megatron_utils import get_model
 
 
 def _init_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--hf_model_path", type=str, required=True, help="The path for the huggingface model")
-    parser.add_argument("--output_path", type=str, required=True, help="The path for the output mcore model")
-    parser.add_argument("--use_cpu_initialization", action="store_true", help="Whether to use cpu initialization")
+    parser.add_argument(
+        "--hf_model_path",
+        type=str,
+        required=True,
+        help="The path for the huggingface model",
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        required=True,
+        help="The path for the output mcore model",
+    )
+    parser.add_argument(
+        "--use_cpu_initialization",
+        action="store_true",
+        help="Whether to use cpu initialization",
+    )
     parser.add_argument("--test", action="store_true", help="Whether to test the conversion")
     parser.add_argument("--trust_remote_code", action="store_true", help="Whether to trust remote code")
     args = parser.parse_args()
@@ -57,7 +71,7 @@ def test_conversion(megatron_model_provider, tfconfig, output_path, model):
     dist_checkpointing.load(ref_state_dict, output_path, strict=StrictHandling.ASSUME_OK_UNEXPECTED)
 
     dut_state_dict = model[0].module.state_dict()
-    for name in dut_state_dict.keys():
+    for name in dut_state_dict:
         if dut_state_dict[name] is None:
             print(f"[Warning] {name} is none in dut_state_dict")
             continue
@@ -73,15 +87,12 @@ def test_conversion(megatron_model_provider, tfconfig, output_path, model):
             print(f"{name} is equal")
         else:
             print(f"[Warning] {name} is not in ref_state_dict")
-    for name in ref_state_dict.keys():
+    for name in ref_state_dict:
         if ref_state_dict[name] is None:
             print(f"[Warning] {name} is none in ref_state_dict")
             continue
         ref_data = ref_state_dict[name]
-        if isinstance(ref_data, ShardedTensor):
-            ref_data = ref_data.data.view(ref_data.local_shape)
-        else:
-            ref_data = ref_data.data
+        ref_data = ref_data.data.view(ref_data.local_shape) if isinstance(ref_data, ShardedTensor) else ref_data.data
         if name in dut_state_dict:
             dut_data = dut_state_dict[name].data
             assert dut_data.shape == ref_data.shape, f"{name=} {dut_data.shape=} {ref_data.shape=}"
@@ -107,7 +118,11 @@ def convert_checkpoint_from_transformers_to_megatron(hf_model, model, hf_config)
             layer.self_attention.linear_qkv.layer_norm_weight.copy_(hf_layer.input_layernorm.weight)
 
             q = hf_layer.self_attn.q_proj.weight.view(
-                [num_key_value_heads, head_dim * num_attention_heads // num_key_value_heads, -1]
+                [
+                    num_key_value_heads,
+                    head_dim * num_attention_heads // num_key_value_heads,
+                    -1,
+                ]
             )
             k = hf_layer.self_attn.k_proj.weight.view([num_key_value_heads, head_dim, -1])
             v = hf_layer.self_attn.v_proj.weight.view([num_key_value_heads, head_dim, -1])
@@ -138,7 +153,10 @@ def convert_checkpoint_from_transformers_to_megatron(hf_model, model, hf_config)
             if has_share_expert:
                 layer.mlp.shared_experts.gate_weight.copy_(hf_layer.mlp.shared_expert_gate.weight)
                 shared_fc1_weight = torch.cat(
-                    [hf_layer.mlp.shared_expert.gate_proj.weight, hf_layer.mlp.shared_expert.up_proj.weight]
+                    [
+                        hf_layer.mlp.shared_expert.gate_proj.weight,
+                        hf_layer.mlp.shared_expert.up_proj.weight,
+                    ]
                 )
                 layer.mlp.shared_experts.linear_fc1.weight.copy_(shared_fc1_weight)
                 layer.mlp.shared_experts.linear_fc2.weight.copy_(hf_layer.mlp.shared_expert.down_proj.weight)
@@ -152,9 +170,8 @@ def safe_copy(
     dst_tensor: torch.Tensor,
     skip_dtype_assert: bool = False,
 ):
-    if not skip_dtype_assert:
-        if src_tensor.dtype != dst_tensor.dtype:
-            raise ValueError(f"Get source dtype {src_tensor.dtype}, but target dtype {dst_tensor.dtype}")
+    if not skip_dtype_assert and src_tensor.device != dst_tensor.device:
+        raise ValueError(f"Get source dtype {src_tensor.dtype}, but target dtype {dst_tensor.dtype}")
     assert src_tensor.shape == dst_tensor.shape
     dst_tensor.data.copy_(src_tensor.data)
     return src_tensor.numel()
@@ -228,7 +245,10 @@ def convert_checkpoint_from_transformers_to_megatron_qwen2_5_vl(hfmodel, mgmodel
     copied_numel = 0
     copied_numel += safe_copy(hfllm.embed_tokens.weight, mgllm.embedding.word_embeddings.weight)
     for mglayer, hflayer in zip(mgllm.decoder.layers, hfllm.layers):
-        copied_numel += safe_copy(hflayer.input_layernorm.weight, mglayer.self_attention.linear_qkv.layer_norm_weight)
+        copied_numel += safe_copy(
+            hflayer.input_layernorm.weight,
+            mglayer.self_attention.linear_qkv.layer_norm_weight,
+        )
 
         q_proj_weight = hflayer.self_attn.q_proj.weight.view(num_query_groups, -1, head_dim, hidden_size)
         k_proj_weight = hflayer.self_attn.k_proj.weight.view(num_query_groups, -1, head_dim, hidden_size)
@@ -247,7 +267,10 @@ def convert_checkpoint_from_transformers_to_megatron_qwen2_5_vl(hfmodel, mgmodel
         copied_numel += safe_copy(fc1_weight, mglayer.mlp.linear_fc1.weight)
 
         copied_numel += safe_copy(hflayer.mlp.down_proj.weight, mglayer.mlp.linear_fc2.weight)
-        copied_numel += safe_copy(hflayer.post_attention_layernorm.weight, mglayer.mlp.linear_fc1.layer_norm_weight)
+        copied_numel += safe_copy(
+            hflayer.post_attention_layernorm.weight,
+            mglayer.mlp.linear_fc1.layer_norm_weight,
+        )
 
     copied_numel += safe_copy(hfllm.norm.weight, mgllm.decoder.final_layernorm.weight)
     if not hf_config.tie_word_embeddings:
@@ -269,27 +292,46 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(hf_model, model, hf_
         numel += safe_copy(hf_layer.input_layernorm.weight, layer.input_layernorm.weight)
 
         if hf_config.q_lora_rank is None:
-            numel += safe_copy(hf_layer.self_attn.q_proj.weight, layer.self_attention.linear_q_proj.weight)
-        else:
-            numel += safe_copy(hf_layer.self_attn.q_a_proj.weight, layer.self_attention.linear_q_down_proj.weight)
-            numel += safe_copy(hf_layer.self_attn.q_b_proj.weight, layer.self_attention.linear_q_up_proj.weight)
             numel += safe_copy(
-                hf_layer.self_attn.q_a_layernorm.weight, layer.self_attention.linear_q_up_proj.layer_norm_weight
+                hf_layer.self_attn.q_proj.weight,
+                layer.self_attention.linear_q_proj.weight,
+            )
+        else:
+            numel += safe_copy(
+                hf_layer.self_attn.q_a_proj.weight,
+                layer.self_attention.linear_q_down_proj.weight,
+            )
+            numel += safe_copy(
+                hf_layer.self_attn.q_b_proj.weight,
+                layer.self_attention.linear_q_up_proj.weight,
+            )
+            numel += safe_copy(
+                hf_layer.self_attn.q_a_layernorm.weight,
+                layer.self_attention.linear_q_up_proj.layer_norm_weight,
             )
 
         numel += safe_copy(
-            hf_layer.self_attn.kv_a_proj_with_mqa.weight, layer.self_attention.linear_kv_down_proj.weight
+            hf_layer.self_attn.kv_a_proj_with_mqa.weight,
+            layer.self_attention.linear_kv_down_proj.weight,
         )
-        numel += safe_copy(hf_layer.self_attn.kv_b_proj.weight, layer.self_attention.linear_kv_up_proj.weight)
         numel += safe_copy(
-            hf_layer.self_attn.kv_a_layernorm.weight, layer.self_attention.linear_kv_up_proj.layer_norm_weight
+            hf_layer.self_attn.kv_b_proj.weight,
+            layer.self_attention.linear_kv_up_proj.weight,
+        )
+        numel += safe_copy(
+            hf_layer.self_attn.kv_a_layernorm.weight,
+            layer.self_attention.linear_kv_up_proj.layer_norm_weight,
         )
         numel += safe_copy(hf_layer.self_attn.o_proj.weight, layer.self_attention.linear_proj.weight)
 
         if not hasattr(layer.mlp, "router"):
-            numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.mlp.linear_fc1.layer_norm_weight)
             numel += safe_copy(
-                torch.cat([hf_layer.mlp.gate_proj.weight, hf_layer.mlp.up_proj.weight]), layer.mlp.linear_fc1.weight
+                hf_layer.post_attention_layernorm.weight,
+                layer.mlp.linear_fc1.layer_norm_weight,
+            )
+            numel += safe_copy(
+                torch.cat([hf_layer.mlp.gate_proj.weight, hf_layer.mlp.up_proj.weight]),
+                layer.mlp.linear_fc1.weight,
             )
             numel += safe_copy(hf_layer.mlp.down_proj.weight, layer.mlp.linear_fc2.weight)
         else:
@@ -297,7 +339,9 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(hf_model, model, hf_
             # NOTE: the e_score_correction_bias in mcore model will be initialized with bfloat16 and \
             # recover to fp32 in the first forward. There is always a diff in the bias between two models (~0.3%)
             numel += safe_copy(
-                hf_layer.mlp.gate.e_score_correction_bias, layer.mlp.router.expert_bias, skip_dtype_assert=True
+                hf_layer.mlp.gate.e_score_correction_bias,
+                layer.mlp.router.expert_bias,
+                skip_dtype_assert=True,
             )
             if tfconfig.moe_grouped_gemm:
                 for i, hf_expert in enumerate(hf_layer.mlp.experts):
@@ -314,10 +358,16 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(hf_model, model, hf_
                     numel += safe_copy(hf_expert.down_proj.weight, expert.linear_fc2.weight)
             numel += safe_copy(hf_layer.post_attention_layernorm.weight, layer.pre_mlp_layernorm.weight)
             shared_fc1_weight = torch.cat(
-                [hf_layer.mlp.shared_experts.gate_proj.weight, hf_layer.mlp.shared_experts.up_proj.weight]
+                [
+                    hf_layer.mlp.shared_experts.gate_proj.weight,
+                    hf_layer.mlp.shared_experts.up_proj.weight,
+                ]
             )
             numel += safe_copy(shared_fc1_weight, layer.mlp.shared_experts.linear_fc1.weight)
-            numel += safe_copy(hf_layer.mlp.shared_experts.down_proj.weight, layer.mlp.shared_experts.linear_fc2.weight)
+            numel += safe_copy(
+                hf_layer.mlp.shared_experts.down_proj.weight,
+                layer.mlp.shared_experts.linear_fc2.weight,
+            )
             print(f"{layer_idx=} {numel=} numel this layer={numel - numel_cur}")
 
     numel += safe_copy(hf_model.model.norm.weight, model.decoder.final_layernorm.weight)
@@ -333,7 +383,13 @@ def noop_context() -> Any:
     yield
 
 
-def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False, test=False, trust_remote_code=False):
+def convert_hf_to_mcore(
+    hf_model_path,
+    output_path,
+    use_cpu_initialization=False,
+    test=False,
+    trust_remote_code=False,
+):
     os.makedirs(output_path, exist_ok=True)
     if len(os.listdir(output_path)) > 0 and not test:
         print(f"Output path {output_path} is not empty, skipping conversion")
@@ -375,7 +431,7 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
         )
         return parallel_model
 
-    context: Callable[..., ContextManager] = init_empty_weights if use_cpu_initialization else noop_context
+    context: Callable[..., AbstractContextManager] = init_empty_weights if use_cpu_initialization else noop_context
     with context():
         model = get_model(
             model_provider_func=megatron_model_provider,
@@ -395,11 +451,15 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
     # init hf model
     if "Qwen2_5_VLForConditionalGeneration" in hf_config.architectures:
         hf_model = AutoModelForImageTextToText.from_pretrained(
-            hf_model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
+            hf_model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=trust_remote_code,
         )
     else:
         hf_model = AutoModelForCausalLM.from_pretrained(
-            hf_model_path, torch_dtype=torch.bfloat16, trust_remote_code=trust_remote_code
+            hf_model_path,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=trust_remote_code,
         )
     hf_state_dict = hf_model.state_dict()
 
@@ -413,7 +473,10 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
             hf_model, model[0].module, hf_config, tfconfig=tfconfig
         )
         if numel != hf_model.num_parameters():
-            warnings.warn(f"numel mismatch: {numel=} != {hf_model.num_parameters()=}", stacklevel=1)
+            warnings.warn(
+                f"numel mismatch: {numel=} != {hf_model.num_parameters()=}",
+                stacklevel=1,
+            )
     elif "Qwen3MoeForCausalLM" in hf_config.architectures:
         convert_checkpoint_from_transformers_to_megatron(hf_model, model[0].module, hf_config)
     else:
@@ -433,7 +496,12 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
 
     # save megatron model
     if len(os.listdir(output_path)) == 0:
-        dist_checkpointing.save(megatron_state_dict, output_path, sharded_strategy=None, async_sharded_save=False)
+        dist_checkpointing.save(
+            megatron_state_dict,
+            output_path,
+            sharded_strategy=None,
+            async_sharded_save=False,
+        )
     if test:
         test_conversion(megatron_model_provider, tfconfig, output_path, model)
 
@@ -441,5 +509,9 @@ def convert_hf_to_mcore(hf_model_path, output_path, use_cpu_initialization=False
 if __name__ == "__main__":
     args = _init_args()
     convert_hf_to_mcore(
-        args.hf_model_path, args.output_path, args.use_cpu_initialization, args.test, args.trust_remote_code
+        args.hf_model_path,
+        args.output_path,
+        args.use_cpu_initialization,
+        args.test,
+        args.trust_remote_code,
     )

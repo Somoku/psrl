@@ -1,25 +1,23 @@
 # fsdp2_demo.py
 
 import os
-import warnings
 
 import torch
 import torch.distributed as dist
 from accelerate import init_empty_weights
-from transformers import AutoConfig, AutoModelForCausalLM
-
-# 注意：FSDP2 API
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    StateDictType,
-    StateDictConfig,
-    CPUOffloadPolicy,
-    MixedPrecisionPolicy,
-    FullyShardedDataParallel,
-    fully_shard
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    set_model_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
+from torch.distributed.fsdp import (
+    CPUOffloadPolicy,
+    MixedPrecisionPolicy,
+    fully_shard,
+)
+
+# 注意：FSDP2 API
+from transformers import AutoConfig, AutoModelForCausalLM
 
 
 def get_init_weight_context_manager(use_meta_tensor: bool = True):
@@ -93,25 +91,16 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_state: dict, cpu_off
 
     # 1. 首先把 wrapper 后的 model 全部转到 GPU 并让参数成为 EmptyTensor（指向本地 GPU），
     #    这样 set_model_state_dict 才能 “in-place fill” 进去每张卡对应的切片。
-    if rank == 0:
-        # rank 0：直接 move_to GPU
-        model = model.to(device=local_cuda, non_blocking=True)
-    else:
-        # 其他 rank：move_to_empty GPU（即占个地址但不真正分配内存）
-        model = model.to_empty(device=local_cuda)
-        
-    '''
+    model = model.to(device=local_cuda, non_blocking=True) if rank == 0 else model.to_empty(device=local_cuda)
+
+    """
     for name, param in model.named_parameters():
         print(f"[Rank {rank}]: before set_model_state_dict, {name}, {param}, {param.shape}")
-    '''
+    """
 
     # 2. 调用 FSDP2 的 set_model_state_dict，将 full_state_dict 切片并加载到各卡。
     cpu_offload_enabled = cpu_offload is not None
-    options = StateDictOptions(
-        full_state_dict=True,
-        cpu_offload=cpu_offload_enabled,
-        broadcast_from_rank0=True
-    )
+    options = StateDictOptions(full_state_dict=True, cpu_offload=cpu_offload_enabled, broadcast_from_rank0=True)
     # 内部会自动把 full_state（只有 rank 0 有真正数据）广播到其他 rank，
     # 并让每个 rank 只收到自己本地 shard。
     set_model_state_dict(model, full_state, options=options)
@@ -138,9 +127,7 @@ def apply_fsdp2_wrapper(model: torch.nn.Module, fsdp_config: dict, config: AutoC
     """
     # 1. 找出需要 wrap 的子模块列表
     default_no_split = getattr(model, "_no_split_modules", None)
-    wrap_cls_names = fsdp_config.get("wrap_policy", {}).get(
-        "transformer_layer_cls_to_wrap", default_no_split
-    )
+    wrap_cls_names = fsdp_config.get("wrap_policy", {}).get("transformer_layer_cls_to_wrap", default_no_split)
     if isinstance(wrap_cls_names, str):
         wrap_cls_names = [wrap_cls_names]
     assert wrap_cls_names and wrap_cls_names[0] is not None
@@ -148,8 +135,9 @@ def apply_fsdp2_wrapper(model: torch.nn.Module, fsdp_config: dict, config: AutoC
 
     modules_to_wrap = []
     for name, subm in model.named_modules():
-        if subm.__class__.__name__ in wrap_cls_names \
-           or (isinstance(subm, torch.nn.Embedding) and not getattr(model.config, "tie_word_embeddings", False)):
+        if subm.__class__.__name__ in wrap_cls_names or (
+            isinstance(subm, torch.nn.Embedding) and not getattr(model.config, "tie_word_embeddings", False)
+        ):
             modules_to_wrap.append(subm)
 
     # 2. 先 wrap 各个 Transformer 层、Embedding
@@ -197,9 +185,7 @@ def main():
 
     # ——5. 第二阶段：Apply FSDP2 Wrapper
     #    配置 MixedPrecision + CPUOffload（可根据需要调整）
-    mp_policy = MixedPrecisionPolicy(param_dtype=torch_dtype,
-                                     reduce_dtype=torch.float32,
-                                     cast_forward_inputs=True)
+    mp_policy = MixedPrecisionPolicy(param_dtype=torch_dtype, reduce_dtype=torch.float32, cast_forward_inputs=True)
     # 这里示例让 actor 不 offload，其他角色 offload，本文就统一设 None
     cpu_offload = None  # CPUOffloadPolicy(pin_memory=True)  # 若要 offload，可启用这一行
 
@@ -207,7 +193,7 @@ def main():
         "mesh": mesh,
         "offload_policy": cpu_offload,
         "mp_policy": mp_policy,
-        "reshard_after_forward": False,   # 只是示例，真实训练可置 True
+        "reshard_after_forward": False,  # 只是示例，真实训练可置 True
     }
     # Wrap
     apply_fsdp2_wrapper(model, fsdp_kwargs, config)
@@ -221,7 +207,10 @@ def main():
     fsdp2_load_full_state_dict(model, full_state, cpu_offload)
 
     # 打印：第三阶段加载完毕后，各 rank 上对应自己的切片参数分布
-    print_model_param_stats(model, "第三阶段：set_model_state_dict + 切片加载完成后（各 rank 仅保留本地 shard）")
+    print_model_param_stats(
+        model,
+        "第三阶段：set_model_state_dict + 切片加载完成后（各 rank 仅保留本地 shard）",
+    )
 
     # ——7. Barrier 同步，并 exit
     dist.barrier()

@@ -2,16 +2,24 @@
 import inspect
 
 from verl import DataProto
+
+from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop import register
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
-from psrl.utils.reward_score import default_compute_score_async
 
 
 @register("dapo")
 class DAPORewardLoopManager(RewardLoopManagerBase):
     """Reward loop for DAPO."""
 
-    def __init__(self, config, tokenizer, compute_score=None, reward_model_router=None, reward_model_tokenizer=None):
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        compute_score=None,
+        reward_model_router=None,
+        reward_model_tokenizer=None,
+    ):
         super().__init__(config, tokenizer)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
@@ -44,7 +52,8 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
 
         response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            None,
+            lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True),
         )
         if self.is_async_reward_score:
             result = await self.compute_score(

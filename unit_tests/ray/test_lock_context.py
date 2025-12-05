@@ -1,7 +1,9 @@
-import ray
-import time
 import asyncio
+import time
 from collections import deque
+
+import ray
+
 
 # --------------------------------------------
 # 1. 定义 add_lock 装饰器，将锁逻辑注入到任意类
@@ -47,9 +49,9 @@ def add_lock(cls):
             self._locked = False
 
     # 将新的 __init__、acquire、release 绑定到原类
-    setattr(cls, "__init__", __init__)
-    setattr(cls, "acquire", acquire)
-    setattr(cls, "release", release)
+    cls.__init__ = __init__
+    cls.acquire = acquire
+    cls.release = release
     return cls
 
 
@@ -90,6 +92,7 @@ class CounterActor:
 # --------------------------------------------
 # 4. 定义两个 worker：一个不加锁，一个加锁
 # --------------------------------------------
+
 
 @ray.remote
 def worker_no_lock(counter: ray.actor.ActorHandle, work_id: int):
@@ -134,10 +137,7 @@ if __name__ == "__main__":
     counter1 = CounterActor.remote()
 
     # 并行启动 NUM_WORKERS 个无锁 worker
-    futures_no_lock = [
-        worker_no_lock.remote(counter1, i)
-        for i in range(NUM_WORKERS)
-    ]
+    futures_no_lock = [worker_no_lock.remote(counter1, i) for i in range(NUM_WORKERS)]
     # 等待所有无锁 worker 完成
     results_no_lock = ray.get(futures_no_lock)
     for r in results_no_lock:
@@ -153,10 +153,7 @@ if __name__ == "__main__":
     counter2 = CounterActor.remote()
 
     # 并行启动 NUM_WORKERS 个有锁 worker
-    futures_with_lock = [
-        worker_with_lock.remote(counter2, i)
-        for i in range(NUM_WORKERS)
-    ]
+    futures_with_lock = [worker_with_lock.remote(counter2, i) for i in range(NUM_WORKERS)]
     results_with_lock = ray.get(futures_with_lock)
     for r in results_with_lock:
         print(r)

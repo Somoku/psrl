@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from verl.base_config import BaseConfig
 
@@ -38,7 +38,7 @@ class FilterGroupsConfig(BaseConfig):
     """
 
     enable: bool = False
-    metric: Optional[str] = None
+    metric: str | None = None
     max_num_gen_batches: int = 0
 
 
@@ -70,4 +70,4 @@ class AlgoConfig(BaseConfig):
     kl_ctrl: KLControlConfig = field(default_factory=KLControlConfig)
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
-    filter_groups: Optional[FilterGroupsConfig] = None
+    filter_groups: FilterGroupsConfig | None = None

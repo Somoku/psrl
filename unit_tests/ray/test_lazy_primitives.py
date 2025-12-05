@@ -1,7 +1,8 @@
 import time
+
 import numpy as np
 import ray
-from psrl.utils.ray import lazy_put, lazy_get, LazyObjectRef
+from psrl.utils.ray import lazy_get, lazy_put
 
 
 def test_lazy_vs_normal_put_get():
@@ -17,7 +18,7 @@ def test_lazy_vs_normal_put_get():
     t0 = time.time()
     obj_ref = ray.put(x)
     t1 = time.time()
-    y = ray.get(obj_ref)
+    _ = ray.get(obj_ref)
     t2 = time.time()
     print(f"Normal ray.put time: {t1 - t0:.4f}s, ray.get time: {t2 - t1:.4f}s, total: {t2 - t0:.4f}s")
 
@@ -35,6 +36,7 @@ def test_lazy_vs_normal_put_get():
 
     # Check correctness
     assert np.allclose(y_lazy, x)
+
 
 if __name__ == "__main__":
     test_lazy_vs_normal_put_get()

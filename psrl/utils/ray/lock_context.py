@@ -1,6 +1,8 @@
-import ray
 import asyncio
 from collections import deque
+
+import ray
+
 
 def add_lock(cls):
     """
@@ -32,21 +34,22 @@ def add_lock(cls):
         else:
             self._locked = False
 
-    setattr(cls, "__init__", __init__)
-    setattr(cls, "acquire", acquire)
-    setattr(cls, "release", release)
+    cls.__init__ = __init__
+    cls.acquire = acquire
+    cls.release = release
     return cls
 
 
 class RayLock:
     """Synchronous context manager around a LockActor."""
+
     def __init__(self, lock_actor):
         self._lock = lock_actor
-        
+
     def acquire(self):
         """Acquire the lock, blocking until it is available."""
         ray.get(self._lock.acquire.remote())
-        
+
     def release(self):
         """Release the lock."""
         ray.get(self._lock.release.remote())
@@ -58,17 +61,18 @@ class RayLock:
     def __exit__(self, exc_type, exc, tb):
         # release regardless of exception
         self.release()
-        
+
 
 class AsyncRayLock:
     """Asynchronous context manager around a LockActor."""
+
     def __init__(self, lock_actor):
         self._lock = lock_actor
-        
+
     async def acquire(self):
         """Acquire the lock, blocking until it is available."""
         await self._lock.acquire.remote()
-        
+
     async def release(self):
         """Release the lock."""
         await self._lock.release.remote()

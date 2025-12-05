@@ -1,15 +1,23 @@
+from collections import OrderedDict
+
 import torch
 from torch.nn import Parameter
-from typing import Dict, List, Tuple, Optional
-from collections import OrderedDict
-from vllm.model_executor.layers.linear import set_weight_attrs
 from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, RowParallelLinear
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+    set_weight_attrs,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-from psrl.utils.converter.model_mappings import ParameterMapping, slice_gate_up_proj, slice_qkv_proj, MappingType
 from psrl.utils.converter.base_converter import BaseConverter
+from psrl.utils.converter.model_mappings import (
+    MappingType,
+    ParameterMapping,
+    slice_gate_up_proj,
+    slice_qkv_proj,
+)
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
@@ -21,8 +29,8 @@ def enable_sharded_weight_attrs(params: dict[str, Parameter]):
 
 class VllmConverter(BaseConverter):
     """Convert vLLM model to a unified format (i.e., HuggingFace) and generate sharding info."""
-    
-    def __init__(self, parameter_mapping: ParameterMapping, tp_rank: Optional[int] = 1):
+
+    def __init__(self, parameter_mapping: ParameterMapping, tp_rank: int | None = 1):
         self.parameter_mapping = parameter_mapping
         self.tp_rank = tp_rank
         self.model_info = parameter_mapping.get_model_info()
@@ -33,10 +41,13 @@ class VllmConverter(BaseConverter):
                 self.fused_mappings[vllm_name] = (mapping_type, [])
             else:
                 assert mapping_type != MappingType.DIRECT, f"Mapping type should not be DIRECT for {vllm_name}"
-                assert mapping_type == self.fused_mappings[vllm_name][0], f"Mapping type for {vllm_name} must be the same, but got {mapping_type} and {self.fused_mappings[vllm_name][0]}"
+                assert mapping_type == self.fused_mappings[vllm_name][0], (
+                    f"Mapping type for {vllm_name} must be the same, "
+                    f"but got {mapping_type} and {self.fused_mappings[vllm_name][0]}"
+                )
             self.fused_mappings[vllm_name][1].append((hf_name, shard_id))
-        
-    def convert_state_and_sharding_dict(self, model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:
+
+    def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
         Convert vLLM model to unified state dict and generate sharding info.
         Args:
@@ -46,11 +57,11 @@ class VllmConverter(BaseConverter):
         """
         converted_state_dict = {}
         sharding_dict = {}
-        
+
         # Workaround: for lm_head, we do not care if it shares the weight with wte
         lm_head_module = None
         lm_head_module_prefix = None
-        if hasattr(model, 'lm_head'):
+        if hasattr(model, "lm_head"):
             lm_head_module = model.lm_head
             lm_head_module_prefix = "lm_head"
 
@@ -66,7 +77,7 @@ class VllmConverter(BaseConverter):
                 for new_param_name, new_param in new_params.items():
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding
-        
+
         # Handle lm_head separately
         if lm_head_module is not None and (lm_head_module_prefix not in seen_module_prefixes):
             module = lm_head_module
@@ -78,19 +89,22 @@ class VllmConverter(BaseConverter):
                 for new_param_name, new_param in new_params.items():
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding
-        
+
         return converted_state_dict, sharding_dict
 
     def convert_parameter(self, full_name: str, param: Parameter, module) -> dict:
         """
-        Convert the parameter, may need to split inplace if it matches a split mapping type (e.g., qkv_proj, gate_up_proj).
+        Convert the parameter, may need to split inplace
+        if it matches a split mapping type (e.g., qkv_proj, gate_up_proj).
         """
         tp_size = getattr(module, "tp_size", 1)
         for vllm_name in self.fused_mappings:
             if vllm_name in full_name:
                 mapping_type, mappings = self.fused_mappings[vllm_name]
                 if mapping_type == MappingType.DIRECT:
-                    assert len(mappings) == 1, f"Mapping type is DIRECT for {vllm_name}, but got {len(mappings)} mappings"
+                    assert len(mappings) == 1, (
+                        f"Mapping type is DIRECT for {vllm_name}, but got {len(mappings)} mappings"
+                    )
                     new_param = param
                     new_param_name = full_name.replace(vllm_name, mappings[0][0])
                     return {new_param_name: new_param}
@@ -101,10 +115,10 @@ class VllmConverter(BaseConverter):
                             num_heads=self.model_info["num_heads"],
                             num_kv_heads=self.model_info["num_kv_heads"],
                             head_size=self.model_info["head_size"],
-                            tp_size=tp_size
+                            tp_size=tp_size,
                         )
                     except Exception as e:
-                        raise ValueError(f"Failed to slice qkv parameter {full_name}: {e}")
+                        raise ValueError(f"Failed to slice qkv parameter {full_name}: {e}") from e
                     out = {}
                     for hf_name, shard_id in mappings:
                         assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
@@ -118,10 +132,10 @@ class VllmConverter(BaseConverter):
                         sliced_params = slice_gate_up_proj(
                             fused_param=param,
                             output_sizes=[intermediate_size, intermediate_size],
-                            tp_size=tp_size
+                            tp_size=tp_size,
                         )
                     except Exception as e:
-                        raise ValueError(f"Failed to slice gate up proj parameter {full_name}: {e}")
+                        raise ValueError(f"Failed to slice gate up proj parameter {full_name}: {e}") from e
                     out = {}
                     for hf_name, shard_id in mappings:
                         assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
@@ -141,9 +155,21 @@ class VllmConverter(BaseConverter):
         """
         tp_size = getattr(module, "tp_size", 1)
         if tp_size > 1:
-            assert tp_size > self.tp_rank, f"Tensor parallel size ({tp_size}) must be greater than tensor parallel rank ({self.tp_rank}), please check the tensor parallel size and rank."
+            assert tp_size > self.tp_rank, (
+                f"Tensor parallel size ({tp_size}) must be "
+                f"greater than tensor parallel rank ({self.tp_rank}), "
+                f"please check the tensor parallel size and rank."
+            )
             shard_indices = [(self.tp_rank,)] if self.tp_rank is not None else [(0,)]
-            if isinstance(module, (ColumnParallelLinear, MergedColumnParallelLinear, QKVParallelLinear, VocabParallelEmbedding)):
+            if isinstance(
+                module,
+                (
+                    ColumnParallelLinear,
+                    MergedColumnParallelLinear,
+                    QKVParallelLinear,
+                    VocabParallelEmbedding,
+                ),
+            ):
                 shard_dim = 0
             elif isinstance(module, RowParallelLinear):
                 shard_dim = 1
@@ -159,7 +185,9 @@ class VllmConverter(BaseConverter):
         return NIXLSharding(**kwargs)
 
 
-def convert_vllm_inplace(parameter_mapping: ParameterMapping, model, tp_rank: int = 0) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:
+def convert_vllm_inplace(
+    parameter_mapping: ParameterMapping, model, tp_rank: int = 0
+) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
     Convenience function to convert vLLM model to unified state dict and sharding info.
     Args:

@@ -1,5 +1,9 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = [
+    "packaging",
+    "setuptools>=61.0",
+    "wheel",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -26,4 +30,68 @@ packages = ["psrl"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-psrl = ["trainer/config/*.yaml"] 
+psrl = ["trainer/config/*.yaml"]
+
+[tool.ruff]
+line-length = 119
+src = ["psrl"]
+
+[tool.ruff.lint]
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # isort
+    "I",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # zip without `strict=`
+    "B905",
+    # Loop control variable not used within loop body
+    "B007",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+# durations=0 will display all tests execution time, sorted in ascending order starting from from the slowest one.
+# -vv will also display tests with duration = 0.00s
+addopts = "--verbose --pyargs --durations=0 --strict-markers"  # always add these arguments to pytest
+testpaths = ["unit_tests"]  # must be an explicit path to avoid importing another "tests" module
+# directories to ignore when discovering tests
+norecursedirs = [
+    "external",
+    "examples",
+    "docs",
+    "scripts",
+    "tools",
+    "tutorials",
+    "*.egg",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "venv",
+    "{arch}",
+]
+# markers to select tests, use `pytest --markers` to see all available markers, `pytest -m "<marker>"` to select tests
+markers = [
+    "unit: marks unit test, i.e. testing a single, well isolated functionality (deselect with '-m \"not unit\"')",
+    "integration: marks test checking the elements when integrated into subsystems (deselect with '-m \"not integration\"')",
+    "system: marks test working at the highest integration level (deselect with '-m \"not system\"')",
+    "acceptance: marks test checking whether the developed product/model passes the user defined acceptance criteria (deselect with '-m \"not acceptance\"')",
+    "docs: mark tests related to documentation (deselect with '-m \"not docs\"')",
+    "skipduringci: marks tests that are skipped ci as they are addressed by Jenkins jobs but should be run to test user setups",
+    "pleasefixme: marks tests that are broken and need fixing",
+]

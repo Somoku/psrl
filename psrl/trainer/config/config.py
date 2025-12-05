@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from verl.base_config import BaseConfig
 
@@ -37,10 +37,10 @@ class ProfileConfig(BaseConfig):
         save_path (Optional[str]): Path to save profiling results.
     """
 
-    profile_ranks: Optional[list[int]] = None
+    profile_ranks: list[int] | None = None
     step_start: int = -1
     step_end: int = -1
-    save_path: Optional[str] = None
+    save_path: str | None = None
 
 
 @dataclass
@@ -57,7 +57,7 @@ class BaseModelConfig(BaseConfig):
     """
 
     path: str = "~/models/deepseek-llm-7b-chat"
-    tokenizer_path: Optional[str] = None
+    tokenizer_path: str | None = None
     override_config: dict[str, Any] = field(default_factory=dict)
-    external_lib: Optional[str] = None
+    external_lib: str | None = None
     trust_remote_code: bool = False

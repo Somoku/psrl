@@ -1,13 +1,14 @@
 import logging
 import os
-from typing import Any
 
+from verl import DataProto
 from verl.utils.profiler import simple_timer
 
 from psrl.workers.agent_loop.manager import AgentLoopBase, AgentLoopOutput, register
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 @register("single_turn_agent")
 class SingleTurnAgentLoop(AgentLoopBase):
@@ -20,6 +21,10 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, request: DataProto) -> AgentLoopOutput:
         metrics = {}
+        messages = request.non_tensor_batch.get("messages", [[]])[0]
+        request_ids = request.non_tensor_batch.get("uid", [None])[0]
+        sampling_params = request.meta_info.get("sampling_params", None)
+
         prompt_ids = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
         )

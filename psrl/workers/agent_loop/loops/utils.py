@@ -1,15 +1,15 @@
-import torch
 from omegaconf import DictConfig
 from pydantic import BaseModel
 
 AGENT_LOOP_REGISTRY: dict[str, dict] = {}
 
+
 def register(agent_name: str):
     """Register an agent loop class with the given name.
-    
+
     Args:
         agent_name (str): Name to register the agent loop under.
-        
+
     Returns:
         function: Decorator function for registering the agent loop class.
     """
@@ -22,13 +22,16 @@ def register(agent_name: str):
 
     return decorator
 
+
 class DummyConfig:
     """Wrapper class to make hydra.utils.instantiate compatible with configuration objects.
-    
+
     This class wraps the configuration to provide the expected interface for Hydra instantiation.
     """
+
     def __init__(self, config: DictConfig) -> None:
         self.config = config
+
 
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""
@@ -37,6 +40,7 @@ class AgentLoopMetrics(BaseModel):
     """Time spent on sequence generation in seconds."""
     tool_calls: float = 0.0
     """Time spent on tool calls in seconds."""
+
 
 class AgentLoopOutput(BaseModel):
     """Output data structure from agent loop execution."""

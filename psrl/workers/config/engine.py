@@ -1,6 +1,6 @@
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from verl.base_config import BaseConfig
 
@@ -42,14 +42,14 @@ class McoreEngineConfig(BaseConfig):
     optimizer_offload: bool = False
     tensor_model_parallel_size: int = 1
     expert_model_parallel_size: int = 1
-    expert_tensor_parallel_size: Optional[int] = None
+    expert_tensor_parallel_size: int | None = None
     pipeline_model_parallel_size: int = 1
-    virtual_pipeline_model_parallel_size: Optional[int] = None
+    virtual_pipeline_model_parallel_size: int | None = None
     context_parallel_size: int = 1
     sequence_parallel: bool = True
     use_distributed_optimizer: bool = True
     use_dist_checkpointing: bool = False
-    dist_checkpointing_path: Optional[str] = None
+    dist_checkpointing_path: str | None = None
     seed: int = 42
     override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
@@ -94,7 +94,7 @@ class FSDPEngineConfig(BaseConfig):
     forward_prefetch: bool = False
     model_dtype: str = "fp32"
     use_orig_params: bool = False
-    mixed_precision: Optional[dict[str, Any]] = None
+    mixed_precision: dict[str, Any] | None = None
     ulysses_sequence_parallel_size: int = 1
     entropy_from_logits_with_chunking: bool = False
     use_torch_compile: bool = True

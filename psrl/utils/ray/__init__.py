@@ -1,8 +1,8 @@
-from .lock_context import add_lock, RayLock, AsyncRayLock
-from .lazy_primitives import lazy_put, lazy_get, LazyObjectRef
+from .lazy_primitives import LazyObjectRef, lazy_get, lazy_put
+from .lock_context import AsyncRayLock, RayLock, add_lock
 
 __all__ = [
-    "add_lock", 
+    "add_lock",
     "RayLock",
     "AsyncRayLock",
     "lazy_put",

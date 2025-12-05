@@ -1,11 +1,12 @@
 from dataclasses import dataclass
-from typing import Union
+
 
 @dataclass(frozen=True)
 class EntryInfo:
     rollout_instance_id: int
     request_id: int
     model_version: int
+
 
 # Creating instances of EntryInfo
 entry1 = EntryInfo(0, 0, 5)

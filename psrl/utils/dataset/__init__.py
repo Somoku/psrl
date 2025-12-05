@@ -1,4 +1,4 @@
-from .data_processor import DatasetType, DataProcessor
+from .data_processor import DataProcessor, DatasetType
 from .utils import create_rl_dataset, create_rl_sampler
 
 __all__ = [

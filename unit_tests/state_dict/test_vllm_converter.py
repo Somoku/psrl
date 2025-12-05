@@ -4,19 +4,18 @@ Example usage of vLLM to HuggingFace state dict converter.
 This example shows how to convert a vLLM model's state dict to HuggingFace format
 using the new class-based API.
 """
+
 import os
-import torch
-from torch.nn import Parameter
-from typing import Dict
 
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+
 
 def example_with_real_model():
     """Example with a real vLLM model instance, now supports distributed torchrun."""
     import torch.distributed as dist
     from vllm import LLM
-    
+
     # Read distributed info from environment variables
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -35,7 +34,7 @@ def example_with_real_model():
     )
     vllm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     # for module_prefix, module in vllm_model.named_modules():
-        # print(f"[rank{rank}] {module_prefix}: {module.__class__.__name__}, {module}")
+    # print(f"[rank{rank}] {module_prefix}: {module.__class__.__name__}, {module}")
 
     # Get the model class
     model_class = type(vllm_model)
@@ -53,7 +52,7 @@ def example_with_real_model():
 
     # Save the converted state dict for each rank
     print("=" * 50)
-    for name in hf_state_dict.keys():
+    for name in hf_state_dict:
         print(f"[rank{rank}] {name}: {hf_state_dict[name].shape}, {hf_state_dict[name].sum()}, {sharding[name]}")
     # torch.save(hf_state_dict, f"converted_model_rank{rank}.pth")
 
@@ -63,4 +62,4 @@ def example_with_real_model():
 
 if __name__ == "__main__":
     print("Real model conversion example...")
-    example_with_real_model() 
+    example_with_real_model()

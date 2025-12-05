@@ -1,38 +1,41 @@
-import torch
-from torch.nn import Parameter
 from collections import OrderedDict
-from typing import Optional, Tuple, Dict
 
+import torch
 from mbridge import AutoBridge
 from mbridge.core.parallel_states import ParallelStates
 from mbridge.core.util import (
     unwrap_model,
 )
+from torch.nn import Parameter
 
-from psrl.utils.converter.model_mappings import ParameterMapping, slice_gate_up_proj, slice_qkv_proj, MappingType
 from psrl.utils.converter.base_converter import BaseConverter
+from psrl.utils.converter.model_mappings import (
+    ParameterMapping,
+    slice_gate_up_proj,
+    slice_qkv_proj,
+)
 from psrl.utils.nixl.nixl_spec import NIXLSharding
+
 
 class MegatronConverter(BaseConverter):
     """Convert Megatron model to a unified format (i.e., HuggingFace) and generate sharding info."""
-    
-    def __init__(
-        self, 
-        parameter_mapping: ParameterMapping,
-        mpu: Optional[ParallelStates] = None
-    ):
+
+    def __init__(self, parameter_mapping: ParameterMapping, mpu: ParallelStates | None = None):
         self.parameter_mapping = parameter_mapping
-        
+
         self.parameter_mapping.disable_tie_word_embeddings()
-        self.bridge = AutoBridge.from_config(self.parameter_mapping.config) # mbridge will maintain its own mpu
+        self.bridge = AutoBridge.from_config(self.parameter_mapping.config)  # mbridge will maintain its own mpu
         if mpu is not None:
-            assert self.bridge.mpu == mpu, f"Megatron parallel states must be the same, but got external {mpu} and mbridge internal {self.bridge.mpu}"
+            assert self.bridge.mpu == mpu, (
+                "Megatron parallel states must be the same, "
+                f"but got external {mpu} and mbridge internal {self.bridge.mpu}"
+            )
             self.mpu = mpu
         else:
             self.mpu = self.bridge.mpu
         self.model_info = parameter_mapping.get_model_info()
-        
-    def convert_state_and_sharding_dict(self, model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:
+
+    def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
         Convert Megatron model to unified state dict and generate sharding info.
         Args:
@@ -42,14 +45,13 @@ class MegatronConverter(BaseConverter):
         """
         converted_state_dict = {}
         sharding_dict = {}
-        
+
         models = [unwrap_model(sub_model) for sub_model in model]
         local_to_global_maps = [
-            self.bridge._weight_name_mapping_mcore_local_to_global(model, consider_ep=False)
-            for model in models
+            self.bridge._weight_name_mapping_mcore_local_to_global(model, consider_ep=False) for model in models
         ]
         # print(f"Unwrapped models: {models}")
-        
+
         def get_model_chunk_generator():
             for vpp_rank, model in enumerate(models):
                 existing_keys = set()
@@ -57,18 +59,17 @@ class MegatronConverter(BaseConverter):
                     existing_keys.add(name)
                     yield vpp_rank, name, param
                 # NOTE(mbridge): there is a bug in megatron GPTModel
-                # decoder.layers[n].mlp.router.expert_bias" in GPTModel is not registered in named_parameter, but in state_dict().
+                # decoder.layers[n].mlp.router.expert_bias" in GPTModel
+                # is not registered in named_parameter, but in state_dict().
                 # for now we patch it by adding those keys to extra_keys.
                 extra_keys = [
                     x
-                    for x in model.state_dict().keys()
-                    if "_extra_state" not in x
-                    and "expert_bias" in x
-                    and x not in existing_keys
+                    for x in model.state_dict()
+                    if "_extra_state" not in x and "expert_bias" in x and x not in existing_keys
                 ]
                 for name in extra_keys:
                     yield vpp_rank, name, model.state_dict()[name]
-        
+
         for vpp_rank, name, param in get_model_chunk_generator():
             # print(f"Converting parameter: {name}")
             # refactor the name to global name
@@ -78,11 +79,11 @@ class MegatronConverter(BaseConverter):
             if ".mlp.experts.linear_fc" in name and self.mpu.ep_size > 1:
                 raise NotImplementedError("EP is not supported yet")
             new_params = self.convert_parameter(name, param)
-            sharding = self.get_sharding_for_param(param) 
+            sharding = self.get_sharding_for_param(param)
             for new_param_name, new_param in new_params.items():
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding
-                
+
         # NOTE(lhy): a workaround for lm_head
         # if PP is not used and the word embedding is shared
         # we manually set the lm_head
@@ -92,12 +93,13 @@ class MegatronConverter(BaseConverter):
                     converted_state_dict["lm_head.weight"] = converted_state_dict[new_name]
                     sharding_dict["lm_head.weight"] = sharding_dict[new_name]
                     break
-        
+
         return converted_state_dict, sharding_dict
-    
+
     def convert_parameter(self, full_name: str, param: Parameter) -> dict:
         """
-        Convert the parameter, may need to split inplace if it matches a split mapping type (e.g., qkv_proj, gate_up_proj).
+        Convert the parameter, may need to split inplace
+        if it matches a split mapping type (e.g., qkv_proj, gate_up_proj).
         """
         full_hf_names = self.bridge._weight_name_mapping_mcore_to_hf(full_name)
         # print(f"convert parameter {full_name} to {full_hf_names}")
@@ -109,10 +111,10 @@ class MegatronConverter(BaseConverter):
                     num_heads=self.model_info["num_heads"],
                     num_kv_heads=self.model_info["num_kv_heads"],
                     head_size=self.model_info["head_size"],
-                    tp_size=self.mpu.tp_size
+                    tp_size=self.mpu.tp_size,
                 )
             except Exception as e:
-                raise ValueError(f"Failed to slice qkv parameter {full_name} into {full_hf_names}: {e}")
+                raise ValueError(f"Failed to slice qkv parameter {full_name} into {full_hf_names}: {e}") from e
             out = {}
             for shard_id, full_hf_name in enumerate(full_hf_names):
                 assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {full_name}"
@@ -125,11 +127,16 @@ class MegatronConverter(BaseConverter):
             try:
                 sliced_params = slice_gate_up_proj(
                     fused_param=param,
-                    output_sizes=[self.model_info["intermediate_size"], self.model_info["intermediate_size"]],
-                    tp_size=self.mpu.tp_size
+                    output_sizes=[
+                        self.model_info["intermediate_size"],
+                        self.model_info["intermediate_size"],
+                    ],
+                    tp_size=self.mpu.tp_size,
                 )
             except Exception as e:
-                raise ValueError(f"Failed to slice gate up proj parameter {full_name} into {full_hf_names}: {e}")
+                raise ValueError(
+                    f"Failed to slice gate up proj parameter {full_name} into {full_hf_names}: {e}"
+                ) from e
             out = {}
             for shard_id, full_hf_name in enumerate(full_hf_names):
                 assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {full_name}"
@@ -138,9 +145,11 @@ class MegatronConverter(BaseConverter):
                 out[new_param_name] = new_param
             return out
         else:
-            assert len(full_hf_names) == 1, f"Only one corresponding hf name should be transformed for {full_name}, but got {full_hf_names}"
+            assert len(full_hf_names) == 1, (
+                f"Only one corresponding hf name should be transformed for {full_name}, but got {full_hf_names}"
+            )
             return {full_hf_names[0]: param}
-        
+
     def get_sharding_for_param(self, param: Parameter) -> NIXLSharding:
         """
         Generate sharding info for a parameter given its module and tp_rank.
@@ -149,7 +158,9 @@ class MegatronConverter(BaseConverter):
         is_tp_param = hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
         if is_tp_param:
             shard_size = self.mpu.tp_size
-            assert hasattr(param, "partition_dim"), f"Tensor parallel partition dim must be set, but got {param.partition_dim}"
+            assert hasattr(param, "partition_dim"), (
+                f"Tensor parallel partition dim must be set, but got {param.partition_dim}"
+            )
             shard_indices = [(self.mpu.tp_rank,)]
             shard_dim = param.partition_dim
         else:
@@ -162,8 +173,8 @@ class MegatronConverter(BaseConverter):
         }
         return NIXLSharding(**kwargs)
 
-        
-def convert_megatron_inplace(parameter_mapping: ParameterMapping, model, mpu: Optional[ParallelStates] = None):
+
+def convert_megatron_inplace(parameter_mapping: ParameterMapping, model, mpu: ParallelStates | None = None):
     """
     Convenience function to convert Megatron model to unified state dict and sharding info.
     Args:

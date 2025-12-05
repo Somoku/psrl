@@ -17,8 +17,8 @@
 
 import argparse
 import time
+
 import torch
-import os
 from nixl._api import nixl_agent, nixl_agent_config
 
 
@@ -59,9 +59,9 @@ if __name__ == "__main__":
 
     if args.mode == "target":
         # 0.01GiB, 1000 tensors
-        tensors = [torch.zeros(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for i in range(1000)]
+        tensors = [torch.zeros(1024**3 // 2 // 128, dtype=torch.bfloat16) for i in range(1000)]
     else:
-        tensors = [torch.ones(1024 ** 3 // 2 // 128, dtype=torch.bfloat16) for i in range(1000)]
+        tensors = [torch.ones(1024**3 // 2 // 128, dtype=torch.bfloat16) for i in range(1000)]
 
     # print(f"{args.mode} Tensors: {tensors}")
 
@@ -94,7 +94,7 @@ if __name__ == "__main__":
         # the full python bytes, here it would be just UUID.
         while not agent.check_remote_xfer_done("initiator", b"UUID"):
             continue
-        
+
     # Initiator code
     else:
         print("Initiator sending to " + args.ip)
@@ -118,9 +118,7 @@ if __name__ == "__main__":
         print("Ready for transfer")
 
         start_time = time.time()
-        xfer_handle = agent.initialize_xfer(
-            "WRITE", initiator_descs, target_descs, "target", "UUID"
-        )
+        xfer_handle = agent.initialize_xfer("WRITE", initiator_descs, target_descs, "target", "UUID")
         end_time = time.time()
         print(f"Initialize transfer time: {end_time - start_time} seconds")
 
@@ -132,11 +130,11 @@ if __name__ == "__main__":
         state = agent.transfer(xfer_handle)
         end_time = time.time()
         print(f"Post transfer time: {end_time - start_time} seconds")
-        
+
         if state == "ERR":
             print("Posting transfer failed.")
             exit()
-            
+
         start_time = time.time()
         while True:
             state = agent.check_xfer_state(xfer_handle)
@@ -150,7 +148,7 @@ if __name__ == "__main__":
 
     # Verify data after read
     for i, tensor in enumerate(tensors):
-        if not torch.allclose(tensor, torch.ones(1024 ** 3 // 2 // 128, dtype=torch.bfloat16)):
+        if not torch.allclose(tensor, torch.ones(1024**3 // 2 // 128, dtype=torch.bfloat16)):
             print(f"Data verification failed for tensor {i}: {tensor}")
             exit()
     # print(f"{args.mode} Data verification passed - {tensors}")

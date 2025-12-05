@@ -1,6 +1,8 @@
-import ray
-import time
 import asyncio
+import time
+
+import ray
+
 
 # --------------------------------------------
 # 定义一个简单的 VersionedActor，用来验证版本等待功能
@@ -64,6 +66,7 @@ def version_waiter(actor_handle, target_ver: int, worker_id: int):
     ray.get(actor_handle.wait_for_version.remote(target_ver))
     print(f"[{time.strftime('%X')}] <-- waiter {worker_id} finish waiting for version {target_ver}")
     return f"[waiter {worker_id}] unblocked: version == {target_ver}"
+
 
 @ray.remote
 def version_setter(actor_handle, new_version: int, delay_s: float):

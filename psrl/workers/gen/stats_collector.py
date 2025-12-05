@@ -101,7 +101,7 @@ class StatCollector(StatLoggerBase):
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             self.log_prefix = f"StatCollector_I{self.instance_id}"
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
-            psrl_logger.info("Initialized StatCollector for instance %s.", self.instance_id)
+            psrl_logger.info(f"Initialized StatCollector for instance {self.instance_id}.")
 
     def begin_record(self):
         """
@@ -158,7 +158,7 @@ class StatCollector(StatLoggerBase):
         )
         # Dump logging to file if enabled
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
-            psrl_logger.info("Snapshot (model version %s): %s", self.model_version, snapshot)
+            psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
         self.last_record_time = curr_time
         self.last_push_to_queue_time = curr_time
 
@@ -237,22 +237,14 @@ class StatCollector(StatLoggerBase):
             ):
                 if self.psrl_config.status_collection.dump_logging_to_file_level == "prompt":
                     if iteration_stats and snapshot["iteration_stats"]["num_prompt_reqs"] > 0:
-                        psrl_logger.info("Snapshot (model version %s): %s", self.model_version, snapshot)
+                        psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
                     if (
                         iteration_stats
                         and snapshot["iteration_stats"]["num_prompt_reqs"] == 0
                         and snapshot["iteration_stats"]["num_generation_reqs"] > 0
                     ):
-                        psrl_logger.info(
-                            "Snapshot (model version %s): %s",
-                            self.model_version,
-                            snapshot,
-                        )
-                    psrl_logger.info(
-                        "Snapshot (model version %s): %s",
-                        self.model_version,
-                        snapshot,
-                    )
+                        psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
+                    psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
                     raise ValueError(
                         f"Invalid dump logging to file level: "
                         f"{self.psrl_config.status_collection.dump_logging_to_file_level}"

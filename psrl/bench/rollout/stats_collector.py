@@ -81,8 +81,8 @@ class StatCollector(StatLoggerBase):
         # Initialize log file
         self._write_log_header()
 
-        psrl_logger.info("Enhanced StatCollector initialized, engine %d", self.engine_index)
-        psrl_logger.info("Profile logs will be saved to: %s", self.log_file)
+        psrl_logger.info(f"Enhanced StatCollector initialized, engine {self.engine_index}")
+        psrl_logger.info(f"Profile logs will be saved to: {self.log_file}")
 
     def _clear_log_file(self):
         """Clear the existing log file to ensure fresh start on each run."""
@@ -90,9 +90,9 @@ class StatCollector(StatLoggerBase):
             if self.log_file.exists():
                 # Remove existing file to ensure clean start
                 self.log_file.unlink()
-                psrl_logger.info("Cleared existing log file: %s", self.log_file)
+                psrl_logger.info(f"Cleared existing log file: {self.log_file}")
         except Exception as e:
-            psrl_logger.warning("Failed to clear log file %s: %s", self.log_file, e)
+            psrl_logger.warning(f"Failed to clear log file {self.log_file}: {e}")
 
     def clear_log_file(self):
         """Public method to manually clear the log file."""
@@ -118,7 +118,7 @@ class StatCollector(StatLoggerBase):
             with open(self.log_file, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         except Exception as e:
-            psrl_logger.error("Failed to write log entry: %s", e)
+            psrl_logger.error(f"Failed to write log entry: {e}")
 
     def record(
         self,

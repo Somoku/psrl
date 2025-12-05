@@ -141,9 +141,9 @@ class RolloutRouter:
         try:
             route_strategy_class = get_route_strategy_class(self.config.psrl.routing_strategy.method)
             self.route_strategy: RouteStrategyBase = route_strategy_class(n_instances, strategy_kwargs)
-            psrl_logger.info("Initialized route strategy: %s", self.config.psrl.routing_strategy.method)
+            psrl_logger.info(f"Initialized route strategy: {self.config.psrl.routing_strategy.method}")
         except Exception as e:
-            psrl_logger.warning("Route strategy error: %s", e)
+            psrl_logger.warning(f"Route strategy error: {e}")
             psrl_logger.warning("Falling back to 'round_robin' strategy")
             from psrl.workers.agent_loop.route_strategy import RoundRobinRouteStrategy
 
@@ -306,10 +306,8 @@ class RolloutRouter:
                     model_versions=needed_model_version,
                 )
                 psrl_logger.info(
-                    "Allocated version tag %s for request %s and routed to rollout instance %s",
-                    needed_model_version,
-                    request_id,
-                    chosen_rollout_instance,
+                    f"Allocated version tag {needed_model_version} for "
+                    f"request {request_id} and routed to rollout instance {chosen_rollout_instance}"
                 )
             # Otherwise, the request is already reserved, only need to update the request instance id
             else:
@@ -561,9 +559,7 @@ class RolloutRouter:
 
                 for i, filtered_requests in enumerate(filtered_requests_list):
                     request_ids = filtered_requests.non_tensor_batch["uid"]
-                    psrl_logger.debug(
-                        "Dispatching requests to rollout instance %s with request ids: %s", i, request_ids
-                    )
+                    psrl_logger.debug(f"Dispatching requests to rollout instance {i} with request ids: {request_ids}")
                     futures.append(self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)[0])
                 rollout_results = ray.get(futures)
 
@@ -580,7 +576,7 @@ class RolloutRouter:
                         continue
                     request_ids = consolidated_outputs.non_tensor_batch["uid"]
                     psrl_logger.debug(
-                        "Consolidated outputs from rollout instance %s have request ids: %s", i, request_ids
+                        f"Consolidated outputs from rollout instance {i} have request ids: {request_ids}"
                     )
                     assert update_statuses is not None and all(
                         update_status == PSRL_RequestStatus.RUNNING for update_status in update_statuses
@@ -830,10 +826,8 @@ class RolloutRouter:
         # Check if request was interrupted and needs to be requeued
         if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
             psrl_logger.info(
-                "Request %s on instance %s was interrupted by scheduler "
-                "(most likely due to kv cache full and preemption), requeueing",
-                request_id,
-                new_instance_id,
+                f"Request {request_id} on instance {new_instance_id} was interrupted "
+                "by scheduler (most likely due to kv cache full and preemption), requeueing"
             )
             # Put back in priority queue for partial rollout
             # Ensure that the consolidated output has the rollout instance id recorded
@@ -842,10 +836,8 @@ class RolloutRouter:
             return
         elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
             psrl_logger.info(
-                "Request %s on instance %s was interrupted "
-                "(due to model synchronization when enabled partial rollout), requeueing",
-                request_id,
-                new_instance_id,
+                f"Request {request_id} on instance {new_instance_id} was interrupted "
+                "(due to model synchronization when enabled partial rollout), requeueing"
             )
             # Put back in priority queue for partial rollout
             # Ensure that the consolidated output has the rollout instance id recorded
@@ -856,11 +848,9 @@ class RolloutRouter:
             response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
             parent_prompt_id = request_id // self.rollout_n
             psrl_logger.info(
-                "Request %s on instance %s of parent prompt %s completed successfully, length is %s",
-                request_id,
-                new_instance_id,
-                parent_prompt_id,
-                response_len,
+                f"Request {request_id} on instance {new_instance_id} of "
+                f"parent prompt {parent_prompt_id} completed successfully, "
+                f"length is {response_len}"
             )
             result = consolidated_output
         else:
@@ -934,11 +924,8 @@ class RolloutRouter:
             version_after_sync = self.instance_to_version_after_sync[instance_id]
             threshold = self.config.psrl.sync_strategy.threshold
             psrl_logger.debug(
-                "Instance %s (version %s) request_num: %s, threshold: %s",
-                instance_id,
-                version_after_sync,
-                request_num,
-                threshold,
+                f"Instance {instance_id} (version {version_after_sync}) "
+                f"request_num: {request_num}, threshold: {threshold}"
             )
             if request_num > self.config.psrl.sync_strategy.threshold:
                 return False
@@ -947,11 +934,8 @@ class RolloutRouter:
             throughput = self.route_strategy.instance_to_engine_status[instance_id].get_generation_throughput()
             version_after_sync = self.instance_to_version_after_sync[instance_id]
             psrl_logger.debug(
-                "Instance %s (version %s) throughput: %s, threshold: %s",
-                instance_id,
-                version_after_sync,
-                throughput,
-                self.config.psrl.sync_strategy.threshold,
+                f"Instance {instance_id} (version {version_after_sync}) "
+                f"throughput: {throughput}, threshold: {self.config.psrl.sync_strategy.threshold}"
             )
             threshold = self.config.psrl.sync_strategy.threshold
             if throughput > threshold:
@@ -963,11 +947,8 @@ class RolloutRouter:
             version_after_sync = self.instance_to_version_after_sync[instance_id]
             threshold = self.config.psrl.sync_strategy.threshold
             psrl_logger.debug(
-                "Instance %s (version %s) kv_cache_utilization: %s, threshold: %s",
-                instance_id,
-                version_after_sync,
-                kv_cache_utilization,
-                threshold,
+                f"Instance {instance_id} (version {version_after_sync}) "
+                f"kv_cache_utilization: {kv_cache_utilization}, threshold: {threshold}"
             )
             threshold = self.config.psrl.sync_strategy.threshold
             if kv_cache_utilization > threshold:
@@ -1030,7 +1011,6 @@ class RolloutRouter:
                 break
             psrl_logger.info(
                 "Waiting for the interrupted partial requests to be looped back in the priority queue, "
-                "instance to inflight request num: %s",
-                self.instance_to_inflight_request_ids,
+                f"instance to inflight request num: {self.instance_to_inflight_request_ids}"
             )
             await asyncio.sleep(0.01)

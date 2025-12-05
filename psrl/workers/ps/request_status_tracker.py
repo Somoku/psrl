@@ -152,12 +152,7 @@ class RequestStatusTracker:
                 old_status = self._request_id_to_status[req_id]
                 if old_status != new_status:
                     self._status_to_request_ids[old_status].discard(req_id)
-                    # psrl_logger.info(
-                    #     "Changed status of request %d: %s -> %s",
-                    #     req_id,
-                    #     old_status.name,
-                    #     new_status.name
-                    # )
+                    # psrl_logger.info(f"Changed status of request {req_id}: {old_status.name} -> {new_status.name}")
                 self._status_to_request_ids[new_status].add(req_id)
                 self._request_id_to_status[req_id] = new_status
                 # Update the rollout instance ID if provided
@@ -320,7 +315,7 @@ class RequestStatusTracker:
         futures = []
         # Abort requests in rollout stage (ROLLOUT_RUNNING)
         if abort_requests_for_rollout:
-            psrl_logger.debug("Aborting requests in rollout stages: %s", abort_requests_for_rollout)
+            psrl_logger.debug(f"Aborting requests in rollout stages: {abort_requests_for_rollout}")
             instance_to_request_ids = self.classify_requests_in_instance(list(abort_requests_for_rollout))
             futures.append(
                 self.rollout_coordinator.exec_command.remote(
@@ -331,11 +326,11 @@ class RequestStatusTracker:
                     blocking=blocking,
                 )
             )
-            psrl_logger.debug("Abort command sent to rollout coordinator for requests: %s", abort_requests_for_rollout)
+            psrl_logger.debug(f"Abort command sent to rollout coordinator for requests: {abort_requests_for_rollout}")
 
         # Abort requests in reward stage (REWARD_RUNNING)
         if abort_requests_for_reward:
-            psrl_logger.debug("Aborting requests in reward stages: %s", abort_requests_for_reward)
+            psrl_logger.debug(f"Aborting requests in reward stages: {abort_requests_for_reward}")
             futures.append(
                 self.reward_manager.exec_command.remote(
                     Command(
@@ -345,7 +340,7 @@ class RequestStatusTracker:
                     blocking=blocking,
                 )
             )
-            psrl_logger.debug("Abort command sent to reward manager for requests: %s", abort_requests_for_reward)
+            psrl_logger.debug(f"Abort command sent to reward manager for requests: {abort_requests_for_reward}")
 
         if futures and blocking:
             ray.get(futures)

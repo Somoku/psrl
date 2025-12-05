@@ -303,7 +303,7 @@ class RolloutCoordinator(CommandExtension):
                         interrupted_request_num = np.sum(interrupted_request_nums)
 
                     result = interrupted_request_num
-                    psrl_logger.info("Received ABORT command, interrupted %s requests", interrupted_request_num)
+                    psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
                     # Post process the command result
                     self._complete_command(command_id, result)
                 elif command_type == CommandType.SYNC:
@@ -502,7 +502,7 @@ class RolloutCoordinator(CommandExtension):
             version (int): The new PS model version to set.
         """
         self.ps_model_version = version
-        psrl_logger.info("Set PS model version to %s", version)
+        psrl_logger.info(f"Set PS model version to {version}")
 
     # This is called by the PS manager to update the rollout instance model version after pulling
     def set_rollout_instance_model_version(self, rollout_instance_id: int, version_tag: int):
@@ -515,7 +515,7 @@ class RolloutCoordinator(CommandExtension):
         """
         old_version = self.instance_to_model_version.get(rollout_instance_id, None)
         self.instance_to_model_version[rollout_instance_id] = version_tag
-        psrl_logger.info("Updated instance %s model version: %s -> %s", rollout_instance_id, old_version, version_tag)
+        psrl_logger.info(f"Updated instance {rollout_instance_id} model version: {old_version} -> {version_tag}")
 
     async def sync_with_ps(
         self,

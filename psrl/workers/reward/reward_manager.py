@@ -280,7 +280,7 @@ class RewardManager(CommandExtension):
                     if parent_ids is None and uids is None:
                         raise ValueError("Abort command must contain either 'parent_ids' or 'uids' in args.")
 
-                    psrl_logger.debug("Received ABORT command with parent_ids: %s, uids: %s", parent_ids, uids)
+                    psrl_logger.debug(f"Received ABORT command with parent_ids: {parent_ids}, uids: {uids}")
                     if not isinstance(parent_ids, (list, type(None))):
                         parent_ids = [parent_ids]
                     if not isinstance(uids, (list, type(None))):
@@ -300,7 +300,7 @@ class RewardManager(CommandExtension):
                         uids = set(uids)
                         abort_request_uids.update(uids)
 
-                    psrl_logger.debug("Total of %s requests to abort", len(abort_request_uids))
+                    psrl_logger.debug(f"Total of {len(abort_request_uids)} requests to abort")
                     # Abort requests in the reward manager
                     # request_id -> reward_future
                     # 1. Kill running reward computation futures
@@ -312,7 +312,7 @@ class RewardManager(CommandExtension):
                             ray.kill(reward_future, no_restart=True)
                             aborted_count += 1
 
-                    psrl_logger.debug("Aborted %s running reward computations", aborted_count)
+                    psrl_logger.debug(f"Aborted {aborted_count} running reward computations")
                     # 2. Remove from the request tracker (update_status)
                     update_status_success = await self.ps_manager_handle.update_request_status.remote(
                         list(abort_request_uids),
@@ -326,7 +326,7 @@ class RewardManager(CommandExtension):
                     raise ValueError(f"Unknown command type: {command_type}")
 
                 # Post process the command
-                psrl_logger.debug("Completing command %s with result: %s", command_id, result)
+                psrl_logger.debug(f"Completing command {command_id} with result: {result}")
 
             await asyncio.sleep(0)
         psrl_logger.info("Command event handler of reward manager has finished.")

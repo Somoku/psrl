@@ -234,10 +234,7 @@ class RolloutScheduler(Scheduler):
                     if is_ready:
                         request.status = RequestStatus.WAITING
                     else:
-                        psrl_logger.debug(
-                            "%s is still in WAITING_FOR_REMOTE_KVS state.",
-                            request.request_id,
-                        )
+                        psrl_logger.debug(f"{request.request_id} is still in WAITING_FOR_REMOTE_KVS state.")
                         self.waiting.pop_request()
                         skipped_waiting_requests.prepend_request(request)
                         continue

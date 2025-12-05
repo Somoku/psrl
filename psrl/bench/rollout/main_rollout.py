@@ -116,7 +116,7 @@ class SimpleRolloutTester:
         if not rollout_config.get("disable_log_stats", True):
             psrl_logger.info("Initializing stats collector for monitoring...")
             vllm_config = engine_args.create_engine_config()
-            psrl_logger.info("vllm config: %s", vllm_config)
+            psrl_logger.info(f"vllm config: {vllm_config}")
             self.stats_collector = StatCollector(
                 vllm_config=vllm_config,
                 engine_index=0,
@@ -124,7 +124,7 @@ class SimpleRolloutTester:
                 log_file=self.config.rollout_test.get("profile_log_file", "profile"),
             )
             stat_loggers = [self.stats_collector]
-            psrl_logger.info("Stats collector initialized, logs will be saved to: %s", self.stats_collector.log_file)
+            psrl_logger.info(f"Stats collector initialized, logs will be saved to: {self.stats_collector.log_file}")
         else:
             self.stats_collector = None
 
@@ -203,7 +203,7 @@ class SimpleRolloutTester:
             return prompts
 
         except Exception as e:
-            psrl_logger.error("Failed to get real data batch: %s", e)
+            psrl_logger.error(f"Failed to get real data batch: {e}")
             raise
 
     async def _generate_batch_async(
@@ -284,8 +284,8 @@ class SimpleRolloutTester:
         """Run performance tests using AsyncLLM directly."""
         test_mode = self.config.rollout_test.get("mode", "synthetic")  # "synthetic" or "real_data"
         estimated_max_model_len = await self.estimate_max_model_len()
-        psrl_logger.info("Estimated max model length: %s", estimated_max_model_len)
-        psrl_logger.info("Starting rollout performance test in %s mode...", test_mode)
+        psrl_logger.info(f"Estimated max model length: {estimated_max_model_len}")
+        psrl_logger.info(f"Starting rollout performance test in {test_mode} mode...")
 
         # Run performance test
         num_iterations = self.config.rollout_test.num_iterations
@@ -304,9 +304,9 @@ class SimpleRolloutTester:
 
                 # Generate responses
                 results = await self._generate_batch_async(test_prompts, synthetic_list)
-                psrl_logger.debug("Warmup iteration %d generated %d sequences", i + 1, len(results))
+                psrl_logger.debug(f"Warmup iteration {i + 1} generated {len(results)} sequences")
             except Exception as e:
-                psrl_logger.warning("Warmup failed: %s", e)
+                psrl_logger.warning(f"Warmup failed: {e}")
                 raise e
 
         # Log warmup completion if stats collector is available
@@ -339,9 +339,9 @@ class SimpleRolloutTester:
 
                 # Generate responses
                 results = await self._generate_batch_async(test_prompts, synthetic_list)
-                psrl_logger.debug("Test iteration %d generated %d sequences", i + 1, len(results))
+                psrl_logger.debug(f"Test iteration {i + 1} generated {len(results)} sequences")
             except Exception as e:
-                psrl_logger.error("Generation failed: %s", e)
+                psrl_logger.error(f"Generation failed: {e}")
                 raise e
 
             end_time = time.time()
@@ -358,13 +358,13 @@ class SimpleRolloutTester:
         psrl_logger.info("=" * 50)
         psrl_logger.info("ROLLOUT PERFORMANCE TEST RESULTS")
         psrl_logger.info("=" * 50)
-        psrl_logger.info("Test mode: %s", test_mode)
-        psrl_logger.info("Batch size: %d", batch_size)
-        psrl_logger.info("Test iterations: %d", num_iterations)
-        psrl_logger.info("Average time per iteration: %.2f ± %.2f seconds", avg_time, std_time)
-        psrl_logger.info("Min time: %.2f seconds", min_time)
-        psrl_logger.info("Max time: %.2f seconds", max_time)
-        psrl_logger.info("Throughput: %.2f samples/second", batch_size / avg_time)
+        psrl_logger.info(f"Test mode: {test_mode}")
+        psrl_logger.info(f"Batch size: {batch_size}")
+        psrl_logger.info(f"Test iterations: {num_iterations}")
+        psrl_logger.info(f"Average time per iteration: {avg_time:.2f} ± {std_time:.2f} seconds")
+        psrl_logger.info(f"Min time: {min_time:.2f} seconds")
+        psrl_logger.info(f"Max time: {max_time:.2f} seconds")
+        psrl_logger.info(f"Throughput: {batch_size / avg_time:.2f} samples/second")
 
         # Print stats collector summary if available
         if self.stats_collector is not None:
@@ -373,7 +373,7 @@ class SimpleRolloutTester:
             psrl_logger.info("=" * 30)
             summary_stats = self.stats_collector.get_summary_stats()
             for key, value in summary_stats.items():
-                psrl_logger.info("%s: %s", key, value)
+                psrl_logger.info(f"{key}: {value}")
             psrl_logger.info("=" * 30)
 
         psrl_logger.info("=" * 50)

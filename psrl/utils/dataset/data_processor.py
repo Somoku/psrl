@@ -213,7 +213,7 @@ class DataProcessor:
         )
 
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
-        psrl_logger.info("Train dataloader saved to %s", dataloader_local_path)
+        psrl_logger.info(f"Train dataloader saved to {dataloader_local_path}")
 
     def load_train_dataloader(self, dataloader_local_path: str) -> None:
         """Load the dataloader from a local path."""
@@ -223,7 +223,7 @@ class DataProcessor:
 
         dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
         self.train_dataloader.load_state_dict(dataloader_state_dict)
-        psrl_logger.info("Train dataloader loaded from %s", dataloader_local_path)
+        psrl_logger.info(f"Train dataloader loaded from {dataloader_local_path}")
 
     # ------- Data Retrieval Methods -------
     def get_train_next(self):

@@ -1402,9 +1402,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             config=OmegaConf.to_container(self.config, resolve=True),
         )
         psrl_logger.info(
-            "Initialized tracking logger with project: %s, experiment: %s",
-            self.config.trainer.project_name,
-            self.config.trainer.experiment_name,
+            f"Initialized tracking logger with project: {self.config.trainer.project_name}, "
+            f"experiment: {self.config.trainer.experiment_name}"
         )
 
         self.global_steps = 0

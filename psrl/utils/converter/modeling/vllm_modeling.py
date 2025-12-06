@@ -43,6 +43,100 @@ class VllmQwen2ParameterMapping(ParameterMapping):
         }
 
 
+# Qwen2Moe
+vllm_qwen2_moe_classes = []
+try:
+    from vllm.model_executor.models.qwen2_moe import Qwen2MoeForCausalLM, Qwen2MoeModel
+
+    vllm_qwen2_moe_classes = [Qwen2MoeForCausalLM, Qwen2MoeModel]
+except ImportError as e:
+    warnings.warn(f"Could not import Qwen2Moe classes: {e}", stacklevel=2)
+
+
+@register_model(["VllmQwen2MoeForCausalLM", "VllmQwen2MoeModel"] + vllm_qwen2_moe_classes)
+class VllmQwen2MoeParameterMapping(ParameterMapping):
+    """Parameter mapping for Qwen2Moe model."""
+
+    def __init__(self, config_path: str):
+        self.config = AutoConfig.from_pretrained(config_path)
+
+    def get_mappings(self):
+        mapping = [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+        ]
+        expert_num = self.config.num_experts
+        for expert_id in range(expert_num):
+            mapping.append(
+                ("w13_weight", f"{expert_id}.gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id)
+            )
+            mapping.append(
+                ("w13_weight", f"{expert_id}.up_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id + 1)
+            )
+            mapping.append(("w2_weight", f"{expert_id}.down_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, expert_id))
+        return mapping
+
+    def get_model_info(self):
+        return {
+            "num_heads": self.config.num_attention_heads,
+            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
+            "head_size": self.config.hidden_size // self.config.num_attention_heads,
+            "intermediate_size": self.config.intermediate_size,
+            "num_experts": self.config.num_experts,
+        }
+
+
+# Qwen3Moe
+vllm_qwen3_moe_classes = []
+try:
+    from vllm.model_executor.models.qwen3_moe import Qwen3MoeForCausalLM, Qwen3MoeModel
+
+    vllm_qwen3_moe_classes = [Qwen3MoeForCausalLM, Qwen3MoeModel]
+except ImportError as e:
+    warnings.warn(f"Could not import Qwen3Moe classes: {e}", stacklevel=2)
+
+
+@register_model(["VllmQwen3MoeForCausalLM", "VllmQwen3MoeModel"] + vllm_qwen3_moe_classes)
+class VllmQwen3MoeParameterMapping(ParameterMapping):
+    """Parameter mapping for Qwen3Moe model."""
+
+    def __init__(self, config_path: str):
+        self.config = AutoConfig.from_pretrained(config_path)
+
+    def get_mappings(self):
+        mapping = [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+        ]
+        expert_num = self.config.num_experts
+        for expert_id in range(expert_num):
+            mapping.append(
+                ("w13_weight", f"{expert_id}.gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id)
+            )
+            mapping.append(
+                ("w13_weight", f"{expert_id}.up_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id + 1)
+            )
+            mapping.append(("w2_weight", f"{expert_id}.down_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, expert_id))
+        return mapping
+
+    def get_model_info(self):
+        # NOTE(zym): qwen3_moe directly provides head_dim,
+        #  which isn't equal to hidden_size // num_attention_heads
+        return {
+            "num_heads": self.config.num_attention_heads,
+            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
+            "head_size": getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads),
+            "intermediate_size": self.config.intermediate_size,
+            "num_experts": self.config.num_experts,
+        }
+
+
 # Llama
 vllm_llama_classes = []
 try:
@@ -180,6 +274,51 @@ class VllmGemmaParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
+
+    def get_model_info(self):
+        return {
+            "num_heads": self.config.num_attention_heads,
+            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
+            "head_size": self.config.hidden_size // self.config.num_attention_heads,
+            "intermediate_size": self.config.intermediate_size,
+        }
+
+
+# OLMoE
+vllm_olmoe_classes = []
+try:
+    from vllm.model_executor.models.olmoe import OlmoeForCausalLM
+
+    vllm_olmoe_classes = [OlmoeForCausalLM]
+except ImportError as e:
+    warnings.warn(f"Could not import OLMoE classes: {e}", stacklevel=2)
+
+
+@register_model(vllm_olmoe_classes)
+class VllmOLMoEParameterMapping(ParameterMapping):
+    """Parameter mapping for OLMoE model."""
+
+    def __init__(self, config_path: str):
+        self.config = AutoConfig.from_pretrained(config_path)
+
+    def get_mappings(self):
+        mapping = [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+        ]
+        expert_num = 64
+        for expert_id in range(expert_num):
+            mapping.append(
+                ("w13_weight", f"{expert_id}.gate_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id)
+            )
+            mapping.append(
+                ("w13_weight", f"{expert_id}.up_proj.weight", MappingType.FUSED_MOE_W13_SPLIT, 2 * expert_id + 1)
+            )
+            mapping.append(("w2_weight", f"{expert_id}.down_proj.weight", MappingType.FUSED_MOE_W2_SPLIT, expert_id))
+        return mapping
 
     def get_model_info(self):
         return {

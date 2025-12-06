@@ -2,10 +2,12 @@ from collections import OrderedDict
 
 import torch
 from torch.nn import Parameter
+from vllm.model_executor.layers.fused_moe.layer import FusedMoE
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
     set_weight_attrs,
 )
@@ -15,6 +17,8 @@ from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     MappingType,
     ParameterMapping,
+    slice_fused_moe_w2_weight,
+    slice_fused_moe_w13_weight,
     slice_gate_up_proj,
     slice_qkv_proj,
 )
@@ -73,7 +77,7 @@ class VllmConverter(BaseConverter):
                 if full_name.startswith("."):
                     full_name = full_name[1:]
                 new_params = self.convert_parameter(full_name, param, module)
-                sharding = self.get_sharding_for_param(module)
+                sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding
@@ -85,7 +89,7 @@ class VllmConverter(BaseConverter):
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
                 new_params = self.convert_parameter(full_name, param, module)
-                sharding = self.get_sharding_for_param(module)
+                sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding
@@ -143,12 +147,64 @@ class VllmConverter(BaseConverter):
                         new_param_name = full_name.replace(vllm_name, hf_name)
                         out[new_param_name] = new_param
                     return out
+                elif mapping_type == MappingType.FUSED_MOE_W13_SPLIT:
+                    try:
+                        sliced_params = slice_fused_moe_w13_weight(
+                            fused_param=param,
+                        )
+                    except Exception as e:
+                        raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}") from e
+                    out = {}
+                    ep_size = getattr(module, "ep_size", 1)
+                    # NOTE(zym) Though module has attribute "ep_rank", the value is incorrect,
+                    # and now we only have dp=1, so we use tp_rank as ep_rank
+                    ep_rank = (
+                        self.tp_rank if ep_size > 1 else 0
+                    )  # considering the case where not enable_expert_parallel
+                    num_experts = self.model_info["num_experts"]
+                    num_experts_per_ep_rank = num_experts // ep_size
+                    local_experts_start_id = ep_rank * num_experts_per_ep_rank
+                    local_experts_end_id = local_experts_start_id + num_experts_per_ep_rank
+                    local_shard_ids = list(range(local_experts_start_id * 2, local_experts_end_id * 2))
+                    for hf_name, shard_id in mappings:
+                        if shard_id not in local_shard_ids:
+                            continue
+                        slice_idx = shard_id - local_experts_start_id * 2
+                        assert slice_idx < len(sliced_params), f"Slice idx {slice_idx} is out of range for {vllm_name}"
+                        new_param = sliced_params[slice_idx]
+                        new_param_name = full_name.replace(vllm_name, hf_name)
+                        out[new_param_name] = new_param
+                    return out
+                elif mapping_type == MappingType.FUSED_MOE_W2_SPLIT:
+                    try:
+                        sliced_params = slice_fused_moe_w2_weight(
+                            fused_param=param,
+                        )
+                    except Exception as e:
+                        raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}") from e
+                    out = {}
+                    ep_size = getattr(module, "ep_size", 1)
+                    ep_rank = self.tp_rank if ep_size > 1 else 0
+                    num_experts = self.model_info["num_experts"]
+                    num_experts_per_ep_rank = num_experts // ep_size
+                    local_experts_start_id = ep_rank * num_experts_per_ep_rank
+                    local_experts_end_id = local_experts_start_id + num_experts_per_ep_rank
+                    local_shard_ids = list(range(local_experts_start_id, local_experts_end_id))
+                    for hf_name, shard_id in mappings:
+                        if shard_id not in local_shard_ids:
+                            continue
+                        slice_idx = shard_id - local_experts_start_id
+                        assert slice_idx < len(sliced_params), f"Slice idx {slice_idx} is out of range for {vllm_name}"
+                        new_param = sliced_params[slice_idx]
+                        new_param_name = full_name.replace(vllm_name, hf_name)
+                        out[new_param_name] = new_param
+                    return out
                 else:
                     raise ValueError(f"Unsupported mapping type: {mapping_type}")
         # Default: No conversion needed
         return {full_name: param}
 
-    def get_sharding_for_param(self, module) -> NIXLSharding:
+    def get_sharding_for_param(self, module, param_name) -> NIXLSharding:
         """
         Generate sharding info for a parameter given its module and tp_rank.
         Returns a NIXLSharding object.
@@ -173,6 +229,20 @@ class VllmConverter(BaseConverter):
                 shard_dim = 0
             elif isinstance(module, RowParallelLinear):
                 shard_dim = 1
+            elif isinstance(module, FusedMoE):
+                if "w13" in param_name:
+                    shard_dim = 0
+                else:
+                    assert "w2" in param_name, f"FusedMoE param can only be w13 and w2, but get {param_name}"
+                    shard_dim = 1
+            elif isinstance(module, ReplicatedLinear):
+                # qwen2_moe  mlp.gate.weight
+                # NOTE(zym): ReplicatedLinear layer doesn't use tp, but it still has tp_size
+                # which is equal to get_tensor_model_parallel_world_size().
+                # Refer to vllm/vllm/model_executor/layers/linear.py
+                tp_size = 1
+                shard_indices = [(0,)]
+                shard_dim = 0
             else:
                 raise ValueError(f"Unsupported module type for sharding: {type(module)}")
         else:

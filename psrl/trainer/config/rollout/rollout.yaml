@@ -59,6 +59,9 @@ data_parallel_size: 1
 # PP size for rollout. Not effective for hf and sync mode
 pipeline_model_parallel_size: 1
 
+# EP size for rollout. If EP enabled, EP size should be equal to DP size * TP size
+expert_parallel_size: 1
+
 # max number of tokens in a batch
 max_num_batched_tokens: 8192
 

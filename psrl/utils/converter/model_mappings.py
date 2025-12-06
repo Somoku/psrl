@@ -138,12 +138,108 @@ def slice_qkv_proj(
     return qkv_params
 
 
+def slice_qkv_proj_megatron(
+    fused_param: Parameter, num_heads: int, num_kv_heads: int, head_size: int, tp_size: int = 1, output_dim: int = 1
+) -> list[Parameter]:
+    """
+    Split a fused qkv_proj parameter into three shards according to Megatron-style:
+      - q_param: query heads
+      - k_param: key heads
+      - v_param: value heads
+
+    Args
+    ----------
+    fused_param : Parameter
+        The fused parameter of shape [..., total_qkv, ...].
+    num_heads : int
+        Number of query heads.
+    num_kv_heads : int
+        Number of key/value heads.
+    head_size : int
+        Dimensionality of each head.
+    tp_size : int, optional
+        Tensor parallel size (default is 1).
+    output_dim : int, optional
+        Dimension along which to split (default is 0).
+
+    Returns
+    -------
+    List[Parameter]
+        A list of three parameters:
+        [
+          q_param, # view of shape [..., num_heads * head_size, ...]
+          k_param, # view of shape [..., num_kv_heads * head_size, ...]
+          v_param, # view of shape [..., num_kv_heads * head_size, ...]
+        ]
+    """
+    import math
+
+    num_split_heads = math.gcd(num_heads, num_kv_heads)
+    assert num_split_heads % tp_size == 0, (
+        "Number of split heads must be divisible by tensor parallel size, "
+        f"but got num_split_heads = {num_split_heads} and tp_size = {tp_size}"
+    )
+
+    q_len = head_size * num_heads // num_split_heads
+    k_len = head_size * num_kv_heads // num_split_heads
+    v_len = head_size * num_kv_heads // num_split_heads
+
+    fused_param = fused_param.reshape(num_split_heads // tp_size, q_len + k_len + v_len, -1)
+    assert fused_param.data.shape[output_dim] == (q_len + k_len + v_len), (
+        f"Dim {output_dim} of fused parameter shape {fused_param.data.shape} must "
+        f"match the sum of qkv lengths {[q_len, k_len, v_len]}"
+    )
+    offset_and_sizes = [
+        (0, q_len),
+        (q_len, k_len),
+        (q_len + k_len, v_len),
+    ]
+
+    qkv_params: list[Parameter] = []
+    for offset, size in offset_and_sizes:
+        # Create a view for each shard without copying data
+        data = fused_param.data.narrow(output_dim, offset, size).reshape(-1, fused_param.shape[2])
+        if data.shape[1] == 1:
+            # bias
+            data = data.reshape(-1)
+        qkv_params.append(make_slice_parameter(data, fused_param))
+    return qkv_params
+
+
+def slice_fused_moe_w13_weight(
+    fused_param: Parameter,
+) -> list[Parameter]:
+    expert_params: list[Parameter] = []
+    expert_num = fused_param.shape[0]
+    shard_size = fused_param.shape[1] // 2
+    for expert_id in range(expert_num):
+        expert = fused_param.data[expert_id]
+        gate = expert.narrow(0, 0, shard_size)
+        up = expert.narrow(0, shard_size, shard_size)
+        expert_params.append(make_slice_parameter(gate, fused_param))
+        expert_params.append(make_slice_parameter(up, fused_param))
+    return expert_params
+
+
+def slice_fused_moe_w2_weight(
+    fused_param: Parameter,
+) -> list[Parameter]:
+    expert_params: list[Parameter] = []
+    expert_num = fused_param.shape[0]
+    for expert_id in range(expert_num):
+        down = fused_param.data[expert_id]
+        expert_params.append(make_slice_parameter(down, fused_param))
+    return expert_params
+
+
 class MappingType(Enum):
     """Enum for mapping prototypes."""
 
     DIRECT = "direct"
     QKV_SPLIT = "qkv_split"
     GATE_UP_PROJ_SPLIT = "gate_up_proj_split"
+    FUSED_MOE_W13_SPLIT = "fused_moe_w13_split"
+    FUSED_MOE_W2_SPLIT = "fused_moe_w2_split"
 
 
 class ParameterMapping(ABC):

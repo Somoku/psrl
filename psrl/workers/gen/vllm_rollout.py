@@ -59,6 +59,8 @@ class PSRL_vLLMRollout:
         assert pipeline_parallel_size == 1 or config.mode == "psrl_async", (
             "pipeline parallel is only supported in psrl_async mode"
         )
+        expert_parallel_size = config.get("expert_parallel_size", 1)
+        enable_expert_parallel = expert_parallel_size > 1
 
         # For async engine and model parallel, we only run the inference engine on the first rank.
         # The inner parallel workers are handled by vLLM + Ray.
@@ -168,6 +170,7 @@ class PSRL_vLLMRollout:
             enable_sleep_mode=False,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
+            enable_expert_parallel=enable_expert_parallel,
             distributed_executor_backend=distributed_executor_backend,
             dtype=config.dtype,
             enforce_eager=config.enforce_eager,

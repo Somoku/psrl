@@ -50,4 +50,4 @@ entropy_checkpointing: false
 forward_only: false
 
 # fsdp or fsdp2
-strategy: fsdp
+strategy: fsdp2

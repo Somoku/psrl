@@ -12,7 +12,7 @@ from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
     slice_gate_up_proj,
-    slice_qkv_proj,
+    slice_qkv_proj_megatron,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -48,7 +48,7 @@ class MegatronConverter(BaseConverter):
 
         models = [unwrap_model(sub_model) for sub_model in model]
         local_to_global_maps = [
-            self.bridge._weight_name_mapping_mcore_local_to_global(model, consider_ep=False) for model in models
+            self.bridge._weight_name_mapping_mcore_local_to_global(model, consider_ep=True) for model in models
         ]
         # print(f"Unwrapped models: {models}")
 
@@ -75,11 +75,8 @@ class MegatronConverter(BaseConverter):
             # refactor the name to global name
             local_to_global_map = local_to_global_maps[vpp_rank]
             name = local_to_global_map[name]
-            # TODO(lhy): add EP support, for more details, please see https://github.com/ISEEKYAN/mbridge/blob/main/mbridge/core/bridge.py#L353
-            if ".mlp.experts.linear_fc" in name and self.mpu.ep_size > 1:
-                raise NotImplementedError("EP is not supported yet")
             new_params = self.convert_parameter(name, param)
-            sharding = self.get_sharding_for_param(param)
+            sharding = self.get_sharding_for_param(name, param)
             for new_param_name, new_param in new_params.items():
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding
@@ -106,7 +103,7 @@ class MegatronConverter(BaseConverter):
         if len(full_hf_names) == 3:
             assert "linear_qkv" in full_name, "Only linear_qkv should have 3 corresponding hf names after split"
             try:
-                sliced_params = slice_qkv_proj(
+                sliced_params = slice_qkv_proj_megatron(
                     fused_param=param,
                     num_heads=self.model_info["num_heads"],
                     num_kv_heads=self.model_info["num_kv_heads"],
@@ -125,14 +122,31 @@ class MegatronConverter(BaseConverter):
         elif len(full_hf_names) == 2:
             assert "linear_fc1" in full_name, "Only linear_fc1 should have 2 corresponding hf names after split"
             try:
-                sliced_params = slice_gate_up_proj(
-                    fused_param=param,
-                    output_sizes=[
-                        self.model_info["intermediate_size"],
-                        self.model_info["intermediate_size"],
-                    ],
-                    tp_size=self.mpu.tp_size,
-                )
+                if "shared_experts" in full_name:
+                    # NOTE(zym): shared_experts use tp_size, not etp_size
+                    sliced_params = slice_gate_up_proj(
+                        fused_param=param,
+                        output_sizes=[
+                            self.model_info["shared_expert_intermediate_size"],
+                            self.model_info["shared_expert_intermediate_size"],
+                        ],
+                        tp_size=self.mpu.tp_size,
+                    )
+                elif "experts" in full_name:
+                    sliced_params = slice_gate_up_proj(
+                        fused_param=param,
+                        output_sizes=[
+                            self.model_info["moe_intermediate_size"],
+                            self.model_info["moe_intermediate_size"],
+                        ],
+                        tp_size=self.mpu.etp_size,
+                    )
+                else:
+                    sliced_params = slice_gate_up_proj(
+                        fused_param=param,
+                        output_sizes=[self.model_info["intermediate_size"], self.model_info["intermediate_size"]],
+                        tp_size=self.mpu.tp_size,
+                    )
             except Exception as e:
                 raise ValueError(
                     f"Failed to slice gate up proj parameter {full_name} into {full_hf_names}: {e}"
@@ -150,13 +164,22 @@ class MegatronConverter(BaseConverter):
             )
             return {full_hf_names[0]: param}
 
-    def get_sharding_for_param(self, param: Parameter) -> NIXLSharding:
+    def get_sharding_for_param(self, full_name: str, param: Parameter) -> NIXLSharding:
         """
         Generate sharding info for a parameter given its module and tp_rank.
         Returns a NIXLSharding object.
         """
-        is_tp_param = hasattr(param, "tensor_model_parallel") and param.tensor_model_parallel
-        if is_tp_param:
+        is_etp_param = "mlp.experts" in full_name and self.mpu.etp_size > 1
+        # NOTE(zym): When enabling both ep and tp, ep param also has attribute "tensor_model_parallel" which is True,
+        # so we need to exclude ep param when determining is_tp_param
+        is_tp_param = getattr(param, "tensor_model_parallel", False) and "mlp.experts" not in full_name
+        # NOTE(zym): etp param also has attribute "tensor_model_parallel" which is True,
+        # so we need to first determine is_etp_param
+        if is_etp_param:
+            shard_size = self.mpu.etp_size
+            shard_indices = [(self.mpu.etp_rank,)]
+            shard_dim = 0 if "fc1" in full_name else 1
+        elif is_tp_param:
             shard_size = self.mpu.tp_size
             assert hasattr(param, "partition_dim"), (
                 f"Tensor parallel partition dim must be set, but got {param.partition_dim}"

@@ -56,31 +56,36 @@ class FSDPConverter(BaseConverter):
         """
         # FSDP
         if len(param.placements) == 1:
-            assert param.placements[0].is_shard(dim=0), (
-                f"Expected single shard on dim 0 for {param_name} when using pure FSDP, got {param.placements}"
-            )
             assert param.device_mesh and param.device_mesh.ndim == 1, (
                 f"Expected 1 dim device mesh for {param_name}, got {param.device_mesh}"
             )
+            if param.placements[0].is_shard(dim=0):
+                shard_dim = 0
+            elif param.placements[0].is_shard(dim=1):
+                shard_dim = 1
+            else:
+                raise ValueError(f"Unexpected shard_dim for {param_name}, got {param.placements}")
             kwargs = {
-                "shard_mesh": OrderedDict([(0, param.device_mesh.size())]),
+                "shard_mesh": OrderedDict([(shard_dim, param.device_mesh.size())]),
                 "shard_indices": [(param.device_mesh.get_rank(),)],
             }
         # HSDP
         else:
-            assert (
-                len(param.placements) == 2
-                and param.placements[0].is_replicate()
-                and param.placements[1].is_shard(dim=0)
-            ), (
-                f"Expected two shards (first replicate, second shard on dim 0) "
-                f"for {param_name} when using hybrid FSDP, got {param.placements}"
+            assert len(param.placements) == 2 and param.placements[0].is_replicate(), (
+                f"Expected two shards (first replicate, second shard on dim 0) for {param_name} "
+                f"when using hybrid FSDP, got {param.placements}"
             )
             assert param.device_mesh and param.device_mesh.ndim == 2, (
                 f"Expected 2 dim device mesh for {param_name}, got {param.device_mesh}"
             )
+            if param.placements[1].is_shard(dim=0):
+                shard_dim = 0
+            elif param.placements[1].is_shard(dim=1):
+                shard_dim = 1
+            else:
+                raise ValueError(f"Unexpected shard_dim for {param_name}, got {param.placements}")
             kwargs = {
-                "shard_mesh": OrderedDict([(0, param.device_mesh.size(mesh_dim=1))]),
+                "shard_mesh": OrderedDict([(shard_dim, param.device_mesh.size(mesh_dim=1))]),
                 "shard_indices": [(param.device_mesh.get_local_rank(mesh_dim=1),)],
             }
         return NIXLSharding(**kwargs)

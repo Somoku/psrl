@@ -301,7 +301,7 @@ class PSRL_vLLMRollout:
             return
         # Wait until queue is empty
         while not self.scheduler_abort_queue.empty():
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0.1)
         
         # Wait for all pending abort requests to complete
         if self.scheduler_abort_events:

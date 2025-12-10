@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-2}
-project_name=psrl_partial_exp_new
-experiment_name=staleness_${staleness}_tp_bl
-fix_weight=${2:-True}
+staleness=${1:-1}
+project_name=paper_exp
+experiment_name=7b_staleness_${staleness}
+fix_weight=${2:-False}
 disable_attn=${3:-False}
+
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
-# HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
-# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
+# HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-7B
+# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
+HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
+DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -25,20 +26,20 @@ GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
-TRAIN_PP=5 # PP in the training side 
+TRAIN_PP=3 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
-NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=5 # Number of layers in the first pipeline stage
-NUM_LAYERS_IN_LAST_PIPELINE_STAGE=5 # Number of layers in the last pipeline stage
+NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=9 # Number of layers in the first pipeline stage
+NUM_LAYERS_IN_LAST_PIPELINE_STAGE=9 # Number of layers in the last pipeline stage
 
 NNODES=8
 NGPUS_PER_NODE=8
 
-GEN_NNODES=3 # Number of nodes for generation
+GEN_NNODES=2 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=5 # Number of nodes for training
+TRAIN_NNODES=6 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
@@ -56,11 +57,12 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
-redundant_train_prompt_bsz=128
+train_prompt_bsz=64
+redundant_train_prompt_bsz=64
 n_resp_per_prompt=8
 redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=128
+train_prompt_mini_bsz=16
+
 # Algorithm
 temperature=1.0
 top_p=1.0
@@ -82,7 +84,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.profile.disable_attn=${disable_attn} \
     psrl.profile.fix_weight=${fix_weight} \
-    psrl.logging_path=${PSRL_PATH}/examples/precision_test/experimental/megatron_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/paper_exp/background/staleness/logs/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=tis \
@@ -100,33 +102,22 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.enable=False \
     \
-    psrl.routing_strategy.method="throughput_optimal" \
-    psrl.routing_strategy.sort_candidate_by_indicator=True \
-    psrl.routing_strategy.enable_dynamic_version_tag=True \
-    psrl.routing_strategy.enable_multi_priority_queue=True \
+    psrl.routing_strategy.method="request_num_balance" \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_7b.json \
-    psrl.routing_strategy.delta_throughput_threshold=0.2 \
-    psrl.routing_strategy.request_budget=1024 \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
+    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=2048 \
     \
-    psrl.sync_and_mig_strategy.method="status_based" \
-    psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
-    psrl.sync_and_mig_strategy.sync.threshold=0.99 \
-    psrl.sync_and_mig_strategy.mig.enable=True \
-    psrl.sync_and_mig_strategy.mig.indicator="throughput" \
-    psrl.sync_and_mig_strategy.mig.threshold=2 \
+    psrl.sync_and_mig_strategy.method="greedy" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.25 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.95 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    gen_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     gen_actor_rollout_ref.rollout.temperature=${temperature} \
     gen_actor_rollout_ref.rollout.top_p=${top_p} \
@@ -198,8 +189,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=False \
-    trainer.test_freq=200 \
+    trainer.val_before_train=True \
+    trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=20 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

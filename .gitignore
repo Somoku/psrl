@@ -6,6 +6,9 @@ third_party_old/
 third_party_new/
 
 # General
+**/*.log
+**/*.svg
+**/*.pdf
 **/*.pkl
 **/*.png
 **/*.pt

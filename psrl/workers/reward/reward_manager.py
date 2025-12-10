@@ -263,7 +263,7 @@ class RewardManager(CommandExtension):
                     if parent_ids is None and uids is None:
                         raise ValueError("Abort command must contain either 'parent_ids' or 'uids' in args.")
                     
-                    psrl_logger.debug(f"Received ABORT command with parent_ids: {parent_ids}, uids: {uids}")
+                    psrl_logger.info(f"Received ABORT command with parent_ids: {parent_ids}, uids: {uids}")
                     
                     if not isinstance(parent_ids, (list, type(None))):
                         parent_ids = [parent_ids]

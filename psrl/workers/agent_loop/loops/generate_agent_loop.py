@@ -35,9 +35,15 @@ class GenerateAgentLoop(AgentLoopBase):
         output = await self.rollout_router.generate_async(request)
         if output is not None:
             response_ids = output.non_tensor_batch["raw_response_ids"][0]
+            response_ids = response_ids[: self.response_length]
             response_mask = [1] * len(response_ids)
-            output.non_tensor_batch["response_mask"] = np.array([response_mask[: self.response_length]])
+            output.non_tensor_batch["raw_response_ids"] = np.array([response_ids])
+            output.non_tensor_batch["response_mask"] = np.array([response_mask])
             output.non_tensor_batch["__num_turns__"] = np.array([0])
+            if "rollout_log_probs" in output.non_tensor_batch:
+                rollout_log_probs = output.non_tensor_batch["rollout_log_probs"][0]
+                rollout_log_probs = rollout_log_probs[: self.response_length]
+                output.non_tensor_batch["rollout_log_probs"] = np.array([rollout_log_probs])
 
         reward_input = output
         reward_result = await self.reward_manager.compute_score.remote(reward_input)

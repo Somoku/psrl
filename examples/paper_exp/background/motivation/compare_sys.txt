@@ -1,0 +1,14 @@
+No Staleness Guarantee
+1. APRIL = Partial + Redundant
+2. SortedRL = Partial + Redundant
+3. Laminar = Multi-Version + Migration
+
+One-Step Off
+4. RhymeRL = Multi-Version + Migration
+5. StreamRL = Partial
+6. verl-pipeline = None
+
+Strict Staleness Control
+7. AReaL = Partial
+8. ROLL Flash = Partial
+9. StaleFlow = Partial + Redundant + Multi-Version + Migration

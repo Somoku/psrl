@@ -70,7 +70,7 @@ class RolloutCoordinator(CommandExtension):
         self.process_status_queue_tasks = []
         self.broadcast_status_to_router_task = None
         self.stop_command_handler = False
-        self.stop_sync = False
+        self.stop_sync_and_migrate = False
         self.stop_process_status_queue = [False] * self.config.psrl.deployment.n_rollout_instances
         self.stop_broadcast_status_to_router = False
         
@@ -179,16 +179,20 @@ class RolloutCoordinator(CommandExtension):
             # Start the task to broadcast the engine status to the router
             self.broadcast_status_to_router_task = self.running_loop.create_task(self._broadcast_status_to_router())
             self.broadcast_status_to_router_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
-            # Start the model sync loop
-            if self.config.psrl.sync_strategy.method == "greedy":
-                self.sync_task = self.running_loop.create_task(self._greedy_sync_loop())
+            # Start the model synchronization and rollout migration loop
+            if self.config.psrl.sync_and_mig_strategy.method == "greedy":
+                self.sync_task = self.running_loop.create_task(self._greedy_sync_and_migrate_loop())
                 self.sync_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
-            elif self.config.psrl.sync_strategy.method == "status_based":
+            elif self.config.psrl.sync_and_mig_strategy.method == "status_based":
                 assert self.config.psrl.status_collection.enable, "Status-based sync strategy is only supported when status collection is enabled"
-                self.sync_task = self.running_loop.create_task(self._status_based_sync_loop())
+                self.sync_task = self.running_loop.create_task(self._status_based_sync_and_migrate_loop())
                 self.sync_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
             else:
-                raise NotImplementedError(f"Sync strategy {self.config.psrl.sync_strategy.method} is not supported")
+                raise NotImplementedError(f"Sync strategy {self.config.psrl.sync_and_mig_strategy.method} is not supported")
+            # Check if rollout migration is enabled
+            if self.config.psrl.sync_and_mig_strategy.mig.enable:
+                assert self.config.psrl.status_collection.enable, "Rollout migration is only supported when status collection is enabled"
+                assert self.config.psrl.partial_rollout.enable, "Rollout migration is only supported when partial rollout is enabled"
     
     async def stop_busy_loop(self):
         """
@@ -203,7 +207,7 @@ class RolloutCoordinator(CommandExtension):
         
         # Stop the background tasks
         self.stop_command_handler = True
-        self.stop_sync = True
+        self.stop_sync_and_migrate = True
         self.stop_process_status_queue = [True] * self.config.psrl.deployment.n_rollout_instances
         self.stop_broadcast_status_to_router = True
         
@@ -243,36 +247,42 @@ class RolloutCoordinator(CommandExtension):
                 result = None
                 # Process the command based on its type
                 if command_type == CommandType.ABORT:
-                    assert "instance_to_uids" in command_args, \
-                        "Abort command must contain 'instance_to_uids' in args."
                     instance_to_uids = command_args.get("instance_to_uids", None)
-                    if instance_to_uids is None:
-                        raise ValueError("Abort command must contain 'instance_to_uids' in args.")
+                    instance_ids = command_args.get("instance_ids", None)
+                    if instance_to_uids is None and instance_ids is None:
+                        raise ValueError("ABORT command must contain 'instance_to_uids' or 'instance_ids' in args.")
                     
-                    psrl_logger.info(f"Received ABORT command with instance_to_uids: {instance_to_uids}")
+                    psrl_logger.info(f"Received ABORT command with instance_to_uids: {instance_to_uids} and instance_ids: {instance_ids}")
                     futures = []
-                    for instance_id, uids in instance_to_uids.items():
-                        if not uids:
-                            continue
-                        if not isinstance(uids, (list, set)):
-                            uids = [uids]
-                        abort_requests = set(uids)  # Ensure uniqueness
-                        if self.rank_0_is_model_owner:
-                            futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", abort_requests))
-                        else:
-                            warnings.warn(f"Interrupt requests on instance {instance_id} in SPMD-style may cause undefined behavior, need to check the behavior")
-                            futures.append(self.rollout_wg_list[instance_id].execute_all_async("interrupt_requests", abort_requests)[0])
+                    
+                    if instance_to_uids is not None:
+                        for instance_id, uids in instance_to_uids.items():
+                            if not uids:
+                                continue
+                            if not isinstance(uids, (list, set)):
+                                uids = [uids]
+                            abort_requests = set(uids)  # Ensure uniqueness
+                            if self.rank_0_is_model_owner:
+                                futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", abort_requests))
+                            else:
+                                raise ValueError("ABORT command in SPMD-style is not supported yet.")
+                    if instance_ids is not None:
+                        for instance_id in instance_ids:
+                            if self.rank_0_is_model_owner:
+                                futures.append(self.rollout_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", None))
+                            else:
+                                raise ValueError("ABORT command in SPMD-style is not supported yet.")
+                    
                     if not futures:
                         interrupted_request_num = 0
                     else:
                         interrupted_request_nums = await asyncio.gather(*futures)
                         interrupted_request_num = np.sum(interrupted_request_nums)
-                    
                     result = interrupted_request_num
                     psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
-                    
                     # Post process the command result
                     self._complete_command(command_id, result)
+                    
                 elif command_type == CommandType.SYNC:
                     # Interrupt the instance, pull the model weights from PS and resume generation.
                     instance_ids = command_args.get("instance_ids", None)
@@ -354,24 +364,27 @@ class RolloutCoordinator(CommandExtension):
         # psrl_logger.info(f"Is routing: {is_routing}")
         return any(is_routing)
     
-    async def _greedy_sync_loop(self):
+    async def _greedy_sync_and_migrate_loop(self):
         """
         Background loop to synchronize with PS based on the greedy algorithm.
         
         This method:
         1. Greedily synchronize with PS for rollout that lags behind PS version.
         2. Check whether the instance has no active tasks if forbid partial rollout.
+        3. Check if any instance is starving and do migration if necessary.
         """
-        psrl_logger.info("Starting greedy sync loop")
+        psrl_logger.info("Starting greedy model synchronization and rollout migration loop")
 
-        while not self.stop_sync:
+        while not self.stop_sync_and_migrate:
             # Sleep for a period of time
-            await asyncio.sleep(self.config.psrl.sync_strategy.check_interval_in_ms / 1000) 
+            await asyncio.sleep(self.config.psrl.sync_and_mig_strategy.check_interval_in_ms / 1000) 
             
+            have_syncing_instance = False
             sync_instance_ids = []
             for instance_id in range(self.config.psrl.deployment.n_rollout_instances):
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if self.instance_to_model_version.get(instance_id, 0) <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
+                    have_syncing_instance = True
                     continue
                 # Check whether instance version lags behind PS version
                 if self.instance_to_model_version.get(instance_id, 0) == self.ps_model_version:
@@ -385,10 +398,13 @@ class RolloutCoordinator(CommandExtension):
                 
             if sync_instance_ids:
                 await self.sync_with_ps(sync_instance_ids)
+            elif not have_syncing_instance and self.config.psrl.sync_and_mig_strategy.mig.enable:
+                # No instance is syncing with PS, check if migration is needed
+                await self.check_and_migrate()
 
-        psrl_logger.info("Greedy sync loop stopped.")
+        psrl_logger.info("Greedy model synchronization and rollout migration loop stopped.")
     
-    async def _status_based_sync_loop(self):
+    async def _status_based_sync_and_migrate_loop(self):
         """
         Background loop to collect engine status and decide whether to synchronize with PS based on the engine status.
         
@@ -396,16 +412,18 @@ class RolloutCoordinator(CommandExtension):
         1. Analyze the instance status (engine waiting & running request counts, etc.).
         2. Decide whether to synchronize with PS for each instance.
         """        
-        psrl_logger.info("Starting status based sync loop")
+        psrl_logger.info("Starting status based model synchronization and rollout migration loop")
 
-        while not self.stop_sync:
+        while not self.stop_sync_and_migrate:
             # Sleep for a period of time and analyze the instance status
-            await asyncio.sleep(self.config.psrl.sync_strategy.check_interval_in_ms / 1000) 
+            await asyncio.sleep(self.config.psrl.sync_and_mig_strategy.check_interval_in_ms / 1000) 
             
+            have_syncing_instance = False
             sync_instance_ids = []
             for instance_id, engine_stats in self.instance_to_engine_status.items():
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if engine_stats.model_version <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
+                    have_syncing_instance = True
                     continue
                 # We do not synchronize with PS if the router is currently routing requests
                 if (await self._is_routing()):
@@ -429,8 +447,11 @@ class RolloutCoordinator(CommandExtension):
 
             if sync_instance_ids:
                 await self.sync_with_ps(sync_instance_ids)
+            elif not have_syncing_instance and self.config.psrl.sync_and_mig_strategy.mig.enable:
+                # No instance is syncing with PS, check if migration is needed
+                await self.check_and_migrate()
 
-        psrl_logger.info("Status based sync loop stopped.")
+        psrl_logger.info("Status based model synchronization and rollout migration loop stopped.")
     
     # ------- FUNCTIONS FOR MODEL SYNCING -------
 
@@ -445,7 +466,7 @@ class RolloutCoordinator(CommandExtension):
             version (int): The new PS model version to set.
         """
         self.ps_model_version = version
-        psrl_logger.info(f"Set PS model version to {version}")
+        psrl_logger.info(f"Updated PS model version to {version}")
      
     # This is called by the PS manager to update the rollout instance model version after pulling
     def set_rollout_instance_model_version(self, rollout_instance_id: int, version_tag: int):
@@ -458,7 +479,7 @@ class RolloutCoordinator(CommandExtension):
         """
         old_version = self.instance_to_model_version.get(rollout_instance_id, None)
         self.instance_to_model_version[rollout_instance_id] = version_tag
-        psrl_logger.info(f"Updated instance {rollout_instance_id} model version: {old_version} -> {version_tag}")
+        psrl_logger.info(f"Updated rollout instance {rollout_instance_id} model version: {old_version} -> {version_tag}")
 
     async def sync_with_ps(self, instance_ids: List[int], wait_model_sync: bool = False, wait_interrupted_partial_requests_loop_back: bool = True):
         """
@@ -474,6 +495,7 @@ class RolloutCoordinator(CommandExtension):
             for instance_id in instance_ids:
                 self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(instance_id, 0)   
             await self.agent_loop_workers[0].interrupt_routing.remote()
+            psrl_logger.info(f"Interrupted routing for synchronization")
             await self.agent_loop_workers[0].update_currently_syncing_instances.remote(instance_ids, self.ps_model_version) 
             await self.exec_command(Command(
                 type=CommandType.SYNC,
@@ -483,8 +505,9 @@ class RolloutCoordinator(CommandExtension):
             ), blocking=True)
             if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
                 await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(instance_ids)
-            psrl_logger.info(f"All interrupted requests have been looped back, resuming routing")
+                psrl_logger.info(f"All interrupted requests on the synchronized instances {instance_ids} have been looped back")
             await self.agent_loop_workers[0].resume_routing.remote()
+            psrl_logger.info(f"Resumed routing after synchronization")
             
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
         """
@@ -503,9 +526,31 @@ class RolloutCoordinator(CommandExtension):
         """
         Check whether to synchronize with PS for the instance.
         """
-        assert self.config.psrl.sync_strategy.method == "status_based", "Partial rollout is only supported for status-based sync strategy"
+        assert self.config.psrl.sync_and_mig_strategy.method == "status_based", "Partial rollout is only supported for status-based sync strategy"
         assert self.config.psrl.status_collection.enable, "Partial rollout is only supported when status collection is enabled"
         assert self.config.psrl.partial_rollout.enable, "Partial rollout is not enabled"
         # TODO(lhy): refactor the router to be a global router
-        # psrl_logger.info(f"Attempting to sync and check for instance {instance_id}, ps model version: {self.ps_model_version}")
+        # psrl_logger.info(f"Checking whether to synchronize with PS for instance {instance_id}, ps model version: {self.ps_model_version}")
         return await self.agent_loop_workers[0].check_should_sync.remote(instance_id, self.ps_model_version)
+    
+    async def check_and_migrate(self, wait_interrupted_partial_requests_loop_back: bool = True):
+        """
+        Check if any instance is starving and do migration if necessary.
+        """
+        assert self.config.psrl.sync_and_mig_strategy.mig.enable, "Rollout migration is not enabled"
+        assert self.config.psrl.status_collection.enable, "Rollout migration is only supported when status collection is enabled"
+        # psrl_logger.info("Checking if any instance is starving and doing migration if necessary")
+        migrate_instance_ids = await self.agent_loop_workers[0].check_should_migrate.remote()
+        if migrate_instance_ids:
+            psrl_logger.info(f"Migrating instances {migrate_instance_ids} to new PS model version {self.ps_model_version}")
+            await self.agent_loop_workers[0].interrupt_routing.remote()
+            psrl_logger.info(f"Interrupted routing for migration")
+            await self.exec_command(Command(
+                type=CommandType.ABORT,
+                instance_ids=migrate_instance_ids,
+            ), blocking=True)
+            if wait_interrupted_partial_requests_loop_back:
+                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(migrate_instance_ids)
+                psrl_logger.info(f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back")
+            await self.agent_loop_workers[0].resume_routing.remote()
+            psrl_logger.info(f"Resumed routing after migration")

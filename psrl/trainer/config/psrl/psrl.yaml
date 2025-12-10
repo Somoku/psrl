@@ -104,7 +104,7 @@ status_collection:
   engine_sync_interval_in_ms: 10
 
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
-  # Here 100 means sync every 0.01 second
+  # Here 10 means sync every 0.01 second
   coordinator_sync_interval_in_ms: 10
 
 # Redundant rollout config
@@ -134,12 +134,19 @@ partial_rollout:
   # Whether view interrupted trajectories as new prompts
   interrupt_as_prompt: False
 
+# Rollout routing strategy config
 routing_strategy:
 
   # Method for rollout routing
   # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
   method: request_num_balance
+
+  # Check interval in millisecond for rollout routing
+  check_interval_in_ms: 100
+
+  # Whether to prioritize short requests
+  short_request_first: False
 
   # Whether to sort the candidates by indicator 
   sort_candidate_by_indicator: False
@@ -149,10 +156,6 @@ routing_strategy:
 
   # Whether to enable multiple priority queues for routing requests
   enable_multi_priority_queue: False
-
-  # Whether to enable global migration
-  # If enabled, the router can migrate the partial rollout requests to other instances.
-  enable_global_migration: False
 
   # Whether to enable group sampling on multiple instances
   enable_group_sampling_on_multi_instances: True
@@ -184,29 +187,53 @@ routing_strategy:
   # The actual max number of concurrent sequences per instance
   max_concurrent_seqs_per_instance: 1024
 
-sync_strategy:
+# Model synchronization and rollout migration strategy config
+sync_and_mig_strategy:
 
-  # Method for model synchronization
+  # Method for model synchronization and rollout migration
   # Available options: "status_based" or "greedy"
   method: status_based
 
-  # Indicator for model synchronization
-  # Available options: "request_num", "throughput", "kv_cache", "hypothesis_test"
-  # request_num: we check if the number of requests is lower than the threshold
-  # throughput: we check if the throughput is lower than the threshold
-  # kv_cache: we check if the KV Cache is saturated
-  # hypothesis_test (TODO): we check if there are any benefits from synchronization
-  indicator: request_num
- 
-  # Workload threshold to trigger model synchronization
-  # When indicator is "request_num", threshold is the number of requests.
-  # When indicator is "throughput", threshold is the throughput.
-  # When indicator is "kv_cache", threshold is the KV Cache utilization.
-  # When indicator is "hypothesis_test", threshold is not used.
-  threshold: null
-
-  # Check interval in millisecond for model synchronization
+  # Check interval in millisecond for model synchronization and rollout migration
   check_interval_in_ms: 100
+
+  # Model synchronization config
+  sync:
+    # Indicator for model synchronization
+    # Available options: "request_num", "throughput", "kv_cache", "hypothesis_test"
+    # request_num: we check if the number of requests is lower than the threshold
+    # throughput: we check if the throughput is lower than the threshold
+    # kv_cache: we check if the KV Cache is saturated
+    # hypothesis_test (TODO): we check if there are any benefits from synchronization
+    indicator: request_num
+  
+    # Workload threshold to trigger model synchronization
+    # When indicator is "request_num", threshold is the number of requests.
+    # When indicator is "throughput", threshold is the throughput.
+    # When indicator is "kv_cache", threshold is the KV Cache utilization.
+    # When indicator is "hypothesis_test", threshold is not used.
+    threshold: null
+
+  # Rollout migration config
+  mig:
+    # Whether to enable rollout migration
+    enable: False
+
+    # Indicator for rollout migration
+    # Available options: "request_num", "throughput", "kv_cache"
+    indicator: request_num
+
+    # Relative threshold for rollout migration
+    # When the indicator of the instance with the max indicator value divided by the indicator of the instance with the min indicator value is greater than the threshold, 
+    # the rollout coordinator will abort all rollout requests of the instance with the max indicator value (the requests will loop back to the router).
+    threshold: null
+
+    # Stop migration when the indicator is less than the threshold
+    # Available options: "request_num", "throughput", "kv_cache"
+    stop_indicator: request_num
+
+    # Threshold for stopping migration
+    stop_threshold: null
 
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:

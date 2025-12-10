@@ -105,12 +105,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.partial_rollout.enable=True \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_global_migration=False \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=False \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
-    psrl.sync_strategy.method="greedy" \
+    psrl.sync_and_mig_strategy.method="greedy" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \

@@ -795,10 +795,13 @@ class PSRL_GenWorker(Worker):
             # Update the request status to ROLLOUT_INTERRUPTED_BY_SCHEDULER or ROLLOUT_INTERRUPTED or RUNNING,
             if interrupted_by_scheduler:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER
+                psrl_logger.info(f"Request {request_ids[0]} is interrupted by scheduler (preemption)")
             elif interrupted:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
+                psrl_logger.info(f"Request {request_ids[0]} is interrupted (partial rollout)")
             else:
                 update_status = PSRL_RequestStatus.RUNNING
+                psrl_logger.info(f"Request {request_ids[0]} is running (finished generation)")
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
@@ -910,11 +913,12 @@ class PSRL_GenWorker(Worker):
         assert consolidate, "Consolidate must be True for async generation for now. Because the postprocess is need to be done inside the vllm rollout to mark the requests that are interrupted by the scheduler."
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
 
+        psrl_logger.info(f"Generating request {request.non_tensor_batch['uid'][0]} with needed model version {request.non_tensor_batch['version_tag'][0]}")
         # Wait for resuming if the generation is interrupted
         if self._async_interrupt_event and self._async_interrupt_event.is_set():
-            psrl_logger.debug(f"Generation interrupted, waiting for resume...")
+            psrl_logger.info(f"Generation interrupted, waiting for resume...")
             await self._async_resume_event.wait()
-            psrl_logger.debug(f"Generation resumed")
+            psrl_logger.info(f"Generation resumed")
 
         request_id = int(request.non_tensor_batch["uid"][0])
         needed_model_version = int(request.non_tensor_batch["version_tag"][0])

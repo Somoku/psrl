@@ -135,7 +135,7 @@ class RequestStatusTracker:
                 if model_version[i] != -1:
                     self._request_infos[req_id].model_version = model_version[i]
                 request_version = self._request_infos[req_id].model_version
-                if request_version < self._running_min_version:
+                if request_version != -1 and request_version < self._running_min_version:
                     psrl_logger.warning("Request %d is stale (version %d < %d), cannot update status", 
                                         req_id, request_version, self._running_min_version)
                     request_update_success[i] = False
@@ -151,11 +151,6 @@ class RequestStatusTracker:
                     # psrl_logger.info("Changed status of request %d: %s -> %s", req_id, old_status.name, new_status.name)
                 self._status_to_request_ids[new_status].add(req_id)
                 self._request_id_to_status[req_id] = new_status
-                # Update the rollout instance ID if provided
-                if rollout_instance_id[i] != -1:
-                    self._request_infos[req_id].rollout_instance_id = rollout_instance_id[i]
-                if model_version[i] != -1:
-                    self._request_infos[req_id].model_version = model_version[i]
             else:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
         

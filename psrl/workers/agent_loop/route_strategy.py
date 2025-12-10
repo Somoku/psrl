@@ -187,7 +187,7 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
         if len(candidates) == 0:
             return None
         idx = np.argmin([self.instance_request_counts[i] for i in candidates])
-        self.logger.debug(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
+        self.logger.info(f"Routing request {request.non_tensor_batch['uid']} among candidates {candidates} "
                           f"with all instance workloads {self.instance_request_counts}, "
                           f"selected instance {candidates[idx]} with workload {self.instance_request_counts[candidates[idx]]}")
         '''
@@ -198,8 +198,8 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
                 # Avoid overload, return None (currently not route to any instance)
                 return None
         '''
-        if self.instance_request_counts[candidates[idx]] >= min(self.max_concurrent_seqs_per_instance, self.balanced_concurrent_seqs_per_instance):
-            # if self.instance_request_counts[candidates[idx]] >= self.max_concurrent_seqs_per_instance:
+        # if self.instance_request_counts[candidates[idx]] >= min(self.max_concurrent_seqs_per_instance, self.balanced_concurrent_seqs_per_instance):
+        if self.instance_request_counts[candidates[idx]] >= self.max_concurrent_seqs_per_instance:
             # Avoid overload, return None (currently not route to any instance)
             return None
         self.instance_request_counts[candidates[idx]] += 1
@@ -388,6 +388,7 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
         if candidates is None:
             candidates = list(range(self.n_instances))
         if len(candidates) == 0:
+            # self.logger.info(f"No candidates available for request {request.non_tensor_batch['uid'][0]}")
             return None
         instance_to_version_after_sync = route_kwargs["instance_to_version_after_sync"]
         candidates_group_by_priority = []
@@ -443,11 +444,11 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                     
             if best_candidate is None:
                 if "rollout_instance_id" in request.non_tensor_batch:
-                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
+                    self.logger.debug(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
                                      f"because none of the candidates can run directly (kv_cache is full), waiting request num is {self.instance_to_waiting_request_num}, running request num is {self.instance_to_running_request_num}, token num is {self.instance_to_token_num}, "
                                      f"request token num is {self._get_request_token_num(request)}, max model len is {self.instance_to_max_model_len}")
                 else:
-                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
+                    self.logger.debug(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
                                      f"because none of the candidates can run directly (kv_cache is full), waiting request num is {self.instance_to_waiting_request_num}, running request num is {self.instance_to_running_request_num}, token num is {self.instance_to_token_num}, "
                                      f"request token num is {self._get_request_token_num(request)}, max model len is {self.instance_to_max_model_len}")
                 continue
@@ -459,21 +460,21 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
                 self.instance_to_running_request_num[best_candidate] += 1
                 self.instance_to_token_num[best_candidate] += self._get_request_token_num(request)
                 if "rollout_instance_id" in request.non_tensor_batch:
-                    self.logger.info(f"Candidate in group {candidates} with indicator {indicator} meets the condition for partial rollout request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
+                    self.logger.debug(f"Candidate in group {candidates} with indicator {indicator} meets the condition for partial rollout request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
                                      f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
                                      f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
                 else:
-                    self.logger.info(f"Candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
+                    self.logger.debug(f"Candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
                                      f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
                                      f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
                 return best_candidate
             else:
                 if "rollout_instance_id" in request.non_tensor_batch:
-                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for partial rollout request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
+                    self.logger.debug(f"No candidate in group {candidates} with indicator {indicator} meets the condition for partial rollout request {request.non_tensor_batch['uid'][0]} from rollout instance {request.non_tensor_batch['rollout_instance_id'][0]} with version {request.non_tensor_batch['version_tag'][0] if 'version_tag' in request.non_tensor_batch else 'None (retry request)'}, "
                                     f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
                                     f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
                 else:
-                    self.logger.info(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
+                    self.logger.debug(f"No candidate in group {candidates} with indicator {indicator} meets the condition for request {request.non_tensor_batch['uid'][0]}, "
                                      f"best candidate {best_candidate} delta throughput: {best_delta_throughput}, baseline delta throughput: {baseline_delta_throughput}, threshold: {threshold}, "
                                      f"its current request_num is {self.instance_to_request_num[best_candidate]} and token_num is {self.instance_to_token_num[best_candidate]}")
         

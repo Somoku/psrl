@@ -207,7 +207,7 @@ class PSRL_AgentLoopWorker:
             tokenizer=self.tokenizer,
         )
         
-        with log_dual_events(f"Agent loop with requests {requests.non_tensor_batch['uid']}", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
+        with log_dual_events(f"Agent loop with requests {requests.non_tensor_batch['uid']}", psrl_logger, level=logging.INFO, event_type=EventType.GEN):
             output = await agent_loop.run(requests)
         
         if output is not None:
@@ -218,7 +218,7 @@ class PSRL_AgentLoopWorker:
                     request_ids.tolist(),
                     PSRL_RequestStatus.COMPLETED,
                 )
-            with log_dual_events(f"Put requests {request_ids} into result queue", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+            with log_dual_events(f"Put requests {request_ids} into result queue", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
                 dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                 if dispatch_request_idxs:
                     output = output.select_idxs(dispatch_request_idxs)
@@ -244,6 +244,14 @@ class PSRL_AgentLoopWorker:
         await self.rollout_router.update_instance_status(instance_to_engine_status, **kwargs)
         # May log some stats here
         # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")
+    
+    async def check_should_migrate(self) -> List[int]:
+        """Check if the instance should migrate to another instance.
+        
+        Returns:
+            List[int]: The instance IDs that should be migrated.
+        """
+        return await self.rollout_router.check_should_migrate()
     
     async def check_should_sync(self, instance_id: int, ps_model_version: int) -> bool:
         """Check if the instance should synchronize with PS.

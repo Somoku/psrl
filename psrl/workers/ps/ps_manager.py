@@ -9,7 +9,7 @@ from omegaconf import DictConfig
 from dataclasses import dataclass
 from verl import DataProto
 
-from psrl.utils.ray import add_lock
+from psrl.utils.ray import add_lock, add_busy_polling_lock
 from psrl.utils.logger import get_ps_logger, setup_ps_logger, get_worker_info, log_single_event, EventType, deprecated, log_dual_events
 from psrl.utils.server.command import CommandType, Command
 from psrl.utils.nixl import NIXLMetaServer
@@ -38,7 +38,7 @@ class ModelStore:
 
 
 # TODO(lhy): Ensure PSManager is a singleton
-@add_lock
+@add_busy_polling_lock
 class PSManager(RequestStatusTracker):
     def __init__(
         self,
@@ -224,6 +224,7 @@ class PSManager(RequestStatusTracker):
         Returns:
             List[bool]: Whether the request can be reserved for each model version
         """
+        # psrl_logger.info(f"Checking if request {request_idx} can be reserved for model versions: {model_versions}")
         if not isinstance(request_idx, list):
             results = []
             for model_version in model_versions:
@@ -429,6 +430,8 @@ class PSManager(RequestStatusTracker):
             # we only need to check whether `curr_buffer_id + staleness` is READY to decide whether to abort `curr_buffer_id`.
             if buffer_range.issubset(ready_buffer_ids):
                 curr_abort_versions.add(version_to_abort)
+                # Further check the continuous buffers to see if they can also be aborted
+                # If the next buffer is also READY, then we can abort the current buffer as well in one go
                 for curr_buffer_id in range(version_to_abort + 1, version_to_abort + self.psrl_config.staleness + 1):
                     if curr_buffer_id + self.psrl_config.staleness in ready_buffer_ids:
                         curr_abort_versions.add(curr_buffer_id)

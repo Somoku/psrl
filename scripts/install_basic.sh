@@ -82,4 +82,7 @@ pushd $PSRL_PATH/patch/verl
 bash apply_patch.sh
 popd
 
+echo "9. Downgrade uvloop to 0.21.0"
+python -m pip install uvloop==0.21.0
+
 echo "Successfully installed all basic packages"

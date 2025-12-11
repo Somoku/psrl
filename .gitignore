@@ -133,3 +133,7 @@ ENV/
 logs
 log
 outputs
+
+
+models/
+data/

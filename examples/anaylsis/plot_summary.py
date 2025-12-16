@@ -11,23 +11,29 @@ Usage:
 The script is robust to missing metrics and attempts UTF-8 then latin1 decoding when needed.
 """
 
+import argparse
+import math
 import os
 import re
-import argparse
 from collections import defaultdict
-import math
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 # Regular expression to extract batch size from filename: B<digits>
-RE_BATCH = re.compile(r'B(\d+)', re.IGNORECASE)
+RE_BATCH = re.compile(r"B(\d+)", re.IGNORECASE)
 
 # Regular expressions for metric extraction (supports integer, float, scientific notation)
 METRIC_KEYS = {
-    'total_preempts': re.compile(r'total_preempts\s*:\s*([+-]?\d+)', re.IGNORECASE),
-    'avg_prompt_throughput': re.compile(r'avg_prompt_throughput\s*:\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', re.IGNORECASE),
-    'avg_generation_throughput': re.compile(r'avg_generation_throughput\s*:\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)', re.IGNORECASE),
+    "total_preempts": re.compile(r"total_preempts\s*:\s*([+-]?\d+)", re.IGNORECASE),
+    "avg_prompt_throughput": re.compile(
+        r"avg_prompt_throughput\s*:\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
+    "avg_generation_throughput": re.compile(
+        r"avg_generation_throughput\s*:\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
+        re.IGNORECASE,
+    ),
 }
 
 
@@ -57,7 +63,7 @@ def scan_folder(folder):
     results = defaultdict(list)
     for root, dirs, files in os.walk(folder):
         for fn in files:
-            if not fn.lower().endswith('.log'):
+            if not fn.lower().endswith(".log"):
                 continue
             m_batch = RE_BATCH.search(fn)
             if not m_batch:
@@ -66,14 +72,14 @@ def scan_folder(folder):
             batch = int(m_batch.group(1))
             path = os.path.join(root, fn)
             try:
-                with open(path, 'r', encoding='utf-8') as f:
+                with open(path, encoding="utf-8") as f:
                     txt = f.read()
             except UnicodeDecodeError:
                 # fallback encoding
-                with open(path, 'r', encoding='latin1') as f:
+                with open(path, encoding="latin1") as f:
                     txt = f.read()
             metrics = parse_metrics_from_text(txt)
-            metrics['_file'] = path
+            metrics["_file"] = path
             results[batch].append(metrics)
     return results
 
@@ -91,19 +97,19 @@ def aggregate_results(results):
 
     for b in batches:
         items = results[b]
-        vals_preempts = [it['total_preempts'] for it in items if it['total_preempts'] is not None]
-        vals_prompt = [it['avg_prompt_throughput'] for it in items if it['avg_prompt_throughput'] is not None]
-        vals_gen = [it['avg_generation_throughput'] for it in items if it['avg_generation_throughput'] is not None]
+        vals_preempts = [it["total_preempts"] for it in items if it["total_preempts"] is not None]
+        vals_prompt = [it["avg_prompt_throughput"] for it in items if it["avg_prompt_throughput"] is not None]
+        vals_gen = [it["avg_generation_throughput"] for it in items if it["avg_generation_throughput"] is not None]
 
         agg_total_preempts[b] = np.mean(vals_preempts) if vals_preempts else None
         agg_avg_prompt[b] = np.mean(vals_prompt) if vals_prompt else None
         agg_avg_generation[b] = np.mean(vals_gen) if vals_gen else None
 
         summary[b] = {
-            'files': len(items),
-            'missing_total_preempts': len(items) - len(vals_preempts),
-            'missing_avg_prompt_throughput': len(items) - len(vals_prompt),
-            'missing_avg_generation_throughput': len(items) - len(vals_gen),
+            "files": len(items),
+            "missing_total_preempts": len(items) - len(vals_preempts),
+            "missing_avg_prompt_throughput": len(items) - len(vals_prompt),
+            "missing_avg_generation_throughput": len(items) - len(vals_gen),
         }
 
     return agg_total_preempts, agg_avg_prompt, agg_avg_generation, summary
@@ -131,24 +137,24 @@ def plot_three_subplots(agg_preempts, agg_prompt, agg_gen, out_file=None):
     x_gen, y_gen = prepare(batches, agg_gen)
 
     fig, axes = plt.subplots(3, 1, figsize=(9, 12), sharex=True)
-    fig.suptitle('Metrics vs Batch Size', fontsize=16)
+    fig.suptitle("Metrics vs Batch Size", fontsize=16)
 
     ax = axes[0]
-    ax.plot(x_pre, y_pre, marker='o', linestyle='-', label='total_preempts')
-    ax.set_ylabel('total_preempts')
+    ax.plot(x_pre, y_pre, marker="o", linestyle="-", label="total_preempts")
+    ax.set_ylabel("total_preempts")
     ax.grid(True)
     ax.legend()
 
     ax = axes[1]
-    ax.plot(x_prm, y_prm, marker='o', linestyle='-', label='avg_prompt_throughput')
-    ax.set_ylabel('avg_prompt_throughput (samples/s)')
+    ax.plot(x_prm, y_prm, marker="o", linestyle="-", label="avg_prompt_throughput")
+    ax.set_ylabel("avg_prompt_throughput (samples/s)")
     ax.grid(True)
     ax.legend()
 
     ax = axes[2]
-    ax.plot(x_gen, y_gen, marker='o', linestyle='-', label='avg_generation_throughput')
-    ax.set_xlabel('Batch size')
-    ax.set_ylabel('avg_generation_throughput')
+    ax.plot(x_gen, y_gen, marker="o", linestyle="-", label="avg_generation_throughput")
+    ax.set_xlabel("Batch size")
+    ax.set_ylabel("avg_generation_throughput")
     ax.grid(True)
     ax.legend()
 
@@ -173,15 +179,23 @@ def main(folder, out_file=None):
     print("Found batches:", sorted(results.keys()))
     for b in sorted(summary.keys()):
         s = summary[b]
-        print(f"Batch {b}: {s['files']} files, missing: total_preempts={s['missing_total_preempts']}, "
-              f"avg_prompt={s['missing_avg_prompt_throughput']}, avg_gen={s['missing_avg_generation_throughput']}")
+        print(
+            f"Batch {b}: {s['files']} files, missing: total_preempts={s['missing_total_preempts']}, "
+            f"avg_prompt={s['missing_avg_prompt_throughput']}, avg_gen={s['missing_avg_generation_throughput']}"
+        )
 
     plot_three_subplots(agg_preempts, agg_prompt, agg_gen, out_file=out_file)
 
 
-if __name__ == '__main__':
-    ap = argparse.ArgumentParser(description="Plot total_preempts, avg_prompt_throughput, avg_generation_throughput by batch")
-    ap.add_argument('folder', help='folder to scan (recursive)')
-    ap.add_argument('--out', help='optional output image file path (png)', default='throughputs_by_batch.png')
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(
+        description="Plot total_preempts, avg_prompt_throughput, avg_generation_throughput by batch"
+    )
+    ap.add_argument("folder", help="folder to scan (recursive)")
+    ap.add_argument(
+        "--out",
+        help="optional output image file path (png)",
+        default="throughputs_by_batch.png",
+    )
     args = ap.parse_args()
     main(args.folder, out_file=args.out)

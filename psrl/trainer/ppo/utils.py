@@ -1,17 +1,17 @@
 import warnings
 from enum import Enum
-from typing import Optional
-from omegaconf import DictConfig
 
+from omegaconf import DictConfig
 from verl import DataProto
-from verl.trainer.ppo.utils import WorkerType
+from verl.single_controller.base import Worker
+from verl.single_controller.base.decorator import Dispatch, register
+from verl.single_controller.ray import RayResourcePool
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, compute_response_mask
-from verl.single_controller.ray import RayResourcePool
-from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import Dispatch, register
+from verl.trainer.ppo.utils import WorkerType
+
 
 class PSRL_Role(Enum):
     Actor = 0
@@ -28,21 +28,24 @@ class PSRL_ResourcePoolManager(ResourcePoolManager):
     """
     Support multiple instances of the same role
     """
+
     mapping: dict[PSRL_Role, list[str]]
-    
+
     def get_resource_pool(self, role: PSRL_Role, instance_id: int = 0) -> RayResourcePool:
         """Get the resource pool of the worker_cls for the given instance_id."""
         return self.resource_pool_dict[self.mapping[role][instance_id]]
+
 
 class PSRL_DummyWorker(Worker):
     def __init__(self, config: DictConfig, **kwargs):
         Worker.__init__(self)
 
         self.config = config
-    
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     def init_model(self):
         return
+
 
 def need_reference_policy(
     role_worker_mapping: dict[PSRL_Role, WorkerType],
@@ -57,6 +60,7 @@ def need_reward_model(
     """Given a role worker mapping, do we need reward model."""
     return PSRL_Role.RewardModel in role_worker_mapping
 
+
 def need_critic(config: DictConfig) -> bool:
     """Given a config, do we need critic."""
     if config.critic.enable is not None:
@@ -70,6 +74,7 @@ def need_critic(config: DictConfig) -> bool:
         )
         return False
 
+
 def PSRL_compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -77,7 +82,7 @@ def PSRL_compute_advantage(
     lam: float = 1.0,
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
-    config: Optional[AlgoConfig] = None,
+    config: AlgoConfig | None = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -98,7 +103,7 @@ def PSRL_compute_advantage(
         DataProto: The updated data with computed advantages and returns.
     """
     # Back-compatible with trainers that do not compute response mask in fit
-    if "response_mask" not in data.batch.keys():
+    if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:

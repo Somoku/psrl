@@ -1,18 +1,17 @@
+import logging
 import os
 import time
-import logging
-import numpy as np
-from datetime import datetime
-from omegaconf import DictConfig
 from dataclasses import dataclass
-from typing import Optional, Final
+from datetime import datetime
+from typing import Final
 
+import numpy as np
+from omegaconf import DictConfig
 from vllm.config import VllmConfig
 from vllm.v1.metrics.loggers import StatLoggerBase
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from psrl.utils.logger import FileOnlyHandler
-
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -41,10 +40,10 @@ class EngineStats:
             },
             "generation_throughput": 0.0,
         }
-     
+
     def get_waiting_queue_size(self) -> int:
         return self.snapshot.get("scheduler_stats", {}).get("num_waiting_reqs", 0)
-  
+
     def get_running_queue_size(self) -> int:
         return self.snapshot.get("scheduler_stats", {}).get("num_running_reqs", 0)
 
@@ -53,33 +52,36 @@ class EngineStats:
 
     def get_generation_throughput(self) -> float:
         return self.snapshot.get("generation_throughput", 0.0)
-    
+
     def get_kv_cache_utilization(self) -> float:
         return self.snapshot.get("scheduler_stats", {}).get("kv_cache_usage", 0.0)
-    
+
     def get_req_id_to_prompt_token_num(self) -> dict[str, int]:
         return self.snapshot.get("scheduler_stats", {}).get("req_id_to_prompt_token_num", {})
-    
+
     def get_req_id_to_response_token_num(self) -> dict[str, int]:
         return self.snapshot.get("scheduler_stats", {}).get("req_id_to_response_token_num", {})
-        
+
     def get_total_token_num(self) -> int:
-        return sum(self.get_req_id_to_prompt_token_num().values()) + sum(self.get_req_id_to_response_token_num().values())
+        return sum(self.get_req_id_to_prompt_token_num().values()) + sum(
+            self.get_req_id_to_response_token_num().values()
+        )
+
 
 class StatCollector(StatLoggerBase):
     """
     Collects and reports statistics from vLLM engine to the rollout coordinator.
-    
+
     This class extends vLLM's StatLoggerBase to:
     - Monitor scheduler statistics (waiting/running request counts)
     - Detect changes in request queue status
     - Send status updates to output queue for coordinator consumption
     """
-    
+
     def __init__(self, vllm_config: VllmConfig, psrl_config: DictConfig, instance_id: int = 0):
         """
         Initialize the StatCollector.
-        
+
         Args:
             vllm_config: vLLM configuration object
             instance_id: Unique identifier for this engine instance
@@ -87,20 +89,20 @@ class StatCollector(StatLoggerBase):
         self.vllm_config = vllm_config
         self.psrl_config = psrl_config
         self.instance_id = instance_id
-        
+
         self.model_version = 0
         self._begin_record = False
         self.start_time = None
         self.last_record_time = None
         self.last_dump_to_file_time = None
         self.last_push_to_queue_time = None
-        
+
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             self.log_prefix = f"StatCollector_I{self.instance_id}"
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized StatCollector for instance {self.instance_id}.")
-        
+
     def begin_record(self):
         """
         Begin recording statistics.
@@ -110,7 +112,7 @@ class StatCollector(StatLoggerBase):
         self.last_record_time = self.start_time
         self.last_dump_to_file_time = self.start_time
         self.last_push_to_queue_time = self.start_time
-        
+
     def _make_snapshot_after_model_version_update(self) -> dict:
         curr_time = time.time()
         snapshot = EngineStats.get_default_snapshot()
@@ -121,7 +123,7 @@ class StatCollector(StatLoggerBase):
     def init_output_queue(self, output_queue):
         """
         Initialize the output queue for sending status updates.
-        
+
         Args:
             output_queue: Ray queue for sending status updates to coordinator
         """
@@ -130,7 +132,7 @@ class StatCollector(StatLoggerBase):
     def init_scheduler_abort_queue(self, scheduler_abort_queue):
         """
         Initialize the scheduler abort queue for receiving abort requests.
-        
+
         Args:
             scheduler_abort_queue: Ray queue for receiving abort requests
         """
@@ -139,7 +141,7 @@ class StatCollector(StatLoggerBase):
     def record_model_version_update(self, model_version: int):
         """
         Set the model version for this engine instance.
-        
+
         Args:
             model_version: Model version
         """
@@ -147,102 +149,130 @@ class StatCollector(StatLoggerBase):
         self.model_version = model_version
         snapshot = self._make_snapshot_after_model_version_update()
         # We force a record to the output queue to ensure the coordinator knows the model version update immediately
-        self.output_queue.put_nowait(EngineStats(
-            instance_id=self.instance_id,
-            model_version=self.model_version,
-            snapshot=snapshot,
-        ))
+        self.output_queue.put_nowait(
+            EngineStats(
+                instance_id=self.instance_id,
+                model_version=self.model_version,
+                snapshot=snapshot,
+            )
+        )
         # Dump logging to file if enabled
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
-            self.last_dump_to_file_time = curr_time
         self.last_record_time = curr_time
         self.last_push_to_queue_time = curr_time
 
     def record(
         self,
-        scheduler_stats: Optional[SchedulerStats],
-        iteration_stats: Optional[IterationStats],
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
         engine_idx: int = 0,
     ):
         """
         Record and process scheduler statistics from vLLM engine.
-        
+
         This method is called by vLLM during inference to report statistics.
         When request counts change, it sends updates to the coordinator via output queue.
-        
+
         Args:
             scheduler_stats: Statistics from vLLM scheduler (request counts, etc.)
             iteration_stats: Statistics from vLLM iteration
             engine_idx: Engine index (not currently used)
         """
-        assert self.output_queue is not None, f"Output queue is not initialized"
+        assert self.output_queue is not None, "Output queue is not initialized"
 
         curr_time = time.time()
-        
+
         snapshot = {
             "timestamp": datetime.now().isoformat(),
             "total_elapsed_time": curr_time - self.start_time,
             "elapsed_time_since_last_record": curr_time - self.last_record_time,
             "scheduler_stats": {
-                "need_to_abort_reqs": scheduler_stats.need_to_abort_reqs if scheduler_stats.need_to_abort_reqs else None,
-                "req_id_to_prompt_token_num": scheduler_stats.req_id_to_prompt_token_num if scheduler_stats.req_id_to_prompt_token_num else {},
-                "req_id_to_response_token_num": scheduler_stats.req_id_to_response_token_num if scheduler_stats.req_id_to_response_token_num else {},
+                "need_to_abort_reqs": (
+                    scheduler_stats.need_to_abort_reqs if scheduler_stats.need_to_abort_reqs else None
+                ),
+                "req_id_to_prompt_token_num": (
+                    scheduler_stats.req_id_to_prompt_token_num if scheduler_stats.req_id_to_prompt_token_num else {}
+                ),
+                "req_id_to_response_token_num": (
+                    scheduler_stats.req_id_to_response_token_num
+                    if scheduler_stats.req_id_to_response_token_num
+                    else {}
+                ),
                 "num_running_reqs": scheduler_stats.num_running_reqs,
                 "num_waiting_reqs": scheduler_stats.num_waiting_reqs,
                 "kv_cache_usage": scheduler_stats.kv_cache_usage,
             },
             "generation_throughput": 0.0,
         }
-       
+
         if iteration_stats:
-            time_to_first_tokens_iter = getattr(iteration_stats, 'time_to_first_tokens_iter', [])
+            time_to_first_tokens_iter = getattr(iteration_stats, "time_to_first_tokens_iter", [])
             num_prompt_reqs = len(time_to_first_tokens_iter)
             if len(time_to_first_tokens_iter) == 0:
                 time_to_first_tokens_iter = [0.0]
-            inter_token_latencies_iter = getattr(iteration_stats, 'inter_token_latencies_iter', [])
+            inter_token_latencies_iter = getattr(iteration_stats, "inter_token_latencies_iter", [])
             num_generation_reqs = len(inter_token_latencies_iter)
             if len(inter_token_latencies_iter) == 0:
                 inter_token_latencies_iter = [0.0]
             iteration_stats_entry = {
-                "num_prompt_tokens": getattr(iteration_stats, 'num_prompt_tokens', 0),
-                "num_generation_tokens": getattr(iteration_stats, 'num_generation_tokens', 0),
+                "num_prompt_tokens": getattr(iteration_stats, "num_prompt_tokens", 0),
+                "num_generation_tokens": getattr(iteration_stats, "num_generation_tokens", 0),
                 "num_prompt_reqs": num_prompt_reqs,
                 "num_generation_reqs": num_generation_reqs,
-                "num_preempted_reqs": getattr(iteration_stats, 'num_preempted_reqs', 0),
-                "num_finished_reqs": len(getattr(iteration_stats, 'finished_requests', [])),
+                "num_preempted_reqs": getattr(iteration_stats, "num_preempted_reqs", 0),
+                "num_finished_reqs": len(getattr(iteration_stats, "finished_requests", [])),
                 # "max_time_to_first_tokens": np.max(time_to_first_tokens_iter),
                 # "max_inter_token_latencies": np.max(inter_token_latencies_iter),
                 "avg_time_to_first_tokens": np.mean(time_to_first_tokens_iter),
                 "avg_inter_token_latencies": np.mean(inter_token_latencies_iter),
             }
-            snapshot["generation_throughput"] = num_generation_reqs / iteration_stats_entry["avg_inter_token_latencies"]
+            snapshot["generation_throughput"] = (
+                num_generation_reqs / iteration_stats_entry["avg_inter_token_latencies"]
+            )
             snapshot["iteration_stats"] = iteration_stats_entry
-        
+
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
-            if curr_time - self.last_dump_to_file_time >= self.psrl_config.status_collection.dump_logging_to_file_interval_in_ms / 1000.0:
+            if (
+                curr_time - self.last_dump_to_file_time
+                >= self.psrl_config.status_collection.dump_logging_to_file_interval_in_ms / 1000.0
+            ):
                 if self.psrl_config.status_collection.dump_logging_to_file_level == "prompt":
                     if iteration_stats and snapshot["iteration_stats"]["num_prompt_reqs"] > 0:
                         psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
                 elif self.psrl_config.status_collection.dump_logging_to_file_level == "generation":
-                    if iteration_stats and snapshot["iteration_stats"]["num_prompt_reqs"] == 0 and snapshot["iteration_stats"]["num_generation_reqs"] > 0:
+                    if (
+                        iteration_stats
+                        and snapshot["iteration_stats"]["num_prompt_reqs"] == 0
+                        and snapshot["iteration_stats"]["num_generation_reqs"] > 0
+                    ):
                         psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
                 elif self.psrl_config.status_collection.dump_logging_to_file_level == "all":
                     psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
                 else:
-                    raise ValueError(f"Invalid dump logging to file level: {self.psrl_config.status_collection.dump_logging_to_file_level}")
+                    raise ValueError(
+                        f"Invalid dump logging to file level: {self.psrl_config.status_collection.dump_logging_to_file_level}"
+                    )
                 self.last_dump_to_file_time = curr_time
         self.last_record_time = curr_time
-            
-        waiting_and_running_queue_size = snapshot["scheduler_stats"]["num_waiting_reqs"] + snapshot["scheduler_stats"]["num_running_reqs"]
-        if waiting_and_running_queue_size == 0 or curr_time - self.last_push_to_queue_time >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0:
-            self.output_queue.put_nowait(EngineStats(
-                instance_id=self.instance_id,
-                model_version=self.model_version,
-                snapshot=snapshot,
-            ))
+
+        waiting_and_running_queue_size = (
+            snapshot["scheduler_stats"]["num_waiting_reqs"] + snapshot["scheduler_stats"]["num_running_reqs"]
+        )
+        if (
+            waiting_and_running_queue_size == 0
+            or curr_time - self.last_push_to_queue_time
+            >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0
+        ):
+            self.output_queue.put_nowait(
+                EngineStats(
+                    instance_id=self.instance_id,
+                    model_version=self.model_version,
+                    snapshot=snapshot,
+                )
+            )
             self.last_push_to_queue_time = curr_time
-            
+
         # Put abort requests to the abort queue if any
         if self.scheduler_abort_queue is not None and snapshot["scheduler_stats"]["need_to_abort_reqs"] is not None:
             self.scheduler_abort_queue.put_nowait(snapshot["scheduler_stats"]["need_to_abort_reqs"])
@@ -250,10 +280,12 @@ class StatCollector(StatLoggerBase):
     def log_engine_initialized(self):
         """
         Log engine initialization information including cache configuration.
-        
+
         This method is called when the vLLM engine completes initialization
         and reports the number of GPU blocks available for caching.
         """
         if self.vllm_config.cache_config.num_gpu_blocks:
-            psrl_logger.info(f"Engine {self.instance_id}: vllm cache_config_info with initialization "
-                             f"after num_gpu_blocks is: {self.vllm_config.cache_config.num_gpu_blocks}")
+            psrl_logger.info(
+                f"Engine {self.instance_id}: vllm cache_config_info with initialization "
+                f"after num_gpu_blocks is: {self.vllm_config.cache_config.num_gpu_blocks}"
+            )

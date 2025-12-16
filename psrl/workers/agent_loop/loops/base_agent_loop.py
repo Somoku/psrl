@@ -1,20 +1,18 @@
 import asyncio
-import numpy as np
 from abc import ABC, abstractmethod
-from typing import Dict
+
+import numpy as np
+import ray
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
-
-import ray
-
 from verl import DataProto
 
 from psrl.workers.agent_loop.loops.utils import DummyConfig
 from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.reward.reward_manager import RewardManager
 
-class AgentLoopBase(ABC):
 
+class AgentLoopBase(ABC):
     _class_initialized = False
 
     def __init__(
@@ -47,7 +45,7 @@ class AgentLoopBase(ABC):
     @classmethod
     def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
         """Perform heavy initialization work shared across all instances.
-        
+
         This method is called only once per class to avoid redundant initialization.
 
         Args:
@@ -59,7 +57,7 @@ class AgentLoopBase(ABC):
             return
         cls._class_initialized = True
 
-    def _post_process_and_merge_reward(self, reward_result: Dict[int, dict], outputs: DataProto) -> DataProto:
+    def _post_process_and_merge_reward(self, reward_result: dict[int, dict], outputs: DataProto) -> DataProto:
         """Merge the computed reward results back into the output DataProto.
 
         This method updates the output data with the reward scores and any additional
@@ -68,15 +66,17 @@ class AgentLoopBase(ABC):
         Args:
             reward_result (Dict[int, dict]): Computed reward results indexed by data item.
             outputs (DataProto): Original output data to be updated.
-            
+
         Returns:
             DataProto: Updated output data with reward information.
         """
         filtered_request_ids = list(reward_result.keys())
-        filtered_request_idxs = [idx for idx, uid in enumerate(outputs.non_tensor_batch["uid"].tolist()) if uid in filtered_request_ids]
+        filtered_request_idxs = [
+            idx for idx, uid in enumerate(outputs.non_tensor_batch["uid"].tolist()) if uid in filtered_request_ids
+        ]
         outputs = outputs.select_idxs(filtered_request_idxs)
         request_ids = outputs.non_tensor_batch["uid"].tolist()
-        
+
         rewards = []
         reward_extra_infos = []
         for request_id in request_ids:
@@ -92,13 +92,13 @@ class AgentLoopBase(ABC):
     @abstractmethod
     async def run(self, request: DataProto) -> DataProto:
         """Execute the agent loop for the given request.
-        
+
         Args:
             request (DataProto): Input request to process.
-            
+
         Returns:
             DataProto: Processed response data.
-            
+
         Raises:
             NotImplementedError: Must be implemented by subclasses.
         """

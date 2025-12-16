@@ -1,6 +1,6 @@
-from .utils import PSRL_Role, PSRL_ResourcePoolManager
+from .utils import PSRL_ResourcePoolManager, PSRL_Role
 
 __all__ = [
     "PSRL_Role",
-    "PSRL_ResourcePoolManager",   
+    "PSRL_ResourcePoolManager",
 ]

@@ -6,7 +6,17 @@ batch_size = [1, 2, 4, 8, 16, 32, 64, 128, 256]
 # 7B TP1
 other_latency = [0.0057, 0.0057, 0.0057, 0.0057, 0.0061, 0.0064, 0.0098, 0.0174, 0.0337]
 # 0 kv cache usage
-all_init_latency = [0.0063, 0.0063, 0.0064, 0.0065, 0.0068, 0.0074, 0.0107, 0.0189, 0.0362]
+all_init_latency = [
+    0.0063,
+    0.0063,
+    0.0064,
+    0.0065,
+    0.0068,
+    0.0074,
+    0.0107,
+    0.0189,
+    0.0362,
+]
 # 0.1 kv cache usage
 all_final_latency = [None, None, None, None, 0.0118, 0.0129, 0.0156, 0.0233, 0.0397]
 tokens = 1415152 * 0.1
@@ -14,7 +24,17 @@ tokens = 1415152 * 0.1
 # 7B TP2
 other_latency = [0.0038, 0.0038, 0.0038, 0.0039, 0.0041, 0.0046, 0.0064, 0.0111, 0.0201]
 # 0 kv cache usage
-all_init_latency = [0.0044, 0.0044, 0.0045, 0.0047, 0.0049, 0.0053, 0.0073, 0.0123, 0.0218]
+all_init_latency = [
+    0.0044,
+    0.0044,
+    0.0045,
+    0.0047,
+    0.0049,
+    0.0053,
+    0.0073,
+    0.0123,
+    0.0218,
+]
 # 0.1 kv cache usage
 all_final_latency = [None, None, None, None, None, 0.0113, 0.0130, 0.0185, 0.0263]
 tokens = 3033664 * 0.1
@@ -32,4 +52,3 @@ for i in range(len(batch_size)):
     if all_final_latency[i] is not None:
         attn_latency_k = (all_final_latency[i] - all_init_latency[i]) / tokens
         print(f"batch_size: {batch_size[i]}, attn_latency_k: {attn_latency_k}")
-        

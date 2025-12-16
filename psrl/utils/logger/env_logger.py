@@ -1,6 +1,8 @@
 import logging
 import os
+
 import torch
+
 
 def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
     # Log environment variables
@@ -20,7 +22,10 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
     avail = torch.cuda.is_available()
     psrl_logger.log(level, f"torch.cuda.is_available(): {avail}")
     if not avail:
-        psrl_logger.log(level, "CUDA not available — skipping further CUDA device and memory logging.")
+        psrl_logger.log(
+            level,
+            "CUDA not available — skipping further CUDA device and memory logging.",
+        )
         return
 
     # Number of CUDA devices
@@ -40,7 +45,11 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
         # Device properties
         try:
             props = torch.cuda.get_device_properties(i)
-            psrl_logger.log(level, f"Device {i}: name={props.name}, capability={props.major}.{props.minor}, total_memory={props.total_memory/1024**3:.2f} GB")
+            psrl_logger.log(
+                level,
+                f"Device {i}: name={props.name}, capability={props.major}.{props.minor}, "
+                f"total_memory={props.total_memory / 1024**3:.2f} GB",
+            )
         except Exception as e:
             psrl_logger.log(level, f"Device {i}: get_device_properties failed: {e}")
 
@@ -48,14 +57,21 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
         try:
             allocated = torch.cuda.memory_allocated(i)
             reserved = torch.cuda.memory_reserved(i)
-            psrl_logger.log(level, f"Device {i}: memory_allocated={allocated/1024**2:.2f} MB, memory_reserved={reserved/1024**2:.2f} MB")
+            psrl_logger.log(
+                level,
+                f"Device {i}: memory_allocated={allocated / 1024**2:.2f} MB, "
+                f"memory_reserved={reserved / 1024**2:.2f} MB",
+            )
         except Exception as e:
             psrl_logger.log(level, f"Device {i}: memory usage query failed: {e}")
 
         # Free & total memory from CUDA context (cudaMemGetInfo equivalent)
         try:
             free_mem, total_mem = torch.cuda.mem_get_info(i)
-            psrl_logger.log(level, f"Device {i}: mem_get_info: free={free_mem/1024**2:.2f} MB, total={total_mem/1024**2:.2f} MB")
+            psrl_logger.log(
+                level,
+                f"Device {i}: mem_get_info: free={free_mem / 1024**2:.2f} MB, total={total_mem / 1024**2:.2f} MB",
+            )
         except Exception as e:
             psrl_logger.log(level, f"Device {i}: mem_get_info failed: {e}")
 
@@ -63,7 +79,10 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
         try:
             cur_stream = torch.cuda.current_stream(device=i)
             default_stream = torch.cuda.default_stream(device=i)
-            psrl_logger.log(level, f"Device {i}: current_stream={cur_stream}, default_stream={default_stream}")
+            psrl_logger.log(
+                level,
+                f"Device {i}: current_stream={cur_stream}, default_stream={default_stream}",
+            )
         except Exception as e:
             psrl_logger.log(level, f"Device {i}: stream query failed: {e}")
 

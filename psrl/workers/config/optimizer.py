@@ -1,9 +1,7 @@
 import warnings
 from dataclasses import dataclass
-from typing import Optional
 
 from omegaconf import MISSING
-
 from verl.base_config import BaseConfig
 
 __all__ = ["OptimizerConfig", "FSDPOptimizerConfig", "McoreOptimizerConfig"]
@@ -27,16 +25,20 @@ class OptimizerConfig(BaseConfig):
     lr_warmup_steps_ratio: float = 0.0
     total_training_steps: int = -1
     weight_decay: float = 0.01
-    lr_warmup_steps: Optional[int] = -1
+    lr_warmup_steps: int | None = -1
     betas: tuple[float, float] = (0.9, 0.999)
     clip_grad: float = 1.0
     # deprecate grad_clip
-    grad_clip: Optional[float] = None
+    grad_clip: float | None = None
 
     def __post_init__(self):
         assert self.lr != MISSING
         if self.grad_clip is not None:
-            warnings.warn("`grad_clip` is deprecated, use `clip_grad` instead.", DeprecationWarning, stacklevel=2)
+            warnings.warn(
+                "`grad_clip` is deprecated, use `clip_grad` instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             self.clip_grad = self.grad_clip
 
 
@@ -51,7 +53,7 @@ class FSDPOptimizerConfig(OptimizerConfig):
         num_cycles (float): Number of cosine cycles in LR schedule.
     """
 
-    min_lr_ratio: Optional[float] = None
+    min_lr_ratio: float | None = None
     warmup_style: str = "constant"
     num_cycles: float = 0.5
 
@@ -80,11 +82,11 @@ class McoreOptimizerConfig(OptimizerConfig):
 
     optimizer: str = "adam"
     lr_warmup_init: float = 0.0
-    lr_decay_steps: Optional[int] = None
+    lr_decay_steps: int | None = None
     lr_decay_style: str = "linear"
     min_lr: float = 0.0
     weight_decay_incr_style: str = "constant"
     lr_wsd_decay_style: str = "exponential"
-    lr_wsd_decay_steps: Optional[int] = None
+    lr_wsd_decay_steps: int | None = None
     use_checkpoint_opt_param_scheduler: bool = False
-    override_optimizer_config: Optional[dict] = None
+    override_optimizer_config: dict | None = None

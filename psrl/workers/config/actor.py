@@ -1,8 +1,7 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from omegaconf import MISSING
-
 from verl.base_config import BaseConfig
 from verl.utils.profiler.config import ProfilerConfig
 
@@ -79,9 +78,9 @@ class ActorConfig(BaseConfig):
 
     strategy: str = MISSING
     ppo_mini_batch_size: int = 256
-    ppo_micro_batch_size: Optional[int] = None  # deprecate
-    ppo_micro_batch_size_per_gpu: Optional[int] = None
-    ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
+    ppo_micro_batch_size: int | None = None  # deprecate
+    ppo_micro_batch_size_per_gpu: int | None = None
+    ppo_infer_micro_batch_size_per_gpu: int | None = None
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384
@@ -188,7 +187,7 @@ class McoreActorConfig(ActorConfig):
     """
 
     strategy: str = "megatron"
-    data_loader_seed: Optional[int] = None
+    data_loader_seed: int | None = None
     load_weight: bool = True
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     profile: dict[str, Any] = field(default_factory=dict)

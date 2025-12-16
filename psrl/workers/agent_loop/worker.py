@@ -1,30 +1,29 @@
-import os
-import logging
 import asyncio
-import hydra
-import torch
-import numpy as np
-from typing import List, Set, Union, Dict
-from omegaconf import DictConfig, OmegaConf
-from tensordict import TensorDict
+import logging
+import os
 from collections import deque
 
+import hydra
+import numpy as np
 import ray
-
+import torch
+from omegaconf import DictConfig, OmegaConf
+from tensordict import TensorDict
 from verl import DataProto
-from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
+from verl.utils.model import compute_position_id_with_mask
 
-from psrl.workers.gen.stats_collector import EngineStats
-from psrl.workers.agent_loop.loops.utils import DummyConfig, AGENT_LOOP_REGISTRY
-from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
-from psrl.workers.agent_loop.router import RolloutRouter
-from psrl.utils.logger import DualOutputHandler, log_dual_events, EventType
 from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
+from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig
+from psrl.workers.agent_loop.router import RolloutRouter
+from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 @ray.remote
 class PSRL_AgentLoopWorker:
@@ -50,7 +49,7 @@ class PSRL_AgentLoopWorker:
         local_path = copy_to_local(config.gen_actor_rollout_ref.model.path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
-        
+
         self.rollout_router = RolloutRouter(
             config,
             ps_manager_handle,
@@ -60,7 +59,7 @@ class PSRL_AgentLoopWorker:
         self.rollout_wg_list = rollout_wg_list
         self.agent_loop_manager = None
         self.reward_manager = None
-        
+
         self.agent_programs = set()
         self.pending_program_queue = deque()
 
@@ -74,15 +73,15 @@ class PSRL_AgentLoopWorker:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 AGENT_LOOP_REGISTRY[agent_loop_config.name] = agent_loop_config
-                
+
         # Build logger
         # TODO(lhy): support >1 workers
-        self.log_prefix = f"AgentLoopWorker"
+        self.log_prefix = "AgentLoopWorker"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
     def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
         """Set the agent loop manager handle for communication.
-        
+
         Args:
             agent_loop_manager: Handle to the agent loop manager actor.
         """
@@ -90,7 +89,7 @@ class PSRL_AgentLoopWorker:
 
     def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
         """Set the reward manager handle for sending processed data.
-        
+
         Args:
             reward_manager: Handle to the reward manager actor.
         """
@@ -98,7 +97,7 @@ class PSRL_AgentLoopWorker:
 
     def add_agent_program(self, data: DataProto):
         """Add a new agent program to the pending queue for processing.
-        
+
         Args:
             data (DataProto or None): Data to process, or None to signal termination.
         """
@@ -121,7 +120,7 @@ class PSRL_AgentLoopWorker:
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._launch_agent_loop())
-        self.busy_loop_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
+        self.busy_loop_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
     def stop_busy_loop(self):
         """Stop the busy loop and wait for the current task to complete."""
@@ -145,6 +144,7 @@ class PSRL_AgentLoopWorker:
 
     def _create_task_done_callback(self, task):
         """Create a callback function to handle task completion."""
+
         def task_done_callback(future):
             try:
                 future.result()  # This will raise an exception if the task failed
@@ -152,17 +152,18 @@ class PSRL_AgentLoopWorker:
                 psrl_logger.error(f"Task {task} failed with exception: {e}")
             finally:
                 self.agent_programs.discard(task)
+
         return task_done_callback
 
     async def generate_trajectories(self, batch: DataProto) -> DataProto:
         """Generate trajectories using the specified agent type based on configuration.
-        
+
         This method only create the task (agent_loop) and add the task to the agent_programs set.
         But the task is not await here so different agent_loop can be run in parallel.
-        
+
         Args:
             batch (DataProto): Input batch containing prompts and metadata.
-            
+
         Returns:
             DataProto: Generated trajectories and associated data.
         """
@@ -172,13 +173,13 @@ class PSRL_AgentLoopWorker:
         elif self.config.psrl.gen_mode == "stream":
             default_agent_name = "generate_only_agent"
 
-        agent_names = batch.non_tensor_batch.pop("agent_name", np.array([default_agent_name] * len(batch), dtype=object))
+        agent_names = batch.non_tensor_batch.pop(
+            "agent_name", np.array([default_agent_name] * len(batch), dtype=object)
+        )
         assert np.all(agent_names == agent_names[0]), "All agent names must be the same for generation-only agents."
         agent_name = agent_names[0]
 
-        task = asyncio.create_task(
-            self._run_agent_loop(agent_name, batch)
-        )
+        task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
         self.agent_programs.add(task)
 
@@ -188,7 +189,7 @@ class PSRL_AgentLoopWorker:
         requests: DataProto,
     ):
         """Execute the specified agent loop on the given requests.
-        
+
         Args:
             agent_name (str): Name of the agent loop to run.
             requests (DataProto): Input requests to process.
@@ -197,7 +198,7 @@ class PSRL_AgentLoopWorker:
             f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
         )
         agent_loop_config = AGENT_LOOP_REGISTRY[agent_name]
-        
+
         agent_loop = hydra.utils.instantiate(
             config=agent_loop_config,
             trainer_config=DummyConfig(config=self.config),
@@ -206,29 +207,45 @@ class PSRL_AgentLoopWorker:
             ps_manager_handle=self.ps_manager_handle,
             tokenizer=self.tokenizer,
         )
-        
-        with log_dual_events(f"Agent loop with requests {requests.non_tensor_batch['uid']}", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
+
+        with log_dual_events(
+            f"Agent loop with requests {requests.non_tensor_batch['uid']}",
+            psrl_logger,
+            level=logging.DEBUG,
+            event_type=EventType.GEN,
+        ):
             output = await agent_loop.run(requests)
-        
+
         if output is not None:
             assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
             request_ids = requests.non_tensor_batch["uid"]
-            with log_dual_events("Update request status", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+            with log_dual_events(
+                "Update request status",
+                psrl_logger,
+                level=logging.DEBUG,
+                event_type=EventType.OTHER,
+            ):
                 update_status_success = await self.ps_manager_handle.update_request_status.remote(
                     request_ids.tolist(),
                     PSRL_RequestStatus.COMPLETED,
                 )
-            with log_dual_events(f"Put requests {request_ids} into result queue", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
+            with log_dual_events(
+                f"Put requests {request_ids} into result queue",
+                psrl_logger,
+                level=logging.DEBUG,
+                event_type=EventType.OTHER,
+            ):
                 dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                 if dispatch_request_idxs:
                     output = output.select_idxs(dispatch_request_idxs)
-                    # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into the result queue, so we process the data inside the reward manager
+                    # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into
+                    # the result queue, so we process the data inside the reward manager
                     # output = self._post_process(output)
                     await self.agent_loop_manager.put_result.remote(output)
 
     def init_route_strategy(self, **kwargs):
         """Initialize the route strategy for the agent loop worker.
-        
+
         Args:
             **kwargs: Keyword arguments for the route strategy.
         """
@@ -236,88 +253,84 @@ class PSRL_AgentLoopWorker:
 
     async def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], **kwargs):
         """Update the instance status received from RolloutCoordinator.
-        
+
         Args:
             instance_to_engine_status (dict[int, EngineStats]): Dictionary mapping instance ID to the engine status.
             **kwargs: Keyword arguments for the update.
         """
         await self.rollout_router.update_instance_status(instance_to_engine_status, **kwargs)
-        # May log some stats here
-        # psrl_logger.debug(f"Updated instance to engine status: {len(instance_to_engine_status)} instances, total queue size: {total_queue_size}")
-    
-    async def check_should_migrate(self) -> List[int]:
+
+    async def check_should_migrate(self) -> list[int]:
         """Check if the instance should migrate to another instance.
-        
+
         Returns:
             List[int]: The instance IDs that should be migrated.
         """
         return await self.rollout_router.check_should_migrate()
-    
+
     async def check_should_sync(self, instance_id: int, ps_model_version: int) -> bool:
         """Check if the instance should synchronize with PS.
-        
+
         Args:
             instance_id (int): The instance ID to synchronize with.
             ps_model_version (int): The version of the PS model to synchronize with.
-        
+
         Returns:
             bool: True if there is any benefit from synchronization, False otherwise.
         """
         return await self.rollout_router.check_should_sync(instance_id, ps_model_version)
 
-    async def update_currently_syncing_instances(self, instance_ids: List[int], ps_model_version: int):
+    async def update_currently_syncing_instances(self, instance_ids: list[int], ps_model_version: int):
         """Update the currently syncing instances.
-        
+
         Args:
             instance_ids (List[int]): The instance IDs to update.
             ps_model_version (int): The version of the PS model to update.
         """
         await self.rollout_router.update_currently_syncing_instances(instance_ids, ps_model_version)
 
-    async def abort_requests(self, instance_to_uids: Dict[int, Union[List[int], Set[int]]]):
+    async def abort_requests(self, instance_to_uids: dict[int, list[int] | set[int]]):
         """Abort the requests in the router.
-        
+
         Args:
             instance_to_uids (Dict[int, Union[List[int], Set[int]]]): The instance IDs to abort.
         """
         await self.rollout_router.abort_requests(instance_to_uids)
-        
-    async def wait_interrupted_partial_requests_loop_back(self, instance_ids: List[int]):
+
+    async def wait_interrupted_partial_requests_loop_back(self, instance_ids: list[int]):
         """Wait for the interrupted partial requests to be looped back in the priority queue.
-        
+
         Args:
             instance_ids (List[int]): The instance IDs to wait for.
         """
         await self.rollout_router.wait_interrupted_partial_requests_loop_back(instance_ids)
-     
+
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests.
-        
+
         Returns:
             bool: True if the router is currently routing requests, False otherwise.
         """
         return self.rollout_router.is_routing()
-        
+
     async def interrupt_routing(self):
-        """Interrupt the routing.
-        """
+        """Interrupt the routing."""
         await self.rollout_router.interrupt_routing()
-        
+
     async def resume_routing(self):
-        """Resume the routing.
-        """
+        """Resume the routing."""
         await self.rollout_router.resume_routing()
 
     # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:
         """Post-process the generated outputs to create properly formatted tensors.
-        
+
         This method handles padding, attention masks, position IDs, and multi-modal inputs
         to ensure compatibility with the training pipeline.
-        
+
         Args:
             inputs (DataProto): Raw generation outputs.
-            
+
         Returns:
             DataProto: Formatted data ready for training.
         """
@@ -333,7 +346,11 @@ class PSRL_AgentLoopWorker:
         if "raw_prompt_ids" not in inputs.non_tensor_batch:
             batch_size = len(inputs)
             raw_prompt_ids = np.array(
-                [_pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i]) for i in range(batch_size)], dtype=object
+                [
+                    _pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i])
+                    for i in range(batch_size)
+                ],
+                dtype=object,
             )
         else:
             raw_prompt_ids = inputs.non_tensor_batch["raw_prompt_ids"]
@@ -345,7 +362,10 @@ class PSRL_AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=True,
         )
-        prompt_ids, prompt_attention_mask = prompt_output["input_ids"], prompt_output["attention_mask"]
+        prompt_ids, prompt_attention_mask = (
+            prompt_output["input_ids"],
+            prompt_output["attention_mask"],
+        )
 
         # responses
         raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
@@ -358,7 +378,10 @@ class PSRL_AgentLoopWorker:
             return_tensors="pt",
             return_attention_mask=True,
         )
-        response_ids, response_attention_mask = outputs["input_ids"], outputs["attention_mask"]
+        response_ids, response_attention_mask = (
+            outputs["input_ids"],
+            outputs["attention_mask"],
+        )
 
         # response_mask
         response_masks = inputs.non_tensor_batch.pop("response_mask", None)
@@ -375,7 +398,7 @@ class PSRL_AgentLoopWorker:
         assert response_ids.shape == response_mask.shape, (
             f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"
         )
-        
+
         response_mask = response_mask * response_attention_mask
         attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)
@@ -383,10 +406,7 @@ class PSRL_AgentLoopWorker:
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
         # TODO(verl): support other multi-modal inputs
         multi_modal_inputs = None
-        if (
-            self.processor is not None
-            and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__
-        ):
+        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             from verl.models.transformers.qwen2_vl import get_rope_index
 
             images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)

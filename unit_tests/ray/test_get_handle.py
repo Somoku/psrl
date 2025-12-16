@@ -1,12 +1,13 @@
 import ray
 from ray import get_runtime_context
 
+
 # 定义一个简单的 Actor
 @ray.remote
 class MyActor:
     def __init__(self):
         self.value = 42
-        
+
     def get_val(self):
         return self.value
 
@@ -33,7 +34,7 @@ actor_handle_outside = ray.get(actor_handle.get_current_actor_handle.remote())
 # 验证返回的句柄，并调用其方法
 if actor_handle_outside:
     print("Successfully retrieved the actor handle!")
-    
+
     # 通过返回的句柄调用actor方法
     result = ray.get(actor_handle_outside.say_hello.remote())
     print("Actor says:", result)

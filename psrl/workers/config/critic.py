@@ -1,9 +1,7 @@
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
 
 from omegaconf import MISSING
-
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 
@@ -13,7 +11,12 @@ from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
-__all__ = ["CriticConfig", "FSDPCriticConfig", "McoreCriticConfig", "FSDPCriticModelCfg"]
+__all__ = [
+    "CriticConfig",
+    "FSDPCriticConfig",
+    "McoreCriticConfig",
+    "FSDPCriticModelCfg",
+]
 
 
 @dataclass
@@ -50,22 +53,22 @@ class CriticConfig(BaseConfig):
     }
 
     strategy: str = MISSING
-    ppo_micro_batch_size_per_gpu: Optional[int] = None
-    enable: Optional[bool] = None
+    ppo_micro_batch_size_per_gpu: int | None = None
+    enable: bool | None = None
     rollout_n: int = 1
     ppo_mini_batch_size: int = 1
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 32768
     # deprecate this
     forward_max_token_len_per_gpu: int = 32768
-    ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
+    ppo_infer_micro_batch_size_per_gpu: int | None = None
     ppo_infer_max_token_len_per_gpu: int = 32768
     ppo_epochs: int = 1
     data_loader_seed: int = 1
     shuffle: bool = True
     cliprange_value: float = 0.5
     loss_agg_mode: str = "token-mean"
-    ppo_micro_batch_size: Optional[int] = None
+    ppo_micro_batch_size: int | None = None
     engine: BaseConfig = field(default_factory=BaseConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     # deprecate model to favor model_config
@@ -79,7 +82,10 @@ class CriticConfig(BaseConfig):
         assert self.strategy != MISSING
 
         if self.model_config is None:
-            warnings.warn("using model in Critic Config is deprecated, please use model_config instead", stacklevel=2)
+            warnings.warn(
+                "using model in Critic Config is deprecated, please use model_config instead",
+                stacklevel=2,
+            )
             self.model_config = self.model
 
         if not self.use_dynamic_bsz:
@@ -151,7 +157,7 @@ class McoreCriticConfig(CriticConfig):
     nccl_timeout: int = 600
     megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
     load_weight: bool = True
-    data_loader_seed: Optional[int] = None
+    data_loader_seed: int | None = None
 
     def validate(self, n_gpus: int, train_batch_size: int):
         """Validate Megatron critic configuration with runtime parameters."""

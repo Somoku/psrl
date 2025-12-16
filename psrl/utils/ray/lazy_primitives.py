@@ -2,13 +2,16 @@
 # There is no way to do async put in ray without any serialization/copying overhead.
 # We should use `ray.put` directly instead.
 
-import ray
 from typing import Any
+
+import ray
+
 
 # A ray remote function for background put
 @ray.remote
 def _background_put(x: Any):
     return ray.put(x)
+
 
 # LazyObjectRef stores the handle of the background task
 class LazyObjectRef:
@@ -19,10 +22,12 @@ class LazyObjectRef:
     def task_ref(self):
         return self._task_ref
 
+
 # Launch the background task
 def lazy_put(x: Any) -> LazyObjectRef:
     task_ref = _background_put.remote(x)
     return LazyObjectRef(task_ref)
+
 
 # Wait for put to finish and get the actual value
 def lazy_get(lazy_ref: LazyObjectRef) -> Any:

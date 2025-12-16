@@ -2,7 +2,6 @@ import importlib.util
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
@@ -53,16 +52,16 @@ class SandboxFusionConfig(BaseConfig):
         memory_limit_mb (int): Max memory limit for each sandbox process in MB.
     """
 
-    url: Optional[str] = None
+    url: str | None = None
     max_concurrent: int = 64
     memory_limit_mb: int = 1024
 
 
 @dataclass
 class RewardModelDataProcessorConfig(BaseConfig):
-    path: Optional[str] = None
-    preprocess_fn_name: Optional[str] = None
-    postprocess_fn_name: Optional[str] = None
+    path: str | None = None
+    preprocess_fn_name: str | None = None
+    postprocess_fn_name: str | None = None
 
     def get_process_fn(self):
         preprocess_fn = get_custome_process_fn(

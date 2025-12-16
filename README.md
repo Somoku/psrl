@@ -46,6 +46,21 @@ As an example, you can run the following command to start training:
 bash examples/ppo_trainer/fsdp/train.sh
 ```
 
+## Contributing to PSRL
+
+PSRL is open to everyone and welcomes all kinds of contributions! Please feel free to submit an Issue or PR. Before contributing, please use [pre-commit](https://pre-commit.com/#usage) to lint and format the codebase:
+
+```bash
+uv pip install pre-commit
+pre-commit install
+
+# run pre-commit to ensure code style consistency
+pre-commit run --all-files --show-diff-on-failure --color=always
+
+# run pre-commit on staged files only
+pre-commit run
+```
+
 ## Acknowledgements
 
 PSRL is built upon the foundations of [verl](https://github.com/volcengine/verl), an open-source RLHF framework from ByteDance Seed.

@@ -1,9 +1,7 @@
-import os
-import time
-import torch
 import ray
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+import torch
 from psrl.utils.nixl.server_client import NIXLMetaServer, NIXLStorageClient
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 @ray.remote
@@ -26,10 +24,18 @@ class MetaServerActor:
     def shutdown(self):
         self.server.shutdown()
 
+
 @ray.remote
 class MetaClientActor:
     def __init__(self, client_name, server_name, server_ip, server_port, local_data):
-        self.client = NIXLStorageClient(client_name, server_name, server_ip, server_port, use_gpu=False, mode="meta_server")
+        self.client = NIXLStorageClient(
+            client_name,
+            server_name,
+            server_ip,
+            server_port,
+            use_gpu=False,
+            mode="meta_server",
+        )
         tensors = {k: torch.zeros_like(torch.tensor(v, dtype=torch.float32)) for k, v in local_data.items()}
         self.client.register_local_tensors(tensors)
         self.tensors = tensors
@@ -67,6 +73,7 @@ class MetaClientActor:
     def get_tensor_value(self, key):
         return self.tensors[key].clone()
 
+
 def test_nixl_meta_comm():
     ray.init(ignore_reinit_error=True)
     listen_ip = "29.210.128.48"
@@ -78,13 +85,10 @@ def test_nixl_meta_comm():
 
     # Start meta server
     print("Starting meta server")
-    ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
+    ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = MetaServerActor.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=ip_to_node_id[listen_ip],
-            soft=False
-        )
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)
     ).remote(server_name, listen_ip, listen_port, num_agents)
     ray.get(server.init_is_ready.remote())
 
@@ -137,7 +141,9 @@ def test_nixl_meta_comm():
         # Client 0 should now have the new data (local read)
         tensor = ray.get(clients[0].get_tensor_value.remote(key))
         # print(f"tensor: {tensor}, new_data: {new_data}")
-        assert torch.allclose(tensor, torch.tensor(new_data, dtype=torch.float32)), f"Meta client write failed for {key}"
+        assert torch.allclose(tensor, torch.tensor(new_data, dtype=torch.float32)), (
+            f"Meta client write failed for {key}"
+        )
 
     # Shutdown
     print("Shutting down meta clients and server")
@@ -145,5 +151,6 @@ def test_nixl_meta_comm():
     ray.get(server.shutdown.remote())
     ray.shutdown()
 
+
 if __name__ == "__main__":
-    test_nixl_meta_comm() 
+    test_nixl_meta_comm()

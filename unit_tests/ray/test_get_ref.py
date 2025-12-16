@@ -1,7 +1,7 @@
-import ray
-import numpy as np
 import time
-from typing import List
+
+import numpy as np
+import ray
 
 # Initialize Ray
 ray.init(ignore_reinit_error=True)
@@ -14,13 +14,18 @@ data_ref = ray.put(data)
 put_time = time.time() - start_time
 print(f"Put time: {put_time:.4f} seconds")
 
+
 # Define a remote function that returns the original ObjectRef
-# Tricky part: If you manually wrap ObjectRef in a container (like list/tuple), Ray will not recursively dereference all refs inside the container
-# Only the top-level task/actor arguments are expanded to real values, and Ray will not traverse all nested structures to find ObjectRefs. This avoids unintentionally pulling large deeply nested objects to the local node.
+# Tricky part: If you manually wrap ObjectRef in a container (like list/tuple),
+# Ray will not recursively dereference all refs inside the container
+# Only the top-level task/actor arguments are expanded to real values,
+# and Ray will not traverse all nested structures to find ObjectRefs.
+# This avoids unintentionally pulling large deeply nested objects to the local node.
 @ray.remote
-def get_data_ref(obj_ref_list: List[ray.ObjectRef]):
+def get_data_ref(obj_ref_list: list[ray.ObjectRef]):
     assert isinstance(obj_ref_list[0], ray.ObjectRef), "The first element of the list should be an ObjectRef"
     return obj_ref_list[0]
+
 
 # Call the remote function to get the nested ObjectRef
 nested_ref = get_data_ref.remote([data_ref])

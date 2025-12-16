@@ -1,5 +1,6 @@
 import ray
 
+
 @ray.remote
 class MyActor:
     def __init__(self):
@@ -9,6 +10,7 @@ class MyActor:
     def get_node_id(self):
         # 返回16进制字符串形式的 NodeID
         return self.node_id
+
 
 # 启动 Ray
 ray.init()

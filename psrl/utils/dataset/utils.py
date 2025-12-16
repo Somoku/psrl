@@ -1,10 +1,11 @@
-import os
-import torch
 import logging
-from typing import List
+import os
+
+import torch
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True):
     """Create a dataset.
@@ -49,6 +50,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     return dataset
 
+
 def create_rl_sampler(data_config, dataset):
     """Create a sampler for the dataset.
 
@@ -73,7 +75,8 @@ def create_rl_sampler(data_config, dataset):
 
     return sampler
 
-def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
+
+def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[int]:
     # remove the left padding in the prompt token_id
     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
     token_ids = prompt_token_ids[non_pad_index:].tolist()

@@ -1,9 +1,9 @@
 import math
-from typing import Any, Callable, Dict, Tuple
+from collections.abc import Callable
+from typing import Any
 
+Processor = Callable[[dict[str, Any]], tuple[bool, dict[str, float], Any]]
 
-Processor = Callable[[Dict[str, Any]], Tuple[bool, Dict[str, float], Any]] 
-    
 
 def build_processor(processor_name: str) -> Processor:
     if processor_name == "intertoken_indexed":
@@ -34,7 +34,7 @@ def make_intertoken_indexed_processor() -> Processor:
     """
     idx = 0  # enclosed counter
 
-    def processor(obj: Dict[str, Any]) -> Tuple[bool, Dict[str, float], int]:
+    def processor(obj: dict[str, Any]) -> tuple[bool, dict[str, float], int]:
         nonlocal idx
         it = obj.get("iteration_stats")
         if not isinstance(it, dict):
@@ -91,11 +91,17 @@ def make_intertoken_indexed_by_kv_cache_usage_processor() -> Processor:
     is_print_init = 0
     is_print_final = 0
 
-    def processor(obj: Dict[str, Any]) -> Tuple[bool, Dict[str, float], int]:
-        nonlocal inter_token_latencies_avg_threshold, kv_cache_usage_threshold, stop_plot, print_num, is_print_init, is_print_final
+    def processor(obj: dict[str, Any]) -> tuple[bool, dict[str, float], int]:
+        nonlocal \
+            inter_token_latencies_avg_threshold, \
+            kv_cache_usage_threshold, \
+            stop_plot, \
+            print_num, \
+            is_print_init, \
+            is_print_final
         if stop_plot:
             return False, {}, None
-        
+
         iteration_stats_it = obj.get("iteration_stats")
         scheduler_stats_it = obj.get("scheduler_stats")
         if not isinstance(iteration_stats_it, dict) or not isinstance(scheduler_stats_it, dict):
@@ -116,7 +122,7 @@ def make_intertoken_indexed_by_kv_cache_usage_processor() -> Processor:
                 return False, {}, None
         except Exception:
             return False, {}, None
-        
+
         # Extract kv_cache_usage as float
         try:
             kv_cache_usage = scheduler_stats_it.get("kv_cache_usage", None)
@@ -145,7 +151,7 @@ def make_intertoken_indexed_by_kv_cache_usage_processor() -> Processor:
                 return False, {}, None
         except Exception:
             return False, {}, None
-    
+
         if is_print_init < print_num:
             is_print_init += 1
             print(f"init: kv_cache_usage: {kv_cache_usage_val}, inter_token_latencies_avg: {val}")
@@ -164,10 +170,10 @@ def make_prompt_time_indexed_processor() -> Processor:
     """
     Return a processor(obj) -> (keep: bool, values: dict, x_value)
     """
-    total_prompt_tokens = 0 
+    total_prompt_tokens = 0
     total_prompt_time = 0
 
-    def processor(obj: Dict[str, Any]) -> Tuple[bool, Dict[str, float], int]:
+    def processor(obj: dict[str, Any]) -> tuple[bool, dict[str, float], int]:
         nonlocal total_prompt_tokens, total_prompt_time
         it = obj.get("iteration_stats")
         if not isinstance(it, dict):
@@ -176,10 +182,10 @@ def make_prompt_time_indexed_processor() -> Processor:
         # Extract num_prompt_tokens
         num_prompt_tokens = obj["iteration_stats"]["num_prompt_tokens"]
         num_prompt_tokens = float(num_prompt_tokens)
-        
+
         if num_prompt_tokens == 0:
             return False, {}, None
-        
+
         # Extract prompt_throughput
         prompt_throughput = obj["throughput_stats"]["prompt_throughput"]
         prompt_throughput = float(prompt_throughput)
@@ -189,7 +195,11 @@ def make_prompt_time_indexed_processor() -> Processor:
         total_prompt_tokens += num_prompt_tokens
         total_prompt_time += num_prompt_tokens / prompt_throughput
         print(f"total_prompt_tokens: {total_prompt_tokens}, total_prompt_time: {total_prompt_time}")
-        return True, {"prompt_time": num_prompt_tokens / prompt_throughput}, num_prompt_tokens
+        return (
+            True,
+            {"prompt_time": num_prompt_tokens / prompt_throughput},
+            num_prompt_tokens,
+        )
 
     return processor
 
@@ -200,14 +210,14 @@ def make_generation_time_indexed_processor() -> Processor:
     """
     idx = 0
 
-    def processor(obj: Dict[str, Any]) -> Tuple[bool, Dict[str, float], int]:
+    def processor(obj: dict[str, Any]) -> tuple[bool, dict[str, float], int]:
         nonlocal idx
         if obj["type"] != "generation_end":
             return False, {}, None
 
         # Extract generation_time as float
         try:
-            generation_time = obj.get("generation_time", None)
+            generation_time = obj.get("generation_time")
             if generation_time is None:
                 return False, {}, None
             val = float(generation_time)
@@ -228,12 +238,12 @@ def make_instance_request_num_indexed_by_time_processor() -> Processor:
     Return a processor(obj) -> (keep: bool, values: dict, x_value)
     """
 
-    def processor(obj: Dict[str, Any]) -> Tuple[bool, Dict[str, float], int]:
+    def processor(obj: dict[str, Any]) -> tuple[bool, dict[str, float], int]:
         if "total_elapsed_time" not in obj:
             return False, {}, None
-        
+
         total_elapsed_time = float(obj["total_elapsed_time"])
-        
+
         it = obj.get("scheduler_stats")
         if not isinstance(it, dict):
             return False, {}, None
@@ -242,9 +252,13 @@ def make_instance_request_num_indexed_by_time_processor() -> Processor:
         running_request_num = obj["scheduler_stats"]["num_running_reqs"]
         waiting_request_num = obj["scheduler_stats"]["num_waiting_reqs"]
         request_num = running_request_num + waiting_request_num
-        
+
         # Passed all checks -> increment index and return point
-        return True, {"request_num": request_num, "running_request_num": running_request_num}, total_elapsed_time
+        return (
+            True,
+            {"request_num": request_num, "running_request_num": running_request_num},
+            total_elapsed_time,
+        )
 
     return processor
 
@@ -253,18 +267,22 @@ def make_instance_throughput_indexed_by_time_processor() -> Processor:
     """
     Return a processor(obj) -> (keep: bool, values: dict, x_value)
     """
-    
-    def processor(obj: Dict[str, Any]) -> Tuple[bool, Dict[str, float], int]:
+
+    def processor(obj: dict[str, Any]) -> tuple[bool, dict[str, float], int]:
         if "total_elapsed_time" not in obj:
             return False, {}, None
-        
+
         total_elapsed_time = float(obj["total_elapsed_time"])
-        
+
         generation_throughput = obj.get("generation_throughput")
         if generation_throughput is None:
             return False, {}, None
         generation_throughput = float(generation_throughput)
 
-        return True, {"generation_throughput": generation_throughput}, total_elapsed_time
-    
+        return (
+            True,
+            {"generation_throughput": generation_throughput},
+            total_elapsed_time,
+        )
+
     return processor

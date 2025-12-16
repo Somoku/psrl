@@ -3,8 +3,6 @@ import asyncio
 import inspect
 from functools import partial
 
-from verl.utils.import_utils import deprecated
-
 
 async def default_compute_score_async(
     data_source,
@@ -33,12 +31,23 @@ async def default_compute_score_async(
     """
     if data_source == "openai/gsm8k":
         from verl.utils.reward_score import gsm8k
+
         compute_score_fn = gsm8k.compute_score
-    elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
+    elif data_source in [
+        "lighteval/MATH",
+        "DigitalLearningGmbH/MATH-lighteval",
+        "HuggingFaceH4/MATH-500",
+    ]:
         from verl.utils.reward_score import math_reward
+
         compute_score_fn = math_reward.compute_score
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+    elif data_source in [
+        "math_dapo",
+        "math",
+        "math_dapo_reasoning",
+    ] or data_source.startswith("aime"):
         from verl.utils.reward_score import math_dapo
+
         compute_score_fn = math_dapo.compute_score
     elif data_source in [
         "numina_aops_forum",
@@ -49,6 +58,7 @@ async def default_compute_score_async(
         "numina_olympiads",
     ]:
         from verl.utils.reward_score import prime_math
+
         compute_score_fn = prime_math.compute_score
     elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
         # Use the passed sandbox_fusion_url if available
@@ -88,7 +98,7 @@ async def default_compute_score_async(
 
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
-    
+
     is_async_reward_score = inspect.iscoroutinefunction(compute_score_fn)
     if is_async_reward_score:
         try:

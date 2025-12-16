@@ -1,5 +1,4 @@
 import torch
-from typing import Dict, Tuple
 
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.nixl.nixl_spec import NIXLSharding
@@ -7,11 +6,11 @@ from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 class HFConverter(BaseConverter):
     """Converter for HuggingFace model"""
-    
+
     def __init__(self):
         pass
 
-    def convert_state_and_sharding_dict(self, model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:
+    def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
         Convert HuggingFace model to unified state dict and sharding info.
         Args:
@@ -21,7 +20,7 @@ class HFConverter(BaseConverter):
         """
         # Extract the state dict from the model
         hf_state_dict = model.state_dict()
-        
+
         # Convert the state dict to a unified format
         converted_state_dict = {}
         sharding_dict = {}
@@ -32,7 +31,9 @@ class HFConverter(BaseConverter):
         return converted_state_dict, sharding_dict
 
 
-def convert_hf_inplace(model) -> Tuple[Dict[str, torch.Tensor], Dict[str, NIXLSharding]]:
+def convert_hf_inplace(
+    model,
+) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
     Convenience function to convert HuggingFace model to unified state dict and sharding info.
     Args:

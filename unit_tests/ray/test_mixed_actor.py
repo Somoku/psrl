@@ -1,10 +1,12 @@
 # mixed_actor_example.py
 
 import asyncio
-import ray
 import time
 
+import ray
+
 ray.init(ignore_reinit_error=True)  # 启动 Ray（如果你已经在运行 Ray，请忽略报错）
+
 
 @ray.remote
 class Worker:
@@ -16,6 +18,7 @@ class Worker:
         await asyncio.sleep(2)
         print(f"[{time.strftime('%X')}] Worker.compute({x}) end")
         return x * x
+
 
 @ray.remote
 class MixedActor:
@@ -48,6 +51,7 @@ class MixedActor:
         result = ray.get(self.worker.compute.remote(x))
         print(f"[{time.strftime('%X')}] MixedActor.sync_method({x}) got result = {result}")
         return result
+
 
 if __name__ == "__main__":
     # 1. 创建 Worker Actor

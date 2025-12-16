@@ -1,13 +1,16 @@
 import os
+
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp._traversal_utils import _get_fsdp_handles 
-from torch.distributed.fsdp.api import ShardingStrategy, StateDictType, FullStateDictConfig, ShardedStateDictConfig
-from transformers import AutoModel, AutoConfig
+from torch.distributed.fsdp.api import (
+    FullStateDictConfig,
+    ShardingStrategy,
+    StateDictType,
+)
+from transformers import AutoModel
 from verl.utils.fsdp_utils import get_fsdp_wrap_policy
-
 
 
 def get_model_sharding(fsdp_model: FSDP) -> dict[str, dict]:
@@ -20,7 +23,6 @@ def get_model_sharding(fsdp_model: FSDP) -> dict[str, dict]:
         "shard_lengths": tuple[int, ...],
       }
     """
-    world_size = dist.get_world_size()
     # 1) Tell FSDP to give us a sharded state‐dict
     with FSDP.state_dict_type(
         fsdp_model,
@@ -28,7 +30,6 @@ def get_model_sharding(fsdp_model: FSDP) -> dict[str, dict]:
     ):
         sharded_sd = fsdp_model.state_dict()
 
-    sharding = {}
     # 2) Each value in the sharded state‐dict is a ShardedTensor;
     #    we grab its single local_shard and read its metadata.
     for name, stensor in sharded_sd.items():
@@ -36,11 +37,13 @@ def get_model_sharding(fsdp_model: FSDP) -> dict[str, dict]:
         if dist.get_rank() == 0:
             print(name, stensor)
 
+
 def setup():
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
+
 
 def print_model_param_stats(model: torch.nn.Module, description: str):
     rank = dist.get_rank()
@@ -72,10 +75,11 @@ def print_model_param_stats(model: torch.nn.Module, description: str):
         print(f"  • 其他 device 上参数: {other_params:,d}")
     # print(model)
 
-    
+
 def auto_wrap(module, recurse, nonwrapped_numel):
     print(f"Wrapping module: {module.__class__.__name__}, recurse: {recurse}, nonwrapped_numel: {nonwrapped_numel}")
     return isinstance(module, torch.nn.Linear)
+
 
 def load_and_shard_model():
     """加载并分片模型"""
@@ -88,22 +92,24 @@ def load_and_shard_model():
         sharding_strategy=ShardingStrategy.FULL_SHARD,
         device_id=torch.cuda.current_device(),
         sync_module_states=False,
-        device_mesh=init_device_mesh("cuda", mesh_shape=(2,))
+        device_mesh=init_device_mesh("cuda", mesh_shape=(2,)),
     )
-    print_model_param_stats(model, "FSDP初始化后") 
+    print_model_param_stats(model, "FSDP初始化后")
     get_model_sharding(model)
     return model
 
+
 if __name__ == "__main__":
     import os
+
     setup()
-    
+
     # 加载并分片模型
     model = load_and_shard_model()
-    
+
     # 训练代码（此处省略）
     # train(model, ...)
-    
+
     # 保存聚合后的模型
     rank = dist.get_rank()
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(True, True)):

@@ -1,11 +1,14 @@
-from .vllm_modeling import *
 from .megatron_modeling import *
+from .vllm_modeling import *
 
 __all__ = [
     "VllmQwen2ParameterMapping",
+    "VllmQwen2MoeParameterMapping",
+    "VllmQwen3MoeParameterMapping",
     "VllmLlamaParameterMapping",
     "VllmMistralParameterMapping",
     "VllmPhiParameterMapping",
     "VllmGemmaParameterMapping",
+    "VllmOLMoEParameterMapping",
     "BridgedMegatronParameterMapping",
 ]

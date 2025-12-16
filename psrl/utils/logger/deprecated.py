@@ -1,11 +1,13 @@
 import functools
 import warnings
 
+
 def deprecated(reason=None):
     """
     Decorator to mark functions or methods as deprecated.
     Emits a DeprecationWarning when the decorated function/method is called.
     """
+
     def decorator(func):
         # Build the warning message
         message = f"Call to deprecated {func.__name__}."

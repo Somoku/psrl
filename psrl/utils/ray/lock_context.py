@@ -1,7 +1,8 @@
-import ray
 import asyncio
 import time
 from collections import deque
+
+import ray
 
 
 def add_lock(cls):
@@ -34,9 +35,9 @@ def add_lock(cls):
         else:
             self._locked = False
 
-    setattr(cls, "__init__", __init__)
-    setattr(cls, "acquire", acquire)
-    setattr(cls, "release", release)
+    cls.__init__ = __init__
+    cls.acquire = acquire
+    cls.release = release
     return cls
 
 
@@ -67,21 +68,22 @@ def add_busy_polling_lock(cls):
         assert self._locked, "Lock is not locked"
         self._locked = False
 
-    setattr(cls, "__init__", __init__)
-    setattr(cls, "acquire", acquire)
-    setattr(cls, "release", release)
+    cls.__init__ = __init__
+    cls.acquire = acquire
+    cls.release = release
     return cls
 
 
 class RayLock:
     """Synchronous context manager around a LockActor."""
+
     def __init__(self, lock_actor):
         self._lock = lock_actor
-        
+
     def acquire(self):
         """Acquire the lock, blocking until it is available."""
         ray.get(self._lock.acquire.remote())
-        
+
     def release(self):
         """Release the lock."""
         ray.get(self._lock.release.remote())
@@ -93,17 +95,18 @@ class RayLock:
     def __exit__(self, exc_type, exc, tb):
         # release regardless of exception
         self.release()
-        
+
 
 class AsyncRayLock:
     """Asynchronous context manager around a LockActor."""
+
     def __init__(self, lock_actor):
         self._lock = lock_actor
-        
+
     async def acquire(self):
         """Acquire the lock, blocking until it is available."""
         await self._lock.acquire.remote()
-        
+
     async def release(self):
         """Release the lock."""
         await self._lock.release.remote()
@@ -122,17 +125,18 @@ class BusyPollingRayLock:
     Synchronous context manager around a LockActor using busy polling.
     Uses busy polling with a specified interval to check if the lock is available.
     """
+
     def __init__(self, lock_actor, poll_interval=0.01):
         """
         Initialize the BusyPollingRayLock.
-        
+
         Args:
             lock_actor: The actor handle with lock methods (acquire, release). The actor should have acquire() method to check lock state.
             poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
         """
         self._lock = lock_actor
         self._poll_interval = poll_interval
-        
+
     def acquire(self):
         """
         Acquire the lock using busy polling, blocking until it is available.
@@ -146,7 +150,7 @@ class BusyPollingRayLock:
                 return
             # Lock is still held, wait for poll_interval before checking again
             time.sleep(self._poll_interval)
-        
+
     def release(self):
         """Release the lock."""
         ray.get(self._lock.release.remote())
@@ -166,17 +170,18 @@ class AsyncBusyPollingRayLock:
     Asynchronous context manager around a LockActor using busy polling.
     Uses busy polling with a specified interval to check if the lock is available.
     """
+
     def __init__(self, lock_actor, poll_interval=0.01):
         """
         Initialize the AsyncBusyPollingRayLock.
-        
+
         Args:
             lock_actor: The actor handle with lock methods (acquire, release). The actor should have acquire() method to check lock state.
             poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
         """
         self._lock = lock_actor
         self._poll_interval = poll_interval
-        
+
     async def acquire(self):
         """
         Acquire the lock using busy polling, blocking until it is available.
@@ -189,7 +194,7 @@ class AsyncBusyPollingRayLock:
                 return
             # Lock is still held, wait for poll_interval before checking again
             await asyncio.sleep(self._poll_interval)
-        
+
     async def release(self):
         """Release the lock."""
         await self._lock.release.remote()

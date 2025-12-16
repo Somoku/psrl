@@ -2,7 +2,7 @@ from psrl.utils.nixl.network_topology import NetworkTopology
 from psrl.utils.nixl.port_scanner import PortScanner
 
 # Global network topology instance
-GLOBAL_TOPOLOGY = NetworkTopology() 
+GLOBAL_TOPOLOGY = NetworkTopology()
 
 # Global port scanner instance
 GLOBAL_PORT_SCANNER = PortScanner.remote()

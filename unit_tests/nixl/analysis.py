@@ -1,6 +1,7 @@
+import heapq
 import os
 import re
-import heapq
+
 
 def extract_top_times_per_file(log_dir: str, k: int = 20):
     pattern = re.compile(r"time:\s*([0-9.eE+-]+)")
@@ -13,13 +14,13 @@ def extract_top_times_per_file(log_dir: str, k: int = 20):
     for fname in files:
         fpath = os.path.join(log_dir, fname)
         entries = []
-        with open(fpath, "r", encoding="utf-8") as f:
+        with open(fpath, encoding="utf-8") as f:
             for line in f:
                 match = pattern.search(line)
                 if match:
                     t = float(match.group(1))
                     entries.append((t, line.strip()))
-        
+
         if not entries:
             print(f"[{fname}] No 'time:' entries found.\n")
             continue
@@ -35,6 +36,7 @@ def extract_top_times_per_file(log_dir: str, k: int = 20):
         for rank, (t, line) in enumerate(top_k, 1):
             print(f"  [{rank}] {t:.6f}s → {line}")
         print("\n")
+
 
 if __name__ == "__main__":
     extract_top_times_per_file(log_dir="./log", k=20)

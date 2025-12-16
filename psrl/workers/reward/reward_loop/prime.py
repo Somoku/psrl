@@ -2,22 +2,31 @@ import asyncio
 import inspect
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from typing import Any, Callable, Optional
 
 import psutil
-import torch
-
 from verl import DataProto
+
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop import register
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
 
 
-async def single_compute_score(evaluation_func, completion, reference, task, task_extra_info, executor, timeout=300.0):
+async def single_compute_score(
+    evaluation_func,
+    completion,
+    reference,
+    task,
+    task_extra_info,
+    executor,
+    timeout=300.0,
+):
     loop = asyncio.get_running_loop()
     try:
         # Ensure process_completion is called properly
-        future = loop.run_in_executor(executor, partial(evaluation_func, task, completion, reference, task_extra_info))
+        future = loop.run_in_executor(
+            executor,
+            partial(evaluation_func, task, completion, reference, task_extra_info),
+        )
         return await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
         print(f"[Timeout] Task timeout: {completion}")
@@ -26,39 +35,47 @@ async def single_compute_score(evaluation_func, completion, reference, task, tas
         print(f"[Error] Task failed: {e}, completion: {completion[:80]}")
         return None  # Default value for failed rows
 
+
 @register("prime")
 class PrimeRewardLoopManager(RewardLoopManagerBase):
     """
     The Reward Manager used in https://github.com/PRIME-RL/PRIME
     """
 
-    def __init__(self, config, tokenizer, compute_score=None, reward_model_router=None, reward_model_tokenizer=None):
+    def __init__(
+        self,
+        config,
+        tokenizer,
+        compute_score=None,
+        reward_model_router=None,
+        reward_model_tokenizer=None,
+    ):
         super().__init__(config, tokenizer)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_model_router = reward_model_router
         self.reward_model_tokenizer = reward_model_tokenizer
-        
+
         # PRIME specific config
         self.num_examine = config.reward_model.get("reward_kwargs", {}).get("num_examine", 1)
         self.reward_fn_key = config.reward_model.get("reward_kwargs", {}).get("reward_fn_key", "data_source")
         self.num_processes = config.reward_model.get("reward_kwargs", {}).get("num_processes", 64)
         self.timeout = config.reward_model.get("reward_kwargs", {}).get("timeout", 300.0)
-        
+
         self.already_print_data_sources = {}
 
     async def run_single(self, data: DataProto) -> dict:
         """Process a single data item and return reward score.
-        
+
         Args:
             data: DataProto containing a single data item
-            
+
         Returns:
             dict: Dictionary containing 'reward_score' and 'reward_extra_info'
         """
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
-        
+
         response_ids = data_item.batch["responses"]
         response_length = response_ids.shape[-1]
         valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
@@ -69,9 +86,10 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
 
         response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
+            None,
+            lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True),
         )
-        
+
         # Use single_compute_score with ProcessPoolExecutor for PRIME's evaluation
         # Check if compute_score is async or sync
         if self.is_async_reward_score:
@@ -79,7 +97,7 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
             try:
                 result = await asyncio.wait_for(
                     self.compute_score(data_source, response_str, ground_truth, extra_info),
-                    timeout=self.timeout
+                    timeout=self.timeout,
                 )
             except asyncio.TimeoutError:
                 print(f"[Timeout] Task timeout: {response_str[:80]}")
@@ -98,7 +116,7 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
                         data_source,
                         extra_info,
                         executor,
-                        timeout=self.timeout
+                        timeout=self.timeout,
                     )
                 except Exception as e:
                     print(f"[Error] PRIME scoring failed: {e}, completion: {response_str[:80]}")
@@ -130,7 +148,7 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
                 reward_extra_info[key] = value
         else:
             score = float(result[0]) if result else 0.0
-        
+
         reward_extra_info["acc"] = score
         reward = score
 
@@ -143,5 +161,3 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
             print(f"[PRIME Example] Data source: {data_source}, Response: {response_str[:200]}, Score: {score}")
 
         return {"reward_score": reward, "reward_extra_info": reward_extra_info}
-
-

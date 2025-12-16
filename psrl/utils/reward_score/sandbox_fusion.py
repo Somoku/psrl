@@ -1,13 +1,13 @@
 # Modified from verl/utils/reward_score/sandbox_fusion/__init__.py and utils.py
-import os
+import asyncio
 import json
 import logging
+import os
 import traceback
-import time
 import uuid
+from typing import Any
+
 import aiohttp
-import asyncio
-from typing import Any, Optional
 
 DEFAULT_TIMEOUT = 10  # Default compile and run timeout
 MAX_RETRIES = 3
@@ -54,6 +54,7 @@ SUPPORTED_LANGUAGES = [
     "swift",
     "racket",
 ]
+
 
 async def compute_score(
     completion,
@@ -154,18 +155,18 @@ async def compute_score(
         final_metadata = metadata_list if "metadata_list" in locals() else [{"error": f"Unhandled exception: {e}"}]
 
         # Ensure float and list are returned
-    return float(score), final_metadata if isinstance(final_metadata, list) else [final_metadata]
+    return float(score), (final_metadata if isinstance(final_metadata, list) else [final_metadata])
 
 
 async def call_sandbox_api(
     sandbox_fusion_url: str,
     code: str,
-    stdin: Optional[str],
+    stdin: str | None,
     compile_timeout: int,
     run_timeout: int,
     memory_limit_mb: int,
     language: str = "python",
-) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+) -> tuple[dict[str, Any] | None, str | None]:
     """
     Calls the remote sandbox API to execute code with retry logic for Gateway Timeout,
     using increasing delay between retries. Logs internal calls with a unique ID.
@@ -217,35 +218,34 @@ async def call_sandbox_api(
             psrl_logger.info(
                 f"{log_prefix}Attempt {attempt + 1}/{MAX_RETRIES}: Calling sandbox API at {sandbox_fusion_url}"
             )
-            
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
+
+            async with (
+                aiohttp.ClientSession(timeout=timeout) as session,
+                session.post(
                     sandbox_fusion_url,
                     headers=headers,
                     json=payload,  # aiohttp automatically serializes to JSON
-                ) as response:
-                    # Check for Gateway Timeout (504) specifically for retrying
-                    if response.status == 504:
-                        last_error = (
-                            f"{log_prefix}API Request Error: Gateway Timeout (504) on attempt "
-                            f"{attempt + 1}/{MAX_RETRIES}"
-                        )
-                        psrl_logger.warning(last_error)
-                        if attempt < MAX_RETRIES - 1:  # Don't sleep after the last attempt
-                            delay = INITIAL_RETRY_DELAY * (attempt + 1)
-                            psrl_logger.info(f"{log_prefix}Retrying after {delay} seconds...")
-                            await asyncio.sleep(delay)
-                        continue  # Go to the next retry attempt
-
-                    # Check for other HTTP errors (e.g., 4xx, other 5xx)
-                    response.raise_for_status()
-
-                    # If successful (status code 2xx)
-                    psrl_logger.info(
-                        f"{log_prefix}Sandbox API call successful on attempt {attempt + 1}"
+                ) as response,
+            ):
+                # Check for Gateway Timeout (504) specifically for retrying
+                if response.status == 504:
+                    last_error = (
+                        f"{log_prefix}API Request Error: Gateway Timeout (504) on attempt {attempt + 1}/{MAX_RETRIES}"
                     )
-                    response_json = await response.json()
-                    return response_json, None
+                    psrl_logger.warning(last_error)
+                    if attempt < MAX_RETRIES - 1:  # Don't sleep after the last attempt
+                        delay = INITIAL_RETRY_DELAY * (attempt + 1)
+                        psrl_logger.info(f"{log_prefix}Retrying after {delay} seconds...")
+                        await asyncio.sleep(delay)
+                    continue  # Go to the next retry attempt
+
+                # Check for other HTTP errors (e.g., 4xx, other 5xx)
+                response.raise_for_status()
+
+                # If successful (status code 2xx)
+                psrl_logger.info(f"{log_prefix}Sandbox API call successful on attempt {attempt + 1}")
+                response_json = await response.json()
+                return response_json, None
 
         except aiohttp.ClientResponseError as e:
             last_error = f"{log_prefix}API Response Error: {e.status} - {e.message}"
@@ -273,7 +273,9 @@ async def call_sandbox_api(
     psrl_logger.error(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")
     # Return the error message without the prefix, as the caller doesn't need the internal ID
     # Ensure API call failure returns error message, leading to -1 in check_correctness
-    return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
+    return None, (
+        last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
+    )
 
 
 async def _process_single_case(
@@ -285,8 +287,8 @@ async def _process_single_case(
     timeout: int,
     memory_limit_mb: int,
     language: str,
-    concurrent_semaphore: Optional[asyncio.Semaphore] = None,
-    fn_name: Optional[str] = None,
+    concurrent_semaphore: asyncio.Semaphore | None = None,
+    fn_name: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Helper function to process a single test case."""
     api_response = None
@@ -513,7 +515,9 @@ if __name__ == '__main__':
                         result_status = -2
                 else:
                     # Other Failed status with run_result, classify as unknown failure
-                    psrl_logger.warning(f"Unknown run_status '{metadata['run_status']}' or state within Failed API status.")
+                    psrl_logger.warning(
+                        f"Unknown run_status '{metadata['run_status']}' or state within Failed API status."
+                    )
                     metadata["status"] = "unknown_failure"
                     result_status = -1  # Default to -1
             else:
@@ -550,12 +554,12 @@ if __name__ == '__main__':
 
 async def check_correctness(
     sandbox_fusion_url: str,
-    in_outs: Optional[dict],
+    in_outs: dict | None,
     generation: str,
     timeout: int = DEFAULT_TIMEOUT,
     memory_limit_mb: int = 1024,
     language: str = "python",
-    concurrent_semaphore: Optional[asyncio.Semaphore] = None,
+    concurrent_semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[list[Any], list[dict[str, Any]]]:
     """
     Checks the correctness of code generation using the remote sandbox API,
@@ -597,7 +601,9 @@ async def check_correctness(
         return [], []
 
     if len(inputs) != len(expected_outputs):
-        psrl_logger.warning(f"Mismatch between number of inputs ({len(inputs)}) and outputs ({len(expected_outputs)}).")
+        psrl_logger.warning(
+            f"Mismatch between number of inputs ({len(inputs)}) and outputs ({len(expected_outputs)})."
+        )
         # Return error based on the number of inputs provided
         return [-1] * num_cases, [{"error": "Input/output count mismatch", "case_index": i} for i in range(num_cases)]
 
@@ -639,7 +645,7 @@ async def check_correctness(
             metadata_list[i] = {
                 "case_index": i,
                 "input": str(inputs[i]),
-                "expected_output": str(expected_outputs[i]) if expected_outputs[i] else None,
+                "expected_output": (str(expected_outputs[i]) if expected_outputs[i] else None),
                 "api_request_error": f"Internal execution error: {task_result}",
                 "status": "internal_error",
             }
@@ -667,7 +673,7 @@ async def check_correctness(
                     metadata_list[i] = {
                         "case_index": i,
                         "input": str(inputs[i]),
-                        "expected_output": str(expected_outputs[i]) if expected_outputs[i] else None,
+                        "expected_output": (str(expected_outputs[i]) if expected_outputs[i] else None),
                         "api_request_error": None,
                         "status": "compile_error_skipped",  # Indicate skipped due to prior compile error
                     }

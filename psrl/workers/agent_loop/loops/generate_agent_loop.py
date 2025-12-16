@@ -1,17 +1,15 @@
-import os
 import logging
+import os
+
 import numpy as np
-
-import ray
-
 from verl import DataProto
-from verl.utils.profiler import simple_timer
 
-from psrl.workers.agent_loop.loops.utils import register
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
+from psrl.workers.agent_loop.loops.utils import register
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 @register("generate_only_agent")
 class GenerateAgentLoop(AgentLoopBase):
@@ -25,10 +23,10 @@ class GenerateAgentLoop(AgentLoopBase):
 
     async def run(self, request: DataProto) -> DataProto:
         """Execute generation for a single request.
-        
+
         Args:
             request (DataProto): Single input request.
-            
+
         Returns:
             DataProto: Generated response with metadata.
         """

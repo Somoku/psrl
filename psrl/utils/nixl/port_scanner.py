@@ -1,13 +1,14 @@
 import socket
+
 import ray
 
-    
+
 @ray.remote
 class PortScanner:
     def __init__(self):
         self.min_port = 20000
         self.max_port = 60000
-        
+
     def find_free_port(self, host="127.0.0.1"):
         for port in range(self.min_port, self.max_port + 1):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

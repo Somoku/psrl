@@ -1,13 +1,20 @@
-import os
-import time
-import torch
 import ray
+import torch
+from psrl.utils.nixl.server_client import NIXLStorageClient, NIXLStorageServer
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from psrl.utils.nixl.server_client import NIXLStorageServer, NIXLStorageClient
+
 
 @ray.remote
 class ServerActor:
-    def __init__(self, server_name, listen_ip, listen_port, cuda, state_dict_data, expected_clients):
+    def __init__(
+        self,
+        server_name,
+        listen_ip,
+        listen_port,
+        cuda,
+        state_dict_data,
+        expected_clients,
+    ):
         self.server = NIXLStorageServer(server_name, listen_ip, listen_port, cuda)
         # Construct state dict
         state_dict = {k: torch.tensor(v, dtype=torch.float32) for k, v in state_dict_data.items()}
@@ -33,10 +40,18 @@ class ServerActor:
     def shutdown(self):
         self.server.shutdown()
 
+
 @ray.remote
 class ClientActor:
     def __init__(self, client_name, server_name, server_ip, server_port, cuda, local_data):
-        self.client = NIXLStorageClient(client_name, server_name, server_ip, server_port, cuda, mode="storage_server")
+        self.client = NIXLStorageClient(
+            client_name,
+            server_name,
+            server_ip,
+            server_port,
+            cuda,
+            mode="storage_server",
+        )
         # Register local tensors
         tensors = {k: torch.zeros_like(torch.tensor(v, dtype=torch.float32)) for k, v in local_data.items()}
         self.client.register_local_tensors(tensors)
@@ -77,12 +92,12 @@ def test_nixl_comm():
 
     # Start server
     print("Starting server")
-    ip_to_node_id = {node['NodeManagerAddress']: node['NodeID'] for node in ray.nodes()}
+    ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = ServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(
             node_id=ip_to_node_id[listen_ip],  # Use the first node's ID
-            soft=False
+            soft=False,
         )
     ).remote(server_name, listen_ip, listen_port, cuda, state_dict_data, num_clients)
 
@@ -90,7 +105,14 @@ def test_nixl_comm():
     print("Starting clients")
     clients = []
     for i in range(num_clients):
-        client = ClientActor.remote(f"{client_name}_{i}", server_name, listen_ip, listen_port, cuda, state_dict_data)
+        client = ClientActor.remote(
+            f"{client_name}_{i}",
+            server_name,
+            listen_ip,
+            listen_port,
+            cuda,
+            state_dict_data,
+        )
         clients.append(client)
 
     # Connect clients
@@ -101,7 +123,7 @@ def test_nixl_comm():
     print("Waiting for clients")
     ray.get(server.wait_for_client_infos.remote())
     ray.get(server.notify_all_client_infos.remote())
-    
+
     # Client syncs descs
     print("Syncing descs")
     ray.get([c.sync_desc.remote() for c in clients])
@@ -121,7 +143,9 @@ def test_nixl_comm():
             ray.get(c.do_write.remote(key, b"write1", new_data))
             # Server should now have the new data
             server_tensor = ray.get(server.get_state.remote(key))
-            assert torch.allclose(server_tensor, torch.tensor(new_data, dtype=torch.float32)), f"Server write failed for {key}"
+            assert torch.allclose(server_tensor, torch.tensor(new_data, dtype=torch.float32)), (
+                f"Server write failed for {key}"
+            )
 
     # Shutdown
     print("Shutting down")
@@ -129,5 +153,6 @@ def test_nixl_comm():
     ray.get(server.shutdown.remote())
     ray.shutdown()
 
+
 if __name__ == "__main__":
-    test_nixl_comm() 
+    test_nixl_comm()

@@ -1,9 +1,8 @@
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from omegaconf import MISSING
 from transformers import AutoConfig
-
 from verl.base_config import BaseConfig
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
@@ -30,11 +29,11 @@ class HFModelConfig(BaseConfig):
     }
 
     path: str = MISSING
-    local_path: Optional[str] = None
-    hf_config_path: Optional[str] = None
-    local_hf_config_path: Optional[str] = None
-    tokenizer_path: Optional[str] = None
-    local_tokenizer_path: Optional[str] = None
+    local_path: str | None = None
+    hf_config_path: str | None = None
+    local_hf_config_path: str | None = None
+    tokenizer_path: str | None = None
+    local_tokenizer_path: str | None = None
 
     # whether to load tokenizer. This is useful when we only want to load model config
     load_tokenizer: bool = True
@@ -49,9 +48,9 @@ class HFModelConfig(BaseConfig):
     trust_remote_code: bool = False
 
     # custom chat template for the model
-    custom_chat_template: Optional[str] = None
+    custom_chat_template: str | None = None
 
-    external_lib: Optional[str] = None
+    external_lib: str | None = None
 
     override_config: dict = field(default_factory=dict)
 
@@ -63,15 +62,15 @@ class HFModelConfig(BaseConfig):
     # lora related. We may setup a separate config later
     lora_rank: int = 0
     lora_alpha: int = 16
-    target_modules: Optional[str] = "all-linear"
+    target_modules: str | None = "all-linear"
 
-    exclude_modules: Optional[str] = None
+    exclude_modules: str | None = None
     use_liger: bool = False
 
     use_fused_kernels: bool = False
     fused_kernel_options: dict = field(default_factory=dict)
 
-    architectures: Optional[list[str]] = None
+    architectures: list[str] | None = None
 
     def __post_init__(self):
         import_external_libs(self.external_lib)
@@ -103,7 +102,9 @@ class HFModelConfig(BaseConfig):
         # constuct hf_config
         attn_implementation = self.override_config.get("attn_implementation", "flash_attention_2")
         self.hf_config = AutoConfig.from_pretrained(
-            self.local_hf_config_path, trust_remote_code=self.trust_remote_code, attn_implementation=attn_implementation
+            self.local_hf_config_path,
+            trust_remote_code=self.trust_remote_code,
+            attn_implementation=attn_implementation,
         )
 
         override_config_kwargs = {}
@@ -129,7 +130,7 @@ class HFModelConfig(BaseConfig):
         # get model architectures
         self.architectures = getattr(self.hf_config, "architectures", None)
         assert self.architectures is not None and len(self.architectures) == 1, (
-            "Expect only one architecture, got {}".format(self.architectures)
+            f"Expect only one architecture, got {self.architectures}"
         )
 
         # per model patch

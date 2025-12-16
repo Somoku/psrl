@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Optional
 
 from omegaconf import MISSING
-
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 
@@ -31,13 +29,13 @@ class MultiTurnConfig(BaseConfig):
     _mutable_fields = {"max_assistant_turns", "max_user_turns"}
 
     enable: bool = False
-    max_assistant_turns: Optional[int] = None
-    tool_config_path: Optional[str] = None
-    max_user_turns: Optional[int] = None
+    max_assistant_turns: int | None = None
+    tool_config_path: str | None = None
+    max_user_turns: int | None = None
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"
-    interaction_config_path: Optional[str] = None
+    interaction_config_path: str | None = None
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
@@ -46,21 +44,21 @@ class MultiTurnConfig(BaseConfig):
 
 @dataclass
 class CustomAsyncServerConfig(BaseConfig):
-    path: Optional[str] = None
-    name: Optional[str] = None
+    path: str | None = None
+    name: str | None = None
 
 
 @dataclass
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
-    agent_loop_config_path: Optional[str] = None
+    agent_loop_config_path: str | None = None
     route_strategy: str = "round_robin"
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
 
 
 @dataclass
 class TraceConfig(BaseConfig):
-    backend: Optional[str] = None
+    backend: str | None = None
     token2text: bool = False
 
 
@@ -81,7 +79,7 @@ class ServerConfig(BaseConfig):
 class RolloutConfig(BaseConfig):
     _mutable_fields = {"max_model_len", "load_format"}
 
-    name: Optional[str] = MISSING
+    name: str | None = MISSING
     mode: str = "sync"
     disable_attn: bool = False
     skip_tokenizer_init: bool = True
@@ -103,7 +101,7 @@ class RolloutConfig(BaseConfig):
     gpu_memory_utilization: float = 0.5
     ignore_eos: bool = False
     enforce_eager: bool = True
-    cudagraph_capture_sizes: Optional[list] = None
+    cudagraph_capture_sizes: list | None = None
     free_cache_engine: bool = True
     data_parallel_size: int = 1
     expert_parallel_size: int = 1
@@ -116,12 +114,12 @@ class RolloutConfig(BaseConfig):
 
     val_kwargs: SamplingConfig = field(default_factory=SamplingConfig)
 
-    max_model_len: Optional[int] = None
+    max_model_len: int | None = None
     max_num_seqs: int = 1024
 
     # note that the logprob computation should belong to the actor
-    log_prob_micro_batch_size: Optional[int] = None
-    log_prob_micro_batch_size_per_gpu: Optional[int] = None
+    log_prob_micro_batch_size: int | None = None
+    log_prob_micro_batch_size_per_gpu: int | None = None
     log_prob_use_dynamic_bsz: bool = False
     log_prob_max_token_len_per_gpu: int = 16384
 
@@ -147,12 +145,12 @@ class RolloutConfig(BaseConfig):
 
     skip_dump_dir: str = "/tmp/rollout_dump"
 
-    profiler: Optional[ProfilerConfig] = None
+    profiler: ProfilerConfig | None = None
 
     enable_chunked_prefill: bool = True
 
     enable_prefix_caching: bool = True
-    
+
     logprobs_mode: str = "raw_logprobs"
 
     load_format: str = "dummy"
@@ -163,6 +161,6 @@ class RolloutConfig(BaseConfig):
 
     sglang_engine_mode: str = "local"
 
-    limit_images: Optional[int] = None
+    limit_images: int | None = None
 
     skip_tokenizer_init: bool = False

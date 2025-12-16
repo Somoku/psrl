@@ -38,7 +38,7 @@ mkdir -p apex_src
 pushd apex_src
 git clone https://github.com/NVIDIA/apex.git && \
 cd apex && \
-MAX_JOB=$MAX_JOBS pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
+MAX_JOB=$MAX_JOBS python -m pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./
 popd
 rm -rf apex_src
 

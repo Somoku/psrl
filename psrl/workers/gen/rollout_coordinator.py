@@ -542,7 +542,7 @@ class RolloutCoordinator(CommandExtension):
         # psrl_logger.info("Checking if any instance is starving and doing migration if necessary")
         migrate_instance_ids = await self.agent_loop_workers[0].check_should_migrate.remote()
         if migrate_instance_ids:
-            psrl_logger.info(f"Migrating instances {migrate_instance_ids} to new PS model version {self.ps_model_version}")
+            psrl_logger.info(f"Migrating instances {migrate_instance_ids}")
             await self.agent_loop_workers[0].interrupt_routing.remote()
             psrl_logger.info(f"Interrupted routing for migration")
             await self.exec_command(Command(

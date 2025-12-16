@@ -44,6 +44,9 @@ class GenerateAgentLoop(AgentLoopBase):
                 rollout_log_probs = output.non_tensor_batch["rollout_log_probs"][0]
                 rollout_log_probs = rollout_log_probs[: self.response_length]
                 output.non_tensor_batch["rollout_log_probs"] = np.array([rollout_log_probs])
+        else:
+            # Indicate that the request is aborted
+            return None
 
         reward_input = output
         reward_result = await self.reward_manager.compute_score.remote(reward_input)

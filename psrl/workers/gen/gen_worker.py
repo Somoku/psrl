@@ -747,7 +747,6 @@ class PSRL_GenWorker(Worker):
         assert self.curr_rollout_instance_model_version >= needed_model_version, \
             f"Rollout model version should not be less than needed version, but got {self.curr_rollout_instance_model_version} for needed {needed_model_version}"
         
-        # Update the request status to ROLLOUT_RUNNING
         request_ids = request.non_tensor_batch.get("uid", None)
         rollout_instance_id = self.get_instance_id()
         
@@ -764,6 +763,7 @@ class PSRL_GenWorker(Worker):
                 await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(request_ids[0], model_version)
             request.non_tensor_batch["version_tag"] = np.array([model_version], dtype=int)
 
+        # Update the request status to ROLLOUT_RUNNING
         update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             PSRL_RequestStatus.ROLLOUT_RUNNING,
@@ -800,14 +800,15 @@ class PSRL_GenWorker(Worker):
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
                 psrl_logger.info(f"Request {request_ids[0]} is interrupted (partial rollout)")
             else:
-                update_status = PSRL_RequestStatus.RUNNING
-                psrl_logger.info(f"Request {request_ids[0]} is running (finished generation)")
+                update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
+                psrl_logger.info(f"Request {request_ids[0]} is completed (finished generation)")
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
             )
             if update_status_success[0]:
                 return result, update_status
+        # Means the request is aborted
         return None, None
 
     def generate(self, requests: DataProto, consolidate: bool = True, return_only_on_representative_rank: bool = True):
@@ -883,7 +884,7 @@ class PSRL_GenWorker(Worker):
                 # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
                 # depending on `interrupted` field in the result
                 with log_dual_events(f"Update request status", psrl_logger, event_type=EventType.OTHER):
-                    update_statuses = [PSRL_RequestStatus.ROLLOUT_INTERRUPTED if vllm_outputs[i].outputs[0].finish_reason == "abort" else PSRL_RequestStatus.RUNNING for i in range(len(vllm_outputs))]
+                    update_statuses = [PSRL_RequestStatus.ROLLOUT_INTERRUPTED if vllm_outputs[i].outputs[0].finish_reason == "abort" else PSRL_RequestStatus.ROLLOUT_COMPLETED for i in range(len(vllm_outputs))]
                     update_status_success = ray.get(self.gen_interface.ps_manager_handle.update_request_status.remote(
                         request_ids.tolist(),
                         update_statuses,

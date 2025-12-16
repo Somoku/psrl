@@ -4,7 +4,7 @@ import asyncio
 import hydra
 import torch
 import numpy as np
-from typing import List
+from typing import List, Set, Union, Dict
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from collections import deque
@@ -207,7 +207,7 @@ class PSRL_AgentLoopWorker:
             tokenizer=self.tokenizer,
         )
         
-        with log_dual_events(f"Agent loop with requests {requests.non_tensor_batch['uid']}", psrl_logger, level=logging.INFO, event_type=EventType.GEN):
+        with log_dual_events(f"Agent loop with requests {requests.non_tensor_batch['uid']}", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
             output = await agent_loop.run(requests)
         
         if output is not None:
@@ -218,7 +218,7 @@ class PSRL_AgentLoopWorker:
                     request_ids.tolist(),
                     PSRL_RequestStatus.COMPLETED,
                 )
-            with log_dual_events(f"Put requests {request_ids} into result queue", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
+            with log_dual_events(f"Put requests {request_ids} into result queue", psrl_logger, level=logging.DEBUG, event_type=EventType.OTHER):
                 dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                 if dispatch_request_idxs:
                     output = output.select_idxs(dispatch_request_idxs)
@@ -274,6 +274,14 @@ class PSRL_AgentLoopWorker:
         """
         await self.rollout_router.update_currently_syncing_instances(instance_ids, ps_model_version)
 
+    async def abort_requests(self, instance_to_uids: Dict[int, Union[List[int], Set[int]]]):
+        """Abort the requests in the router.
+        
+        Args:
+            instance_to_uids (Dict[int, Union[List[int], Set[int]]]): The instance IDs to abort.
+        """
+        await self.rollout_router.abort_requests(instance_to_uids)
+        
     async def wait_interrupted_partial_requests_loop_back(self, instance_ids: List[int]):
         """Wait for the interrupted partial requests to be looped back in the priority queue.
         

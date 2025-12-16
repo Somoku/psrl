@@ -431,7 +431,8 @@ class RolloutRouter:
                 sample_requests.non_tensor_batch["version_tag"] = np.array([needed_model_version] * len(request_indices), dtype=int) # Refactor the version tag (previouly is assigned by uid in agent loop manager)
                 requests_list.append(sample_requests) 
             requests = DataProto.concat(requests_list)
-            
+           
+        # Can skip the status of ROLLOUT_ROUTING since it is not used in batch mode
         update_status_success = ray.get(self.ps_manager_handle.update_request_status.remote(
             request_ids.tolist(),
             PSRL_RequestStatus.ROLLOUT_DISPATCHED,
@@ -481,7 +482,7 @@ class RolloutRouter:
                     psrl_logger.debug(f"Consolidated outputs from rollout instance {i} have request ids: {consolidated_outputs.non_tensor_batch['uid']}")
                     assert (
                         update_statuses is not None and
-                        all(update_status == PSRL_RequestStatus.RUNNING for update_status in update_statuses)
+                        all(update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED for update_status in update_statuses)
                     ), "Interruption is not implemented in batching mode"
                     results.append(consolidated_outputs)
                 return DataProto.concat(results)
@@ -509,12 +510,16 @@ class RolloutRouter:
                 self.scheduler_task = asyncio.create_task(self._single_priority_queue_routing_loop())
             self.scheduler_task.add_done_callback(lambda f: f.result()) # To avoid silent error in async tasks
             psrl_logger.info("Started routing loop")
+         
+        request_id = request.non_tensor_batch["uid"][0]    
+        update_status_success = await self.ps_manager_handle.update_request_status.remote(
+            [request_id],
+            PSRL_RequestStatus.ROLLOUT_ROUTING,
+        )
+        if not update_status_success[0]:
+            # Means the request is aborted
+            return None
         
-        # Create a future to track this request's completion
-        request_id = request.non_tensor_batch["uid"][0]
-        result_future = asyncio.Future()
-        # Store the future in a way that the scheduler can access it
-        self.request_futures[request_id] = result_future
         if self.config.psrl.routing_strategy.enable_dynamic_version_tag:
             # 1. Put in the request queue and route to the instance (the version tag is -1 since we don't know the version tag yet)
             # 2. Allocate the version tag and reserve data in staleness buffer
@@ -524,14 +529,22 @@ class RolloutRouter:
             # 1. Reserve data in staleness buffer (the instance id is -1 since we don't know the instance id yet)
             # 2. Put in the request queue and route to the instance
             model_version = request.non_tensor_batch["version_tag"][0] if "version_tag" in request.non_tensor_batch else request.non_tensor_batch["min_version_limit"][0] - self.staleness
-            await self.ps_manager_handle.reserve_rollout_instance_requests.remote(
-                rollout_instance_ids=-1,
-                request_ids=request_id,
-                model_versions=model_version,
-            )
+            async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+                if await self.ps_manager_handle.check_and_remove_aborted_requests.remote(request_id):
+                    return None
+                await self.ps_manager_handle.reserve_rollout_instance_requests.remote(
+                    rollout_instance_ids=-1,
+                    request_ids=request_id,
+                    model_versions=model_version,
+                )
+                
+        # Create a future to track this request's completion
+        result_future = asyncio.Future()
+        # Store the future in a way that the scheduler can access it
+        self.request_futures[request_id] = result_future
         # Add request to priority queue
         self.requests_to_route.put(request)
-        psrl_logger.info(f"Adding request {request_id} to priority queue")
+        # psrl_logger.info(f"Adding request {request_id} to priority queue")
         self.routing_status_update_event.set()
         # Wait for the request to be processed
         with log_dual_events(f"Routing request {request_id} and waiting for it to be processed", psrl_logger, level=logging.DEBUG, event_type=EventType.GEN):
@@ -539,6 +552,19 @@ class RolloutRouter:
         # Clean up the future
         self.request_futures.pop(request_id)
         return result
+    
+    def _set_result(self, request_id: int, result: Optional[DataProto]):
+        """Set the result for a request.
+        
+        Args:
+            request_id: The id of the request.
+            result: The result to set.
+        """
+        assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
+        assert not self.request_futures[request_id].done(), f"Request {request_id} should not be done"
+        self.request_futures[request_id].set_result(result)
+        if request_id in self.incomplete_request_to_instance:
+            self.incomplete_request_to_instance.pop(request_id)
     
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests."""
@@ -576,6 +602,11 @@ class RolloutRouter:
                     assert request is not None, "Request should not be None in priority queue"
                     request_id = request.non_tensor_batch["uid"][0]
                     assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
+                    if await self.ps_manager_handle.check_aborted_requests.remote(request_id, remove=True):
+                        # Indicate that the request is aborted
+                        # psrl_logger.info(f"Request {request_id} in single priority queue is aborted")
+                        self._set_result(request_id, None)
+                        continue
                     old_instance_id = request.non_tensor_batch["rollout_instance_id"][0] if "rollout_instance_id" in request.non_tensor_batch else None
                     new_instance_id = self._choose_new_rollout_instance(request)
                     # psrl_logger.info(f"Choosing rollout instance for request {request_id} to {instance_id}")
@@ -630,6 +661,11 @@ class RolloutRouter:
                         request_id = request.non_tensor_batch["uid"][0]
                         # psrl_logger.info(f"Processing request {request_id} in priority queue {queue_id}")
                         assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
+                        if await self.ps_manager_handle.check_aborted_requests.remote(request_id, remove=True):
+                            # Indicate that the request is aborted
+                            # psrl_logger.info(f"Request {request_id} in multi priority queue is aborted")
+                            self._set_result(request_id, None)
+                            continue
                         old_instance_id = request.non_tensor_batch["rollout_instance_id"][0] if "rollout_instance_id" in request.non_tensor_batch else None
                         new_instance_id = self._choose_new_rollout_instance(request)
                         if new_instance_id is None:
@@ -687,52 +723,55 @@ class RolloutRouter:
         )
         # psrl_logger.info(f"Update request {request_id} status to ROLLOUT_DISPATCHED success: {update_status_success[0]}")
         
-        if not update_status_success[0]:
-            raise ValueError(f"Failed to update request {request_id} status to ROLLOUT_DISPATCHED")
-            # return
-            
-        # Change engine status    
-        self.route_strategy.push_request(request, new_instance_id)
-        # Add request to inflight request ids for the instance
-        self.instance_to_inflight_request_ids[new_instance_id].append(request_id)
         
-        # Generate response
-        # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")
-        consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async("generate_async", request)
+        if update_status_success[0]:
+            # Change engine status    
+            self.route_strategy.push_request(request, new_instance_id)
+            # Add request to inflight request ids for the instance
+            self.instance_to_inflight_request_ids[new_instance_id].append(request_id)
             
-        # Change engine status 
-        self.route_strategy.pop_request(request, new_instance_id)
-        # Remove request from inflight request ids for the instance
-        self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
-        self.routing_status_update_event.set()
-        
-        # Check if request was interrupted and needs to be requeued
-        if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
-            psrl_logger.info(f"Request {request_id} on instance {new_instance_id} was interrupted by scheduler (most likely due to kv cache full and preemption), requeueing")
-            # Put back in priority queue for partial rollout
-            # Ensure that the consolidated output has the rollout instance id recorded
-            consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
-            self.requests_to_route.put(consolidated_output)
-            return
-        elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
-            psrl_logger.info(f"Request {request_id} on instance {new_instance_id} was interrupted (due to model synchronization or rollout migration when enabled partial rollout), requeueing")
-            # Put back in priority queue for partial rollout
-            # Ensure that the consolidated output has the rollout instance id recorded
-            consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
-            self.requests_to_route.put(consolidated_output)
-            return
-        elif update_status == PSRL_RequestStatus.RUNNING:
-            psrl_logger.info(f"Request {request_id} on instance {new_instance_id} of parent prompt {request_id // self.rollout_n} completed successfully, length is {consolidated_output.non_tensor_batch['response_unpadded_len'][0]}")
-            result = consolidated_output
+            # Generate response
+            # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")
+            consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async("generate_async", request)
+                
+            # Change engine status 
+            self.route_strategy.pop_request(request, new_instance_id)
+            # Remove request from inflight request ids for the instance
+            self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
+            self.routing_status_update_event.set()
+            
+            # Check if request was interrupted and needs to be requeued
+            if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
+                # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is interrupted by scheduler (most likely due to kv cache full and preemption), requeueing")
+                # Put back in priority queue for partial rollout
+                # Ensure that the consolidated output has the rollout instance id recorded
+                consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
+                self.requests_to_route.put(consolidated_output)
+                # No result to set since the request is not completed
+                return
+            elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
+                # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is interrupted (due to model synchronization or rollout migration when enabled partial rollout), requeueing")
+                # Put back in priority queue for partial rollout
+                # Ensure that the consolidated output has the rollout instance id recorded
+                consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
+                self.requests_to_route.put(consolidated_output)
+                # No result to set since the request is not completed
+                return
+            elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
+                # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is completed successfully, response length is {consolidated_output.non_tensor_batch['response_unpadded_len'][0]}")
+                result = consolidated_output
+            else:
+                # Means the request is aborted
+                assert update_status == None, "The update status should be None if the request is aborted"
+                # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is aborted")
+                result = None
         else:
-            # TODO(lhy): support abortion
-            raise ValueError(f"Unexpected update status for request {request_id}: {update_status}")
-    
-        # Set the result for any waiting futures
-        assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
-        assert not self.request_futures[request_id].done(), f"Request {request_id} should not be done"
-        self.incomplete_request_to_instance.pop(request_id)
-        self.request_futures[request_id].set_result(result)
+            # Means the request is aborted
+            # psrl_logger.info(f"Request {request_id} is aborted")
+            result = None
+        
+        # Set the result for the request
+        self._set_result(request_id, result)
     
     async def check_should_migrate(self) -> List[int]:
         """Check which instances should be interrupted to migrate to others due to starvation.
@@ -742,20 +781,27 @@ class RolloutRouter:
         """
         # psrl_logger.info("Checking which instances should be interrupted to migrate to others due to starvation")
         filtered_instance_ids = []
-        for instance_id in range(self.rollout_wg_size):
-            if self.route_strategy.instance_to_engine_status[instance_id].get_waiting_queue_size() != 0:
-                continue
-            instance_version = self.instance_to_version_after_sync[instance_id]
-            filtered_requests = self.requests_to_route.filter_by_condition(
-                lambda request: request.non_tensor_batch.get("version_tag", [instance_version + 1])[0] <= instance_version
-                or request.non_tensor_batch.get("min_version_limit", [instance_version + 1 + self.staleness])[0] <= instance_version + self.staleness,
-            )
-            if self.config.psrl.routing_strategy.enable_dynamic_version_tag:
+        # Filter instances that can be routed to (version is not aborted) but no requests in the priority queue can be routed to it
+        # In this case, the instance is starving and we may migrate requests from other instances to it.
+        async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+            for instance_id in range(self.rollout_wg_size):
+                if self.route_strategy.instance_to_engine_status[instance_id].get_waiting_queue_size() != 0:
+                    continue
+                instance_version = self.instance_to_version_after_sync[instance_id]
+                if await self.ps_manager_handle.check_aborted_model_versions.remote(instance_version):
+                    continue
+                filtered_requests = self.requests_to_route.filter_by_condition(
+                    lambda request: request.non_tensor_batch.get("version_tag", [instance_version + 1])[0] <= instance_version
+                    or request.non_tensor_batch.get("min_version_limit", [instance_version + 1 + self.staleness])[0] <= instance_version + self.staleness,
+                )
                 filtered_request_ids = [request.non_tensor_batch["uid"][0] for request in filtered_requests]
-                can_reserve = await self.ps_manager_handle.can_reserve_request.remote(filtered_request_ids, [instance_version], without_new_reserve_entry=False)
-                filtered_requests = [request for i, request in enumerate(filtered_requests) if can_reserve[i] == [True]]
-            if len(filtered_requests) == 0:
-                filtered_instance_ids.append(instance_id)
+                if self.config.psrl.routing_strategy.enable_dynamic_version_tag and len(filtered_request_ids) > 0:
+                    is_aborted = await self.ps_manager_handle.check_aborted_requests.remote(filtered_request_ids, remove=False)
+                    filtered_request_ids = [request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]]
+                    can_reserve = await self.ps_manager_handle.can_reserve_request.remote(filtered_request_ids, [instance_version], without_new_reserve_entry=False)
+                    filtered_request_ids = [request_id for i, request_id in enumerate(filtered_request_ids) if can_reserve[i] == [True]]
+                if len(filtered_request_ids) == 0:
+                    filtered_instance_ids.append(instance_id)
         
         candidate_migrate_instance_ids = [] # (instance_id, ratio)
         for starved_instance_id in filtered_instance_ids:
@@ -790,7 +836,7 @@ class RolloutRouter:
                     raise ValueError(f"Unknown migrate indicator: {self.config.psrl.sync_and_mig_strategy.mig.indicator}")
                 
                 if ratio > self.config.psrl.sync_and_mig_strategy.mig.threshold:
-                    psrl_logger.info(f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) has a ratio of {ratio} for migrating to instance {starved_instance_id} (version {self.instance_to_version_after_sync[starved_instance_id]})")
+                    # psrl_logger.info(f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) has a ratio of {ratio} for migrating to instance {starved_instance_id} (version {self.instance_to_version_after_sync[starved_instance_id]})")
                     candidate_migrate_instance_ids.append((instance_id, ratio))
     
         # We choose the instance with the highest ratio to migrate
@@ -831,21 +877,29 @@ class RolloutRouter:
         if self.route_strategy.instance_to_engine_status[instance_id].get_waiting_queue_size() > 0:
             return False
         
-        # 1. Check if there are any requests version satisfies the condition before synchronization
-        current_instance_version = await self.ps_manager_handle.get_rollout_instance_model_version.remote(instance_id)
-        filtered_requests = self.requests_to_route.filter_by_condition(
-            lambda request: request.non_tensor_batch.get("version_tag", [current_instance_version + 1])[0] <= current_instance_version
-            or request.non_tensor_batch.get("min_version_limit", [current_instance_version + 1 + self.staleness])[0] <= current_instance_version + self.staleness,
-        )
-        # 2. If enabled dynamic version tag, check if there are any requests that can be RESERVED for the instance but no need to reserve new entry before synchronization
-        if self.config.psrl.routing_strategy.enable_dynamic_version_tag:
-            filtered_request_ids = [request.non_tensor_batch["uid"][0] for request in filtered_requests]
-            can_reserve_without_new_reserve_entry = await self.ps_manager_handle.can_reserve_request.remote(filtered_request_ids, [current_instance_version], without_new_reserve_entry=True)
-            filtered_requests = [request for i, request in enumerate(filtered_requests) if can_reserve_without_new_reserve_entry[i] == [True]]
+        # Check if there are any requests that still can be routed to the instance
+        # In this case, we will not attempt to synchronize with PS
+        async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+            # 1. Check if there are any requests version satisfies the condition before synchronization
+            current_instance_version = await self.ps_manager_handle.get_rollout_instance_model_version.remote(instance_id)
+            if await self.ps_manager_handle.check_aborted_model_versions.remote(current_instance_version):
+                filtered_request_ids = []
+            else:
+                filtered_requests = self.requests_to_route.filter_by_condition(
+                    lambda request: request.non_tensor_batch.get("version_tag", [current_instance_version + 1])[0] <= current_instance_version
+                    or request.non_tensor_batch.get("min_version_limit", [current_instance_version + 1 + self.staleness])[0] <= current_instance_version + self.staleness,
+                )
+                filtered_request_ids = [request.non_tensor_batch["uid"][0] for request in filtered_requests]
+            # 2. If enabled dynamic version tag, check if there are any requests that can be RESERVED for the instance but no need to reserve new entry before synchronization
+            if self.config.psrl.routing_strategy.enable_dynamic_version_tag and len(filtered_request_ids) > 0:
+                is_aborted = await self.ps_manager_handle.check_aborted_requests.remote(filtered_request_ids, remove=False)
+                filtered_request_ids = [request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]]
+                can_reserve_without_new_reserve_entry = await self.ps_manager_handle.can_reserve_request.remote(filtered_request_ids, [current_instance_version], without_new_reserve_entry=True)
+                filtered_request_ids = [request_id for i, request_id in enumerate(filtered_request_ids) if can_reserve_without_new_reserve_entry[i] == [True]]
         
         # If there are requests that can still be routed to the instance before synchronization, we will not attempt to synchronize with PS
-        if len(filtered_requests) > 0:
-            # psrl_logger.info(f"{len(filtered_requests)} requests can still be routed to the instance {instance_id} before synchronization")
+        if len(filtered_request_ids) > 0:
+            # psrl_logger.info(f"{len(filtered_request_ids)} requests can still be routed to the instance {instance_id} before synchronization")
             return False
         
         # 3. Check indicator to determine whether to synchronize with PS
@@ -904,7 +958,7 @@ class RolloutRouter:
                     finished_instance_ids.add(instance_id)
             if len(finished_instance_ids) == len(instance_ids):
                 break
-            psrl_logger.info(f"Waiting for the interrupted partial requests to be looped back in the priority queue, instance to inflight requests: {self.instance_to_inflight_request_ids}")
-            await asyncio.sleep(0.1)
+            # psrl_logger.info(f"Waiting for the interrupted partial requests to be looped back in the priority queue, instance to inflight requests: {self.instance_to_inflight_request_ids}")
+            await asyncio.sleep(0.01)
         psrl_logger.info(f"The interrupted partial requests are looped back in the priority queue")
        

@@ -21,7 +21,7 @@ python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PAT
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
-GEN_TP=1 # TP in the generation side
+GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
@@ -59,11 +59,11 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=32
-redundant_train_prompt_bsz=32
+train_prompt_bsz=64
+redundant_train_prompt_bsz=64
 n_resp_per_prompt=16
 redundant_n_resp_per_prompt=16
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=64
 # Algorithm
 temperature=1.0
 top_p=1.0
@@ -165,6 +165,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
+    train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \

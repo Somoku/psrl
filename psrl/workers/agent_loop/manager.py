@@ -345,7 +345,7 @@ class PSRL_AgentLoopManager:
                     psrl_logger.debug(f"Waiting for ps model version: {max_version_tag}")
                     # Busy polling until the PS worker has the needed model version
                     while (await self.ps_manager_handle.get_ps_model_version.remote(debug_info="agent_loop_manager")) < max_version_tag:
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(0.1)
                     self.curr_ps_version_tag = max_version_tag
                     psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
 
@@ -449,7 +449,7 @@ class PSRL_AgentLoopManager:
     async def put_result(self, result: DataProto):
         """Put result data into the manager's result queue."""
         await self.result_queue.put(result)
-        psrl_logger.info(f"Put result {result.non_tensor_batch['uid']} into result queue")
+        # psrl_logger.info(f"Put result {result.non_tensor_batch['uid']} into result queue")
 
     async def _collect_results(self):
         """Main collection loop that gathers results from workers."""
@@ -457,14 +457,14 @@ class PSRL_AgentLoopManager:
             # psrl_logger.info(f"Collecting results from result queue with size {self.result_queue.qsize()}")
             while not self.result_queue.empty():
                 result = self.result_queue.get_nowait()
-                psrl_logger.info(f"Got requests {result.non_tensor_batch['uid']} from result queue")
+                # psrl_logger.info(f"Got requests {result.non_tensor_batch['uid']} from result queue")
                 
                 # Process the collected result
                 result = self._post_process(result)
                 # Occupy requests in PS worker
-                psrl_logger.info(f"Post-processed requests {result.non_tensor_batch['uid']}")
+                # psrl_logger.info(f"Post-processed requests {result.non_tensor_batch['uid']}")
                 await self.occupy_requests(result)
-                psrl_logger.info(f"Occupied requests {result.non_tensor_batch['uid']}")
+                # psrl_logger.info(f"Occupied requests {result.non_tensor_batch['uid']}")
             await asyncio.sleep(0) # Yield control to the event loop
         psrl_logger.info("Stop collecting results")
 
@@ -478,7 +478,7 @@ class PSRL_AgentLoopManager:
         Args:
             request_data (DataProto): DataProto containing the requests to be occupied.
         """
-        psrl_logger.info(f"Occupying requests {request_data.non_tensor_batch['uid']}")
+        # psrl_logger.info(f"Occupying requests {request_data.non_tensor_batch['uid']}")
         # Ensure the whole occupation process is atomic from the PS manager side
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             # Add data to the data pool
@@ -506,8 +506,8 @@ class PSRL_AgentLoopManager:
                         model_version=request_data.non_tensor_batch["version_tag"][i],
                     )
                     self.rollout_request_tracker[sample_id].append(entry_info)
-                    psrl_logger.info(f"Store data for prompt {sample_id} with info {entry_info}, "
-                                    f"request num: {len(self.rollout_request_tracker[sample_id])}")
+                    psrl_logger.debug(f"Store data for prompt {sample_id} with info {entry_info}, "
+                                      f"request num: {len(self.rollout_request_tracker[sample_id])}")
 
                 # Group post process
                 unique_sample_ids = set(sample_ids)
@@ -579,11 +579,12 @@ class PSRL_AgentLoopManager:
 
             for result, accumulate_entry_data in zip(results, accumulate_entry_data_list):
                 buffer_id, occupy_num, prompt_entry_info = result
-                # If occupy failed due to READY status, abort the requests
+                # If occupy failed due to READY status, the requests must be aborted already
+                # Just continue
                 if buffer_id is None:
-                    request_ids = prompt_entry_info.get_all_requests(self.rollout_n)
-                    psrl_logger.info(f"Failed to occupy prompt {prompt_entry_info}, aborting requests {request_ids}.")
-                    abort_request_ids.extend(request_ids)
+                    # request_ids = prompt_entry_info.get_all_request_ids(self.rollout_n)
+                    # psrl_logger.info(f"Failed to occupy prompt {prompt_entry_info}, aborting requests {request_ids}.")
+                    # abort_request_ids.extend(request_ids)
                     continue
 
                 psrl_logger.debug(f"Successfully occupied prompt {prompt_entry_info} into buffer {buffer_id} with occupy_num {occupy_num}.")
@@ -816,19 +817,14 @@ class PSRL_AgentLoopManager:
         self.log_ready_buffer(buffer_id)
         
         psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
-        await self.ps_manager_handle.check_staleness_abort.remote(buffer_id)
+        await self.ps_manager_handle.abort_after_buffer_ready.remote(buffer_id)
         
         if min_ready_buffer_id is not None:
             self.process_ready_buffer(min_ready_buffer_id)
 
     def process_ready_buffer(self, min_ready_buffer_id: int):
         """
-        Notify the rollout server to check abortion and interruption when there is a ready buffer.
-        
-        This method is called when a buffer is ready to be processed.
-        - Abortion: when a buffer is full, all requests with version_tag equal to `buffer_id - S` should be aborted.
-        - Interruption: check the workload of each rollout instance and whether the abortion led by interruption will
-        influence the training process, to determine whether to interrupt the rollout instance.
+        Awake the waiters for the minimum ready buffer.
         
         Args:
             min_ready_buffer_id (int): The minimum ready buffer ID to process
@@ -955,6 +951,7 @@ class PSRL_AgentLoopManager:
         buffer = self.data_buffers.pop(buffer_id, None)
         assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
         # NOTE(linsh): we will delete buffer during aborting requests of specific versions
+        # This is because the inflight requests of the remaining entries in the buffer can still bu utilized for training
         return buffer
 
     def get_buffer_from_data_pool(self, entry_infos: List[EntryInfo]) -> DataProto:

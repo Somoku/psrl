@@ -71,7 +71,9 @@ class PSManager(RequestStatusTracker):
         self.staleness_inventory: Optional[StalenessInventory] = None  # The staleness inventory for managing stale entries
         
         # Set to track versions to be aborted
-        self.abort_versions = set()
+        self.check_abort_versions = set()
+        # Set to track the maximum version that has been aborted
+        self.max_aborted_version = -1
         
         # Set for buffer ids ready for deletion
         self.ready_for_delete_buffer_ids = set()
@@ -213,7 +215,7 @@ class PSManager(RequestStatusTracker):
         request_idx: Union[int, List[int]],
         model_versions: List[int],
         without_new_reserve_entry: bool = False
-    ) -> List[bool]:
+    ) -> Union[List[bool], List[List[bool]]]:
         """
         Check whether a request can be reserved for a given group of model versions.
         
@@ -222,39 +224,39 @@ class PSManager(RequestStatusTracker):
             model_versions (List[int]): The model versions that need to be checked
             without_new_reserve_entry (bool): Whether to check if the request can be reserved without a new reserve entry
         Returns:
-            List[bool]: Whether the request can be reserved for each model version
+            Union[List[bool], List[List[bool]]]: Whether the request(s) can be reserved for each model version
         """
         # psrl_logger.info(f"Checking if request {request_idx} can be reserved for model versions: {model_versions}")
         if not isinstance(request_idx, list):
+            request_idx = [request_idx]
+            is_single_request = True
+        else:
+            is_single_request = False
+            
+        multi_results = []
+        for request_id in request_idx:
             results = []
             for model_version in model_versions:
+                assert model_version != -1, "Model version should not be -1 when checking if a request can be reserved"
+                assert request_id not in self._abort_request_ids, f"Checking a aborted request {request_id} is not allowed"
+                if model_version <= self.max_aborted_version:
+                    results.append(False)
+                    continue
                 entry_info = EntryInfo(
                     rollout_instance_id=-1, # Not important for this check
-                    prompt_id=request_idx // self.rollout_n,
-                    request_idx=request_idx % self.rollout_n,
+                    prompt_id=request_id // self.rollout_n,
+                    request_idx=request_id % self.rollout_n,
                     model_version=model_version
                 )
                 if without_new_reserve_entry:
                     results.append(self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version))
                 else:
                     results.append(self.staleness_inventory.can_reserve_data(entry_info, model_version))
-            return results
+            multi_results.append(results)
+            
+        if is_single_request:
+            return multi_results[0]
         else:
-            multi_results = []
-            for request_id in request_idx:
-                results = []
-                for model_version in model_versions:
-                    entry_info = EntryInfo(
-                        rollout_instance_id=-1, # Not important for this check
-                        prompt_id=request_id // self.rollout_n,
-                        request_idx=request_id % self.rollout_n,
-                        model_version=model_version
-                    )
-                    if without_new_reserve_entry:
-                        results.append(self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version))
-                    else:
-                        results.append(self.staleness_inventory.can_reserve_data(entry_info, model_version))
-                multi_results.append(results)
             return multi_results
         
     def get_reserve_indicator(
@@ -276,6 +278,11 @@ class PSManager(RequestStatusTracker):
         """
         indicators = []
         for model_version in model_versions:
+            assert model_version != -1, "Model version should not be -1 when getting the indicator of reserving a request"
+            assert request_id not in self._abort_request_ids, f"Checking a aborted request {request_id} is not allowed"
+            if model_version <= self.max_aborted_version:
+                indicators.append(float('inf'))
+                continue
             entry_info = EntryInfo(
                 rollout_instance_id=-1, # Not important for this check
                 prompt_id=request_id // self.rollout_n,
@@ -329,6 +336,9 @@ class PSManager(RequestStatusTracker):
         entry_ids = []
         buffer_ids = []
         for rollout_instance_id, request_id, model_version in zip(rollout_instance_ids, request_ids, model_versions):
+            assert model_version != -1, "Model version should not be -1 when reserving a request"
+            assert request_id not in self._abort_request_ids, f"Reserving a aborted request {request_id} is not allowed"
+            assert model_version > self.max_aborted_version, f"Reserving a request with model version {model_version} is not allowed, because it is not greater than the max aborted version {self.max_aborted_version}"
             max_staleness_buffer_id = model_version + self.psrl_config.staleness
             # Create an entry in the staleness inventory
             # note that model_version may be a future version of the current rollout instance
@@ -343,11 +353,11 @@ class PSManager(RequestStatusTracker):
                 entry_info=entry_info,
                 max_staleness_buffer_id=max_staleness_buffer_id
             )
-            # TODO(lhy): better handle the case where the staleness inventory is full
+        
             if buffer_id is None or entry_id is None:
                 raise RuntimeError(f"Failed to reserve entry for request {request_id} in rollout instance {rollout_instance_id} "
                                    f"with model version {model_version}. "
-                                   f"Please check if the staleness inventory is full or the model version is too old.")
+                                   f"Please report the bug (you may need to check if the staleness inventory is full or the model version is too old).")
             
             entry_ids.append(entry_id)
             buffer_ids.append(buffer_id)
@@ -378,18 +388,17 @@ class PSManager(RequestStatusTracker):
         # Update the corresponding entries, and clear entries if necessary (handled at the end)
         clear_entries = []
         for prompt_id, abort_request_idxs in prompt_id_to_abort_request_idxs.items():
-            if prompt_id not in self.staleness_inventory.data_tracker:
-                continue
+            assert prompt_id in self.staleness_inventory.data_tracker, f"Prompt {prompt_id} must have existing mapping in data tracker."
             buffer_id, entry_id = self.staleness_inventory.data_tracker[prompt_id]
             entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
-            all_requests_of_entry = entry_info.get_all_requests(self.rollout_n)
+            all_requests_of_entry = entry_info.get_all_request_relative_ids()
             rest_requests_of_entry = set(all_requests_of_entry) - set(abort_request_idxs)
             if abort_group and len(rest_requests_of_entry) < self.alg_rollout_n:
                 abort_request_ids = abort_request_ids.union(set(rest_requests_of_entry))
                 clear_entries.append(entry_info.prompt_id)
+                psrl_logger.info(f"Abort (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}")
             else:
                 # Update the entry_info to remove aborted request idxs
-                origin_entry_version = min(entry_info.model_version) if isinstance(entry_info.model_version, list) else entry_info.model_version
                 update_idxs = []
                 assert isinstance(entry_info.request_idx, list), "entry_info.request_idx should be a list."
                 for i, request_idx in enumerate(entry_info.request_idx):
@@ -399,6 +408,7 @@ class PSManager(RequestStatusTracker):
                     entry_info.rollout_instance_id = [entry_info.rollout_instance_id[i] for i in update_idxs]
                 if isinstance(entry_info.model_version, list):
                     entry_info.model_version = [entry_info.model_version[i] for i in update_idxs]
+                psrl_logger.info(f"Abort and update (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}, requests changed from {entry_info.request_idx} to {[entry_info.request_idx[i] for i in update_idxs]}.")
                 entry_info.request_idx = [entry_info.request_idx[i] for i in update_idxs]
                 self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info = entry_info
 
@@ -408,7 +418,32 @@ class PSManager(RequestStatusTracker):
         self._abort_requests(list(abort_request_ids), blocking)
         psrl_logger.debug(f"Abort requests done: {abort_request_ids=}, {clear_entries=}")
 
-    def check_staleness_abort(self, buffer_id: int):
+    def check_aborted_model_versions(self, model_versions: Union[int, List[int]]) -> Union[bool, List[bool]]:
+        """Check if the model versions are aborted.
+        
+        Args:
+            model_versions: The list of model versions to check.
+        Returns:
+            A boolean or a list of booleans indicating whether the model versions are aborted.
+        """
+        if not isinstance(model_versions, list):
+            return model_versions <= self.max_aborted_version
+        return [model_version <= self.max_aborted_version for model_version in model_versions]
+
+    def check_aborted_requests(self, request_ids: Union[int, List[int]], remove: bool = False) -> Union[bool, List[bool]]:
+        """Check if the requests are aborted and remove them from the abort set if needed.
+        
+        Args:
+            request_ids: The list of request ids to check.
+            remove: Whether to remove the requests from the abort set if they are aborted.
+        Returns:
+            A boolean or a list of booleans indicating whether the requests are aborted.
+        """
+        if not isinstance(request_ids, list):
+            return self._check_aborted_request(request_ids, remove)
+        return [self._check_aborted_request(request_id, remove) for request_id in request_ids]
+
+    def abort_after_buffer_ready(self, buffer_id: int):
         """ Check and interrupt rollout instances if necessary based on ready buffers."""
         curr_ps_model_version = self.get_ps_model_version(debug_info="ps_manager")
         ready_buffer_ids = self.staleness_inventory.ready_buffer_ids().copy()
@@ -416,7 +451,11 @@ class PSManager(RequestStatusTracker):
         curr_abort_versions = set()
         
         if buffer_id >= self.psrl_config.staleness:
-            version_to_abort = buffer_id - self.psrl_config.staleness
+            # buffer_id is READY, so we need to check the version of buffer_id - staleness to see if there is any space for the inflight requests of the remaining entries in the buffer
+            self.check_abort_versions.add(buffer_id - self.psrl_config.staleness)
+            
+        while len(self.check_abort_versions) > 0:
+            version_to_abort = min(self.check_abort_versions)
             # NOTE(linsh): The READY order of buffers can not be guaranteed
             # so we need more strict checks to avoid aborting requests too early.
             # `curr_ps_model_version - 1` is READY and consumed by training workers
@@ -430,23 +469,20 @@ class PSManager(RequestStatusTracker):
             # we only need to check whether `curr_buffer_id + staleness` is READY to decide whether to abort `curr_buffer_id`.
             if buffer_range.issubset(ready_buffer_ids):
                 curr_abort_versions.add(version_to_abort)
-                # Further check the continuous buffers to see if they can also be aborted
-                # If the next buffer is also READY, then we can abort the current buffer as well in one go
-                for curr_buffer_id in range(version_to_abort + 1, version_to_abort + self.psrl_config.staleness + 1):
-                    if curr_buffer_id + self.psrl_config.staleness in ready_buffer_ids:
-                        curr_abort_versions.add(curr_buffer_id)
-                        self.abort_versions.discard(curr_buffer_id)
-                    else:
-                        break
-                psrl_logger.info(f"Aborting requests with version tag in {curr_abort_versions} due to ready buffer {buffer_id}.")
-                curr_abort_versions = sorted(list(curr_abort_versions))
-                # Collect requests to abort
-                for abort_version in curr_abort_versions:
-                    requests_of_abort_version = self.get_requests_of_abort_version(abort_version)
-                    psrl_logger.debug(f"Requests of version {abort_version} to abort: {requests_of_abort_version}")
-                    abort_request_ids = abort_request_ids.union(requests_of_abort_version)
+                self.check_abort_versions.discard(version_to_abort)
             else:
-                self.abort_versions.add(version_to_abort)
+                # Currently still have space for the inflight requests of the remaining entries in the buffer
+                # So we will check it next time when another buffer is READY
+                break
+                
+        psrl_logger.info(f"Aborting requests with version tag in {curr_abort_versions} due to buffer {buffer_id} become READY.")
+        curr_abort_versions = sorted(list(curr_abort_versions))
+        # Collect requests to abort
+        for abort_version in curr_abort_versions:
+            self.max_aborted_version = max(self.max_aborted_version, abort_version)
+            requests_of_abort_version = self.get_requests_of_abort_version(abort_version)
+            psrl_logger.debug(f"Requests of version {abort_version} to abort: {requests_of_abort_version}")
+            abort_request_ids = abort_request_ids.union(requests_of_abort_version)
         
         if abort_request_ids:
             with log_dual_events(f"Abort {len(abort_request_ids)} requests in staleness check", psrl_logger, level=logging.INFO, event_type=EventType.OTHER):
@@ -493,16 +529,23 @@ class PSManager(RequestStatusTracker):
         if request_ids is None:
             request_ids = [prompt_id]
         
-        # Remove the request from the training ready requests in the request status manager
-        self.remove_train_ready_request(request_ids)
+        # Remove the request from the request status manager
+        is_aborted = self.check_aborted_requests(request_ids, remove=True)
+        filtered_request_ids = [request_id for i, request_id in enumerate(request_ids) if not is_aborted[i]]
+        self.remove_train_ready_request(filtered_request_ids)
         
         buffer_id, entry_id, occupy_num = self.staleness_inventory.occupy_data_with_reserve(prompt_id)
         if buffer_id is None:
+            assert all(is_aborted), f"Occupy failed due to staleness limit, but some requests are not aborted: {[request_id for i, request_id in enumerate(request_ids) if not is_aborted[i]]}."
+            assert prompt_id not in self.staleness_inventory.data_tracker, f"Occupy failed due to staleness limit, but aborted data exists in the inventory: {prompt_id}."
+            return None, None, None
             # Occupy failed due to staleness limit, return the old entry info for abortion
-            old_buffer_id, old_entry_id = self.staleness_inventory.data_tracker[prompt_id]
-            entry_info = self.staleness_inventory.buffers[old_buffer_id].entries[old_entry_id].entry_info
-            self.staleness_inventory.clear_reserved_entries(prompt_id, move_across_buffer=False)
-            return None, None, entry_info
+            # old_buffer_id, old_entry_id = self.staleness_inventory.data_tracker[prompt_id]
+            # entry_info = self.staleness_inventory.buffers[old_buffer_id].entries[old_entry_id].entry_info
+            # self.staleness_inventory.clear_reserved_entries(prompt_id, move_across_buffer=False)
+            # return None, None, entry_info
+        else:
+            assert not any(is_aborted), f"Occupy success, but some requests are aborted: {[request_id for i, request_id in enumerate(request_ids) if is_aborted[i]]}."
 
         # Update ready num entries if not accumulate_sample, requiring more data to occupy
         if not accumulate_sample:

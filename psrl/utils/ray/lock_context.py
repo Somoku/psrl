@@ -166,7 +166,7 @@ class AsyncBusyPollingRayLock:
     Asynchronous context manager around a LockActor using busy polling.
     Uses busy polling with a specified interval to check if the lock is available.
     """
-    def __init__(self, lock_actor, poll_interval=0.1):
+    def __init__(self, lock_actor, poll_interval=0.01):
         """
         Initialize the AsyncBusyPollingRayLock.
         

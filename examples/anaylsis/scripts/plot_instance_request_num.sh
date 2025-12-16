@@ -14,7 +14,7 @@ python plot.py ../paper_exp/e2e/logs/32b_staleness_1_greedy \
 --mode subplot \
 --processor instance_request_num_indexed_by_time
 
-python plot.py ../paper_exp/e2e/logs/14b_staleness_3_ours \
+python plot.py ../paper_exp/e2e/logs/14b_staleness_1_ours \
 --substring StatCollector \
 --xlabel "time(s)" \
 --ylabel "instance request num" \

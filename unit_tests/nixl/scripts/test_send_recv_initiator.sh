@@ -2,11 +2,11 @@
 # Then run the initiator script
 # export UCX_LOG_LEVEL=debug
 
-PSRL_WORKSPACE=/jizhicfs/lhy/psrl
+PSRL_WORKSPACE=${PSRL_WORKSPACE}/psrl
 CONDA_ENV_FILE=${PSRL_WORKSPACE}/../activate
 CONDA_ENV_NAME=psrl-lhy-new
 GPU_ID=-1
-IP=28.49.53.113
+IP=${SEND_IP}
 
 source ${CONDA_ENV_FILE} 
 conda activate ${CONDA_ENV_NAME} 

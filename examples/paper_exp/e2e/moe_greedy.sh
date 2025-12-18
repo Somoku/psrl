@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-2}
+staleness=${1:-1}
 project_name=paper_exp
-experiment_name=14b_staleness_${staleness}_ours
+experiment_name=moe_staleness_${staleness}_greedy
 fix_weight=${2:-False}
-disable_attn=${3:-False}
+disable_attn=${3:-True}
+
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=/jizhicfs/lhy/models/DeepSeek-R1-Distill-Qwen-14B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-14B
+HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen3-30B-A3B
+DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen3-30B-A3B
+# HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-32B
+# DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen2.5-32B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -25,8 +28,9 @@ VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
 TRAIN_PP=4 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
-# NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=9 # Number of layers in the first pipeline stage
-# NUM_LAYERS_IN_LAST_PIPELINE_STAGE=9 # Number of layers in the last pipeline stage
+TRAIN_EP=4 # CP in the training side
+# NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=12 # Number of layers in the first pipeline stage
+# NUM_LAYERS_IN_LAST_PIPELINE_STAGE=13 # Number of layers in the last pipeline stage
 # +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=${NUM_LAYERS_IN_FIRST_PIPELINE_STAGE} \
 # +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=${NUM_LAYERS_IN_LAST_PIPELINE_STAGE} \
 
@@ -56,11 +60,11 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
-redundant_train_prompt_bsz=128
+train_prompt_bsz=64
+redundant_train_prompt_bsz=64
 n_resp_per_prompt=16
 redundant_n_resp_per_prompt=16
-train_prompt_mini_bsz=32
+train_prompt_mini_bsz=64
 # Algorithm
 temperature=1.0
 top_p=1.0
@@ -102,25 +106,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     psrl.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.method="throughput_optimal" \
-    psrl.routing_strategy.sort_candidate_by_indicator=True \
-    psrl.routing_strategy.enable_dynamic_version_tag=True \
-    psrl.routing_strategy.enable_multi_priority_queue=True \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_14b.json \
-    psrl.routing_strategy.delta_throughput_threshold=0.2 \
-    psrl.routing_strategy.request_budget=1024 \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=2 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=256 \
+    psrl.routing_strategy.method="request_num_balance" \
+    psrl.routing_strategy.enable_group_sampling_on_multi_instances=False \
+    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
-    psrl.sync_and_mig_strategy.method="status_based" \
-    psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
-    psrl.sync_and_mig_strategy.sync.threshold=0.99 \
-    psrl.sync_and_mig_strategy.mig.enable=True \
-    psrl.sync_and_mig_strategy.mig.indicator="throughput" \
-    psrl.sync_and_mig_strategy.mig.threshold=5 \
-    psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
-    psrl.sync_and_mig_strategy.mig.stop_threshold=10 \
+    psrl.sync_and_mig_strategy.method="greedy" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
@@ -139,13 +130,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
+    train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${train_packing_length} \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    train_actor_rollout_ref.rollout.max_num_batched_tokens=${train_packing_length} \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
@@ -173,8 +164,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
+    train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=${TRAIN_EP} \
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
+    train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
@@ -197,8 +192,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=True \
-    trainer.test_freq=5 \
+    trainer.val_before_train=False \
+    trainer.test_freq=200 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=20 2>&1 | tee ${experiment_name}.log

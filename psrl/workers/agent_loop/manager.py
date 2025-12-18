@@ -603,7 +603,7 @@ class PSRL_AgentLoopManager:
 
                             # Notify agent loop manager to retry new requests
                             # self.notify_request_retry(min_pending_buffer)
-                            self.retry_request(min_pending_buffer)
+                            await self.retry_request(min_pending_buffer)
                         else:
                             accumulate_entry_data_list.append(accumulate_group_data)
 
@@ -717,7 +717,7 @@ class PSRL_AgentLoopManager:
                 add_buffer = self.maybe_add_buffer(buffer_id, data_buffer)
                 if add_buffer:
                     psrl_logger.info(f"Buffer {buffer_id} is READY with {len(self.data_buffers[buffer_id])} entries.")
-                    self.try_awake_waiters(buffer_id)
+                    await self.try_awake_waiters(buffer_id)
                     self.remove_buffer_from_data_pool(prompt_entry_infos)
                     self.accumulated_buffers.pop(buffer_id)
                     self.accumulated_buffer_size.pop(buffer_id)
@@ -729,7 +729,7 @@ class PSRL_AgentLoopManager:
                     await self.ps_manager_handle.clear_buffer.remote(retry_buffer_id)
                     min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
                     # Notify agent loop manager to retry new requests
-                    self.retry_request(min_pending_buffer)
+                    await self.retry_request(min_pending_buffer)
                 elif self.config.psrl.retry_bound >= 0:
                     # retry num = retry_ratio * num of failed OCCUPY entries
                     retry_prompt_num = (

@@ -802,8 +802,7 @@ class RolloutRouter:
                         # Method 2: Try to process the other queues
                         # remain_requests.clear()
                     # psrl_logger.info(f"Processing requests in priority queue {queue_id}, there are {request_queue.size()} requests in the queue")
-                    should_process = not request_queue.empty() and not self._interrupt_routing
-                    while should_process:
+                    while not request_queue.empty() and not self._interrupt_routing:
                         request = request_queue.pop()
                         assert request is not None, "Request should not be None in priority queue"
                         request_id = request.non_tensor_batch["uid"][0]

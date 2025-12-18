@@ -4,7 +4,7 @@ from .registry import (
     get_reward_loop_manager_cls,
     load_reward_loop_manager,
     register,
-)  
+)
 from .dapo import DAPORewardLoopManager
 from .naive import NaiveRewardLoopManager
 from .prime import PrimeRewardLoopManager

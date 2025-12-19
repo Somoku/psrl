@@ -396,7 +396,8 @@ class PSRL_AgentLoopManager:
         """
         Get the new static version tag based on the current staleness and request counter.
         This is a naive implementation that increments the version tag for each request.
-        If support dynamic version tag, this version tag is only used to determine when to put the request into the data queue.
+        If support dynamic version tag, this version tag is only used to determine
+        when to put the request into the data queue.
         """
         if self.config.psrl.redundant_rollout.enable:
             buffer_size = self.config.psrl.redundant_rollout.redundant_global_batch_size * self.rollout_n
@@ -649,7 +650,9 @@ class PSRL_AgentLoopManager:
                 # Just continue
                 if buffer_id is None:
                     # request_ids = prompt_entry_info.get_all_requests(self.rollout_n)
-                    # psrl_logger.info(f"Failed to occupy prompt {prompt_entry_info}, aborting requests {request_ids}.")
+                    # psrl_logger.info(
+                    #     f"Failed to occupy prompt {prompt_entry_info}, aborting requests {request_ids}."
+                    # )
                     # abort_request_ids.extend(request_ids)
                     continue
 
@@ -1052,7 +1055,8 @@ class PSRL_AgentLoopManager:
         buffer = self.data_buffers.pop(buffer_id, None)
         assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
         # NOTE(linsh): we will delete buffer during aborting requests of specific versions
-        # This is because the inflight requests of the remaining entries in the buffer can still bu utilized for training
+        # This is because the inflight requests of the remaining entries
+        # in the buffer can still bu utilized for training
         return buffer
 
     def get_buffer_from_data_pool(self, entry_infos: list[EntryInfo]) -> DataProto:

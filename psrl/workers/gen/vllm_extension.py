@@ -18,6 +18,7 @@ from verl.utils.device import get_device_id
 # from vllm.platforms import current_platform
 from verl.utils.fs import copy_to_local
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.converter import create_parameter_mapping
@@ -125,7 +126,10 @@ class vLLMWorkerExtension:
     def patch_vllm_moe_model_weight_loader(self) -> None:
         """Patch the vLLM model weight loader for MoE models."""
         try:
-            patch_vllm_moe_model_weight_loader(self.model_runner.model)
+            vllm_model = self.model_runner.model
+            if isinstance(vllm_model, CUDAGraphWrapper):
+                vllm_model = vllm_model.unwrap()
+            patch_vllm_moe_model_weight_loader(vllm_model)
         except Exception as e:
             raise ValueError(f"Error in vLLMWorkerExtension.patch_vllm_moe_model_weight_loader: {e}") from e
         return None
@@ -174,6 +178,8 @@ class vLLMWorkerExtension:
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info("nixl client protocol step 0: convert_vllm_inplace")
         vllm_model = self.model_runner.model
+        if isinstance(vllm_model, CUDAGraphWrapper):
+            vllm_model = vllm_model.unwrap()
         param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
         unified_state_dict, local_sharding_dict = convert_vllm_inplace(
             param_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()

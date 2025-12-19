@@ -57,12 +57,4 @@ python -m pip install --no-deps --no-cache-dir --no-build-isolation git+https://
 echo "4. Install mbridge"
 python -m pip install --no-cache-dir mbridge==v0.15.1
 
-echo "5. Install trl to fix qwen vl"
-python -m pip install --no-cache-dir --no-deps trl
-
-# If you meet a weird bug from triton, please downgrade triton to 3.1.0
-# See https://github.com/volcengine/verl/issues/904
-# echo "4. Downgrade Triton"
-# python -m pip install triton==3.1.0
-
 echo "Successfully installed all packages for Megatron"

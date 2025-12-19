@@ -246,11 +246,11 @@ class RequestNumBalanceRouteStrategy(RouteStrategyBase):
             f"{self.instance_request_counts[candidates[idx]]}"
         )
 
+        """
         remaining_request_counts = [
             self.instance_request_counts[i] for i in range(self.n_instances) if i != candidates[idx]
         ]
 
-        """
         if len(remaining_request_counts) > 0:
             remaining_max_request_count = max(remaining_request_counts)
             if self.instance_request_counts[candidates[idx]] > remaining_max_request_count:

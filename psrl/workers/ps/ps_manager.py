@@ -376,7 +376,8 @@ class PSManager(RequestStatusTracker):
                     buffer_ids.append(None)
                     continue
             assert model_version > self.max_aborted_version, (
-                f"Reserving a request with model version {model_version} is not allowed, because it is not greater than the max aborted version {self.max_aborted_version}"
+                f"Reserving a request with model version {model_version} is not allowed, "
+                f"because it is not greater than the max aborted version {self.max_aborted_version}"
             )
             max_staleness_buffer_id = model_version + self.psrl_config.staleness
             # Create an entry in the staleness inventory
@@ -456,7 +457,9 @@ class PSManager(RequestStatusTracker):
                 if isinstance(entry_info.model_version, list):
                     entry_info.model_version = [entry_info.model_version[i] for i in update_idxs]
                 psrl_logger.info(
-                    f"Abort and update (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}, requests changed from {entry_info.request_idx} to {[entry_info.request_idx[i] for i in update_idxs]}."
+                    f"Abort and update (buffer {buffer_id}, entry {entry_id}) for prompt {prompt_id}, "
+                    f"requests changed from {entry_info.request_idx} to "
+                    f"{[entry_info.request_idx[i] for i in update_idxs]}."
                 )
                 entry_info.request_idx = [entry_info.request_idx[i] for i in update_idxs]
                 self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info = entry_info
@@ -500,7 +503,9 @@ class PSManager(RequestStatusTracker):
         curr_abort_versions = set()
 
         if buffer_id >= self.psrl_config.staleness:
-            # buffer_id is READY, so we need to check the version of buffer_id - staleness to see if there is any space for the inflight requests of the remaining entries in the buffer
+            # buffer_id is READY, so we need to check the version of
+            # buffer_id - staleness to see if there is any space for the
+            # in-flight requests of the remaining entries in the buffer
             self.check_abort_versions.add(buffer_id - self.psrl_config.staleness)
 
         while len(self.check_abort_versions) > 0:

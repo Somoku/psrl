@@ -987,7 +987,8 @@ class StalenessInventory:
             ]
 
             assert candidate_ids, (
-                f"No suitable PENDING buffer found during occupy prompt {prompt_id} among pending buffers {pending_buffers}. "
+                f"No suitable PENDING buffer found during occupy prompt {prompt_id} "
+                f"among pending buffers {pending_buffers}. "
                 f"The prompt was reserved in (buffer {old_buffer_id}, entry {old_entry_id}). "
                 f"After clear, at least that entry should be available. "
                 f"But found its buffer status is {self.buffers[old_buffer_id].get_status()}, "
@@ -1032,11 +1033,15 @@ class StalenessInventory:
             ]
 
             assert candidate_ids, (
-                f"No suitable not ready buffer found during occupy prompt {prompt_id} among not ready buffers {not_ready_buffers}. "
+                f"No suitable not ready buffer found during occupy prompt {prompt_id} "
+                f"among not ready buffers {not_ready_buffers}. "
                 f"The prompt was reserved in (buffer {old_buffer_id}, entry {old_entry_id}). "
-                f"After clear, at least (buffer {possible_occupy_target_buffer_id}, entry {possible_occupy_target_entry_id}) should be available. "
+                f"After clear, at least "
+                f"(buffer {possible_occupy_target_buffer_id}, "
+                f"entry {possible_occupy_target_entry_id}) should be available. "
                 f"But found its buffer status is {self.buffers[possible_occupy_target_buffer_id].get_status()}, "
-                f"and its first non-occupied entry ID is {self.buffers[possible_occupy_target_buffer_id].get_first_non_occupied()}."
+                f"and its first non-occupied entry ID is "
+                f"{self.buffers[possible_occupy_target_buffer_id].get_first_non_occupied()}."
             )
 
             # Select the lowest entry to insert

@@ -282,7 +282,8 @@ class RolloutCoordinator(CommandExtension):
                         raise ValueError("ABORT command must contain 'instance_to_uids' or 'instance_ids' in args.")
 
                     psrl_logger.info(
-                        f"Received ABORT command with instance_to_uids: {instance_to_uids} and instance_ids: {instance_ids}"
+                        f"Received ABORT command with instance_to_uids: "
+                        f"{instance_to_uids} and instance_ids: {instance_ids}"
                     )
                     futures = []
 
@@ -644,7 +645,10 @@ class RolloutCoordinator(CommandExtension):
         )
         assert self.config.psrl.partial_rollout.enable, "Partial rollout is not enabled"
         # TODO(lhy): refactor the router to be a global router
-        # psrl_logger.info(f"Checking whether to synchronize with PS for instance {instance_id}, ps model version: {self.ps_model_version}")
+        # psrl_logger.info(
+        #     f"Checking whether to synchronize with PS for instance {instance_id}, "
+        #     f"ps model version: {self.ps_model_version}"
+        # )
         return await self.agent_loop_workers[0].check_should_sync.remote(instance_id, self.ps_model_version)
 
     async def check_and_migrate(self, wait_interrupted_partial_requests_loop_back: bool = True):

@@ -9,13 +9,13 @@ PSRL is a post-training framework for LLMs that supports both synchronous and as
 **Requirements:**
 
 - GCC >= 9
-- Python 3.9+
-- PyTorch 2.7.1
+- Python 3.10+
+- PyTorch 2.9.0
 - CUDA 12.8
 
 ```bash
 # Use conda to manage the environment
-conda create -n psrl python=3.10
+conda create -n psrl python=3.11
 conda activate psrl
 
 # Install all dependencies (including NIXL and Megatron)

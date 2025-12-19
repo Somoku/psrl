@@ -342,7 +342,7 @@ index 40e823a5..a4a63896 100644
  
                  stats.update(
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index 795e79d2..cd74700a 100644
+index 795e79d2..1cc92bc6 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
 @@ -142,43 +142,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -435,7 +435,20 @@ index 795e79d2..cd74700a 100644
          # normalize config
          if self._is_actor:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -727,6 +729,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -617,7 +619,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         # For sync mode, we directly switch to trainer mode here.
+         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
+         if rollout_config.mode == "sync" and self._is_actor:
+-            loop = asyncio.get_event_loop()
++            try:
++                loop = asyncio.get_event_loop()
++            except Exception:
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
+             loop.run_until_complete(self.trainer_mode())
+ 
+     async def rollout_mode(self):
+@@ -727,6 +733,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
  
          # This is used to import external_lib into the huggingface systems
          import_external_libs(self.config.model.get("external_lib", None))
@@ -444,7 +457,20 @@ index 795e79d2..cd74700a 100644
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          use_remove_padding = self.config.model.get("use_remove_padding", False)
-@@ -1111,16 +1115,25 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -894,7 +902,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+ 
+         timing_generate = {}
+         if self._is_actor:  # For rollout only, we do not switch context.
+-            loop = asyncio.get_event_loop()
++            try:
++                loop = asyncio.get_event_loop()
++            except Exception:
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
+             loop.run_until_complete(self.rollout_mode())
+             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+ 
+@@ -1111,16 +1123,25 @@ class CriticWorker(Worker, DistProfilerExtension):
          DistProfilerExtension.__init__(
              self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
          )
@@ -472,7 +498,7 @@ index 795e79d2..cd74700a 100644
  
          # build device mesh for Ulysses Sequence Parallel
          world_size = torch.distributed.get_world_size()
-@@ -1148,10 +1161,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1148,10 +1169,6 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
  
@@ -483,7 +509,7 @@ index 795e79d2..cd74700a 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
-@@ -1174,8 +1183,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1174,8 +1191,6 @@ class CriticWorker(Worker, DistProfilerExtension):
                  f"normalized ppo_mini_batch_size {self.config.ppo_mini_batch_size} should be larger than "
                  f"ppo_micro_batch_size_per_gpu {self.config.ppo_micro_batch_size_per_gpu}"
              )
@@ -492,7 +518,7 @@ index 795e79d2..cd74700a 100644
  
      def _build_critic_model_optimizer(self, config):
          # the following line is necessary
-@@ -1404,6 +1411,8 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1404,6 +1419,8 @@ class CriticWorker(Worker, DistProfilerExtension):
          import_external_libs(self.config.model.get("external_lib", None))
  
          from verl.workers.critic import DataParallelPPOCritic
@@ -501,7 +527,7 @@ index 795e79d2..cd74700a 100644
  
          self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
              self.config
-@@ -1538,9 +1547,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1538,9 +1555,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
              DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
          )
  
@@ -516,7 +542,7 @@ index 795e79d2..cd74700a 100644
          if not torch.distributed.is_initialized():
              torch.distributed.init_process_group(
                  backend=get_nccl_backend(),
-@@ -1574,8 +1587,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1574,8 +1595,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
          else:
              self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
  
@@ -525,7 +551,7 @@ index 795e79d2..cd74700a 100644
          # normalize config
          if self.config.micro_batch_size is not None:
              self.config.micro_batch_size //= torch.distributed.get_world_size()
-@@ -1666,6 +1677,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1666,6 +1685,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
      def init_model(self):
          # This is used to import external_lib into the huggingface systems
          import_external_libs(self.config.model.get("external_lib", None))
@@ -534,7 +560,7 @@ index 795e79d2..cd74700a 100644
  
      def _forward_micro_batch(self, micro_batch):
 diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
-index 19f6ee80..dffbb120 100644
+index 19f6ee80..2f408469 100644
 --- a/verl/workers/megatron_workers.py
 +++ b/verl/workers/megatron_workers.py
 @@ -184,44 +184,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
@@ -626,7 +652,20 @@ index 19f6ee80..dffbb120 100644
          # normalize config
          if self._is_actor and self._is_rollout:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -452,6 +451,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -439,7 +438,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         # For sync mode, we directly switch to trainer mode here.
+         # For async mode, we can't call run_until_complete here, so we will switch to trainer mode in AgentLoopManager.
+         if rollout_config.mode == "sync" and self._is_actor:
+-            loop = asyncio.get_event_loop()
++            try:
++                loop = asyncio.get_event_loop()
++            except Exception:
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
+             loop.run_until_complete(self.trainer_mode())
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+@@ -452,6 +455,9 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
  
          from verl.utils.torch_dtypes import PrecisionType
  
@@ -636,7 +675,7 @@ index 19f6ee80..dffbb120 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          if self._is_actor:
              override_transformer_config = OmegaConf.to_container(
-@@ -607,7 +609,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -607,7 +613,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          get_torch_device().set_rng_state(self.torch_random_states)
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -644,7 +683,7 @@ index 19f6ee80..dffbb120 100644
      @DistProfiler.annotate(color="red")
      def update_actor(self, data: DataProto):
          assert self._is_actor
-@@ -650,7 +651,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -650,7 +655,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -652,7 +691,20 @@ index 19f6ee80..dffbb120 100644
      @DistProfiler.annotate(color="red")
      def generate_sequences(self, prompts: DataProto):
          assert self._is_rollout
-@@ -700,7 +700,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -669,7 +673,11 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+ 
+         timing_generate = {}
+         if self._is_actor:  # For rollout only, we do not switch context.
+-            loop = asyncio.get_event_loop()
++            try:
++                loop = asyncio.get_event_loop()
++            except Exception:
++                loop = asyncio.new_event_loop()
++                asyncio.set_event_loop(loop)
+             loop.run_until_complete(self.rollout_mode())
+             log_gpu_memory_usage("After switch to rollout mode", logger=logger)
+ 
+@@ -700,7 +708,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -660,7 +712,7 @@ index 19f6ee80..dffbb120 100644
      @DistProfiler.annotate(color="olive")
      def compute_ref_log_prob(self, data: DataProto):
          assert self._is_ref
-@@ -722,7 +721,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -722,7 +729,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -668,7 +720,7 @@ index 19f6ee80..dffbb120 100644
      @DistProfiler.annotate(color="blue")
      def compute_log_prob(self, data: DataProto):
          assert self._is_actor
-@@ -828,6 +826,13 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -828,6 +834,13 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config: McoreCriticConfig = config
  
@@ -682,7 +734,7 @@ index 19f6ee80..dffbb120 100644
          # NOTE(sgm): We utilize colocate WorkerGroup by default.
          # As a result, Workers for different model share the same process.
          # Therefore, we only require one distribute initialization.
-@@ -863,13 +868,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -863,13 +876,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          self._register_dispatch_collect_info(
              mesh_name="critic", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
          )
@@ -697,7 +749,7 @@ index 19f6ee80..dffbb120 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
-@@ -877,8 +876,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -877,8 +884,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
              self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
  
@@ -706,7 +758,7 @@ index 19f6ee80..dffbb120 100644
      def _build_critic_model_optimizer(
          self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
      ):
-@@ -958,6 +955,8 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -958,6 +963,8 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              import importlib
  
              importlib.import_module(self.config.model.external_lib)
@@ -715,7 +767,7 @@ index 19f6ee80..dffbb120 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          override_transformer_config = OmegaConf.to_container(
              OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
-@@ -1109,6 +1108,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1109,6 +1116,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config = config
  
@@ -723,7 +775,7 @@ index 19f6ee80..dffbb120 100644
          # NOTE(sgm): We utilize colocate WorkerGroup by default.
          # As a result, Workers for different model share the same process.
          # Therefore, we only require one distribute initialization.
-@@ -1145,8 +1145,6 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1145,8 +1153,6 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
              mesh_name="reward", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
          )
  
@@ -732,7 +784,7 @@ index 19f6ee80..dffbb120 100644
          # normalize config
          if self.config.micro_batch_size is not None:
              self.config.micro_batch_size //= mpu.get_data_parallel_world_size()
-@@ -1205,6 +1203,8 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1205,6 +1211,8 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
              import importlib
  
              importlib.import_module(self.config.model.external_lib)
@@ -741,3 +793,47 @@ index 19f6ee80..dffbb120 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          override_transformer_config = OmegaConf.to_container(
              OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+index b89b7d36..88d0b9a5 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+@@ -50,10 +50,20 @@ from omegaconf import ListConfig
+ from tensordict import TensorDict
+ from torch.distributed.device_mesh import DeviceMesh
+ from vllm import LLM, SamplingParams
+-from vllm.config import CompilationConfig, CompilationLevel
++from vllm.config import CompilationConfig
+ from vllm.lora.request import LoRARequest
+-from vllm.model_executor.sampling_metadata import SamplingMetadata
+-from vllm.worker.worker_base import WorkerWrapperBase
++from vllm.v1.sample.metadata import SamplingMetadata
++from vllm.v1.worker.worker_base import WorkerWrapperBase
++
++try:
++    # https://github.com/vllm-project/vllm/commit/96b9aa5aa076e64c68765232aec343e4d0006e2a
++    from vllm.config import CompilationMode
++
++    _use_compilation_mode = True
++except ImportError:
++    from vllm.config import CompilationLevel
++
++    _use_compilation_mode = False
+ 
+ from verl import DataProto
+ from verl.third_party.vllm import VLLM_SLEEP_LEVEL
+@@ -178,9 +188,12 @@ class vLLMRollout(BaseRollout):
+         # enforce_eager must be False to use cudagraph
+         if not config.enforce_eager and cudagraph_capture_sizes:
+             if isinstance(cudagraph_capture_sizes, ListConfig):
+-                compilation_config["compilation_config"] = CompilationConfig(
+-                    level=CompilationLevel.PIECEWISE, cudagraph_capture_sizes=cudagraph_capture_sizes
+-                )
++                compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
++                if _use_compilation_mode:
++                    compilation_args["mode"] = CompilationMode.VLLM_COMPILE
++                else:
++                    compilation_args["level"] = CompilationLevel.PIECEWISE
++                compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
+             else:
+                 logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
+ 

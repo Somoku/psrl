@@ -25,6 +25,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
+@ray.remote
 class RolloutRouter:
     def __init__(
         self,

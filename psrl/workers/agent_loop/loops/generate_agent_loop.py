@@ -30,7 +30,7 @@ class GenerateAgentLoop(AgentLoopBase):
         Returns:
             DataProto: Generated response with metadata.
         """
-        output = await self.rollout_router.generate_async(request)
+        output = await self.rollout_router.generate_async.remote(request)
         if output is not None:
             response_ids = output.non_tensor_batch["raw_response_ids"][0]
             response_ids = response_ids[: self.response_length]

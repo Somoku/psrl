@@ -30,7 +30,7 @@ class BatchGenerateAgentLoop(AgentLoopBase):
         Returns:
             DataProto: Generated responses with metadata.
         """
-        output = self.rollout_router.generate(request)
+        output = await self.rollout_router.generate.remote(request)
         assert "eos_token_id" in output.meta_info, "eos_token_id is not in the meta_info"
         if output is not None:
             batch_size = len(output)

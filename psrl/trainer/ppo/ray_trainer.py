@@ -56,6 +56,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
+from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.gen import GenInterface, RolloutCoordinator
 from psrl.workers.ps import (
     PSClassWithInitArgs,
@@ -539,9 +540,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Agent loop manager is not initialized, skipping stop operation.")
 
+    def init_rollout_router(self):
+        self.rollout_router = RolloutRouter.remote(
+            self.config,
+            self.ps_manager_handle,
+            self.rollout_wg_list,
+        )
+
     def init_rollout_coordinator(self):
+        assert self.rollout_router is not None, (
+            "Rollout router must be initialized before initializing rollout coordinator."
+        )
         self.rollout_coordinator = RolloutCoordinator.remote(
             self.config,
+            self.rollout_router,
             self.rollout_wg_list,
             self.agent_loop_workers,
             self.status_queues,
@@ -1127,6 +1139,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # create agent loop workers
         self.agent_loop_workers = []
         self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.config.psrl.deployment.n_rollout_instances)]
+        self.init_rollout_router()
         for i in range(self.config.gen_actor_rollout_ref.rollout.agent.num_workers):
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
@@ -1134,6 +1147,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
+                    self.rollout_router,
                     self.rollout_wg_list,
                 )
             )

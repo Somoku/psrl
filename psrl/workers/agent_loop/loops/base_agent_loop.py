@@ -8,7 +8,6 @@ from transformers import AutoTokenizer
 from verl import DataProto
 
 from psrl.workers.agent_loop.loops.utils import DummyConfig
-from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.reward.reward_manager import RewardManager
 
 
@@ -18,7 +17,7 @@ class AgentLoopBase(ABC):
     def __init__(
         self,
         trainer_config: DummyConfig,
-        rollout_router: RolloutRouter,
+        rollout_router: ray.actor.ActorHandle,
         reward_manager: RewardManager,
         ps_manager_handle: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
@@ -29,7 +28,7 @@ class AgentLoopBase(ABC):
 
         Args:
             trainer_config (DummyConfig): Wrapper containing trainer configuration.
-            rollout_router (RolloutRouter): Router for distributing requests to LLM servers.
+            rollout_router (ray.actor.ActorHandle): Router for distributing requests to LLM servers.
             ps_manager_handle (ray.actor.ActorHandle): Handle to parameter server manager.
             tokenizer (AutoTokenizer): Tokenizer for processing text messages.
             **kwargs: Additional keyword arguments.

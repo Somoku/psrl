@@ -23,6 +23,7 @@ class RolloutCoordinator(CommandExtension):
     def __init__(
         self,
         config,
+        rollout_router,
         rollout_wg_list,
         agent_loop_workers,
         status_queues,
@@ -40,6 +41,7 @@ class RolloutCoordinator(CommandExtension):
 
         Args:
             config: Configuration object containing PSRL settings
+            rollout_router: Handle to the rollout router actor
             rollout_wg_list: List of rollout worker groups
             agent_loop_workers: List of agent loop worker handles
             status_queues: Queues for receiving status updates from different rollout instances
@@ -63,6 +65,7 @@ class RolloutCoordinator(CommandExtension):
             "The number of rollout worker groups must be the same as the number of rollout instances."
         )
         self.agent_loop_workers = agent_loop_workers
+        self.rollout_router = rollout_router
 
         # Stats collection
         self.status_queues = status_queues
@@ -120,6 +123,7 @@ class RolloutCoordinator(CommandExtension):
         self._is_init_model.set()
 
     async def init_route_strategy(self):
+        assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
         await self._is_init_model.wait()
         futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
@@ -133,14 +137,7 @@ class RolloutCoordinator(CommandExtension):
             i: max(max_model_lens[i]) for i in range(self.config.psrl.deployment.n_rollout_instances)
         }
         # Use the max model len to budget the kv cache size for each instance
-        futures = []
-        for agent_worker in self.agent_loop_workers:
-            futures.append(
-                agent_worker.init_route_strategy.remote(
-                    instance_to_max_model_len=instance_to_max_model_len,
-                )
-            )
-        await asyncio.gather(*futures)
+        await self.rollout_router.init_route_strategy.remote(instance_to_max_model_len=instance_to_max_model_len)
 
     async def init_nixl_client(self):
         await self._is_init_model.wait()
@@ -417,15 +414,12 @@ class RolloutCoordinator(CommandExtension):
         """
         Broadcast the engine status to the router.
         """
+        assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
+
         while not self.stop_broadcast_status_to_router:
             # Broadcast the engine status to the router every coordinator sync interval
             await asyncio.sleep(self.config.psrl.status_collection.coordinator_sync_interval_in_ms / 1000)
-            futures = []
-            # Send to all agent loop workers to update the instance status
-            # TODO(lhy): change it to a global router
-            for agent_worker in self.agent_loop_workers:
-                futures.append(agent_worker.update_instance_status.remote(self.instance_to_engine_status))
-            await asyncio.gather(*futures)
+            await self.rollout_router.update_instance_status.remote(self.instance_to_engine_status)
 
     async def _is_routing(self) -> bool:
         """Check if any agent loop worker is currently routing requests
@@ -435,11 +429,8 @@ class RolloutCoordinator(CommandExtension):
             bool: True if any agent loop worker is currently routing requests,
                 False otherwise.
         """
-        is_routing = await asyncio.gather(
-            *[agent_worker.is_routing.remote() for agent_worker in self.agent_loop_workers]
-        )
-        # psrl_logger.info(f"Is routing: {is_routing}")
-        return any(is_routing)
+        is_routing = await self.rollout_router.is_routing.remote()
+        return is_routing
 
     async def _greedy_sync_and_migrate_loop(self):
         """
@@ -594,11 +585,9 @@ class RolloutCoordinator(CommandExtension):
                 self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
                     instance_id, 0
                 )
-            await self.agent_loop_workers[0].interrupt_routing.remote()
+            await self.rollout_router.interrupt_routing.remote()
             psrl_logger.info("Interrupted routing for synchronization")
-            await self.agent_loop_workers[0].update_currently_syncing_instances.remote(
-                instance_ids, self.ps_model_version
-            )
+            await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
             await self.exec_command(
                 Command(
                     type=CommandType.SYNC,
@@ -609,11 +598,11 @@ class RolloutCoordinator(CommandExtension):
                 blocking=True,
             )
             if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
-                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(instance_ids)
+                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
                 psrl_logger.info(
                     f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
                 )
-            await self.agent_loop_workers[0].resume_routing.remote()
+            await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after synchronization")
 
     async def check_no_activate_tasks(self, instance_id: int) -> bool:
@@ -649,7 +638,7 @@ class RolloutCoordinator(CommandExtension):
         #     f"Checking whether to synchronize with PS for instance {instance_id}, "
         #     f"ps model version: {self.ps_model_version}"
         # )
-        return await self.agent_loop_workers[0].check_should_sync.remote(instance_id, self.ps_model_version)
+        return await self.rollout_router.check_should_sync.remote(instance_id, self.ps_model_version)
 
     async def check_and_migrate(self, wait_interrupted_partial_requests_loop_back: bool = True):
         """
@@ -660,10 +649,10 @@ class RolloutCoordinator(CommandExtension):
             "Rollout migration is only supported when status collection is enabled"
         )
         # psrl_logger.info("Checking if any instance is starving and doing migration if necessary")
-        migrate_instance_ids = await self.agent_loop_workers[0].check_should_migrate.remote()
+        migrate_instance_ids = await self.rollout_router.check_should_migrate.remote()
         if migrate_instance_ids:
             psrl_logger.info(f"Migrating instances {migrate_instance_ids}")
-            await self.agent_loop_workers[0].interrupt_routing.remote()
+            await self.rollout_router.interrupt_routing.remote()
             psrl_logger.info("Interrupted routing for migration")
             await self.exec_command(
                 Command(
@@ -673,11 +662,9 @@ class RolloutCoordinator(CommandExtension):
                 blocking=True,
             )
             if wait_interrupted_partial_requests_loop_back:
-                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(
-                    migrate_instance_ids
-                )
+                await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(migrate_instance_ids)
                 psrl_logger.info(
                     f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
                 )
-            await self.agent_loop_workers[0].resume_routing.remote()
+            await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after migration")

@@ -17,8 +17,6 @@ from verl.utils.model import compute_position_id_with_mask
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig
-from psrl.workers.agent_loop.router import RolloutRouter
-from psrl.workers.gen.stats_collector import EngineStats
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -33,6 +31,7 @@ class PSRL_AgentLoopWorker:
         self,
         config: DictConfig,
         ps_manager_handle,
+        rollout_router,
         rollout_wg_list,
     ):
         """Initialize agent loop worker.
@@ -40,6 +39,7 @@ class PSRL_AgentLoopWorker:
         Args:
             config (DictConfig): Configuration containing model and rollout settings.
             ps_manager_handle: Handle to the parameter server manager.
+            rollout_router: Handle to the rollout router actor.
             rollout_wg_list: List of rollout worker groups.
             rollout_queue: Queue for storing completed rollout results.
         """
@@ -50,11 +50,7 @@ class PSRL_AgentLoopWorker:
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
 
-        self.rollout_router = RolloutRouter(
-            config,
-            ps_manager_handle,
-            rollout_wg_list,
-        )
+        self.rollout_router = rollout_router
         self.ps_manager_handle = ps_manager_handle
         self.rollout_wg_list = rollout_wg_list
         self.agent_loop_manager = None
@@ -242,84 +238,6 @@ class PSRL_AgentLoopWorker:
                     # the result queue, so we process the data inside the reward manager
                     # output = self._post_process(output)
                     await self.agent_loop_manager.put_result.remote(output)
-
-    def init_route_strategy(self, **kwargs):
-        """Initialize the route strategy for the agent loop worker.
-
-        Args:
-            **kwargs: Keyword arguments for the route strategy.
-        """
-        self.rollout_router.init_route_strategy(**kwargs)
-
-    async def update_instance_status(self, instance_to_engine_status: dict[int, EngineStats], **kwargs):
-        """Update the instance status received from RolloutCoordinator.
-
-        Args:
-            instance_to_engine_status (dict[int, EngineStats]): Dictionary mapping instance ID to the engine status.
-            **kwargs: Keyword arguments for the update.
-        """
-        await self.rollout_router.update_instance_status(instance_to_engine_status, **kwargs)
-
-    async def check_should_migrate(self) -> list[int]:
-        """Check if the instance should migrate to another instance.
-
-        Returns:
-            List[int]: The instance IDs that should be migrated.
-        """
-        return await self.rollout_router.check_should_migrate()
-
-    async def check_should_sync(self, instance_id: int, ps_model_version: int) -> bool:
-        """Check if the instance should synchronize with PS.
-
-        Args:
-            instance_id (int): The instance ID to synchronize with.
-            ps_model_version (int): The version of the PS model to synchronize with.
-
-        Returns:
-            bool: True if there is any benefit from synchronization, False otherwise.
-        """
-        return await self.rollout_router.check_should_sync(instance_id, ps_model_version)
-
-    async def update_currently_syncing_instances(self, instance_ids: list[int], ps_model_version: int):
-        """Update the currently syncing instances.
-
-        Args:
-            instance_ids (List[int]): The instance IDs to update.
-            ps_model_version (int): The version of the PS model to update.
-        """
-        await self.rollout_router.update_currently_syncing_instances(instance_ids, ps_model_version)
-
-    async def abort_requests(self, instance_to_uids: dict[int, list[int] | set[int]]):
-        """Abort the requests in the router.
-
-        Args:
-            instance_to_uids (Dict[int, Union[List[int], Set[int]]]): The instance IDs to abort.
-        """
-        await self.rollout_router.abort_requests(instance_to_uids)
-
-    async def wait_interrupted_partial_requests_loop_back(self, instance_ids: list[int]):
-        """Wait for the interrupted partial requests to be looped back in the priority queue.
-
-        Args:
-            instance_ids (List[int]): The instance IDs to wait for.
-        """
-        await self.rollout_router.wait_interrupted_partial_requests_loop_back(instance_ids)
-
-    def is_routing(self) -> bool:
-        """Check if the router is currently routing requests.
-
-        Returns:
-            bool: True if the router is currently routing requests, False otherwise.
-        """
-        return self.rollout_router.is_routing()
-
-    async def interrupt_routing(self):
-        """Interrupt the routing."""
-        await self.rollout_router.interrupt_routing()
-
-    async def resume_routing(self):
-        """Resume the routing."""
-        await self.rollout_router.resume_routing()
 
     # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:

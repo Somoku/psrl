@@ -100,6 +100,8 @@ class RolloutRouter:
         self.request_futures = {}  # Track request futures: {request_id: Future}
         # Track the version after synchronization for each instance: {instance_id: ps_model_version}
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
+        # Track requests in sticky session: {request_id: bool}
+        self.sticky_session_requests = {}
 
         # Build logger
         self.log_prefix = "RolloutRouter"
@@ -197,6 +199,22 @@ class RolloutRouter:
         for instance_id in instance_ids:
             self.instance_to_version_after_sync[instance_id] = ps_model_version
 
+    async def enter_sticky_session(self, request_id: int):
+        """Mark a request as entering sticky session.
+
+        Args:
+            request_id (int): The request ID to mark.
+        """
+        self.sticky_session_requests[request_id] = True
+
+    async def exit_sticky_session(self, request_id: int):
+        """Mark a request as exiting sticky session.
+
+        Args:
+            request_id (int): The request ID to unmark.
+        """
+        self.sticky_session_requests.pop(request_id, None)
+
     def _choose_new_rollout_instance(self, request: DataProto) -> int:
         """Select the best rollout instance for handling the generation request.
 
@@ -231,6 +249,12 @@ class RolloutRouter:
         if "rollout_instance_id" in request.non_tensor_batch and not self.config.psrl.sync_and_mig_strategy.mig.enable:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             assert old_instance_id in candidates, f"Old rollout instance {old_instance_id} is not in the candidates"
+            candidates = [old_instance_id]
+
+        # 2.5. If request is in sticky session, keep the existing instance
+        if self.sticky_session_requests.get(request_id, False) and "rollout_instance_id" in request.non_tensor_batch:
+            old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
+            assert old_instance_id in candidates, f"Sticky session instance {old_instance_id} is not in the candidates"
             candidates = [old_instance_id]
 
         # 3. If forbidden group sampling on multiple instances, only consider the
@@ -722,8 +746,8 @@ class RolloutRouter:
         assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
         assert not self.request_futures[request_id].done(), f"Request {request_id} should not be done"
         self.request_futures[request_id].set_result(result)
-        if request_id in self.incomplete_request_to_instance:
-            self.incomplete_request_to_instance.pop(request_id)
+        self.incomplete_request_to_instance.pop(request_id, None)
+        self.sticky_session_requests.pop(request_id, None)
 
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests."""

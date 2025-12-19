@@ -43,6 +43,7 @@ class EntryInfo:
     # (i.e., higher than the final occupied buffer ID minus the staleness limit)
     request_idx: int | list[int]
     model_version: int | list[int]
+    is_validate: bool = False
 
     def __hash__(self):
         return hash(self.prompt_id)
@@ -247,6 +248,7 @@ class StalenessInventory:
         ready_num_entries (int): The number of entries in the buffer that are sufficient for one training batch
         staleness (int): The staleness tolerance for this buffer
         rollout_n (int): The number of rollout instances
+        is_validate (bool): Whether in validation mode.
     """
 
     def __init__(
@@ -255,18 +257,50 @@ class StalenessInventory:
         ready_num_entries: int,
         staleness: int,
         rollout_n: int,
+        is_validate: bool = False,
     ):
         self.staleness = staleness
         self.buffer_id = 0
         self.num_entries = num_entries
         self.ready_num_entries = ready_num_entries
         self.rollout_n = rollout_n
+        self.is_validate = is_validate
 
         self.buffers: dict[int, StalenessBuffer] = {}
         self.data_tracker: dict[int, tuple[int, int]] = {}  # Maps entry to location (buffer_id, entry_id)
         # Status tracking for buffer IDs
         # this can reduce the need to iterate through all buffers and call `get_status` frequently
         self._buffer_ids_by_status: dict[BufferStatus, set[int]] = {status: set() for status in BufferStatus}
+
+        # Validation inventory constraints
+        # 1. staleness must be None
+        # 2. num_entries must equal ready_num_entries
+        if self.is_validate:
+            if self.staleness:
+                self.staleness = None
+                psrl_logger.warning("Validation inventory must have staleness=None, setting staleness to None.")
+            if self.num_entries != self.ready_num_entries:
+                self.num_entries = self.ready_num_entries
+                psrl_logger.warning(
+                    "Validation inventory must have num_entries equal to ready_num_entries, "
+                    "setting num_entries to ready_num_entries."
+                )
+
+    def create_buffer_with_capacity(self, ready_num_entries: int, num_entries: int):
+        """
+        Set the size of buffers in the inventory.
+
+        Args:
+            ready_num_entries (int): The number of entries in the buffer that are sufficient for one training batch
+            num_entries (int): The number of entries per buffer.
+        """
+        assert self.is_validate, (
+            "Buffer size can only be dynamically set for validation inventory "
+            "because only one buffer is used during validation."
+        )
+        self.num_entries = num_entries
+        self.ready_num_entries = ready_num_entries
+        self.create_buffer(self.buffer_id)
 
     def create_buffer(self, buffer_id: int):
         """
@@ -309,6 +343,7 @@ class StalenessInventory:
             status_set.discard(buffer_id)
         # Remove buffer from inventory
         del self.buffers[buffer_id]
+        psrl_logger.debug(f"[Buffer Delete]: buffer {buffer_id} deleted, current buffer IDs: {self.buffers.keys()}")
 
     def get_buffer_status(self, buffer_id: int) -> BufferStatus:
         """
@@ -415,32 +450,43 @@ class StalenessInventory:
         non_ready = self._buffer_ids_by_status[BufferStatus.STUCK] | self._buffer_ids_by_status[BufferStatus.PENDING]
         return min(non_ready) if non_ready else None
 
-    def ensure_buffer_exists(self, max_staleness_buffer_id: int):
+    def ensure_buffer_exists(self, max_staleness_buffer_id: int | None = None):
         """
         Ensure all buffers up to max_buffer_id exist. Create missing buffers as needed.
 
         Args:
-            max_staleness_buffer_id (int): The maximum buffer ID to ensure exists.
+            max_staleness_buffer_id (int | None): The maximum buffer ID to ensure exists.
         """
+        if self.is_validate:
+            return
+
+        assert max_staleness_buffer_id is not None, "max_staleness_buffer_id must be provided for training inventory"
+
         next_buffer_id = self.buffer_id
         for buffer_id in range(next_buffer_id, max_staleness_buffer_id + 1):
             self.create_buffer(buffer_id)
 
-    def get_empty_entries_total_num(self, max_staleness_buffer_id: int) -> int:
+    def get_empty_entries_total_num(self, max_staleness_buffer_id: int | None) -> int:
         """
         Count the total number of EMPTY entries in all PENDING buffers up to max_staleness_buffer_id.
 
         Args:
-            max_staleness_buffer_id (int): The maximum buffer ID to consider.
+            max_staleness_buffer_id (int | None): The maximum buffer ID to consider.
         Returns:
             int: The total number of EMPTY entries in eligible buffers.
         """
         # Ensure at least num_requests EMPTY entries are available before max_staleness_buffer_id
-        self.ensure_buffer_exists(max_staleness_buffer_id)
+        if not self.is_validate:
+            assert max_staleness_buffer_id is not None, (
+                "max_staleness_buffer_id must be provided for non-validation inventory"
+            )
+            self.ensure_buffer_exists(max_staleness_buffer_id)
 
         pending_buffers = self.get_buffers_with_capacity()
         return sum(
-            self.buffers[bid].get_empty_entries_num() for bid in pending_buffers if bid <= max_staleness_buffer_id
+            self.buffers[bid].get_empty_entries_num()
+            for bid in pending_buffers
+            if (max_staleness_buffer_id is None or bid <= max_staleness_buffer_id)
         )
 
     def get_max_pending_buffer_id(self, max_staleness_buffer_id: int) -> int:
@@ -497,16 +543,22 @@ class StalenessInventory:
             return False
         return True
 
-    def reserve_data(self, entry_info: EntryInfo, max_staleness_buffer_id: int) -> tuple[int | None, int | None]:
+    def reserve_data(
+        self, entry_info: EntryInfo, max_staleness_buffer_id: int | None
+    ) -> tuple[int | None, int | None]:
         """
         Reserve an entry for a rollout instance in an appropriate buffer.
 
         Args:
             entry_info (EntryInfo): The entry metadata to reserve.
-            max_staleness_buffer_id (int): The maximum buffer ID allowed by staleness.
+            max_staleness_buffer_id (int | None): The maximum buffer ID allowed by staleness.
         Returns:
             Tuple[Optional[int], Optional[int]]: The buffer ID and entry ID reserved, or (None, None) if not available.
         """
+        if self.is_validate and max_staleness_buffer_id is not None:
+            max_staleness_buffer_id = None
+            psrl_logger.warning("Validation inventory must have max_staleness_buffer_id=None, setting it to None.")
+
         if entry_info.prompt_id in self.data_tracker:
             buffer_id, entry_id = self.data_tracker[entry_info.prompt_id]
             psrl_logger.info(
@@ -550,15 +602,26 @@ class StalenessInventory:
             return buffer_id, entry_id
 
         # Ensure buffer IDs up to max_staleness_buffer_id exist
-        self.ensure_buffer_exists(max_staleness_buffer_id)
+        if not self.is_validate:
+            assert max_staleness_buffer_id is not None, (
+                "max_staleness_buffer_id must be provided for non-validation inventory"
+            )
+            self.ensure_buffer_exists(max_staleness_buffer_id)
 
         # Get all PENDING buffers within the staleness limit
         pending_buffers = self.get_buffers_with_capacity()
-        candidate_ids = [
-            bid
-            for bid in pending_buffers
-            if max_staleness_buffer_id - self.staleness <= bid <= max_staleness_buffer_id
-        ]
+        if not max_staleness_buffer_id:
+            assert len(pending_buffers) == 1, (
+                f"Only one PENDING buffer should exist when max_staleness_buffer_id is None, "
+                f"but got {pending_buffers}, and current buffers are {self.buffers.keys()}."
+            )
+            candidate_ids = list(pending_buffers)
+        else:
+            candidate_ids = [
+                bid
+                for bid in pending_buffers
+                if max_staleness_buffer_id - self.staleness <= bid <= max_staleness_buffer_id
+            ]
 
         if not candidate_ids:
             # Cases where no PENDING buffers are available
@@ -754,6 +817,9 @@ class StalenessInventory:
             move_across_buffer (bool): Whether to move RESERVED entries across buffers to fill cleared entries.
                 Currently only used for OCCUPY operation.
         """
+        if self.is_validate and move_across_buffer:
+            move_across_buffer = False
+            psrl_logger.warning("Validation inventory must have move_across_buffer=False, setting it to False.")
 
         if not isinstance(prompt_ids, list):
             prompt_ids = [prompt_ids]
@@ -954,37 +1020,47 @@ class StalenessInventory:
         entry_info = self.buffers[old_buffer_id].entries[old_entry_id].entry_info
 
         model_version = entry_info.get_entry_version()
-        min_buffer_id = model_version - self.staleness
-        have_possible_occupy_target = False
-        possible_occupy_target_buffer_id = None
-        possible_occupy_target_entry_id = None
-        for buffer_id in range(min_buffer_id, model_version + self.staleness + 1):
-            if buffer_id not in self.buffers:
-                continue
+        if self.is_validate:
+            buffer_id = self.min_not_ready_buffer_id()
             buffer = self.buffers[buffer_id]
-            if buffer.get_first_non_occupied() < buffer.ready_num_entries:
-                have_possible_occupy_target = True
-                possible_occupy_target_buffer_id = buffer_id
-                possible_occupy_target_entry_id = buffer.get_first_non_occupied()
-                break
+            have_possible_occupy_target = buffer.get_first_non_occupied() < buffer.ready_num_entries
+            possible_occupy_target_buffer_id = buffer_id
+            possible_occupy_target_entry_id = buffer.get_first_non_occupied()
+        else:
+            min_buffer_id = model_version - self.staleness
+            have_possible_occupy_target = False
+            possible_occupy_target_buffer_id = None
+            possible_occupy_target_entry_id = None
+            for buffer_id in range(min_buffer_id, model_version + self.staleness + 1):
+                if buffer_id not in self.buffers:
+                    continue
+                buffer = self.buffers[buffer_id]
+                if buffer.get_first_non_occupied() < buffer.ready_num_entries:
+                    have_possible_occupy_target = True
+                    possible_occupy_target_buffer_id = buffer_id
+                    possible_occupy_target_entry_id = buffer.get_first_non_occupied()
+                    break
 
         assert have_possible_occupy_target, f"No possible occupy target found for prompt {prompt_id}."
 
         # Clean up old entry (may cause entry movement)
-        self.clear_reserved_entries(prompt_id, move_across_buffer=True)
+        self.clear_reserved_entries(prompt_id, move_across_buffer=(not self.is_validate))
 
         if old_entry_id < self.buffers[old_buffer_id].ready_num_entries:
             # It is not a redundant rollout
             # Get all PENDING buffers within the staleness limit
             pending_buffers = self.get_buffers_with_capacity()
-            candidate_ids = [
-                bid
-                for bid in pending_buffers
-                if (
-                    model_version <= bid <= model_version + self.staleness
-                    and self.buffers[bid].get_first_non_occupied() < self.buffers[bid].ready_num_entries
-                )
-            ]
+            if not self.is_validate:
+                candidate_ids = [
+                    bid
+                    for bid in pending_buffers
+                    if (
+                        model_version <= bid <= model_version + self.staleness
+                        and self.buffers[bid].get_first_non_occupied() < self.buffers[bid].ready_num_entries
+                    )
+                ]
+            else:
+                candidate_ids = list(pending_buffers)
 
             assert candidate_ids, (
                 f"No suitable PENDING buffer found during occupy prompt {prompt_id} "

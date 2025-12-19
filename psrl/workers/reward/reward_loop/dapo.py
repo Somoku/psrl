@@ -19,8 +19,9 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         compute_score=None,
         reward_model_router=None,
         reward_model_tokenizer=None,
+        is_validate=False,
     ):
-        super().__init__(config, tokenizer)
+        super().__init__(config, tokenizer, is_validate)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 

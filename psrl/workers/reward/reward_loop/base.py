@@ -10,15 +10,17 @@ from verl import DataProto
 class RewardLoopManagerBase(ABC):
     _class_initialized = False
 
-    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer):
+    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, is_validate: bool = False):
         """Initialize agent loop.
 
         Args:
             config (DictConfig): YAML config.
             tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
+            is_validate (bool): Whether in validation mode.
         """
         self.config = config
         self.tokenizer = tokenizer
+        self.is_validate = is_validate
         self.loop = asyncio.get_running_loop()
         self.init_class(config, tokenizer)
 

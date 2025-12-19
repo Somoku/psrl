@@ -57,6 +57,7 @@ def load_reward_loop_manager(
     input_tokenizer: Any,
     reward_model_router: Any,
     reward_model_tokenizer: Any,
+    is_validate: bool = False,
     **reward_kwargs: Any,
 ) -> RewardLoopManagerBase:
     """Load the reward loop manager based on the configuration.
@@ -70,6 +71,8 @@ def load_reward_loop_manager(
             The reward model router.
         reward_model_tokenizer: `(Any)`
             The tokenizer for the reward model.
+        is_validate: `(bool)`
+            Whether to load the reward loop manager for validation.
         **reward_kwargs: `(Any)`
             Additional keyword arguments for the reward loop manager.
     Returns:
@@ -100,6 +103,8 @@ def load_reward_loop_manager(
             )
         else:
             final_compute_score = default_compute_score_async
+    else:
+        final_compute_score = compute_score
 
     return reward_loop_manager_cls(
         config,
@@ -107,5 +112,6 @@ def load_reward_loop_manager(
         final_compute_score,
         reward_model_router,
         reward_model_tokenizer,
+        is_validate,
         **reward_kwargs,
     )

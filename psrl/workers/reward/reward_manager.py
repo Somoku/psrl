@@ -242,7 +242,7 @@ class RewardManager(CommandExtension):
         if multi_modal_inputs is not None:
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=inputs.meta_info)
 
     async def _command_event_handler(self):
         """Background task to handle incoming commands for the reward manager.
@@ -276,6 +276,9 @@ class RewardManager(CommandExtension):
                     )
                     parent_ids = command_args.get("parent_ids", None)
                     uids = command_args.get("uids", None)
+                    is_validate = command_args.get("is_validate", False)
+
+                    assert not is_validate, "Eval data should not be aborted in reward manager."
 
                     if parent_ids is None and uids is None:
                         raise ValueError("Abort command must contain either 'parent_ids' or 'uids' in args.")
@@ -292,7 +295,9 @@ class RewardManager(CommandExtension):
                     if parent_ids is not None:
                         parent_ids = set(parent_ids)  # Ensure uniqueness
                         psrl_logger.debug(f"Getting child requests for {len(parent_ids)} parent_ids")
-                        child_uids = await self.ps_manager_handle.get_recorded_child_requests.remote(list(parent_ids))
+                        child_uids = await self.ps_manager_handle.get_recorded_child_requests.remote(
+                            list(parent_ids), is_validate
+                        )
                         psrl_logger.debug(f"Found {len(child_uids)} child requests for the parent_ids")
                         abort_request_uids.update(child_uids)
                     # Step 2. Get requests from uids
@@ -317,6 +322,7 @@ class RewardManager(CommandExtension):
                     update_status_success = await self.ps_manager_handle.update_request_status.remote(
                         list(abort_request_uids),
                         PSRL_RequestStatus.REWARD_COMPLETED,
+                        is_validate=is_validate,
                     )
                     assert all(not status for status in update_status_success), (
                         "Update status should not be successful for aborted requests."
@@ -342,6 +348,12 @@ class RewardManager(CommandExtension):
             For async reward computation, the result will be fetched later via
             `wait_for_reward_of_requests` in the main trainer.
         """
+        is_validate = reward_inputs.meta_info.get("validate", False)
+        # Skip reward computation during validation for outside reward functions
+        if is_validate:
+            return {}
+
+        rollout_n = self.rollout_n
         # Data processing
         with log_dual_events(
             "Process reward input",
@@ -359,15 +371,18 @@ class RewardManager(CommandExtension):
                 f"attention_mask sum: {reward_inputs.batch['attention_mask'].sum(dim=-1)}"
             )
             request_ids = reward_inputs.non_tensor_batch["uid"]
+            is_validate = reward_inputs.meta_info.get("validate", False)
 
             # Update the request status to REWARD_RUNNING
             update_status_success = await self.ps_manager_handle.update_request_status.remote(
-                request_ids.tolist(), PSRL_RequestStatus.REWARD_RUNNING
+                request_ids.tolist(),
+                PSRL_RequestStatus.REWARD_RUNNING,
+                is_validate=is_validate,
             )
             if not update_status_success[0]:
                 return None
 
-            if self.rollout_n > 1:
+            if rollout_n > 1:
                 sample_ids = reward_inputs.non_tensor_batch["parent_id"]
             else:
                 sample_ids = reward_inputs.non_tensor_batch["uid"]
@@ -411,7 +426,9 @@ class RewardManager(CommandExtension):
                         result = await self.reward_loop.run_single(reward_input)
                         # Update the request status to REWARD_COMPLETED
                         update_status_success = await self.ps_manager_handle.update_request_status.remote(
-                            int(request_id), PSRL_RequestStatus.REWARD_COMPLETED
+                            int(request_id),
+                            PSRL_RequestStatus.REWARD_COMPLETED,
+                            is_validate=is_validate,
                         )
                         complete_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                         if complete_request_idxs:

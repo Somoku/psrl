@@ -49,15 +49,16 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
         compute_score=None,
         reward_model_router=None,
         reward_model_tokenizer=None,
+        is_validate=False,
     ):
-        super().__init__(config, tokenizer)
+        super().__init__(config, tokenizer, is_validate)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
         self.reward_model_router = reward_model_router
         self.reward_model_tokenizer = reward_model_tokenizer
 
         # PRIME specific config
-        self.num_examine = config.reward_model.get("reward_kwargs", {}).get("num_examine", 1)
+        self.num_examine = config.reward_model.get("reward_kwargs", {}).get("num_examine", 1) if is_validate else 0
         self.reward_fn_key = config.reward_model.get("reward_kwargs", {}).get("reward_fn_key", "data_source")
         self.num_processes = config.reward_model.get("reward_kwargs", {}).get("num_processes", 64)
         self.timeout = config.reward_model.get("reward_kwargs", {}).get("timeout", 300.0)

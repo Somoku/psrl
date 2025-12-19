@@ -50,13 +50,6 @@ class RolloutCoordinator(CommandExtension):
 
         self.config = config
         self.staleness = self.config.psrl.staleness
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
-        else:
-            self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
-            self.alg_rollout_n = self.rollout_n
-
         self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
 
         self.rollout_wg_list = rollout_wg_list

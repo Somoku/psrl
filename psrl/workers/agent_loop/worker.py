@@ -212,9 +212,11 @@ class PSRL_AgentLoopWorker:
         ):
             output = await agent_loop.run(requests)
 
+        # Put the output into the result queue
         if output is not None:
             assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
             request_ids = requests.non_tensor_batch["uid"]
+            is_validate = requests.meta_info.get("validate", False)
             with log_dual_events(
                 "Update request status",
                 psrl_logger,
@@ -224,6 +226,7 @@ class PSRL_AgentLoopWorker:
                 update_status_success = await self.ps_manager_handle.update_request_status.remote(
                     request_ids.tolist(),
                     PSRL_RequestStatus.COMPLETED,
+                    is_validate=is_validate,
                 )
             with log_dual_events(
                 f"Put requests {request_ids} into result queue",
@@ -367,4 +370,4 @@ class PSRL_AgentLoopWorker:
         if multi_modal_inputs is not None:
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=inputs.meta_info)

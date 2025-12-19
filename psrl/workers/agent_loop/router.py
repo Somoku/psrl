@@ -60,6 +60,7 @@ class RolloutRouter:
                 * self.rollout_n
                 // self.config.psrl.deployment.n_rollout_instances
             )
+        self.val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
         self.ps_manager_handle = ps_manager_handle
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
@@ -205,6 +206,8 @@ class RolloutRouter:
         # Ensure the whole routing process is atomic from the PS manager side
         # psrl_logger.info(f"Choosing new rollout instance for request {request.non_tensor_batch['uid'][0]}")
         request_id = request.non_tensor_batch["uid"][0]
+        is_validate = request.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         if "version_tag" in request.non_tensor_batch:
             needed_model_version = request.non_tensor_batch["version_tag"][0]
         else:
@@ -234,7 +237,7 @@ class RolloutRouter:
             group_request_instance_ids = [
                 instance_id
                 for incomplete_request_id, instance_id in self.incomplete_request_to_instance.items()
-                if incomplete_request_id // self.rollout_n == request_id // self.rollout_n
+                if incomplete_request_id // rollout_n == request_id // rollout_n
             ]
             if len(group_request_instance_ids) > 0:
                 first_instance = group_request_instance_ids[0]
@@ -258,7 +261,9 @@ class RolloutRouter:
                 set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
             )
             can_reserve_results = ray.get(
-                self.ps_manager_handle.can_reserve_request.remote(request_id, all_candidate_model_versions)
+                self.ps_manager_handle.can_reserve_request.remote(
+                    request_id, all_candidate_model_versions, is_validate=is_validate
+                )
             )
             candidates = [
                 candidate
@@ -282,7 +287,9 @@ class RolloutRouter:
                     set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
                 )
                 indicator_results = ray.get(
-                    self.ps_manager_handle.get_reserve_indicator.remote(request_id, all_candidate_model_versions)
+                    self.ps_manager_handle.get_reserve_indicator.remote(
+                        request_id, all_candidate_model_versions, is_validate=is_validate
+                    )
                 )
                 candidate_indicator_list = [
                     (
@@ -321,6 +328,7 @@ class RolloutRouter:
                         rollout_instance_ids=chosen_rollout_instance,
                         request_ids=request_id,
                         model_versions=needed_model_version,
+                        is_validate=is_validate,
                     )
                 )
             # Otherwise, the request is already reserved
@@ -331,6 +339,7 @@ class RolloutRouter:
                     self.ps_manager_handle.update_request_instance_id.remote(
                         request_id=request_id,
                         new_instance_id=chosen_rollout_instance,
+                        is_validate=is_validate,
                     )
                 )
         else:
@@ -492,6 +501,8 @@ class RolloutRouter:
             "Dynamic version tag is not supported in batch mode"
         )
         request_ids = requests.non_tensor_batch.get("uid", None)
+        is_validate = requests.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
 
         if "min_version_limit" in requests.non_tensor_batch:
             # Indicate that these requests are retry requests
@@ -505,7 +516,7 @@ class RolloutRouter:
             # Group requests by sample_id and assign versions
             sample_to_requests = {}
             for i, uid in enumerate(request_ids):
-                sample_id = uid // self.rollout_n
+                sample_id = uid // rollout_n
                 if sample_id not in sample_to_requests:
                     sample_to_requests[sample_id] = []
                 sample_to_requests[sample_id].append(i)
@@ -535,6 +546,7 @@ class RolloutRouter:
                 request_ids.tolist(),
                 PSRL_RequestStatus.ROLLOUT_DISPATCHED,
                 model_version=version_tag.tolist(),
+                is_validate=is_validate,
             )
         )
         filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
@@ -577,6 +589,7 @@ class RolloutRouter:
                             rollout_instance_ids=filtered_requests.non_tensor_batch["rollout_instance_id"].tolist(),
                             request_ids=filtered_requests.non_tensor_batch["uid"].tolist(),
                             model_versions=filtered_requests.non_tensor_batch["version_tag"].tolist(),
+                            is_validate=filtered_requests.meta_info.get("validate", False),
                         )
                     )
 
@@ -668,6 +681,7 @@ class RolloutRouter:
                 request_ids=request_id,
                 model_versions=model_version,
                 guarantee_not_aborted=False,
+                is_validate=request.meta_info.get("validate", False),
             )
             if entry_ids[0] is None:
                 return None
@@ -870,6 +884,8 @@ class RolloutRouter:
         #     f"to rollout instance {new_instance_id}"
         # )
         request_id = request.non_tensor_batch["uid"][0]
+        is_validate = request.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         request.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
         if "version_tag" in request.non_tensor_batch:
             needed_model_version = request.non_tensor_batch["version_tag"][0]
@@ -894,6 +910,7 @@ class RolloutRouter:
             [request_id],
             PSRL_RequestStatus.ROLLOUT_DISPATCHED,
             model_version=request.non_tensor_batch["version_tag"].tolist(),
+            is_validate=request.meta_info.get("validate", False),
         )
         # psrl_logger.info(
         #     f"Update request {request_id} status to "
@@ -943,7 +960,7 @@ class RolloutRouter:
                 return
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
                 response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
-                parent_prompt_id = request_id // self.rollout_n
+                parent_prompt_id = request_id // rollout_n
                 psrl_logger.debug(
                     f"Request {request_id} on instance {new_instance_id} of "
                     f"parent prompt {parent_prompt_id} completed successfully, "
@@ -1002,10 +1019,12 @@ class RolloutRouter:
                     filtered_request_ids = [
                         request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]
                     ]
+                    is_validate_list = [request.meta_info.get("validate", False) for request in filtered_requests]
                     can_reserve = await self.ps_manager_handle.can_reserve_request.remote(
                         filtered_request_ids,
                         [instance_version],
                         without_new_reserve_entry=False,
+                        is_validate=is_validate_list,
                     )
                     filtered_request_ids = [
                         request_id for i, request_id in enumerate(filtered_request_ids) if can_reserve[i] == [True]

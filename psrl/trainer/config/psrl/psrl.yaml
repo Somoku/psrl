@@ -277,3 +277,6 @@ retry_bound: -1
 
 # Ratio over retry bound
 retry_ratio: 1.0
+
+# Whether to evaluate on rollout
+eval_on_rollout: True

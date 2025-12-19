@@ -64,6 +64,10 @@ class DynamicSamplingFilterProcessor(BaseBufferPostProcessor):
         Returns:
             Optional[DataProto]: The data if variance > 0, None otherwise.
         """
+        assert not data.meta_info.get("validate", False), (
+            "DynamicSamplingFilterProcessor should not be used during validation."
+        )
+
         metric_name = self.config.algorithm.filter_groups.metric
         if metric_name == "seq_final_reward":
             # Turn to numpy for easier filtering

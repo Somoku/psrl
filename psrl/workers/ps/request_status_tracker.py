@@ -58,6 +58,14 @@ class RequestStatusTracker:
         self._abort_request_ids = set()  # Set of request IDs that are marked for abortion
         self._running_min_version = 0  # Minimum version of requests that are currently running
 
+        if self.psrl_config.redundant_rollout.enable:
+            self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.psrl_config.redundant_rollout.alg_rollout_n
+        else:
+            self.rollout_n = self.psrl_config.rollout_n
+            self.alg_rollout_n = self.rollout_n
+        self.val_rollout_n = self.psrl_config.val_rollout_n
+
         # NOTE(lhy): The `rollout_request_buffer` is not used anymore,
         # we should try to keep the ps_manager/request_status tracker only store the meta data!
         self.rollout_request_buffer = {}  # deprecated: buffer for storing request data during rollout processing
@@ -87,6 +95,7 @@ class RequestStatusTracker:
         status: list[PSRL_RequestStatus] | PSRL_RequestStatus,
         model_version: list[int] | int = -1,
         rollout_instance_id: list[int] | int = -1,
+        is_validate: bool = False,
     ) -> list[bool] | bool:
         """Update the status of requests.
 
@@ -99,6 +108,7 @@ class RequestStatusTracker:
             status (Union[List[PSRL_RequestStatus], PSRL_RequestStatus]): The new status(es) to set
             model_version (int, optional): The model version of the request. Defaults to -1
             rollout_instance_id (int, optional): The instance ID of the rollout worker. Defaults to -1
+            is_validate (bool, optional): Whether the request is for validation. Defaults to False
 
         Returns:
             Union[List[bool], bool]: True if status was updated successfully, False if request was aborted
@@ -136,7 +146,8 @@ class RequestStatusTracker:
                 if model_version[i] != -1:
                     self._request_infos[req_id].model_version = model_version[i]
                 request_version = self._request_infos[req_id].model_version
-                if request_version != -1 and request_version < self._running_min_version:
+                # TODO: check it
+                if not is_validate and request_version != -1 and request_version < self._running_min_version:
                     psrl_logger.warning(
                         "Request %d is stale (version %d < %d), cannot update status",
                         req_id,
@@ -238,6 +249,7 @@ class RequestStatusTracker:
         rollout_instance_id: list[int] | int = -1,
         model_version: list[int] | int = -1,
         status: (list[PSRL_RequestStatus] | PSRL_RequestStatus) = PSRL_RequestStatus.PENDING,
+        is_validate: list[bool] | bool = False,
     ):
         """
         Add new requests to the status manager.
@@ -250,6 +262,8 @@ class RequestStatusTracker:
                 The model version(s) of the request(s). Defaults to -1.
             status (Union[List[PSRL_RequestStatus], PSRL_RequestStatus], optional):
                 The initial status(es) of the request(s). Defaults to PSRL_RequestStatus.PENDING.
+            is_validate (Union[List[bool], bool], optional):
+                Whether the request(s) are for validation. Defaults to False.
         """
         if not isinstance(request_id, list):
             request_id = [request_id]
@@ -259,17 +273,21 @@ class RequestStatusTracker:
             model_version = [model_version] * len(request_id)
         if not isinstance(status, list):
             status = [status] * len(request_id)
+        if not isinstance(is_validate, list):
+            is_validate = [is_validate] * len(request_id)
 
-        assert len(request_id) == len(rollout_instance_id) == len(model_version) == len(status), (
+        assert len(request_id) == len(rollout_instance_id) == len(model_version) == len(status) == len(is_validate), (
             "All parameter lists must have the same length."
         )
 
         for i, req_id in enumerate(request_id):
+            rollout_n = self.val_rollout_n if is_validate[i] else self.rollout_n
             self._request_infos[req_id] = EntryInfo(
-                prompt_id=req_id // self.rollout_n,
-                request_idx=req_id % self.rollout_n,
+                prompt_id=req_id // rollout_n,
+                request_idx=req_id % rollout_n,
                 rollout_instance_id=rollout_instance_id[i],
                 model_version=model_version[i],
+                is_validate=is_validate[i],
             )
             self._request_id_to_status[req_id] = status[i]
             self._status_to_request_ids[status[i]].add(req_id)
@@ -417,12 +435,13 @@ class RequestStatusTracker:
 
         return classified_requests
 
-    def get_recorded_child_requests(self, parent_id: list[int] | int) -> set[int]:
+    def get_recorded_child_requests(self, parent_id: list[int] | int, is_validate: bool = False) -> set[int]:
         """
         Get the recorded child requests for a given parent request ID.
 
         Args:
             parent_id (List[int], int): The unique identifier of the parent request.
+            is_validate (bool, optional): Whether the request is for validation. Defaults to False.
 
         Returns:
             set[int]: A list of child request IDs associated with the parent request.
@@ -430,10 +449,11 @@ class RequestStatusTracker:
         if not isinstance(parent_id, list):
             parent_id = [parent_id]
 
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         child_requests = []
         for pid in parent_id:
-            for i in range(self.rollout_n):
-                child_id = pid * self.rollout_n + i
+            for i in range(rollout_n):
+                child_id = pid * rollout_n + i
                 if child_id in self._request_infos:
                     child_requests.append(child_id)
 
@@ -557,6 +577,7 @@ class RequestStatusTracker:
         abort_request_ids = set()
         for req_id, info in self._request_infos.items():
             if info.model_version == version:
+                assert not info.is_validate, "Validation requests should not be aborted by version."
                 # If the request version matches, we will abort it
                 abort_request_ids.add(req_id)
         self._running_min_version = max(self._running_min_version, version + 1)

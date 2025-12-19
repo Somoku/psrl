@@ -73,6 +73,7 @@ class PSManager(RequestStatusTracker):
         else:
             self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n
+        self.val_rollout_n = self.psrl_config.val_rollout_n
 
         # PS worker specific attributes
         self.rollout_instance_tracker: dict[
@@ -82,9 +83,14 @@ class PSManager(RequestStatusTracker):
             None  # The current model store, which contains the model state dict and version tag
         )
 
-        # Staleness buffer management
+        # Staleness buffer management for training
         self.staleness_inventory: StalenessInventory | None = (
             None  # The staleness inventory for managing stale entries
+        )
+
+        # Staleness buffer management for validation
+        self.val_staleness_inventory: StalenessInventory | None = (
+            None  # The staleness inventory for validation rollout instances
         )
 
         # Set to track versions to be aborted
@@ -108,6 +114,14 @@ class PSManager(RequestStatusTracker):
             ready_num_entries=ready_entries_per_buffer,
             staleness=self.psrl_config.staleness,
             rollout_n=self.rollout_n,
+        )
+
+        self.val_staleness_inventory = StalenessInventory(
+            num_entries=ready_entries_per_buffer,
+            ready_num_entries=ready_entries_per_buffer,
+            staleness=None,  # No staleness limit for validation inventory
+            rollout_n=self.val_rollout_n,
+            is_validate=True,
         )
 
         # NIXL related attributes
@@ -141,16 +155,37 @@ class PSManager(RequestStatusTracker):
 
     # ------- STALENESS INVENTORY MANAGEMENT -------
 
-    def get_max_reserve_num(self, model_version) -> int:
+    def set_val_staleness_inventory_capacity(self, ready_num_entries: int, num_entries: int = None):
+        """Set the capacity of the validation staleness inventory.
+
+        Args:
+            ready_num_entries (int): Number of entries that can be marked as READY in each buffer
+            num_entries (int): Total number of entries in each staleness buffer
+        """
+        if num_entries is None:
+            num_entries = ready_num_entries
+        self.val_staleness_inventory.create_buffer_with_capacity(ready_num_entries, num_entries)
+
+    def ensure_train_buffer_exists(self, buffer_id: int):
+        """Ensure a training buffer exists in the staleness inventory."""
+        self.staleness_inventory.ensure_buffer_exists(buffer_id)
+
+    def ensure_validate_buffer_exists(self):
+        """Ensure a validation buffer exists in the staleness inventory."""
+        self.val_staleness_inventory.ensure_buffer_exists()
+
+    def get_max_reserve_num(self, model_version, is_validate: bool = False) -> int:
         """Get the maximum number of entries that can be reserved for a specific model version.
 
         Args:
             model_version (int): The model version to reserve entries for
+            is_validate (bool): Whether to use the validation staleness inventory
         Returns:
             int: The maximum number of entries that can be reserved for the given model version
         """
-        max_staleness_buffer_id = model_version + self.psrl_config.staleness
-        return self.staleness_inventory.get_empty_entries_total_num(max_staleness_buffer_id)
+        max_staleness_buffer_id = model_version + self.psrl_config.staleness if not is_validate else None
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        return staleness_inventory.get_empty_entries_total_num(max_staleness_buffer_id)
 
     # Used when the model version on the rollout instance is ahead of the request version tag
     # (we allow a old version request to be routed to a new version instance)
@@ -158,9 +193,17 @@ class PSManager(RequestStatusTracker):
         self,
         request_id: int,
         new_version_tag: int,
+        is_validate: bool = False,
     ):
-        """Update the version tag of a specific request in the staleness inventory."""
-        self.staleness_inventory.update_request_version_tag(
+        """Update the version tag of a specific request in the staleness inventory.
+
+        Args:
+            request_id (int): The unique identifier of the request
+            new_version_tag (int): The new version tag to set for the request
+            is_validate (bool): Whether to use the validation staleness inventory
+        """
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        staleness_inventory.update_request_version_tag(
             request_id=request_id,
             new_version_tag=new_version_tag,
         )
@@ -170,9 +213,17 @@ class PSManager(RequestStatusTracker):
         self,
         request_id: int,
         new_instance_id: int,
+        is_validate: bool = False,
     ):
-        """Update the instance id of a specific request in the staleness inventory."""
-        self.staleness_inventory.update_request_instance_id(
+        """Update the instance id of a specific request in the staleness inventory.
+
+        Args:
+            request_id (int): The unique identifier of the request
+            new_instance_id (int): The new rollout instance id to set for the request
+            is_validate (bool): Whether to use the validation staleness inventory
+        """
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        staleness_inventory.update_request_instance_id(
             request_id=request_id,
             new_instance_id=new_instance_id,
         )
@@ -180,27 +231,43 @@ class PSManager(RequestStatusTracker):
     def clear_occupied_entries(
         self,
         prompt_ids: int | list[int],
+        is_validate: bool = False,
     ):
-        """Clear occupied entries in the staleness inventory."""
-        self.staleness_inventory.clear_occupied_entries(prompt_ids)
+        """Clear occupied entries in the staleness inventory.
+
+        Args:
+            prompt_ids (Union[int, List[int]]): The prompt ids to clear
+            is_validate (bool): Whether to use the validation staleness inventory
+        """
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        staleness_inventory.clear_occupied_entries(prompt_ids)
 
     def clear_reserved_entries(
         self,
         prompt_ids: int | list[int],
         move_across_buffer: bool = False,
+        is_validate: bool = False,
     ):
-        """Clear reserved entries in the staleness inventory."""
-        self.staleness_inventory.clear_reserved_entries(prompt_ids, move_across_buffer)
+        """Clear reserved entries in the staleness inventory.
 
-    def get_min_pending_buffer(self) -> int:
+        Args:
+            prompt_ids (Union[int, List[int]]): The prompt ids to clear
+            move_across_buffer (bool): Whether to move entries across buffers when clearing
+            is_validate (bool): Whether to use the validation staleness inventory
+        """
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        staleness_inventory.clear_reserved_entries(prompt_ids, move_across_buffer)
+
+    def get_min_pending_buffer(self, is_validate: bool = False) -> int:
         """Get the minimum pending buffer id in the staleness inventory."""
-        pending_buffers = self.staleness_inventory.get_buffers_with_capacity()
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        pending_buffers = staleness_inventory.get_buffers_with_capacity()
         if not pending_buffers:
-            return self.staleness_inventory.buffer_id
+            return staleness_inventory.buffer_id
         else:
             return min(pending_buffers)
 
-    def maybe_delete_buffer(self, buffer_id: int):
+    def maybe_delete_buffer(self, buffer_id: int, is_validate: bool = False):
         """Maybe delete a buffer from the staleness inventory.
 
         When RESERVE entries are cleared from a buffer, we can not delete it immediately
@@ -209,6 +276,10 @@ class PSManager(RequestStatusTracker):
         This method checks if the buffer can be deleted based on the current PS model version
         because the PS model version indicates which buffers have been consumed by training workers.
         """
+        if is_validate:
+            self.val_staleness_inventory.delete_buffer(buffer_id)
+            return
+
         if buffer_id in self.ready_for_delete_buffer_ids:
             for bid in sorted(list(self.ready_for_delete_buffer_ids)):
                 if bid <= buffer_id:
@@ -218,19 +289,12 @@ class PSManager(RequestStatusTracker):
                 else:
                     break
 
-    def delete_buffer(self, buffer_id: int):
-        """Delete a buffer from the staleness inventory."""
-        self.staleness_inventory.delete_buffer(buffer_id)
-
-    def ensure_buffer_exists(self, buffer_id: int):
-        """Ensure a buffer exists in the staleness inventory."""
-        self.staleness_inventory.ensure_buffer_exists(buffer_id)
-
     def can_reserve_request(
         self,
         request_idx: int | list[int],
         model_versions: list[int],
         without_new_reserve_entry: bool = False,
+        is_validate: bool | list[bool] = False,
     ) -> list[bool] | list[list[bool]]:
         """
         Check whether a request can be reserved for a given group of model versions.
@@ -241,9 +305,14 @@ class PSManager(RequestStatusTracker):
             without_new_reserve_entry (bool):
                 Whether to check if the request can be reserved
                 without a new reserve entry
+            is_validate (bool | list[bool]): Whether to use the validation staleness inventory
         Returns:
             list[bool] | list[list[bool]]: Whether the request(s) can be reserved for each model version
         """
+        assert isinstance(is_validate, bool) or len(is_validate) == len(request_idx), (
+            "is_validate should be a bool or a list of bools with the same length as request_idx."
+        )
+
         # psrl_logger.info(f"Checking if request {request_idx} can be reserved for model versions: {model_versions}")
         if not isinstance(request_idx, list):
             request_idx = [request_idx]
@@ -254,6 +323,8 @@ class PSManager(RequestStatusTracker):
         multi_results = []
         for request_id in request_idx:
             results = []
+            staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             for model_version in model_versions:
                 assert model_version != -1, "Model version should not be -1 when checking if a request can be reserved"
                 assert request_id not in self._abort_request_ids, (
@@ -264,16 +335,16 @@ class PSManager(RequestStatusTracker):
                     continue
                 entry_info = EntryInfo(
                     rollout_instance_id=-1,  # Not important for this check
-                    prompt_id=request_id // self.rollout_n,
-                    request_idx=request_id % self.rollout_n,
+                    prompt_id=request_id // rollout_n,
+                    request_idx=request_id % rollout_n,
                     model_version=model_version,
                 )
                 if without_new_reserve_entry:
                     results.append(
-                        self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version)
+                        staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version)
                     )
                 else:
-                    results.append(self.staleness_inventory.can_reserve_data(entry_info, model_version))
+                    results.append(staleness_inventory.can_reserve_data(entry_info, model_version))
             multi_results.append(results)
 
         if is_single_request:
@@ -285,6 +356,7 @@ class PSManager(RequestStatusTracker):
         self,
         request_id: int,
         model_versions: list[int],
+        is_validate: bool = False,
     ) -> list[float]:
         """
         Get the indicator of reserving a request for a given model version.
@@ -295,10 +367,13 @@ class PSManager(RequestStatusTracker):
         Args:
             request_id (int): The request id
             model_versions (List[int]): The model versions that need to be checked
+            is_validate (bool): Whether to use the validation staleness inventory
         Returns:
             List[int]: The indicator of reserving a request for each model version
         """
         indicators = []
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         for model_version in model_versions:
             assert model_version != -1, (
                 "Model version should not be -1 when getting the indicator of reserving a request"
@@ -309,14 +384,14 @@ class PSManager(RequestStatusTracker):
                 continue
             entry_info = EntryInfo(
                 rollout_instance_id=-1,  # Not important for this check
-                prompt_id=request_id // self.rollout_n,
-                request_idx=request_id % self.rollout_n,
+                prompt_id=request_id // rollout_n,
+                request_idx=request_id % rollout_n,
                 model_version=model_version,
             )
-            if self.staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
+            if staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
                 indicators.append(float("-inf"))
-            elif self.staleness_inventory.can_reserve_data(entry_info, model_version):
-                max_pending_buffer_id = self.staleness_inventory.get_max_pending_buffer_id(
+            elif staleness_inventory.can_reserve_data(entry_info, model_version):
+                max_pending_buffer_id = staleness_inventory.get_max_pending_buffer_id(
                     model_version + self.psrl_config.staleness
                 )
                 indicators.append(-max_pending_buffer_id)
@@ -330,6 +405,7 @@ class PSManager(RequestStatusTracker):
         request_ids: int | list[int],
         model_versions: int | list[int],
         guarantee_not_aborted: bool = True,
+        is_validate: bool = False,
     ) -> tuple[list[int | None], list[int | None]]:
         """
         Reserve requests for specific rollout instances and model versions.
@@ -343,6 +419,8 @@ class PSManager(RequestStatusTracker):
             rollout_instance_ids (Union[int, List[int]]): The rollout instance ids
             request_ids (Union[int, List[int]]): The request ids
             model_versions (Union[int, List[int]]): The model versions
+            guarantee_not_aborted (bool): Whether to guarantee that the requests are not aborted
+            is_validate (bool): Whether to use the validation staleness inventory
         Returns:
             Tuple[Optional[List[int]], Optional[List[int]]]: A tuple containing two lists:
                 - List of reserved buffer ids
@@ -364,6 +442,8 @@ class PSManager(RequestStatusTracker):
         # Initialize the reserved entry and buffer ids
         entry_ids = []
         buffer_ids = []
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
         for rollout_instance_id, request_id, model_version in zip(rollout_instance_ids, request_ids, model_versions):
             assert model_version != -1, "Model version should not be -1 when reserving a request"
             if guarantee_not_aborted:
@@ -379,17 +459,17 @@ class PSManager(RequestStatusTracker):
                 f"Reserving a request with model version {model_version} is not allowed, "
                 f"because it is not greater than the max aborted version {self.max_aborted_version}"
             )
-            max_staleness_buffer_id = model_version + self.psrl_config.staleness
+            max_staleness_buffer_id = model_version + self.psrl_config.staleness if not is_validate else None
             # Create an entry in the staleness inventory
             # note that model_version may be a future version of the current rollout instance
             entry_info = EntryInfo(
                 rollout_instance_id=rollout_instance_id,
-                prompt_id=request_id // self.rollout_n,
-                request_idx=request_id % self.rollout_n,
+                prompt_id=request_id // rollout_n,
+                request_idx=request_id % rollout_n,
                 model_version=model_version,
             )
 
-            buffer_id, entry_id = self.staleness_inventory.reserve_data(
+            buffer_id, entry_id = staleness_inventory.reserve_data(
                 entry_info=entry_info, max_staleness_buffer_id=max_staleness_buffer_id
             )
 
@@ -583,7 +663,8 @@ class PSManager(RequestStatusTracker):
         self,
         prompt_id: int,
         request_ids: int | list[int] | None = None,
-        accumulate_sample: bool | None = True,
+        accumulate_sample: bool = True,
+        is_validate: bool = False,
     ) -> tuple[int | None, BufferStatus | None, EntryInfo]:
         """
         Store a finished request in the staleness inventory, maybe occupy the buffer
@@ -596,6 +677,7 @@ class PSManager(RequestStatusTracker):
             prompt_id (int): The prompt id of the request
             request_ids (Optional[Union[int, List[int]]]): The request ids to occupy
             accumulate_sample (Optional[bool]): Whether to accumulate samples for group sampling
+            is_validate (bool): Whether to use the validation staleness inventory
         Returns:
             Tuple[Optional[int], Optional[BufferStatus], EntryInfo]: A tuple containing:
                 - buffer_id (Optional[int]): The buffer id where the data is stored, or None if not occupied
@@ -616,20 +698,21 @@ class PSManager(RequestStatusTracker):
             )
             return None, None, None
 
-        buffer_id, entry_id, occupy_num = self.staleness_inventory.occupy_data_with_reserve(prompt_id)
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        buffer_id, entry_id, occupy_num = staleness_inventory.occupy_data_with_reserve(prompt_id)
         if buffer_id is None:
             raise RuntimeError("Unexpected error: buffer id is None")
             # This should not happen
             # Occupy failed due to staleness limit, return the old entry info for abortion
-            # old_buffer_id, old_entry_id = self.staleness_inventory.data_tracker[prompt_id]
-            # entry_info = self.staleness_inventory.buffers[old_buffer_id].entries[old_entry_id].entry_info
-            # self.staleness_inventory.clear_reserved_entries(prompt_id, move_across_buffer=False)
+            # old_buffer_id, old_entry_id = staleness_inventory.data_tracker[prompt_id]
+            # entry_info = staleness_inventory.buffers[old_buffer_id].entries[old_entry_id].entry_info
+            # staleness_inventory.clear_reserved_entries(prompt_id, move_across_buffer=False)
             # return None, None, entry_info
 
         # Update ready num entries if not accumulate_sample, requiring more data to occupy
         if not accumulate_sample:
-            self.staleness_inventory.buffers[buffer_id].ready_num_entries += 1
-        entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
+            staleness_inventory.buffers[buffer_id].ready_num_entries += 1
+        entry_info = staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
         return buffer_id, occupy_num, entry_info
 
     # ------- MODEL VERSION MANAGEMENT -------

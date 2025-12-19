@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -61,6 +62,8 @@ class DataProcessor:
         self.val_dataloader_iter = None
         self.global_steps = 0
         self._train_sample_idx = 0
+        self._val_sample_idx = 0
+
         if collate_fn is None:
             from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
@@ -82,6 +85,13 @@ class DataProcessor:
         assert self.rollout_n >= self.alg_rollout_n, (
             f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
         )
+        self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
+
+        # Use conservative bounds: divide available space by 2 for train and eval each
+        # This ensures: MAX_TRAIN_ID * rollout_n < sys.maxsize // 2
+        # MAX_VAL_ID * val_rollout_n < sys.maxsize // 2
+        self.MAX_TRAIN_ID = sys.maxsize // (2 * self.rollout_n)
+        self.MAX_VAL_ID = sys.maxsize // (2 * self.val_rollout_n)
 
         # Threads for data processing
         self.data_process_thread = None
@@ -287,6 +297,29 @@ class DataProcessor:
     def get_val_len(self):
         return len(self.val_dataloader)
 
+    def get_val_sample_ids(self, batch_size: int) -> list:
+        """
+        Generate sample IDs for validation data with cyclic wrapping.
+
+        This method generates unique sample IDs for validation data that are guaranteed
+        not to conflict with training sample IDs by using a separate ID namespace.
+        The IDs cycle within [MAX_TRAIN_ID, MAX_TRAIN_ID + MAX_VAL_ID) to avoid overflow.
+
+        Args:
+            batch_size (int): The number of sample IDs to generate.
+
+        Returns:
+            list: A list of sample IDs for the validation batch.
+        """
+        sample_ids = []
+        for _ in range(batch_size):
+            # Cycle within the validation namespace: [MAX_TRAIN_ID, MAX_TRAIN_ID + MAX_VAL_ID)
+            val_offset = self._val_sample_idx % self.MAX_VAL_ID
+            sample_id = self.MAX_TRAIN_ID + val_offset
+            sample_ids.append(sample_id)
+            self._val_sample_idx += 1
+        return sample_ids
+
     def get_single_controller_batch(self, dataset_type: DatasetType):
         """
         Get a single batch from the dataset for single controller training.
@@ -355,8 +388,13 @@ class DataProcessor:
             try:
                 batch_dict = next(self.train_dataloader_iter)
                 batch_size = len(batch_dict[list(batch_dict.keys())[0]])
-                sample_ids = [self._train_sample_idx + i for i in range(batch_size)]
-                self._train_sample_idx += batch_size
+
+                # Generate training sample IDs with cyclic wrapping to avoid overflow
+                sample_ids = []
+                for i in range(batch_size):
+                    sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
+                    sample_ids.append(sample_id)
+                self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
 
                 # For Group Sampling, we use `parent_id` to indicate the shared prompt.
                 if self.rollout_n > 1:

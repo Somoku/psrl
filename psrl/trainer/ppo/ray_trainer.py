@@ -143,6 +143,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Async rollout mode for training worker
         self.async_rollout_mode = False
 
+        # Whether to evaluate on rollout
+        self.eval_on_rollout = self.config.psrl.eval_on_rollout
+
+        # Indicate whether rank 0 worker is also the model owner in psrl_async mode
+        self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
+
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if config.algorithm.use_kl_in_reward:
@@ -448,6 +454,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _init_ps_manager(self):
         """Initialize the PS manager for handling model version, requests condition and staleness."""
+        # Set the validation rollout number in the config
+        try:
+            OmegaConf.set_struct(self.config, True)
+            with open_dict(self.config):
+                if OmegaConf.select(self.config, "psrl"):
+                    self.config.psrl.val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
+        except Exception as e:
+            psrl_logger.warning(f"Could not set val_rollout_n in config. Structure missing? Error: {e}")
+
         ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
         assert self.config.psrl.ps_manager_ip in ip_to_node_id, (
             f"PSManager IP {self.config.psrl.ps_manager_ip} not found in ray nodes"
@@ -711,6 +726,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         sample_turns = []
         sample_parent_ids = []
 
+        test_batch_list = []
         batch_count = 0
         while True:
             try:
@@ -728,28 +744,40 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     raise
             test_batch = DataProto.from_single_dict(test_data)
 
-            if "parent_id" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["parent_id"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))],
-                    dtype=object,
-                )
-
-            # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.train_actor_rollout_ref.rollout.val_kwargs.n,
-                interleave=True,
-            )
-
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
+
+            test_batch_list.append(test_batch)
+
+        if self.eval_on_rollout:
+            val_data_size = sum(len(batch.batch) for batch in test_batch_list)
+            futures = []
+            futures.append(self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(val_data_size))
+            futures.append(self.agent_loop_manager.set_val_buffer_size.remote(val_data_size))
+            ray.get(futures)
+
+        val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
+        for test_batch in test_batch_list:
+            batch_size = len(test_batch.batch)
+
+            if self.eval_on_rollout:
+                sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
+                test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
+            else:
+                test_batch.non_tensor_batch["parent_id"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(batch_size)],
+                    dtype=object,
+                )
+            # repeat test batch
+            test_batch = test_batch.repeat(repeat_times=val_rollout_n, interleave=True)
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
             # TODO(verl): Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
-            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id"])
+            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -768,10 +796,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 non_tensor_batch_keys_to_pop.append("interaction_kwargs")
             if "agent_name" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("agent_name")
+            if self.eval_on_rollout:
+                non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
+
+            if val_rollout_n > 1 and self.eval_on_rollout:
+                uid_list = []
+                for i in range(batch_size):
+                    for j in range(val_rollout_n):
+                        child_id = sample_ids[i] * val_rollout_n + j
+                        uid_list.append(child_id)
+                test_gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -783,23 +821,32 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             }
             psrl_logger.debug(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_wg.world_size // self.config.train_actor_rollout_ref.rollout.tensor_model_parallel_size
-                if not self.async_rollout_mode
-                else self.config.train_actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            # switch to the inference engine and generate sequences
-            # NOTE: `async_rollout_mode` regards to aysnc engine in verl,
-            # not the async rollout mode in PSRL as `psrl_async`.
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
+            if self.eval_on_rollout:
+                val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_gen_batch))
+                with log_dual_events(
+                    f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT
+                ):
+                    test_output_gen_batch = ray.get(
+                        self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
+                    )
             else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                # pad to be divisible by dp_size
+                size_divisor = (
+                    self.actor_wg.world_size // self.config.train_actor_rollout_ref.rollout.tensor_model_parallel_size
+                    if not self.async_rollout_mode
+                    else self.config.train_actor_rollout_ref.rollout.agent.num_workers
+                )
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+                # switch to the inference engine and generate sequences
+                # NOTE: `async_rollout_mode` regards to aysnc engine in verl,
+                # not the async rollout mode in PSRL as `psrl_async`.
+                if not self.async_rollout_mode:
+                    test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
@@ -1276,11 +1323,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info("PS worker group bound successfully!")
 
         # Build rollout at train side for evaluation
-        psrl_logger.info("Building rollout at train side for evaluation")
-        self.actor_wg.build_rollout(
-            trust_remote_code=self.config.train_actor_rollout_ref.model.get("trust_remote_code", False)
-        )
-        psrl_logger.info("Evaluation rollout built successfully!")
+        if not self.eval_on_rollout:
+            psrl_logger.info("Building rollout at train side for evaluation")
+            self.actor_wg.build_rollout(
+                trust_remote_code=self.config.train_actor_rollout_ref.model.get("trust_remote_code", False)
+            )
+            psrl_logger.info("Evaluation rollout built successfully!")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1495,25 +1543,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             )
             return
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            psrl_logger.info(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
-
         self.init_agent_loop_manager()
 
         futures = []
         futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
         futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         for i in range(self.config.psrl.deployment.n_rollout_instances):
-            futures.extend(
-                self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator)
-            )
+            if self.rank_0_is_model_owner:
+                futures.append(
+                    self.rollout_wg_list[i].execute_rank_zero_async(
+                        "set_rollout_coordinator", self.rollout_coordinator
+                    )
+                )
+            else:
+                futures.extend(
+                    self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator)
+                )
         for agent_loop_worker in self.agent_loop_workers:
             futures.append(agent_loop_worker.set_agent_loop_manager.remote(self.agent_loop_manager))
         ray.get(futures)
@@ -1527,28 +1572,38 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ray.get(futures)
 
         # Start data pipeline
-        # 1. Start data processor to handle data preprocessing and batching
-        psrl_logger.info("Starting data processor...")
-        self.start_data_processor()
-        psrl_logger.info("Data processor started successfully.")
-
         if not self.config.psrl.colocate:
-            # 2. Start rollout coordinator to handle rollouts and data generation
+            # Start rollout coordinator to handle rollouts and data generation
             psrl_logger.info("Starting rollout coordinator...")
             self.start_rollout_coordinator()
             psrl_logger.info("Rollout coordinator started successfully.")
 
-            # 3. Start agent loop manager to handle agent-environment interactions
+            # Start agent loop manager to handle agent-environment interactions
             psrl_logger.info("Starting agent loop manager...")
             self.start_agent_loop_manager()
             psrl_logger.info("Agent loop manager started successfully.")
 
-            # 4. Start reward manager to handle reward computation requests
+            # Start reward manager to handle reward computation requests
             psrl_logger.info("Starting reward manager...")
             self.start_reward_manager()
             psrl_logger.info("Reward manager started successfully.")
 
         psrl_logger.info("All data pipeline components started successfully.")
+
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            val_metrics = self._validate()
+            assert val_metrics, f"{val_metrics=}"
+            psrl_logger.info(f"Initial validation metrics: {val_metrics}")
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get("val_only", False):
+                return
+
+        # Start data processor to handle data preprocessing and batching
+        psrl_logger.info("Starting data processor...")
+        self.start_data_processor()
+        psrl_logger.info("Data processor started successfully.")
 
         # add tqdm
         progress_bar = tqdm(
@@ -1597,7 +1652,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     else:
                         from verl.trainer.ppo.reward import compute_reward
 
-                        batch = ray.get(self.agent_loop_manager_handle.get_data.remote())
+                        batch = ray.get(self.agent_loop_manager.get_data.remote())
                         if batch is None:
                             psrl_logger.info(
                                 "No more data from agent loop manager, ending training at step %d",

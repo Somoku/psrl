@@ -69,6 +69,9 @@ class AgentLoopBase(ABC):
         Returns:
             DataProto: Updated output data with reward information.
         """
+        if outputs.meta_info.get("validate", False):
+            return outputs  # Skip merging for validation data
+
         filtered_request_ids = list(reward_result.keys())
         filtered_request_idxs = [
             idx for idx, uid in enumerate(outputs.non_tensor_batch["uid"].tolist()) if uid in filtered_request_ids

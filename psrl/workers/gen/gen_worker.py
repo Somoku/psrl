@@ -142,6 +142,7 @@ class PSRL_GenWorker(Worker):
         """
         super().__init__()
         self.config = config
+        self.role = role
         self.dtype = self.config.rollout.dtype
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
@@ -226,6 +227,22 @@ class PSRL_GenWorker(Worker):
         """Set the rollout coordinator for this GenWorker."""
         self.coordinator_handle = rollout_coordinator
 
+    async def _collective_rpc(self, method_name: str, args: tuple = ()):
+        """Call a method via collective RPC."""
+        assert self.rollout, "Rollout must be initialized before calling _collective_rpc."
+        if self.config.rollout.mode == "sync":
+            return self.rollout.inference_engine.collective_rpc(
+                method_name,
+                args=args,
+            )
+        elif self.config.rollout.mode == "psrl_async":
+            return await self.rollout.inference_engine.collective_rpc(
+                method_name,
+                args=args,
+            )
+        else:
+            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+
     def _build_distributed(self):
         """Build the distributed process group for the rollout instance."""
         # Initialize the distributed process group
@@ -245,18 +262,7 @@ class PSRL_GenWorker(Worker):
         """
         await self._is_init_model.wait()
         assert self.rollout, "Rollout must be initialized before calling estimate_max_model_len."
-        if self.config.rollout.mode == "sync":
-            max_model_len = self.rollout.inference_engine.collective_rpc(
-                "estimate_max_model_len",
-                args=(),
-            )
-        elif self.config.rollout.mode == "psrl_async":
-            max_model_len = await self.rollout.inference_engine.collective_rpc(
-                "estimate_max_model_len",
-                args=(),
-            )
-        else:
-            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+        max_model_len = await self._collective_rpc("estimate_max_model_len", args=())
         return max_model_len
 
     async def init_nixl_client(self):
@@ -270,28 +276,15 @@ class PSRL_GenWorker(Worker):
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
-            if self.config.rollout.mode == "sync":
-                self.rollout.inference_engine.collective_rpc(
-                    "init_nixl_client",
-                    args=(
-                        self.psrl_config.nixl,
-                        self.nixl_interface,
-                        self.get_instance_id(),
-                        self.psrl_config.logging_path,
-                    ),
-                )
-            elif self.config.rollout.mode == "psrl_async":
-                await self.rollout.inference_engine.collective_rpc(
-                    "init_nixl_client",
-                    args=(
-                        self.psrl_config.nixl,
-                        self.nixl_interface,
-                        self.get_instance_id(),
-                        self.psrl_config.logging_path,
-                    ),
-                )
-            else:
-                raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+            await self._collective_rpc(
+                "init_nixl_client",
+                args=(
+                    self.psrl_config.nixl,
+                    self.nixl_interface,
+                    self.get_instance_id(),
+                    self.psrl_config.logging_path,
+                ),
+            )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         self._is_init_nixl_client.set()
@@ -306,18 +299,7 @@ class PSRL_GenWorker(Worker):
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_protocol."
         psrl_logger.info("NIXL protocol begin via rpc call.")
-        if self.config.rollout.mode == "sync":
-            self.rollout.inference_engine.collective_rpc(
-                "nixl_protocol",
-                args=(self.config,),
-            )
-        elif self.config.rollout.mode == "psrl_async":
-            await self.rollout.inference_engine.collective_rpc(
-                "nixl_protocol",
-                args=(self.config,),
-            )
-        else:
-            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+        await self._collective_rpc("nixl_protocol", args=(self.config,))
         psrl_logger.info("NIXL protocol done via rpc call.")
 
     def get_node_id(self) -> str:
@@ -875,6 +857,7 @@ class PSRL_GenWorker(Worker):
         )
 
         # Update the request status to ROLLOUT_RUNNING
+        is_validate = request.meta_info.get("validate", False)
         request_ids = request.non_tensor_batch.get("uid", None)
         rollout_instance_id = self.get_instance_id()
 
@@ -891,7 +874,7 @@ class PSRL_GenWorker(Worker):
                 )
                 # Update version tag in staleness inventory
                 await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(
-                    request_ids[0], model_version
+                    request_ids[0], model_version, is_validate
                 )
             request.non_tensor_batch["version_tag"] = np.array([model_version], dtype=int)
 
@@ -901,6 +884,7 @@ class PSRL_GenWorker(Worker):
             PSRL_RequestStatus.ROLLOUT_RUNNING,
             rollout_instance_id=rollout_instance_id,
             model_version=model_version,
+            is_validate=is_validate,
         )
         if update_status_success[0]:
             # Prepare the request for generation
@@ -951,6 +935,7 @@ class PSRL_GenWorker(Worker):
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
+                is_validate=is_validate,
             )
             if update_status_success[0]:
                 return result, update_status
@@ -978,6 +963,7 @@ class PSRL_GenWorker(Worker):
 
         curr_rollout_instance_model_version = self.curr_rollout_instance_model_version
         request_ids = requests.non_tensor_batch["uid"]
+        is_validate = requests.meta_info.get("validate", False)
         psrl_logger.debug(
             f"Rollout instance {rollout_instance_id} is generating requests with request ids: {request_ids}"
         )
@@ -1031,6 +1017,7 @@ class PSRL_GenWorker(Worker):
                     request_ids.tolist(),
                     PSRL_RequestStatus.ROLLOUT_RUNNING,
                     rollout_instance_id=rollout_instance_id,
+                    is_validate=is_validate,
                 )
             )
             filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
@@ -1082,6 +1069,7 @@ class PSRL_GenWorker(Worker):
                         self.gen_interface.ps_manager_handle.update_request_status.remote(
                             request_ids.tolist(),
                             update_statuses,
+                            is_validate=is_validate,
                         )
                     )
                     filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]

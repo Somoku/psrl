@@ -1,0 +1,20 @@
+tools:
+  - path: retool.py # relative to the config directory
+    class_name: CustomSandboxFusionTool
+    params:
+      sandbox_fusion_url: "http://localhost:8080/run_code"
+      memory_limit_mb: 1024
+      default_timeout: 30
+      default_language: "python"
+      name: "code_interpreter"
+      description:  "A tool for executing code."
+
+  # Use registered tools
+  # - tool_name: custom_sandbox_fusion
+  #   params:
+  #     sandbox_fusion_url: "http://localhost:8080/run_code"
+  #     memory_limit_mb: 1024
+  #     default_timeout: 30
+  #     default_language: "python"
+  #     name: "code_interpreter"
+  #     description:  "A tool for executing code."

@@ -1,3 +1,5 @@
+from enum import Enum
+
 from omegaconf import DictConfig
 from pydantic import BaseModel
 
@@ -31,6 +33,17 @@ class DummyConfig:
 
     def __init__(self, config: DictConfig) -> None:
         self.config = config
+
+
+class TerminateReason(Enum):
+    FINISHED = "finished"
+    MAX_RESPONSE_LENGTH_EXCEEDED = "max_response_length_exceeded"
+    MAX_TURNS_EXCEEDED = "max_turns_exceeded"
+    ENV_TIMEOUT = "env_timeout"
+    TIMEOUT = "timeout"
+    ABORTED = "aborted"
+    UNKNOWN = "unknown"
+    ERROR = "error"
 
 
 class AgentLoopMetrics(BaseModel):

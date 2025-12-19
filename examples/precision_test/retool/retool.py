@@ -1,0 +1,136 @@
+import re
+from typing import Any
+
+import datasets
+from psrl.tools.base import ToolOutput
+from psrl.tools.sandbox_fusion_tool import DEFAULT_TIMEOUT, SandboxFusionTool
+from psrl.utils.rollout.rollout_trace import rollout_trace_op
+from verl.utils.dataset import RLHFDataset
+from verl.utils.reward_score import math_dapo
+
+
+class CustomSandboxFusionTool(SandboxFusionTool):
+    def __init__(
+        self,
+        sandbox_fusion_url: str,
+        memory_limit_mb: int = 1024,
+        default_timeout: int = DEFAULT_TIMEOUT,
+        default_language: str = "python",
+        name: str = "code_interpreter",
+        description: str = "A tool for execute code",
+    ):
+        super().__init__(
+            sandbox_fusion_url=sandbox_fusion_url,
+            memory_limit_mb=memory_limit_mb,
+            default_timeout=default_timeout,
+            default_language=default_language,
+            name=name,
+            description=description,
+        )
+        self.code_pattern = re.compile(r"```python(.*?)```", re.DOTALL)
+
+    @rollout_trace_op
+    async def async_forward(
+        self,
+        code: str,
+        case_index: int = 0,
+        stdin_data: dict | None = None,
+        expected_output: Any | None = None,
+        language: str | None = None,
+        timeout: int | None = None,
+        concurrent_semaphore: Any | None = None,
+        fn_name: str | None = None,
+        return_score: bool = False,
+        **kwargs,
+    ) -> ToolOutput:
+        if not isinstance(code, str):
+            code = str(code)
+
+        matches = self.code_pattern.findall(code)
+        if matches:
+            code = matches[0].strip()
+
+        # NOTE: some script may not explicitly print result, we need to add a print statement to the end of the script
+        lines = code.split("\n")
+        for i, line in reversed(list(enumerate(lines))):
+            if line == "":
+                continue
+            if not lines[i].startswith("print"):
+                lines[i] = f"print({line})"
+            break
+        code = "\n".join(lines)
+
+        return await super().async_forward(
+            code=code,
+            case_index=case_index,
+            stdin_data=stdin_data,
+            expected_output=expected_output,
+            language=language,
+            timeout=timeout,
+            concurrent_semaphore=concurrent_semaphore,
+            fn_name=fn_name,
+            return_score=return_score,
+            **kwargs,
+        )
+
+
+answer_format = """\nThe answer format must be: \\boxed{'The final answer goes here.'}"""
+
+
+class CustomRLHFDataset(RLHFDataset):
+    """Custom dataset class to process dapo/aime-2024, dapo/aime-2025 datasets."""
+
+    def _read_files_and_tokenize(self):
+        dataframes = []
+        for parquet_file in self.data_files:
+            # read parquet files and cache
+            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            data_source = "/".join(parquet_file.split("/")[-2:]).split(".")[0]  # e.g., dapo/aime-2024
+            if data_source in ["dapo/aime-2024", "dapo/aime-2025"]:
+                dataframe = dataframe.map(
+                    self.map_fn, fn_kwargs={"data_source": data_source}, remove_columns=dataframe.column_names
+                )
+            else:
+                dataframe = dataframe.map(self.map_fn2, num_proc=16)
+            dataframes.append(dataframe)
+        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
+
+        print(f"dataset len: {len(self.dataframe)}")
+
+    def map_fn(self, row: dict, *, data_source: str = None):
+        if data_source == "dapo/aime-2024":
+            problem, answer = row["problem"], row["answer"]
+        elif data_source == "dapo/aime-2025":
+            problem, answer = row["problem"], row["answer"]
+
+        prompt = problem + answer_format
+        data = {
+            "data_source": data_source.split("/")[1].lower(),  # aime_2024, aime_2025
+            "prompt": [{"role": "user", "content": prompt}],
+            "ability": "MATH",
+            "reward_model": {"ground_truth": str(answer)},
+            "agent_name": "multi_turn_agent",
+        }
+        return data
+
+    def map_fn2(self, row: dict):
+        content = row["prompt"][0]["content"]
+        row["prompt"][0]["content"] = content + answer_format
+        row["agent_name"] = "multi_turn_agent"
+        return row
+
+
+def compute_score(data_source, solution_str, ground_truth, extra_info):
+    # use \\boxed{...} answer
+    result = math_dapo.compute_score(solution_str, ground_truth, strict_box_verify=True)
+
+    # encourage model to call tools
+    num_turns = extra_info["num_turns"]
+    if result["score"] < 0:
+        tool_call_reward = (num_turns - 2) / 2 * 0.1
+        result["score"] = min(-0.6, result["score"] + tool_call_reward)
+
+    if result["pred"] is None:
+        result["pred"] = ""
+
+    return result

@@ -16,7 +16,8 @@ from verl.utils.model import compute_position_id_with_mask
 
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
-from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig
+from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig, TerminateReason
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -69,6 +70,15 @@ class PSRL_AgentLoopWorker:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 AGENT_LOOP_REGISTRY[agent_loop_config.name] = agent_loop_config
+
+        # Initialize rollout trace config
+        trace_config = self.config.gen_actor_rollout_ref.rollout.get("trace", {})
+        RolloutTraceConfig.init(
+            self.config.trainer.project_name,
+            self.config.trainer.experiment_name,
+            trace_config.get("backend"),
+            trace_config.get("token2text", False),
+        )
 
         # Build logger
         # TODO(lhy): support >1 workers
@@ -186,61 +196,122 @@ class PSRL_AgentLoopWorker:
     ):
         """Execute the specified agent loop on the given requests.
 
+        This method instantiates the agent loop based on the registered configuration
+        and runs it with the provided requests. It handles retries based on termination reasons.
+
         Args:
             agent_name (str): Name of the agent loop to run.
             requests (DataProto): Input requests to process.
         """
-        assert agent_name in AGENT_LOOP_REGISTRY, (
-            f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
-        )
-        agent_loop_config = AGENT_LOOP_REGISTRY[agent_name]
+        if "parent_id" in requests.non_tensor_batch:
+            prompt_index = requests.non_tensor_batch["parent_id"].tolist()[0]
+            request_index = requests.non_tensor_batch["uid"].tolist()[0]
+        else:
+            prompt_index = requests.non_tensor_batch["uid"].tolist()[0]
+            request_index = requests.non_tensor_batch["uid"].tolist()[0]
 
-        agent_loop = hydra.utils.instantiate(
-            config=agent_loop_config,
-            trainer_config=DummyConfig(config=self.config),
-            rollout_router=self.rollout_router,
-            reward_manager=self.reward_manager,
-            ps_manager_handle=self.ps_manager_handle,
-            tokenizer=self.tokenizer,
-        )
-
-        with log_dual_events(
-            f"Agent loop with requests {requests.non_tensor_batch['uid']}",
-            psrl_logger,
-            level=logging.DEBUG,
-            event_type=EventType.GEN,
+        with rollout_trace_attr(
+            prompt_index=prompt_index,
+            request_index=request_index,
+            step=requests.meta_info.get("global_steps", -1),
+            name=agent_name,
+            validate=requests.meta_info.get("validate", False),
         ):
-            output = await agent_loop.run(requests)
+            assert agent_name in AGENT_LOOP_REGISTRY, (
+                f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
+            )
+            agent_loop_config = AGENT_LOOP_REGISTRY[agent_name]
 
-        # Put the output into the result queue
-        if output is not None:
-            assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
-            request_ids = requests.non_tensor_batch["uid"]
-            is_validate = requests.meta_info.get("validate", False)
+            agent_loop = hydra.utils.instantiate(
+                config=agent_loop_config,
+                trainer_config=DummyConfig(config=self.config),
+                rollout_router=self.rollout_router,
+                reward_manager=self.reward_manager,
+                ps_manager_handle=self.ps_manager_handle,
+                tokenizer=self.tokenizer,
+            )
+
             with log_dual_events(
-                "Update request status",
+                f"Agent loop with requests {requests.non_tensor_batch['uid']}",
                 psrl_logger,
                 level=logging.DEBUG,
-                event_type=EventType.OTHER,
+                event_type=EventType.GEN,
             ):
-                update_status_success = await self.ps_manager_handle.update_request_status.remote(
-                    request_ids.tolist(),
-                    PSRL_RequestStatus.COMPLETED,
-                    is_validate=is_validate,
-                )
-            with log_dual_events(
-                f"Put requests {request_ids} into result queue",
-                psrl_logger,
-                level=logging.DEBUG,
-                event_type=EventType.OTHER,
-            ):
-                dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-                if dispatch_request_idxs:
-                    output = output.select_idxs(dispatch_request_idxs)
-                    # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into
-                    # the result queue, so we process the data inside the reward manager
-                    # output = self._post_process(output)
-                    await self.agent_loop_manager.put_result.remote(output)
+                retry_limit = self.config.gen_actor_rollout_ref.rollout.agent.retry_limit
+                for retry_attempt in range(1, retry_limit + 1):
+                    raise_on_error = (
+                        retry_attempt == retry_limit
+                    ) and self.config.gen_actor_rollout_ref.rollout.agent.raise_on_error
+                    output, terminate_reason = await agent_loop.run_with_termination_handling(
+                        requests, raise_on_error=raise_on_error
+                    )
+
+                    if terminate_reason not in (
+                        TerminateReason.TIMEOUT,
+                        TerminateReason.ENV_TIMEOUT,
+                        TerminateReason.ERROR,
+                        TerminateReason.UNKNOWN,
+                    ):
+                        break
+
+                    # Retry if applicable
+                    if retry_attempt < retry_limit:
+                        psrl_logger.warning(
+                            f"Agent loop for requests {requests.non_tensor_batch['uid']} "
+                            f"terminated with reason {terminate_reason.value} on "
+                            f"attempt {retry_attempt}/{retry_limit}, retrying..."
+                        )
+                        continue
+
+                if terminate_reason in (
+                    TerminateReason.TIMEOUT,
+                    TerminateReason.ENV_TIMEOUT,
+                    TerminateReason.ERROR,
+                    TerminateReason.UNKNOWN,
+                    TerminateReason.ABORTED,
+                ):
+                    psrl_logger.warning(
+                        f"Agent loop for requests {requests.non_tensor_batch['uid']} "
+                        f"terminated with reason {terminate_reason.value} "
+                        f"after {retry_limit} attempts."
+                    )
+                    output = None
+                else:
+                    psrl_logger.debug(
+                        f"Agent loop for requests {requests.non_tensor_batch['uid']} "
+                        f"terminated with reason {terminate_reason.value}."
+                    )
+
+            # Put the output into the result queue
+            if output is not None:
+                assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
+                request_ids = requests.non_tensor_batch["uid"]
+                is_validate = requests.meta_info.get("validate", False)
+                with log_dual_events(
+                    "Update request status",
+                    psrl_logger,
+                    level=logging.DEBUG,
+                    event_type=EventType.OTHER,
+                ):
+                    update_status_success = await self.ps_manager_handle.update_request_status.remote(
+                        request_ids.tolist(),
+                        PSRL_RequestStatus.COMPLETED,
+                        is_validate=is_validate,
+                    )
+
+                with log_dual_events(
+                    f"Put requests {request_ids} into result queue",
+                    psrl_logger,
+                    level=logging.DEBUG,
+                    event_type=EventType.OTHER,
+                ):
+                    dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
+                    if dispatch_request_idxs:
+                        output = output.select_idxs(dispatch_request_idxs)
+                        # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into
+                        # the result queue, so we process the data inside the reward manager
+                        # output = self._post_process(output)
+                        await self.agent_loop_manager.put_result.remote(output)
 
     # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:

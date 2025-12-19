@@ -380,11 +380,11 @@ class PSRL_vLLMRollout:
             Tuple of (vllm_inputs, sampling_kwargs) ready for vLLM generation
         """
 
-        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-        batch_size = idx.size(0)
+        batch_size = len(prompts)
 
         non_tensor_batch = prompts.non_tensor_batch
         if "raw_prompt_ids" not in non_tensor_batch:
+            idx = prompts.batch["input_ids"]  # (bs, prompt_length)
             # Remove the left padding in the prompt token_id
             non_tensor_batch["raw_prompt_ids"] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)],
@@ -397,11 +397,19 @@ class PSRL_vLLMRollout:
                 f"{batch_size=} v.s. {len(non_tensor_batch['raw_prompt_ids'])=}."
             )
 
-        raw_prompt_ids = non_tensor_batch["raw_prompt_ids"]
+        if isinstance(non_tensor_batch["raw_prompt_ids"], np.ndarray):
+            raw_prompt_ids = non_tensor_batch["raw_prompt_ids"].tolist()
+        else:
+            raw_prompt_ids = non_tensor_batch["raw_prompt_ids"]
+
         if "raw_response_ids" in non_tensor_batch:
             raw_response_ids = non_tensor_batch["raw_response_ids"]
+            raw_response_ids = np.fromiter(raw_response_ids.tolist(), dtype=object)
         else:
             raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
+
+        if isinstance(raw_response_ids, np.ndarray):
+            raw_response_ids = raw_response_ids.tolist()
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
@@ -544,15 +552,17 @@ class PSRL_vLLMRollout:
 
         # Consolidate batch results
         if "raw_response_ids" in non_tensor_batch:
-            raw_response_ids = non_tensor_batch["raw_response_ids"]
+            raw_response_ids = non_tensor_batch.pop("raw_response_ids")
+            raw_response_ids = np.fromiter(raw_response_ids.tolist(), dtype=object)
         else:
             raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
 
-        raw_response_ids += np.fromiter(response_ids_list, dtype=object)
+        raw_response_ids = raw_response_ids + np.fromiter(response_ids_list, dtype=object)
         non_tensor_batch["raw_response_ids"] = raw_response_ids
 
         if "response_unpadded_len" in non_tensor_batch:
-            curr_response_unpadded_len = non_tensor_batch["response_unpadded_len"]
+            curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
+            curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
         else:
             curr_response_unpadded_len = [0] * batch_size
         response_unpadded_len = [curr_response_unpadded_len[i] + response_len_list[i] for i in range(batch_size)]

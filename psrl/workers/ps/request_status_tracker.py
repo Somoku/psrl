@@ -146,7 +146,6 @@ class RequestStatusTracker:
                 if model_version[i] != -1:
                     self._request_infos[req_id].model_version = model_version[i]
                 request_version = self._request_infos[req_id].model_version
-                # TODO: check it
                 if not is_validate and request_version != -1 and request_version < self._running_min_version:
                     psrl_logger.warning(
                         "Request %d is stale (version %d < %d), cannot update status",

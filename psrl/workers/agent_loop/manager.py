@@ -423,11 +423,12 @@ class PSRL_AgentLoopManager:
                 self.curr_ps_version_tag = max_version_tag
                 psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
 
-            if self.config.psrl.routing_strategy.enable_dynamic_version_tag:
-                dynamic_version_tags = [-1 for _ in range(batch_size)]
-                data.non_tensor_batch["version_tag"] = np.array(dynamic_version_tags)
-            else:
-                data.non_tensor_batch["version_tag"] = np.array(static_version_tags)
+            if "version_tag" not in data.non_tensor_batch:
+                if self.config.psrl.routing_strategy.enable_dynamic_version_tag:
+                    dynamic_version_tags = [-1 for _ in range(batch_size)]
+                    data.non_tensor_batch["version_tag"] = np.array(dynamic_version_tags)
+                else:
+                    data.non_tensor_batch["version_tag"] = np.array(static_version_tags)
             # psrl_logger.debug(
             #     f"Dispatching data to agent loop workers, total {len(data)} requests "
             #     f"with version tag {data.non_tensor_batch['version_tag']}"
@@ -457,7 +458,8 @@ class PSRL_AgentLoopManager:
             assert is_validate, "Validation data must have validate=True in meta_info"
 
             batch_size = len(data)
-            data.non_tensor_batch["version_tag"] = np.array([self.curr_ps_version_tag] * batch_size)
+            if "version_tag" not in data.non_tensor_batch:
+                data.non_tensor_batch["version_tag"] = np.array([self.curr_ps_version_tag] * batch_size)
 
             # psrl_logger.debug(
             #     f"Dispatching val data to agent loop workers, total {len(data)} requests "

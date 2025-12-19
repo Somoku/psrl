@@ -160,13 +160,10 @@ multi_turn:
   enable: False
 
   # null for no limit (default max_length // 3)
-  max_assistant_turns: null
+  max_turns: null
 
   # null for no tool
   tool_config_path: null
-
-  # null for no limit (default max_length // 3)
-  max_user_turns: null
 
   # max parallel call for tools in single turn
   max_parallel_calls: 1
@@ -176,9 +173,6 @@ multi_turn:
 
   # truncate side of tool response: left, middle, right
   tool_response_truncate_side: middle
-
-  # null for no interaction
-  interaction_config_path: null
 
   # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
   # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
@@ -197,9 +191,6 @@ multi_turn:
 
   # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
   format: hermes
-
-  # Number of repeat rollouts for each interaction
-  num_repeat_rollouts: null
 
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
@@ -237,6 +228,34 @@ agent:
 
     # Class name of the custom async server class (e.g. AsyncvLLMServer)
     name: null
+  
+  # Max time (in seconds) allowed for each agent trajectory before timing out.
+  # If set to null, there is no timeout enforced.
+  trajectory_timeout: null
+  
+  # Environment configuration for the agent loop.
+  env:
+    
+    # Environment class name
+    name: null
+
+    # Timeout (in seconds) for each step in the environment.
+    step_timeout: null
+
+  # Maximum number of retries for each trajectory in case of failures.
+  retry_limit: 1
+
+  # Whether raise error in agent loop
+  raise_on_error: True
+
+  # Discount factor for Monte Carlo return calculation in reward.
+  gamma: 0.0 # no discounting
+  
+  # Coefficient for reward bonus shaping.
+  reward_bonus_coeff: 0.0 # no reward shaping
+
+  # Trajectory reward calculation mode: step or traj
+  traj_reward_mode: traj
 
 # Specifies the tensor bucket size (in megabytes) for batch weight updates during rollout operations.
 # This parameter controls the maximum payload size for a single weight update request.

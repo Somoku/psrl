@@ -7,8 +7,7 @@ from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
 
-from psrl.workers.agent_loop.loops.utils import DummyConfig
-from psrl.workers.reward.reward_manager import RewardManager
+from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
 
 
 class AgentLoopBase(ABC):
@@ -18,7 +17,7 @@ class AgentLoopBase(ABC):
         self,
         trainer_config: DummyConfig,
         rollout_router: ray.actor.ActorHandle,
-        reward_manager: RewardManager,
+        reward_manager: ray.actor.ActorHandle,
         ps_manager_handle: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
         **kwargs,
@@ -33,7 +32,7 @@ class AgentLoopBase(ABC):
             tokenizer (AutoTokenizer): Tokenizer for processing text messages.
             **kwargs: Additional keyword arguments.
         """
-        self.init_class(trainer_config.config, tokenizer, **kwargs)
+        self.init_class(trainer_config.config, **kwargs)
         self.config = trainer_config.config
         self.rollout_router = rollout_router
         self.reward_manager = reward_manager
@@ -42,19 +41,21 @@ class AgentLoopBase(ABC):
         self.loop = asyncio.get_running_loop()
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
+    def init_class(cls, config: DictConfig, **kwargs):
         """Perform heavy initialization work shared across all instances.
 
         This method is called only once per class to avoid redundant initialization.
 
         Args:
             config (DictConfig): Configuration object containing training settings.
-            tokenizer (AutoTokenizer): Tokenizer for processing text messages.
             **kwargs: Additional keyword arguments from configuration.
         """
         if cls._class_initialized:
             return
         cls._class_initialized = True
+
+        cls.prompt_length = config.gen_actor_rollout_ref.rollout.prompt_length
+        cls.response_length = config.gen_actor_rollout_ref.rollout.response_length
 
     def _post_process_and_merge_reward(self, reward_result: dict[int, dict], outputs: DataProto) -> DataProto:
         """Merge the computed reward results back into the output DataProto.
@@ -105,3 +106,43 @@ class AgentLoopBase(ABC):
             NotImplementedError: Must be implemented by subclasses.
         """
         raise NotImplementedError
+
+    async def run_with_termination_handling(
+        self, request: DataProto, raise_on_error: bool = True
+    ) -> tuple[DataProto | None, TerminateReason]:
+        """Run the agent loop with termination event handling.
+
+        This method wraps the run method to catch termination events and handle them appropriately.
+        It enables timeouts and error handling based on the provided configuration.
+
+        Args:
+            request (DataProto): Input request to process.
+            raise_on_error (bool): Whether to raise exceptions on errors.
+
+        Returns:
+            DataProto: Processed response data.
+        """
+        try:
+            coro = self.run(request)
+            output, terminate_reason = await asyncio.wait_for(
+                coro, timeout=self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
+            )
+            if output is not None and isinstance(output, DataProto):
+                return output, terminate_reason
+            elif not raise_on_error:
+                return None, TerminateReason.UNKNOWN
+            else:
+                raise RuntimeError("Agent loop run did not return a valid DataProto output.")
+        except asyncio.TimeoutError:
+            return None, TerminateReason.TIMEOUT
+        except Exception as e:
+            if not raise_on_error:
+                import logging
+
+                psrl_logger = logging.getLogger(__file__)
+                psrl_logger.error(
+                    f"Exception in agent_loop.run for request {request.non_tensor_batch.get('uid', 'N/A')}",
+                    exc_info=True,
+                )
+                return None, TerminateReason.ERROR
+            raise e

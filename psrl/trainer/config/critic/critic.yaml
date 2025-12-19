@@ -12,6 +12,24 @@ strategy: ???
 # set it to True manually if you always want to enable critic worker
 enable: null
 
+# optimizer configs
+optim:
+
+  # Learning rate
+  lr: 1e-5
+
+  # Warmup steps ratio; total steps will be injected at runtime
+  lr_warmup_steps_ratio: 0.0
+
+  # Total training steps (must be overridden at runtime)
+  total_training_steps: -1
+
+  # Weight decay
+  weight_decay: 0.01
+
+  # Prioritized. None, 0 or Negative values mean delegating to lr_warmup_steps_ratio.
+  lr_warmup_steps: -1
+
 # model config for the critic
 model:
 

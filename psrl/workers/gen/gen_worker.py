@@ -36,6 +36,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.nixl import NIXLInterface
+from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
@@ -1090,6 +1091,7 @@ class PSRL_GenWorker(Worker):
                 f"This should not happen."
             )
 
+    @rollout_trace_op
     async def generate_async(self, request: DataProto, consolidate: bool = True):
         """
         Generate sequences asynchronously.

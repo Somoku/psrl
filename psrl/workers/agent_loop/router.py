@@ -10,6 +10,7 @@ from verl import DataProto
 
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
+from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.request_queue import (
     MultiPriorityRequestQueue,
     PriorityRequestQueue,
@@ -31,6 +32,7 @@ class RolloutRouter:
         self,
         config: DictConfig,
         ps_manager_handle,
+        tokenizer,
         rollout_wg_list,
     ):
         """Initialize the rollout router.
@@ -62,6 +64,7 @@ class RolloutRouter:
             )
         self.val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
         self.ps_manager_handle = ps_manager_handle
+        self.tokenizer = tokenizer
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
         assert self.rollout_wg_size == self.config.psrl.deployment.n_rollout_instances, (
@@ -453,11 +456,12 @@ class RolloutRouter:
 
         # Consolidate batch results
         if "raw_response_ids" in non_tensor_batch:
-            raw_response_ids = non_tensor_batch["raw_response_ids"]
+            raw_response_ids = non_tensor_batch.pop("raw_response_ids")
+            raw_response_ids = np.fromiter(raw_response_ids.tolist(), dtype=object)
         else:
             raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
 
-        raw_response_ids += np.fromiter(response_ids_list, dtype=object)
+        raw_response_ids = raw_response_ids + np.fromiter(response_ids_list, dtype=object)
         non_tensor_batch["raw_response_ids"] = raw_response_ids
 
         if "response_unpadded_len" in non_tensor_batch:
@@ -471,10 +475,11 @@ class RolloutRouter:
         # Update rollout_log_probs
         if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
-                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+                curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
+                curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
             else:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-            curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
+            curr_rollout_log_probs = curr_rollout_log_probs + np.fromiter(all_log_prob_list, dtype=object)
             non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
 
         batch = TensorDict(
@@ -622,6 +627,7 @@ class RolloutRouter:
 
         return None
 
+    @rollout_trace_op
     async def generate_async(
         self,
         request: DataProto,
@@ -635,9 +641,6 @@ class RolloutRouter:
             DataProto or None: Generated result or None if request is invalid.
         """
         assert len(request) == 1, "RolloutRouter only supports single request generation."
-        assert "rollout_instance_id" not in request.non_tensor_batch, (
-            "Rollout instance ID should not be provided in the original request"
-        )
         if self.scheduler_task is None:
             if self.config.psrl.routing_strategy.enable_multi_priority_queue:
                 task_coro = self._multi_priority_queue_routing_loop()
@@ -676,15 +679,18 @@ class RolloutRouter:
                 if "version_tag" in request.non_tensor_batch
                 else request.non_tensor_batch["min_version_limit"][0] - self.staleness
             )
-            entry_ids, _ = await self.ps_manager_handle.reserve_rollout_instance_requests.remote(
-                rollout_instance_ids=-1,
-                request_ids=request_id,
-                model_versions=model_version,
-                guarantee_not_aborted=False,
-                is_validate=request.meta_info.get("validate", False),
-            )
-            if entry_ids[0] is None:
-                return None
+            # In multi-turn rollout, the rollout_instance_id may already be assigned
+            not_routed_before = "rollout_instance_id" not in request.non_tensor_batch
+            if not_routed_before:
+                entry_ids, _ = await self.ps_manager_handle.reserve_rollout_instance_requests.remote(
+                    rollout_instance_ids=-1,
+                    request_ids=request_id,
+                    model_versions=model_version,
+                    guarantee_not_aborted=False,
+                    is_validate=request.meta_info.get("validate", False),
+                )
+                if entry_ids[0] is None:
+                    return None
 
         # Create a future to track this request's completion
         result_future = asyncio.Future()

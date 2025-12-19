@@ -11,7 +11,10 @@ def log_data_protocol(
     log_prefix: str,
     level: int = logging.INFO,
 ):
-    input_tensor_types = {k: f"torch.Tensor with dtype {v.dtype} and shape {v.shape}" for k, v in inputs.batch.items()}
+    input_tensor_types = {}
+    if inputs.batch is not None:
+        for k, v in inputs.batch.items():
+            input_tensor_types[k] = f"torch.Tensor with dtype {v.dtype} and shape {v.shape}"
     input_non_tensor_types = {}
     for k, v in inputs.non_tensor_batch.items():
         if isinstance(v, torch.Tensor):

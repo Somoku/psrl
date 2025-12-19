@@ -559,6 +559,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.rollout_router = RolloutRouter.remote(
             self.config,
             self.ps_manager_handle,
+            self.tokenizer,
             self.rollout_wg_list,
         )
 

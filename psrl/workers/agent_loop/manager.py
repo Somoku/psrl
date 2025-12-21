@@ -5,6 +5,7 @@ from collections import Counter
 
 import numpy as np
 import ray
+import requests
 import torch
 from omegaconf import DictConfig
 from tensordict import TensorDict
@@ -14,6 +15,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.torch_functional import pad_2d_list_to_length
 
+from psrl.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import (
     DualOutputHandler,
@@ -37,6 +39,7 @@ class PSRL_AgentLoopManager:
         data_queue_size: int,
         agent_loop_workers,
         ps_manager_handle,
+        rollout_gateway_url,
         group_post_process_fn=None,
         buffer_post_process_fn=None,
     ):
@@ -136,6 +139,19 @@ class PSRL_AgentLoopManager:
         self.rollout_request_tracker: dict[
             str | int, list[EntryInfo]
         ] = {}  # Maps parent request ids to "occupied" child entries
+
+        # Get server addresses from rollout gateway
+        response = requests.get(f"{rollout_gateway_url}/list_workers")
+        response.raise_for_status()
+        engines = response.json().get("engines", {})
+        server_addresses = [addr for addr in engines.values()]
+        rollout_config = self.config.gen_actor_rollout_ref.rollout
+
+        # Update Prometheus configuration with server addresses
+        if rollout_config.prometheus.enable:
+            if rollout_config.disable_log_stats:
+                raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+            update_prometheus_config(rollout_config.prometheus, server_addresses)
 
         # Build logger
         self.log_prefix = "AgentLoopManager"

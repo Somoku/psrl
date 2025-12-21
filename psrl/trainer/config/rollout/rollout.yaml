@@ -131,7 +131,7 @@ engine_kwargs:
 # Sampling parameters used during validation.
 val_kwargs:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.SamplingConfig
 
   # sampling parameters for validation
@@ -153,7 +153,7 @@ val_kwargs:
 # Multi-turn interaction config for tools or chat.
 multi_turn:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.MultiTurnConfig
 
   # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
@@ -199,7 +199,7 @@ calculate_log_probs: False
 # [Experimental] agent loop based rollout configs
 agent:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.AgentLoopConfig
 
   # Number of agent loop workers
@@ -220,7 +220,7 @@ agent:
   # custom async server configs
   custom_async_server:
 
-    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: psrl.workers.config.CustomAsyncServerConfig
 
     # Path to the custom async server implementation
@@ -274,7 +274,7 @@ update_weights_bucket_megabytes: 512
 # trace rollout data
 trace:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.TraceConfig
 
   # trace backend, support mlflow, weave
@@ -299,8 +299,8 @@ skip_tokenizer_init: False
 # profile the rollout model in `generate_sequence` 
 profiler:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: verl.utils.profiler.ProfilerConfig
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: psrl.utils.profiler.ProfilerConfig
 
   # profiler tool, default same as profiler.tool in global config
   # choices: nsys, npu, torch
@@ -320,3 +320,21 @@ profiler:
 
   # specific tool config
   tool_config: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config,null}
+
+# prometheus configuration for vllm server mode
+prometheus:
+
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: psrl.workers.config.PrometheusConfig
+
+  # whether enable prometheus on server mode rollout
+  enable: false
+
+  # Port number that Prometheus listens on, default is 9090
+  port: 9090
+
+  # Path to Prometheus configuration file
+  file: /tmp/ray/session_latest/metrics/prometheus/prometheus.yml
+
+  # Specify served_model_name to avoid displaying overly long model paths in Grafana
+  served_model_name: ${oc.select:train_actor_rollout_ref.model.path,null}

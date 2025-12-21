@@ -52,6 +52,7 @@ class RolloutGateway:
         self.app.add_api_route("/health", self.health_check, methods=["GET"])
         self.app.add_api_route("/add_worker", self.add_worker, methods=["POST"])
         self.app.add_api_route("/remove_worker", self.remove_worker, methods=["POST"])
+        self.app.add_api_route("/list_workers", self.list_workers, methods=["GET"])
         self.app.add_api_route("/generate", self.generate, methods=["POST"])
         self.app.add_api_route("/generate_async", self.generate_async, methods=["POST"])
 
@@ -133,6 +134,12 @@ class RolloutGateway:
                     removed = [iid]
 
         return {"ok": True, "removed": removed}
+
+    async def list_workers(self, request: Request):
+        """List all registered rollout engine addresses."""
+        async with self.engine_lock:
+            engines = {k: v for k, v in self.engine_urls.items()}
+        return {"ok": True, "engines": engines}
 
     async def generate(self, body: GeneratePayload):
         request = loads(body.dataproto_b64)

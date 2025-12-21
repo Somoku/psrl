@@ -140,6 +140,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # Rollout gateway handle
         self.rollout_gateway = None
+        self.gateway_base_url = None
 
         # Parameter server handle for other workers to access
         self.ps_manager_handle = None
@@ -582,13 +583,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ray.get(self.rollout_gateway.start.remote())
 
         bind = ray.get(self.rollout_gateway.get_bind.remote())
-        gateway_base_url = f"http://{bind['host']}:{bind['port']}"
-        psrl_logger.info(f"Rollout Gateway started at {gateway_base_url}")
+        self.gateway_base_url = f"http://{bind['host']}:{bind['port']}"
+        psrl_logger.info(f"Rollout Gateway started at {self.gateway_base_url}")
 
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             # Configure the rollout instance's representative rank GenWorker to
             # self-start an in-process HTTP server and register to gateway.
-            self.rollout_wg_list[i].execute_rank_zero_async("set_rollout_gateway_base_url", gateway_base_url)
+            self.rollout_wg_list[i].execute_rank_zero_async("set_rollout_gateway_base_url", self.gateway_base_url)
 
     def stop_rollout_gateway(self):
         """Stop Rollout Gateway actor if it's running."""

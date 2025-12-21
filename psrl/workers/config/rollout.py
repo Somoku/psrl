@@ -11,6 +11,7 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
+    "PrometheusConfig",
     "RolloutConfig",
 ]
 
@@ -83,6 +84,22 @@ class ServerConfig(BaseConfig):
     retry_delay: float = 2.0
     max_connections: int = 1000
     max_start_wait_time: float = 300.0
+
+
+@dataclass
+class PrometheusConfig(BaseConfig):
+    """
+    Configuration for Prometheus server
+    """
+
+    # whether enable prometheus on server mode rollout
+    enable: bool = False
+    # Port number that Prometheus listens on, default is 9090
+    port: int = 9090
+    # Path to Prometheus configuration file
+    file: str = "/tmp/ray/session_latest/metrics/prometheus/prometheus.yml"
+    # Specify served_model_name to avoid displaying overly long model paths in Grafana
+    served_model_name: str | None = None
 
 
 @dataclass

@@ -1,13 +1,16 @@
 import asyncio
+import json
 import logging
 import os
 import uuid
 from collections.abc import Sequence
 from contextlib import contextmanager
+from pprint import pprint
 from typing import Any, cast
 
 import numpy as np
 import torch
+import vllm
 from omegaconf import DictConfig, ListConfig
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
@@ -19,6 +22,8 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
+from vllm.usage.usage_lib import UsageContext
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine.async_llm import AsyncLLM
 
 try:
@@ -62,6 +67,9 @@ class PSRL_vLLMRollout:
         self.psrl_config = psrl_config
         self.config = config
         self.stat_collector = None
+
+        # Cached vLLM server initialization artifacts for HTTP serving.
+        self._server_args = None
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
@@ -214,17 +222,18 @@ class PSRL_vLLMRollout:
             **engine_kwargs,
         )
 
-        """
-        if psrl_config.ps_mode == "nixl_cpu" or psrl_config.ps_mode == "nixl_gpu":
-            llm_kwargs["worker_cls"] = "psrl.workers.gen.vllm_extension.NIXLWorker"
-            assert kwargs.get("nixl_interface") is not None, "nixl_interface must be provided when using NIXL"
-            assert kwargs.get("instance_id") is not None, "instance_id must be provided when using NIXL"
-            llm_kwargs["additional_config"] = {
-                "nixl_config": psrl_config.nixl,
-                "nixl_interface": kwargs.get("nixl_interface"),
-                "instance_id": kwargs.get("instance_id"),
-            }
-        """
+        if self.config.prometheus.enable:
+            assert self.psrl_config.server_rollout.enable, (
+                "Prometheus monitoring requires server rollout to be enabled."
+            )
+
+            if self.config.prometheus.served_model_name:
+                # Extract model name from path if it's a full path
+                served_model_name = self.config.prometheus.served_model_name
+                if "/" in served_model_name:
+                    # If it's a full path, extract the last part as model name
+                    served_model_name = served_model_name.split("/")[-1]
+                llm_kwargs["served_model_name"] = served_model_name
 
         llm_kwargs["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
         max_num_waiting_reqs_after_preemption = psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption
@@ -241,21 +250,42 @@ class PSRL_vLLMRollout:
         self._scheduler_abort_processor_task = None
 
         if config.mode == "psrl_async":
-            engine_args = AsyncEngineArgs(**llm_kwargs)
+            if self.psrl_config.server_rollout.enable:
+                # Build and cache OpenAI server args at engine init time.
+                # GenWorker will reuse these to start an in-process OpenAI-compatible server
+                # without re-parsing or drifting defaults.
+                server_args = self._build_server_args(model_path=model_path, args=llm_kwargs)
+                self._server_args = server_args
+
+                engine_args = AsyncEngineArgs.from_cli_args(server_args)
+                usage_context = UsageContext.OPENAI_API_SERVER
+                vllm_config = engine_args.create_engine_config(usage_context=usage_context)
+            else:
+                engine_args = AsyncEngineArgs(**llm_kwargs)
+                usage_context = UsageContext.ENGINE_CONTEXT
+                vllm_config = engine_args.create_engine_config()
+
             stat_loggers = None
             if not config.disable_log_stats and psrl_config.status_collection.enable:
                 psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
                 # Use custom stat loggers to collect engine stats
-                vllm_config = engine_args.create_engine_config()
                 status_queue = kwargs["status_queue"]
-                self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
+                self.stat_collector = StatCollector(
+                    vllm_config,
+                    psrl_config,
+                    instance_id=kwargs.get("instance_id", 0),
+                )
                 self.stat_collector.begin_record()
                 self.stat_collector.init_output_queue(status_queue)
                 self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_queue)
                 self.stat_collector.record_model_version_update(0)
                 stat_loggers = [self.stat_collector]
             psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
-            self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)
+            self.inference_engine = AsyncLLM.from_vllm_config(
+                vllm_config=vllm_config,
+                usage_context=usage_context,
+                stat_loggers=stat_loggers,
+            )
         else:
             psrl_logger.info(f"Initialize LLM for rollout instance {kwargs.get('instance_id', 0)}")
             self.inference_engine = LLM(**llm_kwargs)
@@ -300,6 +330,43 @@ class PSRL_vLLMRollout:
             self._scheduler_abort_processor_task.add_done_callback(
                 lambda f: f.result()
             )  # To avoid silent error in async tasks
+
+    def _build_server_args(self, model_path: str, args: dict[str, Any]):
+        """Build a CLI-like args Namespace compatible with vLLM OpenAI server.
+
+        Args:
+            model_path: Path to the model to load
+            args: Dictionary of vLLM engine arguments
+        """
+        server_args = ["serve", model_path]
+        for k, v in args.items():
+            if isinstance(v, bool):
+                if v:
+                    server_args.append(f"--{k}")
+            elif v is not None:
+                server_args.append(f"--{k}")
+                # Use json.dumps for dict to ensure valid JSON format
+                server_args.append(json.dumps(v) if isinstance(v, dict) else str(v))
+
+        pprint(server_args)
+
+        parser = FlexibleArgumentParser(description="vLLM CLI")
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
+        cmds = {}
+        for cmd in vllm.entrypoints.cli.serve.cmd_init():
+            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+            cmds[cmd.name] = cmd
+
+        args = parser.parse_args(args=server_args)
+        args.model = getattr(args, "model_tag", model_path)
+        if getattr(args, "subparser", None) in cmds:
+            cmds[args.subparser].validate(args)
+        return args
+
+    @property
+    def server_args(self):
+        """Get the cached vLLM OpenAI server args."""
+        return self._server_args
 
     async def _scheduler_abort_processor_loop(self):
         """Background loop that processes abort requests from the queue."""

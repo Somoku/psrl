@@ -39,6 +39,7 @@ from verl.utils.seqlen_balancing import (
 )
 from verl.utils.tracking import ValidationGenerationsLogger
 
+from psrl.psrl.workers.gen.rollout_gateway import RolloutGateway
 from psrl.trainer.ppo.utils import (
     PSRL_compute_advantage,
     PSRL_ResourcePoolManager,
@@ -136,6 +137,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.agent_loop_manager = None
         self.rollout_coordinator = None
         self.reward_manager = None
+
+        # Rollout gateway handle
+        self.rollout_gateway = None
 
         # Parameter server handle for other workers to access
         self.ps_manager_handle = None
@@ -562,6 +566,35 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.tokenizer,
             self.rollout_wg_list,
         )
+
+    def start_rollout_gateway(self):
+        """Start Rollout Gateway as a Ray actor (no Ray Serve)."""
+        if self.config.psrl.server_rollout.enable or self.rollout_gateway is not None:
+            return
+
+        assert self.rollout_router is not None, "Rollout router must be initialized before starting gateway."
+
+        self.rollout_gateway = RolloutGateway.remote(
+            config=self.config,
+            rollout_router=self.rollout_router,
+        )
+
+        ray.get(self.rollout_gateway.start.remote())
+
+        bind = ray.get(self.rollout_gateway.get_bind.remote())
+        gateway_base_url = f"http://{bind['host']}:{bind['port']}"
+        psrl_logger.info(f"Rollout Gateway started at {gateway_base_url}")
+
+        for i in range(self.config.psrl.deployment.n_rollout_instances):
+            # Configure the rollout instance's representative rank GenWorker to
+            # self-start an in-process HTTP server and register to gateway.
+            self.rollout_wg_list[i].execute_rank_zero_async("set_rollout_gateway_base_url", gateway_base_url)
+
+    def stop_rollout_gateway(self):
+        """Stop Rollout Gateway actor if it's running."""
+        if self.rollout_gateway is None:
+            return
+        ray.get(self.rollout_gateway.stop.remote())
 
     def init_rollout_coordinator(self):
         assert self.rollout_router is not None, (
@@ -1255,6 +1288,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             raise ValueError(f"Invalid PS mode: {self.config.psrl.ps_mode}")
 
+        # Start rollout gateway to build rollout service
+        self.start_rollout_gateway()
+
         psrl_logger.info("Initializing models in all rollout instances")
         # start rollout coordinator
         self.init_rollout_coordinator()
@@ -1549,17 +1585,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         futures = []
         futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
         futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
-        for i in range(self.config.psrl.deployment.n_rollout_instances):
-            if self.rank_0_is_model_owner:
-                futures.append(
-                    self.rollout_wg_list[i].execute_rank_zero_async(
-                        "set_rollout_coordinator", self.rollout_coordinator
-                    )
-                )
-            else:
-                futures.extend(
-                    self.rollout_wg_list[i].execute_all_async("set_rollout_coordinator", self.rollout_coordinator)
-                )
         for agent_loop_worker in self.agent_loop_workers:
             futures.append(agent_loop_worker.set_agent_loop_manager.remote(self.agent_loop_manager))
         ray.get(futures)
@@ -2038,5 +2063,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.stop_agent_loop_manager()
         self.stop_rollout_coordinator()
         self.stop_data_processor()
+        self.stop_rollout_gateway()
 
         psrl_logger.info("Training completed successfully!")

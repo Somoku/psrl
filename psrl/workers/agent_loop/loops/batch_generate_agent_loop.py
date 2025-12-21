@@ -4,6 +4,7 @@ import os
 import numpy as np
 from verl import DataProto
 
+from psrl.workers.agent_loop.gateway_client import RolloutGatewayClient
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
 
@@ -25,7 +26,11 @@ class BatchGenerateAgentLoop(AgentLoopBase):
             Tuple[DataProto, TerminateReason]:
                 Generated responses with metadata and termination reason.
         """
-        output = await self.rollout_router.generate.remote(request)
+        if self.config.psrl.server_rollout.enable:
+            gateway_client = RolloutGatewayClient.from_config(self.config)
+            output = await gateway_client.generate(request)
+        else:
+            output = await self.rollout_router.generate.remote(request)
         assert "eos_token_id" in output.meta_info, "eos_token_id is not in the meta_info"
         if output is not None:
             batch_size = len(output)

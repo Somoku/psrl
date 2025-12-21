@@ -14,6 +14,7 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 
+from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
@@ -79,6 +80,13 @@ class PSRL_AgentLoopWorker:
             trace_config.get("backend"),
             trace_config.get("token2text", False),
         )
+
+        if self.config.psrl.server_rollout.enable:
+            # Initialize HTTP client
+            init_http_client(
+                server_concurrency=self.config.psrl.server_rollout.server_concurrency,
+                rollout_engine_num=len(self.rollout_wg_list),
+            )
 
         # Build logger
         # TODO(lhy): support >1 workers

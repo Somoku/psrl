@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import ray
+import requests
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -25,6 +26,8 @@ from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
 from verl.utils.model import get_generation_config, update_model_config
 
+from psrl.psrl.workers.gen.engine_http_server import EngineHttpServer
+from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -224,9 +227,13 @@ class PSRL_GenWorker(Worker):
             psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
-    def set_rollout_coordinator(self, rollout_coordinator):
-        """Set the rollout coordinator for this GenWorker."""
-        self.coordinator_handle = rollout_coordinator
+        # [Optional] expose this rollout engine via HTTP (OpenAI-compatible) and
+        # register it to RolloutGateway for catch-all proxying.
+        self._engine_http_server: EngineHttpServer | None = None
+        self._engine_http_bind: dict[str, Any] | None = None
+
+        # Populated by trainer (or other coordinator) after gateway starts.
+        self._gateway_base_url: str | None = None
 
     async def _collective_rpc(self, method_name: str, args: tuple = ()):
         """Call a method via collective RPC."""
@@ -419,7 +426,7 @@ class PSRL_GenWorker(Worker):
             )
             return obj_list[0]
 
-    def _build_rollout(self, trust_remote_code=False):
+    async def _build_rollout(self, trust_remote_code=False):
         """
         Build the rollout engine and sharding manager for the PSRL GenWorker.
         NOTE: This method only supports building for one rollout instance at a time.
@@ -488,13 +495,74 @@ class PSRL_GenWorker(Worker):
             nixl_interface=self.nixl_interface,
         )
 
+        # Don't keep the dummy data in memory
+        await rollout.inference_engine.reset_mm_cache()
+
         return rollout
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def init_model(self):
+    async def init_model(self):
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
-            self.rollout = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            self.rollout = await self._build_rollout(
+                trust_remote_code=self.config.model.get("trust_remote_code", False)
+            )
         self._is_init_model.set()
+
+        # Representative rank can start HTTP server after model built.
+        # For other ranks, the server is not needed.
+        if self.psrl_config.server_rollout.enable and self.is_instance_representative_rank:
+            await self._maybe_start_engine_http_server()
+
+    async def _maybe_start_engine_http_server(self) -> None:
+        """Start in-process HTTP server and register it to gateway."""
+
+        if self._engine_http_server is not None:
+            return
+
+        # If gateway isn't configured, do nothing.
+        if not self._gateway_base_url:
+            psrl_logger.warning(
+                "Rollout gateway base URL not set; skipping engine HTTP server startup and registration."
+            )
+            return
+
+        await self._is_init_model.wait()
+        # Only support vLLM async rollout engine currently.
+        engine = self.rollout.inference_engine
+
+        # Reuse the rollout-cached OpenAI server args/config.
+        args = self.rollout.server_args
+        if args is None:
+            raise RuntimeError("OpenAI server args not initialized on rollout")
+
+        host = ray.util.get_node_ip_address().strip("[]")
+        port = int(find_available_port(20000 + 17 * int(self.get_instance_id())))
+
+        self._engine_http_server = EngineHttpServer(host, port, args, engine)
+        bind = await self._engine_http_server.start()
+        self._engine_http_bind = {"host": bind.host, "port": bind.port, "base_url": bind.base_url}
+
+        # Register to gateway.
+        response = requests.post(
+            f"{self._gateway_base_url}/add_worker",
+            json={
+                "instance_id": int(self.get_instance_id()),
+                "worker_url": bind.base_url,
+            },
+        )
+        response.raise_for_status()
+
+        psrl_logger.info(
+            "Registered rollout engine HTTP endpoint instance_id=%s worker_url=%s to gateway=%s",
+            int(self.get_instance_id()),
+            bind.base_url,
+            self._gateway_base_url,
+        )
+
+    def set_rollout_gateway_base_url(self, base_url: str | None):
+        """Called by trainer to enable worker self-registration to the gateway."""
+
+        self._gateway_base_url = base_url.rstrip("/") if base_url else None
 
     def get_active_task_num(self) -> int:
         """
@@ -610,8 +678,7 @@ class PSRL_GenWorker(Worker):
                     args=(params_to_load,),
                 )
                 if loaded_params is None:
-                    psrl_logger.error(f"Worker failed to update weights. Result: {loaded_params}")
-                    raise
+                    raise RuntimeError(f"Worker failed to update weights. Result: {loaded_params}")
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 

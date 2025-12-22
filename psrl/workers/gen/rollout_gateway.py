@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import logging
@@ -5,13 +6,12 @@ import os
 from typing import Any
 
 import httpx
-import ray
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from psrl.serve.codec import dumps, loads
+from psrl.utils.common.utils import b64_dumps, b64_loads
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -21,13 +21,13 @@ class GeneratePayload(BaseModel):
     dataproto_b64: str = Field(..., description="Pickle+base64 encoded DataProto")
 
 
-@ray.remote
 class RolloutGateway:
-    def __init__(self, config, rollout_router):
+    def __init__(self, host, port, concurrency: int, n_rollout_instances: int, rollout_router):
         self.rollout_router = rollout_router
-        self.config = config
-        self.host = self.config.psrl.server_rollout.gateway.get("router_ip", "127.0.0.1")
-        self.port = int(self.config.psrl.server_rollout.gateway.get("router_port", 8000))
+        self.host = host
+        self.port = port
+        self.concurrency = concurrency
+        self.n_rollout_instances = n_rollout_instances
 
         self.engine_urls: dict[int, str] = {}
         self.engine_lock = asyncio.Lock()
@@ -52,7 +52,6 @@ class RolloutGateway:
         self.app.add_api_route("/health", self.health_check, methods=["GET"])
         self.app.add_api_route("/add_worker", self.add_worker, methods=["POST"])
         self.app.add_api_route("/remove_worker", self.remove_worker, methods=["POST"])
-        self.app.add_api_route("/list_workers", self.list_workers, methods=["GET"])
         self.app.add_api_route("/generate", self.generate, methods=["POST"])
         self.app.add_api_route("/generate_async", self.generate_async, methods=["POST"])
 
@@ -62,6 +61,11 @@ class RolloutGateway:
             self.catch_all_proxy,
             methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         )
+
+    def run_router(self):
+        self.app = FastAPI()
+        self.setup_routes()
+        uvicorn.run(self.app, host=self.host, port=self.port, log_level="info")
 
     async def start(self):
         """Initialize and start the RolloutGateway HTTP server."""
@@ -135,14 +139,8 @@ class RolloutGateway:
 
         return {"ok": True, "removed": removed}
 
-    async def list_workers(self, request: Request):
-        """List all registered rollout engine addresses."""
-        async with self.engine_lock:
-            engines = {k: v for k, v in self.engine_urls.items()}
-        return {"ok": True, "engines": engines}
-
     async def generate(self, body: GeneratePayload):
-        request = loads(body.dataproto_b64)
+        request = b64_loads(body.dataproto_b64)
         try:
             out_ref = self.rollout_router.generate.remote(request)
             output = await out_ref
@@ -151,10 +149,10 @@ class RolloutGateway:
             raise HTTPException(status_code=500, detail=str(e)) from e
         if output is None:
             return {"result": None}
-        return {"result": dumps(output)}
+        return {"result": b64_dumps(output)}
 
     async def generate_async(self, body: GeneratePayload):
-        request = loads(body.dataproto_b64)
+        request = b64_loads(body.dataproto_b64)
         try:
             out_ref = self.rollout_router.generate_async.remote(request)
             output = await out_ref
@@ -163,7 +161,7 @@ class RolloutGateway:
             raise HTTPException(status_code=500, detail=str(e)) from e
         if output is None:
             return {"result": None}
-        return {"result": dumps(output)}
+        return {"result": b64_dumps(output)}
 
     async def _proxy_request_to_engine(self, request: Request, path: str):
         """Proxy an incoming HTTP request to the registered rollout engine server.
@@ -175,9 +173,7 @@ class RolloutGateway:
         # Lazily init a shared proxy client. This client is only used
         # by the catch-all proxy route.
         if self._proxy_client is None:
-            concurrency = int(self.config.psrl.server_rollout.get("server_concurrency", 64))
-            n_instances = int(self.config.psrl.deployment.get("n_rollout_instances", 1))
-            max_connections = max(8, concurrency * max(1, n_instances))
+            max_connections = max(8, self.concurrency * max(1, self.n_rollout_instances))
             self._proxy_client = httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=max_connections),
                 timeout=httpx.Timeout(None),
@@ -248,3 +244,23 @@ class RolloutGateway:
             request: The original HTTP request.
         """
         return await self._proxy_request_to_engine(request=request, path=path)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", type=str, default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--concurrency", type=int, default=64)
+    parser.add_argument("--n_rollout_instances", type=int, default=1)
+
+    args = parser.parse_args()
+
+    # Run the router
+    gateway = RolloutGateway(
+        host=args.host,
+        port=args.port,
+        concurrency=args.concurrency,
+        n_rollout_instances=args.n_rollout_instances,
+        rollout_router=None,
+    )
+    gateway.run_router()

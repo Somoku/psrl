@@ -73,7 +73,7 @@ class PSRL_AgentLoopManager:
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
-        self.val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
+        self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
 
         if self.config.psrl.redundant_rollout.enable:
             self.entries_per_buffer = self.config.psrl.redundant_rollout.redundant_global_batch_size
@@ -833,12 +833,12 @@ class PSRL_AgentLoopManager:
                 for model_version in sorted(list(accumulated_buffers[buffer_id].keys())):
                     prompt_entry_infos.extend(accumulated_buffers[buffer_id][model_version])
                 # Get the data buffer from the data pool
-                data_buffer = self.get_buffer_from_data_pool(prompt_entry_infos, sorted=is_validate)
+                data_buffer = self.get_buffer_from_data_pool(prompt_entry_infos, sort_by_prompt_id=is_validate)
                 # Apply buffer post-processing if exists and add to data_buffers
                 add_buffer = self.maybe_add_buffer(buffer_id, data_buffer, is_validate)
                 if add_buffer:
                     psrl_logger.info(f"Buffer {buffer_id} is READY with {len(data_buffer)} entries.")
-                    self.try_awake_waiters(buffer_id, is_validate)
+                    await self.try_awake_waiters(buffer_id, is_validate)
                     self.remove_buffer_from_data_pool(prompt_entry_infos)
                     accumulated_buffers.pop(buffer_id)
                     accumulated_buffer_size.pop(buffer_id)
@@ -1069,7 +1069,7 @@ class PSRL_AgentLoopManager:
                 self.process_ready_buffer(ready_buffer_id, is_validate)
         else:
             # Check whether there exists ready buffer for training
-            min_ready_buffer_id = min(self.data_buffers.keys(), default=None)
+            min_ready_buffer_id = min(self.train_data_buffers.keys(), default=None)
             self.log_ready_buffer(buffer_id, is_validate)
 
             psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
@@ -1296,7 +1296,7 @@ class PSRL_AgentLoopManager:
         # in the buffer can still bu utilized for training
         return buffer
 
-    def get_buffer_from_data_pool(self, entry_infos: list[EntryInfo], sorted: bool = False) -> DataProto:
+    def get_buffer_from_data_pool(self, entry_infos: list[EntryInfo], sort_by_prompt_id: bool = False) -> DataProto:
         """Retrieve data buffers from the internal data pool based on entry information.
 
         This method is used to fetch specific data buffers that have been stored
@@ -1304,14 +1304,14 @@ class PSRL_AgentLoopManager:
 
         Args:
             entry_infos (List[EntryInfo]): List of EntryInfo objects specifying which buffers to retrieve.
-            sorted (bool): Whether to sort the entry_infos by prompt_id before retrieval.
+            sort_by_prompt_id (bool): Whether to sort the entry_infos by prompt_id before retrieval.
 
         Returns:
             List[DataProto]: List of DataProto objects corresponding to the requested buffers.
         """
         data_list = []
-        if sorted:
-            entry_infos = sorted(entry_infos, key=lambda x: (x.prompt_id,))
+        if sort_by_prompt_id:
+            entry_infos = sorted(entry_infos, key=lambda x: x.prompt_id)
         for entry_info in entry_infos:
             prompt_id = entry_info.prompt_id
             request_idxs = entry_info.request_idx

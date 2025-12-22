@@ -11,6 +11,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 import vllm
+import vllm.entrypoints.cli.serve
 from omegaconf import DictConfig, ListConfig
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
@@ -195,7 +196,6 @@ class PSRL_vLLMRollout:
             distributed_executor_backend = None  # auto detect
 
         llm_kwargs = dict(
-            model=model_path,
             enable_sleep_mode=False,
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
@@ -261,6 +261,7 @@ class PSRL_vLLMRollout:
                 usage_context = UsageContext.OPENAI_API_SERVER
                 vllm_config = engine_args.create_engine_config(usage_context=usage_context)
             else:
+                llm_kwargs["model"] = model_path
                 engine_args = AsyncEngineArgs(**llm_kwargs)
                 usage_context = UsageContext.ENGINE_CONTEXT
                 vllm_config = engine_args.create_engine_config()

@@ -39,7 +39,6 @@ from verl.utils.seqlen_balancing import (
 )
 from verl.utils.tracking import ValidationGenerationsLogger
 
-from psrl.psrl.workers.gen.rollout_gateway import RolloutGateway
 from psrl.trainer.ppo.utils import (
     PSRL_compute_advantage,
     PSRL_ResourcePoolManager,
@@ -59,6 +58,7 @@ from psrl.utils.nixl import GLOBAL_PORT_SCANNER, NIXLInterface
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.gen import GenInterface, RolloutCoordinator
+from psrl.workers.gen.rollout_gateway import RolloutGateway
 from psrl.workers.ps import (
     PSClassWithInitArgs,
     PSManager,
@@ -464,7 +464,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             OmegaConf.set_struct(self.config, True)
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "psrl"):
-                    self.config.psrl.val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
+                    self.config.psrl.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         except Exception as e:
             psrl_logger.warning(f"Could not set val_rollout_n in config. Structure missing? Error: {e}")
 
@@ -570,14 +570,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def start_rollout_gateway(self):
         """Start Rollout Gateway as a Ray actor (no Ray Serve)."""
-        if self.config.psrl.server_rollout.enable or self.rollout_gateway is not None:
+        assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", (
+            "Rollout Gateway can only be started in psrl_async rollout mode."
+        )
+        if not self.config.psrl.server_rollout.enable or self.rollout_gateway is not None:
             return
 
+        ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
         assert self.rollout_router is not None, "Rollout router must be initialized before starting gateway."
 
-        self.rollout_gateway = RolloutGateway.remote(
-            config=self.config,
-            rollout_router=self.rollout_router,
+        self.rollout_gateway = (
+            ray.remote(RolloutGateway)
+            .options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ip_to_node_id[self.config.psrl.server_rollout.gateway.router_ip],
+                    soft=False,
+                )
+            )
+            .remote(
+                host=self.config.psrl.server_rollout.gateway.get("router_ip", "127.0.0.1"),
+                port=int(self.config.psrl.server_rollout.gateway.get("router_port", 8000)),
+                concurrency=int(self.config.psrl.server_rollout.get("server_concurrency", 64)),
+                n_rollout_instances=int(self.config.psrl.deployment.get("n_rollout_instances", 1)),
+                rollout_router=self.rollout_router,
+            )
         )
 
         ray.get(self.rollout_gateway.start.remote())
@@ -586,10 +602,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.gateway_base_url = f"http://{bind['host']}:{bind['port']}"
         psrl_logger.info(f"Rollout Gateway started at {self.gateway_base_url}")
 
+        futures = []
         for i in range(self.config.psrl.deployment.n_rollout_instances):
             # Configure the rollout instance's representative rank GenWorker to
             # self-start an in-process HTTP server and register to gateway.
-            self.rollout_wg_list[i].execute_rank_zero_async("set_rollout_gateway_base_url", self.gateway_base_url)
+            futures.append(
+                self.rollout_wg_list[i].execute_rank_zero_async("set_rollout_gateway_base_url", self.gateway_base_url)
+            )
+        ray.get(futures)
 
     def stop_rollout_gateway(self):
         """Stop Rollout Gateway actor if it's running."""
@@ -792,7 +812,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             futures.append(self.agent_loop_manager.set_val_buffer_size.remote(val_data_size))
             ray.get(futures)
 
-        val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
+        val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         for test_batch in test_batch_list:
             batch_size = len(test_batch.batch)
 
@@ -812,7 +832,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # TODO(verl): Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
-            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
+            sample_parent_ids.extend(
+                test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 or not self.eval_on_rollout else "uid"]
+            )
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch

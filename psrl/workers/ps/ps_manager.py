@@ -338,6 +338,7 @@ class PSManager(RequestStatusTracker):
                     prompt_id=request_id // rollout_n,
                     request_idx=request_id % rollout_n,
                     model_version=model_version,
+                    is_validate=is_validate,
                 )
                 if without_new_reserve_entry:
                     results.append(
@@ -387,6 +388,7 @@ class PSManager(RequestStatusTracker):
                 prompt_id=request_id // rollout_n,
                 request_idx=request_id % rollout_n,
                 model_version=model_version,
+                is_validate=is_validate,
             )
             if staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
                 indicators.append(float("-inf"))
@@ -455,7 +457,7 @@ class PSManager(RequestStatusTracker):
                     entry_ids.append(None)
                     buffer_ids.append(None)
                     continue
-            assert model_version > self.max_aborted_version, (
+            assert is_validate or model_version > self.max_aborted_version, (
                 f"Reserving a request with model version {model_version} is not allowed, "
                 f"because it is not greater than the max aborted version {self.max_aborted_version}"
             )
@@ -467,6 +469,7 @@ class PSManager(RequestStatusTracker):
                 prompt_id=request_id // rollout_n,
                 request_idx=request_id % rollout_n,
                 model_version=model_version,
+                is_validate=is_validate,
             )
 
             buffer_id, entry_id = staleness_inventory.reserve_data(
@@ -690,15 +693,15 @@ class PSManager(RequestStatusTracker):
         # Remove the request from the request status manager
         is_aborted = self.check_aborted_requests(request_ids, remove=True)
         filtered_request_ids = [request_id for i, request_id in enumerate(request_ids) if not is_aborted[i]]
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
         self.remove_train_ready_request(filtered_request_ids)
 
         if len(filtered_request_ids) == 0:
-            assert prompt_id not in self.staleness_inventory.data_tracker, (
+            assert prompt_id not in staleness_inventory.data_tracker, (
                 f"Occupy failed due to staleness limit, but aborted data exists in the inventory: {prompt_id}."
             )
             return None, None, None
 
-        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
         buffer_id, entry_id, occupy_num = staleness_inventory.occupy_data_with_reserve(prompt_id)
         if buffer_id is None:
             raise RuntimeError("Unexpected error: buffer id is None")

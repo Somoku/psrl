@@ -62,7 +62,7 @@ class RolloutRouter:
                 * self.rollout_n
                 // self.config.psrl.deployment.n_rollout_instances
             )
-        self.val_rollout_n = self.config.train_actor_rollout_ref.val_kwargs.n
+        self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         self.ps_manager_handle = ps_manager_handle
         self.tokenizer = tokenizer
         self.rollout_wg_list = rollout_wg_list
@@ -677,9 +677,11 @@ class RolloutRouter:
             psrl_logger.info("Started routing loop")
 
         request_id = request.non_tensor_batch["uid"][0]
+        is_validate = request.meta_info.get("validate", False)
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             [request_id],
             PSRL_RequestStatus.ROLLOUT_ROUTING,
+            is_validate=is_validate,
         )
         if not update_status_success[0]:
             # Means the request is aborted

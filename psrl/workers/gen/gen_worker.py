@@ -26,7 +26,6 @@ from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
 from verl.utils.model import get_generation_config, update_model_config
 
-from psrl.psrl.workers.gen.engine_http_server import EngineHttpServer
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     DualOutputHandler,
@@ -42,6 +41,7 @@ from psrl.utils.nixl import NIXLInterface
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import PSRL_vLLMRollout
+from psrl.workers.gen.engine_http_server import EngineHttpServer
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)

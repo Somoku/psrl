@@ -7,6 +7,7 @@ import ray
 from omegaconf import DictConfig
 from tensordict import TensorDict
 from verl import DataProto
+from vllm.sampling_params import RequestOutputKind
 
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
@@ -622,10 +623,31 @@ class RolloutRouter:
                         )
                     )
 
+                # Set sampling params
+                rollout_config = self.config.gen_actor_rollout_ref.rollout
+                sampling_params = dict(
+                    n=1,
+                    logprobs=0,  # can be set to 0 and let actor to recompute
+                    temperature=rollout_config.temperature,
+                    top_p=rollout_config.top_p,
+                    repetition_penalty=rollout_config.get("repetition_penalty", 1.0),
+                    output_kind=RequestOutputKind.CUMULATIVE,
+                    detokenize=False,
+                )
+
+                # override sampling params for validation
+                if filtered_requests.meta_info.get("validate", False):
+                    val_config = self.config.train_actor_rollout_ref.rollout.val_kwargs
+                    sampling_params["top_k"] = val_config.top_k
+                    sampling_params["top_p"] = val_config.top_p
+                    sampling_params["temperature"] = val_config.temperature
+
                 for i, filtered_requests in enumerate(filtered_requests_list):
                     request_ids = filtered_requests.non_tensor_batch["uid"]
                     psrl_logger.debug(f"Dispatching requests to rollout instance {i} with request ids: {request_ids}")
-                    futures.append(self.rollout_wg_list[i].execute_all_async("generate", filtered_requests)[0])
+                    futures.append(
+                        self.rollout_wg_list[i].execute_all_async("generate", filtered_requests, sampling_params)[0]
+                    )
                 rollout_results = ray.get(futures)
 
             # Process results as needed
@@ -954,6 +976,25 @@ class RolloutRouter:
             self.route_strategy.push_request(request, new_instance_id)
             # Add request to inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].append(request_id)
+
+            # Set sampling params
+            rollout_config = self.config.gen_actor_rollout_ref.rollout
+            sampling_params = dict(
+                n=1,
+                logprobs=0,  # can be set to 0 and let actor to recompute
+                temperature=rollout_config.temperature,
+                top_p=rollout_config.top_p,
+                repetition_penalty=rollout_config.get("repetition_penalty", 1.0),
+                output_kind=RequestOutputKind.CUMULATIVE,
+                detokenize=False,
+            )
+
+            # override sampling params for validation
+            if request.meta_info.get("validate", False):
+                val_config = self.config.train_actor_rollout_ref.rollout.val_kwargs
+                sampling_params["top_k"] = val_config.top_k
+                sampling_params["top_p"] = val_config.top_p
+                sampling_params["temperature"] = val_config.temperature
 
             # Generate response
             # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")

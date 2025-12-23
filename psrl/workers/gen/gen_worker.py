@@ -905,7 +905,9 @@ class PSRL_GenWorker(Worker):
 
         return task_done_callback
 
-    async def _generate_async_task(self, request: DataProto, needed_model_version: int):
+    async def _generate_async_task(
+        self, request: DataProto, sampling_params: dict[str, Any], needed_model_version: int
+    ):
         """
         An async task to generate sequences for a single request.
         This method handles the generation for a single request, managing model versioning
@@ -913,6 +915,7 @@ class PSRL_GenWorker(Worker):
 
         Args:
             request (DataProto): The generation request.
+            sampling_params (dict): The sampling parameters for generation.
             needed_model_version (int): The model version required for this request.
 
         Returns:
@@ -978,7 +981,7 @@ class PSRL_GenWorker(Worker):
                 level=logging.DEBUG,
                 event_type=EventType.GEN,
             ):
-                vllm_outputs = await self.rollout.raw_generate_sequences_async(request)
+                vllm_outputs = await self.rollout.raw_generate_sequences_async(request, sampling_params)
 
             vllm_output = vllm_outputs[0][1] if isinstance(vllm_outputs, list) else vllm_outputs[1]
             assert len(vllm_output.outputs) == 1, (
@@ -1013,6 +1016,7 @@ class PSRL_GenWorker(Worker):
     def generate(
         self,
         requests: DataProto,
+        sampling_params: dict[str, Any],
         consolidate: bool = True,
         return_only_on_representative_rank: bool = True,
     ):
@@ -1023,6 +1027,9 @@ class PSRL_GenWorker(Worker):
 
         Args:
             requests (DataProto): The batch of generation requests.
+            sampling_params (dict): The sampling parameters for generation.
+            consolidate (bool): Whether to consolidate the results from all ranks.
+            return_only_on_representative_rank (bool): Whether to return results only on the representative rank.
 
         Returns:
             tuple: A tuple containing the generated sequences and their corresponding update statuses.
@@ -1115,9 +1122,7 @@ class PSRL_GenWorker(Worker):
                     psrl_logger,
                     event_type=EventType.GEN,
                 ):
-                    vllm_outputs = self.rollout.raw_generate_sequences(filtered_requests)
-
-                # vllm_outputs = [vllm_outputs[i] for i in range(len(vllm_outputs))]
+                    vllm_outputs = self.rollout.raw_generate_sequences(filtered_requests, sampling_params)
 
                 if return_only_on_representative_rank and not self.is_instance_representative_rank:
                     return None, None
@@ -1159,7 +1164,7 @@ class PSRL_GenWorker(Worker):
             )
 
     @rollout_trace_op
-    async def generate_async(self, request: DataProto, consolidate: bool = True):
+    async def generate_async(self, request: DataProto, sampling_params: dict[str, Any], consolidate: bool = True):
         """
         Generate sequences asynchronously.
         This method handles a single async generation request, managing model versioning
@@ -1167,6 +1172,8 @@ class PSRL_GenWorker(Worker):
 
         Args:
             request (DataProto): The async generation request.
+            sampling_params (dict): The sampling parameters for generation.
+            consolidate (bool): Whether to consolidate the results after generation.
         """
         assert consolidate, (
             "Consolidate must be True for async generation for now. "
@@ -1205,7 +1212,9 @@ class PSRL_GenWorker(Worker):
             )
             needed_model_version = self.curr_rollout_instance_model_version
 
-        task = self._generate_loop.create_task(self._generate_async_task(request, needed_model_version))
+        task = self._generate_loop.create_task(
+            self._generate_async_task(request, sampling_params, needed_model_version)
+        )
         task.add_done_callback(
             self._create_task_done_callback(
                 int(request.non_tensor_batch["uid"][0]),

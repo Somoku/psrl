@@ -143,7 +143,7 @@ routing_strategy:
   method: request_num_balance
 
   # Check interval in millisecond for rollout routing
-  check_interval_in_ms: 1000
+  check_interval_in_ms: 100
 
   # Whether to prioritize short requests
   short_request_first: False
@@ -214,6 +214,13 @@ sync_and_mig_strategy:
     # When indicator is "hypothesis_test", threshold is not used.
     threshold: null
 
+    # Whether to check the request that can be routed to the instance before synchronization
+    check_req_before_sync: True
+
+    # All versions in [0, seamless_train_version] satisfy that:
+    # - After pulling the model from the PS, the next buffer is already ready, so the training can be continued seamlessly without waiting for rollout
+    seamless_train_version: 0
+
   # Rollout migration config
   mig:
     # Whether to enable rollout migration
@@ -248,7 +255,7 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 8
+  max_pinned_temp_memory_slots: 4
 
 # Post processor for group requests in streaming mode
 group_post_process:

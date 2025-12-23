@@ -1123,7 +1123,7 @@ class RolloutRouter:
 
         # If there are requests that can still be routed to the instance before synchronization
         # we will not attempt to synchronize with PS
-        if len(filtered_request_ids) > 0:
+        if len(filtered_request_ids) > 0 and self.config.psrl.sync_and_mig_strategy.sync.check_req_before_sync:
             return False
 
         # 3. Check indicator to determine whether to synchronize with PS

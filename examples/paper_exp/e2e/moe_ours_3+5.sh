@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-1}
+staleness=${1:-3}
 project_name=paper_moe_exp
-experiment_name=moe_staleness_${staleness}_greedy
-fix_weight=${2:-True}
+experiment_name=moe_staleness_${staleness}_ours_3+5
+fix_weight=${2:-False}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -23,24 +23,22 @@ GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
-TRAIN_PP=4 # PP in the training side 
+TRAIN_PP=5 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 TRAIN_EP=8 # EP in the training side
 TRAIN_ETP=1 # ETP in the training side
-# NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=9 # Number of layers in the first pipeline stage
-# NUM_LAYERS_IN_LAST_PIPELINE_STAGE=9 # Number of layers in the last pipeline stage
-# +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=${NUM_LAYERS_IN_FIRST_PIPELINE_STAGE} \
-# +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=${NUM_LAYERS_IN_LAST_PIPELINE_STAGE} \
+NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=9 # Number of layers in the first pipeline stage
+NUM_LAYERS_IN_LAST_PIPELINE_STAGE=9 # Number of layers in the last pipeline stage
 
 NNODES=8
 NGPUS_PER_NODE=8
 
-GEN_NNODES=4 # Number of nodes for generation
+GEN_NNODES=3 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=4 # Number of nodes for training
+TRAIN_NNODES=5 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
@@ -48,24 +46,24 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-tis_imp_ratio_cap=2.0
+tis_imp_ratio_cap=4.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 40))
-train_packing_length=$((1024 * 42))
+max_response_length=$((1024 * 20))
+train_packing_length=$((1024 * 44))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 40))
+overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
-redundant_train_prompt_bsz=128
-n_resp_per_prompt=8
-redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=128
+train_prompt_bsz=64
+redundant_train_prompt_bsz=68
+n_resp_per_prompt=16
+redundant_n_resp_per_prompt=16
+train_prompt_mini_bsz=16
 # Algorithm
-temperature=1.2
-top_p=1.0
+temperature=1
+top_p=1
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 filter_groups_metric=acc
@@ -104,12 +102,26 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     psrl.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.method="request_num_balance" \
+    psrl.routing_strategy.method="throughput_optimal" \
+    psrl.routing_strategy.sort_candidate_by_indicator=True \
+    psrl.routing_strategy.enable_dynamic_version_tag=True \
+    psrl.routing_strategy.enable_multi_priority_queue=True \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
+    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_moe_30b.json \
+    psrl.routing_strategy.delta_throughput_threshold=0.3 \
+    psrl.routing_strategy.request_budget=1024 \
+    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
     \
-    psrl.sync_and_mig_strategy.method="greedy" \
+    psrl.sync_and_mig_strategy.method="status_based" \
+    psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
+    psrl.sync_and_mig_strategy.sync.threshold=0.7 \
+    psrl.sync_and_mig_strategy.sync.check_req_before_sync=False \
+    psrl.sync_and_mig_strategy.mig.enable=True \
+    psrl.sync_and_mig_strategy.mig.indicator="throughput" \
+    psrl.sync_and_mig_strategy.mig.threshold=6 \
+    psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
+    psrl.sync_and_mig_strategy.mig.stop_threshold=8 \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
@@ -150,7 +162,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
@@ -167,6 +179,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=${NUM_LAYERS_IN_FIRST_PIPELINE_STAGE} \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=${NUM_LAYERS_IN_LAST_PIPELINE_STAGE} \
     \
     reward_model.reward_manager=dapo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
@@ -193,4 +207,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=200 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=20 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

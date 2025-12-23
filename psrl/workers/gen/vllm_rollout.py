@@ -187,6 +187,7 @@ class PSRL_vLLMRollout:
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
+            max_seq_len_to_capture=max_model_len,
             max_num_seqs=config.max_num_seqs,
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,

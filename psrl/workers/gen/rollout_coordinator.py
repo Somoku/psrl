@@ -91,6 +91,7 @@ class RolloutCoordinator(CommandExtension):
         ] = {}  # The latest stale model version of each instance
         self.instance_to_model_version: dict[int, int] = {}  # Track the model version of each instance
         self.ps_model_version = 0  # Current model version in the parameter server
+        self.ready_buffers = set() # The set of ready buffers
 
         # Engine status tracking
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
@@ -471,6 +472,10 @@ class RolloutCoordinator(CommandExtension):
                 if not self.config.psrl.partial_rollout.enable:
                     if not await self.check_no_activate_tasks(instance_id):
                         continue
+                # Check whether the training side can seamlessly continue to train after the synchronization
+                if self.config.psrl.sync_and_mig_strategy.sync.seamless_train_version >= self.ps_model_version:
+                    if self.ps_model_version not in self.ready_buffers:
+                        continue
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
 
@@ -519,11 +524,17 @@ class RolloutCoordinator(CommandExtension):
                 else:
                     if engine_stats.get_waiting_and_running_queue_size() > 0:
                         continue
+                # Check whether the training side can seamlessly continue to train after the synchronization
+                if self.config.psrl.sync_and_mig_strategy.sync.seamless_train_version >= self.ps_model_version:
+                    if self.ps_model_version not in self.ready_buffers:
+                        continue
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
+                '''
                 # NOTE(lhy): currently, we only synchronize with PS for one instance at a time
                 # But the model pulling time can be overlapped
                 break
+                '''
 
             if sync_instance_ids:
                 await self.sync_with_ps(sync_instance_ids)
@@ -546,6 +557,9 @@ class RolloutCoordinator(CommandExtension):
             version (int): The new PS model version to set.
         """
         self.ps_model_version = version
+        assert self.ps_model_version > 0, "PS model version must be greater than 0"
+        assert (self.ps_model_version - 1) in self.ready_buffers, "PS model version must be greater than the ready buffers"
+        self.ready_buffers.remove(self.ps_model_version - 1)
         psrl_logger.info(f"Updated PS model version to {version}")
 
     # This is called by the PS manager to update the rollout instance model version after pulling
@@ -561,6 +575,15 @@ class RolloutCoordinator(CommandExtension):
         self.instance_to_model_version[rollout_instance_id] = version_tag
         psrl_logger.info(
             f"Updated rollout instance {rollout_instance_id} model version: {old_version} -> {version_tag}"
+        )
+        
+    def update_ready_buffer(self, ready_buffer: int):
+        """
+        Update the ready buffer.
+        """
+        self.ready_buffers.add(ready_buffer)
+        psrl_logger.info(
+            f"Updated ready buffers to: {self.ready_buffers}"
         )
 
     async def sync_with_ps(

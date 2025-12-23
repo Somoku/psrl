@@ -92,9 +92,6 @@ class PSManager(RequestStatusTracker):
         # Set to track the maximum version that has been aborted
         self.max_aborted_version = -1
 
-        # Set for buffer ids ready for deletion
-        self.ready_for_delete_buffer_ids = set()
-
         # Initialize the staleness inventory
         if self.psrl_config.redundant_rollout.enable:
             entries_per_buffer = self.psrl_config.redundant_rollout.redundant_global_batch_size
@@ -209,12 +206,12 @@ class PSManager(RequestStatusTracker):
         This method checks if the buffer can be deleted based on the current PS model version
         because the PS model version indicates which buffers have been consumed by training workers.
         """
-        if buffer_id in self.ready_for_delete_buffer_ids:
-            for bid in sorted(list(self.ready_for_delete_buffer_ids)):
+        ready_for_delete_buffer_ids = self.staleness_inventory.get_ready_for_delete_buffer_ids()
+        if buffer_id in ready_for_delete_buffer_ids:
+            for bid in sorted(list(ready_for_delete_buffer_ids)):
                 if bid <= buffer_id:
-                    psrl_logger.debug(f"Clearing buffer {bid} after model version {buffer_id} is pushed.")
+                    psrl_logger.info(f"Clearing ready for deletion buffer {bid} after model version {buffer_id} is pushed.")
                     self.staleness_inventory.delete_buffer(bid)
-                    self.ready_for_delete_buffer_ids.discard(bid)
                 else:
                     break
 
@@ -492,8 +489,13 @@ class PSManager(RequestStatusTracker):
             return self._check_aborted_request(request_ids, remove)
         return [self._check_aborted_request(request_id, remove) for request_id in request_ids]
 
-    def abort_after_buffer_ready(self, buffer_id: int):
-        """Check and interrupt rollout instances if necessary based on ready buffers."""
+    def _abort_after_buffer_ready(self, buffer_id: int):
+        """
+        Check and interrupt rollout instances if necessary based on the ready buffer.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is ready.
+        """
         curr_ps_model_version = self.get_ps_model_version(debug_info="ps_manager")
         ready_buffer_ids = self.staleness_inventory.ready_buffer_ids().copy()
         abort_request_ids = set()
@@ -523,9 +525,6 @@ class PSManager(RequestStatusTracker):
             # When `buffer_id` buffer is READY, we need to check related versions
             # [version_to_abort, version_to_abort + staleness]
             # that may need to be aborted due to the READY status of `buffer_id`.
-            # Because `version_to_abort` can be aborted, for the following continuous buffers,
-            # we only need to check whether `curr_buffer_id + staleness`
-            # is READY to decide whether to abort `curr_buffer_id`.
             if buffer_range.issubset(ready_buffer_ids):
                 curr_abort_versions.add(version_to_abort)
                 self.check_abort_versions.discard(version_to_abort)
@@ -542,7 +541,7 @@ class PSManager(RequestStatusTracker):
         for abort_version in curr_abort_versions:
             self.max_aborted_version = max(self.max_aborted_version, abort_version)
             requests_of_abort_version = self.get_requests_of_abort_version(abort_version)
-            psrl_logger.debug(f"Requests of version {abort_version} to abort: {requests_of_abort_version}")
+            psrl_logger.info(f"Requests of version {abort_version} to abort: {requests_of_abort_version}")
             abort_request_ids = abort_request_ids.union(requests_of_abort_version)
 
         if abort_request_ids:
@@ -558,14 +557,14 @@ class PSManager(RequestStatusTracker):
         for buffer_id in ready_buffer_ids:
             if self.staleness_inventory.buffers[buffer_id].get_reserve_entry_num() == 0:
                 if curr_ps_model_version > buffer_id:
-                    psrl_logger.debug(
+                    psrl_logger.info(
                         f"Deleting buffer {buffer_id} immediately after aborting requests "
                         f"due to larger ps version {curr_ps_model_version}."
                     )
                     self.staleness_inventory.delete_buffer(buffer_id)
                 else:
-                    psrl_logger.debug(f"Marking buffer {buffer_id} ready for deletion after aborting requests.")
-                    self.ready_for_delete_buffer_ids.add(buffer_id)
+                    psrl_logger.info(f"Marking buffer {buffer_id} ready for deletion after aborting requests.")
+                    self.staleness_inventory.mark_buffer_for_deletion(buffer_id)
 
         psrl_logger.debug(
             f"Check staleness abort done for buffer {buffer_id}. Current PS model version {curr_ps_model_version}, "
@@ -573,7 +572,17 @@ class PSManager(RequestStatusTracker):
             f"abort {len(abort_request_ids)} requests. "
             f"After abortion, current ready buffers {self.staleness_inventory.ready_buffer_ids()}."
         )
-
+        
+    def handle_ready_buffer(self, buffer_id: int):
+        """
+        Handle the ready buffer.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is ready.
+        """
+        self.rollout_coordinator.update_ready_buffer.remote(buffer_id)
+        self._abort_after_buffer_ready(buffer_id)
+        
     def occupy_rollout_instance_request(
         self,
         prompt_id: int,

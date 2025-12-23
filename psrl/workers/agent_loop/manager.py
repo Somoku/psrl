@@ -717,7 +717,7 @@ class PSRL_AgentLoopManager:
                 add_buffer = self.maybe_add_buffer(buffer_id, data_buffer)
                 if add_buffer:
                     psrl_logger.info(f"Buffer {buffer_id} is READY with {len(self.data_buffers[buffer_id])} entries.")
-                    await self.try_awake_waiters(buffer_id)
+                    await self.handle_ready_buffer(buffer_id)
                     self.remove_buffer_from_data_pool(prompt_entry_infos)
                     self.accumulated_buffers.pop(buffer_id)
                     self.accumulated_buffer_size.pop(buffer_id)
@@ -907,32 +907,35 @@ class PSRL_AgentLoopManager:
             )
             self.logged_ready_buffer_ids.add(buffer_id)
 
-    async def try_awake_waiters(self, buffer_id: int):
-        """Check for ready buffers and wake up waiters.
-
-        This method checks if there are any new ready buffers for training and
-        processes them by waking up waiters and handling staleness control.
-        It also sends interruption commands for partial rollout if enabled.
+    async def handle_ready_buffer(self, buffer_id: int):
+        """
+        Handle the ready buffer.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is ready.
         """
         # Check whether there exists ready buffer for training
-        min_ready_buffer_id = min(self.data_buffers.keys(), default=None)
         self.log_ready_buffer(buffer_id)
 
         psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
-        await self.ps_manager_handle.abort_after_buffer_ready.remote(buffer_id)
+        await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id)
 
+        min_ready_buffer_id = min(self.data_buffers.keys(), default=None)
         if min_ready_buffer_id is not None:
-            self.process_ready_buffer(min_ready_buffer_id)
-
-    def process_ready_buffer(self, min_ready_buffer_id: int):
-        """
-        Awake the waiters for the minimum ready buffer.
-
-        Args:
-            min_ready_buffer_id (int): The minimum ready buffer ID to process
-        """
-        # If there are ready buffers, wake up the waiters for the minimum ready buffer
-        self._awake_training_batch_waiters(min_ready_buffer_id)
+            # Wake all Futures waiting for this buffer
+            if min_ready_buffer_id in self._buffer_waiters:
+                buffer_data = self.consume_buffer(min_ready_buffer_id)
+                assert len(self._buffer_waiters[min_ready_buffer_id]) == 1, (
+                    f"Expected only one waiter for buffer {min_ready_buffer_id}, but found {len(self._buffer_waiters[min_ready_buffer_id])}."
+                )
+                # Set the result for all futures
+                for fut in self._buffer_waiters[min_ready_buffer_id]:
+                    if not fut.done():
+                        fut.set_result(buffer_data)
+                # Remove the key after waking all waiters
+                del self._buffer_waiters[buffer_id]
+            else:
+                psrl_logger.warning(f"No waiters found for buffer {buffer_id} when trying to awake.")
 
     async def wait_for_training_batch(self, buffer_id: int) -> DataProto:
         """Await a training batch for a specific buffer ID."""
@@ -956,30 +959,6 @@ class PSRL_AgentLoopManager:
         result = await fut
         # Once resumed, return
         return result
-
-    def _awake_training_batch_waiters(self, buffer_id: int):
-        """Wake up all training waiters for a specific buffer.
-
-        When a buffer becomes ready, this method consumes the buffer data
-        and sets the result for all futures waiting for this buffer.
-
-        Args:
-            buffer_id (int): The buffer ID to wake waiters for
-        """
-        # Wake all Futures waiting for this buffer
-        if buffer_id in self._buffer_waiters:
-            buffer_data = self.consume_buffer(buffer_id)
-            assert len(self._buffer_waiters[buffer_id]) == 1, (
-                f"Expected only one waiter for buffer {buffer_id}, but found {len(self._buffer_waiters[buffer_id])}."
-            )
-            # Set the result for all futures
-            for fut in self._buffer_waiters[buffer_id]:
-                if not fut.done():
-                    fut.set_result(buffer_data)
-            # Remove the key after waking all waiters
-            del self._buffer_waiters[buffer_id]
-        else:
-            psrl_logger.warning(f"No waiters found for buffer {buffer_id} when trying to awake.")
 
     # TODO(lhy): current logic may cause the request have no place to RESERVE
     # If other requests OCCUPY the place to RESERVE, the request will have no place to RESERVE

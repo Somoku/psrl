@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-1}
+staleness=${1:-3}
 project_name=paper_moe_exp
-experiment_name=moe_staleness_${staleness}_greedy
+experiment_name=moe_staleness_${staleness}_ours_2+6
 fix_weight=${2:-True}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -23,7 +23,7 @@ GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
-TRAIN_PP=4 # PP in the training side 
+TRAIN_PP=3 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 TRAIN_EP=8 # EP in the training side
 TRAIN_ETP=1 # ETP in the training side
@@ -35,12 +35,12 @@ TRAIN_ETP=1 # ETP in the training side
 NNODES=8
 NGPUS_PER_NODE=8
 
-GEN_NNODES=4 # Number of nodes for generation
+GEN_NNODES=2 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=4 # Number of nodes for training
+TRAIN_NNODES=6 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 adv_estimator=grpo
@@ -58,13 +58,13 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 40))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
-redundant_train_prompt_bsz=128
-n_resp_per_prompt=8
-redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=128
+train_prompt_bsz=64
+redundant_train_prompt_bsz=64
+n_resp_per_prompt=16
+redundant_n_resp_per_prompt=16
+train_prompt_mini_bsz=16
 # Algorithm
-temperature=1.2
+temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
@@ -104,12 +104,25 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     psrl.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.method="request_num_balance" \
+    psrl.routing_strategy.method="throughput_optimal" \
+    psrl.routing_strategy.sort_candidate_by_indicator=True \
+    psrl.routing_strategy.enable_dynamic_version_tag=True \
+    psrl.routing_strategy.enable_multi_priority_queue=True \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
+    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_moe_30b.json \
+    psrl.routing_strategy.delta_throughput_threshold=0.2 \
+    psrl.routing_strategy.request_budget=1024 \
+    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=1 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=96 \
     \
-    psrl.sync_and_mig_strategy.method="greedy" \
+    psrl.sync_and_mig_strategy.method="status_based" \
+    psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
+    psrl.sync_and_mig_strategy.sync.threshold=0.99 \
+    psrl.sync_and_mig_strategy.mig.enable=True \
+    psrl.sync_and_mig_strategy.mig.indicator="throughput" \
+    psrl.sync_and_mig_strategy.mig.threshold=5 \
+    psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
+    psrl.sync_and_mig_strategy.mig.stop_threshold=10 \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \

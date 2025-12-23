@@ -85,11 +85,12 @@ def read_jsonl_lines(path: str) -> Iterable[dict[str, Any]]:
 
             if json_start != -1:
                 json_part = raw[json_start:]
+                json_part = json_part.replace('np.float64(', '').replace(')', '')
                 # Try JSON parsing first (standard format with double quotes)
                 try:
                     yield json.loads(json_part)
                     continue
-                except Exception:
+                except Exception as e:
                     pass
 
                 # If JSON parsing fails, try Python literal eval (handles single quotes)

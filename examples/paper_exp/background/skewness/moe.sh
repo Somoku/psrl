@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-1}
-project_name=paper_moe_exp
-experiment_name=moe_staleness_${staleness}_greedy
+staleness=${1:-0}
+project_name=paper_background_exp
+experiment_name=moe_skewness
 fix_weight=${2:-True}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -58,13 +58,13 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 40))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
-redundant_train_prompt_bsz=128
-n_resp_per_prompt=8
-redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=128
+train_prompt_bsz=64
+redundant_train_prompt_bsz=64
+n_resp_per_prompt=16
+redundant_n_resp_per_prompt=16
+train_prompt_mini_bsz=64
 # Algorithm
-temperature=1.2
+temperature=1.0
 top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
@@ -84,7 +84,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.profile.disable_attn=${disable_attn} \
     psrl.profile.fix_weight=${fix_weight} \
-    psrl.logging_path=${PSRL_PATH}/examples/paper_exp/e2e/logs/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/paper_exp/background/skewness/logs/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
     psrl.log_prob.mode=tis \
@@ -102,10 +102,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.partial_rollout.enable=False \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.routing_strategy.enable_group_sampling_on_multi_instances=False \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
@@ -150,8 +150,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-    train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
+    train_actor_rollout_ref.actor.optim.weight_decay=0 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     train_actor_rollout_ref.actor.megatron.param_offload=False \
@@ -186,11 +186,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.filter_groups.metric=${filter_groups_metric} \
-    trainer.logger='["console","wandb"]' \
+    trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.val_before_train=False \
     trainer.test_freq=200 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=20 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=1 2>&1 | tee ${experiment_name}.log

@@ -5,7 +5,7 @@ staleness=${1:-1}
 project_name=paper_exp
 experiment_name=32b_staleness_${staleness}_greedy
 fix_weight=${2:-True}
-disable_attn=${3:-True}
+disable_attn=${3:-False}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 

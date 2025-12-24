@@ -47,6 +47,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         cls.max_tool_response_length = config.gen_actor_rollout_ref.rollout.multi_turn.max_tool_response_length
         cls.tool_response_truncate_side = config.gen_actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
+        cls.max_parallel_calls = config.gen_actor_rollout_ref.rollout.multi_turn.max_parallel_calls
 
         # Initialize tools from configuration file
         tool_config_path = config.gen_actor_rollout_ref.rollout.multi_turn.tool_config_path
@@ -147,12 +148,14 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                 info={},
             )
 
-        # Execute all tool calls concurrently
-        tool_call_tasks = []
-        for tool_call in action:
-            tool_call_tasks.append(self._call_tool(tool_call))
+        # Execute tool calls with an explicit concurrency cap to control latency spikes.
+        sem = asyncio.Semaphore(self.max_parallel_calls)
 
-        tool_outputs = await asyncio.gather(*tool_call_tasks)
+        async def _guarded_call(tc: dict):
+            async with sem:
+                return await self._call_tool(tc)
+
+        tool_outputs = await asyncio.gather(*[_guarded_call(tc) for tc in action])
 
         # Collect observations and rewards from tool executions
         next_observation = []
@@ -199,6 +202,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             tool_output = await tool(**tool_args)
             tool_response_text = tool_output.output["content"]
             tool_reward = tool_output.output.get("score", None)
+            tool_metadata = tool_output.output.get("metadata", None)
         except Exception as e:
             psrl_logger.warning(f"Error when executing tool: {e}")
             return (
@@ -217,7 +221,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                 length = self.max_tool_response_length // 2
                 tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
 
-        tool_message = {"role": "tool", "content": tool_response_text}
+        tool_message = {"role": "tool", "content": tool_response_text, "metadata": tool_metadata}
         psrl_logger.debug(f"Tool {tool_name} called with args {tool_args}, response: {tool_response_text}")
         return tool_message, tool_reward
 
@@ -226,7 +230,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         Currently a no-op as tools don't require explicit cleanup.
         """
-        pass
+        return
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Get the JSON schemas for all available tools.

@@ -999,7 +999,7 @@ class RolloutRouter:
             # Generate response
             # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")
             consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async(
-                "generate_async", request
+                "generate_async", request, sampling_params
             )
 
             # Change engine status

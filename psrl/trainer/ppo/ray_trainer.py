@@ -540,6 +540,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.data_queue_size,
             self.agent_loop_workers,
             self.ps_manager_handle,
+            self.gateway_base_url,
             group_post_process_fn=self.group_post_process_fn,
             buffer_post_process_fn=self.buffer_post_process_fn,
         )

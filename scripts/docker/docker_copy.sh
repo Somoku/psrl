@@ -26,7 +26,7 @@ MANAGER=${hosts[0]}
 WORKERS=("${hosts[@]:1}")
 
 # 3. Leave Swarm
-for node in "${WORKERS[@]}"; do
+for node in $MANAGER "${WORKERS[@]}"; do
     pssh -t 3600 -H $node -i "cp $SANDBOX_SERVER_PATH/code_sandbox_server.tar /tmp/"
     pssh -t 3600 -H $node -i "docker load -i /tmp/code_sandbox_server.tar && rm /tmp/code_sandbox_server.tar"
 done

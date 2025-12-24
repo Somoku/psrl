@@ -27,7 +27,7 @@ logging_path: ~/psrl_logs
 
 server_rollout:
   # Whether to enable server rollout service.
-  enable: True
+  enable: False
 
   # Rollout gateway config.
   # This gateway is an HTTP entrypoint used by agent loops to call rollout service.

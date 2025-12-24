@@ -300,7 +300,7 @@ skip_tokenizer_init: False
 profiler:
 
   # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: psrl.utils.profiler.ProfilerConfig
+  _target_: verl.utils.profiler.ProfilerConfig
 
   # profiler tool, default same as profiler.tool in global config
   # choices: nsys, npu, torch

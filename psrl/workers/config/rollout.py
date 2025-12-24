@@ -166,6 +166,9 @@ class RolloutConfig(BaseConfig):
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)
 
+    # Use Prometheus to collect and monitor rollout statistics
+    prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
+
     update_weights_bucket_megabytes: int = 512
 
     skip_rollout: bool = False

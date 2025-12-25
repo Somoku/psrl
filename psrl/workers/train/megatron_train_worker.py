@@ -13,6 +13,7 @@ from verl.single_controller.base.decorator import (
 )
 from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 from verl.utils.megatron_utils import (
     load_megatron_model_to_gpu,
     offload_megatron_model_to_cpu,
@@ -213,8 +214,22 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
             data = data.to(get_device_id())
-            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+
+            if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+            if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(tensors={"recomputed_log_probs": output, "entropys": entropys})
+
+            if self.config.actor.router_replay.mode == "R2":
+                output.batch["routed_experts"] = layers_topk_idx
+            if self.config.actor.router_replay.mode in ["R2", "R3"]:
+                RouterReplay.clear_global_indices()
+                RouterReplay.clear_global_router_replay_action()
+
             output = output.to("cpu")
             # clear kv cache
             if self._is_offload_param:

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import uuid
@@ -24,11 +25,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.ray_trainer import (
-    RayPPOTrainer,
-    apply_kl_penalty,
-    compute_response_mask,
-)
 from verl.trainer.ppo.utils import WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.debug import marked_timer
@@ -43,6 +39,8 @@ from psrl.trainer.ppo.utils import (
     PSRL_compute_advantage,
     PSRL_ResourcePoolManager,
     PSRL_Role,
+    apply_kl_penalty,
+    compute_response_mask,
     need_critic,
     need_reference_policy,
     need_reward_model,
@@ -75,7 +73,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-class PSRL_RayPPOTrainer(RayPPOTrainer):
+class PSRL_RayPPOTrainer:
     def __init__(
         self,
         config,
@@ -687,6 +685,34 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
 
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        n = len(inputs)
+        base_data = {
+            "input": inputs,
+            "output": outputs,
+            "gts": gts,
+            "score": scores,
+            "step": [self.global_steps] * n,
+        }
+
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
+        lines = []
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        psrl_logger.info(f"Dumped generations to {filename}")
+
     def _log_rollout_data(
         self,
         batch: DataProto,
@@ -1115,7 +1141,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # you should not use `create_colocated_worker_cls_fused`.
         # Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        def create_worker_group(resource_pool, class_dict):
+        def create_worker_group(resource_pool, class_dict, wg_kwargs=wg_kwargs):
             # if there is only one worker class in the resource pool, we can directly create a worker group
             # so that we can use 'execute_all_async' and other low-level APIs
             # NOTE(lhy): in newest verl, we can use `create_colocated_worker_cls_fused`
@@ -1208,25 +1234,27 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 continue
             if any("rollout" in key for key in class_dict.keys()):
                 assert len(class_dict) == 1, "Rollout resource pool should only have one worker class."
-                gen_tasks.append((resource_pool, class_dict))
+                gen_tasks.append((resource_pool, class_dict, wg_kwargs))
             else:
-                train_tasks.append((resource_pool, class_dict))
+                # NOTE(linsh): adapt wg_kwargs for fused train worker
+                # if want to add specific env args.
+                train_tasks.append((resource_pool, class_dict, wg_kwargs))
         # We must execute train tasks first because rollout instances may occupy
         # the resources randomly and no structured resources are available for training
         with ThreadPoolExecutor(
             max_workers=len(train_tasks)
         ) as executor:  # max_workers is the number of threads to use
             futures = {}
-            for resource_pool, class_dict in train_tasks:
-                future = executor.submit(create_worker_group, resource_pool, class_dict)
+            for resource_pool, class_dict, train_wg_kwargs in train_tasks:
+                future = executor.submit(create_worker_group, resource_pool, class_dict, train_wg_kwargs)
                 futures[future] = (resource_pool, class_dict)
             for future in futures:
                 result = future.result()
                 all_wg.update(result)
         with ThreadPoolExecutor(max_workers=len(gen_tasks)) as executor:  # max_workers is the number of threads to use
             futures = {}
-            for resource_pool, class_dict in gen_tasks:
-                future = executor.submit(create_worker_group, resource_pool, class_dict)
+            for resource_pool, class_dict, gen_wg_kwargs in gen_tasks:
+                future = executor.submit(create_worker_group, resource_pool, class_dict, gen_wg_kwargs)
                 futures[future] = (resource_pool, class_dict)
             for future in futures:
                 result = future.result()

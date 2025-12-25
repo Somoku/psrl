@@ -79,6 +79,8 @@ class PSRL_vLLMRollout:
         expert_parallel_size = config.get("expert_parallel_size", 1)
         enable_expert_parallel = expert_parallel_size > 1
 
+        enable_return_routed_experts = config.get("enable_rollout_routing_replay", False)
+
         # For async engine and model parallel, we only run the inference engine on the first rank.
         # The inner parallel workers are handled by vLLM + Ray.
         if config.mode == "psrl_async" and model_parallel_size > 1:
@@ -215,6 +217,7 @@ class PSRL_vLLMRollout:
             logprobs_mode=config.logprobs_mode,
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
+            enable_return_routed_experts=enable_return_routed_experts,
             **compilation_config,
             **lora_kwargs,
             **engine_kwargs,
@@ -494,6 +497,7 @@ class PSRL_vLLMRollout:
         interrupted_list = []
         interrupted_by_scheduler_list = []
         all_log_prob_list = []
+        routed_experts_list = []
 
         for i, uid in enumerate(uid_list):
             vllm_output = outputs[i]
@@ -544,6 +548,11 @@ class PSRL_vLLMRollout:
                         log_prob_list.append(logprob[response_ids[i]].logprob)
             all_log_prob_list.append(log_prob_list)
 
+            routed_experts = None
+            if self.config.enable_rollout_routing_replay:
+                routed_experts = vllm_output.outputs[0].routed_experts
+            routed_experts_list.append(routed_experts)
+
         # Consolidate batch results
         if "raw_response_ids" in non_tensor_batch:
             raw_response_ids = non_tensor_batch.pop("raw_response_ids")
@@ -572,6 +581,10 @@ class PSRL_vLLMRollout:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
             curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
             non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
+
+        # process routed experts
+        if self.config.enable_rollout_routing_replay:
+            non_tensor_batch["routed_experts"] = np.fromiter(routed_experts_list, dtype=object)
 
         batch = TensorDict(
             {

@@ -224,8 +224,8 @@ class PSRL_AgentLoopManager:
     def _post_process(self, inputs: DataProto) -> DataProto:
         """Post-process the generated outputs to create properly formatted tensors.
 
-        This method handles padding, attention masks, position IDs, and multi-modal inputs
-        to ensure compatibility with the training pipeline.
+        This method handles padding, attention masks, position IDs, multi-modal inputs
+        and routed experts to ensure compatibility with the training pipeline.
 
         Args:
             inputs (DataProto): Raw generation outputs.
@@ -376,6 +376,42 @@ class PSRL_AgentLoopManager:
             ).to(device)
             rollout_log_probs = rollout_log_probs.to(torch.float32)
             batch["rollout_log_probs"] = rollout_log_probs
+
+        # Routed experts processing
+        if self.config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay:
+            device = batch["input_ids"].device
+            bsz, total_length = input_ids.shape
+
+            experts_array_list = inputs.non_tensor_batch.pop("routed_experts", None)
+            assert experts_array_list is not None, "routed_experts should not be None"
+            assert len(experts_array_list) == bsz, "len of experts_array_list should be equal to bsz"
+            _, layer_num, topk_num = experts_array_list[0].shape
+            dtype = torch.from_numpy(np.array([], dtype=experts_array_list[0].dtype)).dtype
+
+            routed_experts = torch.zeros(bsz, total_length, layer_num, topk_num, dtype=dtype)
+
+            for i in range(bsz):
+                experts_array = experts_array_list[i]
+                actual_length = experts_array.shape[0]
+                experts_tensor = torch.from_numpy(experts_array)
+
+                raw_prompt_id = raw_prompt_ids[i]
+
+                # Calculate start position: left padding means original prompt starts at the end
+                start_pos = prompt_ids.shape[1] - len(raw_prompt_id)
+                end_pos = min(start_pos + actual_length, total_length)
+
+                # Add boundary checks for robustness
+                if start_pos < 0 or end_pos > total_length:
+                    raise ValueError(
+                        f"Invalid position range: start_pos={start_pos}, "
+                        f"end_pos={end_pos}, total_length={total_length}"
+                    )
+
+                routed_experts[i, start_pos:end_pos] = experts_tensor
+
+            routed_experts = routed_experts.to(device)
+            batch["routed_experts"] = routed_experts
 
         inputs.non_tensor_batch.pop("raw_prompt_ids", None)
         inputs.non_tensor_batch.pop("raw_response_ids", None)

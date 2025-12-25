@@ -50,13 +50,17 @@ if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
     # NOTE(linsh): Current patch will modify cpp files,
     # so we need to apply the patch before building vllm
-    # we can update it until v0.12.1 is released
+    # we can update it until v0.14.0 is released
     git clone -b v0.12.0 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$THIRD_PARTY_PATH/vllm
     cd $VLLM_PATH
     cp $PSRL_PATH/patch/vllm/v0.12.0.patch .
     git apply v0.12.0.patch
     rm v0.12.0.patch
+    # Apply R3 patch (remove it after merged into vllm main branch)
+    cp $PSRL_PATH/patch/vllm/R3.patch .
+    git apply R3.patch
+    rm R3.patch
     popd
 fi
 pushd $VLLM_PATH

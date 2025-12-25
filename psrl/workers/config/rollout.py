@@ -194,3 +194,5 @@ class RolloutConfig(BaseConfig):
     limit_images: int | None = None
 
     skip_tokenizer_init: bool = False
+
+    enable_rollout_routing_replay: bool = False

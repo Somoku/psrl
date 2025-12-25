@@ -194,9 +194,9 @@ class TaskRunner:
         self.mapping[PSRL_Role.Actor] = [train_pool_id]
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list
         self.mapping[PSRL_Role.Critic] = [train_pool_id]
-        from psrl.trainer.ppo.utils import PSRL_ResourcePoolManager
+        from psrl.trainer.ppo.utils import ResourcePoolManager
 
-        resource_pool_manager = PSRL_ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
 
         print(f"resource_pool_spec = {resource_pool_spec}, mapping = {self.mapping}")
 

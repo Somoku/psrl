@@ -10,7 +10,7 @@ from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
 
-from psrl.environments.base import ConversationType
+from psrl.environments.base import ConversationType, Environment
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -154,6 +154,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
+        env: Environment,
         **kwargs,
     ):
         """Initialize the AgentData instance.
@@ -164,7 +165,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             tokenizer: Tokenizer for converting between text and tokens
             **kwargs: Additional keyword arguments from configuration
         """
-        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
+        self.init_class(config=config, tokenizer=tokenizer, env=env, **kwargs)
         self.config = config
         self.reward_manager = reward_manager
         self.tokenizer = tokenizer
@@ -176,7 +177,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.reward_bonus_coeff = self.config.gen_actor_rollout_ref.rollout.agent.reward_bonus_coeff
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
+    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, env: Environment, **kwargs):
         """This is used to do heavy initialization work that should shared across all instances. It's only called once.
 
         Args:
@@ -187,6 +188,116 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         if cls._class_initialized:
             return
         cls._class_initialized = True
+        cls.env = env
+
+    def start_step(self, observation: ObsType, reward: float | None, done: bool, info: dict | None) -> Step:
+        """Start (append) a new step to the trajectory.
+
+        Subclasses are encouraged to call this at the beginning of `update_from_env`
+        to avoid relying on the implicit `steps[-1]` contract.
+
+        Args:
+            observation: Observation from environment.
+            reward: Optional env/tool reward.
+            done: Env done flag.
+            info: Metadata.
+
+        Returns:
+            The newly created Step.
+        """
+        step = Step(
+            # chat_completions must always be ConversationType.
+            # Let subclasses decide how to convert observation into ConversationType.
+            chat_completions=[],
+            observation=observation,
+        )
+        step.tool_reward = reward
+        step.done = done
+        step.info = info or {}
+        self.trajectory.steps.append(step)
+        return step
+
+    @abstractmethod
+    def format_chat_completions(self, observation: ObsType, *, is_init: bool) -> ConversationType:
+        """Convert an environment observation into ConversationType for Step.chat_completions.
+
+        Design notes:
+        - Step.chat_completions is considered a normalized chat history format used by
+          downstream tooling / debugging / logging, independent of the raw ObsType.
+        - For non-chat environments, subclasses can choose any representation as long
+          as it is a list of {"role": str, "content": str} dicts.
+
+        Args:
+            observation: Raw observation from environment (ObsType).
+            is_init: Whether this is the first observation of the trajectory.
+
+        Returns:
+            ConversationType: a list of chat messages.
+        """
+        raise NotImplementedError
+
+    def get_current_step(self) -> Step:
+        """Get the current (latest) step.
+
+        Raises a clearer error than an IndexError if subclasses call into
+        step-dependent helpers before starting a step.
+        """
+        if len(self.trajectory.steps) == 0:
+            raise RuntimeError(
+                "No step exists in trajectory yet. Ensure `update_from_env()` (or `start_step()`) "
+                "is called before `update_from_model_*()` methods."
+            )
+        return self.trajectory.steps[-1]
+
+    def append_prompt_ids(self, prompt_ids: list[int]) -> None:
+        """Set prompt token ids for the trajectory."""
+        self.trajectory.prompt_ids = list(prompt_ids)
+
+    def append_user_tokens(self, token_ids: list[int]) -> None:
+        """Append tokens that come from the environment/user side.
+
+        These tokens should not be trained on, so response_mask is 0.
+        Subclasses may override if they use a different masking scheme.
+        """
+        if not token_ids:
+            return
+        self.trajectory.user_turns += 1
+        self.trajectory.response_ids += list(token_ids)
+        self.trajectory.response_mask += [0] * len(token_ids)
+        self.trajectory.response_length += len(token_ids)
+        if len(self.trajectory.response_logprobs) > 0:
+            # Keep alignment if logprobs are being tracked.
+            self.trajectory.response_logprobs += [0.0] * len(token_ids)
+
+    def append_assistant_tokens(self, token_ids: list[int], logprobs: list[float] | None = None) -> None:
+        """Append tokens generated by the model/assistant side.
+
+        Args:
+            token_ids: Generated token ids.
+            logprobs: Optional per-token logprob list aligned to token_ids.
+        """
+        if not token_ids:
+            return
+        self.trajectory.assistant_turns += 1
+        self.trajectory.response_ids += list(token_ids)
+        self.trajectory.response_mask += [1] * len(token_ids)
+        self.trajectory.response_length += len(token_ids)
+        if logprobs:
+            self.trajectory.response_logprobs += list(logprobs)
+
+    def set_step_action(self, action: ActType) -> None:
+        """Set parsed action for the current step."""
+        self.get_current_step().action = action
+
+    def set_step_model_response(self, text: str) -> None:
+        """Set raw model response text for the current step."""
+        self.get_current_step().model_response = text
+
+    def add_step_chat_message(self, message: dict[str, Any]) -> None:
+        """Append a chat-format message into current step's chat completion list."""
+        step = self.get_current_step()
+        # Preserve backward compatibility: Step.chat_completions is a list.
+        step.chat_completions.append(message)
 
     @abstractmethod
     def reset(self) -> None:
@@ -195,7 +306,30 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         This method should clear any accumulated trajectory data and prepare
         the agent for a new episode. Must be implemented by subclasses.
         """
-        pass
+        return
+
+    @abstractmethod
+    def encode_observation(self, observation: ObsType, *, is_init: bool) -> tuple[list[int], bool]:
+        """Encode an environment observation into token IDs.
+
+        Default implementation indicates "not implemented" so subclasses can
+        keep implementing `update_from_env` directly.
+
+        Returns:
+            (token_ids, is_prompt):
+              - token_ids: token ids derived from observation
+              - is_prompt: whether these ids should be treated as prompt_ids
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def decode_action_from_token_ids(self, token_ids: list[int]) -> ActType:
+        """Decode model-generated token ids into an environment action.
+
+        Default isn't implemented so subclasses can keep implementing
+        `update_from_model_token_ids` directly.
+        """
+        raise NotImplementedError
 
     def init_trajectory(self, request: Any) -> None:
         """Initialize a new trajectory based on the input request.
@@ -282,7 +416,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
     def update_trajectory_state_from_output(self, output: DataProto, **kwargs):
         """Update trajectory state based on model output dataproto."""
         self.trajectory.curr_rollout_instance_id = output.non_tensor_batch.get("rollout_instance_id", [None])[0]
-        self.trajectory.steps[-1].info["rollout_instance_id"] = output.non_tensor_batch.get(
+        self.get_current_step().info["rollout_instance_id"] = output.non_tensor_batch.get(
             "rollout_instance_id", [None]
         )[0]
 
@@ -385,6 +519,8 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
         data = DataProto(non_tensor_batch=non_tensor_batch, meta_info=request.meta_info)
 
+        output: DataProto = data
+
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
             assert not self.config.reward_model.launch_reward_fn_async, (
                 "Asynchronous reward computation is not supported in 'step' traj_reward_mode."
@@ -398,6 +534,11 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             reward_result = await self.reward_manager.compute_score.remote(data)
             if not self.config.reward_model.launch_reward_fn_async:
                 output = self._post_process_and_merge_reward(reward_result, data)
+        else:
+            raise ValueError(
+                f"Unknown traj_reward_mode: {self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode}"
+            )
+
         return output
 
     def _post_process_and_merge_reward(self, reward_result: dict[int, dict], outputs: DataProto) -> DataProto:

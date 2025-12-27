@@ -59,7 +59,6 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
         max_turns: int,
-        **kwargs,
     ):
         """
         Initialize the ToolEnvironment.
@@ -70,7 +69,10 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             max_turns: Maximum number of turns allowed in an episode
             **kwargs: Additional keyword arguments
         """
-        super().__init__(config, reward_manager, max_turns)
+        super().__init__(config, reward_manager)
+
+        self.max_turns = max_turns
+        self.num_turn = 0
 
     async def reset(self, task: DataProto, **kwargs) -> tuple[ConversationType, dict]:
         """Reset the environment to an initial state.

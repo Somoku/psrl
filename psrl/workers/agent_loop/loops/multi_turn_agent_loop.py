@@ -49,24 +49,6 @@ class MultiTurnAgentLoop(AgentLoopBase):
         cls.max_turns = config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
         cls.env_step_timeout = config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
-    def __init__(self, *args, **kwargs) -> None:
-        """Initialize the multi-turn agent loop."""
-        super().__init__(*args, **kwargs)
-        self.env = Environment.get_environment(
-            self.config.gen_actor_rollout_ref.rollout.agent.env.name,
-            self.config,
-            self.reward_manager,
-            self.max_turns,
-        )
-        self.agent_data = AgentData.get_agent_data(
-            "tool_agent_data",
-            self.config,
-            self.reward_manager,
-            self.tokenizer,
-            self.env.get_tool_schemas(),
-        )
-        self.agent_data.reset()
-
     @rollout_trace_op
     async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
         """Execute generation for a single request.
@@ -77,6 +59,28 @@ class MultiTurnAgentLoop(AgentLoopBase):
         Returns:
             Tuple[DataProto, TerminateReason]: Generated response with metadata and termination reason.
         """
+        env_class = request.non_tensor_batch.get(
+            "env_class", self.config.gen_actor_rollout_ref.rollout.agent.env.name
+        )[0]
+        data_class = request.non_tensor_batch.get(
+            "data_class", self.config.gen_actor_rollout_ref.rollout.agent.data.name
+        )[0]
+
+        self.env = Environment.get_environment(
+            env_class,
+            self.config,
+            self.reward_manager,
+            self.max_turns,
+        )
+        self.agent_data = AgentData.get_agent_data(
+            data_class,
+            self.config,
+            self.reward_manager,
+            self.tokenizer,
+            self.env,
+        )
+        self.agent_data.reset()
+
         observation, info = await self.env.reset(
             task=request,
             seed=request.non_tensor_batch.get("seed", None),

@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-from typing import Any
 
 import numpy as np
 import ray
@@ -9,10 +8,10 @@ from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
 
-from psrl.environments.base import ConversationType
+from psrl.environments.base import ConversationType, Environment
 from psrl.environments.tool_env import ToolAction
 from psrl.tools.tool_parser.base import ToolParser
-from psrl.workers.agent_loop.agent_data.base import AgentData, Step, Trajectory
+from psrl.workers.agent_loop.agent_data.base import AgentData, Trajectory
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -32,7 +31,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
     """
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
+    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, env: Environment, **kwargs):
         """Initialize class-level shared resources for all instances.
 
         This method sets up the tokenizer, maximum turns, and tool parser that
@@ -46,6 +45,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         if cls._class_initialized:
             return
         cls._class_initialized = True
+        cls.env = env
 
         # Initialize class-level attributes from config
         cls.tokenizer = tokenizer
@@ -59,7 +59,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
-        tool_schemas: list[dict[str, Any]],
+        env: Environment,
         **kwargs,
     ):
         """Initialize ToolAgentData instance.
@@ -71,9 +71,11 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             tool_schemas: List of tool schema dictionaries for chat template
             **kwargs: Additional keyword arguments from configuration
         """
-        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
-        super().__init__(config, reward_manager, tokenizer)
-        self.tool_schemas = tool_schemas
+        assert hasattr(env, "get_tool_schemas"), "Environment must implement get_tool_schemas method."
+
+        self.init_class(config=config, tokenizer=tokenizer, env=env, **kwargs)
+        super().__init__(config, reward_manager, tokenizer, env)
+        self.tool_schemas = env.get_tool_schemas()
         self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
 
         # Pre-compute system prompt for efficient token generation
@@ -83,6 +85,58 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             tokenize=True,
             **self.apply_chat_template_kwargs,
         )
+
+    def encode_observation(self, observation: ConversationType, *, is_init: bool) -> tuple[list[int], bool]:
+        """Encode tool-env conversation messages into token ids.
+
+        For the first observation, we include tool schemas and treat the result as prompt.
+        For subsequent observations, we drop the system prompt prefix and treat the result
+        as user-side tokens (masked out for training).
+        """
+        if not observation:
+            return [], is_init
+
+        if is_init:
+            token_ids = self.tokenizer.apply_chat_template(
+                observation,
+                tools=self.tool_schemas,
+                add_generation_prompt=True,
+                tokenize=True,
+                **self.apply_chat_template_kwargs,
+            )
+            return token_ids, True
+
+        token_ids = self.tokenizer.apply_chat_template(
+            observation,
+            add_generation_prompt=True,
+            tokenize=True,
+        )
+        token_ids = token_ids[len(self.system_prompt) :]
+        return token_ids, False
+
+    def format_chat_completions(self, observation: ConversationType, *, is_init: bool) -> ConversationType:
+        """ToolEnvironment already uses ConversationType as observation, so return as-is."""
+        return observation
+
+    def decode_action_from_token_ids(self, token_ids: list[int]) -> ToolAction:
+        """Decode model generated token ids into ToolAction.
+
+        Returns a list of OpenAI-function-call style dicts:
+        [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
+        """
+        _, tool_calls = self.tool_parser.extract_tool_calls(token_ids)
+        tool_calls_dict = [
+            {
+                "type": "function",
+                "function": tool_call.to_dict(),
+            }
+            for tool_call in tool_calls
+        ]
+        # Ensure tool call arguments are JSON strings (required by chat template)
+        for i, call in enumerate(tool_calls_dict):
+            if isinstance(call.get("function", {}).get("arguments"), dict):
+                tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        return tool_calls_dict
 
     def reset(self) -> None:
         """Reset the agent data to initial state.
@@ -141,55 +195,21 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         """
         is_init = len(self.trajectory.steps) == 0
         if len(self.trajectory.steps) < self.max_turns:
-            # Create a new step with the environment observation
-            step = Step(
-                chat_completions=[observation],
-                observation=observation,
-            )
-            self.trajectory.steps.append(step)
-            self.trajectory.steps[-1].tool_reward = reward
-            self.trajectory.steps[-1].done = done
-            self.trajectory.steps[-1].info = info
+            # Create a new step explicitly (avoids implicit steps[-1] contract).
+            step = self.start_step(observation=observation, reward=reward, done=done, info=info)
 
-            if observation:
-                # Apply chat template to convert observation to token IDs
-                if is_init:
-                    # Initial prompt includes tool schemas
-                    response_ids = self.tokenizer.apply_chat_template(
-                        observation,
-                        tools=self.tool_schemas,
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        **self.apply_chat_template_kwargs,
-                    )
-                else:
-                    # Subsequent turns don't need tool schemas again
-                    response_ids = self.tokenizer.apply_chat_template(
-                        observation,
-                        add_generation_prompt=True,
-                        tokenize=True,
-                    )
-                    # Remove system prompt prefix from subsequent turns
-                    response_ids = response_ids[len(self.system_prompt) :]
+            # Fill normalized ConversationType for logging/debugging.
+            step.chat_completions = self.format_chat_completions(observation, is_init=is_init)
 
-                if is_init:
-                    # First observation becomes the prompt
-                    self.trajectory.prompt_ids = response_ids
+            token_ids, is_prompt = self.encode_observation(observation, is_init=is_init)
+            if token_ids:
+                if is_prompt:
+                    self.append_prompt_ids(token_ids)
                 else:
-                    # Update trajectory state with new tokens
-                    self.trajectory.user_turns += 1
-                    self.trajectory.response_ids += response_ids
-                    self.trajectory.response_mask += [0] * len(response_ids)  # User tokens masked
-                    self.trajectory.response_length += len(response_ids)
-                    if self.trajectory.response_logprobs:
-                        # Mask logprobs for user tokens (not generated by model)
-                        self.trajectory.response_logprobs += [0.0] * len(response_ids)
+                    self.append_user_tokens(token_ids)
 
         # Check if response length limit is reached
-        if self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:
-            return True
-        else:
-            return False
+        return self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length
 
     async def update_from_model_token_ids(self, output: DataProto, **kwargs) -> tuple[ToolAction, bool]:
         """Update agent data from model token ids output.
@@ -205,57 +225,44 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             tuple: (tool_calls, done) where tool_calls is a list of tool call
                 dictionaries and done indicates if response limit is reached
         """
+        # Ensure we have a step to attach model output to.
+        if len(self.trajectory.steps) == 0:
+            # This should not happen in MultiTurnAgentLoop, but keep a safe fallback
+            # for custom loops or unexpected call orders.
+            self.start_step(observation=[], reward=None, done=False, info={})
+
         self.update_trajectory_state_from_output(output)
 
         response_ids = output.non_tensor_batch.pop("raw_response_ids", [None])[0]
         rollout_logprobs = output.non_tensor_batch.pop("rollout_log_probs", [None])[0]
 
         # Update trajectory state with model-generated tokens
-        self.trajectory.assistant_turns += 1
-        self.trajectory.response_ids += response_ids
-        self.trajectory.response_mask += [1] * len(response_ids)  # Use assistant tokens for training
-        self.trajectory.response_length += len(response_ids)
-        if rollout_logprobs:
-            self.trajectory.response_logprobs += rollout_logprobs
-
-        # Parse tool calls from the model response
-        try:
-            _, tool_calls = self.tool_parser.extract_tool_calls(response_ids)
-            tool_calls_dict = [
-                {
-                    "type": "function",
-                    "function": tool_call.to_dict(),
-                }
-                for tool_call in tool_calls
-            ]
-        except Exception as e:
-            psrl_logger.error(f"Failed to parse tool calls: {e}")
-            tool_calls_dict = []
+        self.append_assistant_tokens(response_ids, logprobs=rollout_logprobs)
 
         # Decode response text and create assistant message
         assistant_content = self.tokenizer.decode(response_ids, skip_special_tokens=True)
         assistant_message = {"role": "assistant", "content": assistant_content}
 
-        # Ensure tool call arguments are JSON strings (required by chat template)
-        if len(tool_calls_dict) > 0:
-            for i, call in enumerate(tool_calls_dict):
-                if isinstance(call.get("function", {}).get("arguments"), dict):
-                    tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        # Parse tool calls from the model response
+        try:
+            tool_calls_dict = self.decode_action_from_token_ids(response_ids)
+        except Exception as e:
+            psrl_logger.error("Failed to parse tool calls: %s", e)
+            tool_calls_dict = []
 
         # Update current step with assistant response
-        self.trajectory.steps[-1].chat_completions.append(assistant_message)
-        self.trajectory.steps[-1].model_response = assistant_content
-        self.trajectory.steps[-1].action = tool_calls_dict
+        self.add_step_chat_message(assistant_message)
+        self.set_step_model_response(assistant_content)
+        self.set_step_action(tool_calls_dict)
 
         # Compute step reward if using step-level reward mode
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
             output.non_tensor_batch["__num_turns__"] = np.array(
                 [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
             )
-            self.trajectory.steps[-1].model_reward = await self.reward_manager.compute_score.remote(output)
+            self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(output)
 
         # Check if response length limit is reached
         if self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:
             return [], True
-        else:
-            return tool_calls_dict, False
+        return tool_calls_dict, False

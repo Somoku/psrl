@@ -242,6 +242,12 @@ agent:
     # Timeout (in seconds) for each step in the environment.
     step_timeout: null
 
+  # Agent data configuration for the agent loop.
+  data:
+  
+    # Agent data class name
+    name: null
+
   # Maximum number of retries for each trajectory in case of failures.
   retry_limit: 1
 

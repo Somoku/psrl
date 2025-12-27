@@ -113,6 +113,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
     gen_actor_rollout_ref.rollout.multi_turn.format=hermes \
     gen_actor_rollout_ref.rollout.agent.env.name=tool_env \
+    gen_actor_rollout_ref.rollout.agent.data.name=tool_agent_data \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \

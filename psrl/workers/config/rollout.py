@@ -53,6 +53,11 @@ class EnvironmentConfig(BaseConfig):
 
 
 @dataclass
+class AgentDataConfig(BaseConfig):
+    name: str | None = MISSING
+
+
+@dataclass
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
     agent_loop_config_path: str | None = None
@@ -60,6 +65,7 @@ class AgentLoopConfig(BaseConfig):
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
     trajectory_timeout: float | None = None
     env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    data: AgentDataConfig = field(default_factory=AgentDataConfig)
     retry_limit: int = 1
     raise_on_error: bool = True
     gamma: float = 0.0

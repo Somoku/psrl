@@ -31,26 +31,21 @@ class Environment(ABC, Generic[ObsType, ActType]):
 
     Attributes:
         reward_manager: Ray actor handle for computing rewards
-        max_turns: Maximum number of turns allowed per episode
-        num_turn: Current turn number in the episode
         task: Current task being processed
     """
 
     _class_initialized = False
     _registry: dict[str, type["Environment"]] = {}
 
-    def __init__(self, config: DictConfig, reward_manager: ray.actor.ActorHandle, max_turns: int):
+    def __init__(self, config: DictConfig, reward_manager: ray.actor.ActorHandle):
         """Initialize the environment.
 
         Args:
             config: Configuration object containing training settings
             reward_manager: Ray actor handle for computing rewards
-            max_turns: Maximum number of turns allowed per episode
         """
         self.init_class(config=config)
         self.reward_manager = reward_manager
-        self.max_turns = max_turns
-        self.num_turn = 0
         self.task = None
 
     @classmethod
@@ -82,7 +77,7 @@ class Environment(ABC, Generic[ObsType, ActType]):
             tuple: (initial_observation, info_dict) where initial_observation is the
                    starting observation and info_dict contains additional metadata
         """
-        pass
+        return None, {}
 
     @abstractmethod
     async def step(self, action: ActType) -> EnvStepOutput:

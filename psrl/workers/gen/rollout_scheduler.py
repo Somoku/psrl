@@ -52,6 +52,47 @@ class RolloutScheduler(Scheduler):
             kv_connector_stats=connector_stats_payload,
         )
 
+    def _preempt_request(
+        self,
+        request: Request,
+        timestamp: float,
+    ) -> None:
+        """Preempt a request and put it back to the waiting queue.
+
+        NOTE: The request should be popped from the running queue outside of this
+        method.
+        """
+        assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
+        self.kv_cache_manager.free(request)
+        self.encoder_cache_manager.free(request)
+        request.status = RequestStatus.PREEMPTED
+        request.num_computed_tokens = 0
+        request.num_preemptions += 1
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
+
+        # NOTE(lhy): We examine the number of waiting requests to
+        # determine whether to abort the preempted request.
+        # Once aborted, the preempted request will be put back to
+        # the rollout router to be scheduled again.
+        max_num_waiting_reqs_after_preemption = self.vllm_config.additional_config.get(
+            "max_num_waiting_reqs_after_preemption", 0
+        )
+        if len(self.waiting) > max_num_waiting_reqs_after_preemption:
+            # NOTE(lhy): the `need_to_abort_reqs` is set and put
+            # into the scheduler stats. Afterwards inside vllm
+            # rollout, the abortion will be performed.
+            print(
+                f"Preempted request {request.request_id} is "
+                f"aborted because of "
+                f"max_num_waiting_reqs_after_preemption is "
+                f"{max_num_waiting_reqs_after_preemption}"
+            )
+            self.need_to_abort_reqs.append(request.request_id)
+
+        # Put the request back to the waiting queue.
+        self.waiting.prepend_request(request)
+
     # NOTE(lhy): The most of the code is copied from the vLLM 10.0.2 scheduler.
     # We refactor the logic of preemption to allow preempted sequences to directly returned as aborted.
     # So that we can allow rollout migration of the waiting requests between different instances.
@@ -191,27 +232,6 @@ class RolloutScheduler(Scheduler):
                         preempted_req = self.running.pop()
 
                     self._preempt_request(preempted_req, scheduled_timestamp)
-
-                    # NOTE(lhy): We examine the number of waiting requests to
-                    # determine whether to abort the preempted request.
-                    # Once aborted, the preempted request will be put back to
-                    # the rollout router to be scheduled again.
-                    max_num_waiting_reqs_after_preemption = self.vllm_config.additional_config.get(
-                        "max_num_waiting_reqs_after_preemption", 0
-                    )
-                    if len(self.waiting) > max_num_waiting_reqs_after_preemption:
-                        # NOTE(lhy): the `need_to_abort_reqs` is set and put
-                        # into the scheduler stats. Afterwards inside vllm
-                        # rollout, the abortion will be performed.
-                        print(
-                            f"Preempted request {preempted_req.request_id} is "
-                            f"aborted because of "
-                            f"max_num_waiting_reqs_after_preemption is "
-                            f"{max_num_waiting_reqs_after_preemption}"
-                        )
-                        self.need_to_abort_reqs.append(preempted_req.request_id)
-
-                    self.waiting.prepend_request(preempted_req)
                     preempted_reqs.append(preempted_req)
                     if preempted_req == request:
                         # No more request to preempt. Cannot schedule this request.

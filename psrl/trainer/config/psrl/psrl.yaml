@@ -41,12 +41,6 @@ log_prob:
   # Whether to return logprobs from rollout engines
   enable_rollout_engine_log_prob: True
 
-  # Whether to use proxy logprobs (AReaL)
-  enable_train_engine_recompute_log_prob: False
-
-  # rollout, recompute, tis
-  mode: rollout
-
 # Worker deployment and resource allocation
 deployment:
 

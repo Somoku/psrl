@@ -31,6 +31,9 @@ defaults:
   # (Rule-based) Reward manager config.
   - reward_manager@reward_manager
 
+  # Rollout correction config.
+  - algorithm@algorithm.rollout_correction: rollout_correction
+
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
   - _self_

@@ -1,3 +1,30 @@
+From 33ab1ab32c3fe6fe3b83c8598cf584c5a8aad87e Mon Sep 17 00:00:00 2001
+From: Somoku <linsh0@protonmail.com>
+Date: Mon, 29 Dec 2025 18:41:15 +0800
+Subject: [PATCH] verl patch
+
+---
+ recipe/dapo/test_dapo_7b_math.sh              |  24 +-
+ recipe/dapo/test_dapo_7b_math_megatron.sh     |  31 +-
+ verl/protocol.py                              |   2 +-
+ verl/single_controller/base/worker.py         |   3 +-
+ verl/single_controller/ray/base.py            |  55 ++-
+ verl/trainer/config/data/legacy_data.yaml     |   2 +-
+ verl/trainer/constants_ppo.py                 |   5 +-
+ verl/trainer/sft_trainer.py                   |   2 +-
+ verl/utils/checkpoint/__init__.py             |   4 -
+ verl/utils/import_utils.py                    |  60 ++-
+ verl/utils/megatron_utils.py                  |   4 +
+ verl/workers/actor/megatron_actor.py          |   3 +
+ verl/workers/fsdp_workers.py                  | 106 +++--
+ verl/workers/megatron_workers.py              | 170 ++++---
+ verl/workers/rollout/base.py                  |   1 +
+ verl/workers/rollout/vllm_rollout/__init__.py |   1 +
+ .../rollout/vllm_rollout/vllm_rollout.py      |   4 +-
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py | 441 ++++++++++++++++++
+ 18 files changed, 754 insertions(+), 164 deletions(-)
+ create mode 100644 verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
+
 diff --git a/recipe/dapo/test_dapo_7b_math.sh b/recipe/dapo/test_dapo_7b_math.sh
 index e7fa9926..c6d75bd5 100644
 --- a/recipe/dapo/test_dapo_7b_math.sh
@@ -435,19 +462,9 @@ index c319910d..8d2832ab 100644
      if config.pipeline_model_parallel_size > 1:
          if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout:
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
-index 466402ca..48870cf9 100644
+index 466402ca..5ed8a5bc 100644
 --- a/verl/workers/actor/megatron_actor.py
 +++ b/verl/workers/actor/megatron_actor.py
-@@ -291,8 +291,8 @@ class MegatronPPOActor(BasePPOActor):
-                         async_op=False,
-                     )
-                     entropys = entropys.to("cpu")
--                layers_topk_idx = None
- 
-+                layers_topk_idx = None
-                 if RouterReplayHelper.is_r2_record_action(self.tf_config):
-                     # (bs, max_seq_len/response_len,local_layer_num,topk)
-                     layers_topk_idx = output["mini_layer_topk_idx_tensor"].to(torch.uint8)
 @@ -386,6 +386,7 @@ class MegatronPPOActor(BasePPOActor):
          """
          # broadcast from last pp rank to all other pp ranks
@@ -649,10 +666,10 @@ index b7d89134..92cfd7f9 100644
  
      def _forward_micro_batch(self, micro_batch):
 diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
-index db2e3fb1..8e32f790 100644
+index db2e3fb1..97852f83 100644
 --- a/verl/workers/megatron_workers.py
 +++ b/verl/workers/megatron_workers.py
-@@ -32,51 +32,34 @@ try:
+@@ -32,14 +32,12 @@ try:
  except ImportError:
      repatch = None
  
@@ -661,26 +678,18 @@ index db2e3fb1..8e32f790 100644
  from verl import DataProto
  from verl.models.mcore import get_mcore_weight_converter
  from verl.single_controller.base import Worker
--from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
-+from verl.single_controller.base.decorator import (
-+    Dispatch, make_nd_compute_dataproto_dispatch_fn, register)
+ from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
  from verl.utils import hf_tokenizer
 -from verl.utils.checkpoint.megatron_checkpoint_manager import MegatronCheckpointManager
  from verl.utils.config import omega_conf_to_dataclass
--from verl.utils.device import (
--    get_device_id,
--    get_device_name,
--    get_nccl_backend,
--    get_torch_device,
--    set_expandable_segments,
--)
-+from verl.utils.device import (get_device_id, get_device_name,
-+                               get_nccl_backend, get_torch_device,
-+                               set_expandable_segments)
+ from verl.utils.device import (
+     get_device_id,
+@@ -51,17 +49,9 @@ from verl.utils.device import (
  from verl.utils.distributed import set_numa_affinity
  from verl.utils.flops_counter import FlopsCounter
  from verl.utils.fs import copy_to_local
--from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
++from verl.utils.import_utils import lazy_import_many_to_globals, lazy_import_to_globals
+ from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 -from verl.utils.megatron_utils import (
 -    load_megatron_model_to_gpu,
 -    load_megatron_optimizer,
@@ -689,27 +698,13 @@ index db2e3fb1..8e32f790 100644
 -    per_tensor_generator,
 -    register_megatron_training_hooks,
 -)
-+from verl.utils.import_utils import (lazy_import_many_to_globals,
-+                                     lazy_import_to_globals)
-+from verl.utils.megatron.router_replay_patch import (RouterReplay,
-+                                                     RouterReplayAction,
-+                                                     apply_router_replay_patch)
  from verl.utils.memory_utils import aggressive_empty_cache
 -from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
--from verl.utils.profiler import (
--    DistProfiler,
--    DistProfilerExtension,
--    GPUMemoryLogger,
--    ProfilerConfig,
--    log_gpu_memory_usage,
--    simple_timer,
--)
--from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
-+from verl.utils.profiler import (DistProfiler, DistProfilerExtension,
-+                                 GPUMemoryLogger, ProfilerConfig,
-+                                 log_gpu_memory_usage, simple_timer)
-+from verl.utils.profiler.performance import (reduce_timing,
-+                                             topk_reduce_ratio_min_max)
+ from verl.utils.profiler import (
+     DistProfiler,
+     DistProfilerExtension,
+@@ -73,10 +63,7 @@ from verl.utils.profiler import (
+ from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
  from verl.utils.ray_utils import get_event_loop
  from verl.utils.torch_functional import use_original_torch_compile
 -from verl.workers.actor.megatron_actor import MegatronPPOActor
@@ -719,17 +714,7 @@ index db2e3fb1..8e32f790 100644
  from verl.workers.rollout import get_rollout_class
  
  logger = logging.getLogger(__file__)
-@@ -154,7 +137,8 @@ class MegatronWorker(Worker):
-         if self.rank == 0:
-             print(f"Model config after override: {hf_config}")
- 
--        from verl.models.mcore.config_converter import mapping_string_to_attn_backend
-+        from verl.models.mcore.config_converter import \
-+            mapping_string_to_attn_backend
- 
-         # todo: remove this line after mcore adopt mbridge 0.15, now for compatibility
-         override_transformer_config = mapping_string_to_attn_backend(override_transformer_config)
-@@ -248,12 +232,54 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -248,12 +235,54 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
          self._is_ref = self.role in ["ref", "actor_rollout_ref"]
  
@@ -784,7 +769,7 @@ index db2e3fb1..8e32f790 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -287,48 +313,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -287,48 +316,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              )
          only_rollout = self._is_rollout and not self._is_actor
  
@@ -833,28 +818,22 @@ index db2e3fb1..8e32f790 100644
          # normalize config
          if self._is_actor:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -357,12 +343,14 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
-         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
-     ):
-         from verl.utils.megatron.optimizer import (
--            get_megatron_optimizer,
--            get_megatron_optimizer_param_scheduler,
--            init_megatron_optim_config,
--        )
--        from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
+@@ -362,7 +351,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+             init_megatron_optim_config,
+         )
+         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
 -        from verl.utils.model import get_generation_config, print_model_size
-+            get_megatron_optimizer, get_megatron_optimizer_param_scheduler,
-+            init_megatron_optim_config)
-+        from verl.utils.megatron_utils import (McoreModuleWrapperConfig,
-+                                               make_megatron_module)
-+        from verl.utils.model import (get_generation_config, get_hf_model_path,
-+                                      load_mcore_dist_weights,
-+                                      load_megatron_gptmodel_weights,
-+                                      print_model_size)
++        from verl.utils.model import (
++            get_generation_config,
++            get_hf_model_path,
++            load_mcore_dist_weights,
++            load_megatron_gptmodel_weights,
++            print_model_size
++        )
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -548,6 +536,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -548,6 +543,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              importlib.import_module(self.config.model.external_lib)
  
          from verl.utils.torch_dtypes import PrecisionType
@@ -873,7 +852,7 @@ index db2e3fb1..8e32f790 100644
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          if self._is_actor:
-@@ -723,7 +723,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -723,7 +730,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          get_torch_device().set_rng_state(self.torch_random_states)
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -881,7 +860,7 @@ index db2e3fb1..8e32f790 100644
      @DistProfiler.annotate(color="red")
      def update_actor(self, data: DataProto):
          assert self._is_actor
-@@ -766,7 +765,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -766,7 +772,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -889,7 +868,7 @@ index db2e3fb1..8e32f790 100644
      @DistProfiler.annotate(color="red")
      def generate_sequences(self, prompts: DataProto):
          assert self._is_rollout
-@@ -816,7 +814,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -816,7 +821,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -897,7 +876,7 @@ index db2e3fb1..8e32f790 100644
      @DistProfiler.annotate(color="olive")
      def compute_ref_log_prob(self, data: DataProto):
          assert self._is_ref
-@@ -838,7 +835,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -838,7 +842,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -905,17 +884,7 @@ index db2e3fb1..8e32f790 100644
      @DistProfiler.annotate(color="blue")
      def compute_log_prob(self, data: DataProto):
          assert self._is_actor
-@@ -915,7 +911,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
- 
-     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-     def async_calls_finalize_fn_exec(self, blocking=False):
--        from megatron.core.dist_checkpointing.strategies.base import async_calls
-+        from megatron.core.dist_checkpointing.strategies.base import \
-+            async_calls
- 
-         async_calls.maybe_finalize_async_calls(blocking=blocking)
- 
-@@ -998,12 +995,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -998,12 +1001,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config: McoreCriticConfig = config
  
@@ -937,7 +906,7 @@ index db2e3fb1..8e32f790 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1035,11 +1041,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1035,11 +1047,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
  
          set_random_seed(seed=self.config.megatron.seed)
@@ -950,7 +919,7 @@ index db2e3fb1..8e32f790 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
-@@ -1047,18 +1049,18 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1047,8 +1055,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
              self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
  
@@ -959,25 +928,21 @@ index db2e3fb1..8e32f790 100644
      def _build_critic_model_optimizer(
          self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
      ):
-         from verl.utils.megatron.optimizer import (
--            get_megatron_optimizer,
--            get_megatron_optimizer_param_scheduler,
--            init_megatron_optim_config,
--        )
--        from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
+@@ -1058,7 +1064,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+             init_megatron_optim_config,
+         )
+         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
 -        from verl.utils.model import print_model_size
-+            get_megatron_optimizer, get_megatron_optimizer_param_scheduler,
-+            init_megatron_optim_config)
-+        from verl.utils.megatron_utils import (McoreModuleWrapperConfig,
-+                                               make_megatron_module)
-+        from verl.utils.model import (get_hf_model_path,
-+                                      load_mcore_dist_weights,
-+                                      load_megatron_gptmodel_weights,
-+                                      print_model_size)
++        from verl.utils.model import (
++            get_hf_model_path,
++            load_mcore_dist_weights,
++            load_megatron_gptmodel_weights,
++            print_model_size,
++        )
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1141,12 +1143,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1141,12 +1152,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType
@@ -1001,7 +966,7 @@ index db2e3fb1..8e32f790 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          override_transformer_config = OmegaConf.to_container(
              OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
-@@ -1300,12 +1313,15 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1300,12 +1322,15 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config = config
  
@@ -1017,20 +982,15 @@ index db2e3fb1..8e32f790 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1344,7 +1360,11 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
-             self.config.micro_batch_size_per_gpu = self.config.micro_batch_size
+@@ -1345,6 +1370,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
  
      def _build_rm_model(self, model_path, tokenizer, override_model_config, override_transformer_config):
--        from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
-+        from verl.utils.megatron_utils import (McoreModuleWrapperConfig,
-+                                               make_megatron_module)
-+        from verl.utils.model import (get_hf_model_path,
-+                                      load_mcore_dist_weights,
-+                                      load_megatron_gptmodel_weights)
+         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
++        from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1402,12 +1422,22 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1402,12 +1428,22 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType
@@ -1101,7 +1061,7 @@ index 42a1cd96..70d35891 100644
          return address
 diff --git a/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
 new file mode 100644
-index 00000000..fd3c2747
+index 00000000..34392a32
 --- /dev/null
 +++ b/verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
 @@ -0,0 +1,441 @@
@@ -1546,4 +1506,6 @@ index 00000000..fd3c2747
 +            model.load_weights(weights)
 +
 +            
-\ No newline at end of file
+-- 
+2.43.0
+

@@ -232,7 +232,11 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-            data = data.to(get_device_id())
+            for k, v in data.batch.items():
+                if k != "routed_experts":
+                    data.batch[k] = v.to(get_device_id())
+                else:
+                    data.batch[k] = v
 
             if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)

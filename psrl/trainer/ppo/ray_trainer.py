@@ -397,29 +397,6 @@ class PSRL_RayPPOTrainer:
                 f"NOTICE: NIXL is enabled. Actor strategy used is {self.config.train_actor_rollout_ref.actor.strategy}"
             )
 
-        # Check log_prob mode
-        if self.config.psrl.log_prob.mode == "rollout":
-            assert self.config.psrl.log_prob.enable_rollout_engine_log_prob, (
-                "enable_rollout_engine_log_prob must be set when using rollout log_prob"
-            )
-        elif self.config.psrl.log_prob.mode == "recompute":
-            assert self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, (
-                "enable_train_engine_recompute_log_prob must be set when using recompute log_prob"
-            )
-        elif self.config.psrl.log_prob.mode == "tis":
-            assert (
-                self.config.psrl.log_prob.enable_rollout_engine_log_prob
-                and self.config.psrl.log_prob.enable_train_engine_recompute_log_prob
-            ), (
-                "enable_rollout_engine_log_prob and enable_train_engine_recompute_log_prob "
-                "must be set when using TIS log_prob"
-            )
-        else:
-            raise ValueError(
-                f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}, "
-                "must be one of ['rollout', 'recompute', 'tis']"
-            )
-
         # Check colocate mode
         if self.config.psrl.colocate:
             assert self.config.psrl.gen_mode == "batch", "gen_mode must be batch when using colocate mode"
@@ -1798,10 +1775,25 @@ class PSRL_RayPPOTrainer:
                     self.config.train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
                 )
                 batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
-                if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
-                    # batch.batch["rollout_log_probs"] can be used directly
-                    pass
-                if self.config.psrl.log_prob.enable_train_engine_recompute_log_prob:
+
+                # Operating Mode Selection:
+                # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+
+                if bypass_recomputing_logprobs:
+                    from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
+
+                    apply_rollout_correction(
+                        batch=batch,
+                        rollout_corr_config=rollout_corr_config,
+                        policy_loss_config=self.config.train_actor_rollout_ref.actor.policy_loss,
+                    )
+
+                    batch.batch.pop("rollout_log_probs")
+                else:
                     # recompute log_probs in the training side
                     with marked_timer("recompute_log_prob", timing_raw, color="orange"):
                         with log_dual_events(
@@ -1844,18 +1836,8 @@ class PSRL_RayPPOTrainer:
                                         "training/probs_diff_std": probs_diff_std.detach().item(),
                                     }
                                 )
-
-                if self.config.psrl.log_prob.mode == "rollout":
-                    batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
-                    batch.batch.pop("rollout_log_probs")
-                elif self.config.psrl.log_prob.mode == "recompute":
                     batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
                     batch.batch.pop("recomputed_log_probs")
-                elif self.config.psrl.log_prob.mode == "tis":
-                    batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
-                    batch.batch.pop("recomputed_log_probs")
-                else:
-                    raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}")
 
                 if self.use_reference_policy:
                     # compute reference log_prob
@@ -1956,8 +1938,24 @@ class PSRL_RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        if (
+                            rollout_corr_config is not None
+                            and "rollout_log_probs" in batch.batch
+                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                        ):
+                            from verl.trainer.ppo.rollout_corr_helper import (
+                                compute_rollout_correction_and_add_to_batch,
+                            )
 
+                            # Compute IS weights, apply rejection sampling, compute metrics
+                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            metrics.update(is_metrics)
+
+                        # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor

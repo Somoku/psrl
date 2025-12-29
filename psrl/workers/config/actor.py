@@ -122,7 +122,6 @@ class ActorConfig(BaseConfig):
     loss_scale_factor: int | None = None
     entropy_coeff: float = 0
     calculate_entropy: bool = False
-    tis_imp_ratio_cap: float = -1
     use_kl_loss: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001

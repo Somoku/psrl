@@ -435,31 +435,26 @@ index c319910d..8d2832ab 100644
      if config.pipeline_model_parallel_size > 1:
          if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout:
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
-index 466402ca..7861c82e 100644
+index 466402ca..5ed8a5bc 100644
 --- a/verl/workers/actor/megatron_actor.py
 +++ b/verl/workers/actor/megatron_actor.py
-@@ -352,6 +352,13 @@ class MegatronPPOActor(BasePPOActor):
-         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
-         if "rollout_log_probs" in data.batch.keys():
-             select_keys.append("rollout_log_probs")
-+        if self.config.tis_imp_ratio_cap > 0:
-+            assert "rollout_log_probs" in data.batch.keys(), (
-+                "Truncated Importance Sampling (TIS) requires to configure "
-+                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-+                "and is not currently supported in Server mode (agent loop)."
-+            )
-+            select_keys.append("rollout_log_probs")
-         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-         # router replay
-         if self.enable_routing_replay:
-@@ -475,6 +482,7 @@ class MegatronPPOActor(BasePPOActor):
-             stats = {}
-             if not forward_only:
-                 old_log_prob = data["old_log_probs"]
-+                rollout_log_probs = data["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
-                 advantages = data["advantages"]
- 
-                 entropy_coeff = self.config.entropy_coeff
+@@ -386,6 +386,7 @@ class MegatronPPOActor(BasePPOActor):
+         """
+         # broadcast from last pp rank to all other pp ranks
+         # TODO: actually, we just need to control the sampling order.
++        routed_experts = data.batch.pop("routed_experts", None)
+         data.to(get_device_id())
+         data.batch = data.batch.contiguous()
+         mini_batch = data
+@@ -395,6 +396,8 @@ class MegatronPPOActor(BasePPOActor):
+             group=mpu.get_pipeline_model_parallel_group(),
+         )
+         mini_batch.to("cpu")
++        if routed_experts is not None:
++            mini_batch.batch["routed_experts"] = routed_experts
+         # split into micro-batches
+         mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
+         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
 index b7d89134..92cfd7f9 100644
 --- a/verl/workers/fsdp_workers.py
@@ -644,7 +639,7 @@ index b7d89134..92cfd7f9 100644
  
      def _forward_micro_batch(self, micro_batch):
 diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
-index db2e3fb1..ede1aa05 100644
+index db2e3fb1..97852f83 100644
 --- a/verl/workers/megatron_workers.py
 +++ b/verl/workers/megatron_workers.py
 @@ -32,14 +32,12 @@ try:
@@ -681,126 +676,122 @@ index db2e3fb1..ede1aa05 100644
  from verl.utils.profiler import (
      DistProfiler,
      DistProfilerExtension,
-@@ -73,10 +63,8 @@ from verl.utils.profiler import (
+@@ -73,10 +63,7 @@ from verl.utils.profiler import (
  from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
  from verl.utils.ray_utils import get_event_loop
  from verl.utils.torch_functional import use_original_torch_compile
 -from verl.workers.actor.megatron_actor import MegatronPPOActor
-+
  from verl.workers.config import HFModelConfig, McoreCriticConfig, RolloutConfig
 -from verl.workers.critic.megatron_critic import MegatronPPOCritic
 -from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
  from verl.workers.rollout import get_rollout_class
  
  logger = logging.getLogger(__file__)
-@@ -248,45 +236,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -248,12 +235,54 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
          self._is_ref = self.role in ["ref", "actor_rollout_ref"]
  
--        # NOTE(sgm): We utilize colocate WorkerGroup by default.
--        # As a result, Workers for different model share the same process.
--        # Therefore, we only require one distribute initialization.
--        # To utilize different parallel strategy in different models:
--        # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
--        # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
--        if not torch.distributed.is_initialized():
--            set_numa_affinity()
--            rank = int(os.environ["LOCAL_RANK"])
--            torch.distributed.init_process_group(
--                backend=get_nccl_backend(),
--                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
--                init_method=os.environ.get("DIST_INIT_METHOD", None),
--            )
--            get_torch_device().set_device(rank)
--
--            if self._is_actor or self._is_ref:
--                mpu.initialize_model_parallel(
--                    tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
--                    pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
--                    virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
--                    use_sharp=False,
--                    context_parallel_size=self.config.actor.megatron.context_parallel_size,
--                    expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
--                    expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
--                    nccl_communicator_config_path=None,
--                )
--
--        if self._is_actor or self._is_ref:
--            is_collect = (
--                mpu.get_tensor_model_parallel_rank() == 0
--                and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
--                and mpu.get_context_parallel_rank() == 0
--            )
--            self._register_dispatch_collect_info(
--                mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
--            )
--        only_rollout = self._is_rollout and not self._is_actor
--
-         self.enable_routing_replay = False
-         if self._is_actor:
-             self.router_replay = self.config.actor.router_replay
-@@ -294,9 +243,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
- 
-         if self.enable_routing_replay:
-             apply_router_replay_patch()
--
--        set_random_seed(seed=self.config.actor.megatron.seed, only_rollout=only_rollout)
--
-         if self._is_actor:
-             omega_profiler_config = config.actor.get("profiler", {})
-         elif self._is_rollout:
-@@ -353,6 +299,50 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
-                 )
-             self._ref_is_offload_param = self.config.ref.megatron.get("param_offload", False)
- 
++        self.enable_routing_replay = False
++        if self._is_actor:
++            self.router_replay = self.config.actor.router_replay
++            self.enable_routing_replay = self.router_replay.mode != "disabled"
++
++        if self.enable_routing_replay:
++            apply_router_replay_patch()
++        if self._is_actor:
++            omega_profiler_config = config.actor.get("profiler", {})
++        elif self._is_rollout:
++            # NOTE: In colocation mode, rollout config may not take effect (follow the actor config)
++            # This is for extendability in AsyncRL cases
++            omega_profiler_config = config.rollout.get("profiler", {})
++        elif self._is_ref:
++            omega_profiler_config = config.ref.get("profiler", {})
++        else:
++            raise ValueError(
++                f"Invalid role {self.role}, should be one of "
++                "['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']"
++            )
++        # omega_profiler_config is DictConfig
++        # profiler_config is a ProfilerConfig dataclass
++        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
++        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
++            tool_config = omega_conf_to_dataclass(
++                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
++            )
++        else:
++            tool_config = None
++        DistProfilerExtension.__init__(
++            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
++        )
++
++        # TODO(sgm): Currently, we only support reference model param offload
++        # will support other offload later
++        self._is_offload_param = False
++        self._is_offload_grad = False
++        self._is_offload_optimizer = False
++
 +    def _build_distributed(self):
-+        # NOTE(sgm): We utilize colocate WorkerGroup by default.
-+        # As a result, Workers for different model share the same process.
-+        # Therefore, we only require one distribute initialization.
-+        # To utilize different parallel strategy in different models:
-+        # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
-+        # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
+         # NOTE(sgm): We utilize colocate WorkerGroup by default.
+         # As a result, Workers for different model share the same process.
+         # Therefore, we only require one distribute initialization.
+         # To utilize different parallel strategy in different models:
+         # 1, users should disable WorkerDict; 2.assign different ResourcePool to different models,
+         # 3. and apply the following patch in ray==2.10, https://github.com/ray-project/ray/pull/44385
 +        from megatron.core import parallel_state as mpu
 +
-+        if not torch.distributed.is_initialized():
-+            set_numa_affinity()
-+            rank = int(os.environ["LOCAL_RANK"])
-+            torch.distributed.init_process_group(
-+                backend=get_nccl_backend(),
-+                timeout=datetime.timedelta(seconds=self.config.get("nccl_timeout", 600)),
-+                init_method=os.environ.get("DIST_INIT_METHOD", None),
-+            )
-+            get_torch_device().set_device(rank)
-+
-+            if self._is_actor or self._is_ref:
-+                mpu.initialize_model_parallel(
-+                    tensor_model_parallel_size=self.config.actor.megatron.tensor_model_parallel_size,
-+                    pipeline_model_parallel_size=self.config.actor.megatron.pipeline_model_parallel_size,
-+                    virtual_pipeline_model_parallel_size=self.config.actor.megatron.virtual_pipeline_model_parallel_size,
-+                    use_sharp=False,
-+                    context_parallel_size=self.config.actor.megatron.context_parallel_size,
-+                    expert_model_parallel_size=self.config.actor.megatron.expert_model_parallel_size,
-+                    expert_tensor_parallel_size=self.config.actor.megatron.expert_tensor_parallel_size,
-+                    nccl_communicator_config_path=None,
-+                )
-+
-+        if self._is_actor or self._is_ref:
-+            is_collect = (
-+                mpu.get_tensor_model_parallel_rank() == 0
-+                and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
-+                and mpu.get_context_parallel_rank() == 0
-+            )
-+            self._register_dispatch_collect_info(
-+                mesh_name="actor", dp_rank=mpu.get_data_parallel_rank(), is_collect=is_collect
-+            )
-+        only_rollout = self._is_rollout and not self._is_actor
-+
-+        set_random_seed(seed=self.config.actor.megatron.seed, only_rollout=only_rollout)
-+
-     def _build_model_optimizer(
-         self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config=None
-     ):
-@@ -362,7 +352,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+         if not torch.distributed.is_initialized():
+             set_numa_affinity()
+             rank = int(os.environ["LOCAL_RANK"])
+@@ -287,48 +316,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+             )
+         only_rollout = self._is_rollout and not self._is_actor
+ 
+-        self.enable_routing_replay = False
+-        if self._is_actor:
+-            self.router_replay = self.config.actor.router_replay
+-            self.enable_routing_replay = self.router_replay.mode != "disabled"
+-
+-        if self.enable_routing_replay:
+-            apply_router_replay_patch()
+-
+         set_random_seed(seed=self.config.actor.megatron.seed, only_rollout=only_rollout)
+ 
+-        if self._is_actor:
+-            omega_profiler_config = config.actor.get("profiler", {})
+-        elif self._is_rollout:
+-            # NOTE: In colocation mode, rollout config may not take effect (follow the actor config)
+-            # This is for extendability in AsyncRL cases
+-            omega_profiler_config = config.rollout.get("profiler", {})
+-        elif self._is_ref:
+-            omega_profiler_config = config.ref.get("profiler", {})
+-        else:
+-            raise ValueError(
+-                f"Invalid role {self.role}, should be one of "
+-                "['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']"
+-            )
+-        # omega_profiler_config is DictConfig
+-        # profiler_config is a ProfilerConfig dataclass
+-        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+-        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory"]:
+-            tool_config = omega_conf_to_dataclass(
+-                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+-            )
+-        else:
+-            tool_config = None
+-        DistProfilerExtension.__init__(
+-            self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
+-        )
+-
+-        # TODO(sgm): Currently, we only support reference model param offload
+-        # will support other offload later
+-        self._is_offload_param = False
+-        self._is_offload_grad = False
+-        self._is_offload_optimizer = False
+-
+         # normalize config
+         if self._is_actor:
+             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+@@ -362,7 +351,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              init_megatron_optim_config,
          )
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -810,12 +801,12 @@ index db2e3fb1..ede1aa05 100644
 +            get_hf_model_path,
 +            load_mcore_dist_weights,
 +            load_megatron_gptmodel_weights,
-+            print_model_size,
++            print_model_size
 +        )
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -548,6 +544,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -548,6 +543,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              importlib.import_module(self.config.model.external_lib)
  
          from verl.utils.torch_dtypes import PrecisionType
@@ -834,7 +825,7 @@ index db2e3fb1..ede1aa05 100644
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          if self._is_actor:
-@@ -723,7 +731,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -723,7 +730,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          get_torch_device().set_rng_state(self.torch_random_states)
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -842,7 +833,7 @@ index db2e3fb1..ede1aa05 100644
      @DistProfiler.annotate(color="red")
      def update_actor(self, data: DataProto):
          assert self._is_actor
-@@ -766,7 +773,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -766,7 +772,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -850,7 +841,7 @@ index db2e3fb1..ede1aa05 100644
      @DistProfiler.annotate(color="red")
      def generate_sequences(self, prompts: DataProto):
          assert self._is_rollout
-@@ -816,7 +822,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -816,7 +821,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -858,7 +849,7 @@ index db2e3fb1..ede1aa05 100644
      @DistProfiler.annotate(color="olive")
      def compute_ref_log_prob(self, data: DataProto):
          assert self._is_ref
-@@ -838,7 +843,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -838,7 +842,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -866,7 +857,7 @@ index db2e3fb1..ede1aa05 100644
      @DistProfiler.annotate(color="blue")
      def compute_log_prob(self, data: DataProto):
          assert self._is_actor
-@@ -998,12 +1002,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -998,12 +1001,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config: McoreCriticConfig = config
  
@@ -888,7 +879,7 @@ index db2e3fb1..ede1aa05 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1035,11 +1048,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1035,11 +1047,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
  
          set_random_seed(seed=self.config.megatron.seed)
@@ -901,7 +892,7 @@ index db2e3fb1..ede1aa05 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
-@@ -1047,8 +1056,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1047,8 +1055,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
              self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
  
@@ -910,7 +901,7 @@ index db2e3fb1..ede1aa05 100644
      def _build_critic_model_optimizer(
          self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
      ):
-@@ -1058,7 +1065,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1058,7 +1064,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              init_megatron_optim_config,
          )
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -924,7 +915,7 @@ index db2e3fb1..ede1aa05 100644
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1141,12 +1153,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1141,12 +1152,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType
@@ -948,7 +939,7 @@ index db2e3fb1..ede1aa05 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          override_transformer_config = OmegaConf.to_container(
              OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
-@@ -1300,12 +1323,15 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1300,12 +1322,15 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config = config
  
@@ -964,7 +955,7 @@ index db2e3fb1..ede1aa05 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1345,6 +1371,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1345,6 +1370,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
  
      def _build_rm_model(self, model_path, tokenizer, override_model_config, override_transformer_config):
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -972,7 +963,7 @@ index db2e3fb1..ede1aa05 100644
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1402,12 +1429,22 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1402,12 +1428,22 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType

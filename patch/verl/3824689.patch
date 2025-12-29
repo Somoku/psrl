@@ -435,31 +435,36 @@ index c319910d..8d2832ab 100644
      if config.pipeline_model_parallel_size > 1:
          if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout:
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
-index 466402ca..7861c82e 100644
+index 466402ca..48870cf9 100644
 --- a/verl/workers/actor/megatron_actor.py
 +++ b/verl/workers/actor/megatron_actor.py
-@@ -352,6 +352,13 @@ class MegatronPPOActor(BasePPOActor):
-         # Include rollout_log_probs for computing rollout_corr metrics in bypass mode
-         if "rollout_log_probs" in data.batch.keys():
-             select_keys.append("rollout_log_probs")
-+        if self.config.tis_imp_ratio_cap > 0:
-+            assert "rollout_log_probs" in data.batch.keys(), (
-+                "Truncated Importance Sampling (TIS) requires to configure "
-+                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-+                "and is not currently supported in Server mode (agent loop)."
-+            )
-+            select_keys.append("rollout_log_probs")
-         self.has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
-         # router replay
-         if self.enable_routing_replay:
-@@ -475,6 +482,7 @@ class MegatronPPOActor(BasePPOActor):
-             stats = {}
-             if not forward_only:
-                 old_log_prob = data["old_log_probs"]
-+                rollout_log_probs = data["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
-                 advantages = data["advantages"]
+@@ -291,8 +291,8 @@ class MegatronPPOActor(BasePPOActor):
+                         async_op=False,
+                     )
+                     entropys = entropys.to("cpu")
+-                layers_topk_idx = None
  
-                 entropy_coeff = self.config.entropy_coeff
++                layers_topk_idx = None
+                 if RouterReplayHelper.is_r2_record_action(self.tf_config):
+                     # (bs, max_seq_len/response_len,local_layer_num,topk)
+                     layers_topk_idx = output["mini_layer_topk_idx_tensor"].to(torch.uint8)
+@@ -386,6 +386,7 @@ class MegatronPPOActor(BasePPOActor):
+         """
+         # broadcast from last pp rank to all other pp ranks
+         # TODO: actually, we just need to control the sampling order.
++        routed_experts = data.batch.pop("routed_experts", None)
+         data.to(get_device_id())
+         data.batch = data.batch.contiguous()
+         mini_batch = data
+@@ -395,6 +396,8 @@ class MegatronPPOActor(BasePPOActor):
+             group=mpu.get_pipeline_model_parallel_group(),
+         )
+         mini_batch.to("cpu")
++        if routed_experts is not None:
++            mini_batch.batch["routed_experts"] = routed_experts
+         # split into micro-batches
+         mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
+         self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
 index b7d89134..92cfd7f9 100644
 --- a/verl/workers/fsdp_workers.py

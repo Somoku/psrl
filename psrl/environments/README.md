@@ -8,7 +8,7 @@ This document explains **what an Environment and AgentData are in PSRL**, and ho
 > - `Environment[ObsType, ActType]` (defines the interaction dynamics)
 > - `AgentData[ObsType, ActType]` (adapts env observations to model tokens, and model tokens to env actions)
 >
-> Then select them in config: `rollout.agent.env.name` and `rollout.agent.data.name`.
+> Then select them in config: `rollout.agent.env.name` and `rollout.agent.data.name` or per-request in `DataProto`.
 
 ## Concept Overview
 
@@ -155,15 +155,14 @@ MyAct = dict[str, Any]
 class MyAgentData(AgentData[MyObs, MyAct]):
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, env: Environment, **kwargs):
+    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
         if cls._class_initialized:
             return
         cls._class_initialized = True
-        cls.env = env
         cls.tokenizer = tokenizer
 
     def __init__(self, config: DictConfig, reward_manager: ray.actor.ActorHandle, tokenizer: AutoTokenizer, env: Environment, **kwargs):
-        self.init_class(config=config, tokenizer=tokenizer, env=env, **kwargs)
+        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
         super().__init__(config, reward_manager, tokenizer, env)
 
     def reset(self) -> None:
@@ -252,7 +251,16 @@ Make sure:
    - The simplest way is to add them to some package `__init__.py` import, or ensure your runner imports the module.
 2. Set config values:
 
+If all training data use the same environment and agent data, you can set in your config:
+
 ```yaml
 gen_actor_rollout_ref.rollout.agent.env.name: "my_env"
 gen_actor_rollout_ref.rollout.agent.data.name: "my_agent_data"
+```
+
+Otherwise, you can set them per-request in the `DataProto` non-tensor batch:
+
+```python
+request.non_tensor_batch["env_class"] = np.array(["my_env"])
+request.non_tensor_batch["data_class"] = np.array(["my_agent_data"])
 ```

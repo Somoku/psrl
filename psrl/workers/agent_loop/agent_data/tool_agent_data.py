@@ -31,7 +31,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
     """
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, env: Environment, **kwargs):
+    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
         """Initialize class-level shared resources for all instances.
 
         This method sets up the tokenizer, maximum turns, and tool parser that
@@ -45,7 +45,6 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         if cls._class_initialized:
             return
         cls._class_initialized = True
-        cls.env = env
 
         # Initialize class-level attributes from config
         cls.tokenizer = tokenizer
@@ -73,9 +72,9 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         """
         assert hasattr(env, "get_tool_schemas"), "Environment must implement get_tool_schemas method."
 
-        self.init_class(config=config, tokenizer=tokenizer, env=env, **kwargs)
+        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
         super().__init__(config, reward_manager, tokenizer, env)
-        self.tool_schemas = env.get_tool_schemas()
+        self.tool_schemas = self.env.get_tool_schemas()
         self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
 
         # Pre-compute system prompt for efficient token generation

@@ -165,10 +165,11 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             tokenizer: Tokenizer for converting between text and tokens
             **kwargs: Additional keyword arguments from configuration
         """
-        self.init_class(config=config, tokenizer=tokenizer, env=env, **kwargs)
+        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
         self.config = config
         self.reward_manager = reward_manager
         self.tokenizer = tokenizer
+        self.env = env
         self.trajectory = Trajectory()
 
         # Discount factor for reward discounting (default: 0.0)
@@ -177,7 +178,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.reward_bonus_coeff = self.config.gen_actor_rollout_ref.rollout.agent.reward_bonus_coeff
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, env: Environment, **kwargs):
+    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
         """This is used to do heavy initialization work that should shared across all instances. It's only called once.
 
         Args:
@@ -188,7 +189,6 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         if cls._class_initialized:
             return
         cls._class_initialized = True
-        cls.env = env
 
     def start_step(self, observation: ObsType, reward: float | None, done: bool, info: dict | None) -> Step:
         """Start (append) a new step to the trajectory.

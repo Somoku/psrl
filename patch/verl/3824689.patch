@@ -335,24 +335,42 @@ index df927583..1ce90c5e 100644
 -
 -__all__ = ["CheckpointHandler", "OrchestrationMode"]
 diff --git a/verl/utils/import_utils.py b/verl/utils/import_utils.py
-index 626b6285..1e499417 100644
+index 626b6285..f3b21fb9 100644
 --- a/verl/utils/import_utils.py
 +++ b/verl/utils/import_utils.py
-@@ -21,7 +21,7 @@ import importlib.util
+@@ -18,10 +18,11 @@ We assume package availability won't change during runtime.
+ 
+ import importlib
+ import importlib.util
++import inspect
  import os
  import warnings
  from functools import cache, wraps
 -from typing import Optional
-+from typing import Optional, Any
++from typing import Any, Optional
  
  
  @cache
-@@ -201,3 +201,42 @@ def load_extern_object(module_path: str, object_name: str) -> object:
+@@ -74,8 +75,6 @@ def import_external_libs(external_libs=None):
+         return
+     if not isinstance(external_libs, list):
+         external_libs = [external_libs]
+-    import importlib
+-
+     for external_lib in external_libs:
+         importlib.import_module(external_lib)
+ 
+@@ -201,3 +200,58 @@ def load_extern_object(module_path: str, object_name: str) -> object:
  def load_extern_type(file_path: str, type_name: str) -> type:
      """DEPRECATED. Directly use `load_extern_object` instead."""
      return load_extern_object(file_path, type_name)
 +
-+def lazy_import_to_globals(module_path: str, name: str, *, alias: str | None = None) -> Any:
++def lazy_import_to_globals(
++    module_path: str,
++    name: str,
++    alias: Optional[str] = None,
++    target_globals: Optional[dict[str, Any]] = None,
++) -> Any:
 +    """
 +    Lazily import an object from a module and store it in the global namespace.
 +    Equivalent to
@@ -364,32 +382,43 @@ index 626b6285..1e499417 100644
 +        name (str): The name of the object to import from the module.
 +        alias (str | None): An optional alias to store the object under in globals().
 +            If None, the object is stored under its original name.
++        target_globals (dict[str, Any] | None): The globals dictionary to store the imported object in.
++            If None, uses the caller's global namespace.
 +    """
-+    g = globals()
++    if target_globals is None:
++        frame = inspect.currentframe()
++        # currentframe() -> this function; f_back -> caller
++        caller_frame = frame.f_back if frame is not None else None
++        target_globals = caller_frame.f_globals if caller_frame is not None else globals()
++
++    g = target_globals
 +    key = alias or name
 +    obj = g.get(key, None)
 +    if obj is not None:
 +        return obj
-+
-+    import importlib
 +
 +    mod = importlib.import_module(module_path)
 +    obj = getattr(mod, name)
 +    g[key] = obj
 +    return obj
 +
++
 +def lazy_import_many_to_globals(module_path: str, names: list[str]) -> None:
 +    """
 +    Lazily import multiple objects from a module and store them in the global namespace.
 +    Equivalent to
 +        - from module_path import name1, name2, ..., nameN
-+    
++
 +    Args:
 +        module_path (str): The dot-separated path of the module to import from.
 +        names (list[str]): A list of names of the objects to import from the module.
 +    """
++    frame = inspect.currentframe()
++    caller_frame = frame.f_back if frame is not None else None
++    target_globals = caller_frame.f_globals if caller_frame is not None else globals()
++
 +    for name in names:
-+        lazy_import_to_globals(module_path, name)
++        lazy_import_to_globals(module_path, name, target_globals=target_globals)
 diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
 index c319910d..8d2832ab 100644
 --- a/verl/utils/megatron_utils.py

@@ -37,8 +37,8 @@ from verl.utils.tracking import ValidationGenerationsLogger
 
 from psrl.trainer.ppo.utils import (
     PSRL_compute_advantage,
-    PSRL_ResourcePoolManager,
     PSRL_Role,
+    ResourcePoolManager,
     apply_kl_penalty,
     compute_response_mask,
     need_critic,
@@ -79,7 +79,7 @@ class PSRL_RayPPOTrainer:
         config,
         tokenizer,
         role_worker_mapping: dict[PSRL_Role, WorkerType],
-        resource_pool_manager: PSRL_ResourcePoolManager,
+        resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
         processor=None,
         reward_fn=None,
@@ -97,7 +97,7 @@ class PSRL_RayPPOTrainer:
             config: Configuration object containing training parameters.
             tokenizer: Tokenizer used for encoding and decoding text.
             role_worker_mapping (dict[PSRL_Role, WorkerType]): Mapping from roles to worker classes.
-            resource_pool_manager (PSRL_ResourcePoolManager): Manager for Ray resources.
+            resource_pool_manager (ResourcePoolManager): Manager for Ray resources.
             ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
             processor: Optional data processor, used for multimodal data.
             reward_fn: Function to compute rewards for the training data.

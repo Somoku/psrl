@@ -18,6 +18,7 @@ class CustomSandboxFusionTool(SandboxFusionTool):
         default_language: str = "python",
         name: str = "code_interpreter",
         description: str = "A tool for execute code",
+        type: str = "native",
     ):
         super().__init__(
             sandbox_fusion_url=sandbox_fusion_url,
@@ -26,6 +27,7 @@ class CustomSandboxFusionTool(SandboxFusionTool):
             default_language=default_language,
             name=name,
             description=description,
+            type=type,
         )
         self.code_pattern = re.compile(r"```python(.*?)```", re.DOTALL)
 

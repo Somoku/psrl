@@ -75,6 +75,7 @@ class SandboxFusionTool(Tool):
         default_language: str = "python",
         name: str = "code_interpreter",
         description: str = "A tool for execute code",
+        type: str = "native",
     ):
         """
         Initialize the SandboxFusionTool.
@@ -86,6 +87,7 @@ class SandboxFusionTool(Tool):
             default_language: Programming language (default: "python")
             name: Tool name for registration
             description: Tool description
+            type: Tool type
         """
         # Initialize the base Tool class
         super().__init__(name=name, description=description)
@@ -94,6 +96,7 @@ class SandboxFusionTool(Tool):
         self.memory_limit_mb = memory_limit_mb
         self.timeout = default_timeout
         self.language = default_language
+        self.type = type
 
         if not self.sandbox_fusion_url:
             raise ValueError("sandbox_fusion_url is required")

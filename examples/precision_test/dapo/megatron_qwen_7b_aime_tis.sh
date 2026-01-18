@@ -59,6 +59,10 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
+# TIS
+rollout_is=null
+rollout_is_threshold=null
+
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
 offload=True
@@ -72,8 +76,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/dapo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=tis \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -81,6 +83,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
+    psrl.validate_on_psrl=False \
+    psrl.tms.range=null \
+    psrl.tms.enable_nixl=False \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
@@ -134,6 +139,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

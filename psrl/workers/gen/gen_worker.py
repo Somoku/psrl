@@ -24,6 +24,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_tokenizer, omega_conf_to_dataclass
 from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_generation_config, update_model_config
 
 from psrl.utils.common.http_utils import find_available_port
@@ -61,6 +62,7 @@ class PSRL_GenWorker(Worker):
     @staticmethod
     def configure_worker(
         config,
+        psrl_config,
         num_gpus: int | float,
         dp_idx: int,
         bundle_indices: list[int],
@@ -113,8 +115,34 @@ class PSRL_GenWorker(Worker):
             resources["num_gpus"] = 0
             resources["num_cpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            env_vars["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
+            env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
+            env_vars["WORLD_SIZE"] = str(len(bundle_indices))
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+        # NOTE(linsh): Expandable segments are not compatible with
+        # memory pool of sleep mode in vLLM.
+        # Please track https://github.com/pytorch/pytorch/issues/147851 for more infos.
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+
+        # use tms for memory management of model weights and kv cache
+        if psrl_config.tms.range == "all" or psrl_config.tms.enable_nixl:
+            import torch_memory_saver  # noqa: F401
+
+            dynlib_path = os.path.join(
+                os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+                "torch_memory_saver_hook_mode_preload.abi3.so",
+            )
+            assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+            env_vars["LD_PRELOAD"] = dynlib_path
+            env_vars["TMS_INIT_ENABLE"] = "0"
+            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
+
+        if psrl_config.tms.enable_cuda_graph:
+            env_vars["PSRL_VLLM_PATCHES"] = "TMS:GRAPH"
+        elif psrl_config.tms.range == "all":
+            env_vars["PSRL_VLLM_PATCHES"] = "TMS"
+
         if config.rollout.disable_attn:
             warnings.warn(
                 "CAUTION: you are disabling the attention, "
@@ -298,7 +326,19 @@ class PSRL_GenWorker(Worker):
         self._is_init_nixl_client.set()
         psrl_logger.info("NIXL client initialized via rpc call.")
 
-    async def nixl_protocol(self):
+    async def nixl_convert_params(self):
+        """
+        Convert the model parameters to unified state dict and sharding dict via NIXL.
+        This is implemented via rpc call in the vLLM extension.
+        """
+        await self._is_init_model.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_convert_params."
+
+        psrl_logger.info("NIXL convert params begin via rpc call.")
+        await self._collective_rpc("nixl_convert_params", args=(self.config,))
+        psrl_logger.info("NIXL convert params done via rpc call.")
+
+    async def nixl_protocol(self, mode: str = "full"):
         """
         Register the state dict and sharding dict to the NIXL client.
         This is implemented via rpc call in the vLLM extension.
@@ -307,8 +347,72 @@ class PSRL_GenWorker(Worker):
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_protocol."
         psrl_logger.info("NIXL protocol begin via rpc call.")
-        await self._collective_rpc("nixl_protocol", args=(self.config,))
+        await self._collective_rpc("nixl_protocol", args=(self.config, mode))
         psrl_logger.info("NIXL protocol done via rpc call.")
+
+    async def nixl_wake_up(self):
+        """Wake up model weights and register for NIXL."""
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_wake_up."
+
+        # init empty model
+        await self.wake_up()
+        # register local tensors
+        await self._collective_rpc("nixl_register_after_wake_up", args=())
+
+    async def nixl_sleep(self):
+        """Deregister local tensors and put model weights to sleep state (free up GPU memory)."""
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_sleep."
+
+        # put model weights to sleep
+        await self.sleep()
+        # deregister local tensors
+        await self._collective_rpc("nixl_deregister", args=())
+
+    async def sleep(self):
+        """Put model weights to sleep state (free up GPU memory)."""
+        await self.rollout.inference_engine.sleep(level=2)
+        if self.psrl_config.tms.range in ["rollout", "all"]:
+            # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
+            # Here we do an aggressive empty cache for TMS.
+            aggressive_empty_cache(force_sync=True)
+
+    async def wake_up(self):
+        """Wake up model weights."""
+        wake_up_tags = ["weights", "kv_cache"]
+        if self.psrl_config.tms.enable_cuda_graph:
+            wake_up_tags.append("graph")
+        await self.rollout.inference_engine.wake_up(tags=wake_up_tags)
+
+    async def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict):
+        """
+        Update local NIXL info to the PS workers on the same node with this train worker.
+        """
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_update_local_info_to_ps."
+        await self._collective_rpc("nixl_update_local_info_to_ps", args=(ps_worker_node_id_to_idxs,))
+
+    async def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
+        """
+        Send local NIXL info to the destination NIXL agents.
+
+        Args:
+            dst_agent_names (str | list[str]): Destination NIXL agent names
+        """
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_send_local_info_to."
+        await self._collective_rpc("nixl_send_local_info_to", args=(dst_agent_names,))
+
+    async def nixl_wait_for_update_infos(self, info_num: int):
+        """Wait for update infos from the storage client.
+
+        Args:
+            info_num (int): Number of infos to wait for
+        """
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_wait_for_update_infos."
+        await self._collective_rpc("nixl_wait_for_update_infos", args=(info_num,))
 
     def get_node_id(self) -> str:
         """
@@ -426,14 +530,23 @@ class PSRL_GenWorker(Worker):
             )
             return obj_list[0]
 
-    async def _build_rollout(self, trust_remote_code=False):
+    async def _build_rollout(self, init_mode: str = "full", trust_remote_code=False):
         """
         Build the rollout engine and sharding manager for the PSRL GenWorker.
+
+        Args:
+            init_mode (str): The initialization mode for the model, either 'full' or 'empty'.
+            trust_remote_code (bool): Whether to trust remote code when loading the model.
+
         NOTE: This method only supports building for one rollout instance at a time.
         """
         rollout_name = self.config.rollout.name
         assert rollout_name == "vllm", "Only support vLLM rollout for now"
+        assert init_mode in ["full", "empty"], "init_mode must be either 'full' or 'empty'"
+
         try:
+            # NOTE(linsh): For validation (fused), we will use config in `train_actor_rollout_ref.rollout`.
+            # For rollout, we will use config in `gen_actor_rollout_ref.rollout`.
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
             model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         except Exception as e:
@@ -493,6 +606,8 @@ class PSRL_GenWorker(Worker):
             status_queue=self.gen_interface.status_queue,
             instance_id=self.get_instance_id(),
             nixl_interface=self.nixl_interface,
+            is_validate=self.role == "validate",
+            init_mode=init_mode,
         )
 
         # Don't keep the dummy data in memory
@@ -501,10 +616,18 @@ class PSRL_GenWorker(Worker):
         return rollout
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    async def init_model(self):
+    async def init_model(self, init_mode: str = "full"):
+        """Initialize the model for the rollout engine.
+
+        If init_mode is 'full', load the full model weights.
+        If init_mode is 'empty', load dummy weights for faster initialization.
+
+        Args:
+            init_mode (str): The initialization mode, either 'full' or 'empty'.
+        """
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             self.rollout = await self._build_rollout(
-                trust_remote_code=self.config.model.get("trust_remote_code", False)
+                init_mode, trust_remote_code=self.config.model.get("trust_remote_code", False)
             )
         self._is_init_model.set()
 
@@ -512,6 +635,18 @@ class PSRL_GenWorker(Worker):
         # For other ranks, the server is not needed.
         if self.psrl_config.server_rollout.enable and self.is_instance_representative_rank:
             await self._maybe_start_engine_http_server()
+
+    async def init_and_register_model(self, init_mode: str = "full"):
+        """Initialize and register the model for the rollout engine.
+
+        If init_mode is 'full', load the full model weights.
+        If init_mode is 'empty', load dummy weights for faster initialization.
+
+        Args:
+            init_mode (str): The initialization mode, either 'full' or 'empty'.
+        """
+        await self.init_model(init_mode)
+        await self.register_rollout_instance()
 
     async def _maybe_start_engine_http_server(self) -> None:
         """Start in-process HTTP server and register it to gateway."""

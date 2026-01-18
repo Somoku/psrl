@@ -1,28 +1,36 @@
-From 33ab1ab32c3fe6fe3b83c8598cf584c5a8aad87e Mon Sep 17 00:00:00 2001
+From 088eb9fe9e5c9a2056cb0d4abc10fb11a430f852 Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Mon, 29 Dec 2025 18:41:15 +0800
-Subject: [PATCH] verl patch
+Date: Sat, 17 Jan 2026 20:19:31 +0800
+Subject: [PATCH] Basic patch for PSRL
 
+- safer get_event_loop
+- add spmd vllm rollout back
+- add router replay in megatron
+- add lazy import for megatron v0.15.0
+- disaggregate dist group init from `__init__` to speedup worker startup
+- support specifying resource num per bundle to enable colocate of different resource pools
+- support configure worker-specified env setups through `configure_worker`
+- support tms for weight and optim memory management
 ---
  recipe/dapo/test_dapo_7b_math.sh              |  24 +-
  recipe/dapo/test_dapo_7b_math_megatron.sh     |  31 +-
  verl/protocol.py                              |   2 +-
  verl/single_controller/base/worker.py         |   3 +-
- verl/single_controller/ray/base.py            |  55 ++-
+ verl/single_controller/ray/base.py            |  57 +-
  verl/trainer/config/data/legacy_data.yaml     |   2 +-
  verl/trainer/constants_ppo.py                 |   5 +-
  verl/trainer/sft_trainer.py                   |   2 +-
  verl/utils/checkpoint/__init__.py             |   4 -
- verl/utils/import_utils.py                    |  60 ++-
+ verl/utils/import_utils.py                    |  60 +-
  verl/utils/megatron_utils.py                  |   4 +
  verl/workers/actor/megatron_actor.py          |   3 +
- verl/workers/fsdp_workers.py                  | 106 +++--
- verl/workers/megatron_workers.py              | 170 ++++---
+ verl/workers/fsdp_workers.py                  | 513 ++++++++++--------
+ verl/workers/megatron_workers.py              | 384 +++++++------
  verl/workers/rollout/base.py                  |   1 +
  verl/workers/rollout/vllm_rollout/__init__.py |   1 +
  .../rollout/vllm_rollout/vllm_rollout.py      |   4 +-
- .../rollout/vllm_rollout/vllm_rollout_spmd.py | 441 ++++++++++++++++++
- 18 files changed, 754 insertions(+), 164 deletions(-)
+ .../rollout/vllm_rollout/vllm_rollout_spmd.py | 441 +++++++++++++++
+ 18 files changed, 1085 insertions(+), 456 deletions(-)
  create mode 100644 verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
 
 diff --git a/recipe/dapo/test_dapo_7b_math.sh b/recipe/dapo/test_dapo_7b_math.sh
@@ -202,7 +210,7 @@ index 4b82f4e1..3f3a1b86 100644
              get_torch_device().set_device(int(local_rank))
  
 diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
-index feb73a54..01449822 100644
+index feb73a54..cab31dbc 100644
 --- a/verl/single_controller/ray/base.py
 +++ b/verl/single_controller/ray/base.py
 @@ -102,6 +102,7 @@ class RayResourcePool(ResourcePool):
@@ -230,7 +238,7 @@ index feb73a54..01449822 100644
              if self.accelerator_type is not None:
                  bundle[self.accelerator_type] = 1e-4
          pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
-@@ -307,12 +309,50 @@ class RayClassWithInitArgs(ClassWithInitArgs):
+@@ -307,12 +309,52 @@ class RayClassWithInitArgs(ClassWithInitArgs):
              options = {"scheduling_strategy": NodeAffinitySchedulingStrategy(node_id=target_node_id, soft=False)}
              return self.cls.options(**options).remote(*self.args, cuda_visible_devices=visible_devices, **self.kwargs)
  
@@ -243,6 +251,7 @@ index feb73a54..01449822 100644
          options.update(self._options)
 +        if hasattr(self.cls, "configure_worker"):
 +            config = self.kwargs.get("config", None)
++            psrl_config = self.kwargs.get("psrl_config", None)
 +            # Specialized for PSRL
 +            gen_interface = self.kwargs.get("gen_interface", None)
 +            dp_idx = 0
@@ -253,6 +262,7 @@ index feb73a54..01449822 100644
 +            bundle_indices = range(len(placement_group.bundle_specs))
 +            resources, env_vars, init_kwargs = self.cls.configure_worker(
 +                config=config,
++                psrl_config=psrl_config,
 +                num_gpus=num_gpus,
 +                dp_idx=dp_idx,
 +                bundle_indices=bundle_indices,
@@ -286,7 +296,7 @@ index feb73a54..01449822 100644
  
          if use_gpu and device_name == "cuda":
              options["num_gpus"] = num_gpus
-@@ -526,7 +566,7 @@ class RayWorkerGroup(WorkerGroup):
+@@ -526,7 +568,7 @@ class RayWorkerGroup(WorkerGroup):
          world_size = resource_pool.world_size
          use_gpu = resource_pool.use_gpu
          local_world_size = resource_pool.store[0]
@@ -295,7 +305,7 @@ index feb73a54..01449822 100644
  
          # we pass in environment variable at option so that Worker can use environment variable to set
          env_vars = {
-@@ -535,6 +575,7 @@ class RayWorkerGroup(WorkerGroup):
+@@ -535,6 +577,7 @@ class RayWorkerGroup(WorkerGroup):
              "WG_PREFIX": self.name_prefix,
              "WG_BACKEND": "ray",
              "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
@@ -483,10 +493,32 @@ index 466402ca..5ed8a5bc 100644
          mini_batch.batch["attention_mask"] = mini_batch.batch["attention_mask"].to(bool)
          self.has_multi_modal_inputs = "multi_modal_inputs" in mini_batch.non_tensor_batch.keys()
 diff --git a/verl/workers/fsdp_workers.py b/verl/workers/fsdp_workers.py
-index b7d89134..92cfd7f9 100644
+index b7d89134..c99b0091 100644
 --- a/verl/workers/fsdp_workers.py
 +++ b/verl/workers/fsdp_workers.py
-@@ -141,43 +141,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -22,6 +22,7 @@ import os
+ import warnings
+ from dataclasses import asdict
+ from typing import Any, Optional
++from contextlib import nullcontext
+ 
+ import numpy as np
+ import psutil
+@@ -90,6 +91,13 @@ from verl.workers.config.optimizer import build_optimizer
+ from verl.workers.rollout import get_rollout_class
+ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+ 
++USE_TMS = False
++if os.environ.get("PSRL_TMS_ENABLE", "0") == "1":
++    USE_TMS = True
++    from torch_memory_saver import torch_memory_saver
++else:
++    torch_memory_saver = None
++
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+@@ -141,43 +149,6 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
          Worker.__init__(self)
  
          self.config = config
@@ -530,7 +562,7 @@ index b7d89134..92cfd7f9 100644
          self._lora_rank = self.config.model.get("lora_rank", 0)
          self._is_lora = self.config.model.get("lora_adapter_path") is not None or self._lora_rank > 0
  
-@@ -230,6 +193,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -230,6 +201,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
              # TODO: it seems that manual offload is slowly than FSDP offload
              self._is_offload_param = self.config.ref.fsdp_config.get("param_offload", False)
  
@@ -576,7 +608,459 @@ index b7d89134..92cfd7f9 100644
          # normalize config
          if self._is_actor:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -758,6 +760,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -279,6 +289,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         use_liger=False,
+         role="actor",
+         enable_activation_offload=False,
++        skip_load_weight=False,
+     ):
+         from torch.distributed.fsdp import CPUOffload, MixedPrecision
+         from transformers import (
+@@ -346,234 +357,245 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+             use_meta_tensor=not actor_model_config.tie_word_embeddings, mesh=self.device_mesh
+         )
+ 
+-        with init_context(), warnings.catch_warnings():
+-            warnings.simplefilter("ignore")
+-            has_remote_code = hasattr(actor_model_config, "auto_map") and any(
+-                actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+-            )
+-            if has_remote_code:
+-                auto_class = next(
+-                    k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
++        tms_weight_ctx = torch_memory_saver.region() if USE_TMS else nullcontext()
++        with tms_weight_ctx:
++            with init_context(), warnings.catch_warnings():
++                warnings.simplefilter("ignore")
++                has_remote_code = hasattr(actor_model_config, "auto_map") and any(
++                    actor_model_config.architectures[0] in val for val in actor_model_config.auto_map.values()
+                 )
+-                match auto_class:
+-                    case "AutoModelForVision2Seq":
++                if has_remote_code:
++                    auto_class = next(
++                        k for k, v in actor_model_config.auto_map.items() if actor_model_config.architectures[0] in v
++                    )
++                    match auto_class:
++                        case "AutoModelForVision2Seq":
++                            actor_module_class = AutoModelForVision2Seq
++                        case "AutoModelForCausalLM":
++                            actor_module_class = AutoModelForCausalLM
++                        case "AutoModelForImageTextToText":
++                            actor_module_class = AutoModelForImageTextToText
++                        case _:
++                            actor_module_class = AutoModel
++                else:
++                    if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+                         actor_module_class = AutoModelForVision2Seq
+-                    case "AutoModelForCausalLM":
++                    elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
+                         actor_module_class = AutoModelForCausalLM
+-                    case "AutoModelForImageTextToText":
++                    elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+                         actor_module_class = AutoModelForImageTextToText
+-                    case _:
++                    else:
+                         actor_module_class = AutoModel
+-            else:
+-                if type(actor_model_config) in AutoModelForVision2Seq._model_mapping.keys():
+-                    actor_module_class = AutoModelForVision2Seq
+-                elif type(actor_model_config) in AutoModelForCausalLM._model_mapping.keys():
+-                    actor_module_class = AutoModelForCausalLM
+-                elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
+-                    actor_module_class = AutoModelForImageTextToText
++
++                if skip_load_weight:
++                    actor_module = actor_module_class.from_config(
++                        config=actor_model_config,
++                        torch_dtype=torch_dtype,
++                        trust_remote_code=trust_remote_code,
++                    )
+                 else:
+-                    actor_module_class = AutoModel
++                    actor_module = actor_module_class.from_pretrained(
++                        pretrained_model_name_or_path=local_path,
++                        torch_dtype=torch_dtype,
++                        config=actor_model_config,
++                        trust_remote_code=trust_remote_code,
++                        attn_implementation=attn_implementation,
++                    )
+ 
+-            actor_module = actor_module_class.from_pretrained(
+-                pretrained_model_name_or_path=local_path,
+-                torch_dtype=torch_dtype,
+-                config=actor_model_config,
+-                trust_remote_code=trust_remote_code,
+-                attn_implementation=attn_implementation,
+-            )
++                # Apply Liger kernel to the model if use_liger is set to True
++                if use_liger:
++                    from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
+ 
+-            # Apply Liger kernel to the model if use_liger is set to True
+-            if use_liger:
+-                from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
++                    _apply_liger_kernel_to_instance(model=actor_module)
+ 
+-                _apply_liger_kernel_to_instance(model=actor_module)
++                fused_kernel_options = self.config.model.get("fused_kernel_options", None)
++                fused_kernels_backend = (
++                    fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
++                )
+ 
+-            fused_kernel_options = self.config.model.get("fused_kernel_options", None)
+-            fused_kernels_backend = (
+-                fused_kernel_options.get("impl_backend", None) if fused_kernel_options is not None else None
+-            )
++                apply_monkey_patch(
++                    model=actor_module,
++                    use_remove_padding=use_remove_padding,
++                    ulysses_sp_size=self.ulysses_sequence_parallel_size,
++                    use_fused_kernels=use_fused_kernels,
++                    fused_kernels_backend=fused_kernels_backend,
++                )
+ 
+-            apply_monkey_patch(
+-                model=actor_module,
+-                use_remove_padding=use_remove_padding,
+-                ulysses_sp_size=self.ulysses_sequence_parallel_size,
+-                use_fused_kernels=use_fused_kernels,
+-                fused_kernels_backend=fused_kernels_backend,
+-            )
++                # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
++                actor_module.to(torch_dtype)
+ 
+-            # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+-            actor_module.to(torch_dtype)
++                if enable_gradient_checkpointing:
++                    actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+ 
+-            if enable_gradient_checkpointing:
+-                actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
++            if self._is_lora:
++                print("Applying LoRA to actor module")
++                actor_module.enable_input_require_grads()
+ 
+-        if self._is_lora:
+-            print("Applying LoRA to actor module")
+-            actor_module.enable_input_require_grads()
++                lora_adapter_path = self.config.model.get("lora_adapter_path")
++                if lora_adapter_path is not None:
++                    from peft import PeftModel
+ 
+-            lora_adapter_path = self.config.model.get("lora_adapter_path")
+-            if lora_adapter_path is not None:
+-                from peft import PeftModel
++                    print(f"Loading pre-trained LoRA adapter to {role} from: {lora_adapter_path}")
+ 
+-                print(f"Loading pre-trained LoRA adapter to {role} from: {lora_adapter_path}")
++                    # Copy adapter to local if needed
++                    local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
+ 
+-                # Copy adapter to local if needed
+-                local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
++                    actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
++                    peft_config = actor_module.peft_config["default"]
++                    # Ensure task_type is TaskType enum, not string
++                    if isinstance(peft_config.task_type, str):
++                        peft_config.task_type = TaskType.CAUSAL_LM
+ 
+-                actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+-                peft_config = actor_module.peft_config["default"]
+-                # Ensure task_type is TaskType enum, not string
+-                if isinstance(peft_config.task_type, str):
+-                    peft_config.task_type = TaskType.CAUSAL_LM
+-
+-            else:
+-                # Convert config to regular Python types before creating PEFT model
+-                lora_config = {
+-                    "task_type": TaskType.CAUSAL_LM,
+-                    "r": self.config.model.lora_rank,
+-                    "lora_alpha": self.config.model.lora_alpha,
+-                    "target_modules": convert_to_regular_types(self.config.model.target_modules),
+-                    "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
+-                    "bias": "none",
+-                }
+-                actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+-
+-        self.use_orig_params = fsdp_config.get("use_orig_params", False)
+-        if self.config.actor.get("freeze_vision_tower", False):
+-            vision_tower = get_vl_model_vision_tower(actor_module)
+-            if vision_tower is not None:
+-                vision_tower.requires_grad_(False)
+-                self.use_orig_params = True
+-                if self.rank == 0:
+-                    print("[actor model] Vision tower is set to not trainable.")
+-            else:
+-                if self.rank == 0:
+-                    print("[actor model] No vision tower found.")
+-
+-        torch.distributed.barrier()
+-
+-        if self.rank == 0:
+-            print_model_size(actor_module)
++                else:
++                    # Convert config to regular Python types before creating PEFT model
++                    lora_config = {
++                        "task_type": TaskType.CAUSAL_LM,
++                        "r": self.config.model.lora_rank,
++                        "lora_alpha": self.config.model.lora_alpha,
++                        "target_modules": convert_to_regular_types(self.config.model.target_modules),
++                        "exclude_modules": convert_to_regular_types(self.config.model.exclude_modules),
++                        "bias": "none",
++                    }
++                    actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
++
++            self.use_orig_params = fsdp_config.get("use_orig_params", False)
++            if self.config.actor.get("freeze_vision_tower", False):
++                vision_tower = get_vl_model_vision_tower(actor_module)
++                if vision_tower is not None:
++                    vision_tower.requires_grad_(False)
++                    self.use_orig_params = True
++                    if self.rank == 0:
++                        print("[actor model] Vision tower is set to not trainable.")
++                else:
++                    if self.rank == 0:
++                        print("[actor model] No vision tower found.")
+ 
+-        log_gpu_memory_usage(f"After init {role} from HF AutoModel", logger=logger)
++            torch.distributed.barrier()
+ 
+-        # We wrap FSDP for rollout as well
+-        mixed_precision_config = fsdp_config.get("mixed_precision", None)
+-        if mixed_precision_config is not None:
+-            param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
+-            reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
+-            buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
+-        else:
+-            param_dtype = PrecisionType.to_dtype(fsdp_config.dtype)
+-            reduce_dtype = torch.float32
+-            buffer_dtype = torch.float32
++            if self.rank == 0:
++                print_model_size(actor_module)
+ 
+-        mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
++            log_gpu_memory_usage(f"After init {role} from HF AutoModel", logger=logger)
+ 
+-        auto_wrap_policy = get_fsdp_wrap_policy(
+-            module=actor_module,
+-            config=fsdp_config.get("wrap_policy", None),
+-            is_lora=self._is_lora,
+-        )
++            # We wrap FSDP for rollout as well
++            mixed_precision_config = fsdp_config.get("mixed_precision", None)
++            if mixed_precision_config is not None:
++                param_dtype = PrecisionType.to_dtype(mixed_precision_config.get("param_dtype", "bf16"))
++                reduce_dtype = PrecisionType.to_dtype(mixed_precision_config.get("reduce_dtype", "fp32"))
++                buffer_dtype = PrecisionType.to_dtype(mixed_precision_config.get("buffer_dtype", "fp32"))
++            else:
++                param_dtype = PrecisionType.to_dtype(fsdp_config.dtype)
++                reduce_dtype = torch.float32
++                buffer_dtype = torch.float32
+ 
+-        # if self._is_rollout and self.config.rollout.name == "hf":
+-        #     # TODO(zhangchi.usc1992, shengguangming) fix me.
+-        #     Current, auto_wrap_policy causes HFRollout to hang in Gemma
+-        #     auto_wrap_policy = None
++            mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
+ 
+-        if self.rank == 0:
+-            print(f"wrap_policy: {auto_wrap_policy}")
++            auto_wrap_policy = get_fsdp_wrap_policy(
++                module=actor_module,
++                config=fsdp_config.get("wrap_policy", None),
++                is_lora=self._is_lora,
++            )
+ 
+-        fsdp_mesh = self.device_mesh
+-        sharding_strategy = get_sharding_strategy(fsdp_mesh)
++            # if self._is_rollout and self.config.rollout.name == "hf":
++            #     # TODO(zhangchi.usc1992, shengguangming) fix me.
++            #     Current, auto_wrap_policy causes HFRollout to hang in Gemma
++            #     auto_wrap_policy = None
+ 
+-        # TODO: add transformer policy
+-        # We force reference policy to use CPUOffload to save memory.
+-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+-        fsdp_strategy = self.config.actor.strategy
+-        if fsdp_strategy == "fsdp":
+-            actor_module_fsdp = FSDP(
+-                actor_module,
+-                cpu_offload=cpu_offload,
+-                param_init_fn=init_fn,
+-                auto_wrap_policy=auto_wrap_policy,
+-                device_id=get_device_id(),
+-                sharding_strategy=sharding_strategy,  # zero3
+-                mixed_precision=mixed_precision,
+-                sync_module_states=True,
+-                device_mesh=self.device_mesh,
+-                use_orig_params=self.use_orig_params,
+-                forward_prefetch=fsdp_config.get("forward_prefetch", False),
+-            )
+-        elif fsdp_strategy == "fsdp2":
+-            assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
+-            mp_policy = MixedPrecisionPolicy(
+-                param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
+-            )
+-            if role == "actor" and fsdp_config.offload_policy:
+-                cpu_offload = CPUOffloadPolicy(pin_memory=True)
+-                self._is_offload_param = False
+-                self._is_offload_optimizer = False
++            if self.rank == 0:
++                print(f"wrap_policy: {auto_wrap_policy}")
++
++            fsdp_mesh = self.device_mesh
++            sharding_strategy = get_sharding_strategy(fsdp_mesh)
++
++            # TODO: add transformer policy
++            # We force reference policy to use CPUOffload to save memory.
++            # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
++            cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
++            fsdp_strategy = self.config.actor.strategy
++            if fsdp_strategy == "fsdp":
++                actor_module_fsdp = FSDP(
++                    actor_module,
++                    cpu_offload=cpu_offload,
++                    param_init_fn=init_fn,
++                    auto_wrap_policy=auto_wrap_policy,
++                    device_id=get_device_id(),
++                    sharding_strategy=sharding_strategy,  # zero3
++                    mixed_precision=mixed_precision,
++                    sync_module_states=True,
++                    device_mesh=self.device_mesh,
++                    use_orig_params=self.use_orig_params,
++                    forward_prefetch=fsdp_config.get("forward_prefetch", False),
++                )
++            elif fsdp_strategy == "fsdp2":
++                assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
++                mp_policy = MixedPrecisionPolicy(
++                    param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
++                )
++                if role == "actor" and fsdp_config.offload_policy:
++                    cpu_offload = CPUOffloadPolicy(pin_memory=True)
++                    self._is_offload_param = False
++                    self._is_offload_optimizer = False
++                else:
++                    cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
++
++                fsdp_kwargs = {
++                    "mesh": fsdp_mesh,
++                    "mp_policy": mp_policy,
++                    "offload_policy": cpu_offload,
++                    "reshard_after_forward": fsdp_config.reshard_after_forward,
++                    "shard_placement_fn": get_shard_placement_fn(fsdp_size=self.device_mesh.shape[-1]),
++                }
++                full_state = actor_module.state_dict()
++                apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
++                fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
++                actor_module_fsdp = actor_module
+             else:
+-                cpu_offload = None if role == "actor" else CPUOffloadPolicy(pin_memory=True)
++                raise NotImplementedError(f"not implement {fsdp_strategy}")
+ 
+-            fsdp_kwargs = {
+-                "mesh": fsdp_mesh,
+-                "mp_policy": mp_policy,
+-                "offload_policy": cpu_offload,
+-                "reshard_after_forward": fsdp_config.reshard_after_forward,
+-                "shard_placement_fn": get_shard_placement_fn(fsdp_size=self.device_mesh.shape[-1]),
+-            }
+-            full_state = actor_module.state_dict()
+-            apply_fsdp2(actor_module, fsdp_kwargs, fsdp_config)
+-            fsdp2_load_full_state_dict(actor_module, full_state, fsdp_mesh, cpu_offload)
+-            actor_module_fsdp = actor_module
+-        else:
+-            raise NotImplementedError(f"not implement {fsdp_strategy}")
++            if enable_activation_offload:
++                enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
+ 
+-        if enable_activation_offload:
+-            enable_activation_offloading(actor_module_fsdp, fsdp_strategy, enable_gradient_checkpointing)
++        log_gpu_memory_usage(f"After {role} FSDP init", logger=logger, level=logging.INFO)
+ 
+-        log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
++        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
++        with tms_optim_ctx:
++            # TODO: add more optimizer args into config
++            if role == "actor" and optim_config is not None:
++                from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+ 
+-        # TODO: add more optimizer args into config
+-        if role == "actor" and optim_config is not None:
+-            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
++                actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+ 
+-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
++                total_steps = optim_config.get("total_training_steps", 0)
++                num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
++                lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
++                min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
++                num_cycles = optim_config.get("num_cycles", 0.5)
++                if num_warmup_steps < 0:
++                    num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
++                    num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+ 
+-            total_steps = optim_config.get("total_training_steps", 0)
+-            num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
+-            lr_scheduler_type = optim_config.get("lr_scheduler_type", "constant")
+-            min_lr_ratio = optim_config.get("min_lr_ratio", 0.0)
+-            num_cycles = optim_config.get("num_cycles", 0.5)
+-            if num_warmup_steps < 0:
+-                num_warmup_steps_ratio = optim_config.get("lr_warmup_steps_ratio", 0.0)
+-                num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
++                if self.rank == 0:
++                    print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
+ 
+-            if self.rank == 0:
+-                print(f"Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}")
++                if lr_scheduler_type == "constant":
++                    actor_lr_scheduler = get_constant_schedule_with_warmup(
++                        optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps
++                    )
++                elif lr_scheduler_type == "cosine":
++                    actor_lr_scheduler = get_cosine_schedule_with_warmup(
++                        optimizer=actor_optimizer,
++                        num_warmup_steps=num_warmup_steps,
++                        num_training_steps=total_steps,
++                        min_lr_ratio=min_lr_ratio,
++                        num_cycles=num_cycles,
++                    )
++                else:
++                    raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
+ 
+-            if lr_scheduler_type == "constant":
+-                actor_lr_scheduler = get_constant_schedule_with_warmup(
+-                    optimizer=actor_optimizer, num_warmup_steps=num_warmup_steps
+-                )
+-            elif lr_scheduler_type == "cosine":
+-                actor_lr_scheduler = get_cosine_schedule_with_warmup(
+-                    optimizer=actor_optimizer,
+-                    num_warmup_steps=num_warmup_steps,
+-                    num_training_steps=total_steps,
+-                    min_lr_ratio=min_lr_ratio,
+-                    num_cycles=num_cycles,
+-                )
++                log_gpu_memory_usage(f"After {role} optimizer init", logger=logger)
+             else:
+-                raise NotImplementedError(f"LR scheduler type {lr_scheduler_type} is not supported")
+-
+-            log_gpu_memory_usage(f"After {role} optimizer init", logger=logger)
+-        else:
+-            actor_optimizer = None
+-            actor_lr_scheduler = None
++                actor_optimizer = None
++                actor_lr_scheduler = None
+ 
+         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+ 
+@@ -753,11 +775,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+         get_torch_device().set_rng_state(self.torch_random_states)
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+-    def init_model(self):
++    def init_model(self, skip_load_weight: bool = False):
+         from verl.workers.actor import DataParallelPPOActor
  
          # This is used to import external_lib into the huggingface systems
          import_external_libs(self.config.model.get("external_lib", None))
@@ -585,7 +1069,15 @@ index b7d89134..92cfd7f9 100644
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          use_remove_padding = self.config.model.get("use_remove_padding", False)
-@@ -1150,16 +1154,25 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -791,6 +815,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+                 use_liger=self.config.model.get("use_liger", False),
+                 role="actor",
+                 enable_activation_offload=self.config.model.get("enable_activation_offload", False),
++                skip_load_weight=skip_load_weight,
+             )
+ 
+             # get the original unwrapped module
+@@ -1150,16 +1175,25 @@ class CriticWorker(Worker, DistProfilerExtension):
          DistProfilerExtension.__init__(
              self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
          )
@@ -613,7 +1105,7 @@ index b7d89134..92cfd7f9 100644
  
          # build device mesh for Ulysses Sequence Parallel
          world_size = torch.distributed.get_world_size()
-@@ -1187,10 +1200,6 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1187,10 +1221,6 @@ class CriticWorker(Worker, DistProfilerExtension):
  
          self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
  
@@ -624,7 +1116,7 @@ index b7d89134..92cfd7f9 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size
-@@ -1460,6 +1469,8 @@ class CriticWorker(Worker, DistProfilerExtension):
+@@ -1460,6 +1490,8 @@ class CriticWorker(Worker, DistProfilerExtension):
          import_external_libs(self.config.model.get("external_lib", None))
  
          from verl.workers.critic import DataParallelPPOCritic
@@ -633,7 +1125,7 @@ index b7d89134..92cfd7f9 100644
  
          self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
              self.config
-@@ -1594,9 +1605,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1594,9 +1626,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
              DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config),
          )
  
@@ -648,7 +1140,7 @@ index b7d89134..92cfd7f9 100644
          if not torch.distributed.is_initialized():
              torch.distributed.init_process_group(
                  backend=get_nccl_backend(),
-@@ -1630,8 +1645,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1630,8 +1666,6 @@ class RewardModelWorker(Worker, DistProfilerExtension):
          else:
              self._register_dispatch_collect_info("reward", dp_rank=self.rank, is_collect=True)
  
@@ -657,7 +1149,7 @@ index b7d89134..92cfd7f9 100644
          # normalize config
          if self.config.micro_batch_size is not None:
              self.config.micro_batch_size //= torch.distributed.get_world_size()
-@@ -1726,6 +1739,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
+@@ -1726,6 +1760,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
      def init_model(self):
          # This is used to import external_lib into the huggingface systems
          import_external_libs(self.config.model.get("external_lib", None))
@@ -666,17 +1158,25 @@ index b7d89134..92cfd7f9 100644
  
      def _forward_micro_batch(self, micro_batch):
 diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
-index db2e3fb1..97852f83 100644
+index db2e3fb1..4ea866f7 100644
 --- a/verl/workers/megatron_workers.py
 +++ b/verl/workers/megatron_workers.py
-@@ -32,14 +32,12 @@ try:
+@@ -20,6 +20,7 @@ import logging
+ import os
+ import time
+ from typing import Any, Optional
++from contextlib import nullcontext
+ 
+ import psutil
+ import torch
+@@ -32,14 +33,11 @@ try:
  except ImportError:
      repatch = None
  
 -from megatron.core import parallel_state as mpu
  
  from verl import DataProto
- from verl.models.mcore import get_mcore_weight_converter
+-from verl.models.mcore import get_mcore_weight_converter
  from verl.single_controller.base import Worker
  from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
  from verl.utils import hf_tokenizer
@@ -684,12 +1184,11 @@ index db2e3fb1..97852f83 100644
  from verl.utils.config import omega_conf_to_dataclass
  from verl.utils.device import (
      get_device_id,
-@@ -51,17 +49,9 @@ from verl.utils.device import (
+@@ -51,17 +49,8 @@ from verl.utils.device import (
  from verl.utils.distributed import set_numa_affinity
  from verl.utils.flops_counter import FlopsCounter
  from verl.utils.fs import copy_to_local
-+from verl.utils.import_utils import lazy_import_many_to_globals, lazy_import_to_globals
- from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
+-from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction, apply_router_replay_patch
 -from verl.utils.megatron_utils import (
 -    load_megatron_model_to_gpu,
 -    load_megatron_optimizer,
@@ -698,12 +1197,13 @@ index db2e3fb1..97852f83 100644
 -    per_tensor_generator,
 -    register_megatron_training_hooks,
 -)
++from verl.utils.import_utils import lazy_import_many_to_globals, lazy_import_to_globals
  from verl.utils.memory_utils import aggressive_empty_cache
 -from verl.utils.model import get_hf_model_path, load_mcore_dist_weights, load_megatron_gptmodel_weights
  from verl.utils.profiler import (
      DistProfiler,
      DistProfilerExtension,
-@@ -73,10 +63,7 @@ from verl.utils.profiler import (
+@@ -73,12 +62,16 @@ from verl.utils.profiler import (
  from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
  from verl.utils.ray_utils import get_event_loop
  from verl.utils.torch_functional import use_original_torch_compile
@@ -713,8 +1213,17 @@ index db2e3fb1..97852f83 100644
 -from verl.workers.reward_model.megatron.reward_model import MegatronRewardModel
  from verl.workers.rollout import get_rollout_class
  
++USE_TMS = False
++if os.environ.get("PSRL_TMS_ENABLE", "0") == "1":
++    USE_TMS = True
++    from torch_memory_saver import torch_memory_saver
++else:
++    torch_memory_saver = None
++
  logger = logging.getLogger(__file__)
-@@ -248,12 +235,54 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+@@ -248,12 +241,54 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
          self._is_ref = self.role in ["ref", "actor_rollout_ref"]
  
@@ -769,7 +1278,7 @@ index db2e3fb1..97852f83 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -287,48 +316,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -287,48 +322,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              )
          only_rollout = self._is_rollout and not self._is_actor
  
@@ -818,7 +1327,7 @@ index db2e3fb1..97852f83 100644
          # normalize config
          if self._is_actor:
              self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-@@ -362,7 +351,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -362,7 +357,13 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              init_megatron_optim_config,
          )
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -833,12 +1342,223 @@ index db2e3fb1..97852f83 100644
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -548,6 +543,18 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -378,108 +379,112 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+             self.config.model.get("trust_remote_code", False),
+         )
+ 
+-        if self._is_actor or self._is_rollout:
+-            wrap_config = McoreModuleWrapperConfig(
+-                is_value_model=False,  # actor is not value model
+-                share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+-                wrap_with_ddp=True,
+-                use_distributed_optimizer=self.config.actor.megatron.use_distributed_optimizer,
+-            )
+-            actor_module, updated_tf_config = make_megatron_module(
+-                wrap_config=wrap_config,
+-                tf_config=self.tf_config,
+-                hf_config=self.hf_config,
+-                bridge=self.bridge,
+-                provider=self.provider,
+-                override_model_config=override_model_config,
+-                override_ddp_config=override_ddp_config,
+-                peft_cls=self.peft_cls,
+-                peft_config=self.config.model.get("lora", None),
+-            )
+-            self.tf_config = updated_tf_config
+-            print(f"actor_module: {len(actor_module)}")
+-            if self.config.actor.load_weight:
+-                if self.config.actor.megatron.use_dist_checkpointing:
+-                    load_mcore_dist_weights(
+-                        actor_module,
+-                        self.config.actor.megatron.dist_checkpointing_path,
+-                        is_value_model=False,
+-                        prefix=self.config.actor.megatron.dist_checkpointing_prefix,
+-                    )
+-                else:
+-                    if self.bridge is not None:
+-                        local_model_path = get_hf_model_path(self.config)
+-                        if self.vanilla_bridge:
+-                            self.bridge.load_weights(actor_module, local_model_path)
+-                        else:
+-                            self.bridge.load_hf_weights(actor_module, local_model_path)
+-                    else:
+-                        load_megatron_gptmodel_weights(
+-                            self.config, self.hf_config, actor_module, params_dtype=self.dtype, is_value_model=False
++        tms_weight_ctx = torch_memory_saver.region() if USE_TMS else nullcontext()
++        with tms_weight_ctx:
++            if self._is_actor or self._is_rollout:
++                wrap_config = McoreModuleWrapperConfig(
++                    is_value_model=False,  # actor is not value model
++                    share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
++                    wrap_with_ddp=True,
++                    use_distributed_optimizer=self.config.actor.megatron.use_distributed_optimizer,
++                )
++                actor_module, updated_tf_config = make_megatron_module(
++                    wrap_config=wrap_config,
++                    tf_config=self.tf_config,
++                    hf_config=self.hf_config,
++                    bridge=self.bridge,
++                    provider=self.provider,
++                    override_model_config=override_model_config,
++                    override_ddp_config=override_ddp_config,
++                    peft_cls=self.peft_cls,
++                    peft_config=self.config.model.get("lora", None),
++                )
++                self.tf_config = updated_tf_config
++                print(f"actor_module: {len(actor_module)}")
++                if self.config.actor.load_weight:
++                    if self.config.actor.megatron.use_dist_checkpointing:
++                        load_mcore_dist_weights(
++                            actor_module,
++                            self.config.actor.megatron.dist_checkpointing_path,
++                            is_value_model=False,
++                            prefix=self.config.actor.megatron.dist_checkpointing_prefix,
+                         )
+-
+-            if self.rank == 0:
+-                print_model_size(actor_module[0])
+-            log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
+-        elif self._is_ref:
+-            wrap_config = McoreModuleWrapperConfig(
+-                is_value_model=False,  # ref is not value model
+-                share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
+-                wrap_with_ddp=False,
+-                use_distributed_optimizer=self.config.ref.megatron.use_distributed_optimizer,
+-            )
+-            ref_module, updated_tf_config = make_megatron_module(
+-                wrap_config=wrap_config,
+-                tf_config=self.tf_config,
+-                hf_config=self.hf_config,
+-                bridge=self.bridge,
+-                provider=self.provider,
+-                override_model_config=override_model_config,
+-            )
+-            self.tf_config = updated_tf_config
+-            if self.config.ref.load_weight:  # should align with the actor:
+-                assert self.config.actor.load_weight == self.config.ref.load_weight
+-                print("load ref weight start")
+-                if self.config.ref.megatron.use_dist_checkpointing:
+-                    load_mcore_dist_weights(
+-                        ref_module,
+-                        self.config.ref.megatron.dist_checkpointing_path,
+-                        is_value_model=False,
+-                        prefix=self.config.ref.megatron.dist_checkpointing_prefix,
+-                    )
+-                else:
+-                    if self.bridge is not None:
+-                        local_model_path = get_hf_model_path(self.config)
+-                        if self.vanilla_bridge:
+-                            self.bridge.load_weights(ref_module, local_model_path)
+-                        else:
+-                            self.bridge.load_hf_weights(ref_module, local_model_path)
+                     else:
+-                        load_megatron_gptmodel_weights(
+-                            self.config, self.hf_config, ref_module, params_dtype=self.dtype, is_value_model=False
++                        if self.bridge is not None:
++                            local_model_path = get_hf_model_path(self.config)
++                            if self.vanilla_bridge:
++                                self.bridge.load_weights(actor_module, local_model_path)
++                            else:
++                                self.bridge.load_hf_weights(actor_module, local_model_path)
++                        else:
++                            load_megatron_gptmodel_weights(
++                                self.config, self.hf_config, actor_module, params_dtype=self.dtype, is_value_model=False
++                            )
++
++                if self.rank == 0:
++                    print_model_size(actor_module[0])
++                log_gpu_memory_usage("After MegatronPPOActor init", logger=logger)
++            elif self._is_ref:
++                wrap_config = McoreModuleWrapperConfig(
++                    is_value_model=False,  # ref is not value model
++                    share_embeddings_and_output_weights=self.share_embeddings_and_output_weights,
++                    wrap_with_ddp=False,
++                    use_distributed_optimizer=self.config.ref.megatron.use_distributed_optimizer,
++                )
++                ref_module, updated_tf_config = make_megatron_module(
++                    wrap_config=wrap_config,
++                    tf_config=self.tf_config,
++                    hf_config=self.hf_config,
++                    bridge=self.bridge,
++                    provider=self.provider,
++                    override_model_config=override_model_config,
++                )
++                self.tf_config = updated_tf_config
++                if self.config.ref.load_weight:  # should align with the actor:
++                    assert self.config.actor.load_weight == self.config.ref.load_weight
++                    print("load ref weight start")
++                    if self.config.ref.megatron.use_dist_checkpointing:
++                        load_mcore_dist_weights(
++                            ref_module,
++                            self.config.ref.megatron.dist_checkpointing_path,
++                            is_value_model=False,
++                            prefix=self.config.ref.megatron.dist_checkpointing_prefix,
+                         )
+-            log_gpu_memory_usage("After ref module init", logger=logger)
+-            return ref_module, self.hf_config
+-
+-        # TODO: add more optimizer args into config
+-        if self._is_actor:
+-            optim_config_megatron = init_megatron_optim_config(
+-                optim_config,
+-                use_distributed_optimizer=wrap_config.use_distributed_optimizer,
+-                fp16=self.dtype == torch.float16,
+-            )
+-            actor_optimizer = get_megatron_optimizer(model=actor_module, config=optim_config_megatron)
+-            actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
+-                optimizer=actor_optimizer, config=optim_config
+-            )
+-        else:
+-            optim_config = None
+-            actor_optimizer = None
+-            actor_optimizer_scheduler = None
++                    else:
++                        if self.bridge is not None:
++                            local_model_path = get_hf_model_path(self.config)
++                            if self.vanilla_bridge:
++                                self.bridge.load_weights(ref_module, local_model_path)
++                            else:
++                                self.bridge.load_hf_weights(ref_module, local_model_path)
++                        else:
++                            load_megatron_gptmodel_weights(
++                                self.config, self.hf_config, ref_module, params_dtype=self.dtype, is_value_model=False
++                            )
++                log_gpu_memory_usage("After ref module init", logger=logger)
++                return ref_module, self.hf_config
++
++        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
++        with tms_optim_ctx:
++            # TODO: add more optimizer args into config
++            if self._is_actor:
++                optim_config_megatron = init_megatron_optim_config(
++                    optim_config,
++                    use_distributed_optimizer=wrap_config.use_distributed_optimizer,
++                    fp16=self.dtype == torch.float16,
++                )
++                actor_optimizer = get_megatron_optimizer(model=actor_module, config=optim_config_megatron)
++                actor_optimizer_scheduler = get_megatron_optimizer_param_scheduler(
++                    optimizer=actor_optimizer, config=optim_config
++                )
++            else:
++                optim_config = None
++                actor_optimizer = None
++                actor_optimizer_scheduler = None
+ 
+-        log_gpu_memory_usage("After actor optimizer init", logger=logger)
++            log_gpu_memory_usage("After actor optimizer init", logger=logger)
+ 
+-        register_megatron_training_hooks(actor_module, actor_optimizer)
++            register_megatron_training_hooks(actor_module, actor_optimizer)
+ 
+         return actor_module, actor_optimizer, actor_optimizer_scheduler, self.hf_config, optim_config
+ 
+@@ -548,6 +553,24 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
              importlib.import_module(self.config.model.external_lib)
  
          from verl.utils.torch_dtypes import PrecisionType
 +        lazy_import_to_globals("verl.utils.checkpoint.megatron_checkpoint_manager", "MegatronCheckpointManager")
 +        lazy_import_to_globals("verl.workers.actor.megatron_actor", "MegatronPPOActor")
++        lazy_import_to_globals("verl.models.mcore", "get_mcore_weight_converter")
 +        lazy_import_many_to_globals("verl.utils.megatron_utils", [
 +            "load_megatron_model_to_gpu",
 +            "load_megatron_optimizer",
@@ -847,12 +1567,17 @@ index db2e3fb1..97852f83 100644
 +            "per_tensor_generator",
 +            "register_megatron_training_hooks",
 +        ])
++        lazy_import_many_to_globals("verl.utils.megatron.router_replay_patch", [
++            "RouterReplay",
++            "RouterReplayAction",
++            "apply_router_replay_patch",
++        ])
 +
 +        self._build_distributed()
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          if self._is_actor:
-@@ -723,7 +730,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -723,7 +746,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          get_torch_device().set_rng_state(self.torch_random_states)
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -860,7 +1585,7 @@ index db2e3fb1..97852f83 100644
      @DistProfiler.annotate(color="red")
      def update_actor(self, data: DataProto):
          assert self._is_actor
-@@ -766,7 +772,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -766,7 +788,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -868,7 +1593,7 @@ index db2e3fb1..97852f83 100644
      @DistProfiler.annotate(color="red")
      def generate_sequences(self, prompts: DataProto):
          assert self._is_rollout
-@@ -816,7 +821,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -816,7 +837,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -876,7 +1601,7 @@ index db2e3fb1..97852f83 100644
      @DistProfiler.annotate(color="olive")
      def compute_ref_log_prob(self, data: DataProto):
          assert self._is_ref
-@@ -838,7 +842,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -838,7 +858,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -884,7 +1609,7 @@ index db2e3fb1..97852f83 100644
      @DistProfiler.annotate(color="blue")
      def compute_log_prob(self, data: DataProto):
          assert self._is_actor
-@@ -998,12 +1001,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -998,12 +1017,21 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config: McoreCriticConfig = config
  
@@ -906,7 +1631,7 @@ index db2e3fb1..97852f83 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1035,11 +1047,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1035,11 +1063,7 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          )
  
          set_random_seed(seed=self.config.megatron.seed)
@@ -919,7 +1644,7 @@ index db2e3fb1..97852f83 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
-@@ -1047,8 +1055,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1047,8 +1071,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
              self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
  
@@ -928,7 +1653,7 @@ index db2e3fb1..97852f83 100644
      def _build_critic_model_optimizer(
          self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
      ):
-@@ -1058,7 +1064,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1058,7 +1080,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              init_megatron_optim_config,
          )
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -942,7 +1667,7 @@ index db2e3fb1..97852f83 100644
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1141,12 +1152,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1141,12 +1168,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType
@@ -966,7 +1691,7 @@ index db2e3fb1..97852f83 100644
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          override_transformer_config = OmegaConf.to_container(
              OmegaConf.create(self.config.megatron.get("override_transformer_config", {}))
-@@ -1300,12 +1322,15 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1300,12 +1338,15 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          )
          self.config = config
  
@@ -982,7 +1707,7 @@ index db2e3fb1..97852f83 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1345,6 +1370,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1345,6 +1386,7 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
  
      def _build_rm_model(self, model_path, tokenizer, override_model_config, override_transformer_config):
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -990,7 +1715,7 @@ index db2e3fb1..97852f83 100644
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1402,12 +1428,22 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
+@@ -1402,12 +1444,22 @@ class RewardModelWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType

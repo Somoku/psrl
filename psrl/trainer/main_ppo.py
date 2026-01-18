@@ -136,6 +136,8 @@ class TaskRunner:
 
         self.role_worker_mapping[PSRL_Role.Rollout] = ray.remote(PSRL_GenWorker)
         self.role_worker_mapping[PSRL_Role.Actor] = ray.remote(PSRL_TrainWorker)
+        if config.psrl.colocate_validate_and_train:
+            self.role_worker_mapping[PSRL_Role.Validate] = ray.remote(PSRL_GenWorker)
 
         return actor_rollout_cls, ray_worker_group_cls
 
@@ -143,9 +145,18 @@ class TaskRunner:
         """Initialize resource pool manager."""
         deployment_config = config.psrl.deployment
         train_pool_id = "train_pool"
+        train_bundle_resource_num = 0.9 if config.psrl.colocate_validate_and_train else 1.0
         rollout_pool_id_list = [f"rollout_pool_{i}" for i in range(deployment_config.n_rollout_instances)]
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
+        }
+        # Validation resource pool share with training pool by default.
+        # But the granularity of validation is per DP worker, while training is the whole training job.
+        # Thus we set different resource fraction to enable resource sharing between training and validation.
+        # The training pool gets higher fraction due to initialization order.
+        # Note that 50% is not safe because two bundle in one pool may share one GPU, which causes error.
+        resource_num_per_bundle = {
+            train_pool_id: train_bundle_resource_num,
         }
 
         # Reward model resource pool
@@ -191,12 +202,27 @@ class TaskRunner:
                     deployment_config.rollout_ngpus_per_node_per_instance
                 ] * deployment_config.rollout_nnodes_per_instance
 
+        # Set the resource pool spec for each validation instance.
+        if config.psrl.colocate_validate_and_train:
+            val_pool_id_list = [f"validate_pool_{i}" for i in range(deployment_config.n_validate_instances)]
+            for i in range(deployment_config.n_validate_instances):
+                validate_pool_id = val_pool_id_list[i]
+                resource_pool_spec[validate_pool_id] = [
+                    deployment_config.validate_ngpus_per_node_per_instance
+                ] * deployment_config.validate_nnodes_per_instance
+                resource_num_per_bundle[validate_pool_id] = 1.0 - train_bundle_resource_num
+            self.mapping[PSRL_Role.Validate] = val_pool_id_list
+
         self.mapping[PSRL_Role.Actor] = [train_pool_id]
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list
         self.mapping[PSRL_Role.Critic] = [train_pool_id]
         from psrl.trainer.ppo.utils import ResourcePoolManager
 
-        resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec=resource_pool_spec,
+            mapping=self.mapping,
+            resource_num_per_bundle=resource_num_per_bundle,
+        )
 
         print(f"resource_pool_spec = {resource_pool_spec}, mapping = {self.mapping}")
 

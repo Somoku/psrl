@@ -576,8 +576,6 @@ class RequestStatusTracker:
         abort_request_ids = set()
         for req_id, info in self._request_infos.items():
             if not info.is_validate and info.model_version == version:
-                assert not info.is_validate, "Validation requests should not be aborted by version."
-                # If the request version matches, we will abort it
                 abort_request_ids.add(req_id)
         self._running_min_version = max(self._running_min_version, version + 1)
         return abort_request_ids

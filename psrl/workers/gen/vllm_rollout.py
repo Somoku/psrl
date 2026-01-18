@@ -66,6 +66,7 @@ class PSRL_vLLMRollout:
         self.psrl_config = psrl_config
         self.config = config
         self.stat_collector = None
+        self.is_validate = kwargs.get("is_validate", False)
 
         # Cached vLLM server initialization artifacts for HTTP serving.
         self._server_args = None
@@ -147,7 +148,12 @@ class PSRL_vLLMRollout:
                              please increase max_num_batched_tokens or disable chunked prefill"
             )
 
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+        # Load dummy format for meta init mode to save init time
+        load_format = (
+            "dummy"
+            if (config.load_format.startswith("dummy") or kwargs.get("init_mode", "full") == "empty")
+            else config.load_format
+        )
 
         # LoRA configuration
         lora_kwargs = (
@@ -196,7 +202,7 @@ class PSRL_vLLMRollout:
             distributed_executor_backend = None  # auto detect
 
         llm_kwargs = dict(
-            enable_sleep_mode=False,
+            enable_sleep_mode=self.is_validate,  # Only validation uses sleep mode for val/train switching
             tensor_parallel_size=tensor_parallel_size,
             pipeline_parallel_size=pipeline_parallel_size,
             enable_expert_parallel=enable_expert_parallel,

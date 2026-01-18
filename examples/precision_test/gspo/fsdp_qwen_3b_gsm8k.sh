@@ -72,6 +72,10 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
+# TIS
+rollout_is=null
+rollout_is_threshold=null
+
 # Performance Related Parameter
 sp_size=1
 use_dynamic_bsz=true
@@ -88,7 +92,6 @@ PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/grpo/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -96,6 +99,9 @@ PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
+    psrl.validate_on_psrl=False \
+    psrl.tms.range=null \
+    psrl.tms.enable_nixl=False \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=${rollout_mode} \
@@ -148,6 +154,9 @@ PYTHONUNBUFFERED=1 python -m verl.trainer.main_ppo \
     train_actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing} \
     train_actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     train_actor_rollout_ref.ref.ulysses_sequence_parallel_size=${sp_size} \
+    \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.adv_estimator=${adv_estimator} \

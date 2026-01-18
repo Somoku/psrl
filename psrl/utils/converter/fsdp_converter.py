@@ -95,6 +95,7 @@ def convert_fsdp_inplace(fsdp_strategy: str, model) -> tuple[dict[str, torch.Ten
     """
     Convenience function to convert FSDP/FSDP2 model to unified state dict and sharding info.
     Args:
+        fsdp_strategy: FSDP strategy, either 'fsdp' or 'fsdp2'
         model: The FSDP/FSDP2 model instance
     Returns:
         (converted_state_dict, sharding_dict)

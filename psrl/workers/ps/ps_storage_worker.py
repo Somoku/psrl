@@ -179,6 +179,23 @@ class PSStorageWorker:
             )
         self._nixl_protocol_phase2()
 
+    def nixl_wait_for_update_infos(self, info_num: int):
+        """Wait for update infos from the storage client.
+
+        Args:
+            info_num (int): Number of infos to wait for
+        """
+        self.nixl_multi_storage_clients.wait_for_update_infos(info_num)
+
+    def nixl_broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
+        """Broadcast updated client infos to destination agents.
+
+        Args:
+            dst_agent_names (list[str]): List of destination agent names
+            update_client_names (list[str]): List of updated client names
+        """
+        self.nixl_multi_storage_clients.broadcast_update_client_infos(dst_agent_names, update_client_names)
+
     def get_nixl_agent_name(self) -> str:
         """Get the name of the NIXL agent."""
         return self.agent_name
@@ -191,8 +208,15 @@ class PSStorageWorker:
         """Get the name of the NIXL gen storage client."""
         return self.client_for_pull_name
 
-    def init_model(self):
-        """Initialize the model."""
+    def init_model(self, init_mode: str = "meta"):
+        """
+        Initialize the model.
+
+        Args:
+            init_mode (str, optional): The initialization mode. Defaults to "meta".
+                When "meta", initialize the model on meta device.
+                When "full", initialize the model with full weights.
+        """
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         model_config = AutoConfig.from_pretrained(
             local_path,
@@ -204,21 +228,39 @@ class PSStorageWorker:
             model_class = AutoModelForCausalLM
 
         if self.psrl_config.ps_mode == "nixl_cpu":
-            # Initialize the model on meta device
-            with init_empty_weights():
-                self.train_meta_hf_model = model_class.from_config(
-                    model_config,
+            if init_mode == "meta":
+                # Initialize the model on meta device
+                with init_empty_weights():
+                    self.train_meta_hf_model = model_class.from_config(
+                        model_config,
+                        torch_dtype=self.storage_plan.train_model_dtype,
+                        trust_remote_code=self.model_config.get("trust_remote_code", False),
+                    )
+                    if self.storage_plan.train_gen_model_share():
+                        self.gen_meta_hf_model = self.train_meta_hf_model
+                    else:
+                        self.gen_meta_hf_model = model_class.from_config(
+                            model_config,
+                            torch_dtype=self.storage_plan.gen_model_dtype,
+                            trust_remote_code=self.model_config.get("trust_remote_code", False),
+                        )
+            elif init_mode == "full":
+                # Initialize the model with full weights
+                self.train_meta_hf_model = model_class.from_pretrained(
+                    local_path,
                     torch_dtype=self.storage_plan.train_model_dtype,
                     trust_remote_code=self.model_config.get("trust_remote_code", False),
                 )
                 if self.storage_plan.train_gen_model_share():
                     self.gen_meta_hf_model = self.train_meta_hf_model
                 else:
-                    self.gen_meta_hf_model = model_class.from_config(
-                        model_config,
+                    self.gen_meta_hf_model = model_class.from_pretrained(
+                        local_path,
                         torch_dtype=self.storage_plan.gen_model_dtype,
                         trust_remote_code=self.model_config.get("trust_remote_code", False),
                     )
+            else:
+                raise ValueError(f"Invalid init_mode: {init_mode}")
         elif self.psrl_config.ps_mode == "nixl_gpu":
             raise NotImplementedError("NIXL GPU mode is not implemented yet.")
         else:

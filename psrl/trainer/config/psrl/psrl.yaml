@@ -61,11 +61,20 @@ deployment:
   # Number for rollout instances
   n_rollout_instances: 1
 
+  # Number for validation rollout instances
+  n_validate_instances: 1
+
   # Node number for each rollout instance
   rollout_nnodes_per_instance: 1
 
   # GPU number for each rollout instance in every node
   rollout_ngpus_per_node_per_instance: 1
+
+  # Node number for each validate instance
+  validate_nnodes_per_instance: 1
+
+  # GPU number for each validate instance in every node
+  validate_ngpus_per_node_per_instance: 1
 
   # Node number for trainer
   train_nnodes: 1
@@ -258,6 +267,9 @@ nixl:
   # Pinned temp memory slots num for non-contiguous transfer
   max_pinned_temp_memory_slots: 8
 
+  # Enable TMS management for NIXL temp buffers
+  enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
 # Post processor for group requests in streaming mode
 group_post_process:
 
@@ -286,5 +298,30 @@ retry_bound: -1
 # Ratio over retry bound
 retry_ratio: 1.0
 
-# Whether to evaluate on rollout
-eval_on_rollout: True
+# Whether to validate on PSRL rollout workers
+validate_on_psrl: True
+
+# Whether to colocate validate and training workers
+colocate_validate_and_train: True
+
+# Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
+fuse_rollout_with_validate: False
+
+# Whether to use torch_memory_saver (TMS) for GPU management
+tms:
+
+  # Range of TMS to enable, available options:
+  #  - "null": disable TMS
+  #  - "train": enable TMS for training workers only
+  #  - "all": enable TMS for both rollout and training workers
+  range: train
+
+  # Whether to enable TMS on CUDA graphs
+  # When enabled, CUDA graphs will be released by TMS to save GPU memory
+  # This requires range to be "all"
+  enable_cuda_graph: False
+
+  # Whether to enable TMS on NIXL temp buffers
+  # When enabled, NIXL temp buffers will be released by TMS to save GPU
+  # and the reregister will be simplified.
+  enable_nixl: True

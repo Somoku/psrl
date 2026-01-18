@@ -41,6 +41,10 @@ gsm8k_test_path=$HOME/data/gsm8k/test.parquet
 train_files="['$gsm8k_train_path']"
 test_files="['$gsm8k_test_path']"
 
+# TIS
+rollout_is=null
+rollout_is_threshold=null
+
 echo "Tensor parallel sizes: ${GEN_TP_SIZES_STR}"
 echo "Pipeline parallel sizes: ${GEN_PP_SIZES_STR}"
 echo "Rollout GPUs per node per instance: ${ROLLOUT_NGPUS_STR}"
@@ -55,7 +59,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/ppo/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.heterogeneous_rollout.enable=True \
     psrl.deployment.heterogeneous_rollout.rollout_nnodes_per_instance="${ROLLOUT_NNODES_STR}" \
@@ -66,6 +69,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
+    psrl.validate_on_psrl=False \
+    psrl.tms.range=null \
+    psrl.tms.enable_nixl=False \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
@@ -93,6 +99,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     critic.ppo_micro_batch_size_per_gpu=1 \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
+    \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     \
     algorithm.use_kl_in_reward=False \
     algorithm.adv_estimator=gae \

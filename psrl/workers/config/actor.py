@@ -102,6 +102,7 @@ class ActorConfig(BaseConfig):
         "ppo_micro_batch_size",
         "ppo_micro_batch_size_per_gpu",
         "ppo_infer_micro_batch_size_per_gpu",
+        "engine",
     }
 
     strategy: str = MISSING

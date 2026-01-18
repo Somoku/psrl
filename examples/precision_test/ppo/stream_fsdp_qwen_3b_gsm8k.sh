@@ -12,7 +12,9 @@ GLOBAL_BATCH_SIZE=512
 
 GEN_TP=2 # TP in the generation side
 GEN_PP=2 # PP in the generation side
+
 VAL_TP=2 # TP in the training side for validation
+VAL_PP=1 # PP in the training side for validation
 
 NNODES=2
 NGPUS_PER_NODE=8
@@ -24,6 +26,13 @@ GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs pe
 
 TRAIN_NNODES=${NNODES} # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
+
+VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
+VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
+
+# TIS
+rollout_is=null
+rollout_is_threshold=null
 
 gsm8k_train_path=$HOME/data/gsm8k/train.parquet
 gsm8k_test_path=$HOME/data/gsm8k/test.parquet
@@ -40,10 +49,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/ppo/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=False \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
+    psrl.deployment.validate_nnodes_per_instance=1 \
+    psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
@@ -59,10 +70,15 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    train_actor_rollout_ref.rollout.mode=psrl_async \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
+    train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    train_actor_rollout_ref.rollout.temperature=${temperature} \
+    train_actor_rollout_ref.rollout.top_p=${top_p} \
+    train_actor_rollout_ref.rollout.top_k=${top_k} \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${GLOBAL_BATCH_SIZE} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -77,6 +93,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     critic.ppo_micro_batch_size_per_gpu=1 \
     critic.model.fsdp_config.param_offload=False \
     critic.model.fsdp_config.optimizer_offload=False \
+    \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     \
     algorithm.use_kl_in_reward=False \
     algorithm.adv_estimator=gae \

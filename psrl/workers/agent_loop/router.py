@@ -47,28 +47,34 @@ class RolloutRouter:
         """
         self.config = config
         self.staleness = self.config.psrl.staleness
+        self.n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
+        self.n_validate_instances = (
+            self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
+        )
+
+        # TODO(linsh): currently we only support balance strategy on rollout instances
+        # we may extend it to validate instances in the future with dynamic routing strategy
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
             self.balanced_concurrent_seqs_per_instance = (
                 self.config.psrl.redundant_rollout.redundant_global_batch_size
                 * self.rollout_n
-                // self.config.psrl.deployment.n_rollout_instances
+                // self.n_rollout_instances
             )
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
             self.balanced_concurrent_seqs_per_instance = (
-                self.config.psrl.staleness_buffer_entries
-                * self.rollout_n
-                // self.config.psrl.deployment.n_rollout_instances
+                self.config.psrl.staleness_buffer_entries * self.rollout_n // self.n_rollout_instances
             )
+
         self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         self.ps_manager_handle = ps_manager_handle
         self.tokenizer = tokenizer
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
-        assert self.rollout_wg_size == self.config.psrl.deployment.n_rollout_instances, (
+        assert self.rollout_wg_size == self.n_rollout_instances + self.n_validate_instances, (
             "Rollout worker group size must match the number of deployment instances"
         )
 
@@ -101,6 +107,8 @@ class RolloutRouter:
         self.request_futures = {}  # Track request futures: {request_id: Future}
         # Track the version after synchronization for each instance: {instance_id: ps_model_version}
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
+        # Track the instance ids that are currently paused (not available for routing)
+        self.currently_paused_instance_ids = set()
         # Track requests in sticky session: {request_id: bool}
         self.sticky_session_requests = {}
 
@@ -216,6 +224,25 @@ class RolloutRouter:
         """
         self.sticky_session_requests.pop(request_id, None)
 
+    async def pause_instances(self, instance_ids: list[int]):
+        """Notify the router about paused instances.
+
+        Args:
+            instance_ids (List[int]): List of instance IDs that are paused.
+        """
+        for instance_id in instance_ids:
+            self.currently_paused_instance_ids.add(instance_id)
+
+    async def resume_instances(self, instance_ids: list[int]):
+        """Notify the router about resumed instances.
+
+        Args:
+            instance_ids (List[int]): List of instance IDs that are resumed.
+        """
+        for instance_id in instance_ids:
+            self.currently_paused_instance_ids.discard(instance_id)
+        self.routing_status_update_event.set()
+
     def _choose_new_rollout_instance(self, request: DataProto) -> int:
         """Select the best rollout instance for handling the generation request.
 
@@ -238,12 +265,28 @@ class RolloutRouter:
             )
             needed_model_version = request.non_tensor_batch["min_version_limit"][0] - self.staleness
 
-        # 1. Filter the rollout instances that can tolerate the needed staleness of the request
+        # 1. Filter the rollout instances that are not paused and can tolerate the needed staleness of the request
         # This guarantees that the gen worker will have no ahead-of-time version tag when generating
+        if self.config.psrl.fuse_rollout_with_validate:
+            available_instance_ids = set(range(self.rollout_wg_size))
+        else:
+            # If not fusing rollout with validate, separate the instance IDs for rollout and validate
+            available_instance_ids = set(
+                range(self.rollout_wg_size - self.n_validate_instances)
+                if not is_validate
+                else range(self.rollout_wg_size - self.n_validate_instances, self.rollout_wg_size)
+            )
+        available_instance_ids = available_instance_ids - self.currently_paused_instance_ids
         candidates = [
-            i for i, version in self.instance_to_version_after_sync.items() if version >= needed_model_version
+            i
+            for i, version in self.instance_to_version_after_sync.items()
+            if i in available_instance_ids and version >= needed_model_version
         ]
-        # psrl_logger.info(f"Candidates for request {request_id}: {candidates}")
+        psrl_logger.debug(
+            f"Routing candidates of request {request_id} is {candidates}, where "
+            f"available instance: {available_instance_ids}, "
+            f"instance_to_version: {self.instance_to_version_after_sync}"
+        )
 
         # 2. If forbidden global migration and the request is a partial rollout request,
         # only consider the specific instance for routing

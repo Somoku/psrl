@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 
 import numpy as np
 import ray
@@ -786,6 +787,8 @@ class RolloutRouter:
         while True:
             # Process all requests in the multiple priority queues
             self._is_routing = False
+            route_num = 0
+            begin_time = time.time()
             is_stuck = True
             # psrl_logger.info("Trying to acquire lock")
             async with (
@@ -828,6 +831,7 @@ class RolloutRouter:
                         task = asyncio.create_task(task_coro)
                         # To avoid silent error in async tasks
                         task.add_done_callback(lambda f: f.result())
+                        route_num += 1
                     # psrl_logger.info(f"There are {len(remain_requests)} requests left in priority queue {queue_id}, putting them back to the queue")
                     for request in remain_requests:
                         request_queue.put(request)
@@ -843,6 +847,8 @@ class RolloutRouter:
             """
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
+            if route_num > 0:
+                psrl_logger.info(f"Routing {route_num} requests in multi priority queue routing loop, time cost: {time.time() - begin_time} seconds")
             await asyncio.sleep(sleep_time)
 
     async def _route_single_request(self, request: DataProto, old_instance_id: int | None, new_instance_id: int):

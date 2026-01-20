@@ -242,6 +242,21 @@ sync_and_mig_strategy:
     # Threshold for stopping migration
     stop_threshold: null
 
+# Abort and truncate strategy when training side is waiting for a buffer
+abort_and_truncate_strategy:
+  # Whether to enable abort or truncate strategy
+  # Available options: "null", "abort", "truncate"
+  method: null
+
+  # TODO: Implement this
+  # Whether to retry the request as a prompt after abort
+  abort_as_retry_prompt: False
+
+  # Threshold of aborted/truncated requests per buffer
+  # When the buffer is not ready but the training side is waiting for it
+  # We will trigger the abort/truncate strategy when the number of remaining reserved entries is smaller than this value
+  threshold: 0
+
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:
 

@@ -302,6 +302,8 @@ class RequestStatusTracker:
     def _abort_requests(self, request_ids: list[int] | int, blocking: bool = False):
         """
         Mark requests for abortion.
+        If the request is in the COMPLETED status, simply delete it from the status tracker.
+        Otherwise, the request will not be aborted immediately, but will be aborted next time when the request is updated.
 
         Args:
             request_ids (Union[List[int], int]): The unique identifiers of the requests to abort.
@@ -321,6 +323,7 @@ class RequestStatusTracker:
 
         abort_requests_for_rollout = set()
         abort_requests_for_reward = set()
+        abort_requests_for_completed = set()
 
         for status, req_ids in status_to_req_ids.items():
             psrl_logger.info(f"Classifying aborted requests in status {status}: {req_ids}")
@@ -333,6 +336,8 @@ class RequestStatusTracker:
                 abort_requests_for_rollout.update(req_ids)
             elif status in {PSRL_RequestStatus.REWARD_RUNNING}:
                 abort_requests_for_reward.update(req_ids)
+            elif status in {PSRL_RequestStatus.COMPLETED}:
+                abort_requests_for_completed.update(req_ids)
 
         futures = []
         # Abort requests in rollout stage (ROLLOUT_RUNNING)
@@ -363,6 +368,11 @@ class RequestStatusTracker:
                 )
             )
             psrl_logger.debug(f"Abort command sent to reward manager for requests: {abort_requests_for_reward}")
+
+        # Abort requests in completed stage (COMPLETED)
+        # Simply delete the requests since it will not be updated anymore
+        if abort_requests_for_completed:
+            self.remove_request(list(abort_requests_for_completed))
 
         if futures and blocking:
             ray.get(futures)
@@ -556,6 +566,9 @@ class RequestStatusTracker:
 
         abort_request_ids = set()
         for req_id, info in self._request_infos.items():
+            if req_id in self._abort_request_ids:
+                # If the request is in the abort set, we will not abort it again
+                continue
             if info.model_version == version:
                 # If the request version matches, we will abort it
                 abort_request_ids.add(req_id)

@@ -2,8 +2,8 @@
 set -xeuo pipefail
 
 staleness=${1:-3}
-project_name=paper_moe_exp
-experiment_name=moe_staleness_${staleness}_ours_3+5
+project_name=psrl_precision_test
+experiment_name=staleness_${staleness}_redundant
 fix_weight=${2:-False}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -46,21 +46,22 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-tis_imp_ratio_cap=4.0
+# tis_imp_ratio_cap=4.0
+# train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 20))
-train_packing_length=$((1024 * 44))
+max_response_length=$((1024 * 40))
+train_packing_length=$((1024 * 42))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 20))
+overlong_buffer_len=$((1024 * 40))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=64
-redundant_train_prompt_bsz=68
+train_prompt_bsz=32
+redundant_train_prompt_bsz=32
 n_resp_per_prompt=16
-redundant_n_resp_per_prompt=16
-train_prompt_mini_bsz=16
+redundant_n_resp_per_prompt=17
+train_prompt_mini_bsz=32
 # Algorithm
 temperature=1
 top_p=1
@@ -82,10 +83,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.profile.disable_attn=${disable_attn} \
     psrl.profile.fix_weight=${fix_weight} \
-    psrl.logging_path=${PSRL_PATH}/examples/paper_exp/e2e/logs/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/precision_test/experimental/logs/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=tis \
+    psrl.log_prob.mode=recompute \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -96,7 +97,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
-    psrl.redundant_rollout.enable=False \
+    psrl.redundant_rollout.enable=True \
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
@@ -108,20 +109,23 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.routing_strategy.enable_multi_priority_queue=True \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
     psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_moe_30b.json \
-    psrl.routing_strategy.delta_throughput_threshold=0.3 \
+    psrl.routing_strategy.delta_throughput_threshold=0.2 \
     psrl.routing_strategy.request_budget=1024 \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=512 \
     \
     psrl.sync_and_mig_strategy.method="status_based" \
     psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
-    psrl.sync_and_mig_strategy.sync.threshold=0.7 \
+    psrl.sync_and_mig_strategy.sync.threshold=0.6 \
     psrl.sync_and_mig_strategy.sync.check_req_before_sync=False \
     psrl.sync_and_mig_strategy.mig.enable=True \
     psrl.sync_and_mig_strategy.mig.indicator="throughput" \
-    psrl.sync_and_mig_strategy.mig.threshold=6 \
+    psrl.sync_and_mig_strategy.mig.threshold=5 \
     psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
-    psrl.sync_and_mig_strategy.mig.stop_threshold=8 \
+    psrl.sync_and_mig_strategy.mig.stop_threshold=10 \
+    \
+    psrl.abort_and_truncate_strategy.method="abort" \
+    psrl.abort_and_truncate_strategy.threshold=2 \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
@@ -139,7 +143,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
@@ -155,11 +159,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    train_actor_rollout_ref.actor.use_dynamic_bsz=True \
+    train_actor_rollout_ref.actor.use_dynamic_bsz=False \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${train_packing_length} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
     train_actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
@@ -207,4 +210,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=200 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=50 2>&1 | tee ${experiment_name}.log

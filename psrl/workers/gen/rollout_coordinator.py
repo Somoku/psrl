@@ -681,22 +681,27 @@ class RolloutCoordinator(CommandExtension):
         # psrl_logger.info("Checking if any instance is starving and doing migration if necessary")
         migrate_instance_ids = await self.agent_loop_workers[0].check_should_migrate.remote()
         if migrate_instance_ids:
-            psrl_logger.info(f"Migrating instances {migrate_instance_ids}")
-            await self.agent_loop_workers[0].interrupt_routing.remote()
-            psrl_logger.info("Interrupted routing for migration")
-            await self.exec_command(
-                Command(
-                    type=CommandType.ABORT,
-                    instance_ids=migrate_instance_ids,
-                ),
-                blocking=True,
-            )
-            if wait_interrupted_partial_requests_loop_back:
-                await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(
-                    migrate_instance_ids
+            with log_dual_events(
+                f"Migrating instances {migrate_instance_ids}",
+                psrl_logger,
+                level=logging.INFO,
+                event_type=EventType.OTHER,
+            ):
+                await self.agent_loop_workers[0].interrupt_routing.remote()
+                psrl_logger.info("Interrupted routing for migration")
+                await self.exec_command(
+                    Command(
+                        type=CommandType.ABORT,
+                        instance_ids=migrate_instance_ids,
+                    ),
+                    blocking=True,
                 )
-                psrl_logger.info(
-                    f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
-                )
-            await self.agent_loop_workers[0].resume_routing.remote()
-            psrl_logger.info("Resumed routing after migration")
+                if wait_interrupted_partial_requests_loop_back:
+                    await self.agent_loop_workers[0].wait_interrupted_partial_requests_loop_back.remote(
+                        migrate_instance_ids
+                    )
+                    psrl_logger.info(
+                        f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
+                    )
+                await self.agent_loop_workers[0].resume_routing.remote()
+                psrl_logger.info("Resumed routing after migration")

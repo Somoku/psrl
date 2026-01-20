@@ -36,6 +36,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.nixl import NIXLInterface
+from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import PSRL_vLLMRollout
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
@@ -816,11 +817,12 @@ class PSRL_GenWorker(Worker):
             )
 
         # Step 2: Pull model
-        with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
-            if self.config.rollout.mode == "psrl_async":
-                await self.pull_model_async()
-            else:
-                self.pull_model()
+        async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
+            with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
+                if self.config.rollout.mode == "psrl_async":
+                    await self.pull_model_async()
+                else:
+                    self.pull_model()
 
         # NOTE(lhy): The version obtained from the PS manager is the actual model version after the pull
         # It may be higher than the required version due to the pushing happens between waiting and pulling

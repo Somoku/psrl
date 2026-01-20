@@ -196,9 +196,11 @@ class PSRL_BaseTrainWorker:
                             raise e
                         psrl_logger.debug(f"Wait completed for key {key} to target {target_client_name}")
                         ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
+                        '''
                         precision_transfer_futures.append(
                             ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer)
                         )
+                        '''
                         psrl_logger.debug(
                             f"Transfer {shards_to_transfer} shards of {key} "
                             f"from train to gen in target {target_client_name}"
@@ -207,7 +209,7 @@ class PSRL_BaseTrainWorker:
                     f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} "
                     f"train to gen transfers on the PS..."
                 )
-                ray.get(precision_transfer_futures)
+                # ray.get(precision_transfer_futures)
                 psrl_logger.debug("Starting to push model tag to the PS...")
                 # Ensure all workers have completed the NIXL push operations and precision transfers
                 assert dist.is_initialized(), "Pytorch distributed is not initialized."

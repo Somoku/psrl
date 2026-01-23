@@ -3,6 +3,7 @@ examples/visualization/.*/
 unit_tests/nixl/plot/
 third_party/
 third_party_old/
+third_party_old_2/
 third_party_new/
 
 # General

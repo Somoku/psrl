@@ -41,12 +41,6 @@ log_prob:
   # Whether to return logprobs from rollout engines
   enable_rollout_engine_log_prob: True
 
-  # Whether to use proxy logprobs (AReaL)
-  enable_train_engine_recompute_log_prob: False
-
-  # rollout, recompute, tis
-  mode: rollout
-
 # Worker deployment and resource allocation
 deployment:
 
@@ -146,7 +140,7 @@ routing_strategy:
   check_interval_in_ms: 100
 
   # Whether to prioritize short requests
-  short_request_first: False
+  sort_indicator: small_id
 
   # Whether to sort the candidates by indicator 
   sort_candidate_by_indicator: False

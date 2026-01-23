@@ -960,6 +960,7 @@ class NIXLStorageClient:
                     self._contiguous_event_cache[(key, shard_idx)].synchronize()
                     self._contiguous_event_cache.pop((key, shard_idx))
                 tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                # assert tag not in self.xfer_handles, f"Tag {tag} already in xfer_handles"
                 if tag not in self.xfer_handles:
                     self.xfer_handles[tag] = self.agent.initialize_xfer(
                         "WRITE",

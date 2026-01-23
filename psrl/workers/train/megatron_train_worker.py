@@ -1,12 +1,12 @@
 import logging
 import os
+from typing import TYPE_CHECKING
 
 import ray
 import torch
 from contextlib import nullcontext
 from omegaconf import DictConfig
 from verl import DataProto
-from verl.models.mcore import get_mcore_weight_converter
 from verl.single_controller.base.decorator import (
     Dispatch,
     make_nd_compute_dataproto_dispatch_fn,
@@ -14,17 +14,13 @@ from verl.single_controller.base.decorator import (
 )
 from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
-from verl.utils.megatron_utils import (
-    load_megatron_model_to_gpu,
-    offload_megatron_model_to_cpu,
-    per_tensor_generator,
-)
+from verl.utils.megatron.router_replay_patch import RouterReplay, RouterReplayAction
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.profiler import GPUMemoryLogger
 from verl.workers.megatron_workers import ActorRolloutRefWorker
 
+from psrl.utils.common.utils import lazy_import_many_to_globals, lazy_import_to_globals
 from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -40,6 +36,23 @@ from psrl.utils.nixl import (
     NIXLStorageClient,
 )
 from psrl.workers.train import PSRL_BaseTrainWorker, TrainInterface
+
+# Make type checking happy
+if TYPE_CHECKING:
+    from verl.models.mcore import get_mcore_weight_converter
+    from verl.utils.megatron_utils import (
+        load_megatron_model_to_gpu,
+        offload_megatron_model_to_cpu,
+        per_tensor_generator,
+    )
+
+    from psrl.utils.converter.megatron_converter import convert_megatron_inplace
+else:
+    get_mcore_weight_converter = None
+    load_megatron_model_to_gpu = None
+    offload_megatron_model_to_cpu = None
+    per_tensor_generator = None
+    convert_megatron_inplace = None
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -115,6 +128,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
     def nixl_protocol(self):
+        lazy_import_to_globals("psrl.utils.converter.megatron_converter", "convert_megatron_inplace")
+
         # Register the state dict and sharding dict to the NIXL client
         psrl_logger.info("nixl client protocol step 0: convert_megatron_inplace")
         parameter_mapping = create_parameter_mapping("Megatron", copy_to_local(self.config.model.path))
@@ -191,6 +206,11 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def init_model(self):
+        lazy_import_to_globals("verl.models.mcore", "get_mcore_weight_converter")
+        lazy_import_many_to_globals(
+            "verl.utils.megatron_utils",
+            ["load_megatron_model_to_gpu", "offload_megatron_model_to_cpu", "per_tensor_generator"],
+        )
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             ActorRolloutRefWorker.init_model(self)
 
@@ -214,9 +234,27 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-            data = data.to(get_device_id())
-            output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
+            for k, v in data.batch.items():
+                if k != "routed_experts":
+                    data.batch[k] = v.to(get_device_id())
+                else:
+                    data.batch[k] = v
+
+            if self.enable_routing_replay and self.config.actor.router_replay.mode == "R2":
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+            if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+
+            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
             output = DataProto.from_dict(tensors={"recomputed_log_probs": output, "entropys": entropys})
+
+            if self.config.actor.router_replay.mode == "R2":
+                output.batch["routed_experts"] = layers_topk_idx
+            if self.config.actor.router_replay.mode in ["R2", "R3"]:
+                RouterReplay.clear_global_indices()
+                RouterReplay.clear_global_router_replay_action()
+
             output = output.to("cpu")
             # clear kv cache
             if self._is_offload_param:

@@ -1121,7 +1121,8 @@ class PSRL_GenWorker(Worker):
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
 
         psrl_logger.info(
-            f"Generating request {request.non_tensor_batch['uid'][0]} with needed model version {request.non_tensor_batch['version_tag'][0]}"
+            f"Generating request {request.non_tensor_batch['uid'][0]} "
+            f"with needed model version {request.non_tensor_batch['version_tag'][0]}"
         )
         # Wait for resuming if the generation is interrupted
         if self._async_interrupt_event and self._async_interrupt_event.is_set():

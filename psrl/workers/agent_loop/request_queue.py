@@ -1,8 +1,30 @@
 import heapq
+from enum import Enum
 from collections.abc import Callable, Iterator
 
 from sortedcontainers import SortedDict
 from verl import DataProto
+
+
+class RequestSortIndicator(Enum):
+    SHORT_LENGTH = "short_length"
+    LONG_LENGTH = "long_length"
+    SMALL_ID = "small_id"
+
+    def __str__(self) -> str:
+        return self.value
+
+    def __repr__(self) -> str:
+        return self.value
+
+    @classmethod
+    def _missing_(cls, value):
+        """Allow initialization from string value."""
+        if isinstance(value, str):
+            for member in cls:
+                if member.value == value:
+                    return member
+        raise ValueError(f"{value!r} is not a valid {cls.__name__}")
 
 
 def get_priority_by_version(request: DataProto, staleness: int) -> int:
@@ -56,10 +78,18 @@ def get_priority_by_version_and_token_num(
     return (version_priority, token_num_priority)
 
 
+def get_priority_by_version_and_id(request: DataProto, staleness: int) -> int:
+    """Get the priority value for a request based on version tag and ID.
+    """
+    version_priority = get_priority_by_version(request, staleness)
+    id_priority = request.non_tensor_batch["uid"][0]
+    return (version_priority, id_priority)
+
+
 class PriorityRequestQueue:
     """A priority queue for routing requests based on version tags."""
 
-    def __init__(self, staleness: int, short_request_first: bool = False):
+    def __init__(self, staleness: int, sort_indicator: RequestSortIndicator = RequestSortIndicator.SMALL_ID):
         """Initialize the priority queue.
 
         Args:
@@ -67,7 +97,7 @@ class PriorityRequestQueue:
         """
         self._queue = []
         self._staleness = staleness
-        self._short_request_first = short_request_first
+        self._sort_indicator = sort_indicator
         self._counter = 0  # To ensure FIFO for same priority items
 
     def put(self, request: DataProto) -> None:
@@ -76,7 +106,14 @@ class PriorityRequestQueue:
         Args:
             request (DataProto): The request to enqueue.
         """
-        priority = get_priority_by_version_and_token_num(request, self._staleness, self._short_request_first)
+        if self._sort_indicator == RequestSortIndicator.SHORT_LENGTH:
+            priority = get_priority_by_version_and_token_num(request, self._staleness, True)
+        elif self._sort_indicator == RequestSortIndicator.LONG_LENGTH:
+            priority = get_priority_by_version_and_token_num(request, self._staleness, False)
+        elif self._sort_indicator == RequestSortIndicator.SMALL_ID:
+            priority = get_priority_by_version_and_id(request, self._staleness)
+        else:
+            raise ValueError(f"Invalid sort indicator: {self._sort_indicator}")
         # Use counter to maintain FIFO order for items with same priority
         heapq.heappush(self._queue, (priority, self._counter, request))
         self._counter += 1
@@ -180,7 +217,7 @@ class MultiPriorityRequestQueue:
         self,
         staleness: int,
         queue_selector: Callable[[DataProto, int], int] = get_priority_by_version,
-        short_request_first: bool = False,
+        sort_indicator: RequestSortIndicator = RequestSortIndicator.SMALL_ID,
     ) -> None:
         """Initialize the multi-priority queue.
 
@@ -188,11 +225,11 @@ class MultiPriorityRequestQueue:
             staleness (int): The staleness tolerance for version comparison.
             queue_selector (Callable[[DataProto, int], int]): A function that takes a request and staleness
                 and returns the queue ID (int) to which the request should be routed.
-            short_request_first (bool): Whether to prioritize short requests.
+            sort_indicator (RequestSortIndicator): The sort indicator for the priority queue.
         """
         self._staleness = staleness
         self._queue_selector = queue_selector
-        self._short_request_first = short_request_first
+        self._sort_indicator = sort_indicator
         self._queues = SortedDict(lambda x: x)
 
     def put(self, request: DataProto) -> None:
@@ -206,7 +243,7 @@ class MultiPriorityRequestQueue:
         """
         queue_id = self._queue_selector(request, self._staleness)
         if queue_id not in self._queues:
-            self._queues[queue_id] = PriorityRequestQueue(self._staleness, self._short_request_first)
+            self._queues[queue_id] = PriorityRequestQueue(self._staleness, self._sort_indicator)
         self._queues[queue_id].put(request)
 
     def get_queue(self, queue_id: int) -> PriorityRequestQueue | None:

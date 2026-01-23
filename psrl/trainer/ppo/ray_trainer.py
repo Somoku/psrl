@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import uuid
@@ -24,11 +25,6 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.ray_trainer import (
-    RayPPOTrainer,
-    apply_kl_penalty,
-    compute_response_mask,
-)
 from verl.trainer.ppo.utils import WorkerType
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.debug import marked_timer
@@ -38,11 +34,14 @@ from verl.utils.seqlen_balancing import (
     log_seqlen_unbalance,
 )
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.torch_dtypes import PrecisionType
 
 from psrl.trainer.ppo.utils import (
     PSRL_compute_advantage,
-    PSRL_ResourcePoolManager,
     PSRL_Role,
+    ResourcePoolManager,
+    apply_kl_penalty,
+    compute_response_mask,
     need_critic,
     need_reference_policy,
     need_reward_model,
@@ -73,13 +72,13 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-class PSRL_RayPPOTrainer(RayPPOTrainer):
+class PSRL_RayPPOTrainer:
     def __init__(
         self,
         config,
         tokenizer,
         role_worker_mapping: dict[PSRL_Role, WorkerType],
-        resource_pool_manager: PSRL_ResourcePoolManager,
+        resource_pool_manager: ResourcePoolManager,
         ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
         processor=None,
         reward_fn=None,
@@ -97,7 +96,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             config: Configuration object containing training parameters.
             tokenizer: Tokenizer used for encoding and decoding text.
             role_worker_mapping (dict[PSRL_Role, WorkerType]): Mapping from roles to worker classes.
-            resource_pool_manager (PSRL_ResourcePoolManager): Manager for Ray resources.
+            resource_pool_manager (ResourcePoolManager): Manager for Ray resources.
             ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
             processor: Optional data processor, used for multimodal data.
             reward_fn: Function to compute rewards for the training data.
@@ -387,29 +386,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 f"NOTICE: NIXL is enabled. Actor strategy used is {self.config.train_actor_rollout_ref.actor.strategy}"
             )
 
-        # Check log_prob mode
-        if self.config.psrl.log_prob.mode == "rollout":
-            assert self.config.psrl.log_prob.enable_rollout_engine_log_prob, (
-                "enable_rollout_engine_log_prob must be set when using rollout log_prob"
-            )
-        elif self.config.psrl.log_prob.mode == "recompute":
-            assert self.config.psrl.log_prob.enable_train_engine_recompute_log_prob, (
-                "enable_train_engine_recompute_log_prob must be set when using recompute log_prob"
-            )
-        elif self.config.psrl.log_prob.mode == "tis":
-            assert (
-                self.config.psrl.log_prob.enable_rollout_engine_log_prob
-                and self.config.psrl.log_prob.enable_train_engine_recompute_log_prob
-            ), (
-                "enable_rollout_engine_log_prob and enable_train_engine_recompute_log_prob "
-                "must be set when using TIS log_prob"
-            )
-        else:
-            raise ValueError(
-                f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}, "
-                "must be one of ['rollout', 'recompute', 'tis']"
-            )
-
         # Check colocate mode
         if self.config.psrl.colocate:
             assert self.config.psrl.gen_mode == "batch", "gen_mode must be batch when using colocate mode"
@@ -603,6 +579,34 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.debug("Reward manager stopped successfully.")
         else:
             psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        n = len(inputs)
+        base_data = {
+            "input": inputs,
+            "output": outputs,
+            "gts": gts,
+            "score": scores,
+            "step": [self.global_steps] * n,
+        }
+
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
+        lines = []
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        psrl_logger.info(f"Dumped generations to {filename}")
 
     def _log_rollout_data(
         self,
@@ -998,7 +1002,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # you should not use `create_colocated_worker_cls_fused`.
         # Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
-        def create_worker_group(resource_pool, class_dict):
+        def create_worker_group(resource_pool, class_dict, wg_kwargs=wg_kwargs):
             # if there is only one worker class in the resource pool, we can directly create a worker group
             # so that we can use 'execute_all_async' and other low-level APIs
             # NOTE(lhy): in newest verl, we can use `create_colocated_worker_cls_fused`
@@ -1091,25 +1095,27 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 continue
             if any("rollout" in key for key in class_dict.keys()):
                 assert len(class_dict) == 1, "Rollout resource pool should only have one worker class."
-                gen_tasks.append((resource_pool, class_dict))
+                gen_tasks.append((resource_pool, class_dict, wg_kwargs))
             else:
-                train_tasks.append((resource_pool, class_dict))
+                # NOTE(linsh): adapt wg_kwargs for fused train worker
+                # if want to add specific env args.
+                train_tasks.append((resource_pool, class_dict, wg_kwargs))
         # We must execute train tasks first because rollout instances may occupy
         # the resources randomly and no structured resources are available for training
         with ThreadPoolExecutor(
             max_workers=len(train_tasks)
         ) as executor:  # max_workers is the number of threads to use
             futures = {}
-            for resource_pool, class_dict in train_tasks:
-                future = executor.submit(create_worker_group, resource_pool, class_dict)
+            for resource_pool, class_dict, train_wg_kwargs in train_tasks:
+                future = executor.submit(create_worker_group, resource_pool, class_dict, train_wg_kwargs)
                 futures[future] = (resource_pool, class_dict)
             for future in futures:
                 result = future.result()
                 all_wg.update(result)
         with ThreadPoolExecutor(max_workers=len(gen_tasks)) as executor:  # max_workers is the number of threads to use
             futures = {}
-            for resource_pool, class_dict in gen_tasks:
-                future = executor.submit(create_worker_group, resource_pool, class_dict)
+            for resource_pool, class_dict, gen_wg_kwargs in gen_tasks:
+                future = executor.submit(create_worker_group, resource_pool, class_dict, gen_wg_kwargs)
                 futures[future] = (resource_pool, class_dict)
             for future in futures:
                 result = future.result()
@@ -1149,7 +1155,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
         storage_plan = PSStoragePlan(
             train_model_dtype=train_model_dtype,
-            gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype,
+            gen_model_dtype=PrecisionType.to_dtype(self.config.gen_actor_rollout_ref.rollout.dtype),
         )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict
@@ -1651,10 +1657,25 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self.config.train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
                 )
                 batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
-                if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
-                    # batch.batch["rollout_log_probs"] can be used directly
-                    pass
-                if self.config.psrl.log_prob.enable_train_engine_recompute_log_prob:
+
+                # Operating Mode Selection:
+                # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+                # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+                #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+                rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+
+                if bypass_recomputing_logprobs:
+                    from verl.trainer.ppo.rollout_corr_helper import apply_rollout_correction
+
+                    apply_rollout_correction(
+                        batch=batch,
+                        rollout_corr_config=rollout_corr_config,
+                        policy_loss_config=self.config.train_actor_rollout_ref.actor.policy_loss,
+                    )
+
+                    batch.batch.pop("rollout_log_probs")
+                else:
                     # recompute log_probs in the training side
                     with marked_timer("recompute_log_prob", timing_raw, color="orange"):
                         with log_dual_events(
@@ -1697,18 +1718,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                                         "training/probs_diff_std": probs_diff_std.detach().item(),
                                     }
                                 )
-
-                if self.config.psrl.log_prob.mode == "rollout":
-                    batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
-                    batch.batch.pop("rollout_log_probs")
-                elif self.config.psrl.log_prob.mode == "recompute":
                     batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
                     batch.batch.pop("recomputed_log_probs")
-                elif self.config.psrl.log_prob.mode == "tis":
-                    batch.batch["old_log_probs"] = batch.batch["recomputed_log_probs"]
-                    batch.batch.pop("recomputed_log_probs")
-                else:
-                    raise ValueError(f"Invalid log_prob mode: {self.config.psrl.log_prob.mode}")
 
                 if self.use_reference_policy:
                     # compute reference log_prob
@@ -1809,8 +1820,24 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
+                        # Compute rollout correction: IS weights, rejection sampling, and metrics
+                        # Only runs in decoupled mode (computes once per batch using stable π_old)
+                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        if (
+                            rollout_corr_config is not None
+                            and "rollout_log_probs" in batch.batch
+                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+                        ):
+                            from verl.trainer.ppo.rollout_corr_helper import (
+                                compute_rollout_correction_and_add_to_batch,
+                            )
 
+                            # Compute IS weights, apply rejection sampling, compute metrics
+                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+                            # IS and off-policy metrics already have rollout_corr/ prefix
+                            metrics.update(is_metrics)
+
+                        # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor

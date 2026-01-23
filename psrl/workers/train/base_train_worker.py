@@ -1,11 +1,12 @@
 import logging
 import os
 import threading
-from dataclasses import dataclass
-
+import time
 import ray
+import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
+from dataclasses import dataclass
 
 from psrl.utils.nixl import NIXLInterface
 
@@ -140,7 +141,10 @@ class PSRL_BaseTrainWorker:
         # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                precision_transfer_futures = []
+                # NOTE(lhy): Now we use a dict to store the PS handle and the key and shards to transfer and merge them on the PS side.
+                # This is more efficient than calling transfer_train_to_gen for each key and shard, which will cause
+                # a lot of remote calls and may cause the ray actor collapse.
+                ps_handle_to_precision_transfer_key_and_shards_list: dict[str, list[tuple[str, list[tuple[int, ...]]]]] = {}
                 psrl_logger.debug(f"Starting to push model to the PS via NIXL for version {next_ps_model_version}...")
                 for key in self.unified_state_dict:
                     wait_operations = []
@@ -177,39 +181,28 @@ class PSRL_BaseTrainWorker:
                         f"Starting to wait for {len(wait_operations)} NIXL operations "
                         f"for version {next_ps_model_version}..."
                     )
-                    for key, target_client_name, shards_to_transfer in wait_operations:
+                    for wait_key, wait_target_client_name, wait_shards_to_transfer in wait_operations:
                         try:
                             self.nixl_storage_client.wait(
-                                key,
+                                wait_key,
                                 f"train_push_{next_ps_model_version}",
                                 "WRITE",
-                                target_client=target_client_name,
+                                target_client=wait_target_client_name,
                             )
-                            # self.nixl_storage_client.wait(
-                            #     key, "train_push", "WRITE", target_client=target_client_name
-                            # )
                         except Exception as e:
                             psrl_logger.error(
-                                f"Error waiting for key {key} to target {target_client_name} "
+                                f"Error waiting for key {wait_key} to target {wait_target_client_name} "
                                 f"for version {next_ps_model_version}: {e}"
                             )
                             raise e
-                        psrl_logger.debug(f"Wait completed for key {key} to target {target_client_name}")
-                        ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
-                        '''
-                        precision_transfer_futures.append(
-                            ps_worker_handle.transfer_train_to_gen.remote(key, shards_to_transfer)
-                        )
-                        '''
-                        psrl_logger.debug(
-                            f"Transfer {shards_to_transfer} shards of {key} "
-                            f"from train to gen in target {target_client_name}"
-                        )
-                psrl_logger.debug(
-                    f"Wait NIXL xfers done, start to wait for {len(precision_transfer_futures)} "
-                    f"train to gen transfers on the PS..."
-                )
-                # ray.get(precision_transfer_futures)
+                        psrl_logger.debug(f"Wait completed for key {wait_key} to target {wait_target_client_name}")
+                        if wait_target_client_name not in ps_handle_to_precision_transfer_key_and_shards_list:
+                            ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name] = []
+                        ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name].append((wait_key, wait_shards_to_transfer))
+                precision_transfer_futures = []
+                for target_client_name, precision_transfer_key_and_shards_list in ps_handle_to_precision_transfer_key_and_shards_list.items():
+                    precision_transfer_futures.append(self._cached_ps_worker_handles[target_client_name].transfer_train_to_gen_merged.remote(precision_transfer_key_and_shards_list))
+                ray.get(precision_transfer_futures)
                 psrl_logger.debug("Starting to push model tag to the PS...")
                 # Ensure all workers have completed the NIXL push operations and precision transfers
                 assert dist.is_initialized(), "Pytorch distributed is not initialized."

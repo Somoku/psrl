@@ -163,8 +163,10 @@ class BusyPollingRayLock:
         Initialize the BusyPollingRayLock.
 
         Args:
-            lock_actor: The actor handle with lock methods (acquire, release). The actor should have acquire() method to check lock state.
-            poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+            lock_actor: The actor handle with lock methods (acquire, release).
+                The actor should have acquire() method to check lock state.
+            poll_interval: The interval (in seconds) between polling checks.
+                Default is 0.01 seconds.
         """
         self._lock = lock_actor
         self._poll_interval = poll_interval
@@ -208,8 +210,10 @@ class AsyncBusyPollingRayLock:
         Initialize the AsyncBusyPollingRayLock.
 
         Args:
-            lock_actor: The actor handle with lock methods (acquire, release). The actor should have acquire() method to check lock state.
-            poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+            lock_actor: The actor handle with lock methods (acquire, release).
+                The actor should have acquire() method to check lock state.
+            poll_interval: The interval (in seconds) between polling checks.
+                Default is 0.01 seconds.
         """
         self._lock = lock_actor
         self._poll_interval = poll_interval

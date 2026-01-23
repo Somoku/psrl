@@ -9,7 +9,7 @@ import numpy as np
 from omegaconf import DictConfig
 from vllm.config import VllmConfig
 from vllm.v1.metrics.loggers import StatLoggerBase
-from vllm.v1.metrics.stats import IterationStats, SchedulerStats
+from vllm.v1.metrics.stats import IterationStats, MultiModalCacheStats, SchedulerStats
 
 from psrl.utils.logger import FileOnlyHandler
 
@@ -166,6 +166,7 @@ class StatCollector(StatLoggerBase):
         self,
         scheduler_stats: SchedulerStats | None,
         iteration_stats: IterationStats | None,
+        mm_cache_stats: MultiModalCacheStats | None = None,
         engine_idx: int = 0,
     ):
         """
@@ -177,6 +178,7 @@ class StatCollector(StatLoggerBase):
         Args:
             scheduler_stats: Statistics from vLLM scheduler (request counts, etc.)
             iteration_stats: Statistics from vLLM iteration
+            mm_cache_stats: Multi-modal cache statistics (not currently used)
             engine_idx: Engine index (not currently used)
         """
         assert self.output_queue is not None, "Output queue is not initialized"
@@ -251,7 +253,8 @@ class StatCollector(StatLoggerBase):
                     psrl_logger.info(f"Snapshot (model version {self.model_version}): {snapshot}")
                 else:
                     raise ValueError(
-                        f"Invalid dump logging to file level: {self.psrl_config.status_collection.dump_logging_to_file_level}"
+                        f"Invalid dump logging to file level: "
+                        f"{self.psrl_config.status_collection.dump_logging_to_file_level}"
                     )
                 self.last_dump_to_file_time = curr_time
         self.last_record_time = curr_time

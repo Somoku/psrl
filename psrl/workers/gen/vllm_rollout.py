@@ -14,12 +14,22 @@ from tensordict import TensorDict
 from verl import DataProto
 from verl.utils.debug import GPUMemoryLogger
 from vllm import LLM, SamplingParams
-from vllm.config import CompilationConfig, CompilationLevel
+from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine.async_llm import AsyncLLM
+
+try:
+    # https://github.com/vllm-project/vllm/commit/96b9aa5aa076e64c68765232aec343e4d0006e2a
+    from vllm.config import CompilationMode
+
+    _use_compilation_mode = True
+except ImportError:
+    from vllm.config import CompilationLevel
+
+    _use_compilation_mode = False
 
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import deprecated
@@ -61,6 +71,8 @@ class PSRL_vLLMRollout:
         )
         expert_parallel_size = config.get("expert_parallel_size", 1)
         enable_expert_parallel = expert_parallel_size > 1
+
+        enable_return_routed_experts = config.get("enable_rollout_routing_replay", False)
 
         # For async engine and model parallel, we only run the inference engine on the first rank.
         # The inner parallel workers are handled by vLLM + Ray.
@@ -157,10 +169,12 @@ class PSRL_vLLMRollout:
         # enforce_eager must be False to use cudagraph
         if not config.enforce_eager and cudagraph_capture_sizes:
             if isinstance(cudagraph_capture_sizes, ListConfig):
-                compilation_config["compilation_config"] = CompilationConfig(
-                    level=CompilationLevel.PIECEWISE,
-                    cudagraph_capture_sizes=cudagraph_capture_sizes,
-                )
+                compilation_args = {"cudagraph_capture_sizes": cudagraph_capture_sizes}
+                if _use_compilation_mode:
+                    compilation_args["mode"] = CompilationMode.VLLM_COMPILE
+                else:
+                    compilation_args["level"] = CompilationLevel.PIECEWISE
+                compilation_config["compilation_config"] = CompilationConfig(**compilation_args)
             else:
                 psrl_logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
@@ -187,7 +201,7 @@ class PSRL_vLLMRollout:
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
-            max_seq_len_to_capture=max_model_len,
+            # max_seq_len_to_capture=max_model_len,
             max_num_seqs=config.max_num_seqs,
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
@@ -198,6 +212,8 @@ class PSRL_vLLMRollout:
             logprobs_mode=config.logprobs_mode,
             worker_extension_cls="psrl.workers.gen.vllm_extension.vLLMWorkerExtension",
             seed=kwargs.get("seed", 0),
+            enable_return_routed_experts=enable_return_routed_experts,
+            **compilation_config,
             **lora_kwargs,
             **engine_kwargs,
         )
@@ -480,6 +496,7 @@ class PSRL_vLLMRollout:
         interrupted_list = []
         interrupted_by_scheduler_list = []
         all_log_prob_list = []
+        routed_experts_list = []
 
         for i, uid in enumerate(uid_list):
             vllm_output = outputs[i]
@@ -530,6 +547,11 @@ class PSRL_vLLMRollout:
                         log_prob_list.append(logprob[response_ids[i]].logprob)
             all_log_prob_list.append(log_prob_list)
 
+            routed_experts = None
+            if self.config.enable_rollout_routing_replay:
+                routed_experts = vllm_output.outputs[0].routed_experts
+            routed_experts_list.append(routed_experts)
+
         # Consolidate batch results
         if "raw_response_ids" in non_tensor_batch:
             raw_response_ids = non_tensor_batch["raw_response_ids"]
@@ -556,6 +578,10 @@ class PSRL_vLLMRollout:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
             curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
             non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
+
+        # process routed experts
+        if self.config.enable_rollout_routing_replay:
+            non_tensor_batch["routed_experts"] = np.fromiter(routed_experts_list, dtype=object)
 
         batch = TensorDict(
             {

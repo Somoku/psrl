@@ -999,7 +999,7 @@ class ClusterScanner:
                         },
                     }
                     return {"ok": True, "method": "nccl_allreduce", "result": results}
-            except Exception:
+            except Exception as e:
                 return {"ok": False, "error": str(e)}
             finally:
                 left_sr.close()

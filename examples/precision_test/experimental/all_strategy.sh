@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-3}
 project_name=psrl_precision_test
-experiment_name=staleness_${staleness}_redundant
+experiment_name=staleness_${staleness}_redundant_debug
 fix_weight=${2:-False}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -11,8 +11,8 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen3-30B-A3B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen3-30B-A3B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3-30B-A3B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-30B-A3B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -51,10 +51,10 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 40))
-train_packing_length=$((1024 * 42))
+max_response_length=$((1024 * 20))
+train_packing_length=$((1024 * 44))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 40))
+overlong_buffer_len=$((1024 * 8))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=32
@@ -85,8 +85,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.profile.fix_weight=${fix_weight} \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/experimental/logs/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=recompute \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -210,4 +208,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=200 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=50 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

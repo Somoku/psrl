@@ -217,9 +217,9 @@ def plot_metrics_from_files(
 if __name__ == "__main__":
     # Define your file paths
     file_paths = [
-        "/jizhicfs/lhy/psrl/examples/paper_exp/background/staleness/7b_staleness_1.log",
-        "/jizhicfs/lhy/psrl/examples/paper_exp/background/staleness/7b_staleness_2.log",
-        "/jizhicfs/lhy/psrl/examples/paper_exp/background/staleness/7b_staleness_3.log",
+        "${PSRL_WORKSPACE}/psrl/examples/paper_exp/background/staleness/7b_staleness_1.log",
+        "${PSRL_WORKSPACE}/psrl/examples/paper_exp/background/staleness/7b_staleness_2.log",
+        "${PSRL_WORKSPACE}/psrl/examples/paper_exp/background/staleness/7b_staleness_3.log",
     ]
 
     # Optional: Define custom labels for each file path
@@ -241,9 +241,9 @@ if __name__ == "__main__":
 
     # Define your file paths
     file_paths = [
-        "/jizhicfs/lhy/psrl/examples/paper_exp/background/staleness/7b_staleness_1.log",
-        "/jizhicfs/lhy/psrl/examples/paper_exp/background/staleness/7b_staleness_3.log",
-        "/jizhicfs/lhy/psrl/examples/paper_exp/background/staleness/7b_staleness_2.log",
+        "${PSRL_WORKSPACE}/psrl/examples/paper_exp/background/staleness/7b_staleness_1.log",
+        "${PSRL_WORKSPACE}/psrl/examples/paper_exp/background/staleness/7b_staleness_3.log",
+        "${PSRL_WORKSPACE}/psrl/examples/paper_exp/background/staleness/7b_staleness_2.log",
     ]
 
     # Optional: Define custom labels for each file path

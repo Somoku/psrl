@@ -234,6 +234,11 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
+            
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+            
             for k, v in data.batch.items():
                 if k != "routed_experts":
                     data.batch[k] = v.to(get_device_id())

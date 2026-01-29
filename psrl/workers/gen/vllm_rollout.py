@@ -66,19 +66,15 @@ class PSRL_vLLMRollout:
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         pipeline_parallel_size = config.get("pipeline_model_parallel_size", 1)
         model_parallel_size = tensor_parallel_size * pipeline_parallel_size
-        assert pipeline_parallel_size == 1 or config.mode == "psrl_async", (
-            "pipeline parallel is only supported in psrl_async mode"
-        )
         expert_parallel_size = config.get("expert_parallel_size", 1)
         enable_expert_parallel = expert_parallel_size > 1
 
         enable_return_routed_experts = config.get("enable_rollout_routing_replay", False)
 
-        # For async engine and model parallel, we only run the inference engine on the first rank.
+        # For model parallel, we only run the inference engine on the first rank.
         # The inner parallel workers are handled by vLLM + Ray.
-        if config.mode == "psrl_async" and model_parallel_size > 1:
+        if model_parallel_size > 1:
             import os
-
             if os.environ.get("LOCAL_RANK") != "0":
                 self.inference_engine = None
                 return
@@ -178,13 +174,11 @@ class PSRL_vLLMRollout:
             else:
                 psrl_logger.warning(f"cudagraph_capture_sizes must be a list, but got {cudagraph_capture_sizes}")
 
-        if config.mode == "psrl_async" and model_parallel_size > 1:
+        if model_parallel_size > 1:
             # Configure vLLM for tensor/pipeline parallelism within Ray
             # Reset CUDA_VISIBLE_DEVICES to allow vLLM to manage GPU assignment
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             distributed_executor_backend = "ray"
-        elif config.mode == "sync":
-            distributed_executor_backend = "external_launcher"
         else:
             distributed_executor_backend = None  # auto detect
 
@@ -201,7 +195,7 @@ class PSRL_vLLMRollout:
             disable_custom_all_reduce=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
-            # max_seq_len_to_capture=max_model_len,
+            # max_seq_len_to_capture=max_model_len, # deprecated
             max_num_seqs=config.max_num_seqs,
             load_format=load_format,
             disable_log_stats=config.disable_log_stats,
@@ -238,31 +232,27 @@ class PSRL_vLLMRollout:
             * psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
         }
 
-        # Initialize abort queue, events, and request ids for psrl_async mode
+        # Initialize abort queue, events, and request ids
         self.scheduler_abort_queue = RayQueue()
         self.scheduler_abort_events = {}
         self.scheduler_abort_requests = set()
         self._scheduler_abort_processor_task = None
 
-        if config.mode == "psrl_async":
-            engine_args = AsyncEngineArgs(**llm_kwargs)
-            stat_loggers = None
-            if not config.disable_log_stats and psrl_config.status_collection.enable:
-                psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
-                # Use custom stat loggers to collect engine stats
-                vllm_config = engine_args.create_engine_config()
-                status_queue = kwargs["status_queue"]
-                self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
-                self.stat_collector.begin_record()
-                self.stat_collector.init_output_queue(status_queue)
-                self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_queue)
-                self.stat_collector.record_model_version_update(0)
-                stat_loggers = [self.stat_collector]
-            psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
-            self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)
-        else:
-            psrl_logger.info(f"Initialize LLM for rollout instance {kwargs.get('instance_id', 0)}")
-            self.inference_engine = LLM(**llm_kwargs)
+        engine_args = AsyncEngineArgs(**llm_kwargs)
+        stat_loggers = None
+        if not config.disable_log_stats and psrl_config.status_collection.enable:
+            psrl_logger.info(f"Enable status collection for rollout instance {kwargs.get('instance_id', 0)}")
+            # Use custom stat loggers to collect engine stats
+            vllm_config = engine_args.create_engine_config()
+            status_queue = kwargs["status_queue"]
+            self.stat_collector = StatCollector(vllm_config, psrl_config, instance_id=kwargs.get("instance_id", 0))
+            self.stat_collector.begin_record()
+            self.stat_collector.init_output_queue(status_queue)
+            self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_queue)
+            self.stat_collector.record_model_version_update(0)
+            stat_loggers = [self.stat_collector]
+        psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")
+        self.inference_engine = AsyncLLM.from_engine_args(engine_args, stat_loggers=stat_loggers)
 
         # NOTE(lhy): sleep mode is not supported when using NIXL
         # Because it will cause illegal memory registration
@@ -293,17 +283,16 @@ class PSRL_vLLMRollout:
 
         self.pad_token_id = tokenizer.pad_token_id
 
-        # Start abort processor task for async mode
-        if config.mode == "psrl_async":
-            try:
-                loop = asyncio.get_event_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-            self._scheduler_abort_processor_task = loop.create_task(self._scheduler_abort_processor_loop())
-            self._scheduler_abort_processor_task.add_done_callback(
-                lambda f: f.result()
-            )  # To avoid silent error in async tasks
+        # Start abort processor task
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        self._scheduler_abort_processor_task = loop.create_task(self._scheduler_abort_processor_loop())
+        self._scheduler_abort_processor_task.add_done_callback(
+            lambda f: f.result()
+        )  # To avoid silent error in async tasks
 
     async def _scheduler_abort_processor_loop(self):
         """Background loop that processes abort requests from the queue."""
@@ -332,7 +321,7 @@ class PSRL_vLLMRollout:
             return
         # Wait until queue is empty
         while not self.scheduler_abort_queue.empty():
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
 
         # Wait for all pending abort requests to complete
         if self.scheduler_abort_events:
@@ -594,9 +583,7 @@ class PSRL_vLLMRollout:
     def add_requests(self, prompts: DataProto, **kwargs):
         """
         Add generation requests to the vLLM inference engine.
-
         This method converts prompts to vLLM format and queues them for generation.
-        Used primarily for async/streaming generation modes.
 
         Args:
             prompts: DataProto containing input prompts
@@ -618,52 +605,7 @@ class PSRL_vLLMRollout:
                     priority=0,
                 )
 
-    @deprecated("vllm_rollout.step_all is not used.")
-    @torch.no_grad()
-    def step_all(self) -> list[RequestOutput | PoolingRequestOutput]:
-        outputs: list[RequestOutput | PoolingRequestOutput] = []
-        while self.inference_engine.llm_engine.has_unfinished_requests():
-            step_outputs = self.inference_engine.llm_engine.step()
-            for output in step_outputs:
-                if output.finished:
-                    outputs.append(output)
-        return sorted(outputs, key=lambda x: int(x.request_id))
-
-    @deprecated("vllm_rollout.step is not used.")
-    @torch.no_grad()
-    def step(self) -> list[RequestOutput | PoolingRequestOutput]:
-        return self.inference_engine.llm_engine.step()
-
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
-    @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        """
-        Generate sequences from prompts using synchronous vLLM generation.
-
-        This is the main synchronous generation method that:
-        1. Pre-processes inputs for vLLM
-        2. Runs generation with specified sampling parameters
-        3. Post-processes outputs back to DataProto format
-
-        Args:
-            prompts: DataProto containing input prompts and metadata
-            **kwargs: Additional generation parameters
-
-        Returns:
-            DataProto with generated sequences and updated metadata
-        """
-        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            # the inference_engine will handle the request_id internally
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                use_tqdm=False,
-            )
-            return self.post_process_outputs(prompts, outputs)
-
-    @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
+    @GPUMemoryLogger(role="vllm rollout", logger=psrl_logger)
     @torch.no_grad()
     async def generate_sequences_async(self, prompts: DataProto, **kwargs) -> DataProto:
         """
@@ -710,26 +652,7 @@ class PSRL_vLLMRollout:
 
         return DataProto.concat(completed_rollout)
 
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=psrl_logger)
-    @torch.no_grad()
-    def raw_generate_sequences(self, prompts: DataProto, **kwargs):
-        """Generate sequences from the prompts using vLLM without post-processing."""
-        assert "response_unpadded_len" not in prompts.non_tensor_batch, (
-            "partial rollout is currently not supported in sync mode"
-        )
-
-        vllm_inputs, kwargs = self.pre_process_inputs(prompts, kwargs)
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            # the inference_engine will handle the request_id internally
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                use_tqdm=False,
-            )
-            return outputs
-
-    @GPUMemoryLogger(role="vllm stream rollout", logger=psrl_logger)
+    @GPUMemoryLogger(role="vllm rollout", logger=psrl_logger)
     @torch.no_grad()
     async def raw_generate_sequences_async(self, prompts: DataProto, **kwargs):
         """Generate sequences from the prompts using vLLM asynchronously without post-processing."""

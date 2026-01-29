@@ -16,7 +16,7 @@ class OptimizerConfig(BaseConfig):
         lr_warmup_steps_ratio (float): Warmup steps ratio; total steps will be injected at runtime.
         total_training_steps (int): Total training steps (must be overridden at runtime).
         weight_decay (float): Weight decay factor.
-        lr_warmup_steps (Optional[int]): Number of warmup steps; None delegates to lr_warmup_steps_ratio.
+        lr_warmup_steps (int | None): Number of warmup steps; None delegates to lr_warmup_steps_ratio.
     """
 
     _mutable_fields = {"clip_grad", "total_training_steps", "lr_warmup_steps"}
@@ -34,11 +34,7 @@ class OptimizerConfig(BaseConfig):
     def __post_init__(self):
         assert self.lr != MISSING
         if self.grad_clip is not None:
-            warnings.warn(
-                "`grad_clip` is deprecated, use `clip_grad` instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
+            warnings.warn("`grad_clip` is deprecated, use `clip_grad` instead.", DeprecationWarning, stacklevel=2)
             self.clip_grad = self.grad_clip
 
 
@@ -47,18 +43,35 @@ class FSDPOptimizerConfig(OptimizerConfig):
     """FSDP optimizer configuration extending base OptimizerConfig.
 
     Args:
+        optimizer (str): Optimizer class name (e.g., "AdamW", "AdamW8bit", "_AdamW").
+        optimizer_impl (str): Module path to import optimizer from (e.g., "torch.optim", "torchao.optim",
+            "bitsandbytes.optim").
         lr (float): Learning rate.
-        min_lr_ratio (Optional[float]): Minimum LR ratio for cosine schedule.
-        warmup_style (str): LR warmup style: "constant" or "cosine".
+        min_lr_ratio (float | None): Minimum LR ratio for cosine schedule.
+        lr_scheduler_type (str): LR scheduler type: "constant" or "cosine".
         num_cycles (float): Number of cosine cycles in LR schedule.
     """
 
+    _mutable_fields = OptimizerConfig._mutable_fields.copy()
+    _mutable_fields.add("lr_scheduler_type")
+
+    optimizer: str = "AdamW"
+    optimizer_impl: str = "torch.optim"
     min_lr_ratio: float | None = None
-    warmup_style: str = "constant"
+    # deprecate warmup_style
+    warmup_style: str | None = None
+    lr_scheduler_type: str = "constant"
     num_cycles: float = 0.5
+    override_optimizer_config: dict | None = None
 
     def __post_init__(self):
-        assert self.warmup_style in ["constant", "cosine"]
+        if self.warmup_style is not None:
+            assert self.warmup_style in ["constant", "cosine"]
+            warnings.warn(
+                "`warmup_style` is deprecated, use `lr_scheduler_type` instead.", DeprecationWarning, stacklevel=2
+            )
+            self.lr_scheduler_type = self.warmup_style
+        assert self.lr_scheduler_type in ["constant", "cosine"]
         return super().__post_init__()
 
 
@@ -71,12 +84,12 @@ class McoreOptimizerConfig(OptimizerConfig):
         lr (float): Learning rate.
         clip_grad (float): Gradient clipping norm.
         lr_warmup_init (float): Initial learning rate for warmup; defaults to 0.0.
-        lr_decay_steps (Optional[int]): Number of decay steps.
+        lr_decay_steps (int | None): Number of decay steps.
         lr_decay_style (str): LR decay style: "constant", "linear", "cosine", or "inverse_square_root".
         min_lr (float): Minimum learning rate.
         weight_decay_incr_style (str): Weight decay increment style: "constant" or "cosine".
         lr_wsd_decay_style (str): Weight-standard-deviation decay style: "constant", "exponential", or "cosine".
-        lr_wsd_decay_steps (Optional[int]): Number of steps for weight-standard-deviation decay.
+        lr_wsd_decay_steps (int | None): Number of steps for weight-standard-deviation decay.
         use_checkpoint_opt_param_scheduler (bool): Whether to use checkpoint optimizer parameter scheduler.
     """
 

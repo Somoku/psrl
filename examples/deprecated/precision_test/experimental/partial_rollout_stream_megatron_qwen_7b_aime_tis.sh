@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-3}
-project_name=psrl_precision_test
-experiment_name=staleness_${staleness}_redundant_debug
-fix_weight=${2:-False}
+staleness=${1:-2}
+project_name=psrl_partial_exp_new
+experiment_name=staleness_${staleness}_tp_bl
+fix_weight=${2:-True}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3-30B-A3B
-DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-30B-A3B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/DeepSeek-R1-Distill-Qwen-7B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/DeepSeek-R1-Distill-Qwen-7B
+# HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+# DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-Math-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
@@ -25,10 +27,8 @@ VAL_TP=4 # TP in the training side for validation
 TRAIN_TP=4 # TP in the training side 
 TRAIN_PP=5 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
-TRAIN_EP=8 # EP in the training side
-TRAIN_ETP=1 # ETP in the training side
-NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=9 # Number of layers in the first pipeline stage
-NUM_LAYERS_IN_LAST_PIPELINE_STAGE=9 # Number of layers in the last pipeline stage
+NUM_LAYERS_IN_FIRST_PIPELINE_STAGE=5 # Number of layers in the first pipeline stage
+NUM_LAYERS_IN_LAST_PIPELINE_STAGE=5 # Number of layers in the last pipeline stage
 
 NNODES=8
 NGPUS_PER_NODE=8
@@ -46,32 +46,31 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-# tis_imp_ratio_cap=4.0
-# train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
+tis_imp_ratio_cap=2.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 20))
-train_packing_length=$((1024 * 44))
+max_prompt_length=$((1024 * 4))
+max_response_length=$((1024 * 28))
+train_packing_length=$((1024 * 32))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 8))
+overlong_buffer_len=$((1024 * 20))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=32
-redundant_train_prompt_bsz=32
-n_resp_per_prompt=16
-redundant_n_resp_per_prompt=17
-train_prompt_mini_bsz=32
+train_prompt_bsz=128
+redundant_train_prompt_bsz=128
+n_resp_per_prompt=8
+redundant_n_resp_per_prompt=8
+train_prompt_mini_bsz=128
 # Algorithm
-temperature=1
-top_p=1
+temperature=1.0
+top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 filter_groups_metric=acc
 
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
-offload=True
+offload=False
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -83,8 +82,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.profile.disable_attn=${disable_attn} \
     psrl.profile.fix_weight=${fix_weight} \
-    psrl.logging_path=${PSRL_PATH}/examples/precision_test/experimental/logs/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/precision_test/experimental/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
+    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
+    psrl.log_prob.mode=tis \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -95,39 +96,32 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
-    psrl.redundant_rollout.enable=True \
+    psrl.redundant_rollout.enable=False \
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
     psrl.partial_rollout.enable=True \
     \
     psrl.routing_strategy.method="throughput_optimal" \
-    psrl.routing_strategy.sort_candidate_by_indicator=True \
-    psrl.routing_strategy.enable_dynamic_version_tag=True \
     psrl.routing_strategy.enable_multi_priority_queue=True \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_moe_30b.json \
+    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_7b.json \
     psrl.routing_strategy.delta_throughput_threshold=0.2 \
     psrl.routing_strategy.request_budget=1024 \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=512 \
+    psrl.routing_strategy.max_concurrent_seqs_per_instance=128 \
     \
     psrl.sync_and_mig_strategy.method="status_based" \
     psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
-    psrl.sync_and_mig_strategy.sync.threshold=0.6 \
-    psrl.sync_and_mig_strategy.sync.check_req_before_sync=False \
+    psrl.sync_and_mig_strategy.sync.threshold=0.99 \
     psrl.sync_and_mig_strategy.mig.enable=True \
     psrl.sync_and_mig_strategy.mig.indicator="throughput" \
-    psrl.sync_and_mig_strategy.mig.threshold=5 \
-    psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
-    psrl.sync_and_mig_strategy.mig.stop_threshold=10 \
-    \
-    psrl.abort_and_truncate_strategy.method="abort" \
-    psrl.abort_and_truncate_strategy.threshold=2 \
+    psrl.sync_and_mig_strategy.mig.threshold=2 \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.25 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -140,8 +134,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
+    +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
-    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
+    train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
@@ -157,13 +152,14 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    train_actor_rollout_ref.actor.use_dynamic_bsz=False \
+    train_actor_rollout_ref.actor.use_dynamic_bsz=True \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${train_packing_length} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    train_actor_rollout_ref.actor.tis_imp_ratio_cap=${tis_imp_ratio_cap} \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
@@ -173,13 +169,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
-    train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${TRAIN_ETP} \
-    train_actor_rollout_ref.actor.megatron.expert_model_parallel_size=${TRAIN_EP} \
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
-    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
-    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
-    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=selective \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=${NUM_LAYERS_IN_FIRST_PIPELINE_STAGE} \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=${NUM_LAYERS_IN_LAST_PIPELINE_STAGE} \
     \
@@ -208,4 +200,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=200 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=20 2>&1 | tee ${experiment_name}.log

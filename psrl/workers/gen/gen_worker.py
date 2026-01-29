@@ -82,10 +82,6 @@ class PSRL_GenWorker(Worker):
         init_kwargs: dict[str, Any] = {}
         env_vars: dict[str, str] = {}
 
-        # Nothing to do for SPMD-style synchronous rollout engines
-        if config is not None and hasattr(config, "rollout") and config.rollout.mode == "sync":
-            return resources, env_vars, init_kwargs
-
         resources["num_gpus"] = num_gpus
         psrl_logger.info("Configuring PSRL GenWorker...")
 
@@ -172,8 +168,7 @@ class PSRL_GenWorker(Worker):
 
         # Rollout loop management
         self._generate_loop = asyncio.get_running_loop()  # Background async loop for generation
-        self.gen_task = None  # Generation task in stream mode
-        self._generate_thread = None  # Generation thread in batch mode
+        self.gen_task = None  # Generation task
         self._rollout_running = False
         self.active_tasks = set()  # Active tasks for the current generation loop
 
@@ -188,15 +183,6 @@ class PSRL_GenWorker(Worker):
 
         # Rollout request management
         self.request_queue = deque()
-        if self.psrl_config.gen_mode == "batch":
-            self.request_num_queue = queue.Queue()
-        else:
-            assert self.config.rollout.mode == "psrl_async", (
-                "Only support psrl_async mode for stream generation, "
-                "please set rollout.mode to psrl_async in the config."
-            )
-
-        # Request management
         self.version_to_task_num: dict[int, int] = {}
         self.request_id_to_active_tasks: dict[int, set[asyncio.Task]] = defaultdict(lambda: set())
         self.pending_version_requests: dict[int, list[DataProto]] = defaultdict(lambda: [])
@@ -246,18 +232,10 @@ class PSRL_GenWorker(Worker):
         """
         await self._is_init_model.wait()
         assert self.rollout, "Rollout must be initialized before calling estimate_max_model_len."
-        if self.config.rollout.mode == "sync":
-            max_model_len = self.rollout.inference_engine.collective_rpc(
-                "estimate_max_model_len",
-                args=(),
-            )
-        elif self.config.rollout.mode == "psrl_async":
-            max_model_len = await self.rollout.inference_engine.collective_rpc(
-                "estimate_max_model_len",
-                args=(),
-            )
-        else:
-            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+        max_model_len = await self.rollout.inference_engine.collective_rpc(
+            "estimate_max_model_len",
+            args=(),
+        )
         return max_model_len
 
     async def init_nixl_client(self):
@@ -271,8 +249,7 @@ class PSRL_GenWorker(Worker):
         if self.psrl_config.nixl.server_mode == "storage_server":
             raise ValueError("Storage server mode is deprecated.")
         elif self.psrl_config.nixl.server_mode == "meta_server":
-            if self.config.rollout.mode == "sync":
-                self.rollout.inference_engine.collective_rpc(
+            await self.rollout.inference_engine.collective_rpc(
                     "init_nixl_client",
                     args=(
                         self.psrl_config.nixl,
@@ -281,18 +258,6 @@ class PSRL_GenWorker(Worker):
                         self.psrl_config.logging_path,
                     ),
                 )
-            elif self.config.rollout.mode == "psrl_async":
-                await self.rollout.inference_engine.collective_rpc(
-                    "init_nixl_client",
-                    args=(
-                        self.psrl_config.nixl,
-                        self.nixl_interface,
-                        self.get_instance_id(),
-                        self.psrl_config.logging_path,
-                    ),
-                )
-            else:
-                raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
         self._is_init_nixl_client.set()
@@ -307,18 +272,10 @@ class PSRL_GenWorker(Worker):
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_protocol."
         psrl_logger.info("NIXL protocol begin via rpc call.")
-        if self.config.rollout.mode == "sync":
-            self.rollout.inference_engine.collective_rpc(
-                "nixl_protocol",
-                args=(self.config,),
-            )
-        elif self.config.rollout.mode == "psrl_async":
-            await self.rollout.inference_engine.collective_rpc(
-                "nixl_protocol",
-                args=(self.config,),
-            )
-        else:
-            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
+        await self.rollout.inference_engine.collective_rpc(
+            "nixl_protocol",
+            args=(self.config,),
+        )
         psrl_logger.info("NIXL protocol done via rpc call.")
 
     def get_node_id(self) -> str:
@@ -352,13 +309,6 @@ class PSRL_GenWorker(Worker):
         Get the local tp rank of the rollout instance.
         """
         tp_rank = self.rank % self.config.rollout.get("tensor_model_parallel_size", 1)
-        if self.config.rollout.mode == "sync" and self.rollout:
-            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
-
-            vllm_tp_rank = get_tensor_model_parallel_rank()
-            assert tp_rank == vllm_tp_rank, (
-                "The tp rank of the rollout instance is not consistent with the vllm tp rank."
-            )
         return tp_rank
 
     def get_instance_id(self) -> int:
@@ -375,33 +325,6 @@ class PSRL_GenWorker(Worker):
         The representative rank is the rank 0 of the rollout instance in current implementation (i.e., DP=1).
         """
         return self.rank == self.get_instance_representative_rank()
-
-    @deprecated("Use _broadcast_val_from_representative_rank instead")
-    def _broadcast_int_val_from_representative_rank(self, val: int | None = None) -> None:
-        # NOTE(lhy): This is a temporary solution to broadcast the int value
-        # from the representative rank to all instance ranks
-        # A more general solution is to use the `torch.distributed.broadcast_object_list` (https://pytorch.org/docs/stable/distributed.html#torch.distributed.broadcast_object_list)
-        """Broadcast an integer value from the representative rank to all instance ranks."""
-        if not self.instance_dist_group:
-            # If the instance dist group is not set, we will create it
-            self.instance_dist_group = dist.new_group(ranks=self.get_instance_ranks())
-        if self.is_instance_representative_rank:
-            # If the current rank is the representative rank, we will broadcast the value to all instance ranks
-            dist.broadcast(
-                torch.tensor([val], dtype=torch.int64).cuda(),
-                src=self.get_instance_representative_rank(),
-                group=self.instance_dist_group,
-            )
-        else:
-            # If the current rank is not the representative rank,
-            # we will receive the value from the representative rank
-            val_tensor = torch.zeros(1, dtype=torch.int64).cuda()
-            dist.broadcast(
-                val_tensor,
-                src=self.get_instance_representative_rank(),
-                group=self.instance_dist_group,
-            )
-            return val_tensor.item()
 
     async def register_rollout_instance(self):
         """Register the rollout instance in the PS worker."""
@@ -454,15 +377,6 @@ class PSRL_GenWorker(Worker):
         tp = self.config.rollout.get("tensor_model_parallel_size", 1)
         pp = self.config.rollout.get("pipeline_model_parallel_size", 1)
         assert self.world_size == tp * pp, "Only support dp=1 for now"
-
-        if self.config.rollout.mode == "sync":
-            self._build_distributed()
-        elif self.config.rollout.mode == "psrl_async":
-            # NOTE(lhy): No need to build distributed for psrl_async mode
-            # vllm will handle the distributed communication internally
-            pass
-        else:
-            raise ValueError(f"Invalid rollout mode: {self.config.rollout.mode}")
 
         # Build the rollout engine
         local_path = copy_to_local(self.config.model.path, use_shm=self.config.model.get("use_shm", False))
@@ -530,14 +444,14 @@ class PSRL_GenWorker(Worker):
         if task_added and active_task_num == 1:
             self.active_tasks_start_time = time.time()
             log_begin_event(
-                f"Streaming generate with model version {self.curr_rollout_instance_model_version}",
+                f"Generate with model version {self.curr_rollout_instance_model_version}",
                 psrl_logger,
                 event_type=EventType.GEN,
             )
         if task_done and active_task_num == 0:
             duration = time.time() - self.active_tasks_start_time
             log_end_event(
-                f"Streaming generate with model version {self.curr_rollout_instance_model_version}",
+                f"Generate with model version {self.curr_rollout_instance_model_version}",
                 psrl_logger,
                 event_type=EventType.GEN,
                 duration=duration,
@@ -549,57 +463,12 @@ class PSRL_GenWorker(Worker):
                 event_type=EventType.OTHER,
             )
 
-    def ray_pull_model(self) -> None:
-        """
-        Pull the model state dict from PS via CPU and update the rollout model weights.
-        In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
-        In 'cpu_ref' mode, get the ray object_ref and ray.get it (parallel, non-blocking for PS worker).
-        """
-        ps_manager_handle = self.gen_interface.ps_manager_handle
-        model = self.rollout.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-        device = get_torch_device().current_device()
-
-        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            if self.psrl_config.ps_mode == "cpu":
-                # In 'cpu' mode, pull the full state dict (PS worker will block on transfer)
-                model_state_dict_cpu = ray.get(
-                    ps_manager_handle.pull_model_state_dict_cpu.remote(self.get_instance_id())
-                )
-            elif self.psrl_config.ps_mode == "cpu_ref":
-                # In 'cpu_ref' mode, get the object_ref and ray.get it (PS worker is non-blocking)
-                object_ref = ray.get(ps_manager_handle.pull_model_state_dict_cpu_ref.remote(self.get_instance_id()))
-                model_state_dict_cpu = ray.get(
-                    object_ref
-                )  # This blocks until the state dict is available in the object store
-            # Load the model state dict to the vllm model
-            # sharding will be handled automatically inside vllm
-            if not self.psrl_config.profile.fix_weight:
-                model.load_weights(
-                    (
-                        (
-                            name,
-                            (
-                                param.to(device, non_blocking=True).full_tensor()
-                                if isinstance(param, DTensor)
-                                else param.to(device, non_blocking=True)
-                            ),
-                        )
-                        for name, param in model_state_dict_cpu.items()
-                    )
-                )
-            # NOTE(lhy): Do we need to clear the cache after loading the model?
-            # get_torch_device().empty_cache()
-            # torch.cuda.synchronize()
-        else:
-            raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-
     async def ray_pull_model_async(self) -> None:
         """
         Pull the model state dict from PS via CPU and update the rollout model weights.
         In 'cpu' mode, pull the full state dict (potential bottleneck for large models).
         In 'cpu_ref' mode, get the ray object_ref and await it (parallel, non-blocking for PS worker).
         """
-        assert self.config.rollout.mode == "psrl_async", "Only support psrl_async mode for async pull model."
         ps_manager_handle = self.gen_interface.ps_manager_handle
 
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
@@ -633,34 +502,6 @@ class PSRL_GenWorker(Worker):
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
-    def nixl_pull_model(self) -> None:
-        """
-        Pull the model state dict from PS via NIXL and update the rollout model weights.
-        This is implemented via rpc call in the vLLM extension.
-        """
-        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
-            "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
-        )
-        ps_manager_handle = self.gen_interface.ps_manager_handle
-        if self._cached_ps_nixl_agent_names is None:
-            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
-        if self._cached_ps_nixl_gen_storage_client_names is None:
-            self._cached_ps_nixl_gen_storage_client_names = ray.get(
-                ps_manager_handle.get_ps_nixl_gen_storage_client_names.remote()
-            )
-        if not self.psrl_config.profile.fix_weight:
-            self.rollout.inference_engine.collective_rpc(
-                "nixl_pull_model_core",
-                args=(
-                    self._cached_ps_nixl_agent_names,
-                    self._cached_ps_nixl_gen_storage_client_names,
-                ),
-            )
-        ray.get(
-            ps_manager_handle.pull_model_state_dict_nixl.remote(self.get_instance_id())
-        )  # This only updates the model version
-        psrl_logger.info("NIXL pull model done.")
-
     async def nixl_pull_model_async(self) -> None:
         """
         Pull the model state dict from PS via NIXL and update the rollout model weights.
@@ -689,21 +530,7 @@ class PSRL_GenWorker(Worker):
         )  # This only updates the model version
         psrl_logger.info("NIXL pull model done.")
 
-    def pull_model(self) -> None:
-        assert self.config.rollout.mode == "sync", "Only support `sync` mode."
-        assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks."
-
-        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            self.ray_pull_model()
-        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            self.nixl_pull_model()
-        else:
-            raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-        # Important: the prefix cache needs to be cleared after pulling the model
-        self.rollout.inference_engine.reset_prefix_cache()
-
     async def pull_model_async(self) -> None:
-        assert self.config.rollout.mode == "psrl_async", "Only support `psrl_async` mode."
         assert len(self.active_tasks) == 0, f"Cannot pull model while there are {len(self.active_tasks)} active tasks"
 
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
@@ -757,12 +584,8 @@ class PSRL_GenWorker(Worker):
     async def interrupt_generation(self):
         """Interrupt the generation process."""
         # Interrupt creating generation tasks
-        if self._generate_thread and self._generate_thread.is_alive():
-            self._generate_loop.call_soon_threadsafe(self._async_interrupt_event.set)
-            self._generate_loop.call_soon_threadsafe(self._async_resume_event.clear)
-        else:
-            self._async_interrupt_event.set()
-            self._async_resume_event.clear()
+        self._async_interrupt_event.set()
+        self._async_resume_event.clear()
 
         # Interrupt all requests in the engine queue (waiting and running)
         interrupted_request_num = await self.interrupt_all_requests()
@@ -776,12 +599,8 @@ class PSRL_GenWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def resume_generation(self):
         """Resume the generation process."""
-        if self._generate_thread and self._generate_thread.is_alive():
-            self._generate_loop.call_soon_threadsafe(self._async_resume_event.set)
-            self._generate_loop.call_soon_threadsafe(self._async_interrupt_event.clear)
-        else:
-            self._async_resume_event.set()
-            self._async_interrupt_event.clear()
+        self._async_resume_event.set()
+        self._async_interrupt_event.clear()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def sync_with_ps(self, ps_version: int, interrupt_generation: bool = False) -> int:
@@ -819,10 +638,7 @@ class PSRL_GenWorker(Worker):
         # Step 2: Pull model
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
             with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
-                if self.config.rollout.mode == "psrl_async":
-                    await self.pull_model_async()
-                else:
-                    self.pull_model()
+                await self.pull_model_async()
 
         # NOTE(lhy): The version obtained from the PS manager is the actual model version after the pull
         # It may be higher than the required version due to the pushing happens between waiting and pulling
@@ -943,13 +759,13 @@ class PSRL_GenWorker(Worker):
             # Update the request status to ROLLOUT_INTERRUPTED_BY_SCHEDULER or ROLLOUT_INTERRUPTED or RUNNING,
             if interrupted_by_scheduler:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER
-                psrl_logger.info(f"Request {request_ids[0]} is interrupted by scheduler (preemption)")
+                # psrl_logger.info(f"Request {request_ids[0]} is interrupted by scheduler (preemption)")
             elif interrupted:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
-                psrl_logger.info(f"Request {request_ids[0]} is interrupted (partial rollout)")
+                # psrl_logger.info(f"Request {request_ids[0]} is interrupted (partial rollout)")
             else:
                 update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
-                psrl_logger.info(f"Request {request_ids[0]} is completed (finished generation)")
+                # psrl_logger.info(f"Request {request_ids[0]} is completed (finished generation)")
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
@@ -958,151 +774,6 @@ class PSRL_GenWorker(Worker):
                 return result, update_status
         # Means the request is aborted
         return None, None
-
-    def generate(
-        self,
-        requests: DataProto,
-        consolidate: bool = True,
-        return_only_on_representative_rank: bool = True,
-    ):
-        """
-        Generate sequences in batch mode.
-        This method handles a batch of generation requests, managing model versioning
-        and ensuring that the requests are processed in a timely manner.
-
-        Args:
-            requests (DataProto): The batch of generation requests.
-
-        Returns:
-            tuple: A tuple containing the generated sequences and their corresponding update statuses.
-        """
-        rollout_instance_id = self.get_instance_id()
-
-        curr_rollout_instance_model_version = self.curr_rollout_instance_model_version
-        request_ids = requests.non_tensor_batch["uid"]
-        psrl_logger.debug(
-            f"Rollout instance {rollout_instance_id} is generating requests with request ids: {request_ids}"
-        )
-        needed_model_versions = requests.non_tensor_batch["version_tag"]
-        # assert all version tag in needed_model_versions are equal
-        if not all(version == needed_model_versions[0] for version in needed_model_versions):
-            raise ValueError(f"All version tags must be the same, got {needed_model_versions}")
-        needed_model_version = needed_model_versions[0]
-
-        if needed_model_version >= curr_rollout_instance_model_version:
-            if needed_model_version > curr_rollout_instance_model_version:
-                with log_dual_events(
-                    f"Wait for model version {needed_model_version}",
-                    psrl_logger,
-                    event_type=EventType.WAIT,
-                ):
-                    # Busy polling until the PS worker has the needed model version
-                    while (
-                        ray.get(
-                            self.gen_interface.ps_manager_handle.get_ps_model_version.remote(debug_info="gen_worker")
-                        )
-                        < needed_model_version
-                    ):
-                        time.sleep(1)
-
-                with log_dual_events("Pull model", psrl_logger, event_type=EventType.PULL):
-                    self.pull_model()
-
-                # NOTE(lhy): The version obtained from the PS manager is the actual model version after the pull
-                # It may be higher than the required version due to the pushing happens between waiting and pulling
-                self.curr_rollout_instance_model_version = ray.get(
-                    self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(rollout_instance_id)
-                )
-                psrl_logger.debug(
-                    f"Updated current rollout instance model version to {self.curr_rollout_instance_model_version}"
-                )
-                assert self.curr_rollout_instance_model_version >= needed_model_version, (
-                    f"Current rollout instance model version should not be less than needed version, "
-                    f"but got {self.curr_rollout_instance_model_version} vs. {needed_model_version}"
-                )
-                if self.curr_rollout_instance_model_version > needed_model_version:
-                    psrl_logger.warning(
-                        f"Actual model version for generation is {self.curr_rollout_instance_model_version}, "
-                        f"needed model version is {needed_model_version}"
-                    )
-                if self.rollout.stat_collector is not None:
-                    self.rollout.stat_collector.record_model_version_update(self.curr_rollout_instance_model_version)
-
-            update_status_success = ray.get(
-                self.gen_interface.ps_manager_handle.update_request_status.remote(
-                    request_ids.tolist(),
-                    PSRL_RequestStatus.ROLLOUT_RUNNING,
-                    rollout_instance_id=rollout_instance_id,
-                )
-            )
-            filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-            if filtered_request_idxs:
-                filtered_requests = requests[filtered_request_idxs]
-                # Prepare the request for generation
-                meta_info = {
-                    "eos_token_id": (
-                        self.generation_config.eos_token_id
-                        if self.generation_config is not None
-                        else self.tokenizer.eos_token_id
-                    ),
-                    "pad_token_id": (
-                        self.generation_config.pad_token_id
-                        if self.generation_config is not None
-                        else self.tokenizer.pad_token_id
-                    ),
-                }
-                filtered_requests.meta_info.update(meta_info)
-                filtered_requests.non_tensor_batch["rollout_instance_id"] = np.array(
-                    [rollout_instance_id] * len(filtered_requests.batch)
-                )
-
-                # Start the generation
-                with log_dual_events(
-                    f"Core generation with model version {self.curr_rollout_instance_model_version}",
-                    psrl_logger,
-                    event_type=EventType.GEN,
-                ):
-                    vllm_outputs = self.rollout.raw_generate_sequences(filtered_requests)
-
-                # vllm_outputs = [vllm_outputs[i] for i in range(len(vllm_outputs))]
-
-                if return_only_on_representative_rank and not self.is_instance_representative_rank:
-                    return None, None
-
-                # Update the request status to ROLLOUT_COMPLETED or ROLLOUT_INTERRUPTED,
-                # depending on `interrupted` field in the result
-                with log_dual_events("Update request status", psrl_logger, event_type=EventType.OTHER):
-                    update_statuses = [
-                        (
-                            PSRL_RequestStatus.ROLLOUT_INTERRUPTED
-                            if vllm_outputs[i].outputs[0].finish_reason == "abort"
-                            else PSRL_RequestStatus.ROLLOUT_COMPLETED
-                        )
-                        for i in range(len(vllm_outputs))
-                    ]
-                    update_status_success = ray.get(
-                        self.gen_interface.ps_manager_handle.update_request_status.remote(
-                            request_ids.tolist(),
-                            update_statuses,
-                        )
-                    )
-                    filtered_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-                    if filtered_request_idxs:
-                        filtered_requests = filtered_requests[filtered_request_idxs]
-                        filtered_result = [vllm_outputs[i] for i in filtered_request_idxs]
-                        filtered_update_statuses = [update_statuses[i] for i in filtered_request_idxs]
-                        # NOTE(lhy): The DataProto will be huge and slow to transfer using ray,
-                        # so we postprocess the data inside the vllm rollout
-                        if consolidate:
-                            filtered_result = self.rollout.post_process_outputs(filtered_requests, filtered_result)
-                        return filtered_result, filtered_update_statuses
-                    return None, None
-        else:
-            raise ValueError(
-                f"Needed model version {needed_model_version} is less than "
-                f"current rollout instance model version {curr_rollout_instance_model_version}. "
-                f"This should not happen."
-            )
 
     async def generate_async(self, request: DataProto, consolidate: bool = True):
         """
@@ -1120,7 +791,7 @@ class PSRL_GenWorker(Worker):
         )
         assert len(request) == 1, f"Expected request length to be 1, got {len(request)}"
 
-        psrl_logger.info(
+        psrl_logger.debug(
             f"Generating request {request.non_tensor_batch['uid'][0]} "
             f"with needed model version {request.non_tensor_batch['version_tag'][0]}"
         )

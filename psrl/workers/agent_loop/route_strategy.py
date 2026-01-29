@@ -310,9 +310,6 @@ class CostModelBasedRouteStrategy(RouteStrategyBase):
 
     def __init__(self, n_instances: int, strategy_kwargs: dict = None):
         super().__init__(n_instances, strategy_kwargs)
-        assert "sort_candidate_by_indicator" in strategy_kwargs, (
-            "sort_candidate_by_indicator is required for CostModelBasedRouteStrategy"
-        )
         assert "logging_interval_in_ms" in strategy_kwargs, (
             "logging_interval_in_ms is required for CostModelBasedRouteStrategy"
         )
@@ -336,7 +333,6 @@ class CostModelBasedRouteStrategy(RouteStrategyBase):
             "instance_to_max_model_len is required for CostModelBasedRouteStrategy"
         )
 
-        self.sort_candidate_by_indicator = strategy_kwargs["sort_candidate_by_indicator"]
         self.last_logging_time = [time.time() for _ in range(n_instances)]
         self.logging_interval_in_ms = strategy_kwargs["logging_interval_in_ms"]
         cost_model_path = strategy_kwargs["cost_model_path"]
@@ -530,48 +526,26 @@ class ThroughputOptimalRouteStrategy(CostModelBasedRouteStrategy):
         if len(candidates) == 0:
             # self.logger.info(f"No candidates available for request {request.non_tensor_batch['uid'][0]}")
             return None
-        instance_to_version_after_sync = route_kwargs["instance_to_version_after_sync"]
         candidates_group_by_priority = []
 
-        # By default, route strategy groups candidates by version and sort
-        # them from smallest to largest
-        if not self.sort_candidate_by_indicator:
-            version_to_candidates = {}
-            for candidate in candidates:
-                version = instance_to_version_after_sync.get(candidate, 0)
-                if version not in version_to_candidates:
-                    version_to_candidates[version] = []
-                version_to_candidates[version].append(candidate)
-
-            # Sort versions from smallest to largest
-            sorted_versions = sorted(version_to_candidates.keys())
-            # For the request with dynamic version tag, we reverse the sorted
-            # versions to try to allocate to the latest version first
-            if "version_tag" in request.non_tensor_batch and request.non_tensor_batch["version_tag"][0] == -1:
-                sorted_versions = sorted_versions[::-1]
-            for version in sorted_versions:
-                candidates_group_by_priority.append((version, version_to_candidates[version]))
-        # Group candidates by indicator and sort them from smallest to largest
-        else:
-            assert "candidate_indicator_list" in route_kwargs, (
-                "candidate_indicator_list is required for "
-                "CostModelBasedRouteStrategy when "
-                "sort_candidate_by_indicator is False"
-            )
-            candidate_indicator_list = route_kwargs["candidate_indicator_list"]
-            assert len(candidate_indicator_list) == len(candidates), (
-                f"The number of candidates and candidate indicator list must "
-                f"be the same, but have {len(candidates)} candidates and "
-                f"{len(candidate_indicator_list)} candidate indicator list"
-            )
-            indicator_to_candidates = {}
-            for candidate, indicator in zip(candidates, candidate_indicator_list):
-                if indicator not in indicator_to_candidates:
-                    indicator_to_candidates[indicator] = []
-                indicator_to_candidates[indicator].append(candidate)
-            # Sort indicators from smallest to largest
-            for indicator in sorted(indicator_to_candidates.keys()):
-                candidates_group_by_priority.append((indicator, indicator_to_candidates[indicator]))
+        # Sort candidates by indicator
+        assert "candidate_indicator_list" in route_kwargs, (
+            "candidate_indicator_list is required for CostModelBasedRouteStrategy"
+        )
+        candidate_indicator_list = route_kwargs["candidate_indicator_list"]
+        assert len(candidate_indicator_list) == len(candidates), (
+            f"The number of candidates and candidate indicator list must "
+            f"be the same, but have {len(candidates)} candidates and "
+            f"{len(candidate_indicator_list)} candidate indicator list"
+        )
+        indicator_to_candidates = {}
+        for candidate, indicator in zip(candidates, candidate_indicator_list):
+            if indicator not in indicator_to_candidates:
+                indicator_to_candidates[indicator] = []
+            indicator_to_candidates[indicator].append(candidate)
+        # Sort indicators from smallest to largest
+        for indicator in sorted(indicator_to_candidates.keys()):
+            candidates_group_by_priority.append((indicator, indicator_to_candidates[indicator]))
 
         # Process each group of candidates
         # from highest priority to lowest priority

@@ -233,6 +233,10 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
+                
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
 
             is_lora = data.meta_info.pop("is_lora", False)
             adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()

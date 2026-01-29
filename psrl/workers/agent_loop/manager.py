@@ -116,6 +116,12 @@ class PSRL_AgentLoopManager:
         self.rollout_request_tracker: dict[
             str | int, list[EntryInfo]
         ] = {}  # Maps parent request ids to "occupied" child entries
+        
+        # Record the keys of the data proto
+        self._data_keys_initialized = False
+        self._batch_keys = None
+        self._non_tensor_batch_keys = None
+        self._meta_info_keys = None
 
         # Build logger
         self.log_prefix = "AgentLoopManager"
@@ -390,59 +396,84 @@ class PSRL_AgentLoopManager:
         while not self.stop_dispatch_task:
             while not self.data_queue.empty():
                 data = await self.data_queue.get()
-
                 # Receive END signal to stop processing data queue
                 if data is None:
                     self.stop_dispatch_task = True
                     continue
-
+                
+                if not self._data_keys_initialized:
+                    self._data_keys_initialized = True
+                    self._batch_keys = list(data.batch.keys())
+                    self._non_tensor_batch_keys = list(data.non_tensor_batch.keys())
+                    self._meta_info_keys = list(data.meta_info.keys())
+                    psrl_logger.info(f"Data keys initialized: batch keys are {self._batch_keys}, non_tensor_batch keys are {self._non_tensor_batch_keys}, meta_info keys are {self._meta_info_keys}")
+                
+                batch_size = len(data)
+                self._request_counter += batch_size
                 psrl_logger.debug(f"Got {len(data)} requests from data queue")
 
-                # Set version tag for each request
-                batch_size = len(data)
-                static_version_tags = [self.get_new_static_version_tag() for _ in range(batch_size)]
-
                 # Wait for version update in ps
-                max_version_tag = np.max(static_version_tags)
-                if max_version_tag > self.curr_ps_version_tag:
-                    psrl_logger.debug(f"Waiting for ps model version: {max_version_tag}")
+                # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
+                expected_ps_version = self._get_expected_ps_version()
+                if expected_ps_version > self.curr_ps_version_tag:
+                    psrl_logger.debug(f"Waiting for ps model version: {expected_ps_version}")
                     # Busy polling until the PS worker has the needed model version
                     while (
                         await self.ps_manager_handle.get_ps_model_version.remote(debug_info="agent_loop_manager")
-                    ) < max_version_tag:
+                    ) < expected_ps_version:
                         await asyncio.sleep(0.1)
-                    self.curr_ps_version_tag = max_version_tag
+                    self.curr_ps_version_tag = expected_ps_version
                     psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
-
-                if self.config.psrl.routing_strategy.enable_dynamic_version_tag:
-                    dynamic_version_tags = [-1 for _ in range(batch_size)]
-                    data.non_tensor_batch["version_tag"] = np.array(dynamic_version_tags)
-                else:
-                    data.non_tensor_batch["version_tag"] = np.array(static_version_tags)
-                # psrl_logger.debug(
-                #     f"Dispatching data to agent loop workers, total {len(data)} requests "
-                #     f"with version tag {data.non_tensor_batch['version_tag']}"
-                # )
+                 
+                # Initialize the version tag to -1 for all requests   
+                data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
 
                 # Dispatch data to agent loop workers
                 await self._inner_dispatch_data(data)
             await asyncio.sleep(0)  # Yield control to the event loop
 
-    def get_new_static_version_tag(self):
+    async def _retry_data(self, data: DataProto | None = None):
+        """Notify the agent loop manager to retry processing some data.
+
+        Args:
+            data (DataProto | None): Data to be retried. If None, the new data from the data queue will be used.
         """
-        Get the new static version tag based on the current staleness and request counter.
-        This is a naive implementation that increments the version tag for each request.
-        If support dynamic version tag, this version tag is only used to determine
-        when to put the request into the data queue.
+        if self.running_loop and not self.stop_dispatch_task:
+            # If data is None, the new data from the data queue will be used.
+            if data is None:
+                if not self.data_queue.empty():
+                    data = await self.data_queue.get()
+                    batch_size = len(data)
+                    if data is None:
+                        raise ValueError("Data queue should not contain None when retrying requests.")
+                    data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
+                    psrl_logger.info(f"Retry {batch_size} requests (the data is provided by the data queue)")
+                    await self._inner_dispatch_data(data)
+            else:
+                assert self._data_keys_initialized, "Data keys should be initialized when retrying data"
+                batch_size = len(data)
+                data = data.select(
+                    batch_keys=self._batch_keys,
+                    non_tensor_batch_keys=self._non_tensor_batch_keys,
+                    meta_info_keys=self._meta_info_keys,
+                )
+                data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
+                psrl_logger.info(f"Retry {batch_size} requests (the data is provided by the caller)")
+                await self._inner_dispatch_data(data)
+        else:
+            psrl_logger.warning("Busy loop of the agent loop manager has stopped, the retry operation will be skipped")
+
+    def _get_expected_ps_version(self):
+        """
+        Get the expected PS version tag based on the current staleness and request counter.
         """
         if self.config.psrl.redundant_rollout.enable:
             buffer_size = self.config.psrl.redundant_rollout.redundant_global_batch_size * self.rollout_n
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
-        version_tag = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
-        self._request_counter += 1
-        return version_tag
+        expected_ps_version = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
+        return expected_ps_version
 
     async def _inner_dispatch_data(self, data: DataProto):
         """Dispatch data to agent loop workers in a round-robin manner.
@@ -450,17 +481,11 @@ class PSRL_AgentLoopManager:
             data (DataProto): Input data.
         """
 
-        # Update request status from PENDING to RUNNING
-        request_ids = data.non_tensor_batch["uid"]
-        if "version_tag" in data.non_tensor_batch:
-            version_tags = data.non_tensor_batch["version_tag"]
-        else:
-            # Guarantee the version tags are valid (>=0)
-            version_tags = np.maximum(data.non_tensor_batch["min_version_limit"] - self.staleness, 0)
+        # Update request status from PENDING to RUNNING 
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
-            request_ids.tolist(),
+            data.non_tensor_batch["uid"].tolist(),
             PSRL_RequestStatus.RUNNING,
-            model_version=version_tags.tolist(),
+            model_version=data.non_tensor_batch["version_tag"].tolist(),
         )
         dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
         if not dispatch_request_idxs:
@@ -474,12 +499,8 @@ class PSRL_AgentLoopManager:
                 continue
 
             # Dispatch data to the corresponding worker
-            if self.config.psrl.gen_mode == "stream":
-                # Dispatch `rollout_n` requests
-                for i in range(self.rollout_n):
-                    self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i : i + 1])
-            else:
-                self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data)
+            for i in range(self.rollout_n):
+                self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i : i + 1])
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
         """Create a dispatch plan for distributing data across workers.
@@ -557,12 +578,11 @@ class PSRL_AgentLoopManager:
                     request_data[i : i + 1],
                 )
 
-            retry_buffer_ids = set()  # Buffer IDs that need to abort OCCUPY entries and retry
             ready_buffer_ids = set()  # Buffer IDs that are READY after occupation
-            accumulate_entry_data_list = []  # Whether to accumulate data for each prompt entry
             occupy_futures = []
             abort_request_ids = [] # Used to abort requests in the data pool
-            # Occupy requests in the PS worker and try to awake waiters if READY buffers are formed
+            
+            # 1. Judge whether to abort requests and occupy requests in the PS worker
             if self.rollout_n > 1:
                 sample_ids = request_data.non_tensor_batch["parent_id"].tolist()
                 for i, sample_id in enumerate(sample_ids):
@@ -624,11 +644,11 @@ class PSRL_AgentLoopManager:
                         )
 
                         alg_entry_infos = entry_infos[: self.alg_rollout_n]
-                        accumulate_group_data = True
+                        add_data = True
                         if self.group_post_process_fn:
-                            accumulate_group_data = await self._group_post_process(alg_entry_infos)
+                            add_data = await self._group_post_process(alg_entry_infos)
 
-                        if not accumulate_group_data and self.config.psrl.retry_bound == -1:
+                        if not add_data:
                             # Retry immediately and no occupation
                             # NOTE(linsh): data has been popped from data pool in `_group_post_process`
                             psrl_logger.info(
@@ -637,13 +657,9 @@ class PSRL_AgentLoopManager:
                             )
                             # Clear the reserved entries for the group entry
                             await self.ps_manager_handle.clear_reserved_entries.remote(sample_id)
-                            min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
-
                             # Notify agent loop manager to retry new requests
-                            await self.retry_request(min_version_limit=min_pending_buffer)
+                            await self._retry_data()
                         else:
-                            accumulate_entry_data_list.append(accumulate_group_data)
-
                             prompt_to_occupy_requests[sample_id] = alg_entry_infos
                             request_ids = [
                                 sample_id * self.rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
@@ -652,28 +668,23 @@ class PSRL_AgentLoopManager:
                                 self.ps_manager_handle.occupy_rollout_instance_request.remote(
                                     prompt_id=sample_id,
                                     request_ids=request_ids,
-                                    accumulate_sample=accumulate_group_data,
                                 )
                             )
             # Without group sampling (e.g., PPO)
-            # Every request is a accumulate data
+            # Group post processing is not used and every data will be added
             else:
                 for i in range(len(request_data)):
                     request = request_data[i : i + 1]
                     request_id = int(request.non_tensor_batch["uid"][0])
-                    accumulate_data = True
-                    accumulate_entry_data_list.append(accumulate_data)
-
                     occupy_futures.append(
                         self.ps_manager_handle.occupy_rollout_instance_request.remote(
                             prompt_id=request_id,
-                            accumulate_sample=accumulate_data,
                         )
                     )
 
+            # 2. Occupy requests in the PS worker
             if not occupy_futures:
                 return
-
             with log_dual_events(
                 "Occupy requests",
                 psrl_logger,
@@ -682,16 +693,12 @@ class PSRL_AgentLoopManager:
             ):
                 results = await asyncio.gather(*occupy_futures)
 
-            for result, accumulate_entry_data in zip(results, accumulate_entry_data_list):
+            # 3. Handle the occupied results to accumulate data
+            for result in results:
                 buffer_id, occupy_num, prompt_entry_info = result
                 # If occupy failed due to READY status, the requests must be aborted already
                 # Just continue
                 if buffer_id is None:
-                    # request_ids = prompt_entry_info.get_all_requests(self.rollout_n)
-                    # psrl_logger.info(
-                    #     f"Failed to occupy prompt {prompt_entry_info}, aborting requests {request_ids}."
-                    # )
-                    # abort_request_ids.extend(request_ids)
                     continue
 
                 psrl_logger.debug(
@@ -708,51 +715,40 @@ class PSRL_AgentLoopManager:
                 else:
                     request_ids = [prompt_entry_info.prompt_id + prompt_entry_info.request_idx]
 
-                # Accumulate data or mark for abort based on accumulate_entry_data
-                if accumulate_entry_data:
-                    if buffer_id not in self.accumulated_buffers:
-                        self.accumulated_buffers[buffer_id] = {}
-                        self.accumulated_buffer_size[buffer_id] = 0
-                    model_version = prompt_entry_info.get_entry_version()
-                    if model_version not in self.accumulated_buffers[buffer_id]:
-                        self.accumulated_buffers[buffer_id][model_version] = []
-                    self.accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
-                    self.accumulated_buffer_size[buffer_id] += 1
-                    psrl_logger.info(
-                        f"Accumulated buffer {buffer_id} size: "
-                        f"{self.accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer}"
-                    )
-                    # Check if the buffer is the earliest waiting buffer
-                    # If so, handle the waiting buffer using the abort and truncate strategy
-                    if self._buffer_waiters:
-                        min_waiter_buffer_id = min(self._buffer_waiters.keys())
-                        if min_waiter_buffer_id == buffer_id:
-                            await self.handle_waiting_buffer(buffer_id)
-                else:
-                    abort_request_ids.extend(request_ids)
-                    if self.config.psrl.retry_bound >= 0:
-                        if buffer_id not in self.abort_occupied_entries:
-                            self.abort_occupied_entries[buffer_id] = []
-                        self.abort_occupied_entries[buffer_id].append(entry_info.prompt_id)
+                # Accumulate data
+                if buffer_id not in self.accumulated_buffers:
+                    self.accumulated_buffers[buffer_id] = {}
+                    self.accumulated_buffer_size[buffer_id] = 0
+                model_version = prompt_entry_info.get_entry_version()
+                if model_version not in self.accumulated_buffers[buffer_id]:
+                    self.accumulated_buffers[buffer_id][model_version] = []
+                self.accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
+                self.accumulated_buffer_size[buffer_id] += 1
+                psrl_logger.info(
+                    f"Accumulated buffer {buffer_id} size: "
+                    f"{self.accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer}"
+                )
+                
+                # Check if the buffer is the earliest waiting buffer
+                # If so, handle the waiting buffer using the abort and truncate strategy
+                if self._buffer_waiters:
+                    min_waiter_buffer_id = min(self._buffer_waiters.keys())
+                    if min_waiter_buffer_id == buffer_id:
+                        await self.handle_waiting_buffer(buffer_id)
 
-                # Check for READY or RETRY buffers
+                # Check for READY buffers
                 if (
-                    self.config.psrl.retry_bound >= 0
-                    and self.accumulated_buffer_size[buffer_id] < self.ready_entries_per_buffer
-                    and occupy_num == self.entries_per_buffer - self.config.psrl.retry_bound
-                ):
-                    retry_buffer_ids.add(buffer_id)
-                elif (
                     self.accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer
                     and buffer_id not in ready_buffer_ids
                 ):
                     psrl_logger.info(f"Add buffer {buffer_id} to ready_buffer_ids")
                     ready_buffer_ids.add(buffer_id)
 
+            # 4. Process abort requests
             if abort_request_ids:
                 self.remove_from_data_pool(abort_request_ids, guarantee_exists=True)
 
-            # Process READY buffers
+            # 5. Process READY buffers
             for buffer_id in sorted(list(ready_buffer_ids)):
                 # Collect all prompt entry infos for the buffer
                 prompt_entry_infos = []
@@ -768,32 +764,6 @@ class PSRL_AgentLoopManager:
                     self.remove_buffer_from_data_pool(prompt_entry_infos)
                     self.accumulated_buffers.pop(buffer_id)
                     self.accumulated_buffer_size.pop(buffer_id)
-
-            # Process RETRY buffers
-            for retry_buffer_id in retry_buffer_ids:
-                if self.config.psrl.gen_mode == "batch":
-                    assert self.config.psrl.retry_bound == 0, "For batch mode, retry_bound must be 0."
-                    await self.ps_manager_handle.clear_buffer.remote(retry_buffer_id)
-                    min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
-                    # Notify agent loop manager to retry new requests
-                    await self.retry_request(min_version_limit=min_pending_buffer)
-                elif self.config.psrl.retry_bound >= 0:
-                    # retry num = retry_ratio * num of failed OCCUPY entries
-                    retry_prompt_num = (
-                        self.entries_per_buffer - self.config.psrl.retry_bound - self.ready_entries_per_buffer
-                    ) * self.config.psrl.retry_ratio
-                    if retry_prompt_num > 0:
-                        # the last retry_prompt_num prompts to retry
-                        psrl_logger.debug(f"Retrying {retry_prompt_num} prompts from full buffer {retry_buffer_id}.")
-                        # Clear the last `retry_prompt_num` occupied entries for retry with RESERVE
-                        abort_occupied_entries = self.abort_occupied_entries[retry_buffer_id][-retry_prompt_num:]
-                        self.abort_occupied_entries[retry_buffer_id] = self.abort_occupied_entries[retry_buffer_id][
-                            :-retry_prompt_num
-                        ]
-                        await self.ps_manager_handle.clear_occupied_entries.remote(abort_occupied_entries)
-                        min_pending_buffer = await self.ps_manager_handle.get_min_pending_buffer.remote()
-                        # Notify agent loop manager to retry new requests
-                        await self.retry_request(min_version_limit=min_pending_buffer)
 
     def maybe_add_buffer(self, buffer_id, data_buffer) -> bool:
         """
@@ -988,13 +958,13 @@ class PSRL_AgentLoopManager:
                 
     async def handle_waiting_buffer(self, buffer_id: int):
         """Handle the waiting buffer."""
-        # WIP(lhy): Implement the abort and truncate strategy
-        if self.config.psrl.abort_and_truncate_strategy.method == "abort":
+        # WIP(lhy): Implement the retry and truncate strategy
+        if self.config.psrl.proactive_filter_strategy.method == "retry":
             gap = self.ready_entries_per_buffer - self.accumulated_buffer_size[buffer_id]
             if gap == 0:
                 return
             assert gap > 0, f"Gap should be greater than 0, but got {gap}"
-            if gap <= self.config.psrl.abort_and_truncate_strategy.threshold:
+            if gap <= self.config.psrl.proactive_filter_strategy.threshold:
                 psrl_logger.info(f"Trying to abort the rest {gap} entries in buffer {buffer_id} and move some occupied entries from other buffers to make it ready.")
                 # Guarantee other buffers have enough entries to make it ready
                 total_available_entries = 0
@@ -1045,9 +1015,10 @@ class PSRL_AgentLoopManager:
                 # Finally, notify the PS manager to move the occupied entries to the buffer 
                 await self.ps_manager_handle.move_occupied_entries.remote(moved_occupied_entry_infos, buffer_id)
                 psrl_logger.info(f"Moved {total_moved_entries} occupied entries (the total gap is {gap}) from other buffers to buffer {buffer_id}.")
-                await self.retry_request(retry_num=aborted_entry_num)
+                for _ in range(aborted_entry_num):
+                    await self._retry_data()
                             
-        elif self.config.psrl.abort_and_truncate_strategy.method == "truncate":
+        elif self.config.psrl.proactive_filter_strategy.method == "truncate":
             raise NotImplementedError("Truncate strategy is not implemented yet.")
         
         else:
@@ -1096,39 +1067,6 @@ class PSRL_AgentLoopManager:
         # Once resumed, return
         return result
 
-    # TODO(lhy): current logic may cause the request have no place to RESERVE
-    # If other requests OCCUPY the place to RESERVE, the request will have no place to RESERVE
-    # So we may need to reserve here in advance, rather than in the router
-    async def retry_request(self, min_version_limit: int = None, retry_num: int = 1):
-        """Notify the agent loop manager to retry processing requests associated with a specific buffer ID.
-
-        Args:
-            min_version_limit (int): The buffer ID whose requests need to be retried.
-            retry_num (int): The number of retries to attempt.
-        """
-        if self.running_loop and not self.stop_dispatch_task:
-            for _ in range(retry_num):
-                if not self.data_queue.empty():
-                    data = await self.data_queue.get()
-                    if data is None:
-                        raise ValueError("Data queue should not contain None when retrying requests.")
-
-                    if min_version_limit is not None:
-                        data.non_tensor_batch["min_version_limit"] = np.array([min_version_limit] * len(data), dtype=int)
-                        psrl_logger.info(
-                            f"Retry {len(data)} requests with minimum version limit {min_version_limit}"
-                        )
-                    else:
-                        assert self.config.psrl.routing_strategy.enable_dynamic_version_tag, "Dynamic version tag is not enabled"
-                        data.non_tensor_batch["version_tag"] = np.array([-1] * len(data), dtype=int)
-                        psrl_logger.info(
-                            f"Retry {len(data)} requests with dynamic version tag (i.e., -1)"
-                        )
-
-                    await self._inner_dispatch_data(data)
-        else:
-            psrl_logger.warning("Busy loop of the agent loop manager has stopped, the retry operation will be skipped")
-
     # ------- DATA POOL MANAGEMENT -------
 
     def log_buffer(self, buffer_id: int):
@@ -1175,7 +1113,7 @@ class PSRL_AgentLoopManager:
         assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
         # NOTE(linsh): we will delete buffer during aborting requests of specific versions
         # This is because the inflight requests of the remaining entries
-        # in the buffer can still bu utilized for training
+        # in the buffer can still be utilized for training
         return buffer
 
     def get_buffer_from_data_pool(self, entry_infos: list[EntryInfo]) -> DataProto:

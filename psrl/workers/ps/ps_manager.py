@@ -640,7 +640,6 @@ class PSManager(RequestStatusTracker):
         self,
         prompt_id: int,
         request_ids: int | list[int] | None = None,
-        accumulate_sample: bool | None = True,
     ) -> tuple[int | None, BufferStatus | None, EntryInfo]:
         """
         Store a finished request in the staleness inventory, maybe occupy the buffer
@@ -652,7 +651,7 @@ class PSManager(RequestStatusTracker):
         Args:
             prompt_id (int): The prompt id of the request
             request_ids (Optional[Union[int, List[int]]]): The request ids to occupy
-            accumulate_sample (Optional[bool]): Whether to accumulate samples for group sampling
+        
         Returns:
             Tuple[Optional[int], Optional[BufferStatus], EntryInfo]: A tuple containing:
                 - buffer_id (Optional[int]): The buffer id where the data is stored, or None if not occupied
@@ -683,9 +682,6 @@ class PSManager(RequestStatusTracker):
             # self.staleness_inventory.clear_reserved_entries(prompt_id, move_across_buffer=False)
             # return None, None, entry_info
 
-        # Update ready num entries if not accumulate_sample, requiring more data to occupy
-        if not accumulate_sample:
-            self.staleness_inventory.buffers[buffer_id].ready_num_entries += 1
         entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
         return buffer_id, occupy_num, entry_info
 

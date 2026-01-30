@@ -175,6 +175,67 @@ class VllmQwen3MoeParameterMapping(ParameterMapping):
         }
 
 
+# Mixtral
+vllm_mixtral_classes = []
+try:
+    from vllm.model_executor.models.mixtral import MixtralForCausalLM, MixtralModel
+
+    vllm_mixtral_classes = [MixtralForCausalLM, MixtralModel]
+except ImportError as e:
+    warnings.warn(f"Could not import Mixtral classes: {e}", stacklevel=2)
+
+
+@register_model(["VllmMixtralForCausalLM", "VllmMixtralModel"] + vllm_mixtral_classes)
+class VllmMixtralParameterMapping(ParameterMapping):
+    """Parameter mapping for Mixtral model."""
+
+    def __init__(self, config_path: str):
+        self.config = AutoConfig.from_pretrained(config_path)
+
+    def get_mappings(self):
+        mapping = [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+        ]
+        expert_num = self.config.num_local_experts
+        for expert_id in range(expert_num):
+            mapping.append(
+                (
+                    "w13_weight",
+                    f"{expert_id}.w1.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id,
+                )
+            )
+            mapping.append(
+                (
+                    "w13_weight",
+                    f"{expert_id}.w3.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id + 1,
+                )
+            )
+            mapping.append(
+                (
+                    "w2_weight",
+                    f"{expert_id}.w2.weight",
+                    MappingType.FUSED_MOE_W2_SPLIT,
+                    expert_id,
+                )
+            )
+        return mapping
+
+    def get_model_info(self):
+        return {
+            "num_heads": self.config.num_attention_heads,
+            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
+            "head_size": self.config.hidden_size // self.config.num_attention_heads,
+            "intermediate_size": self.config.intermediate_size,
+            "num_experts": self.config.num_local_experts,
+        }
+
+
 # Llama
 vllm_llama_classes = []
 try:

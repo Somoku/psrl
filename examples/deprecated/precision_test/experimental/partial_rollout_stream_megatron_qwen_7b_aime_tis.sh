@@ -113,8 +113,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.partial_rollout.enable=True \
     \
     psrl.routing_strategy.method="throughput_optimal" \
-    psrl.routing_strategy.sort_candidate_by_indicator=True \
-    psrl.routing_strategy.enable_dynamic_version_tag=True \
     psrl.routing_strategy.enable_multi_priority_queue=True \
     psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
     psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_7b.json \

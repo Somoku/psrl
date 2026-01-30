@@ -274,7 +274,15 @@ class PSStorageWorker:
                 self._transfer_key_cache[k] = []
             self._transfer_key_cache[k].append((k, shard_idx))
 
-    def transfer_train_to_gen(self, key: str, shards_to_transfer: list[tuple[int, ...]] | None = None):
+    def transfer_train_to_gen_merged(self, key_and_shards_list: list[tuple[str, list[tuple[int, ...]]]]):
+        if self.storage_plan.train_gen_model_share():
+            return
+        for key, shards in key_and_shards_list:
+            self.transfer_train_to_gen(key, shards, sync=False)
+        if self.use_gpu:
+            torch.cuda.synchronize()
+
+    def transfer_train_to_gen(self, key: str, shards: list[tuple[int, ...]] | None = None, sync: bool = True):
         if self.storage_plan.train_gen_model_share():
             return
         src_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
@@ -290,10 +298,10 @@ class PSStorageWorker:
             self._build_transfer_key_cache(src_original_state_dict)
         matching_keys = self._transfer_key_cache.get(key, [])
         for key_shard_idx_tuple in matching_keys:
-            if shards_to_transfer is not None and key_shard_idx_tuple[1] not in shards_to_transfer:
+            if shards is not None and key_shard_idx_tuple[1] not in shards:
                 continue
             target_original_state_dict[key_shard_idx_tuple].copy_(src_original_state_dict[key_shard_idx_tuple])
-        if self.use_gpu:
+        if sync and self.use_gpu:
             torch.cuda.synchronize()
 
     def shutdown(self):

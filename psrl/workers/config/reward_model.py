@@ -47,7 +47,7 @@ class SandboxFusionConfig(BaseConfig):
     """Configuration for cloud/local sandbox fusion.
 
     Args:
-        url (Optional[str]): Cloud/local function URL for sandbox execution.
+        url (str | None): Cloud/local function URL for sandbox execution.
         max_concurrent (int): Max concurrent requests allowed to sandbox.
         memory_limit_mb (int): Max memory limit for each sandbox process in MB.
     """

@@ -74,6 +74,38 @@ def add_busy_polling_lock(cls):
     return cls
 
 
+def exclusive_push_model_context(ps_manager):
+    """
+    A context manager that ensures exclusive access during model push.
+    Ensures no other push or pull operations are in progress when entering.
+    """
+    return _ExclusivePushModelContext(ps_manager)
+
+
+def shared_pull_model_context(ps_manager):
+    """
+    A context manager that ensures shared access during model pull.
+    Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
+    """
+    return _SharedPullModelContext(ps_manager)
+
+
+def exclusive_push_model_context_async(ps_manager, poll_interval=0.01):
+    """
+    An async context manager that ensures exclusive access during model push.
+    Ensures no other push or pull operations are in progress when entering.
+    """
+    return _AsyncExclusivePushModelContext(ps_manager, poll_interval)
+
+
+def shared_pull_model_context_async(ps_manager, poll_interval=0.01):
+    """
+    An async context manager that ensures shared access during model pull.
+    Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
+    """
+    return _AsyncSharedPullModelContext(ps_manager, poll_interval)
+
+
 class RayLock:
     """Synchronous context manager around a LockActor."""
 
@@ -211,3 +243,147 @@ class AsyncBusyPollingRayLock:
     async def __aexit__(self, exc_type, exc, tb):
         # release regardless of exception
         await self.release()
+
+
+class _ExclusivePushModelContext:
+    """
+    Context manager for exclusive push model operations.
+    Ensures no other push or pull operations are in progress when entering.
+    """
+
+    def __init__(self, ps_manager, poll_interval=0.01):
+        """
+        Initialize the exclusive push model context.
+
+        Args:
+            ps_manager: The PSManager instance
+            poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+        """
+        self.ps_manager = ps_manager
+        self.poll_interval = poll_interval
+
+    def __enter__(self):
+        """Enter the context, acquiring exclusive lock."""
+        # Busy polling until we can acquire the exclusive lock
+        # We need to wait until:
+        # 1. No push is in progress (_exclusive_push_locked == False)
+        # 2. No pull is in progress (_shared_pull_count == 0)
+        while True:
+            # Check if we can acquire the lock
+            can_acquire = ray.get(self.ps_manager._try_acquire_exclusive_push_lock.remote())
+            if can_acquire:
+                return self
+            # Lock is still held, wait for poll_interval before checking again
+            time.sleep(self.poll_interval)
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        """Exit the context, releasing exclusive lock."""
+        ray.get(self.ps_manager._release_exclusive_push_lock.remote())
+        return False
+
+
+class _SharedPullModelContext:
+    """
+    Context manager for shared pull model operations.
+    Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
+    """
+
+    def __init__(self, ps_manager, poll_interval=0.01):
+        """
+        Initialize the shared pull model context.
+
+        Args:
+            ps_manager: The PSManager instance
+            poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+        """
+        self.ps_manager = ps_manager
+        self.poll_interval = poll_interval
+
+    def __enter__(self):
+        """Enter the context, acquiring shared lock."""
+        # Busy polling until we can acquire the shared lock
+        # We need to wait until no push is in progress (_exclusive_push_locked == False)
+        while True:
+            # Check if we can acquire the lock
+            can_acquire = ray.get(self.ps_manager._try_acquire_shared_pull_lock.remote())
+            if can_acquire:
+                return self
+            # Lock is still held, wait for poll_interval before checking again
+            time.sleep(self.poll_interval)
+
+    def __exit__(self, exc_type, exc, exc_tb):
+        """Exit the context, releasing shared lock."""
+        ray.get(self.ps_manager._release_shared_pull_lock.remote())
+        return False
+
+
+class _AsyncExclusivePushModelContext:
+    """
+    Async context manager for exclusive push model operations.
+    Ensures no other push or pull operations are in progress when entering.
+    """
+
+    def __init__(self, ps_manager, poll_interval=0.01):
+        """
+        Initialize the async exclusive push model context.
+
+        Args:
+            ps_manager: The PSManager instance
+            poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+        """
+        self.ps_manager = ps_manager
+        self.poll_interval = poll_interval
+
+    async def __aenter__(self):
+        """Enter the context, acquiring exclusive lock."""
+        # Busy polling until we can acquire the exclusive lock
+        # We need to wait until:
+        # 1. No push is in progress (_exclusive_push_locked == False)
+        # 2. No pull is in progress (_shared_pull_count == 0)
+        while True:
+            # Check if we can acquire the lock
+            can_acquire = await self.ps_manager._try_acquire_exclusive_push_lock.remote()
+            if can_acquire:
+                return self
+            # Lock is still held, wait for poll_interval before checking again
+            await asyncio.sleep(self.poll_interval)
+
+    async def __aexit__(self, exc_type, exc, exc_tb):
+        """Exit the context, releasing exclusive lock."""
+        await self.ps_manager._release_exclusive_push_lock.remote()
+        return False
+
+
+class _AsyncSharedPullModelContext:
+    """
+    Async context manager for shared pull model operations.
+    Allows multiple pull operations to run concurrently, but blocks if a push is in progress.
+    """
+
+    def __init__(self, ps_manager, poll_interval=0.01):
+        """
+        Initialize the async shared pull model context.
+
+        Args:
+            ps_manager: The PSManager instance
+            poll_interval: The interval (in seconds) between polling checks. Default is 0.01 seconds.
+        """
+        self.ps_manager = ps_manager
+        self.poll_interval = poll_interval
+
+    async def __aenter__(self):
+        """Enter the context, acquiring shared lock."""
+        # Busy polling until we can acquire the shared lock
+        # We need to wait until no push is in progress (_exclusive_push_locked == False)
+        while True:
+            # Check if we can acquire the lock
+            can_acquire = await self.ps_manager._try_acquire_shared_pull_lock.remote()
+            if can_acquire:
+                return self
+            # Lock is still held, wait for poll_interval before checking again
+            await asyncio.sleep(self.poll_interval)
+
+    async def __aexit__(self, exc_type, exc, exc_tb):
+        """Exit the context, releasing shared lock."""
+        await self.ps_manager._release_shared_pull_lock.remote()
+        return False

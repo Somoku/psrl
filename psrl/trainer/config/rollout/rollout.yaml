@@ -5,9 +5,6 @@ _target_: psrl.workers.config.RolloutConfig
 # currently we only support vllm
 name: vllm
 
-# sync: LLM, async: AsyncLLM
-mode: sync
-
 # Whether to disable the attention
 disable_attn: ${oc.select:psrl.profile.disable_attn,False}
 

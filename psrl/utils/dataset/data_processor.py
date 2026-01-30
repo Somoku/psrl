@@ -38,7 +38,6 @@ class DataProcessor:
         processor,
         ps_manager_handle,
         collate_fn=None,
-        process_mode="batch",
     ):
         """
         Initialize the DataProcessor, responsible for processing data batches.
@@ -50,7 +49,6 @@ class DataProcessor:
             processor: Optional data processor, used for multimodal data
             ps_manager_handle: Parameter Server handle for communication with the PS worker.
             collate_fn: Function to collate data samples into batches.
-            process_mode: Mode of processing data, either "stream" or "batch".
         """
 
         self.config = config
@@ -75,7 +73,6 @@ class DataProcessor:
         self.ps_manager_handle = ps_manager_handle
         self.reward_manager_handle = None  # Will be set by the ray trainer
 
-        self.process_mode = process_mode
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
@@ -138,7 +135,6 @@ class DataProcessor:
         This method creates a StatefulDataLoader for the training dataset.
         Note that the batch size is determined by `gen_batch_size` in the configuration,
         use `train_batch_size` as fallback.
-        It also checks that the batch size is divisible by the number of rollout instances if process_mode is "batch".
         """
         assert self.train_dataset is not None, (
             "Train dataset is not built yet. Call build_train_and_val_dataset() first."
@@ -149,13 +145,6 @@ class DataProcessor:
             batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
         else:
             batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
-
-        assert (
-            self.config.psrl.gen_mode != "batch" or batch_size % self.config.psrl.deployment.n_rollout_instances == 0
-        ), (
-            f"In batch mode, batch size {batch_size} is not divisible by"
-            f" the number of rollout instances {self.config.psrl.deployment.n_rollout_instances}"
-        )
 
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
@@ -459,24 +448,18 @@ class DataProcessor:
                     gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
 
                 # Record the request status in the request status manager and put the batch into the data queue.
-                if self.process_mode == "stream":
-                    # Put group-level requests to data queue
-                    for i in range(batch_size):
-                        ray.get(
-                            self.ps_manager_handle.add_request.remote(
-                                gen_batch.non_tensor_batch["uid"][
-                                    i * self.rollout_n : (i + 1) * self.rollout_n
-                                ].tolist(),
-                            )
+                # Put group-level requests to data queue
+                for i in range(batch_size):
+                    ray.get(
+                        self.ps_manager_handle.add_request.remote(
+                            gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
                         )
-                        ray.get(
-                            self.agent_loop_manager_handle.put_data.remote(
-                                gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n]
-                            )
+                    )
+                    ray.get(
+                        self.agent_loop_manager_handle.put_data.remote(
+                            gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n]
                         )
-                else:
-                    ray.get(self.ps_manager_handle.add_request.remote(gen_batch.non_tensor_batch["uid"].tolist()))
-                    ray.get(self.agent_loop_manager_handle.put_data.remote(gen_batch))
+                    )
 
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:

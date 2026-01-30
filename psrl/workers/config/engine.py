@@ -73,15 +73,15 @@ class McoreEngineConfig(EngineConfig):
         optimizer_offload (bool): Whether to offload optimizer states to CPU.
         tensor_model_parallel_size (int): Tensor model parallel size.
         expert_model_parallel_size (int): Expert model parallel size for MoE models.
-        expert_tensor_parallel_size (Optional[int]): Expert tensor parallel size for MoE models.
+        expert_tensor_parallel_size (int | None): Expert tensor parallel size for MoE models.
         pipeline_model_parallel_size (int): Pipeline model parallel size.
-        virtual_pipeline_model_parallel_size (Optional[int]): Virtual pipeline model parallel size
+        virtual_pipeline_model_parallel_size (int | None): Virtual pipeline model parallel size
             for interleaved scheduling.
         context_parallel_size (int): Context parallel size for long sequences.
         sequence_parallel (bool): Whether to enable sequence parallelism.
         use_distributed_optimizer (bool): Whether to use distributed optimizer.
         use_dist_checkpointing (bool): Whether to use distributed checkpointing.
-        dist_checkpointing_path (Optional[str]): Path for distributed checkpointing.
+        dist_checkpointing_path (str | None): Path for distributed checkpointing.
         seed (int): Random seed for reproducibility.
         override_ddp_config (dict[str, Any]): Override configuration for DDP.
         override_transformer_config (dict[str, Any]): Override configuration for transformer.
@@ -140,7 +140,7 @@ class FSDPEngineConfig(EngineConfig):
         full_determinism (bool): If true, enable_full_determinism is called to ensure reproducible results
             in distributed training. Important: this will negatively impact performance, so only use it for
             debugging.
-        mixed_precision (Optional[dict[str, Any]]): Mixed precision configuration for FSDP, default None
+        mixed_precision (dict[str, Any] | None): Mixed precision configuration for FSDP, default None
         dtype (str): Mixed precision training param dtype, default "bfloat16"
     """
 

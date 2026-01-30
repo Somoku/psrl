@@ -1,5 +1,6 @@
 import logging
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import ray
@@ -39,6 +40,7 @@ from psrl.utils.nixl import (
     NIXLInterface,
     NIXLStorageClient,
 )
+from psrl.utils.ray import exclusive_push_model_context
 from psrl.workers.train import PSRL_BaseTrainWorker, TrainInterface
 
 if TYPE_CHECKING:
@@ -384,8 +386,9 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-            # Support all hardwares
-            from contextlib import nullcontext
+            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
 
             is_lora = data.meta_info.pop("is_lora", False)
             adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
@@ -415,6 +418,12 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
         torch.cuda.synchronize()
-        with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
-            PSRL_BaseTrainWorker.push_model(self)
+        context_manager = (
+            exclusive_push_model_context(self.train_interface.ps_manager_handle)
+            if self.is_train_representative_rank
+            else nullcontext()
+        )
+        with context_manager:
+            with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
+                PSRL_BaseTrainWorker.push_model(self)
         return output

@@ -47,7 +47,7 @@ defaults:
 train_actor_rollout_ref:
 
   # Whether it's a hybrid engine, currently only supports hybrid engine
-  hybrid_engine: true
+  hybrid_engine: True
 
   # Timeout for operations executed against the process group
   nccl_timeout: 600

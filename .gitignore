@@ -1,9 +1,7 @@
 # PSRL
 examples/visualization/.*/
 unit_tests/nixl/plot/
-third_party/
-third_party_old/
-third_party_new/
+third_party*/
 
 # General
 **/*.log

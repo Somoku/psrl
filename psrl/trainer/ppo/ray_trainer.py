@@ -33,6 +33,7 @@ from verl.utils.seqlen_balancing import (
     get_seqlen_balanced_partitions,
     log_seqlen_unbalance,
 )
+from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
 
 from psrl.trainer.ppo.utils import (
@@ -208,7 +209,6 @@ class PSRL_RayPPOTrainer:
         self._init_data_processor()
 
     def _initialize_queue_buffers(self):
-        self.process_mode = self.config.psrl.gen_mode
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
@@ -220,20 +220,10 @@ class PSRL_RayPPOTrainer:
         )
 
         # Data queue is the communication handle between the data processor and the rollout server.
-        # It holds the data batches that are ready for processing.
-        # The size of the queue is determined by the batch size and the process mode.
-        # If process_mode is "stream", it will hold multiple requests for streaming processing.
-        # If process_mode is "batch", it will hold a single batch for batch processing.
-        # Rollout queue is the communication handle between the rollout workers and the data processor (reward module).
-        # It holds the rollout data that is ready for reward computation.
-        # The size of the queue is the same as the whole batch size for streaming mode.
-        # The size of the queue is the same as number of agent workers for batch mode.
-        if self.process_mode == "stream":
-            self.data_queue_size = (
-                self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n
-            )
-        else:
-            self.data_queue_size = 1
+        # The size of the queue is determined by the batch size and the rollout n.
+        self.data_queue_size = (
+            self.config.data.get("gen_batch_size", self.config.data.train_batch_size) * self.rollout_n
+        )
 
         # Status queues are used to store the status of the rollout instances.
         # The status is collected by the rollout coordinator and sent to the agent loop workers.
@@ -429,11 +419,6 @@ class PSRL_RayPPOTrainer:
                 f"NOTICE: NIXL is enabled. Actor strategy used is {self.config.train_actor_rollout_ref.actor.strategy}"
             )
 
-        # Check colocate mode
-        if self.config.psrl.colocate:
-            assert self.config.psrl.gen_mode == "batch", "gen_mode must be batch when using colocate mode"
-            assert self.config.psrl.staleness == 0, "staleness must be 0 when using colocate mode"
-
         # Check validate mode
         if self.config.psrl.colocate_validate_and_train:
             assert self.config.psrl.validate_on_psrl, (
@@ -443,24 +428,6 @@ class PSRL_RayPPOTrainer:
         if not self.config.psrl.validate_on_psrl and not self.config.psrl.fuse_rollout_with_validate:
             psrl_logger.warning(
                 "Validation is set to use verl trainer instead of PSRL rollout. fuse_rollout_with_validate is ignored."
-            )
-
-        # Check rollout mode
-        if self.config.psrl.gen_mode == "batch":
-            assert self.config.gen_actor_rollout_ref.rollout.mode == "sync", (
-                "rollout mode must be sync when using batch mode"
-            )
-        elif self.config.psrl.gen_mode == "stream":
-            assert self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async", (
-                "rollout mode must be psrl_async when using stream mode"
-            )
-        else:
-            raise ValueError(f"Invalid gen_mode: {self.config.psrl.gen_mode}, must be one of ['batch', 'stream']")
-
-        # Check partial and redundant rollout
-        if self.config.psrl.partial_rollout.enable or self.config.psrl.redundant_rollout.enable:
-            assert self.config.psrl.gen_mode == "stream", (
-                "gen_mode must be stream when using partial or redundant rollout"
             )
 
         # Check routing strategy
@@ -519,12 +486,7 @@ class PSRL_RayPPOTrainer:
 
         # Initialize the data processor
         self.data_processor = DataProcessor.remote(
-            self.config,
-            self.tokenizer,
-            self.processor,
-            self.ps_manager_handle,
-            collate_fn=self.collate_fn,
-            process_mode=self.process_mode,
+            self.config, self.tokenizer, self.processor, self.ps_manager_handle, collate_fn=self.collate_fn
         )
 
         # Get total training steps from the data processor where dataloaders are built
@@ -1374,7 +1336,7 @@ class PSRL_RayPPOTrainer:
         )
         storage_plan = PSStoragePlan(
             train_model_dtype=train_model_dtype,
-            gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype,
+            gen_model_dtype=PrecisionType.to_dtype(self.config.gen_actor_rollout_ref.rollout.dtype),
         )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict
@@ -2173,15 +2135,6 @@ class PSRL_RayPPOTrainer:
 
                 # compute global_valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                batch.meta_info["micro_batch_size"] = (
-                    self.config.train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-                )
-                batch.meta_info["max_token_len"] = (
-                    self.config.train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-                )
-                batch.meta_info["use_dynamic_bsz"] = (
-                    self.config.train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-                )
                 batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
 
                 # Operating Mode Selection:

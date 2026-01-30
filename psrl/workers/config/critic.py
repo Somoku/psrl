@@ -32,7 +32,7 @@ class CriticConfig(BaseConfig):
         optim (Dict[str, Any]): Optimizer configuration including lr, weight_decay, etc.
         model (Dict[str, Any]): Model configuration including path, tokenizer_path, etc.
         ppo_mini_batch_size (int): PPO mini-batch size per update.
-        ppo_micro_batch_size (Optional[int]): Global micro batch size (deprecated).
+        ppo_micro_batch_size (int | None): Global micro batch size (deprecated).
         use_dynamic_bsz (bool): Whether to automatically adjust batch size at runtime.
         ppo_max_token_len_per_gpu (int): Max tokens per GPU in one PPO batch.
         forward_max_token_len_per_gpu (int): Max token length per GPU in forward pass.
@@ -42,7 +42,7 @@ class CriticConfig(BaseConfig):
         loss_agg_mode (str): Loss aggregation mode.
         checkpoint (Dict[str, Any]): Checkpoint configuration.
         profiler (Dict[str, Any]): Profiler configuration.
-        enable (Optional[bool]): Whether to enable the critic.
+        enable (bool | None): Whether to enable the critic.
     """
 
     _mutable_fields = BaseConfig._mutable_fields | {

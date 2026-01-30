@@ -16,9 +16,6 @@ staleness_buffer_entries: 512
 # number of responses (i.e. num sample times). > 1 for grpo
 rollout_n: 1
 
-# Generate mode: batch or stream
-gen_mode: batch
-
 # Weight synchronization mode for parameter server: cpu_ref or nixl_cpu
 ps_mode: cpu_ref
 
@@ -160,16 +157,15 @@ routing_strategy:
   method: request_num_balance
 
   # Check interval in millisecond for rollout routing
-  check_interval_in_ms: 1000
+  check_interval_in_ms: 10
 
   # Whether to prioritize short requests
-  short_request_first: False
+  # Available options: "short_length", "long_length", "small_id"
+  request_sort_indicator: small_id
 
   # Whether to sort the candidates by indicator 
-  sort_candidate_by_indicator: False
-
-  # Whether to allocate the version tag dynamically (first routing to the instance, then allocate the version tag)
-  enable_dynamic_version_tag: False
+  # Available options: "version", "reserve_capability"
+  candidate_sort_indicator: version
 
   # Whether to enable multiple priority queues for routing requests
   enable_multi_priority_queue: False
@@ -209,7 +205,7 @@ sync_and_mig_strategy:
 
   # Method for model synchronization and rollout migration
   # Available options: "status_based" or "greedy"
-  method: status_based
+  method: greedy
 
   # Check interval in millisecond for model synchronization and rollout migration
   check_interval_in_ms: 100
@@ -231,6 +227,13 @@ sync_and_mig_strategy:
     # When indicator is "hypothesis_test", threshold is not used.
     threshold: null
 
+    # Whether to check the request that can be routed to the instance before synchronization
+    check_req_before_sync: True
+
+    # All versions in [0, seamless_train_version] satisfy that:
+    # - After pulling the model from the PS, the next buffer is already ready, so the training can be continued seamlessly without waiting for rollout
+    seamless_train_version: 0
+
   # Rollout migration config
   mig:
     # Whether to enable rollout migration
@@ -251,6 +254,18 @@ sync_and_mig_strategy:
 
     # Threshold for stopping migration
     stop_threshold: null
+
+# Filter strategy
+proactive_filter_strategy:
+
+  # Method for proactive filter strategy
+  # Available options: "null", "retry", "truncate"
+  method: null
+
+  # Threshold of retry/truncate requests per buffer
+  # When the buffer is not ready but the training side is waiting for it
+  # We will trigger the retry/truncate strategy when the number of remaining reserved entries is smaller than this value
+  threshold: 0
 
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:

@@ -116,7 +116,6 @@ class PSRL_VerlGenWorker(ActorRolloutRefWorker):
             raise NotImplementedError(f"PSRL VerlGenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
     def pull_model(self) -> None:
-        assert self.config.rollout.mode == "sync", "Only support `sync` mode."
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_pull_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
@@ -128,7 +127,6 @@ class PSRL_VerlGenWorker(ActorRolloutRefWorker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def verl_generate_sequences_all(self, prompts: DataProto):
-        assert self.psrl_config.gen_mode == "batch", "verl_generate_sequences is only supported in batch mode"
         assert self.config.rollout.get("pipeline_model_parallel_size", 1) == 1, (
             "verl_generate_sequences is only supported in pure tensor parallel mode"
         )
@@ -158,7 +156,6 @@ class PSRL_VerlGenWorker(ActorRolloutRefWorker):
             return outputs
 
     def verl_generate_sequences(self, prompts: DataProto):
-        assert self.psrl_config.gen_mode == "batch", "verl_generate_sequences is only supported in batch mode"
         assert self.config.rollout.get("pipeline_model_parallel_size", 1) == 1, (
             "verl_generate_sequences is only supported in pure tensor parallel mode"
         )

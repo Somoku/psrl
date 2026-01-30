@@ -182,10 +182,7 @@ class PSRL_AgentLoopWorker:
             DataProto: Generated trajectories and associated data.
         """
         # by default, we assume it's a generation-only agent
-        if self.config.psrl.gen_mode == "batch":
-            default_agent_name = "batch_generate_only_agent"
-        elif self.config.psrl.gen_mode == "stream":
-            default_agent_name = "generate_only_agent"
+        default_agent_name = "generate_only_agent"
 
         agent_names = batch.non_tensor_batch.pop(
             "agent_name", np.array([default_agent_name] * len(batch), dtype=object)

@@ -339,6 +339,7 @@ class NIXLMetaServer:
                             client_info = NIXLClientInfo.deserialize(info)
                             self.client_infos[client_name] = client_info
                             self._client_temp_mappings[client_name] = client_temp_mapping
+                            self._add_client(agent_name, client_name)
                             already_recved_agents.add(agent_name)
                     except Exception as e:
                         psrl_logger.error(f"Failed to parse updated client infos from agent {agent_name}: {e}")
@@ -371,7 +372,15 @@ class NIXLMetaServer:
 
         for agent_name in dst_agent_names:
             # Send notification with updated client infos
-            self.agent.send_notif(agent_name, payload)
+            try:
+                self.agent.send_notif(agent_name, payload)
+            except Exception as e:
+                raise RuntimeError(
+                    f"{self.server_name}: Failed to send update client infos to agent {agent_name}: {e}, "
+                    f"connected clients: {self.connected_clients}, "
+                    f"dst agent names: {dst_agent_names}, "
+                    f"update client names: {update_client_names}"
+                ) from e
 
         psrl_logger.debug(
             f"Broadcast update client infos to agents: {dst_agent_names}, include clients: {update_client_names}"

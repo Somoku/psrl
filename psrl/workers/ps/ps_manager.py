@@ -862,6 +862,11 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_agent_names = ray.get(ps_nixl_agent_name_futures)
         self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
         self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
+        psrl_logger.info(
+            f"PS worker group initialized with NIXL agent names: {self.ps_nixl_agent_names}, "
+            f"train storage client names: {self.ps_nixl_train_storage_client_names}, "
+            f"gen storage client names: {self.ps_nixl_gen_storage_client_names}"
+        )
 
     def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:
         """Get the PS worker handle by the client name."""

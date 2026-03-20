@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -14,7 +13,6 @@ from ray.util.queue import Queue as RayQueue
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tqdm import tqdm
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls_fused
 from verl.trainer.ppo import core_algos
@@ -33,6 +31,7 @@ from verl.utils.seqlen_balancing import (
     get_seqlen_balanced_partitions,
     log_seqlen_unbalance,
 )
+from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
 
 from psrl.trainer.ppo.utils import (
@@ -154,16 +153,11 @@ class PSRL_RayPPOTrainer:
         self.async_rollout_mode = False
 
         # Indicate whether current mode is rollout mode in actor
-        init_with_rollout_mode_in_actor = (
-            # Generate trajectories for training
-            self.config.psrl.validate_on_psrl
-            and self.config.psrl.fuse_rollout_with_validate
-            or
-            # Validation before training
-            self.config.trainer.get("val_before_train", True)
-        )
         self.is_rollout_mode_in_actor = (
-            self.config.psrl.colocate_validate_and_train and init_with_rollout_mode_in_actor
+            self.config.psrl.colocate_validate_and_train and self.config.trainer.val_before_train
+        )
+        psrl_logger.info(
+            f"Initializing PSRL_RayPPOTrainer with is_rollout_mode_in_actor: {self.is_rollout_mode_in_actor}"
         )
 
         # Indicate whether rank 0 worker is also the model owner in psrl_async mode
@@ -177,9 +171,6 @@ class PSRL_RayPPOTrainer:
         self.n_validate_instances = (
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
-
-        # Whether to evaluate on rollout
-        self.validate_on_psrl = self.config.psrl.validate_on_psrl
 
         # Indicate whether rank 0 worker is also the model owner in psrl_async mode
         self.rank_0_is_model_owner = self.config.gen_actor_rollout_ref.rollout.mode == "psrl_async"
@@ -436,13 +427,12 @@ class PSRL_RayPPOTrainer:
 
         # Check validate mode
         if self.config.psrl.colocate_validate_and_train:
-            assert self.config.psrl.validate_on_psrl, (
-                "validate_on_psrl must be True when using colocate_validate_and_train mode"
+            assert self.config.psrl.tms.range == "train" or self.config.psrl.tms.range == "all", (
+                "TMS range must be 'train' or 'all' when using colocate_validate_and_train"
             )
-
-        if not self.config.psrl.validate_on_psrl and not self.config.psrl.fuse_rollout_with_validate:
-            psrl_logger.warning(
-                "Validation is set to use verl trainer instead of PSRL rollout. fuse_rollout_with_validate is ignored."
+        else:
+            assert self.config.psrl.fuse_rollout_with_validate, (
+                "fuse_rollout_with_validate must be enabled when not colocate_validate_and_train"
             )
 
         # Check rollout mode
@@ -630,6 +620,12 @@ class PSRL_RayPPOTrainer:
 
         bind = ray.get(self.rollout_gateway.get_bind.remote())
         self.gateway_base_url = f"http://{bind['host']}:{bind['port']}"
+        assert bind["host"] == self.config.psrl.server_rollout.gateway.get("router_ip", "127.0.0.1"), (
+            "Rollout Gateway host must be the same as router_ip"
+        )
+        assert bind["port"] == int(self.config.psrl.server_rollout.gateway.get("router_port", 8000)), (
+            "Rollout Gateway port must be the same as router_port"
+        )
         psrl_logger.info(f"Rollout Gateway started at {self.gateway_base_url}")
 
         futures = []
@@ -866,25 +862,18 @@ class PSRL_RayPPOTrainer:
 
             test_batch_list.append(test_batch)
 
-        if self.validate_on_psrl:
-            val_data_size = sum(len(batch.batch) for batch in test_batch_list)
-            futures = []
-            futures.append(self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(val_data_size))
-            futures.append(self.agent_loop_manager.set_val_buffer_size.remote(val_data_size))
-            ray.get(futures)
+        val_data_size = sum(len(batch.batch) for batch in test_batch_list)
+        futures = []
+        futures.append(self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(val_data_size))
+        futures.append(self.agent_loop_manager.set_val_buffer_size.remote(val_data_size))
+        ray.get(futures)
 
         val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         for test_batch in test_batch_list:
             batch_size = len(test_batch.batch)
 
-            if self.validate_on_psrl:
-                sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
-                test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
-            else:
-                test_batch.non_tensor_batch["parent_id"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(batch_size)],
-                    dtype=object,
-                )
+            sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
+            test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=val_rollout_n, interleave=True)
 
@@ -893,9 +882,7 @@ class PSRL_RayPPOTrainer:
             # TODO(verl): Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
-            sample_parent_ids.extend(
-                test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 or not self.validate_on_psrl else "uid"]
-            )
+            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
@@ -914,14 +901,13 @@ class PSRL_RayPPOTrainer:
                 non_tensor_batch_keys_to_pop.append("interaction_kwargs")
             if "agent_name" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("agent_name")
-            if self.validate_on_psrl:
-                non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
+            non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
 
-            if val_rollout_n > 1 and self.validate_on_psrl:
+            if val_rollout_n > 1:
                 uid_list = []
                 for i in range(batch_size):
                     for j in range(val_rollout_n):
@@ -939,32 +925,11 @@ class PSRL_RayPPOTrainer:
             }
             psrl_logger.debug(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            if self.validate_on_psrl:
-                val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_gen_batch))
-                with log_dual_events(
-                    f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT
-                ):
-                    test_output_gen_batch = ray.get(
-                        self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
-                    )
-            else:
-                # pad to be divisible by dp_size
-                size_divisor = (
-                    self.actor_wg.world_size // self.config.train_actor_rollout_ref.rollout.tensor_model_parallel_size
-                    if not self.async_rollout_mode
-                    else self.config.train_actor_rollout_ref.rollout.agent.num_workers
+            val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_gen_batch))
+            with log_dual_events(f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT):
+                test_output_gen_batch = ray.get(
+                    self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
                 )
-                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-                # switch to the inference engine and generate sequences
-                # NOTE: `async_rollout_mode` regards to aysnc engine in verl,
-                # not the async rollout mode in PSRL as `psrl_async`.
-                if not self.async_rollout_mode:
-                    test_output_gen_batch_padded = self.actor_wg.generate_sequences(test_gen_batch_padded)
-                else:
-                    raise NotImplementedError("async_rollout_mode of verl is not supported for validation yet.")
-
-                # unpad
-                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
@@ -1143,7 +1108,7 @@ class PSRL_RayPPOTrainer:
         actor_cls = RayClassWithInitArgs(
             cls=self.role_worker_mapping[PSRL_Role.Actor],
             config=self.config.train_actor_rollout_ref,
-            role="actor" if self.validate_on_psrl else "actor_rollout",
+            role="actor",
             psrl_config=self.config.psrl,
             train_interface=train_interface,
             nixl_interface=nixl_interface,
@@ -1330,7 +1295,9 @@ class PSRL_RayPPOTrainer:
                     }
                 else:
                     train_wg_kwargs = wg_kwargs
-                    train_wg_kwargs["worker_env"] = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+                    # NOTE(lhy): Still cannot use expandable segments, will cause NIXL error
+                    # train_wg_kwargs["worker_env"] = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+                psrl_logger.info(f"train_wg_kwargs: {train_wg_kwargs}")
                 train_tasks.append((resource_pool, class_dict, train_wg_kwargs))
         # We must execute train tasks first because rollout instances may occupy
         # the resources randomly and no structured resources are available for training
@@ -1374,7 +1341,7 @@ class PSRL_RayPPOTrainer:
         )
         storage_plan = PSStoragePlan(
             train_model_dtype=train_model_dtype,
-            gen_model_dtype=self.config.gen_actor_rollout_ref.rollout.dtype,
+            gen_model_dtype=PrecisionType.to_dtype(self.config.gen_actor_rollout_ref.rollout.dtype),
         )
         if self.config.psrl.ps_mode == "cpu" or self.config.psrl.ps_mode == "cpu_ref":
             # PSManager is used to store the model state dict
@@ -1424,6 +1391,8 @@ class PSRL_RayPPOTrainer:
                     self.worker_to_ps_idx.update(
                         {worker: i for worker, nid in self.worker_to_node_id.items() if nid == node_id}
                     )
+                psrl_logger.info(f"Worker to node id: {self.worker_to_node_id}")
+                psrl_logger.info(f"Worker to PS id: {self.worker_to_ps_idx}")
 
                 for node_id in ps_node_ids:
                     ps_spec_list.append(PSResourceSpec(node_id=node_id, attached_gpu_id=None))
@@ -1441,10 +1410,8 @@ class PSRL_RayPPOTrainer:
                 )
                 if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
                     nixl_client_futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
-                # Init full weight in ps for trainer pulling after wake up
-                model_init_futures.extend(
-                    self.ps_wg.execute_all_async("init_model", "full" if self.is_rollout_mode_in_actor else "meta")
-                )
+                # Init model skeleton on meta device; weights are loaded after NIXL protocol completes.
+                model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
                 psrl_logger.info("PS model initialized successfully!")
             elif self.config.psrl.ps_mode == "nixl_gpu":
                 raise NotImplementedError("PS mode 'nixl_gpu' is not implemented yet")
@@ -1504,7 +1471,7 @@ class PSRL_RayPPOTrainer:
             psrl_logger.info("Initialized NIXL client in actor worker group")
             self.actor_wg.init_model("empty")
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
-            ray.get(self.actor_wg.execute_all_async("sleep"))
+            ray.get(self.actor_wg.execute_all_async("nixl_sleep", "meta"))
 
             psrl_logger.info("Initializing validation model")
             # NOTE(linsh): here we must use rollout coordinator to init model
@@ -1525,7 +1492,18 @@ class PSRL_RayPPOTrainer:
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             ray.get(self.rollout_coordinator.init_route_strategy.remote("all"))
-            ray.get(self.rollout_coordinator.sleep.remote("validate"))
+            # Pause validate instances in the router before sleeping them, so that the router
+            # does not route rollout requests to validate instances that are in sleep state.
+            # (fuse_rollout_with_validate=True makes all instances available by default)
+            init_paused_instance_ids = list(
+                range(self.n_rollout_instances, self.n_rollout_instances + self.n_validate_instances)
+            )
+            ray.get(
+                [
+                    self.rollout_coordinator.sleep.remote("validate"),
+                    self.rollout_router.pause_instances.remote(init_paused_instance_ids),
+                ]
+            )
 
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
@@ -1542,8 +1520,8 @@ class PSRL_RayPPOTrainer:
                 f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, "
                 f"{self.actor_wg.world_size} actor workers, {rollout_world_size} rollout workers"
             )
-            expected_agents = self.ps_wg.world_size + self.actor_wg.world_size + rollout_world_size
-            ray.get(self.ps_manager_handle.init_nixl_server.remote(expected_agents))
+            expected_nixl_client_agents = self.ps_wg.world_size + self.actor_wg.world_size + rollout_world_size
+            ray.get(self.ps_manager_handle.init_nixl_server.remote(expected_nixl_client_agents))
             actor_protocol_mode = "meta" if self.is_rollout_mode_in_actor else "full"
             rollout_full_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
 
@@ -1555,17 +1533,17 @@ class PSRL_RayPPOTrainer:
                 futures.append(self.rollout_coordinator.nixl_protocol.remote(rollout_full_tag))
                 ray.get(futures)
 
+            # Now that all NIXL buffers are allocated (meta tensors replaced),
+            # stream checkpoint weights into the PS registered tensors.
+            # TODO(lhy): change all loading logic to this, not only val_before_train
+            #            (disk -> PS CPUs -> train/gen GPUs)
+            if self.is_rollout_mode_in_actor:
+                with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
+                    ray.get(self.ps_wg.execute_all_async("load_weights_to_registered_tensors"))
+
             psrl_logger.info("Binding PS worker group")
             self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg)
             psrl_logger.info("PS worker group bound successfully!")
-
-        # Build rollout at train side for evaluation
-        if not self.validate_on_psrl:
-            psrl_logger.info("Building rollout at train side for evaluation")
-            self.actor_wg.build_rollout(
-                trust_remote_code=self.config.train_actor_rollout_ref.model.get("trust_remote_code", False)
-            )
-            psrl_logger.info("Evaluation rollout built successfully!")
 
     def switch_to_rollout_mode(self):
         """Switch the PSRL colocate part to rollout mode for validation.
@@ -1587,7 +1565,7 @@ class PSRL_RayPPOTrainer:
 
         psrl_logger.info("Step 1 - Deregistering actor clients from NIXL...")
         # actor_wg nixl client deregister weight memory
-        release_futures = self.actor_wg.execute_all_async("nixl_sleep")
+        release_futures = self.actor_wg.execute_all_async("nixl_sleep", "full")
         ray.get(release_futures)
 
         psrl_logger.info("Step 2 - Waking up validation instances...")
@@ -1606,7 +1584,7 @@ class PSRL_RayPPOTrainer:
         futures = []
         for i in range(self.n_validate_instances):
             instance_id = self.n_rollout_instances + i
-            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"validate_I{i}")]
+            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"validate_I{i}_R")]
             tp_size = len(worker_names)
             for rank in range(len(worker_names)):
                 updated_client_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{rank}")
@@ -1752,17 +1730,17 @@ class PSRL_RayPPOTrainer:
         """
         src_agent_names = [GLOBAL_META_SERVER_NAME]
         dst_agent_names = []
-        # 1. other ps storage workers
+        # 1. ps storage workers
         ps_worker_num = self.ps_wg.world_size
         for i in range(ps_worker_num):
             dst_agent_names.append(f"{GLOBAL_PS_CLIENT_NAME}_{i}")
         # 2. rollout workers
         for i in range(self.n_rollout_instances):
-            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"rollout_I{i}")]
+            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"rollout_I{i}_R")]
             for rank in range(len(worker_names)):
                 dst_agent_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{i}_R{rank}")
         for i in range(self.n_validate_instances):
-            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"validate_I{i}")]
+            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"validate_I{i}_R")]
             instance_id = self.n_rollout_instances + i
             for rank in range(len(worker_names)):
                 dst_agent_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{rank}")
@@ -2159,6 +2137,12 @@ class PSRL_RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+
+                # Log multi-turn or other metrics
+                if "metrics" in batch.meta_info:
+                    gen_metrics = batch.meta_info["metrics"]
+                    metrics.update(reduce_metrics(gen_metrics))
+                    batch.meta_info["metrics"].clear()
 
                 if "response_mask" not in batch.batch.keys():
                     batch.batch["response_mask"] = compute_response_mask(batch)

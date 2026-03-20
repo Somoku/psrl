@@ -2,32 +2,32 @@
 # set -v
 
 # Launch Docker on all nodes
-# ./docker-manager.sh start all
+# ./docker_manager.sh start all
 
-# Check Docker status of node 192.168.1.102
-# ./docker-manager.sh status 192.168.1.102
+# Check Docker status of node 28.49.198.139
+# ./docker_manager.sh status 28.49.198.139
 
-# Check Docker logs of node 192.168.1.101
-# ./docker-manager.sh logs 192.168.1.101
+# Check Docker logs of node 28.49.198.139
+# ./docker_manager.sh logs 28.49.198.139
+#
+# Requires SANDBOX_NODE_NUM and SANDBOX_NODE_IPS (env; $1/$2 are used for action/host):
+#   SANDBOX_NODE_NUM=8 SANDBOX_NODE_IPS="ip1:8,ip2:8,..." ./docker_manager.sh start all
 
-NODE_NUM=
-
-if [ -z "$NODE_IP_LIST" ]; then
-    echo "Error: NODE_IP_LIST is not set"
+if [ -z "$SANDBOX_NODE_IPS" ]; then
+    echo "Error: SANDBOX_NODE_IPS is not set"
     exit 1
 fi
 
-if [ -z "$NODE_NUM" ]; then
-    NODE_NUM=$(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | wc -l)
+if [ -z "$SANDBOX_NODE_NUM" ]; then
+    SANDBOX_NODE_NUM=$(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | wc -l)
 fi
 
-mapfile -t hosts < <(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | head -n $NODE_NUM)
+mapfile -t hosts < <(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | head -n $SANDBOX_NODE_NUM)
 if [ ${#hosts[@]} -eq 0 ]; then
-    echo "Error: NODE_IP_LIST is empty"
+    echo "Error: SANDBOX_NODE_IPS is empty or invalid"
     exit 1
 fi
 
-hosts=("${hosts[@]:0}")
 MANAGER=${hosts[0]}
 WORKERS=("${hosts[@]:1}")
 

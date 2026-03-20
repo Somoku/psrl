@@ -19,7 +19,6 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_model_to_cpu,
 )
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.profiler import log_gpu_memory_usage
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
@@ -28,9 +27,12 @@ from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
+    MemoryLogger,
     deprecated,
     get_worker_info,
+    gpu_memory_logger_decorator,
     log_dual_events,
+    log_tensor,
 )
 from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
@@ -124,6 +126,17 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
+        # Memory logger (periodic + on-demand GPU memory log, same path/prefix pattern with Mem suffix)
+        if torch.cuda.is_available() and self.psrl_config.memory_logger.enable:
+            self.memory_logger = MemoryLogger(
+                self.psrl_config.logging_path,
+                f"{self.log_prefix}_Mem",
+                interval_seconds=self.psrl_config.memory_logger.interval_seconds,
+            )
+            self.memory_logger.start()
+        else:
+            self.memory_logger = None
+
     @property
     def is_train_representative_rank(self) -> bool:
         """
@@ -164,12 +177,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
     def nixl_convert_params(self):
-        """Convert the FSDP model parameters for NIXL storage client.
-
-        Args:
-            meta_only: If True, generate meta tensors instead of actual tensors.
-                       This is used when the model is in sleep state.
-        """
+        """Convert the FSDP model parameters for NIXL storage client."""
         self.unified_state_dict, self.local_sharding_dict = convert_fsdp_inplace(
             self.config.actor.strategy,
             self.actor_module_fsdp,
@@ -210,25 +218,88 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.info("nixl client protocol done.")
         self.unified_sharding_dict = unified_sharding_dict
 
-    def nixl_sleep(self):
+    def clear_fsdp2_grads(self):
+        """Clear all FSDP2 gradient state after wake_up/pull_model.
+
+        optimizer.zero_grad() only clears sharded_param.grad, but FSDP2 internally
+        maintains unsharded_accumulated_grad on each FSDPParam object. If a val phase
+        interrupts the training loop before post_backward() has a chance to consume and
+        reset this field, the stale unsharded grad will be accumulated on top of the
+        next backward pass, causing grad_norm to explode.
+
+        This method clears all three grad locations:
+          1. sharded_param.grad        - what the optimizer sees
+          2. unsharded_accumulated_grad - FSDP2 internal accumulation buffer
+          3. _unsharded_param.grad     - transient grad on the all-gathered parameter
+        """
+        from torch.distributed._composable.fsdp import FSDPModule
+
+        dirty_count = 0
+        for module in self.actor_module_fsdp.modules():
+            if isinstance(module, FSDPModule):
+                for pg in module._get_fsdp_state()._fsdp_param_groups:
+                    for fp in pg.fsdp_params:
+                        if fp.unsharded_accumulated_grad is not None:
+                            psrl_logger.debug(
+                                f"[clear_fsdp2_grads] {fp._param_fqn}: "
+                                f"unsharded_accumulated_grad norm = {fp.unsharded_accumulated_grad.norm():.4f}"
+                            )
+                            fp.unsharded_accumulated_grad = None
+                            dirty_count += 1
+                        if fp._unsharded_param.grad is not None:
+                            psrl_logger.debug(
+                                f"[clear_fsdp2_grads] {fp._param_fqn}: "
+                                f"_unsharded_param.grad norm = {fp._unsharded_param.grad.norm():.4f}"
+                            )
+                            fp._unsharded_param.grad = None
+                            dirty_count += 1
+
+        # Also clear sharded_param.grad (what optimizer.zero_grad() would clear)
+        for p in self.actor_module_fsdp.parameters():
+            if p.grad is not None:
+                p.grad = None
+                dirty_count += 1
+
+        if dirty_count > 0:
+            psrl_logger.warning(
+                f"[clear_fsdp2_grads] Cleared {dirty_count} stale grad tensor(s) "
+                f"after wake_up on rank {self.rank}. "
+                f"This likely indicates val interrupted a backward pass."
+            )
+        else:
+            psrl_logger.debug(f"[clear_fsdp2_grads] No stale grads found on rank {self.rank}.")
+
+    def nixl_sleep(self, mode: str = "full"):
         """Deregister the model weights for NIXL and free up GPU memory."""
-        self.sleep()
+        self.sleep_fsdp_model()
+        if mode == "meta":
+            return
         self.nixl_storage_client.deregister_local_tensors()
 
-    def sleep(self):
+    def sleep_fsdp_model(self):
         """
         Release GPU memory for model weights without CPU offloading.
         The model metadata (shape, dtype, etc.) is preserved for later wake_up.
         """
-        log_gpu_memory_usage(f"Before TrainWorker_R{self.rank} sleep", psrl_logger, level=logging.INFO)
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
+
+        for buffer in self.actor_module_fsdp.buffers():
+            buffer.data = buffer.data.to("cpu")
+
+        # NOTE(lhy): aggressive_empty_cache is used to ensure no torch reserved memory exists
+        # so torch won't trigger cudaFree from the mempool side
+        # otherwise it will cause double cuMemRelease (first pause, then free) in tms
+        aggressive_empty_cache(force_sync=True)
         # Release GPU memory for FSDP model parameters
         if self.psrl_config.tms.range in ["train", "all"]:
             torch_memory_saver.pause()
         else:
             self._sleep_fsdp_model(self.actor_module_fsdp)
+        # aggressive_empty_cache(force_sync=True)
 
-        aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage(f"After TrainWorker_R{self.rank} sleep", psrl_logger, level=logging.INFO)
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} sleep")
 
     @deprecated(
         "This method is deprecated, it's reserved as an example "
@@ -266,26 +337,31 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         This method restores GPU memory allocation and performs NIXL re-registration
         to handle memory changes after sleep/wake_up cycle.
         """
-        self.wake_up()
-
+        self.wake_up_fsdp_model()
         # Reset nixl agent and reregister to handle physical memory changes
         self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
 
-    def wake_up(self):
+    def wake_up_fsdp_model(self):
         """
         Restore GPU memory allocation for model weights without restoring data.
         The actual data will be transferred via NIXL.
         """
-        log_gpu_memory_usage(f"Before TrainWorker_R{self.rank} wake_up", psrl_logger, level=logging.INFO)
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} wake_up")
 
+        # aggressive_empty_cache(force_sync=True)
         # Restore GPU memory allocation for FSDP model
         if self.psrl_config.tms.range in ["train", "all"]:
             torch_memory_saver.resume()
         else:
             self._wake_up_fsdp_model(self.actor_module_fsdp)
+        # aggressive_empty_cache(force_sync=True)
 
-        aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage(f"After TrainWorker_R{self.rank} wake_up", psrl_logger, level=logging.INFO)
+        for buffer in self.actor_module_fsdp.buffers():
+            buffer.data = buffer.data.to(get_device_id())
+
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} wake_up")
 
     @deprecated(
         "This method is deprecated, it's reserved as an example "
@@ -354,8 +430,9 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def init_model(self, init_mode: str = "full"):
-        """Initialize the Megatron model.
+        """Initialize the FSDP model.
 
         If init_mode is 'empty', only initialize the model without loading weights.
 
@@ -370,11 +447,13 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def build_rollout(self, trust_remote_code: bool = False):
         ActorRolloutRefWorker._build_rollout(self, trust_remote_code=trust_remote_code)
 
     # The log_prob in training side may need to be recomputed
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def compute_log_prob(self, data: DataProto):
         # NOTE(lhy): compared with verl, we replace `old_log_probs` with `recomputed_log_probs` in the output.
         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
@@ -411,6 +490,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
@@ -418,3 +498,18 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
             PSRL_BaseTrainWorker.push_model(self)
         return output
+
+    def _debug_log_train_model_info(self, label: str, max_elements: int = 10):
+        """Debug log train model tensor statistics."""
+        for tensor_type, named_tensors in (
+            ("param", self.actor_module_fsdp.named_parameters()),
+            ("buffer", self.actor_module_fsdp.named_buffers()),
+        ):
+            for name, tensor in named_tensors:
+                log_tensor(
+                    tensor=tensor,
+                    psrl_logger=psrl_logger,
+                    log_prefix=label,
+                    name=f"{tensor_type}={name}",
+                    max_elements=max_elements,
+                )

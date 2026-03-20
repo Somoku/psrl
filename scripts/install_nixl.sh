@@ -1,4 +1,7 @@
 #!/bin/bash
+set -e
+set -o pipefail
+trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 CUDA_PATH=${CUDA_PATH:-"/usr/local/cuda"}
 MAX_JOBS=${MAX_JOBS:-32}
@@ -75,7 +78,7 @@ fi
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-git clone -b 0.8.0 https://github.com/ai-dynamo/nixl.git
+git clone -b 0.10.1 https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
 # Disable obj backend

@@ -24,6 +24,7 @@ conda activate psrl
 bash scripts/install_basic.sh
 bash scripts/install_nixl.sh
 bash scripts/install_megatron.sh
+bash scripts/install_tms.sh
 
 # Install PSRL
 pip install -e .

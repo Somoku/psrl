@@ -1,23 +1,24 @@
 #!/bin/bash
+# Requires SANDBOX_NODE_NUM and SANDBOX_NODE_IPS (env or args: $1=SANDBOX_NODE_IPS, $2=SANDBOX_NODE_NUM).
 
-NODE_NUM=
+[ -n "$1" ] && SANDBOX_NODE_IPS="$1"
+[ -n "$2" ] && SANDBOX_NODE_NUM="$2"
 
-if [ -z "$NODE_IP_LIST" ]; then
-    echo "Error: NODE_IP_LIST is not set"
+if [ -z "$SANDBOX_NODE_IPS" ]; then
+    echo "Error: SANDBOX_NODE_IPS is not set"
     exit 1
 fi
 
-if [ -z "$NODE_NUM" ]; then
-    NODE_NUM=$(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | wc -l)
+if [ -z "$SANDBOX_NODE_NUM" ]; then
+    SANDBOX_NODE_NUM=$(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | wc -l)
 fi
 
-mapfile -t hosts < <(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | head -n $NODE_NUM)
+mapfile -t hosts < <(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | head -n $SANDBOX_NODE_NUM)
 if [ ${#hosts[@]} -eq 0 ]; then
-    echo "Error: NODE_IP_LIST is empty"
+    echo "Error: SANDBOX_NODE_IPS is empty or invalid"
     exit 1
 fi
 
-hosts=("${hosts[@]:0}")
 MANAGER=${hosts[0]}
 WORKERS=("${hosts[@]:1}")
 

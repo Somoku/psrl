@@ -1,4 +1,7 @@
 #!/bin/bash
+set -e
+set -o pipefail
+trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 # Function: Install cuDNN and set CUDNN_PATH if not already installed or version is too low
 install_cudnn() {

@@ -314,6 +314,8 @@ class vLLMWorkerExtension:
             )
             # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
+        self.cuda_synchronize()
+        self.nixl_storage_client.clear_intermediate_cached_data()
         time_end = time.time()
         psrl_logger.info(
             f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). "

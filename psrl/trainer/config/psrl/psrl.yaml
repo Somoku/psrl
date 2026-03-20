@@ -114,7 +114,7 @@ status_collection:
   dump_logging_to_file_level: generation
 
   # Logging interval in milliseconds
-  dump_logging_to_file_interval_in_ms: 2000
+  dump_logging_to_file_interval_in_ms: 500
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
   # Here 10 means sync every 0.01 second
@@ -123,6 +123,15 @@ status_collection:
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
   # Here 10 means sync every 0.01 second
   coordinator_sync_interval_in_ms: 10
+
+# Memory logger config
+memory_logger:
+
+  # Whether to enable memory logger
+  enable: True
+
+  # Logging interval in seconds
+  interval_seconds: 20
 
 # Redundant rollout config
 redundant_rollout:
@@ -209,7 +218,7 @@ sync_and_mig_strategy:
 
   # Method for model synchronization and rollout migration
   # Available options: "status_based" or "greedy"
-  method: status_based
+  method: greedy
 
   # Check interval in millisecond for model synchronization and rollout migration
   check_interval_in_ms: 100
@@ -265,7 +274,7 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 8
+  max_pinned_temp_memory_slots: 16
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
@@ -298,14 +307,11 @@ retry_bound: -1
 # Ratio over retry bound
 retry_ratio: 1.0
 
-# Whether to validate on PSRL rollout workers
-validate_on_psrl: True
-
 # Whether to colocate validate and training workers
 colocate_validate_and_train: True
 
 # Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
-fuse_rollout_with_validate: False
+fuse_rollout_with_validate: True
 
 # Whether to use torch_memory_saver (TMS) for GPU management
 tms:
@@ -314,7 +320,7 @@ tms:
   #  - "null": disable TMS
   #  - "train": enable TMS for training workers only
   #  - "all": enable TMS for both rollout and training workers
-  range: train
+  range: all
 
   # Whether to enable TMS on CUDA graphs
   # When enabled, CUDA graphs will be released by TMS to save GPU memory
@@ -324,4 +330,4 @@ tms:
   # Whether to enable TMS on NIXL temp buffers
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
-  enable_nixl: True
+  enable_nixl: False

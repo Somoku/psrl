@@ -2,11 +2,12 @@
 # Then run the initiator script
 # export UCX_LOG_LEVEL=debug
 
-PSRL_WORKSPACE=${PSRL_WORKSPACE}/psrl
+TARGET_IP=28.49.196.77
+PSRL_WORKSPACE=${PSRL_WORKSPACE}/psrl_agent
 CONDA_ENV_FILE=${PSRL_WORKSPACE}/../activate
-CONDA_ENV_NAME=psrl-lhy-new
+CONDA_ENV_NAME=psrl-lhy-agent
 GPU_ID=2
-IP=${RECV_IP}
+IP=${TARGET_IP}
 
 source ${CONDA_ENV_FILE} 
 conda activate ${CONDA_ENV_NAME} 

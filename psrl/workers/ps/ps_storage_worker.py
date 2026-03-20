@@ -1,9 +1,12 @@
+import gc
+import json
 import os
 from dataclasses import dataclass
 
 import torch
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
+from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 from verl.utils.fs import copy_to_local
 
@@ -110,7 +113,8 @@ class PSStorageWorker:
                 ],
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface,
-                # client_group_id=self.get_replica_id()
+                # client_group_id=self.get_replica_id(),
+                logging_path=self.psrl_config.logging_path,
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
@@ -208,14 +212,15 @@ class PSStorageWorker:
         """Get the name of the NIXL gen storage client."""
         return self.client_for_pull_name
 
-    def init_model(self, init_mode: str = "meta"):
+    def init_model(self):
         """
-        Initialize the model.
+        Initialize the model skeleton on the meta device.
 
-        Args:
-            init_mode (str, optional): The initialization mode. Defaults to "meta".
-                When "meta", initialize the model on meta device.
-                When "full", initialize the model with full weights.
+        Only the parameter shapes / dtypes are materialised here; no actual
+        weight data is loaded.  Call ``load_weights_to_registered_tensors()``
+        *after* the full NIXL protocol (``nixl_protocol()``) has completed so
+        that all meta-device tensors have been replaced by real allocated
+        buffers, and only then copy the checkpoint weights into them.
         """
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         model_config = AutoConfig.from_pretrained(
@@ -227,44 +232,139 @@ class PSStorageWorker:
         else:
             model_class = AutoModelForCausalLM
 
-        if self.psrl_config.ps_mode == "nixl_cpu":
-            if init_mode == "meta":
-                # Initialize the model on meta device
-                with init_empty_weights():
-                    self.train_meta_hf_model = model_class.from_config(
-                        model_config,
-                        torch_dtype=self.storage_plan.train_model_dtype,
-                        trust_remote_code=self.model_config.get("trust_remote_code", False),
-                    )
-                    if self.storage_plan.train_gen_model_share():
-                        self.gen_meta_hf_model = self.train_meta_hf_model
-                    else:
-                        self.gen_meta_hf_model = model_class.from_config(
-                            model_config,
-                            torch_dtype=self.storage_plan.gen_model_dtype,
-                            trust_remote_code=self.model_config.get("trust_remote_code", False),
-                        )
-            elif init_mode == "full":
-                # Initialize the model with full weights
-                self.train_meta_hf_model = model_class.from_pretrained(
-                    local_path,
+        if self.psrl_config.ps_mode in ("nixl_cpu", "nixl_gpu"):
+            with init_empty_weights():
+                self.train_meta_hf_model = model_class.from_config(
+                    model_config,
                     torch_dtype=self.storage_plan.train_model_dtype,
                     trust_remote_code=self.model_config.get("trust_remote_code", False),
                 )
                 if self.storage_plan.train_gen_model_share():
                     self.gen_meta_hf_model = self.train_meta_hf_model
                 else:
-                    self.gen_meta_hf_model = model_class.from_pretrained(
-                        local_path,
+                    self.gen_meta_hf_model = model_class.from_config(
+                        model_config,
                         torch_dtype=self.storage_plan.gen_model_dtype,
                         trust_remote_code=self.model_config.get("trust_remote_code", False),
                     )
-            else:
-                raise ValueError(f"Invalid init_mode: {init_mode}")
-        elif self.psrl_config.ps_mode == "nixl_gpu":
-            raise NotImplementedError("NIXL GPU mode is not implemented yet.")
         else:
             raise ValueError(f"Invalid PS mode: {self.psrl_config.ps_mode}")
+        psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
+
+    # ------------------------------------------------------------------
+    # Post-protocol weight loading
+    # ------------------------------------------------------------------
+
+    def load_weights_to_registered_tensors(self):
+        """
+        Stream HuggingFace checkpoint weights into the already-registered NIXL
+        buffers (``_original_tensor_mapping`` entries inside each sub-client).
+
+        Must be called **after** ``nixl_protocol()`` has completed so that all
+        meta-device tensors have been replaced by real allocated slices.
+
+        Memory strategy
+        ---------------
+        * Checkpoint shards are opened lazily with ``safetensors.safe_open``
+          (one file at a time, one tensor at a time).
+        * Each source tensor is immediately deleted after being copied into the
+          registered destination(s), so peak extra RAM equals roughly the size
+          of a single parameter tensor.
+        * When train and gen clients share the same underlying buffers
+          (``train_gen_model_share() == True``) the copy is done only once.
+        * The HF meta-model references are released at the end to free any
+          remaining structure overhead.
+        """
+        assert self.nixl_multi_storage_clients is not None, (
+            "NIXL clients must be initialized (call init_nixl_client()) before loading weights."
+        )
+
+        local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
+        shard_files = self._discover_safetensors_shards(local_path)
+        psrl_logger.info(f"load_weights_to_registered_tensors: {len(shard_files)} shard file(s) under {local_path}")
+
+        push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        pull_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_pull_name)
+        shared = self.storage_plan.train_gen_model_share()
+
+        # Collect all keys expected by every sub-client so we can warn about missing ones.
+        expected_keys: set[str] = set(push_client.local_client_info.tensor_infos.keys())
+        if not shared:
+            expected_keys |= set(pull_client.local_client_info.tensor_infos.keys())
+
+        loaded_keys: set[str] = set()
+
+        for shard_file in shard_files:
+            psrl_logger.info(f"load_weights_to_registered_tensors: opening {shard_file}")
+            with safe_open(shard_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key not in expected_keys:
+                        continue  # this PS worker doesn't hold this key
+                    src_tensor = f.get_tensor(key)  # loaded to CPU
+                    # Delegate slicing + copy to each client
+                    push_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                    if not shared:
+                        pull_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                    del src_tensor
+                    loaded_keys.add(key)
+
+        missing = expected_keys - loaded_keys
+        if missing:
+            raise RuntimeError(
+                f"load_weights_to_registered_tensors: {len(missing)} key(s) not found in checkpoint: "
+                f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
+            )
+        psrl_logger.info(f"load_weights_to_registered_tensors: loaded {len(loaded_keys)}/{len(expected_keys)} key(s).")
+
+        gc.collect()
+
+    @staticmethod
+    def _discover_safetensors_shards(local_path: str) -> list[str]:
+        """
+        Return an ordered list of absolute safetensors shard file paths.
+
+        Looks for (in priority order):
+        1. ``model.safetensors.index.json``  — multi-shard checkpoint
+        2. ``model.safetensors``             — single-file checkpoint
+
+        Raises a helpful ``FileNotFoundError`` / ``RuntimeError`` for unknown
+        or unsupported (pytorch_model.bin) formats.
+        """
+        index_json = os.path.join(local_path, "model.safetensors.index.json")
+        single_sf = os.path.join(local_path, "model.safetensors")
+
+        if os.path.isfile(index_json):
+            with open(index_json) as fh:
+                index = json.load(fh)
+            # weight_map: param_name -> relative shard filename
+            weight_map: dict[str, str] = index.get("weight_map", index)
+            # Deduplicate while preserving encounter order
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for rel_path in weight_map.values():
+                if rel_path not in seen:
+                    seen.add(rel_path)
+                    ordered.append(os.path.join(local_path, rel_path))
+            return ordered
+
+        if os.path.isfile(single_sf):
+            return [single_sf]
+
+        # Legacy pytorch_model.bin — not supported
+        pt_bin = os.path.join(local_path, "pytorch_model.bin")
+        pt_idx = os.path.join(local_path, "pytorch_model.bin.index.json")
+        if os.path.isfile(pt_bin) or os.path.isfile(pt_idx):
+            raise RuntimeError(
+                f"Checkpoint at '{local_path}' uses pytorch_model.bin format, which is not supported. "
+                "Convert it to safetensors first:\n"
+                "  python -c \"from transformers import AutoModel; m = AutoModel.from_pretrained('<path>'); "
+                "m.save_pretrained('<path>', safe_serialization=True)\""
+            )
+
+        raise FileNotFoundError(
+            f"No safetensors checkpoint found under '{local_path}'. "
+            "Expected 'model.safetensors' or 'model.safetensors.index.json'."
+        )
 
     def _build_transfer_key_cache(self, src_original_state_dict):
         self._transfer_key_cache = {"src_dict_id": id(src_original_state_dict)}
@@ -298,3 +398,13 @@ class PSStorageWorker:
 
     def shutdown(self):
         self.nixl_multi_storage_clients.shutdown()
+
+    def debug_log_info(self, label: str = ""):
+        """
+        Log info for both push (train) and pull (gen) clients on this PS worker.
+        Called via Ray RPC from the train worker for precision debugging.
+        """
+        push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        pull_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_pull_name)
+        push_client.log_shard_info(label=label)
+        pull_client.log_shard_info(label=label)

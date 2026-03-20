@@ -10,6 +10,7 @@ from verl import DataProto
 
 from psrl.environments.base import ConversationType, Environment, EnvStepOutput
 from psrl.tools.base import ToolGroup, initialize_tools_from_config
+from psrl.utils.logger import FileOnlyHandler
 
 ToolAction = list[dict] | dict
 
@@ -53,6 +54,12 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         tool_config_path = config.gen_actor_rollout_ref.rollout.multi_turn.tool_config_path
         tools = initialize_tools_from_config(tool_config_path) if tool_config_path else []
         cls.tools = ToolGroup(tools=tools)
+
+        # Build a class-level logger for tool calls.
+        log_prefix = "ToolEnvironment"
+        psrl_logger.propagate = False
+        psrl_logger.addHandler(FileOnlyHandler(config.psrl.logging_path, log_prefix))
+        psrl_logger.info("ToolEnvironment logger initialized for tool calls.")
 
     def __init__(
         self,
@@ -224,7 +231,12 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                 tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
 
         tool_message = {"role": "tool", "content": tool_response_text, "metadata": tool_metadata}
-        psrl_logger.debug(f"Tool {tool_name} called with args {tool_args}, response: {tool_response_text}")
+
+        # Log each tool invocation with its input arguments and (possibly truncated) output.
+        psrl_logger.info(
+            f"Tool call - name: {tool_name}, args: {tool_args}, "
+            f"response: {tool_response_text}, reward: {tool_reward}, metadata: {tool_metadata}"
+        )
         return tool_message, tool_reward
 
     async def close(self) -> None:

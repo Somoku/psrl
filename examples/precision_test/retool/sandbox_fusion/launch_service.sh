@@ -1,25 +1,27 @@
 #!/bin/bash
 # set -v
+# Requires SANDBOX_NODE_NUM and SANDBOX_NODE_IPS (env or args: $1=SANDBOX_NODE_IPS, $2=SANDBOX_NODE_NUM).
 
-NODE_NUM=
+[ -n "$1" ] && SANDBOX_NODE_IPS="$1"
+[ -n "$2" ] && SANDBOX_NODE_NUM="$2"
+
 IMAGE_NAME=code_sandbox:server
 
-if [ -z "$NODE_IP_LIST" ]; then
-    echo "Error: NODE_IP_LIST is not set"
+if [ -z "$SANDBOX_NODE_IPS" ]; then
+    echo "Error: SANDBOX_NODE_IPS is not set"
     exit 1
 fi
 
-if [ -z "$NODE_NUM" ]; then
-    NODE_NUM=$(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | wc -l)
+if [ -z "$SANDBOX_NODE_NUM" ]; then
+    SANDBOX_NODE_NUM=$(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | wc -l)
 fi
 
-mapfile -t hosts < <(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | head -n $NODE_NUM)
+mapfile -t hosts < <(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | head -n $SANDBOX_NODE_NUM)
 if [ ${#hosts[@]} -eq 0 ]; then
-    echo "Error: NODE_IP_LIST is empty"
+    echo "Error: SANDBOX_NODE_IPS is empty or invalid"
     exit 1
 fi
 
-hosts=("${hosts[@]:0}")
 MANAGER=${hosts[0]}
 WORKERS=("${hosts[@]:1}")
 
@@ -75,12 +77,14 @@ pssh -H $MANAGER -i "docker swarm init --advertise-addr $MANAGER"
 
 # Get join token
 TOKEN=$(ssh $MANAGER "docker swarm join-token worker -q")
+LEAVE_CMD="docker swarm leave"
 JOIN_CMD="docker swarm join --token $TOKEN $MANAGER:2377"
 
 echo "2. Adding workers to swarm..."
 echo $JOIN_CMD
 for worker in "${WORKERS[@]}"; do
     echo "Adding $worker..."
+    pssh -H $worker -i "$LEAVE_CMD"
     pssh -H $worker -i "$JOIN_CMD"
 done
 
@@ -98,7 +102,7 @@ echo "4. Deploying sandbox service..."
 pssh -H $MANAGER -i "docker service create \
     --name sandbox-service \
     --network sandbox-overlay \
-    --replicas $NODE_NUM \
+    --replicas $SANDBOX_NODE_NUM \
     --publish published=8080,target=8080,mode=host \
     --cap-add ALL \
     --env ALLOWED_HOSTS=* \

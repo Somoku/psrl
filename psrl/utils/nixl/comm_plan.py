@@ -23,7 +23,11 @@ class NIXLCommPlan:
 
     # PULL_SIDE <- PS read plan
     # {pull_client: {key: {ps_client: [shard_indices]}}}
-    pull_from_ps_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]
+    rollout_pull_from_ps_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]
+
+    # PUSH_SIDE <- PS read plan
+    # {pull_client: {key: {ps_client: [shard_indices]}}
+    train_pull_from_ps_plan: dict[str, dict[str, dict[str, list[tuple[int, ...]]]]]
 
     def serialize(self):
         """Serialize communication plan"""
@@ -38,9 +42,13 @@ class NIXLCommPlan:
         """Get write plan for specific PUSH_SIDE client and key"""
         return self.push_to_ps_plan.get(push_client, {}).get(key, {})
 
-    def get_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
+    def get_rollout_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PULL_SIDE client and key"""
-        return self.pull_from_ps_plan.get(pull_client, {}).get(key, {})
+        return self.rollout_pull_from_ps_plan.get(pull_client, {}).get(key, {})
+
+    def get_train_pull_plan(self, pull_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
+        """Get read plan for specific PUSH_SIDE client and key"""
+        return self.train_pull_from_ps_plan.get(pull_client, {}).get(key, {})
 
     def get_ps_write_plan(self, ps_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get write plan for specific PS client and key (receiving from PUSH_SIDE)"""
@@ -50,10 +58,18 @@ class NIXLCommPlan:
                 result[push_client] = key_plans[key][ps_client]
         return result
 
-    def get_ps_read_plan(self, ps_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
+    def get_rollout_ps_read_plan(self, ps_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
         """Get read plan for specific PS client and key (sending to PULL_SIDE)"""
         result = {}
-        for pull_client, key_plans in self.pull_from_ps_plan.items():
+        for pull_client, key_plans in self.rollout_pull_from_ps_plan.items():
+            if key in key_plans and ps_client in key_plans[key]:
+                result[pull_client] = key_plans[key][ps_client]
+        return result
+
+    def get_train_ps_read_plan(self, ps_client: str, key: str) -> dict[str, list[tuple[int, ...]]]:
+        """Get read plan for specific PS client and key (sending to PUSH_SIDE)"""
+        result = {}
+        for pull_client, key_plans in self.train_pull_from_ps_plan.items():
             if key in key_plans and ps_client in key_plans[key]:
                 result[pull_client] = key_plans[key][ps_client]
         return result
@@ -85,47 +101,67 @@ class CommunicationPlanner:
         # Classify clients
         push_client_groups = {}
         ps_for_push_client_groups = {}
-        pull_client_groups = {}
-        ps_for_pull_client_groups = {}
+        rollout_pull_client_groups = {}
+        ps_for_rollout_pull_client_groups = {}
+        train_pull_client_groups = {}
+        ps_for_train_pull_client_groups = {}
 
         for client_name, client_info in clients.items():
             if client_info.type == NIXLClientType.PUSH_SIDE:
                 if client_info.client_group_id not in push_client_groups:
                     push_client_groups[client_info.client_group_id] = []
                 push_client_groups[client_info.client_group_id].append(client_name)
+                if client_info.client_group_id not in train_pull_client_groups:
+                    train_pull_client_groups[client_info.client_group_id] = []
+                train_pull_client_groups[client_info.client_group_id].append(client_name)
             elif client_info.type == NIXLClientType.PS_FOR_PUSH:
                 if client_info.client_group_id not in ps_for_push_client_groups:
                     ps_for_push_client_groups[client_info.client_group_id] = []
                 ps_for_push_client_groups[client_info.client_group_id].append(client_name)
+                if client_info.client_group_id not in ps_for_train_pull_client_groups:
+                    ps_for_train_pull_client_groups[client_info.client_group_id] = []
+                ps_for_train_pull_client_groups[client_info.client_group_id].append(client_name)
             elif client_info.type == NIXLClientType.PULL_SIDE:
-                if client_info.client_group_id not in pull_client_groups:
-                    pull_client_groups[client_info.client_group_id] = []
-                pull_client_groups[client_info.client_group_id].append(client_name)
+                if client_info.client_group_id not in rollout_pull_client_groups:
+                    rollout_pull_client_groups[client_info.client_group_id] = []
+                rollout_pull_client_groups[client_info.client_group_id].append(client_name)
             elif client_info.type == NIXLClientType.PS_FOR_PULL:
-                if client_info.client_group_id not in ps_for_pull_client_groups:
-                    ps_for_pull_client_groups[client_info.client_group_id] = []
-                ps_for_pull_client_groups[client_info.client_group_id].append(client_name)
+                if client_info.client_group_id not in ps_for_rollout_pull_client_groups:
+                    ps_for_rollout_pull_client_groups[client_info.client_group_id] = []
+                ps_for_rollout_pull_client_groups[client_info.client_group_id].append(client_name)
             else:
                 raise ValueError(f"Unknown client type: {client_info.type}")
 
         # Initialize communication plans
         push_to_ps_plan = {client: {} for client_group in push_client_groups.values() for client in client_group}
-        pull_from_ps_plan = {client: {} for client_group in pull_client_groups.values() for client in client_group}
+        rollout_pull_from_ps_plan = {
+            client: {} for client_group in rollout_pull_client_groups.values() for client in client_group
+        }
+        train_pull_from_ps_plan = {
+            client: {} for client_group in train_pull_client_groups.values() for client in client_group
+        }
 
         # Generate PUSH_SIDE -> PS_FOR_PUSH write plan
         if push_client_groups and ps_for_push_client_groups:
             self._make_push_to_ps_plan(clients, push_client_groups, ps_for_push_client_groups, push_to_ps_plan)
 
-        # Generate PULL_SIDE <- PS_FOR_PULL read plan
-        if pull_client_groups and ps_for_pull_client_groups:
+        # Generate PUSH_SIDE <- PS_FOR_PUSH read plan
+        if train_pull_client_groups and ps_for_train_pull_client_groups:
             self._make_pull_from_ps_plan(
-                clients,
-                pull_client_groups,
-                ps_for_pull_client_groups,
-                pull_from_ps_plan,
+                clients, train_pull_client_groups, ps_for_train_pull_client_groups, train_pull_from_ps_plan
             )
 
-        return NIXLCommPlan(push_to_ps_plan=push_to_ps_plan, pull_from_ps_plan=pull_from_ps_plan)
+        # Generate PULL_SIDE <- PS_FOR_PULL read plan
+        if rollout_pull_client_groups and ps_for_rollout_pull_client_groups:
+            self._make_pull_from_ps_plan(
+                clients, rollout_pull_client_groups, ps_for_rollout_pull_client_groups, rollout_pull_from_ps_plan
+            )
+
+        return NIXLCommPlan(
+            push_to_ps_plan=push_to_ps_plan,
+            rollout_pull_from_ps_plan=rollout_pull_from_ps_plan,
+            train_pull_from_ps_plan=train_pull_from_ps_plan,
+        )
 
     def _make_push_to_ps_plan(
         self,

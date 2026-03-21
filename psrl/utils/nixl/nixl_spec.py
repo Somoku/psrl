@@ -413,14 +413,8 @@ class NIXLShardMetaInfo:
 
     def can_xfer_to(self, other: "NIXLShardMetaInfo") -> bool:
         """Check if the shard can be transferred to another shard"""
-        # xfer between non-contiguous shards is not supported
-        return (
-            self.is_contiguous
-            and other.is_contiguous
-            and self.dtype == other.dtype
-            and self.shape == other.shape
-            and self.stride == other.stride
-        )
+        # xfer from non-contiguous shards is not supported
+        return self.is_contiguous and self.dtype == other.dtype and self.shape == other.shape
 
 
 @dataclass
@@ -428,15 +422,18 @@ class NIXLTensorInfo:
     """Tensor descriptor information with sharding support"""
 
     desc_bytes_list: list[bytes]  # Descriptors for each shard (None for non-contiguous shards)
+    temp_desc_bytes_list: list[bytes]  # Descriptors for temp tensor of non-contiguous shards
     sharding: NIXLSharding  # Sharding information
     shard_meta_infos: list[NIXLShardMetaInfo]  # Metadata for each shard
 
     def __repr__(self):
         # Only show the type and length of desc_bytes_list
         desc_bytes_info = f"<List[bytes] of len {len(self.desc_bytes_list)}>"
+        temp_desc_bytes_info = f"<List[bytes] of len {len(self.temp_desc_bytes_list)}>"
         return (
             f"{self.__class__.__name__}("
             f"desc_bytes_list={desc_bytes_info}, "
+            f"temp_desc_bytes_list={temp_desc_bytes_info}, "
             f"sharding={repr(self.sharding)}, "
             f"shard_meta_infos={repr(self.shard_meta_infos)})"
         )
@@ -447,9 +444,17 @@ class NIXLTensorInfo:
             return None
         return agent.deserialize_descs(self.desc_bytes_list[local_pos])
 
+    def get_temp_desc(self, agent, local_pos: int):
+        if local_pos >= len(self.temp_desc_bytes_list) or self.temp_desc_bytes_list[local_pos] is None:
+            return None
+        return agent.deserialize_descs(self.temp_desc_bytes_list[local_pos])
+
     def get_all_descs(self, agent):
         """Get all shard descriptors"""
         return [agent.deserialize_descs(b) if b is not None else None for b in self.desc_bytes_list]
+
+    def get_all_temp_descs(self, agent):
+        return [agent.deserialize_descs(b) if b is not None else None for b in self.temp_desc_bytes_list]
 
     def serialize(self):
         """Serialize the tensor descriptor info"""
@@ -497,6 +502,7 @@ class NIXLClientInfo:
     tensor_infos: dict[str, NIXLTensorInfo]  # key -> TensorDescInfo
     meta: bytes  # agent metadata
     client_group_id: int = -1  # -1 is the default client group
+    is_registered: bool = False
 
     def get_tensor_info(self, key):
         """Get tensor descriptor info for specific key"""

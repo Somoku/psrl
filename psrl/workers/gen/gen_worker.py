@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import ray
+import requests
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig, OmegaConf
@@ -23,8 +24,10 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils import hf_tokenizer, omega_conf_to_dataclass
 from verl.utils.device import get_torch_device
 from verl.utils.fs import copy_to_local
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_generation_config, update_model_config
 
+from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -37,8 +40,10 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl import NIXLInterface
 from psrl.utils.ray import shared_pull_model_context_async
+from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import PSRL_vLLMRollout
+from psrl.workers.gen.engine_http_server import EngineHttpServer
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -58,6 +63,7 @@ class PSRL_GenWorker(Worker):
     @staticmethod
     def configure_worker(
         config,
+        psrl_config,
         num_gpus: int | float,
         dp_idx: int,
         bundle_indices: list[int],
@@ -106,8 +112,34 @@ class PSRL_GenWorker(Worker):
             resources["num_gpus"] = 0
             resources["num_cpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+            env_vars["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
+            env_vars["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
+            env_vars["WORLD_SIZE"] = str(len(bundle_indices))
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
+        # NOTE(linsh): Expandable segments are not compatible with
+        # memory pool of sleep mode in vLLM.
+        # Please track https://github.com/pytorch/pytorch/issues/147851 for more infos.
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
+
+        # use tms for memory management of model weights and kv cache
+        if psrl_config.tms.range == "all" or psrl_config.tms.enable_nixl:
+            import torch_memory_saver  # noqa: F401
+
+            dynlib_path = os.path.join(
+                os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+                "torch_memory_saver_hook_mode_preload.abi3.so",
+            )
+            assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+            env_vars["LD_PRELOAD"] = dynlib_path
+            env_vars["TMS_INIT_ENABLE"] = "0"
+            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "0"
+
+        if psrl_config.tms.enable_cuda_graph:
+            env_vars["PSRL_VLLM_PATCHES"] = "TMS:GRAPH"
+        elif psrl_config.tms.range == "all":
+            env_vars["PSRL_VLLM_PATCHES"] = "TMS"
+
         if config.rollout.disable_attn:
             warnings.warn(
                 "CAUTION: you are disabling the attention, "
@@ -139,6 +171,7 @@ class PSRL_GenWorker(Worker):
         """
         super().__init__()
         self.config = config
+        self.role = role
         self.dtype = self.config.rollout.dtype
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
@@ -209,9 +242,21 @@ class PSRL_GenWorker(Worker):
             psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
-    def set_rollout_coordinator(self, rollout_coordinator):
-        """Set the rollout coordinator for this GenWorker."""
-        self.coordinator_handle = rollout_coordinator
+        # [Optional] expose this rollout engine via HTTP (OpenAI-compatible) and
+        # register it to RolloutGateway for catch-all proxying.
+        self._engine_http_server: EngineHttpServer | None = None
+        self._engine_http_bind: dict[str, Any] | None = None
+
+        # Populated by trainer (or other coordinator) after gateway starts.
+        self._gateway_base_url: str | None = None
+
+    async def _collective_rpc(self, method_name: str, args: tuple = ()):
+        """Call a method via collective RPC."""
+        assert self.rollout, "Rollout must be initialized before calling _collective_rpc."
+        return await self.rollout.inference_engine.collective_rpc(
+            method_name,
+            args=args,
+        )
 
     def _build_distributed(self):
         """Build the distributed process group for the rollout instance."""
@@ -232,10 +277,7 @@ class PSRL_GenWorker(Worker):
         """
         await self._is_init_model.wait()
         assert self.rollout, "Rollout must be initialized before calling estimate_max_model_len."
-        max_model_len = await self.rollout.inference_engine.collective_rpc(
-            "estimate_max_model_len",
-            args=(),
-        )
+        max_model_len = await self._collective_rpc("estimate_max_model_len", args=())
         return max_model_len
 
     async def init_nixl_client(self):
@@ -246,24 +288,31 @@ class PSRL_GenWorker(Worker):
         await self._is_init_model.wait()
         assert self.rollout, "Rollout must be initialized before calling init_nixl_client."
         psrl_logger.info("NIXL client initialization begin via rpc call.")
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            await self.rollout.inference_engine.collective_rpc(
-                    "init_nixl_client",
-                    args=(
-                        self.psrl_config.nixl,
-                        self.nixl_interface,
-                        self.get_instance_id(),
-                        self.psrl_config.logging_path,
-                    ),
-                )
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        await self._collective_rpc(
+            "init_nixl_client",
+            args=(
+                self.psrl_config.nixl,
+                self.nixl_interface,
+                self.get_instance_id(),
+                self.psrl_config.logging_path,
+            ),
+        )
         self._is_init_nixl_client.set()
         psrl_logger.info("NIXL client initialized via rpc call.")
 
-    async def nixl_protocol(self):
+    async def nixl_convert_params(self):
+        """
+        Convert the model parameters to unified state dict and sharding dict via NIXL.
+        This is implemented via rpc call in the vLLM extension.
+        """
+        await self._is_init_model.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_convert_params."
+
+        psrl_logger.info("NIXL convert params begin via rpc call.")
+        await self._collective_rpc("nixl_convert_params", args=(self.config,))
+        psrl_logger.info("NIXL convert params done via rpc call.")
+
+    async def nixl_protocol(self, mode: str = "full"):
         """
         Register the state dict and sharding dict to the NIXL client.
         This is implemented via rpc call in the vLLM extension.
@@ -272,11 +321,72 @@ class PSRL_GenWorker(Worker):
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_protocol."
         psrl_logger.info("NIXL protocol begin via rpc call.")
-        await self.rollout.inference_engine.collective_rpc(
-            "nixl_protocol",
-            args=(self.config,),
-        )
+        await self._collective_rpc("nixl_protocol", args=(self.config, mode))
         psrl_logger.info("NIXL protocol done via rpc call.")
+
+    async def nixl_wake_up(self):
+        """Wake up model weights and register for NIXL."""
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_wake_up."
+
+        # init empty model
+        await self.wake_up()
+        # register local tensors
+        await self._collective_rpc("nixl_register_after_wake_up", args=())
+
+    async def nixl_sleep(self):
+        """Deregister local tensors and put model weights to sleep state (free up GPU memory)."""
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_sleep."
+
+        # put model weights to sleep
+        await self.sleep()
+        # deregister local tensors
+        await self._collective_rpc("nixl_deregister", args=())
+
+    async def sleep(self):
+        """Put model weights to sleep state (free up GPU memory)."""
+        await self.rollout.inference_engine.sleep(level=2)
+        if self.psrl_config.tms.range in ["rollout", "all"]:
+            # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
+            # Here we do an aggressive empty cache for TMS.
+            aggressive_empty_cache(force_sync=True)
+
+    async def wake_up(self):
+        """Wake up model weights."""
+        wake_up_tags = ["weights", "kv_cache"]
+        if self.psrl_config.tms.enable_cuda_graph:
+            wake_up_tags.append("graph")
+        await self.rollout.inference_engine.wake_up(tags=wake_up_tags)
+
+    async def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict):
+        """
+        Update local NIXL info to the PS workers on the same node with this train worker.
+        """
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_update_local_info_to_ps."
+        await self._collective_rpc("nixl_update_local_info_to_ps", args=(ps_worker_node_id_to_idxs,))
+
+    async def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
+        """
+        Send local NIXL info to the destination NIXL agents.
+
+        Args:
+            dst_agent_names (str | list[str]): Destination NIXL agent names
+        """
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_send_local_info_to."
+        await self._collective_rpc("nixl_send_local_info_to", args=(dst_agent_names,))
+
+    async def nixl_wait_for_update_infos(self, info_num: int):
+        """Wait for update infos from the storage client.
+
+        Args:
+            info_num (int): Number of infos to wait for
+        """
+        await self._is_init_nixl_client.wait()
+        assert self.rollout, "Rollout must be initialized before calling nixl_wait_for_update_infos."
+        await self._collective_rpc("nixl_wait_for_update_infos", args=(info_num,))
 
     def get_node_id(self) -> str:
         """
@@ -360,14 +470,23 @@ class PSRL_GenWorker(Worker):
             )
             return obj_list[0]
 
-    def _build_rollout(self, trust_remote_code=False):
+    async def _build_rollout(self, init_mode: str = "full", trust_remote_code=False):
         """
         Build the rollout engine and sharding manager for the PSRL GenWorker.
+
+        Args:
+            init_mode (str): The initialization mode for the model, either 'full' or 'empty'.
+            trust_remote_code (bool): Whether to trust remote code when loading the model.
+
         NOTE: This method only supports building for one rollout instance at a time.
         """
         rollout_name = self.config.rollout.name
         assert rollout_name == "vllm", "Only support vLLM rollout for now"
+        assert init_mode in ["full", "empty"], "init_mode must be either 'full' or 'empty'"
+
         try:
+            # NOTE(linsh): For validation (fused), we will use config in `train_actor_rollout_ref.rollout`.
+            # For rollout, we will use config in `gen_actor_rollout_ref.rollout`.
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
             model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
         except Exception as e:
@@ -418,15 +537,98 @@ class PSRL_GenWorker(Worker):
             status_queue=self.gen_interface.status_queue,
             instance_id=self.get_instance_id(),
             nixl_interface=self.nixl_interface,
+            is_validate=self.role == "validate",
+            init_mode=init_mode,
         )
+
+        # Don't keep the dummy data in memory
+        await rollout.inference_engine.reset_mm_cache()
 
         return rollout
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def init_model(self):
+    async def init_model(self, init_mode: str = "full"):
+        """Initialize the model for the rollout engine.
+
+        If init_mode is 'full', load the full model weights.
+        If init_mode is 'empty', load dummy weights for faster initialization.
+
+        Args:
+            init_mode (str): The initialization mode, either 'full' or 'empty'.
+        """
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
-            self.rollout = self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            self.rollout = await self._build_rollout(
+                init_mode, trust_remote_code=self.config.model.get("trust_remote_code", False)
+            )
         self._is_init_model.set()
+
+        # Representative rank can start HTTP server after model built.
+        # For other ranks, the server is not needed.
+        if self.psrl_config.server_rollout.enable and self.is_instance_representative_rank:
+            await self._maybe_start_engine_http_server()
+
+    async def init_and_register_model(self, init_mode: str = "full"):
+        """Initialize and register the model for the rollout engine.
+
+        If init_mode is 'full', load the full model weights.
+        If init_mode is 'empty', load dummy weights for faster initialization.
+
+        Args:
+            init_mode (str): The initialization mode, either 'full' or 'empty'.
+        """
+        await self.init_model(init_mode)
+        await self.register_rollout_instance()
+
+    async def _maybe_start_engine_http_server(self) -> None:
+        """Start in-process HTTP server and register it to gateway."""
+
+        if self._engine_http_server is not None:
+            return
+
+        # If gateway isn't configured, do nothing.
+        if not self._gateway_base_url:
+            psrl_logger.warning(
+                "Rollout gateway base URL not set; skipping engine HTTP server startup and registration."
+            )
+            return
+
+        await self._is_init_model.wait()
+        # Only support vLLM async rollout engine currently.
+        engine = self.rollout.inference_engine
+
+        # Reuse the rollout-cached OpenAI server args/config.
+        args = self.rollout.server_args
+        if args is None:
+            raise RuntimeError("OpenAI server args not initialized on rollout")
+
+        host = ray.util.get_node_ip_address().strip("[]")
+        port = int(find_available_port(20000 + 17 * int(self.get_instance_id())))
+
+        self._engine_http_server = EngineHttpServer(host, port, args, engine)
+        bind = await self._engine_http_server.start()
+        self._engine_http_bind = {"host": bind.host, "port": bind.port, "base_url": bind.base_url}
+
+        # Register to gateway.
+        response = requests.post(
+            f"{self._gateway_base_url}/add_worker",
+            json={
+                "instance_id": int(self.get_instance_id()),
+                "worker_url": bind.base_url,
+            },
+        )
+        response.raise_for_status()
+
+        psrl_logger.info(
+            "Registered rollout engine HTTP endpoint instance_id=%s worker_url=%s to gateway=%s",
+            int(self.get_instance_id()),
+            bind.base_url,
+            self._gateway_base_url,
+        )
+
+    def set_rollout_gateway_base_url(self, base_url: str | None):
+        """Called by trainer to enable worker self-registration to the gateway."""
+
+        self._gateway_base_url = base_url.rstrip("/") if base_url else None
 
     def get_active_task_num(self) -> int:
         """
@@ -497,8 +699,7 @@ class PSRL_GenWorker(Worker):
                     args=(params_to_load,),
                 )
                 if loaded_params is None:
-                    psrl_logger.error(f"Worker failed to update weights. Result: {loaded_params}")
-                    raise
+                    raise RuntimeError(f"Worker failed to update weights. Result: {loaded_params}")
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
@@ -673,7 +874,9 @@ class PSRL_GenWorker(Worker):
 
         return task_done_callback
 
-    async def _generate_async_task(self, request: DataProto, needed_model_version: int):
+    async def _generate_async_task(
+        self, request: DataProto, sampling_params: dict[str, Any], needed_model_version: int
+    ):
         """
         An async task to generate sequences for a single request.
         This method handles the generation for a single request, managing model versioning
@@ -681,6 +884,7 @@ class PSRL_GenWorker(Worker):
 
         Args:
             request (DataProto): The generation request.
+            sampling_params (dict): The sampling parameters for generation.
             needed_model_version (int): The model version required for this request.
 
         Returns:
@@ -693,6 +897,7 @@ class PSRL_GenWorker(Worker):
         )
 
         # Update the request status to ROLLOUT_RUNNING
+        is_validate = request.meta_info.get("validate", False)
         request_ids = request.non_tensor_batch.get("uid", None)
         rollout_instance_id = self.get_instance_id()
 
@@ -709,7 +914,7 @@ class PSRL_GenWorker(Worker):
                 )
                 # Update version tag in staleness inventory
                 await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(
-                    request_ids[0], model_version
+                    request_ids[0], model_version, is_validate
                 )
             request.non_tensor_batch["version_tag"] = np.array([model_version], dtype=int)
 
@@ -719,6 +924,7 @@ class PSRL_GenWorker(Worker):
             PSRL_RequestStatus.ROLLOUT_RUNNING,
             rollout_instance_id=rollout_instance_id,
             model_version=model_version,
+            is_validate=is_validate,
         )
         if update_status_success[0]:
             # Prepare the request for generation
@@ -744,7 +950,7 @@ class PSRL_GenWorker(Worker):
                 level=logging.DEBUG,
                 event_type=EventType.GEN,
             ):
-                vllm_outputs = await self.rollout.raw_generate_sequences_async(request)
+                vllm_outputs = await self.rollout.raw_generate_sequences_async(request, sampling_params)
 
             vllm_output = vllm_outputs[0][1] if isinstance(vllm_outputs, list) else vllm_outputs[1]
             assert len(vllm_output.outputs) == 1, (
@@ -769,13 +975,15 @@ class PSRL_GenWorker(Worker):
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,
+                is_validate=is_validate,
             )
             if update_status_success[0]:
                 return result, update_status
         # Means the request is aborted
         return None, None
 
-    async def generate_async(self, request: DataProto, consolidate: bool = True):
+    @rollout_trace_op
+    async def generate_async(self, request: DataProto, sampling_params: dict[str, Any], consolidate: bool = True):
         """
         Generate sequences asynchronously.
         This method handles a single async generation request, managing model versioning
@@ -783,6 +991,8 @@ class PSRL_GenWorker(Worker):
 
         Args:
             request (DataProto): The async generation request.
+            sampling_params (dict): The sampling parameters for generation.
+            consolidate (bool): Whether to consolidate the results after generation.
         """
         assert consolidate, (
             "Consolidate must be True for async generation for now. "
@@ -821,7 +1031,9 @@ class PSRL_GenWorker(Worker):
             )
             needed_model_version = self.curr_rollout_instance_model_version
 
-        task = self._generate_loop.create_task(self._generate_async_task(request, needed_model_version))
+        task = self._generate_loop.create_task(
+            self._generate_async_task(request, sampling_params, needed_model_version)
+        )
         task.add_done_callback(
             self._create_task_done_callback(
                 int(request.non_tensor_batch["uid"][0]),

@@ -1,5 +1,10 @@
 # Target class for this configuration
 _target_: psrl.workers.config.ActorConfig
+
+# PSRL will not do rollout on actor side, so skip it
+# Number of rollouts per update (mirrors actor rollout_n)
+# rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
+
 # the abstract actor configs
 # fsdp, fsdp2 or megatron. must be set.
 strategy: ???
@@ -64,8 +69,15 @@ clip_ratio_c: 3.0
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
 loss_agg_mode: token-mean
 
+# Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.
+# If null, uses response_length. Set to a constant to ensure consistent normalization.
+loss_scale_factor: null
+
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
+
+# When true, the actor forward will request entropy from the model
+calculate_entropy: false
 
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
@@ -86,6 +98,9 @@ ppo_epochs: 1
 # Shuffle training data across PPO epochs
 shuffle: false
 
+# The seed used to construct mini-batch
+data_loader_seed: 42
+
 # checkpoint configs
 checkpoint:
 
@@ -102,6 +117,24 @@ checkpoint:
 
   # Whether to save checkpoints asynchronously. Only effective for Megatron as of now.
   async_save: False
+
+# optimizer configs
+optim:
+
+  # Learning rate
+  lr: 1e-6
+
+  # Warmup steps ratio (used if lr_warmup_steps is 0 or negative)
+  lr_warmup_steps_ratio: 0.0
+
+  # Total training steps (must be overridden at runtime)
+  total_training_steps: -1
+
+  # Weight decay
+  weight_decay: 0.01
+
+  # Prioritized. None, 0 or Negative values mean delegating to lr_warmup_steps_ratio.
+  lr_warmup_steps: -1
 
 # Whether to use custom fused kernels (e.g., FlashAttention, fused MLP)
 use_fused_kernels: ${oc.select:train_actor_rollout_ref.model.use_fused_kernels,false}

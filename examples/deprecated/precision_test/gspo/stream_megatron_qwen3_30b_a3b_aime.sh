@@ -16,6 +16,8 @@ GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
+VAL_PP=1 # PP in the training side for validation
+
 TRAIN_TP=4 # TP in the training side 
 TRAIN_PP=4 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
@@ -31,6 +33,9 @@ GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs pe
 
 TRAIN_NNODES=2
 TRAIN_NGPUS_PER_NODE=8
+
+VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
+VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
 TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
@@ -80,6 +85,10 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
+# TIS
+rollout_is=null
+rollout_is_threshold=null
+
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -90,11 +99,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/gspo/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=recompute \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
+    psrl.deployment.validate_nnodes_per_instance=1 \
+    psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
@@ -113,11 +123,16 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \
+    train_actor_rollout_ref.rollout.mode=psrl_async \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
+    train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=true \
+    train_actor_rollout_ref.rollout.temperature=${temperature} \
+    train_actor_rollout_ref.rollout.top_p=${top_p} \
+    train_actor_rollout_ref.rollout.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
@@ -152,6 +167,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${ETP} \
     train_actor_rollout_ref.ref.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.ref.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
+    \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.adv_estimator=${adv_estimator} \

@@ -22,6 +22,20 @@ ps_mode: cpu_ref
 # Logging path
 logging_path: ~/psrl_logs
 
+server_rollout:
+  # Whether to enable server rollout service.
+  enable: False
+
+  # Rollout gateway config.
+  # This gateway is an HTTP entrypoint used by agent loops to call rollout service.
+  gateway:
+    # Bind address for the gateway process.
+    router_ip: ${psrl.ps_manager_ip}
+    router_port: 18080
+
+  # Max concurrent connections per rollout server for the HTTP client.
+  server_concurrency: 64
+
 # Config for profile
 profile:
 
@@ -44,11 +58,20 @@ deployment:
   # Number for rollout instances
   n_rollout_instances: 1
 
+  # Number for validation rollout instances
+  n_validate_instances: 1
+
   # Node number for each rollout instance
   rollout_nnodes_per_instance: 1
 
   # GPU number for each rollout instance in every node
   rollout_ngpus_per_node_per_instance: 1
+
+  # Node number for each validate instance
+  validate_nnodes_per_instance: 1
+
+  # GPU number for each validate instance in every node
+  validate_ngpus_per_node_per_instance: 1
 
   # Node number for trainer
   train_nnodes: 1
@@ -88,7 +111,7 @@ status_collection:
   dump_logging_to_file_level: generation
 
   # Logging interval in milliseconds
-  dump_logging_to_file_interval_in_ms: 2000
+  dump_logging_to_file_interval_in_ms: 500
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
   # Here 10 means sync every 0.01 second
@@ -97,6 +120,15 @@ status_collection:
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
   # Here 10 means sync every 0.01 second
   coordinator_sync_interval_in_ms: 10
+
+# Memory logger config
+memory_logger:
+
+  # Whether to enable memory logger
+  enable: True
+
+  # Logging interval in seconds
+  interval_seconds: 20
 
 # Redundant rollout config
 redundant_rollout:
@@ -257,7 +289,10 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 8
+  max_pinned_temp_memory_slots: 16
+
+  # Enable TMS management for NIXL temp buffers
+  enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
 
 # Post processor for group requests in streaming mode
 group_post_process:
@@ -280,3 +315,28 @@ buffer_post_process:
   # Available options: "dynamic_sampling_filter", "no_filter"
   # When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
   name: null
+
+# Whether to colocate validate and training workers
+colocate_validate_and_train: True
+
+# Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
+fuse_rollout_with_validate: True
+
+# Whether to use torch_memory_saver (TMS) for GPU management
+tms:
+
+  # Range of TMS to enable, available options:
+  #  - "null": disable TMS
+  #  - "train": enable TMS for training workers only
+  #  - "all": enable TMS for both rollout and training workers
+  range: all
+
+  # Whether to enable TMS on CUDA graphs
+  # When enabled, CUDA graphs will be released by TMS to save GPU memory
+  # This requires range to be "all"
+  enable_cuda_graph: False
+
+  # Whether to enable TMS on NIXL temp buffers
+  # When enabled, NIXL temp buffers will be released by TMS to save GPU
+  # and the reregister will be simplified.
+  enable_nixl: False

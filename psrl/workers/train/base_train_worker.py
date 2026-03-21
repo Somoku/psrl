@@ -8,7 +8,8 @@ import torch.distributed as dist
 from omegaconf import DictConfig
 from dataclasses import dataclass
 
-from psrl.utils.nixl import NIXLInterface
+from psrl.utils.logger import DualOutputHandler
+from psrl.utils.nixl import GLOBAL_META_SERVER_NAME, GLOBAL_PS_CLIENT_NAME, NIXLInterface
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -40,6 +41,7 @@ class PSRL_BaseTrainWorker:
         self.train_interface = train_interface
         self.nixl_interface = nixl_interface
         # NIXL
+        self.node_id = None
         self.nixl_storage_client = None
         self.unified_state_dict = None
         self.unified_sharding_dict = None
@@ -52,9 +54,9 @@ class PSRL_BaseTrainWorker:
         self.nixl_wait_completed = threading.Event()
 
         # Build logger
-        # self.log_prefix = f"BaseTrainWorker_R{self.rank}"
-        # psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
-        # psrl_logger.debug(f"Initialized on {get_worker_info()}.")
+        self.log_prefix = f"BaseTrainWorker_R{self.rank}"
+        psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
+        psrl_logger.info(f"Initialized on {ray.get_runtime_context().get_node_id()}.")
 
         # Env debug
         # log_env_info(psrl_logger, level=logging.DEBUG)
@@ -63,7 +65,10 @@ class PSRL_BaseTrainWorker:
         """
         Get the node id of the train worker.
         """
-        return ray.get_runtime_context().get_node_id()
+        if self.node_id is not None:
+            return self.node_id
+        self.node_id = ray.get_runtime_context().get_node_id()
+        return self.node_id
 
     @property
     def is_train_representative_rank(self) -> bool:
@@ -82,7 +87,10 @@ class PSRL_BaseTrainWorker:
     def init_nixl_client(self):
         pass
 
-    def nixl_protocol(self):
+    def nixl_protocol(self, mode: str = "full"):
+        pass
+
+    def nixl_sleep(self, mode: str = "full"):
         pass
 
     def ray_push_model(self) -> None:
@@ -176,6 +184,10 @@ class PSRL_BaseTrainWorker:
                             )
                             raise e
                         if len(shards_to_transfer) > 0:
+                            psrl_logger.info(
+                                f"Pushing key {key} shards {shards_to_transfer} to {target_client_name} "
+                                f"for version {next_ps_model_version} with {len(shards_to_transfer)} shards"
+                            )
                             wait_operations.append((key, target_client_name, shards_to_transfer))
                     psrl_logger.debug(
                         f"Starting to wait for {len(wait_operations)} NIXL operations "
@@ -211,6 +223,7 @@ class PSRL_BaseTrainWorker:
                 if self.worker_rank == 0:
                     # Only the representative rank pushes the model tag to the PS
                     ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
+                self.nixl_storage_client.clear_intermediate_cached_data()
                 self.nixl_wait_completed.set()
                 psrl_logger.debug(
                     f"All NIXL push operations completed, "
@@ -283,9 +296,145 @@ class PSRL_BaseTrainWorker:
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            # ---- DEBUG: log train info BEFORE push ----
+            # self._debug_log_train_info(label=f"TRAIN_BEFORE_PUSH_R{self.worker_rank}")
             self.nixl_push_model()
             # TODO(lhy): wait for the push to complete before the next iteration optimizer update
             # This will enable the NIXL push to be overlapped with the next iteration training
             self.wait_for_nixl_push_completion()
+            # ---- DEBUG: log PS info AFTER push completes ----
+            # self._debug_log_ps_info(label=f"PS_AFTER_PUSH_R{self.worker_rank}")
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+
+    def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict[str, int]):
+        """
+        Update local NIXL info to the PS workers on the same node with this train worker.
+        """
+        node_id = self.get_node_id()
+        dst_ps_worker_idx = ps_worker_node_id_to_idxs[node_id]
+        dst_agent_names = [f"{GLOBAL_PS_CLIENT_NAME}_{dst_ps_worker_idx}", GLOBAL_META_SERVER_NAME]
+        self.nixl_storage_client.send_local_info_to(dst_agent_names)
+
+    def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
+        """
+        Send local NIXL info to the specified destination agent names.
+
+        Args:
+            dst_agent_names (str | list[str]): Destination agent name(s) to send local info to.
+        """
+        if isinstance(dst_agent_names, str):
+            dst_agent_names = [dst_agent_names]
+        self.nixl_storage_client.send_local_info_to(dst_agent_names)
+
+    def nixl_wait_for_update_infos(self, info_num: int):
+        """Wait for infos of updated clients for global synchronization.
+
+        Args:
+            info_num (int): Number of infos to wait for.
+        """
+        self.nixl_storage_client.wait_for_update_infos(info_num)
+
+    def nixl_pull_model(self):
+        """Pull the model from the NIXL storage client."""
+        assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
+            "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
+        )
+        ps_manager_handle = self.train_interface.ps_manager_handle
+        # Cache the agent and client names to avoid redundant ray calls
+        if self._cached_ps_nixl_agent_names is None:
+            self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
+        if self._cached_ps_nixl_train_storage_client_names is None:
+            self._cached_ps_nixl_train_storage_client_names = ray.get(
+                ps_manager_handle.get_ps_nixl_train_storage_client_names.remote()
+            )
+        self.nixl_pull_model_core(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_train_storage_client_names)
+
+    def nixl_pull_model_core(self, ps_nixl_agent_names: list[str], ps_nixl_train_storage_client_names: list[str]):
+        """
+        Core logic for pulling the model from NIXL storage clients.
+
+        Args:
+            ps_nixl_agent_names (list[str]): List of PS NIXL agent names
+            ps_nixl_train_storage_client_names (list[str]): List of PS NIXL train storage client names
+        """
+        if not hasattr(self, "pull_times"):
+            self.pull_times = 0
+        self.pull_times += 1
+        wait_operations = []
+        time_start = time.time()
+        for key in self.unified_state_dict:
+            for target_agent_name, target_client_name in zip(ps_nixl_agent_names, ps_nixl_train_storage_client_names):
+                shards_to_transfer = self.nixl_storage_client.client_read(
+                    target_agent_name, target_client_name, key, f"train_pull_{self.pull_times}"
+                )
+                # shards_to_transfer = self.nixl_storage_client.client_read(
+                #     target_agent_name, target_client_name, key, "train_pull", merge_and_cache_xfer=False
+                # )
+                if len(shards_to_transfer) > 0:
+                    psrl_logger.info(
+                        f"Pulling key {key} shards {shards_to_transfer} from {target_client_name} "
+                        f"for pull {self.pull_times} times"
+                    )
+                    wait_operations.append((key, target_client_name, shards_to_transfer))
+        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
+        for key, target_client_name, shards_to_transfer in wait_operations:
+            self.nixl_storage_client.wait(
+                key, f"train_pull_{self.pull_times}", "READ", target_client=target_client_name
+            )
+            # self.nixl_storage_client.wait(key, "train_pull", "READ", target_client=target_client_name)
+        self.nixl_storage_client.merge_and_finish_cached_xfer()
+        psrl_logger.info(
+            f"{self.nixl_storage_client}: NIXL pull model core done "
+            f"({self.pull_times} times). time: {time.time() - time_start}s"
+        )
+        torch.cuda.synchronize()
+        self.nixl_storage_client.clear_intermediate_cached_data()
+
+    def pull_model(self):
+        """Pull the model from the PS via the specified mode.
+
+        Currently we do not support `cpu` and `cpu_ref` modes for pulling the model in trainer.
+        """
+        if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
+            raise RuntimeError("ray_pull_model is not supported for TrainWorker in 'cpu' or 'cpu_ref' mode.")
+        elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            # ---- DEBUG: log PS info BEFORE pull ----
+            # self._debug_log_ps_info(label=f"PS_BEFORE_PULL_R{self.worker_rank}")
+            self.nixl_pull_model()
+            # ---- DEBUG: log train info AFTER pull ----
+            # self._debug_log_train_info(label=f"TRAIN_AFTER_PULL_R{self.worker_rank}")
+        else:
+            raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
+
+    def _debug_log_train_info(self, label: str):
+        """Debug log the train info."""
+        if self.nixl_storage_client is not None:
+            self.nixl_storage_client.log_shard_info(label=label)
+        self._debug_log_train_model_info(label=label)
+
+    def _debug_log_train_model_info(self, label: str):
+        """Debug log the train model info."""
+        pass
+
+    def _debug_log_ps_info(self, label: str):
+        """Call debug_log_info on every PSStorageWorker via Ray RPC (rank-0 only to reduce noise)."""
+        if self.worker_rank != 0:
+            return
+        try:
+            ps_manager_handle = self.train_interface.ps_manager_handle
+            if self._cached_ps_nixl_train_storage_client_names is None:
+                self._cached_ps_nixl_train_storage_client_names = ray.get(
+                    ps_manager_handle.get_ps_nixl_train_storage_client_names.remote()
+                )
+            futures = []
+            for target_client_name in self._cached_ps_nixl_train_storage_client_names:
+                if target_client_name not in self._cached_ps_worker_handles:
+                    self._cached_ps_worker_handles[target_client_name] = ray.get(
+                        ps_manager_handle.get_ps_worker_handle.remote(target_client_name)
+                    )
+                ps_worker_handle = self._cached_ps_worker_handles[target_client_name]
+                futures.append(ps_worker_handle.debug_log_info.remote(label=label))
+            ray.get(futures)
+        except Exception as e:
+            psrl_logger.warning(f"[{label}] Failed to log PS shard info: {e}")

@@ -100,6 +100,7 @@ class StatCollector(StatLoggerBase):
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             self.log_prefix = f"StatCollector_I{self.instance_id}"
+            psrl_logger.propagate = False
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized StatCollector for instance {self.instance_id}.")
 

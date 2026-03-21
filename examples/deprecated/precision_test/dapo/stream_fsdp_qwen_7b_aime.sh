@@ -15,20 +15,15 @@ TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
 GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
+
 VAL_TP=4 # TP in the training side for validation
+VAL_PP=1 # PP in the training side for validation
+
 TRAIN_SP=4 # SP in the training side
 TRAIN_FSDP=16 # FSDP in the training side
 
 NNODES=8
 NGPUS_PER_NODE=8
-
-# GEN_NNODES=${NNODES} # Number of nodes for generation
-# GEN_NGPUS_PER_NODE=4 # Number of GPUs per node for generation
-# GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
-# GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
-
-# TRAIN_NNODES=${NNODES} # Number of nodes for training
-# TRAIN_NGPUS_PER_NODE=$(( ${NGPUS_PER_NODE} - ${GEN_NGPUS_PER_NODE} )) # Number of GPUs per node for training
 
 GEN_NNODES=4 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
@@ -37,6 +32,9 @@ GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs pe
 
 TRAIN_NNODES=4 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
+
+VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
+VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
 adv_estimator=grpo
 use_kl_in_reward=False
@@ -61,13 +59,17 @@ top_p=1.0
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 
+# TIS
+rollout_is=null
+rollout_is_threshold=null
+
 # Performance Related Parameter
 use_dynamic_bsz=True
 actor_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 2))
 infer_ppo_max_token_len=$(((max_prompt_length + max_response_length) * 3))
 # NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
 # May support this in the future
-offload=True
+offload=False
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -78,11 +80,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/precision_test/dapo/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=False \
-    psrl.log_prob.enable_train_engine_recompute_log_prob=True \
-    psrl.log_prob.mode=recompute \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
+    psrl.deployment.validate_nnodes_per_instance=1 \
+    psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.nixl.server_mode=meta_server \
@@ -104,11 +107,17 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    train_actor_rollout_ref.rollout.mode=psrl_async \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=False \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
+    train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    train_actor_rollout_ref.rollout.temperature=${temperature} \
+    train_actor_rollout_ref.rollout.top_p=${top_p} \
+    train_actor_rollout_ref.rollout.top_k=${top_k} \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
@@ -140,6 +149,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo \
     +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
     +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
     +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
+    \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

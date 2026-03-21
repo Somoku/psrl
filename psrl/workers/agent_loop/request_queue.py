@@ -53,7 +53,7 @@ def get_priority_by_version(request: DataProto, staleness: int) -> int:
 
 def get_priority_by_version_and_token_num(
     request: DataProto, staleness: int, short_request_first: bool = False
-) -> int:
+) -> tuple[int, int, int]:
     """Get the priority value for a request based on version tag and token number.
 
     Args:
@@ -62,8 +62,11 @@ def get_priority_by_version_and_token_num(
         short_request_first (bool): Whether to prioritize short requests.
 
     Returns:
-        Tuple[int, int]: Priority value (lower is higher priority).
+        Tuple[int, int, int]: Priority value (lower is higher priority).
     """
+    # Prioritize validation requests than training requests
+    is_validate = request.meta_info.get("validate", False)
+    validate_priority = not is_validate
     version_priority = get_priority_by_version(request, staleness)
     assert "raw_prompt_ids" in request.non_tensor_batch, "raw_prompt_ids is required in non_tensor_batch"
     prompt_token_num = len(request.non_tensor_batch["raw_prompt_ids"][0])
@@ -75,7 +78,7 @@ def get_priority_by_version_and_token_num(
         token_num_priority = prompt_token_num + response_token_num
     else:
         token_num_priority = -(prompt_token_num + response_token_num)
-    return (version_priority, token_num_priority)
+    return (validate_priority, version_priority, token_num_priority)
 
 
 def get_priority_by_version_and_id(request: DataProto, staleness: int) -> int:

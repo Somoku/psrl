@@ -221,3 +221,35 @@ class PSWorkerGroup:
                 return result
 
         return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
+
+    def execute_single_async(self, worker_index: int, method_name: str, *args, **kwargs):
+        """Execute a method on a single worker asynchronously.
+
+        Args:
+            worker_index: Index of the worker to execute the method on
+            method_name: Name of the method to execute
+            *args: Positional arguments for the method
+            **kwargs: Keyword arguments for the method
+
+        Returns:
+            Remote object reference to the method execution
+        """
+        return self._execute_remote_single_worker(self._workers[worker_index], method_name, *args, **kwargs)
+
+    def execute_async(self, worker_indices: int | list[int], method_name: str, *args, **kwargs):
+        """Execute a method on specified workers asynchronously.
+
+        Args:
+            worker_indices: Index or list of indices of workers to execute the method on
+            method_name: Name of the method to execute
+            *args: Positional arguments for the method
+            **kwargs: Keyword arguments for the method
+
+        Returns:
+            List of remote object references to the method executions
+        """
+        if isinstance(worker_indices, int):
+            worker_indices = [worker_indices]
+        return [
+            self._execute_remote_single_worker(self._workers[i], method_name, *args, **kwargs) for i in worker_indices
+        ]

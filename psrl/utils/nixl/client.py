@@ -2,16 +2,21 @@ import logging
 import os
 import pickle
 import time
-from typing import Any
+from contextlib import nullcontext
+from typing import TYPE_CHECKING, Any
 
 import nixl._bindings as nixlBind
+import numpy as np
 import ray
 import torch
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
-from psrl.utils.logger import deprecated, get_worker_info
+from psrl.utils.common.patch_utils import apply_tms_patch
+from psrl.utils.common.utils import lazy_import_to_globals
+from psrl.utils.logger import DualOutputHandler, get_worker_info, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
+from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
@@ -21,6 +26,11 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLShardMetaInfo,
     NIXLTensorInfo,
 )
+
+if TYPE_CHECKING:
+    from torch_memory_saver import torch_memory_saver
+else:
+    torch_memory_saver = None  # type: ignore
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -81,6 +91,12 @@ class NIXLStorageClient:
         )  # None means no pinned temp memory
         self.nixl_interface = nixl_interface if nixl_interface is not None else NIXLInterface()
         self.client_group_id = client_group_id
+        self.enable_tms_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
+
+        if self.enable_tms_for_temp_buffers:
+            lazy_import_to_globals("torch_memory_saver", "torch_memory_saver")
+            apply_tms_patch()
+            psrl_logger.info(f"NIXLStorageClient {self.client_name} enabled TMS for temporary buffers.")
 
         # Initialize NIXL agent
         if binded_agent is None:
@@ -112,13 +128,30 @@ class NIXLStorageClient:
         # If we use pinned memory, we need to record the mapping
         # from the uncontiguous tensor to the index of the pinned memory
         self._temp_pinned_idx_mapping: dict[tuple[str, tuple[int, ...]], int] = {}  # (key, shard_idx) -> pinned_idx
-        self._pinned_slot_running_xfer: dict[
+        self._pinned_slot_running_write_xfer: dict[
             tuple[torch.Size, torch.dtype, int], tuple
         ] = {}  # (shape, dtype, pinned_idx) -> (key, tag, op_type, target_client)
-        self._pinned_memory: dict[tuple[torch.Size, torch.dtype], list[tuple[torch.Tensor, bytes]]] | None = None
-        self._contiguous_event_cache: dict[
+        self._pinned_slot_running_read_xfer: dict[
+            tuple[torch.Size, torch.dtype, int], tuple
+        ] = {}  # (shape, dtype, pinned_idx) -> (key, tag, op_type, target_client)
+        self._pinned_memory: dict[tuple[torch.Size, torch.dtype], list[torch.Tensor]] | None = None
+        self._read_contiguous_event_cache: dict[
             tuple[str, tuple[int, ...]], torch.cuda.streams.Event
         ] = {}  # (key, shard_idx) -> cudaEvent
+        self._write_contiguous_event_cache: dict[
+            tuple[str, tuple[int, ...]], torch.cuda.streams.Event
+        ] = {}  # (key, shard_idx) -> cudaEvent
+
+        # Registry for all local registrations (desc_bytes -> desc object)
+        self._registered_descs: dict[bytes, Any] = {}
+
+        # mem_type -> [(base_addr, nbytes, device_id, mem_type)] tuples for storage registration
+        self._mtype_to_reg_region_lists: dict[str, list[tuple[int, int, int, str]]] = {}
+        self._reg_regions: set[tuple[int, int, int, str]] = set()
+
+        # Mapping from (key, shard_idx) to registered desc slice info
+        self.contig_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[int, int, int, str]] = {}
+        self.temp_desc_slice_map: dict[tuple[str, tuple[int, ...]], tuple[int, int, int, str]] = {}
 
         # Optimization: merge multiple contiguous transfers into one
         self._cached_xfer_descs = []  # [("READ", local_desc, remote_desc, target_agent, tag, target_client)]
@@ -134,72 +167,25 @@ class NIXLStorageClient:
         self._all_client_infos_fetched = False
         self._comm_plan: NIXLCommPlan | None = None  # Communication plan
         self._all_temp_mappings: dict[str, dict[tuple[str, int], bytes]] = {}  # client_name -> temp_desc_mapping
-        self._all_temp_mappings_fetched = False
 
         # logging
-        """
         if logging_path is not None:
             self.log_prefix = "NIXLStorageClient_" + self.client_name
             psrl_logger.addHandler(DualOutputHandler(logging_path, self.log_prefix))
             psrl_logger.info(f"NIXLStorageClient {self.client_name} initialized.")
-        """
 
     def release_temp_memory(self):
-        """Release all temporary memory and deregister descriptors"""
-        _cached_deregister_descs = []
-        for _, desc_bytes in self._temp_desc_bytes_mapping.items():
-            # Deregister the descriptor
-            if desc_bytes in _cached_deregister_descs:
-                continue
-            _cached_deregister_descs.append(desc_bytes)
-            try:
-                desc = self.agent.deserialize_descs(desc_bytes)
-                self.agent.deregister_memory(desc)
-            except Exception as e:
-                psrl_logger.warning(f"Failed to deregister descriptor {desc_bytes}: {e}")
-                raise e
+        """Release all temporary memory and deregister descriptors.
 
+        NOTE(linsh): deregistration is done globally. Here we just clear the local mappings.
+        """
         # Clear all temporary mappings
         self._temp_tensor_mapping = {}
         self._temp_desc_bytes_mapping = {}
         self._temp_meta_mapping = {}
-
-    def reallocate_temp_memory(self):
-        """Reallocate temporary memory for non-contiguous shards"""
-        assert self.local_client_info is not None, "Local client info not registered."
-        assert self.max_pinned_temp_memory_slots is None, (
-            "temporary memory reallocation is forbidden if pinned temp memory is enabled"
-        )
-
-        for key, tensor_info in self.local_client_info.tensor_infos.items():
-            for idx, meta_info in enumerate(tensor_info.shard_meta_infos):
-                if not meta_info.is_contiguous:
-                    # Recreate temporary contiguous tensor
-                    contiguous_tensor = torch.empty(
-                        meta_info.shape,
-                        dtype=meta_info.dtype,
-                        device=self.device,
-                        requires_grad=False,
-                    )
-                    contiguous_meta_info = NIXLShardMetaInfo(
-                        dtype=contiguous_tensor.dtype,
-                        device=contiguous_tensor.device,
-                        shape=contiguous_tensor.shape,
-                        stride=contiguous_tensor.stride,
-                        is_contiguous=True,
-                    )
-
-                    # Register the new contiguous tensor
-                    desc = self.agent.register_memory([contiguous_tensor])
-                    if not desc:
-                        raise RuntimeError(f"Memory registration failed for key {key} shard {idx} (realloc).")
-                    desc_bytes = self.agent.get_serialized_descs(desc)
-
-                    # Store temporary mappings
-                    shard_idx = tensor_info.sharding.shard_indices[idx]
-                    self._temp_tensor_mapping[(key, shard_idx)] = contiguous_tensor
-                    self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
-                    self._temp_meta_mapping[(key, shard_idx)] = contiguous_meta_info
+        self._pinned_memory = None
+        self._temp_pinned_idx_mapping = {}
+        self.temp_desc_slice_map = {}
 
     def _get_local_original_tensor(self, key: str, shard_idx: tuple[int, ...]) -> torch.Tensor | None:
         """Get original tensor mapping for non-contiguous shard"""
@@ -214,7 +200,6 @@ class NIXLStorageClient:
     def _get_temp_desc_bytes(self, client_name: str, key: str, shard_idx: tuple[int, ...]) -> bytes | None:
         """Get temporary descriptor for non-contiguous shard"""
         assert self.mode == "meta_server", "get_temp_desc only valid in meta_server mode"
-        assert self._all_temp_mappings_fetched, "All temp mappings not fetched yet."
         assert client_name in self._all_temp_mappings, f"Client {client_name} not found in temp mappings."
         # Currently, temp mappings are only used locally
         assert client_name == self.client_name, f"Client {client_name} is not the current client."
@@ -234,11 +219,172 @@ class NIXLStorageClient:
         assert self.mode == "meta_server", "get_temp_tensor_mapping only valid in meta_server mode"
         return self._temp_tensor_mapping
 
+    def _track_registered_desc(self, desc) -> bytes:
+        """Cache registered desc object and return serialized bytes."""
+        desc_bytes = self.agent.get_serialized_descs(desc)
+        self._registered_descs[desc_bytes] = desc
+        return desc_bytes
+
+    def _record_region_registration(self, tensor: torch.Tensor) -> tuple[int, int, int, str]:
+        """Record the base storage registration entry for a tensor view.
+
+        Returns a storage key tuple of (base_addr, nbytes, device_id, mem_type).
+        """
+        storage = tensor.untyped_storage()
+        base_addr = storage.data_ptr()
+        nbytes = storage.nbytes()
+        device_id = tensor.get_device() if tensor.is_cuda else 0
+        mem_type = "cuda" if tensor.is_cuda else "cpu"
+        storage_region = (base_addr, nbytes, device_id, mem_type)
+        if storage_region not in self._reg_regions:
+            self._reg_regions.add(storage_region)
+            self._mtype_to_reg_region_lists.setdefault(mem_type, []).append((base_addr, nbytes, device_id, ""))
+        return storage_region
+
+    def _build_xfer_desc_bytes(self, addr: int, length: int, device_id: int, mem_type: str) -> bytes:
+        """Build serialized xfer descriptors for a contiguous slice."""
+        xfer_descs = self.agent.get_xfer_descs([(addr, length, device_id)], mem_type=mem_type)
+        return self.agent.get_serialized_descs(xfer_descs)
+
+    def _deserialize_to_xfer_descs(self, desc_bytes: bytes):
+        """Deserialize desc bytes and ensure xfer descriptors are returned."""
+        descs = self.agent.deserialize_descs(desc_bytes)
+        if isinstance(descs, nixlBind.nixlRegDList):
+            return descs.trim()
+        return descs
+
+    def _ensure_xfer_descs(self, descs):
+        """Normalize reg/xfer descriptors to xfer list."""
+        if isinstance(descs, nixlBind.nixlRegDList):
+            return descs.trim()
+        return descs
+
+    def _deregister_all_descs(self):
+        """Deregister all cached descriptors in one pass."""
+        if not self._registered_descs:
+            return
+        descs = list(self._registered_descs.values())
+        self._registered_descs = {}
+        for desc in descs:
+            self.agent.deregister_memory(desc)
+
+    def _merge_contiguous_regions(
+        self, region_list: list[tuple[int, int, int, str]]
+    ) -> list[tuple[int, int, int, str]]:
+        """Merge contiguous memory regions to reduce registration calls.
+
+        Args:
+            region_list: List of (base_addr, nbytes, device_id, mem_type) tuples.
+        Returns:
+            Merged list of (base_addr, nbytes, device_id, mem_type) tuples.
+        """
+        if not region_list:
+            return []
+
+        # Sort regions by base address
+        sorted_regions = sorted(region_list, key=lambda x: x[0])
+        merged_regions = []
+        current_base, current_size, current_device_id, current_mem_type = sorted_regions[0]
+
+        for base, size, device_id, mem_type in sorted_regions[1:]:
+            if current_base + current_size == base and current_device_id == device_id and current_mem_type == mem_type:
+                # Merge contiguous region
+                current_size += size
+            else:
+                # Append the current region and start a new one
+                merged_regions.append((current_base, current_size, current_device_id, current_mem_type))
+                current_base, current_size, current_device_id, current_mem_type = base, size, device_id, mem_type
+
+        # Append the last region
+        merged_regions.append((current_base, current_size, current_device_id, current_mem_type))
+        return merged_regions
+
+    def _register_memory(self, mem_type: str, reg_list: list[tuple[int, int, int, str]]) -> nixlBind.nixlRegDList:
+        """Register memory with NIXL."""
+        dlist = np.zeros((len(reg_list), 3), dtype=np.uint64)
+        for i, (base_addr, nbytes, device_id, _) in enumerate(reg_list):
+            dlist[i, 0] = base_addr
+            dlist[i, 1] = nbytes
+            dlist[i, 2] = device_id
+        descs = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], dlist)
+        return self.agent.register_memory(descs)
+
+    # NOTE(lhy): low-level nixl api is time consuming, so we use high-level register memory
+    # maintained by us to ensure all tensors are registered
+    def _ensure_all_tensor_registered_low_level(self):
+        """Check if all tensors are registered."""
+        for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
+            slice_addr, slice_len, device_id, mem_type = slice_info
+            desc = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], [(slice_addr, slice_len, device_id, "")])
+            try:
+                query_info = self.agent.query_memory(desc, "UCX")
+            except Exception as e:
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor "
+                    f"but not registered: {e}"
+                ) from e
+            if query_info is None:
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor but not registered"
+                )
+            else:
+                psrl_logger.info(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor and registered, "
+                    f"query info: {query_info}"
+                )
+        for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
+            slice_addr, slice_len, device_id, mem_type = slice_info
+            desc = nixlBind.nixlRegDList(self.agent.nixl_mems[mem_type], [(slice_addr, slice_len, device_id, "")])
+            try:
+                query_info = self.agent.query_memory(desc, "UCX")
+            except Exception as e:
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor but not registered: {e}"
+                ) from e
+            if query_info is None:
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor but not registered"
+                )
+            else:
+                psrl_logger.info(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor and registered, "
+                    f"query info: {query_info}"
+                )
+
+    def _ensure_all_tensor_registered_high_level(self):
+        """Check if all tensors are covered by our registered regions (no NIXL query)."""
+        # Build (base, size) list from current registered regions
+        registered: list[tuple[int, int]] = []
+        for reg_list in self._mtype_to_reg_region_lists.values():
+            for base_addr, nbytes, _device_id, _ in reg_list:
+                registered.append((base_addr, nbytes))
+
+        def _is_covered(ptr: int, size: int) -> bool:
+            for base, sz in registered:
+                if ptr >= base and ptr + size <= base + sz:
+                    return True
+            return False
+
+        for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
+            slice_addr, slice_len, _device_id, _mem_type = slice_info
+            if not _is_covered(slice_addr, slice_len):
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a contiguous tensor but not registered"
+                )
+
+        for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
+            slice_addr, slice_len, _device_id, _mem_type = slice_info
+            if not _is_covered(slice_addr, slice_len):
+                raise RuntimeError(
+                    f"{self.client_name}: tensor {key} shard {shard_idx} is a temp tensor but not registered"
+                )
+
     def register_local_tensors(
         self,
         state_dict: dict[str, torch.Tensor],
         sharding_dict: dict[str, NIXLSharding] | None = None,
         binded_meta_tensor_mapping: (dict[tuple[str, tuple[int, ...]], torch.Tensor] | None) = None,
+        meta_only: bool = False,
     ):
         """
         Register local tensors with NIXL. Build key->desc mapping.
@@ -246,233 +392,361 @@ class NIXLStorageClient:
             state_dict: {key: torch.Tensor}
             sharding_dict: {key: NIXLSharding}
             binded_meta_tensor_mapping: {(key, shard_idx): torch.Tensor}
+            meta_only: whether to skip registering real tensors
         """
-        # If pinned temp memory is enabled, we need to first scan the state_dict
-        # and find all the tensors that are not contiguous
-        # Then we need to find all types (shape and dtype) of uncontiguous tensor
-        # and allocate max_pinned_temp_memory_slots times of their size as pinned memory
-        # (each pinned memory tensor is like this: [max_pinned_temp_memory_slots, *])
-        # Then we enumerate the uncontiguous tensors again and map them with the pinned memory in a round-robin manner
-        # (the first uncontiguous tensor map to [0, *], the second to [1, *],
-        # the (max_pinned_temp_memory_slots+1)-th to [0, *] again, etc.)
-        # We should record a mapping from the uncontiguous tensor to the index of the pinned memory
-        # log_env_info(psrl_logger)
-        if sharding_dict is None:
-            sharding_dict = {}
-        _uncontiguous_tensor_mapping: dict[
-            tuple[Any, Any], list[tuple[str, tuple[int, ...], torch.Tensor]]
-        ] = {}  # (shape, dtype) -> [key, shard_idx, uncontiguous_tensor]
-        if self.max_pinned_temp_memory_slots is not None:
-            # Scan the state_dict and find all the tensors that are not contiguous
-            for key, tensor in state_dict.items():
-                assert key in sharding_dict, f"Key {key} not found in sharding_dict."
-                if tensor.device == torch.device("meta"):
+
+        if (
+            self.enable_tms_for_temp_buffers
+            and self.local_client_info is not None
+            and self.local_client_info.is_registered
+        ):
+            # Re-register local tensors
+            assert self._mtype_to_reg_region_lists is not None, "No registered regions found."
+            for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
+                if not reg_list:
                     continue
-                sharding = sharding_dict[key]
-                shard_indices = sharding.shard_indices
-                local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
-                for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
-                    if not local_sharded_tensor.is_contiguous():
-                        if (
-                            local_sharded_tensor.shape,
-                            local_sharded_tensor.dtype,
-                        ) not in _uncontiguous_tensor_mapping:
-                            _uncontiguous_tensor_mapping[(local_sharded_tensor.shape, local_sharded_tensor.dtype)] = []
-                        _uncontiguous_tensor_mapping[(local_sharded_tensor.shape, local_sharded_tensor.dtype)].append(
-                            (key, shard_indices[local_pos], local_sharded_tensor)
-                        )
-            # Find all types of uncontiguous tensor and allocate pinned memory for them
-            if _uncontiguous_tensor_mapping:
-                self._pinned_memory = {}
-                for (
-                    shape,
-                    dtype,
-                ), uncontiguous_tensor_list in _uncontiguous_tensor_mapping.items():
-                    self._pinned_memory[(shape, dtype)] = []
-                    for slot_idx in range(self.max_pinned_temp_memory_slots):
-                        memory_slot = torch.empty(*shape, dtype=dtype, device=self.device, requires_grad=False)
-                        # psrl_logger.info(
-                        #     f"{self.client_name} registering memory for the "
-                        #     f"{slot_idx}-th slot of (shape: {shape}, dtype: {dtype})"
-                        # )
-                        try:
-                            temp_desc = self.agent.register_memory([memory_slot])
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"{self.client_name} memory registration failed for "
-                                f"the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype}) : {e}"
-                            ) from e
-                        if not temp_desc:
-                            raise RuntimeError(
-                                f"{self.client_name} memory registration failed for "
-                                f"the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype})"
-                            )
-                        # psrl_logger.info(
-                        #     f"{self.client_name} memory registration succeeded for "
-                        #     f"the {slot_idx}-th slot of (shape: {shape}, dtype: {dtype})"
-                        # )
-                        temp_desc_bytes = self.agent.get_serialized_descs(temp_desc)
-                        self._pinned_memory[(shape, dtype)].append((memory_slot, temp_desc_bytes))
-                    for i, (key, shard_idx, uncontiguous_tensor) in enumerate(uncontiguous_tensor_list):
-                        self._temp_pinned_idx_mapping[(key, shard_idx)] = i % self.max_pinned_temp_memory_slots
+                reg_descs = self._register_memory(mem_type, reg_list)
+                self._track_registered_desc(reg_descs)
 
-        # psrl_logger.info(f"{self.client_name}: temp pinned memory mapping is: {self._temp_pinned_idx_mapping}")
-        tensor_infos = {}
-        for key, tensor in state_dict.items():
-            assert key in sharding_dict, f"Key {key} not found in sharding_dict."
-            sharding = sharding_dict[key]
-            shard_indices = sharding.shard_indices
-            # assert sharding.is_contiguous_sharding(), "Only contiguous sharding is supported for now."
-            # Split registration
-            desc_bytes_list = []
-            shard_meta_info_list = []
-            local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+            # Rebuild desc bytes for all shards
+            for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
+                slice_addr, slice_len, device_id, mem_type = slice_info
+                desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
+                self.local_client_info.tensor_infos[key].desc_bytes_list[
+                    self.local_client_info.tensor_infos[key].sharding.shard_indices.index(shard_idx)
+                ] = desc_bytes
 
-            for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
-                # Store the original tensor mapping
-                # If the tensor is on meta device, allocate on-the-fly or binded from the external tensor
-                if local_sharded_tensor.device == torch.device("meta"):
-                    if (
-                        binded_meta_tensor_mapping is not None
-                        and (key, shard_indices[local_pos]) in binded_meta_tensor_mapping
-                    ):
-                        local_sharded_tensor = binded_meta_tensor_mapping[(key, shard_indices[local_pos])]
-                    else:
-                        local_sharded_tensor = torch.empty_like(local_sharded_tensor, device=self.device)
-                assert local_sharded_tensor.device == self.device, (
-                    f"Local sharded tensor {key} shard {shard_indices[local_pos]} is not "
-                    f"on device {self.device}, but on {local_sharded_tensor.device}, "
-                    f"torch current device is {torch.cuda.current_device()}, "
-                    f"CUDA_VISIBLE_DEVICES is {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}"
-                )
-                self._original_tensor_mapping[(key, shard_indices[local_pos])] = local_sharded_tensor
+            for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
+                slice_addr, slice_len, device_id, mem_type = slice_info
+                desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
+                self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
+                self.local_client_info.tensor_infos[key].temp_desc_bytes_list[
+                    self.local_client_info.tensor_infos[key].sharding.shard_indices.index(shard_idx)
+                ] = desc_bytes
+            return
 
-                # Create meta info for non-contiguous shard
-                is_contiguous = local_sharded_tensor.is_contiguous()
-                meta_info = NIXLShardMetaInfo(
-                    dtype=local_sharded_tensor.dtype,
-                    device=local_sharded_tensor.device,
-                    shape=local_sharded_tensor.shape,
-                    stride=local_sharded_tensor.stride(),
-                    is_contiguous=is_contiguous,
-                )
-                shard_meta_info_list.append(meta_info)
+        tms_ctx = torch_memory_saver.region(tag="nixl") if self.enable_tms_for_temp_buffers else nullcontext()
+        with tms_ctx:
+            # If pinned temp memory is enabled, we need to first scan the state_dict
+            # and find all the tensors that are not contiguous
+            # Then we need to find all types (shape and dtype) of uncontiguous tensor
+            # and allocate max_pinned_temp_memory_slots times of their size as pinned memory
+            # (each pinned memory tensor is like this: [max_pinned_temp_memory_slots, *])
+            # Then we enumerate the uncontiguous tensors again and
+            # map them with the pinned memory in a round-robin manner
+            # (the first uncontiguous tensor map to [0, *], the second to [1, *],
+            # the (max_pinned_temp_memory_slots+1)-th to [0, *] again, etc.)
+            # We should record a mapping from the uncontiguous tensor to the index of the pinned memory
+            # log_env_info(psrl_logger)
+            if sharding_dict is None:
+                sharding_dict = {}
+            _uncontiguous_tensor_mapping: dict[
+                tuple[Any, Any], list[tuple[str, tuple[int, ...], torch.Tensor]]
+            ] = {}  # (shape, dtype) -> [key, shard_idx, uncontiguous_tensor]
+            if self.max_pinned_temp_memory_slots is not None:
+                # Scan the state_dict and find all the tensors that are not contiguous
+                for key, tensor in state_dict.items():
+                    assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                    if tensor.device == torch.device("meta"):
+                        continue
+                    sharding = sharding_dict[key]
+                    shard_indices = sharding.shard_indices
+                    local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+                    for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
+                        if not local_sharded_tensor.is_contiguous():
+                            if (
+                                local_sharded_tensor.shape,
+                                local_sharded_tensor.dtype,
+                            ) not in _uncontiguous_tensor_mapping:
+                                _uncontiguous_tensor_mapping[
+                                    (local_sharded_tensor.shape, local_sharded_tensor.dtype)
+                                ] = []
+                            _uncontiguous_tensor_mapping[
+                                (local_sharded_tensor.shape, local_sharded_tensor.dtype)
+                            ].append((key, shard_indices[local_pos], local_sharded_tensor))
+                # Find all types of uncontiguous tensor and allocate pinned memory for them
+                if _uncontiguous_tensor_mapping:
+                    self._pinned_memory = {}
+                    for (
+                        shape,
+                        dtype,
+                    ), uncontiguous_tensor_list in _uncontiguous_tensor_mapping.items():
+                        self._pinned_memory[(shape, dtype)] = []
+                        for i, (key, shard_idx, uncontiguous_tensor) in enumerate(uncontiguous_tensor_list):
+                            self._temp_pinned_idx_mapping[(key, shard_idx)] = i % self.max_pinned_temp_memory_slots
+                        if meta_only:
+                            continue
 
-                # Check if the shard is contiguous
-                psrl_logger.debug(
-                    f"{self.client_name} key {key} shard {shard_indices[local_pos]} "
-                    f"register local tensor with shape {local_sharded_tensor.shape} and "
-                    f"dtype {local_sharded_tensor.dtype}"
-                )
-                if local_sharded_tensor.is_contiguous():
-                    # Contiguous shard: register directly
-                    try:
-                        desc = self.agent.register_memory([local_sharded_tensor])
-                    except Exception as e:
-                        raise RuntimeError(
-                            f"{self.client_name} memory registration failed for "
-                            f"key {key} shard {shard_indices[local_pos]}: {e}"
-                        ) from e
-                    if not desc:
-                        raise RuntimeError(
-                            f"{self.client_name} memory registration failed for "
-                            f"key {key} shard {shard_indices[local_pos]}."
-                        )
-                    desc_bytes = self.agent.get_serialized_descs(desc)
-                    desc_bytes_list.append(desc_bytes)
-                else:
-                    if self.max_pinned_temp_memory_slots is None:
-                        # Non-contiguous shard: create temporary contiguous memory
-                        # Create a new contiguous tensor with the same shape and dtype
-                        # raise RuntimeError(
-                        #     "Non-contiguous shard requires pinned memory, "
-                        #     "but pinned memory is not enabled."
-                        # )
-                        contiguous_tensor = torch.empty_like(
-                            local_sharded_tensor,
+                        # Optimization: allocate a big pinned memory tensor and chunk it
+                        # to reduce the number of registration calls
+                        pinned_memory = torch.empty(
+                            (self.max_pinned_temp_memory_slots, *shape),
+                            dtype=dtype,
                             device=self.device,
                             requires_grad=False,
                         )
-                        try:
-                            temp_desc = self.agent.register_memory([contiguous_tensor])
-                        except Exception as e:
-                            raise RuntimeError(
-                                f"{self.client_name} memory registration failed for "
-                                f"key {key} shard {shard_indices[local_pos]} : {e}"
-                            ) from e
-                        if not temp_desc:
-                            raise RuntimeError(
-                                f"{self.client_name} memory registration failed for "
-                                f"key {key} shard {shard_indices[local_pos]}."
+                        self._record_region_registration(pinned_memory)
+                        memory_slots = torch.chunk(pinned_memory, self.max_pinned_temp_memory_slots, dim=0)
+                        assert len(memory_slots) == self.max_pinned_temp_memory_slots, (
+                            f"Expected {self.max_pinned_temp_memory_slots} memory slots, but got {len(memory_slots)}."
+                        )
+                        for slot in memory_slots:
+                            memory_slot = slot.squeeze(0)
+                            self._pinned_memory[(shape, dtype)].append(memory_slot)
+
+            # Pre-scan meta tensors: one 1D buffer per dtype, single _record_region_registration per
+            # buffer; each tensor is a view (offset + length, then reshape) via MetaBuffer.
+            meta_buffer: MetaBuffer | None = None
+            if binded_meta_tensor_mapping is None and not meta_only:
+                entries: list[tuple[tuple[Any, Any], tuple[int, ...], torch.dtype]] = []
+                for key, tensor in state_dict.items():
+                    assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                    sharding = sharding_dict[key]
+                    shard_indices = sharding.shard_indices
+                    local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+                    for local_pos, local_sharded_tensor in enumerate(local_sharded_tensors):
+                        if local_sharded_tensor.device == torch.device("meta"):
+                            entries.append(
+                                (
+                                    (key, shard_indices[local_pos]),
+                                    local_sharded_tensor.shape,
+                                    local_sharded_tensor.dtype,
+                                )
                             )
-                        temp_desc_bytes = self.agent.get_serialized_descs(temp_desc)
+                if entries:
+                    meta_buffer = MetaBuffer(self.device)
+                    meta_buffer.allocate(entries)
+                    for buf in meta_buffer.buffers():
+                        self._record_region_registration(buf)
+
+            tensor_infos = {}
+            for key, tensor in state_dict.items():
+                assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                sharding = sharding_dict[key]
+                shard_indices = sharding.shard_indices
+                # assert sharding.is_contiguous_sharding(), "Only contiguous sharding is supported for now."
+                # Split registration
+                desc_bytes_list = []
+                temp_desc_bytes_list = []
+                shard_meta_info_list = []
+
+                local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+                for local_pos, tbd_local_sharded_tensor in enumerate(local_sharded_tensors):
+                    # Store the original tensor mapping
+                    # If the tensor is on meta device, allocate on-the-fly or binded from the external tensor
+                    if tbd_local_sharded_tensor.device == torch.device("meta"):
+                        # Case 1: use pre-allocated slice (from early scan) or binded from the external tensor
+                        if binded_meta_tensor_mapping is None and meta_buffer is not None:
+                            local_sharded_tensor = meta_buffer.get_tensor((key, shard_indices[local_pos]))
+                        elif (
+                            binded_meta_tensor_mapping is not None
+                            and (key, shard_indices[local_pos]) in binded_meta_tensor_mapping
+                        ):
+                            local_sharded_tensor = binded_meta_tensor_mapping[(key, shard_indices[local_pos])]
+                        else:
+                            local_sharded_tensor = tbd_local_sharded_tensor
                     else:
-                        assert self._pinned_memory is not None, "Pinned memory is not initialized."
-                        assert (
-                            local_sharded_tensor.shape,
-                            local_sharded_tensor.dtype,
-                        ) in self._pinned_memory, (
-                            f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
+                        local_sharded_tensor = tbd_local_sharded_tensor
+                    if not meta_only:
+                        # Local sharded tensor should be on a real device now
+                        assert local_sharded_tensor.device == self.device, (
+                            f"Local sharded tensor {key} shard {shard_indices[local_pos]} is not "
+                            f"on device {self.device}, but on {local_sharded_tensor.device}, "
+                            f"torch current device is {torch.cuda.current_device()}, "
+                            f"CUDA_VISIBLE_DEVICES is {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}"
                         )
-                        assert (
-                            key,
-                            shard_indices[local_pos],
-                        ) in self._temp_pinned_idx_mapping, (
-                            f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
-                        )
-                        # Non-contiguous shard: map to pinned memory
-                        pinned_slot, temp_desc_bytes = self._pinned_memory[
-                            (local_sharded_tensor.shape, local_sharded_tensor.dtype)
-                        ][self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]]
-                        assert pinned_slot.dtype == local_sharded_tensor.dtype, (
-                            f"Pinned slot {self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]} "
-                            f"has {pinned_slot.dtype} dtype, but the {key} shard {shard_indices[local_pos]} "
-                            f"requires {local_sharded_tensor.dtype} dtype."
-                        )
-                        assert pinned_slot.shape == local_sharded_tensor.shape, (
-                            f"Pinned slot {self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]} "
-                            f"has {pinned_slot.shape} shape, but the {key} shard {shard_indices[local_pos]} "
-                            f"requires {local_sharded_tensor.shape} shape."
-                        )
-                        contiguous_tensor = pinned_slot
+                    self._original_tensor_mapping[(key, shard_indices[local_pos])] = local_sharded_tensor
 
-                    # Store None in desc_bytes_list to indicate this shard uses temp memory
-                    desc_bytes_list.append(None)
-                    # Build the contiguous meta info
-                    contiguous_meta_info = NIXLShardMetaInfo(
-                        dtype=contiguous_tensor.dtype,
-                        device=contiguous_tensor.device,
-                        shape=contiguous_tensor.shape,
-                        stride=contiguous_tensor.stride(),
-                        is_contiguous=True,
+                    # Create meta info for shards
+                    is_contiguous = local_sharded_tensor.is_contiguous()
+                    meta_info = NIXLShardMetaInfo(
+                        dtype=local_sharded_tensor.dtype,
+                        device=local_sharded_tensor.device,
+                        shape=local_sharded_tensor.shape,
+                        stride=local_sharded_tensor.stride(),
+                        is_contiguous=is_contiguous,
                     )
-                    # Store temporary mappings
-                    self._temp_tensor_mapping[(key, shard_indices[local_pos])] = contiguous_tensor
-                    self._temp_desc_bytes_mapping[(key, shard_indices[local_pos])] = temp_desc_bytes
-                    self._temp_meta_mapping[(key, shard_indices[local_pos])] = contiguous_meta_info
+                    shard_meta_info_list.append(meta_info)
 
-            # Create the tensor descriptor info
-            tensor_infos[key] = NIXLTensorInfo(
-                desc_bytes_list=desc_bytes_list,
-                sharding=sharding,
-                shard_meta_infos=shard_meta_info_list,
+                    # Check if the shard is contiguous
+                    # psrl_logger.info(
+                    #     f"{self.client_name} key {key} shard {shard_indices[local_pos]} "
+                    #     f"register local tensor with shape {local_sharded_tensor.shape} and "
+                    #     f"dtype {local_sharded_tensor.dtype}, is_contiguous = {is_contiguous}"
+                    # )
+                    if not meta_only:
+                        if local_sharded_tensor.is_contiguous():
+                            # Contiguous shard: batch register
+                            if binded_meta_tensor_mapping is None:
+                                storage_key = self._record_region_registration(local_sharded_tensor)
+                            slice_addr = local_sharded_tensor.data_ptr()
+                            slice_len = local_sharded_tensor.numel() * local_sharded_tensor.element_size()
+                            if binded_meta_tensor_mapping is None:
+                                assert (
+                                    slice_addr >= storage_key[0]
+                                    and slice_addr + slice_len <= storage_key[0] + storage_key[1]
+                                ), (
+                                    f"{self.client_name}: key {key} shard {shard_indices[local_pos]} is contiguous, "
+                                    f"but contiguous slice address {slice_addr} is not within the registered "
+                                    f"region {storage_key[0]} - {storage_key[0] + storage_key[1]}."
+                                )
+                            device_id = local_sharded_tensor.get_device() if local_sharded_tensor.is_cuda else 0
+                            mem_type = "cuda" if local_sharded_tensor.is_cuda else "cpu"
+                            self.contig_desc_slice_map[(key, shard_indices[local_pos])] = (
+                                slice_addr,
+                                slice_len,
+                                device_id,
+                                mem_type,
+                            )
+                        else:
+                            if self.max_pinned_temp_memory_slots is None:
+                                # Non-contiguous shard: create temporary contiguous memory
+                                # Create a new contiguous tensor with the same shape and dtype
+                                contiguous_tensor = torch.empty_like(
+                                    local_sharded_tensor, device=self.device, memory_format=torch.contiguous_format
+                                )
+                                storage_key = self._record_region_registration(contiguous_tensor)
+                            else:
+                                assert self._pinned_memory is not None, (
+                                    f"Pinned memory is not initialized for {key} shard {shard_indices[local_pos]}, "
+                                    f"max_pinned_temp_memory_slots is {self.max_pinned_temp_memory_slots} and "
+                                    f"_uncontiguous_tensor_mapping is {_uncontiguous_tensor_mapping}."
+                                )
+                                assert (
+                                    local_sharded_tensor.shape,
+                                    local_sharded_tensor.dtype,
+                                ) in self._pinned_memory, (
+                                    f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
+                                )
+                                assert (
+                                    key,
+                                    shard_indices[local_pos],
+                                ) in self._temp_pinned_idx_mapping, (
+                                    f"Pinned memory does not have slot for {key} shard {shard_indices[local_pos]}."
+                                )
+                                # Non-contiguous shard: map to pinned memory
+                                pinned_slot = self._pinned_memory[
+                                    (local_sharded_tensor.shape, local_sharded_tensor.dtype)
+                                ][self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]]
+                                assert pinned_slot.dtype == local_sharded_tensor.dtype, (
+                                    f"Pinned slot {self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]} "
+                                    f"has {pinned_slot.dtype} dtype, but the {key} shard {shard_indices[local_pos]} "
+                                    f"requires {local_sharded_tensor.dtype} dtype."
+                                )
+                                assert pinned_slot.shape == local_sharded_tensor.shape, (
+                                    f"Pinned slot {self._temp_pinned_idx_mapping[(key, shard_indices[local_pos])]} "
+                                    f"has {pinned_slot.shape} shape, but the {key} shard {shard_indices[local_pos]} "
+                                    f"requires {local_sharded_tensor.shape} shape."
+                                )
+                                contiguous_tensor = pinned_slot
+                                storage_key = self._record_region_registration(contiguous_tensor)
+
+                            # Build the contiguous meta info
+                            contiguous_meta_info = NIXLShardMetaInfo(
+                                dtype=contiguous_tensor.dtype,
+                                device=contiguous_tensor.device,
+                                shape=contiguous_tensor.shape,
+                                stride=contiguous_tensor.stride(),
+                                is_contiguous=True,
+                            )
+                            # Store temporary mappings
+                            temp_slice_addr = contiguous_tensor.data_ptr()
+                            temp_slice_len = contiguous_tensor.numel() * contiguous_tensor.element_size()
+                            assert (
+                                temp_slice_addr >= storage_key[0]
+                                and temp_slice_addr + temp_slice_len <= storage_key[0] + storage_key[1]
+                            ), (
+                                f"{self.client_name}: key {key} shard {shard_indices[local_pos]} is non-contiguous, "
+                                f"but temporary slice address {temp_slice_addr} is not within the registered "
+                                f"region {storage_key[0]} - {storage_key[0] + storage_key[1]}."
+                            )
+                            self.temp_desc_slice_map[(key, shard_indices[local_pos])] = (
+                                temp_slice_addr,
+                                temp_slice_len,
+                                storage_key[2],
+                                storage_key[3],
+                            )
+                            self._temp_tensor_mapping[(key, shard_indices[local_pos])] = contiguous_tensor
+                            self._temp_meta_mapping[(key, shard_indices[local_pos])] = contiguous_meta_info
+
+                    # Placeholder for desc bytes, will be filled after global registration
+                    desc_bytes_list.append(None)
+                    temp_desc_bytes_list.append(None)
+
+                # Create the tensor descriptor info
+                tensor_infos[key] = NIXLTensorInfo(
+                    desc_bytes_list=desc_bytes_list,
+                    temp_desc_bytes_list=temp_desc_bytes_list,
+                    sharding=sharding,
+                    shard_meta_infos=shard_meta_info_list,
+                )
+
+            # Batch register all tensors and cache the reg list once.
+            if not meta_only and self._mtype_to_reg_region_lists:
+                for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
+                    if not reg_list:
+                        continue
+                    reg_list = self._merge_contiguous_regions(reg_list)
+                    self._mtype_to_reg_region_lists[mem_type] = reg_list
+                    reg_descs = self._register_memory(mem_type, reg_list)
+                    self._track_registered_desc(reg_descs)
+
+                for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
+                    slice_addr, slice_len, device_id, mem_type = slice_info
+                    desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
+                    tensor_infos[key].desc_bytes_list[tensor_infos[key].sharding.shard_indices.index(shard_idx)] = (
+                        desc_bytes
+                    )
+
+                for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
+                    slice_addr, slice_len, device_id, mem_type = slice_info
+                    desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
+                    self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
+                    tensor_infos[key].temp_desc_bytes_list[
+                        tensor_infos[key].sharding.shard_indices.index(shard_idx)
+                    ] = desc_bytes
+
+            # Create the client info
+            self.local_client_info = NIXLClientInfo(
+                name=self.client_name,
+                node_ip=get_local_ip(),
+                node_gpu_id=get_local_gpu_id(),
+                type=self.client_type,
+                tensor_infos=tensor_infos,
+                meta=self.agent.get_agent_metadata(),
+                client_group_id=self.client_group_id,
+                is_registered=not meta_only,
+            )
+            psrl_logger.debug(
+                f"Local client info is built, "
+                f"temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, "
+                f"temp meta mapping is: {self._temp_meta_mapping}"
             )
 
-        # Create the client info
-        self.local_client_info = NIXLClientInfo(
-            name=self.client_name,
-            node_ip=get_local_ip(),
-            node_gpu_id=get_local_gpu_id(),
-            type=self.client_type,
-            tensor_infos=tensor_infos,
-            meta=self.agent.get_agent_metadata(),
-            client_group_id=self.client_group_id,
-        )
-        psrl_logger.debug(
-            f"Local client info is built, "
-            f"temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, "
-            f"temp meta mapping is: {self._temp_meta_mapping}"
-        )
+            self._ensure_all_tensor_registered_high_level()
+            psrl_logger.info(f"{self.client_name} all local tensors are registered.")
+
+    def deregister_local_tensors(self):
+        """Deregister all local tensors"""
+        assert self.local_client_info is not None, "Local client info not registered."
+        # Deregister all registered regions.
+        self._deregister_all_descs()
+        if not self.enable_tms_for_temp_buffers:
+            self.release_temp_memory()
+
+            # Clear all mappings
+            self.local_client_info = None
+            self._original_tensor_mapping = {}
+            self._pinned_slot_running_read_xfer = {}
+            self._pinned_slot_running_write_xfer = {}
+            self._read_contiguous_event_cache = {}
+            self._write_contiguous_event_cache = {}
+            self.xfer_handles = {}
+            self._reg_regions = set()
+            self._mtype_to_reg_region_lists = {}
+            self.contig_desc_slice_map = {}
+
+        psrl_logger.debug(f"{self.client_name} deregistered all local tensors.")
 
     def connect_to_server(self, timeout: float = 600.0):
         """
@@ -614,8 +888,6 @@ class NIXLStorageClient:
         """Wait for the server temporary mappings to be fetched."""
         assert self.mode == "meta_server", "wait_for_server_temp_mappings only valid in meta_server mode"
         assert self._is_connected, "Not connected to server"
-        if self._all_temp_mappings_fetched:
-            return
         start = time.time()
         while True:
             notifs = self.agent.get_new_notifs()
@@ -625,44 +897,73 @@ class NIXLStorageClient:
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for temp mappings.")
             time.sleep(0.1)
-        self._all_temp_mappings_fetched = True
 
-    # --- storage_server mode read/write  ---
-    @deprecated("Use client_read instead")
-    def read(self, key: str, tag: str):
-        """
-        Read from the storage server.
-        """
-        if self.mode != "storage_server":
-            raise RuntimeError("read(key, tag) only valid in storage_server mode")
-        self.wait_for_server_info()
-        local_desc = self.local_client_info.get_tensor_desc(self.agent, 0).trim()
-        server_desc = self.server_client_info.get_tensor_desc(self.agent, 0).trim()
-        handle = self.agent.initialize_xfer("READ", local_desc, server_desc, self.server_name, tag)
-        if not handle:
-            raise RuntimeError(f"Creating READ transfer failed for key {key}.")
-        state = self.agent.transfer(handle)
-        if state == "ERR":
-            raise RuntimeError(f"Posting READ transfer failed for key {key}.")
-        self.xfer_handles[(key, tag, "READ")] = handle
+    def send_local_info_to(self, dst_agent_names: list[str]):
+        """Send local client info to specified destination agents (meta_server mode).
 
-    @deprecated("Use client_write instead")
-    def write(self, key: str, tag: str):
+        Args:
+            dst_agent_names: List of destination agent names.
         """
-        Write to the storage server.
+        assert self._is_connected, "Not connected to server"
+        payload_dict = {
+            self.client_name: {
+                "info": self.local_client_info.serialize(),
+                "temp_mapping": self._temp_desc_bytes_mapping,
+            }
+        }
+        payload = pickle.dumps(payload_dict)
+        for dst_agent_name in dst_agent_names:
+            self.agent.send_notif(dst_agent_name, payload)
+
+    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+        """Wait for updated client infos from other clients (meta_server mode).
+
+        Args:
+            expected_agents: Number of expected client infos to be updated.
+            timeout: Timeout in seconds.
         """
-        if self.mode != "storage_server":
-            raise RuntimeError("write(key, tag) only valid in storage_server mode")
-        self.wait_for_server_info()
-        local_desc = self.local_client_info.get_tensor_desc(self.agent, 0).trim()
-        server_desc = self.server_client_info.get_tensor_desc(self.agent, 0).trim()
-        handle = self.agent.initialize_xfer("WRITE", local_desc, server_desc, self.server_name, tag)
-        if not handle:
-            raise RuntimeError(f"Creating WRITE transfer failed for key {key}.")
-        state = self.agent.transfer(handle)
-        if state == "ERR":
-            raise RuntimeError(f"Posting WRITE transfer failed for key {key}.")
-        self.xfer_handles[(key, tag, "WRITE")] = handle
+        assert self._is_connected, "Not connected to server"
+        psrl_logger.info(f"{self.client_name}: Waiting for {expected_agents} updated client infos...")
+        start = time.time()
+        already_recved_agents = set()
+        while len(already_recved_agents) < expected_agents:
+            notifs = self.agent.get_new_notifs()
+            for agent_name, notif_list in notifs.items():
+                for notif in notif_list:
+                    try:
+                        multi_infos = pickle.loads(notif)
+                        assert isinstance(multi_infos, dict), f"Expected a dict of multi_infos, but got {multi_infos}"
+                        for client_name, info_and_temp_mapping in multi_infos.items():
+                            info = info_and_temp_mapping["info"]
+                            client_temp_mapping = info_and_temp_mapping["temp_mapping"]
+                            client_info = NIXLClientInfo.deserialize(info)
+                            self._all_client_infos[client_name] = client_info
+                            self._all_temp_mappings[client_name] = client_temp_mapping
+                        already_recved_agents.add(agent_name)
+                        psrl_logger.info(
+                            f"Already received {len(already_recved_agents)} agents: {already_recved_agents}"
+                        )
+                    except Exception:
+                        continue
+            if time.time() - start > timeout:
+                raise TimeoutError("Timeout waiting for agents.")
+            time.sleep(0.1)
+
+    def broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
+        """Broadcast updated client infos to specified destination agents (meta_server mode).
+
+        Args:
+            dst_agent_names: List of destination agent names.
+            update_client_names: List of client names whose infos are to be broadcasted.
+        """
+        payload_dict = {}
+        for client_name in update_client_names:
+            client_info = self._all_client_infos[client_name]
+            client_temp_mapping = self._all_temp_mappings[client_name]
+            payload_dict[client_name] = {"info": client_info.serialize(), "temp_mapping": client_temp_mapping}
+        payload = pickle.dumps(payload_dict)
+        for dst_agent_name in dst_agent_names:
+            self.agent.send_notif(dst_agent_name, payload)
 
     # --- meta_server mode: client-to-client read/write ---
     def _ensure_client_info_fetched(self, target_client: str):
@@ -703,9 +1004,13 @@ class NIXLStorageClient:
         local_info = self.local_client_info.get_tensor_info(key)
         shards_to_transfer = []
         if plan and self.client_type == NIXLClientType.PULL_SIDE:
-            pull_plan = plan.get_pull_plan(self.client_name, key)
+            pull_plan = plan.get_rollout_pull_plan(self.client_name, key)
             if target_client in pull_plan:
                 shards_to_transfer = pull_plan[target_client]
+        elif plan and self.client_type == NIXLClientType.PUSH_SIDE:
+            push_plan = plan.get_train_pull_plan(self.client_name, key)
+            if target_client in push_plan:
+                shards_to_transfer = push_plan[target_client]
         else:
             # Default behavior: align shards
             for shard_idx in local_info.sharding.shard_indices:
@@ -732,7 +1037,8 @@ class NIXLStorageClient:
                 meta_info = self._temp_meta_mapping[(key, shard_idx)]
                 assert meta_info.can_xfer_to(remote_info.shard_meta_infos[remote_pos]), (
                     f"Temporary shard meta info mismatch for key {key} shard {shard_idx}: "
-                    f"{meta_info} != {remote_info.shard_meta_infos[remote_pos]}"
+                    f"{meta_info} != {remote_info.shard_meta_infos[remote_pos]} "
+                    f"during client_read from {self.client_name} to {target_client}"
                 )
                 # Use temporary descriptor for non-contiguous shard
                 local_desc_bytes = self._get_temp_desc_bytes(self.client_name, key, shard_idx)
@@ -742,14 +1048,14 @@ class NIXLStorageClient:
                 if self.max_pinned_temp_memory_slots is not None:
                     pinned_idx = self._temp_pinned_idx_mapping[(key, shard_idx)]
                     slot_key = (meta_info.shape, meta_info.dtype, pinned_idx)
-                    if slot_key in self._pinned_slot_running_xfer:
+                    if slot_key in self._pinned_slot_running_read_xfer:
                         (
                             running_key,
                             running_tag,
                             running_op_type,
                             running_target_client,
                             running_shard_idx,
-                        ) = self._pinned_slot_running_xfer[slot_key]
+                        ) = self._pinned_slot_running_read_xfer[slot_key]
                         # start_time = time.time()
                         self.wait(
                             running_key,
@@ -763,7 +1069,7 @@ class NIXLStorageClient:
                         #     f"{self.client_name} read uncontiguous {(key, shard_idx)}, "
                         #     f"pinned slot {pinned_idx} is available, time: {end_time - start_time}s"
                         # )
-                    self._pinned_slot_running_xfer[slot_key] = (
+                    self._pinned_slot_running_read_xfer[slot_key] = (
                         key,
                         tag,
                         "READ",
@@ -774,19 +1080,20 @@ class NIXLStorageClient:
             # Get remote descriptor (check if it's a temporary one)
             remote_desc_bytes = remote_info.desc_bytes_list[remote_pos]
             if remote_desc_bytes is None:
-                raise NotImplementedError("Not implemented for non-contiguous shards on the remote side.")
-                # Use temporary descriptor for non-contiguous shard
-                remote_desc_bytes = self._get_temp_desc_bytes(target_client, key, remote_pos)
-                if remote_desc_bytes is None:
-                    raise RuntimeError(f"No remote temporary descriptor found for key {key} shard {shard_idx}")
+                raise RuntimeError(
+                    f"Remote descriptor must be contiguous for client read, "
+                    f"but found key {key} shard {shard_idx} is non-contiguous"
+                )
+                # if remote_desc_bytes is None:
+                #     raise RuntimeError(f"No remote temporary descriptor found for key {key} shard {shard_idx}")
 
             # Double check the shard size
             assert local_info.get_shard_size_bytes(local_pos) == remote_info.get_shard_size_bytes(remote_pos), (
                 f"Shard size mismatch for key {key} shard {shard_idx}: "
                 f"{local_info.get_shard_size_bytes(local_pos)} != {remote_info.get_shard_size_bytes(remote_pos)}"
             )
-            local_desc = self.agent.deserialize_descs(local_desc_bytes).trim()
-            remote_desc = self.agent.deserialize_descs(remote_desc_bytes).trim()
+            local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
+            remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
             # Contiguous xfer can be merged and executed together later
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
@@ -797,21 +1104,21 @@ class NIXLStorageClient:
                     assert (
                         running_key,
                         running_shard_idx,
-                    ) in self._contiguous_event_cache, (
+                    ) in self._read_contiguous_event_cache, (
                         f"Running key {running_key} shard {running_shard_idx} not found in contiguous event cache"
                     )
-                    self._contiguous_event_cache[(running_key, running_shard_idx)].synchronize()
-                    self._contiguous_event_cache.pop((running_key, running_shard_idx))
-                tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
-                if tag not in self.xfer_handles:
-                    self.xfer_handles[tag] = self.agent.initialize_xfer(
+                    self._read_contiguous_event_cache[(running_key, running_shard_idx)].synchronize()
+                    self._read_contiguous_event_cache.pop((running_key, running_shard_idx))
+                xfer_tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                if xfer_tag not in self.xfer_handles:
+                    self.xfer_handles[xfer_tag] = self.agent.initialize_xfer(
                         "READ",
                         local_desc,
                         remote_desc,
                         target_agent,
-                        make_xfer_tag(tag, self.client_name, target_client, key, shard_idx),
+                        xfer_tag,
                     )
-                handle = self.xfer_handles[tag]
+                handle = self.xfer_handles[xfer_tag]
             except Exception as e:
                 raise RuntimeError(
                     f"{self.client_name} creating client READ transfer to {target_client} failed for "
@@ -895,14 +1202,14 @@ class NIXLStorageClient:
                 if self.max_pinned_temp_memory_slots is not None:
                     pinned_idx = self._temp_pinned_idx_mapping[(key, shard_idx)]
                     slot_key = (meta_info.shape, meta_info.dtype, pinned_idx)
-                    if slot_key in self._pinned_slot_running_xfer:
+                    if slot_key in self._pinned_slot_running_write_xfer:
                         (
                             running_key,
                             running_tag,
                             running_op_type,
                             running_target_client,
                             running_shard_idx,
-                        ) = self._pinned_slot_running_xfer[slot_key]
+                        ) = self._pinned_slot_running_write_xfer[slot_key]
                         start_time = time.time()
                         self.wait(
                             running_key,
@@ -916,7 +1223,7 @@ class NIXLStorageClient:
                             f"{self.client_name} write uncontiguous {(key, shard_idx)}, "
                             f"pinned slot {pinned_idx} is available, time: {end_time - start_time}s"
                         )
-                    self._pinned_slot_running_xfer[slot_key] = (
+                    self._pinned_slot_running_write_xfer[slot_key] = (
                         key,
                         tag,
                         "WRITE",
@@ -924,9 +1231,9 @@ class NIXLStorageClient:
                         shard_idx,
                     )
                 # Copy data from original non-contiguous tensor to temporary contiguous tensor
-                self._contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
+                self._write_contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
                 contiguous_tensor.copy_(original_tensor.detach())
-                self._contiguous_event_cache[(key, shard_idx)].record()
+                self._write_contiguous_event_cache[(key, shard_idx)].record()
                 # Use temporary descriptor
                 local_desc_bytes = self._get_temp_desc_bytes(self.client_name, key, shard_idx)
                 if local_desc_bytes is None:
@@ -938,38 +1245,36 @@ class NIXLStorageClient:
             # Get remote descriptor (check if it's a temporary one)
             remote_desc_bytes = remote_info.desc_bytes_list[remote_pos]
             if remote_desc_bytes is None:
-                raise NotImplementedError("Not implemented for non-contiguous shards on the remote side.")
+                raise RuntimeError(
+                    f"Remote descriptor must be contiguous for client write, "
+                    f"but found key {key} shard {shard_idx} is non-contiguous"
+                )
                 # Use temporary descriptor for non-contiguous shard
-                remote_desc_bytes = self._get_temp_desc_bytes(target_client, key, shard_idx)
-                if remote_desc_bytes is None:
-                    raise RuntimeError(f"No remote temporary descriptor found for key {key} shard {shard_idx}")
+                # remote_desc_bytes = remote_info.temp_desc_bytes_list[remote_pos]
+                # if remote_desc_bytes is None:
+                #     raise RuntimeError(f"No remote temporary descriptor found for key {key} shard {shard_idx}")
 
             # Double check the shard size
             assert local_info.get_shard_size_bytes(local_pos) == remote_info.get_shard_size_bytes(remote_pos), (
                 f"Shard size mismatch for key {key} shard {shard_idx}: "
                 f"{local_info.get_shard_size_bytes(local_pos)} != {remote_info.get_shard_size_bytes(remote_pos)}"
             )
-            local_desc = self.agent.deserialize_descs(local_desc_bytes).trim()
-            remote_desc = self.agent.deserialize_descs(remote_desc_bytes).trim()
+            local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
+            remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("WRITE", local_desc, remote_desc, target_agent, tag, target_client))
                 return []
             # Real xfer
             try:
-                if (key, shard_idx) in self._contiguous_event_cache:
-                    self._contiguous_event_cache[(key, shard_idx)].synchronize()
-                    self._contiguous_event_cache.pop((key, shard_idx))
-                tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
-                # assert tag not in self.xfer_handles, f"Tag {tag} already in xfer_handles"
-                if tag not in self.xfer_handles:
-                    self.xfer_handles[tag] = self.agent.initialize_xfer(
-                        "WRITE",
-                        local_desc,
-                        remote_desc,
-                        target_agent,
-                        make_xfer_tag(tag, self.client_name, target_client, key, shard_idx),
+                if (key, shard_idx) in self._write_contiguous_event_cache:
+                    self._write_contiguous_event_cache[(key, shard_idx)].synchronize()
+                    self._write_contiguous_event_cache.pop((key, shard_idx))
+                xfer_tag = make_xfer_tag(tag, self.client_name, target_client, key, shard_idx)
+                if xfer_tag not in self.xfer_handles:
+                    self.xfer_handles[xfer_tag] = self.agent.initialize_xfer(
+                        "WRITE", local_desc, remote_desc, target_agent, xfer_tag
                     )
-                handle = self.xfer_handles[tag]
+                handle = self.xfer_handles[xfer_tag]
             except Exception as e:
                 raise RuntimeError(
                     f"{self.client_name} creating client WRITE transfer to {target_client} failed for "
@@ -987,6 +1292,14 @@ class NIXLStorageClient:
                     f"key {key} shard {shard_idx}."
                 )
         return shards_to_transfer
+
+    def clear_intermediate_cached_data(self):
+        """Clear intermediate cached data."""
+        self._pinned_slot_running_read_xfer.clear()
+        self._pinned_slot_running_write_xfer.clear()
+        self._read_contiguous_event_cache.clear()
+        self._write_contiguous_event_cache.clear()
+        self.xfer_handles.clear()
 
     # NOTE(lhy): This use low-level NIXL API to merge fragmented transfers into a single transfer,
     # which is more efficient than finishing each transfer individually.
@@ -1173,10 +1486,10 @@ class NIXLStorageClient:
             for shard_idx in waiting_shard_indices:
                 handle = self.xfer_handles.get(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
                 if handle is None:
-                    # psrl_logger.info(
-                    #     f"Transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
-                    #     f"from {self.client_name} to {target_client} not found, continue"
-                    # )
+                    psrl_logger.debug(
+                        f"Transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
+                        f"from {self.client_name} to {target_client} not found, continue"
+                    )
                     continue  # This shard did not do transfer
                 start = time.time()
                 while True:
@@ -1214,9 +1527,13 @@ class NIXLStorageClient:
                                         f"No temporary tensor mapping found for key {key} shard {shard_idx}"
                                     )
                                 # Copy data from temporary contiguous tensor back to original non-contiguous tensor
-                                self._contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
+                                self._read_contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
                                 original_tensor.copy_(contiguous_tensor)
-                                self._contiguous_event_cache[(key, shard_idx)].record()
+                                self._read_contiguous_event_cache[(key, shard_idx)].record()
+                                psrl_logger.debug(
+                                    f"Copied data from temporary contiguous tensor to original "
+                                    f"non-contiguous tensor for key {key} shard {shard_idx}"
+                                )
                         # NOTE(lhy): can keep the handle for future reuse
                         # but no obvious performance gain, so we just pop it here
                         self.xfer_handles.pop(make_xfer_tag(tag, self.client_name, target_client, key, shard_idx))
@@ -1226,20 +1543,168 @@ class NIXLStorageClient:
                             f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
                             f"from {self.client_name} to {target_client}"
                         )
-                    time.sleep(0.0001)
+                    # time.sleep(0.0001)
         else:
             raise ValueError(f"Unknown mode: {self.mode}")
 
+    def load_state_dict_into_registered_tensors(
+        self,
+        state_dict: dict[str, torch.Tensor],
+    ) -> None:
+        """
+        Copy weights from *state_dict* into the already-registered NIXL buffers.
+
+        This must be called **after** ``register_local_tensors()`` has completed so
+        that ``_original_tensor_mapping`` is fully populated and every meta-device
+        tensor has been replaced by a real allocated slice.
+
+        For each key in the client's registered tensor infos the method:
+
+        1.  Looks up the sharding that was used during ``register_local_tensors``
+            (stored in ``local_client_info.tensor_infos[key].sharding``).
+        2.  Calls ``sharding.get_local_sharded_tensors(src_tensor)`` to obtain the
+            exact same slices that were registered — i.e. it produces the same
+            ``len(shard_indices)`` sub-tensors in the same order.
+        3.  For each sub-tensor (shard) copies it into the corresponding registered
+            destination tensor retrieved from ``_original_tensor_mapping``.
+
+        If a key present in the client's registrations is **not** in *state_dict*,
+        a warning is emitted (it may be that this PS worker only holds a subset of
+        the model) and the key is skipped.
+
+        Args:
+            state_dict: ``{param_name: torch.Tensor}`` — full-precision weights
+                        loaded from the checkpoint.  The tensors will be cast to
+                        the registered dtype on-the-fly during ``copy_``.
+        """
+        assert self.local_client_info is not None, (
+            "load_state_dict_into_registered_tensors: local_client_info is None — call register_local_tensors() first."
+        )
+        assert self.local_client_info.is_registered, (
+            "load_state_dict_into_registered_tensors: local_client_info.is_registered is False — "
+            "register_local_tensors() must have been called with meta_only=False."
+        )
+
+        tensor_infos = self.local_client_info.tensor_infos
+        loaded = 0
+        missing = []
+
+        for key, tensor_info in tensor_infos.items():
+            if key not in state_dict:
+                missing.append(key)
+                continue
+
+            src_tensor = state_dict[key]
+            sharding = tensor_info.sharding
+
+            # Produce the same shards that were registered.
+            # For the default (no-op) sharding this returns [src_tensor] as-is.
+            src_shards = sharding.get_local_sharded_tensors(src_tensor)
+
+            assert len(src_shards) == len(sharding.shard_indices), (
+                f"[{self.client_name}] key={key!r}: sharding produced {len(src_shards)} shards "
+                f"but shard_indices has {len(sharding.shard_indices)} entries."
+            )
+
+            for local_pos, (shard_idx, src_shard) in enumerate(zip(sharding.shard_indices, src_shards)):
+                dst_tensor = self._original_tensor_mapping.get((key, shard_idx))
+                if dst_tensor is None:
+                    psrl_logger.warning(
+                        f"[{self.client_name}] key={key!r} shard_idx={shard_idx}: "
+                        f"not found in _original_tensor_mapping — skipping."
+                    )
+                    continue
+
+                # Shape must match the registered shard's shape.
+                assert src_shard.shape == dst_tensor.shape, (
+                    f"[{self.client_name}] key={key!r} shard_idx={shard_idx}: "
+                    f"src_shard.shape={tuple(src_shard.shape)} != "
+                    f"dst_tensor.shape={tuple(dst_tensor.shape)}. "
+                    f"src full shape={tuple(src_tensor.shape)}, "
+                    f"sharding={sharding.shard_mesh}."
+                )
+                # numel sanity (catches dtype/element-size confusion early)
+                assert src_shard.numel() == dst_tensor.numel(), (
+                    f"[{self.client_name}] key={key!r} shard_idx={shard_idx}: "
+                    f"src_shard.numel()={src_shard.numel()} != dst_tensor.numel()={dst_tensor.numel()}."
+                )
+                # copy_ handles device and dtype cast automatically.
+                dst_tensor.copy_(src_shard, non_blocking=False)
+
+            loaded += 1
+
+        if missing:
+            psrl_logger.warning(
+                f"[{self.client_name}] load_state_dict_into_registered_tensors: "
+                f"{len(missing)} key(s) not found in state_dict: "
+                f"{missing[:10]}{'...' if len(missing) > 10 else ''}"
+            )
+        psrl_logger.info(
+            f"[{self.client_name}] load_state_dict_into_registered_tensors: loaded {loaded}/{len(tensor_infos)} keys."
+        )
+
+    def log_shard_info(self, label: str = "", max_elements: int = 8):
+        """
+        Print detailed shard information for debugging push/pull precision issues.
+
+        For each (key, shard_idx) known to this client, logs:
+          - shard type: "contiguous" (from _original_tensor_mapping) or "temp" (from _temp_tensor_mapping)
+          - shard name (key) and shard indices
+          - tensor stats: shape, dtype, min/max/mean/norm and the first `max_elements` values
+
+        Args:
+            label: A descriptive label printed at the start (e.g. "BEFORE_PUSH").
+            max_elements: How many scalar values to print per shard.
+        """
+        all_keys: set[tuple[str, tuple[int, ...]]] = set(self._original_tensor_mapping.keys()) | set(
+            self._temp_tensor_mapping.keys()
+        )
+        psrl_logger.info(
+            f"[{self.client_name}] === log_shard_info [{label}] === "
+            f"total shards: {len(all_keys)} "
+            f"(uncontiguous: {len(self._temp_tensor_mapping)})"
+        )
+        for key, shard_idx in sorted(all_keys, key=lambda x: (x[0], x[1])):
+            # Determine type and pick the tensor
+            if (key, shard_idx) in self._temp_tensor_mapping:
+                shard_type = "uncontiguous"
+                temp_tensor = self._temp_tensor_mapping[(key, shard_idx)]
+            else:
+                shard_type = "contiguous"
+                temp_tensor = None
+            assert (key, shard_idx) in self._original_tensor_mapping, (
+                f"[{self.client_name}][{label}]: key={key!r}, shard_idx={shard_idx}, "
+                f"type={shard_type}, not found in _original_tensor_mapping"
+            )
+            tensor = self._original_tensor_mapping[(key, shard_idx)]
+
+            log_tensor(
+                tensor=tensor,
+                psrl_logger=psrl_logger,
+                log_prefix=f"{self.client_name}][{label}",
+                name="shard",
+                max_elements=max_elements,
+                key=key,
+                shard_idx=shard_idx,
+                shard_type=shard_type,
+                tensor_variant="original",
+            )
+            if temp_tensor is not None:
+                log_tensor(
+                    tensor=temp_tensor,
+                    psrl_logger=psrl_logger,
+                    log_prefix=f"{self.client_name}][{label}",
+                    name="shard",
+                    max_elements=max_elements,
+                    key=key,
+                    shard_idx=shard_idx,
+                    shard_type=shard_type,
+                    tensor_variant="temp",
+                )
+
     def shutdown(self):
         # Release temporary memory first
-        self.release_temp_memory()
-
-        if self.local_client_info:
-            for info in self.local_client_info.tensor_infos.values():
-                for local_pos in range(info.num_local_shards):
-                    # Only deregister if the descriptor is not None (not a temporary one)
-                    if info.desc_bytes_list[local_pos] is not None:
-                        self.agent.deregister_memory(info.get_desc(self.agent, local_pos))
+        self._deregister_all_descs()
 
 
 class NIXLMultiStorageClients:
@@ -1258,6 +1723,7 @@ class NIXLMultiStorageClients:
         nixl_config: DictConfig,
         nixl_interface: NIXLInterface | None = None,
         client_group_id: int = -1,  # -1 is the default client group
+        logging_path: str | None = None,
     ):
         self.agent_name = agent_name
         self.multi_client_names = multi_client_names
@@ -1291,6 +1757,7 @@ class NIXLMultiStorageClients:
                     nixl_interface,
                     binded_agent=self.agent,
                     client_group_id=client_group_id,
+                    logging_path=logging_path,
                 )
             )
 
@@ -1306,10 +1773,6 @@ class NIXLMultiStorageClients:
     def release_temp_memory(self):
         for client in self.multi_clients:
             client.release_temp_memory()
-
-    def reallocate_temp_memory(self):
-        for client in self.multi_clients:
-            client.reallocate_temp_memory()
 
     def connect_to_server(self, timeout: float = 600.0):
         assert not self._is_connected, "Already connected to server"
@@ -1390,7 +1853,18 @@ class NIXLMultiStorageClients:
         if len(self.multi_clients) > 1:
             for client in self.multi_clients[1:]:
                 client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
-                client._all_temp_mappings_fetched = True
+
+    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+        assert self._is_connected, "Not connected to server"
+        self.multi_clients[0].wait_for_update_infos(expected_agents, timeout)
+        if len(self.multi_clients) > 1:
+            for client in self.multi_clients[1:]:
+                client._all_client_infos = self.multi_clients[0]._all_client_infos
+                client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
+
+    def broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
+        assert self._is_connected, "Not connected to server"
+        self.multi_clients[0].broadcast_update_client_infos(dst_agent_names, update_client_names)
 
     def client_read(
         self,
@@ -1430,6 +1904,38 @@ class NIXLMultiStorageClients:
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
         client.wait(key, tag, op_type, target_client, timeout)
+
+    def log_shard_info(self, label: str = "", max_elements: int = 8):
+        """Call log_shard_info on every sub-client."""
+        for client in self.multi_clients:
+            client.log_shard_info(label=label, max_elements=max_elements)
+
+    def load_state_dict_into_clients(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        shared: bool = True,
+    ) -> None:
+        """
+        Load *state_dict* weights into all registered sub-clients.
+
+        When *shared* is True (train and gen clients point at the same
+        underlying buffers), the state_dict only needs to be written once —
+        into the first client — because the other client's
+        ``_original_tensor_mapping`` tensors share the same storage.
+
+        When *shared* is False each client receives an independent copy via
+        its own ``load_state_dict_into_registered_tensors`` call.
+
+        Args:
+            state_dict: ``{param_name: torch.Tensor}`` weights to load.
+            shared: Whether train/gen clients share underlying buffers.
+        """
+        if shared:
+            # Write only into the first client; the rest share storage.
+            self.multi_clients[0].load_state_dict_into_registered_tensors(state_dict)
+        else:
+            for client in self.multi_clients:
+                client.load_state_dict_into_registered_tensors(state_dict)
 
     def shutdown(self):
         # TODO(lhy): better shutdown logic

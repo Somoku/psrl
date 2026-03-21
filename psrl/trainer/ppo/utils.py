@@ -1,3 +1,4 @@
+import enum
 import warnings
 from dataclasses import dataclass, field
 from enum import Enum
@@ -17,14 +18,15 @@ from verl.utils.torch_functional import masked_mean
 
 
 class PSRL_Role(Enum):
-    Actor = 0
-    Rollout = 1
-    ActorRollout = 2
-    Critic = 3
-    RefPolicy = 4
-    RewardModel = 5
-    ActorRolloutRef = 6
-    DummyPolicy = 7
+    Actor = enum.auto()
+    Rollout = enum.auto()
+    ActorRollout = enum.auto()
+    Critic = enum.auto()
+    RefPolicy = enum.auto()
+    RewardModel = enum.auto()
+    ActorRolloutRef = enum.auto()
+    Validate = enum.auto()
+    DummyPolicy = enum.auto()
 
 
 @dataclass
@@ -35,6 +37,7 @@ class ResourcePoolManager:
 
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[PSRL_Role, list[str]]
+    resource_num_per_bundle: dict[str, int] = field(default_factory=dict)
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
@@ -51,7 +54,11 @@ class ResourcePoolManager:
             # For Megatron backend, we recommend using max_colocate_count>1
             # that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(
-                process_on_nodes=process_on_nodes, use_gpu=True, max_colocate_count=3, name_prefix=resource_pool_name
+                process_on_nodes=process_on_nodes,
+                use_gpu=True,
+                max_colocate_count=1,
+                name_prefix=resource_pool_name,
+                resource_num_per_bundle=self.resource_num_per_bundle.get(resource_pool_name, 1),
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -74,11 +81,18 @@ class ResourcePoolManager:
         }
 
         # check total required gpus can be satisfied
+        # Use a small epsilon to avoid false failure from float precision (e.g. 64.0 vs 64.00000000000004)
+        # when resource_num_per_bundle has floats like 0.9/0.1; real shortages (e.g. 64.9) still fail.
+        _GPU_EPS = 1e-9
         total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
-            [n_gpus for process_on_nodes in self.resource_pool_spec.values() for n_gpus in process_on_nodes]
+            [
+                n_gpus * self.resource_num_per_bundle.get(resource_pool_name, 1)
+                for resource_pool_name, process_on_nodes in self.resource_pool_spec.items()
+                for n_gpus in process_on_nodes
+            ]
         )
-        if total_available_gpus < total_required_gpus:
+        if total_available_gpus < total_required_gpus - _GPU_EPS:
             raise ValueError(
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )

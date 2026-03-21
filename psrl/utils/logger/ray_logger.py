@@ -34,6 +34,7 @@ class EventType(Enum):
     GEN = "GEN"
     VAL = "VAL"
     WAIT = "WAIT"
+    SWITCH = "SWITCH"
     OTHER = "OTHER"
 
 

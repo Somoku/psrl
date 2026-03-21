@@ -50,7 +50,6 @@ class MegatronConverter(BaseConverter):
         local_to_global_maps = [
             self.bridge._weight_name_mapping_mcore_local_to_global(model, consider_ep=True) for model in models
         ]
-        # print(f"Unwrapped models: {models}")
 
         def get_model_chunk_generator():
             for vpp_rank, model in enumerate(models):
@@ -71,12 +70,11 @@ class MegatronConverter(BaseConverter):
                     yield vpp_rank, name, model.state_dict()[name]
 
         for vpp_rank, name, param in get_model_chunk_generator():
-            # print(f"Converting parameter: {name}")
             # refactor the name to global name
             local_to_global_map = local_to_global_maps[vpp_rank]
-            name = local_to_global_map[name]
-            new_params = self.convert_parameter(name, param)
-            sharding = self.get_sharding_for_param(name, param)
+            global_name = local_to_global_map[name]
+            new_params = self.convert_parameter(global_name, param)
+            sharding = self.get_sharding_for_param(global_name, param)
             for new_param_name, new_param in new_params.items():
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding
@@ -97,9 +95,15 @@ class MegatronConverter(BaseConverter):
         """
         Convert the parameter, may need to split inplace
         if it matches a split mapping type (e.g., qkv_proj, gate_up_proj).
+
+        Args:
+            full_name: The full parameter name in Megatron model
+            param: The parameter tensor
+        Returns:
+            A dict of {new_param_name: new_param_tensor}
         """
         full_hf_names = self.bridge._weight_name_mapping_mcore_to_hf(full_name)
-        # print(f"convert parameter {full_name} to {full_hf_names}")
+
         if len(full_hf_names) == 3:
             assert "linear_qkv" in full_name, "Only linear_qkv should have 3 corresponding hf names after split"
             try:

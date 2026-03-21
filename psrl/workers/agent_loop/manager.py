@@ -4,6 +4,8 @@ import os
 from collections import Counter
 
 import numpy as np
+import ray
+import requests
 import torch
 from omegaconf import DictConfig
 from tensordict import TensorDict
@@ -22,6 +24,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import AsyncBusyPollingRayLock
+from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
 
@@ -36,6 +39,7 @@ class PSRL_AgentLoopManager:
         data_queue_size: int,
         agent_loop_workers,
         ps_manager_handle,
+        rollout_gateway_url,
         group_post_process_fn=None,
         buffer_post_process_fn=None,
     ):
@@ -69,6 +73,7 @@ class PSRL_AgentLoopManager:
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
+        self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
 
         if self.config.psrl.redundant_rollout.enable:
             self.entries_per_buffer = self.config.psrl.redundant_rollout.redundant_global_batch_size
@@ -77,7 +82,8 @@ class PSRL_AgentLoopManager:
             self.entries_per_buffer = self.config.psrl.staleness_buffer_entries
             self.ready_entries_per_buffer = self.config.psrl.staleness_buffer_entries
 
-        self.data_queue = asyncio.Queue(maxsize=data_queue_size)
+        self.train_data_queue = asyncio.Queue(maxsize=data_queue_size)
+        self.val_data_queue = asyncio.Queue(maxsize=data_queue_size)
         # result_queue_size = self.entries_per_buffer * self.rollout_n * (self.staleness + 1)
         # self.result_queue = asyncio.Queue(maxsize=result_queue_size)
         self.result_queue = asyncio.Queue()
@@ -87,28 +93,45 @@ class PSRL_AgentLoopManager:
         self._request_counter = 0  # For version tag setting
 
         self._dispatch_idx = 0
+        self._val_buffer_id = 0
         self.running_loop = None
-        self.dispatch_task = None
+        self.train_dispatch_task = None
+        self.val_dispatch_task = None
         self.collect_task = None
-        self.stop_dispatch_task = False
+        self.stop_train_dispatch_task = False
+        self.stop_val_dispatch_task = False
         self.stop_collect_task = False
 
         self.curr_ps_version_tag = 0
 
         # Data
         self.data_pool: dict[int, DataProto] = {}  # Maps request_id to stored/occupied DataProto
-        self.data_buffers: dict[int, DataProto] = {}  # data of READY buffer in ps manager
-        self.accumulated_buffers: dict[
+
+        # Training data buffers
+        self.train_data_buffers: dict[int, DataProto] = {}  # data of READY buffer in ps manager
+        self.train_accumulated_buffers: dict[
             int, dict[int, list[EntryInfo]]
         ] = {}  # Maps buffer_id to dict of model_version to READY entry_info list
-        self.accumulated_buffer_size: dict[int, int] = {}  # Maps buffer id to current accumulated size
+        self.train_accumulated_buffer_size: dict[int, int] = {}  # Maps buffer id to current accumulated size
         self.abort_occupied_entries: dict[int, list[int]] = {}
 
+        # Validation data buffers
+        self.val_data_buffers: dict[int, DataProto] = {}  # data of READY buffer in ps manager
+        self.val_accumulated_buffers: dict[
+            int, dict[int, list[EntryInfo]]
+        ] = {}  # Maps buffer_id to dict of model_version to READY entry_info list
+        self.val_accumulated_buffer_size: dict[int, int] = {}  # Maps buffer id to current accumulated size
+        self.val_buffer_size = None  # Set by main trainer when starting validation
+
         # Set of buffer ids that have been logged as ready, to avoid duplicate logging
-        self.logged_ready_buffer_ids: set[int] = set()
+        self.logged_ready_train_buffer_ids: set[int] = set()
+        self.logged_ready_val_buffer_ids: set[int] = set()
 
         # Waiting lists for training batches
-        self._buffer_waiters: dict[
+        self._train_buffer_waiters: dict[
+            int, list[asyncio.Future]
+        ] = {}  # Maps buffer IDs to a set of futures waiting for that buffer
+        self._val_buffer_waiters: dict[
             int, list[asyncio.Future]
         ] = {}  # Maps buffer IDs to a set of futures waiting for that buffer
 
@@ -123,15 +146,35 @@ class PSRL_AgentLoopManager:
         self._non_tensor_batch_keys = None
         self._meta_info_keys = None
 
+        if self.config.psrl.server_rollout.enable:
+            # Get server addresses from rollout gateway
+            response = requests.get(f"{rollout_gateway_url}/list_workers")
+            response.raise_for_status()
+            engines = response.json().get("engines", {})
+            server_addresses = [addr for addr in engines.values()]
+            rollout_config = self.config.gen_actor_rollout_ref.rollout
+
+            # Update Prometheus configuration with server addresses
+            if rollout_config.prometheus.enable:
+                if rollout_config.disable_log_stats:
+                    raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
+                update_prometheus_config(rollout_config.prometheus, server_addresses)
+
         # Build logger
         self.log_prefix = "AgentLoopManager"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
 
+    def set_val_buffer_size(self, val_buffer_size: int):
+        """Set the validation buffer size."""
+        self.val_buffer_size = val_buffer_size
+
     async def start_busy_loop(self):
         """Start the busy loop for continuous data processing from the queue."""
         if (
-            self.dispatch_task is not None
-            and not self.dispatch_task.done()
+            self.train_dispatch_task is not None
+            and not self.train_dispatch_task.done()
+            or self.val_dispatch_task is not None
+            and not self.val_dispatch_task.done()
             or self.collect_task is not None
             and not self.collect_task.done()
         ):
@@ -145,22 +188,31 @@ class PSRL_AgentLoopManager:
 
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
-        self.dispatch_task = self.running_loop.create_task(self._dispatch_data())
-        self.dispatch_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        self.train_dispatch_task = self.running_loop.create_task(self._train_dispatch_data())
+        self.train_dispatch_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
+        self.val_dispatch_task = self.running_loop.create_task(self._val_dispatch_data())
+        self.val_dispatch_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
         self.collect_task = self.running_loop.create_task(self._collect_results())
         self.collect_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""
-        if (not self.dispatch_task or self.dispatch_task.done()) and (
-            not self.collect_task or self.collect_task.done()
+        if (
+            (not self.train_dispatch_task or self.train_dispatch_task.done())
+            and (not self.val_dispatch_task or self.val_dispatch_task.done())
+            and (not self.collect_task or self.collect_task.done())
         ):
             return
 
-        self.stop_dispatch_task = True
+        self.stop_train_dispatch_task = True
+        self.stop_val_dispatch_task = True
         self.stop_collect_task = True
         # Wait for the background task to finish
-        await asyncio.gather(self.dispatch_task, self.collect_task)
+        await asyncio.gather(
+            self.train_dispatch_task,
+            self.val_dispatch_task,
+            self.collect_task,
+        )
 
         # Stop the busy loop of agent loop workers
         futures = []
@@ -168,9 +220,30 @@ class PSRL_AgentLoopManager:
             futures.append(worker.stop_busy_loop.remote())
         await asyncio.gather(*futures)
 
-    async def put_data(self, data: DataProto):
+    async def put_data(self, data: DataProto, is_validate: bool = False):
         """Put data into the manager's data queue."""
-        await self.data_queue.put(data)
+        if is_validate:
+            await self.val_data_queue.put(data)
+        else:
+            await self.train_data_queue.put(data)
+            
+    async def generate_validate_sequences(self, data: DataProto) -> int:
+        """Generate validation sequences by adding data to the validation data queue.
+
+        Args:
+            data (DataProto): Data to be dispatched for validation sequence generation.
+        Returns:
+            The ID of the generated validation buffer.
+        """
+        batch_size = len(data) // self.val_rollout_n
+        for i in range(batch_size):
+            await self.ps_manager_handle.add_request.remote(
+                data.non_tensor_batch["uid"][i * self.val_rollout_n : (i + 1) * self.val_rollout_n].tolist(),
+                is_validate=True,
+            )
+            await self.put_data(data[i * self.val_rollout_n : (i + 1) * self.val_rollout_n], is_validate=True)
+        self._val_buffer_id += 1
+        return self._val_buffer_id - 1
 
     def _post_process(self, inputs: DataProto) -> DataProto:
         """Post-process the generated outputs to create properly formatted tensors.
@@ -180,7 +253,6 @@ class PSRL_AgentLoopManager:
 
         Args:
             inputs (DataProto): Raw generation outputs.
-
         Returns:
             DataProto: Formatted data ready for training.
         """
@@ -370,9 +442,10 @@ class PSRL_AgentLoopManager:
         if multi_modal_inputs is not None:
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
 
-        meta_info = {}
-        # Reward processing
-        if not self.config.reward_model.launch_reward_fn_async:
+        meta_info = inputs.meta_info
+        is_validate = meta_info.get("validate", False)
+        # Reward processing. Only for training data.
+        if not is_validate and not self.config.reward_model.launch_reward_fn_async:
             ## psrl_logger.info("Reward processing begin")
             scores = inputs.non_tensor_batch.pop("reward_scores", None).tolist()
             prompt_length = prompt_ids.size(1)
@@ -386,51 +459,85 @@ class PSRL_AgentLoopManager:
             reward_extra_keys = list(reward_extra_infos[0].keys())
             for key in reward_extra_keys:
                 non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
-            meta_info = {"reward_extra_keys": reward_extra_keys}
+            meta_info["reward_extra_keys"] = reward_extra_keys
 
         ## psrl_logger.info("Return data proto")
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
-    async def _dispatch_data(self):
+    async def _train_dispatch_data(self):
         """Main dispatch loop that processes data from the queue and routes to workers."""
-        while not self.stop_dispatch_task:
-            while not self.data_queue.empty():
-                data = await self.data_queue.get()
-                # Receive END signal to stop processing data queue
-                if data is None:
-                    self.stop_dispatch_task = True
-                    continue
-                
-                if not self._data_keys_initialized:
-                    self._data_keys_initialized = True
-                    self._batch_keys = list(data.batch.keys())
-                    self._non_tensor_batch_keys = list(data.non_tensor_batch.keys())
-                    self._meta_info_keys = list(data.meta_info.keys())
-                    psrl_logger.info(f"Data keys initialized: batch keys are {self._batch_keys}, non_tensor_batch keys are {self._non_tensor_batch_keys}, meta_info keys are {self._meta_info_keys}")
-                
-                batch_size = len(data)
-                self._request_counter += batch_size
-                psrl_logger.debug(f"Got {len(data)} requests from data queue")
+        while not self.stop_train_dispatch_task:
+            if not self.train_data_queue.empty():
+                data = self.train_data_queue.get_nowait()
+            else:
+                await asyncio.sleep(0) # Yield control to the event loop
+                continue
 
-                # Wait for version update in ps
-                # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
-                expected_ps_version = self._get_expected_ps_version()
-                if expected_ps_version > self.curr_ps_version_tag:
-                    psrl_logger.debug(f"Waiting for ps model version: {expected_ps_version}")
-                    # Busy polling until the PS worker has the needed model version
-                    while (
-                        await self.ps_manager_handle.get_ps_model_version.remote(debug_info="agent_loop_manager")
-                    ) < expected_ps_version:
-                        await asyncio.sleep(0.1)
-                    self.curr_ps_version_tag = expected_ps_version
-                    psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
+            # Receive END signal to stop processing data queue
+            if data is None:
+                psrl_logger.info("Received END signal, stopping agent loop manager train dispatch task.")
+                self.stop_train_dispatch_task = True
+                continue
+                
+            if not self._data_keys_initialized:
+                self._data_keys_initialized = True
+                self._batch_keys = list(data.batch.keys())
+                self._non_tensor_batch_keys = list(data.non_tensor_batch.keys())
+                self._meta_info_keys = list(data.meta_info.keys())
+                psrl_logger.info(f"Data keys initialized: batch keys are {self._batch_keys}, non_tensor_batch keys are {self._non_tensor_batch_keys}, meta_info keys are {self._meta_info_keys}")
+                
+            is_validate = data.meta_info.get("validate", False)
+            assert not is_validate, "Training data must have validate=False in meta_info"
+            batch_size = len(data)
+            self._request_counter += batch_size
+            psrl_logger.debug(f"Got {len(data)} requests from data queue")
+
+            # Wait for version update in ps
+            # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
+            expected_ps_version = self._get_expected_ps_version()
+            if expected_ps_version > self.curr_ps_version_tag:
+                psrl_logger.debug(f"Waiting for ps model version: {expected_ps_version}")
+                # Busy polling until the PS worker has the needed model version
+                while (
+                    await self.ps_manager_handle.get_ps_model_version.remote(debug_info="agent_loop_manager")
+                ) < expected_ps_version:
+                    await asyncio.sleep(0.1)
+                self.curr_ps_version_tag = expected_ps_version
+                psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
                  
-                # Initialize the version tag to -1 for all requests   
-                data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
+            # Initialize the version tag to -1 for all requests 
+            # The version tag will be updated after routing to the instance  
+            data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
+            # Dispatch data to agent loop workers
+            await self._inner_dispatch_data(data, is_validate) 
+            
+        psrl_logger.info("Agent loop manager train dispatch task stopped.")
+            
+    async def _val_dispatch_data(self):
+        """Main dispatch loop that processes data from the queue and routes to workers."""
+        while not self.stop_val_dispatch_task:
+            if not self.val_data_queue.empty():
+                data = self.val_data_queue.get_nowait()
+            else:
+                await asyncio.sleep(0) # Yield control to the event loop
+                continue
 
-                # Dispatch data to agent loop workers
-                await self._inner_dispatch_data(data)
-            await asyncio.sleep(0)  # Yield control to the event loop
+            # Receive END signal to stop processing data queue
+            if data is None:
+                psrl_logger.info("Received END signal, stopping agent loop manager validation dispatch task.")
+                self.stop_val_dispatch_task = True
+                continue
+
+            is_validate = data.meta_info.get("validate", False)
+            assert is_validate, "Validation data must have validate=True in meta_info"
+            batch_size = len(data)
+            # Initialize the version tag to the current PS version tag
+            # This means the instance used to validate should have a version at least equal to the current PS version
+            data.non_tensor_batch["version_tag"] = np.array([self.curr_ps_version_tag] * batch_size)
+            # Dispatch data to agent loop workers
+            await self._inner_dispatch_data(data, is_validate)
+
+        psrl_logger.info("Agent loop manager validation dispatch task stopped.")
 
     async def _retry_data(self, data: DataProto | None = None):
         """Notify the agent loop manager to retry processing some data.
@@ -438,11 +545,11 @@ class PSRL_AgentLoopManager:
         Args:
             data (DataProto | None): Data to be retried. If None, the new data from the data queue will be used.
         """
-        if self.running_loop and not self.stop_dispatch_task:
+        if self.running_loop and not self.stop_train_dispatch_task:
             # If data is None, the new data from the data queue will be used.
             if data is None:
-                if not self.data_queue.empty():
-                    data = await self.data_queue.get()
+                if not self.train_data_queue.empty():
+                    data = await self.train_data_queue.get()
                     batch_size = len(data)
                     if data is None:
                         raise ValueError("Data queue should not contain None when retrying requests.")
@@ -475,17 +582,21 @@ class PSRL_AgentLoopManager:
         expected_ps_version = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
         return expected_ps_version
 
-    async def _inner_dispatch_data(self, data: DataProto):
+    async def _inner_dispatch_data(self, data: DataProto, is_validate: bool = False):
         """Dispatch data to agent loop workers in a round-robin manner.
         Args:
             data (DataProto): Input data.
+            is_validate (bool): Whether the data is for validation.
         """
 
-        # Update request status from PENDING to RUNNING 
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        # Update request status from PENDING to RUNNING
+        version_tags = data.non_tensor_batch["version_tag"]
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             data.non_tensor_batch["uid"].tolist(),
             PSRL_RequestStatus.RUNNING,
-            model_version=data.non_tensor_batch["version_tag"].tolist(),
+            model_version=version_tags.tolist(),
+            is_validate=is_validate,
         )
         dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
         if not dispatch_request_idxs:
@@ -499,7 +610,7 @@ class PSRL_AgentLoopManager:
                 continue
 
             # Dispatch data to the corresponding worker
-            for i in range(self.rollout_n):
+            for i in range(rollout_n):
                 self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i : i + 1])
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
@@ -507,13 +618,14 @@ class PSRL_AgentLoopManager:
 
         Args:
             data (DataProto): Data to be distributed.
-
         Returns:
             dict[int, DataProto]: Mapping of worker index to assigned data.
         """
         dispatch_plan = {}
         prompt_to_worker = {}
-        if self.rollout_n > 1:
+        is_validate = data.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        if rollout_n > 1:
             assert "parent_id" in data.non_tensor_batch, "parent_id not found in data"
             prompt_ids = data.non_tensor_batch["parent_id"].tolist()
         else:
@@ -578,21 +690,26 @@ class PSRL_AgentLoopManager:
                     request_data[i : i + 1],
                 )
 
+            is_validate = request_data.meta_info.get("validate", False)
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+            alg_rollout_n = self.val_rollout_n if is_validate else self.alg_rollout_n
+
             ready_buffer_ids = set()  # Buffer IDs that are READY after occupation
             occupy_futures = []
             abort_request_ids = [] # Used to abort requests in the data pool
             
             # 1. Judge whether to abort requests and occupy requests in the PS worker
-            if self.rollout_n > 1:
+            if rollout_n > 1:
                 sample_ids = request_data.non_tensor_batch["parent_id"].tolist()
                 for i, sample_id in enumerate(sample_ids):
                     if sample_id not in self.rollout_request_tracker:
                         self.rollout_request_tracker[sample_id] = []
                     entry_info = EntryInfo(
                         rollout_instance_id=int(request_data.non_tensor_batch["rollout_instance_id"][i]),
-                        request_idx=int(request_data.non_tensor_batch["uid"][i]) % self.rollout_n,
+                        request_idx=int(request_data.non_tensor_batch["uid"][i]) % rollout_n,
                         prompt_id=int(request_data.non_tensor_batch["parent_id"][i]),
                         model_version=request_data.non_tensor_batch["version_tag"][i],
+                        is_validate=is_validate,
                     )
                     self.rollout_request_tracker[sample_id].append(entry_info)
                     psrl_logger.debug(
@@ -604,9 +721,9 @@ class PSRL_AgentLoopManager:
                 unique_sample_ids = set(sample_ids)
                 prompt_to_occupy_requests = {}
                 for sample_id in unique_sample_ids:
-                    if len(self.rollout_request_tracker[sample_id]) >= self.alg_rollout_n:
+                    if len(self.rollout_request_tracker[sample_id]) >= alg_rollout_n:
                         psrl_logger.debug(
-                            f"Reached/Required: ({len(self.rollout_request_tracker[sample_id])}/{self.alg_rollout_n}) "
+                            f"Reached/Required: ({len(self.rollout_request_tracker[sample_id])}/{alg_rollout_n}) "
                             f"samples for prompt {sample_id}"
                         )
                         entry_infos = self.rollout_request_tracker.pop(sample_id)
@@ -615,15 +732,16 @@ class PSRL_AgentLoopManager:
                             f"entry count: {len(entry_infos)}"
                         )
 
-                        all_child_idxs = set(range(self.rollout_n))
+                        all_child_idxs = set(range(rollout_n))
                         stored_child_idxs = {entry_info.request_idx for entry_info in entry_infos}
                         abort_child_idxs = all_child_idxs - stored_child_idxs
-                        abort_child_ids = [sample_id * self.rollout_n + idx for idx in abort_child_idxs]
-                        stored_child_ids = [sample_id * self.rollout_n + idx for idx in stored_child_idxs]
+                        abort_child_ids = [sample_id * rollout_n + idx for idx in abort_child_idxs]
+                        stored_child_ids = [sample_id * rollout_n + idx for idx in stored_child_idxs]
                         psrl_logger.debug(f"Stored child IDs: {stored_child_ids}, Abort child IDs: {abort_child_ids}")
 
                         # Notify the request status manager to abort the child requests
                         if abort_child_ids:
+                            assert not is_validate, "Abort child requests should not happen in validation"
                             psrl_logger.info(f"Aborting child requests {abort_child_ids} for sample {sample_id}.")
                             with log_dual_events(
                                 f"Abort {len(abort_child_ids)} requests",
@@ -638,14 +756,15 @@ class PSRL_AgentLoopManager:
                         # Abort the extra entries beyond alg_rollout_n
                         abort_request_ids.extend(
                             [
-                                sample_id * self.rollout_n + entry_info.request_idx
-                                for entry_info in entry_infos[self.alg_rollout_n :]
+                                sample_id * rollout_n + entry_info.request_idx
+                                for entry_info in entry_infos[alg_rollout_n:]
                             ]
                         )
 
-                        alg_entry_infos = entry_infos[: self.alg_rollout_n]
+                        alg_entry_infos = entry_infos[:alg_rollout_n]
                         add_data = True
-                        if self.group_post_process_fn:
+                        # Perform group post-processing for training data only
+                        if not is_validate and self.group_post_process_fn:
                             add_data = await self._group_post_process(alg_entry_infos)
 
                         if not add_data:
@@ -656,18 +775,19 @@ class PSRL_AgentLoopManager:
                                 f"prompt {sample_id}. Retrying immediately."
                             )
                             # Clear the reserved entries for the group entry
-                            await self.ps_manager_handle.clear_reserved_entries.remote(sample_id)
+                            await self.ps_manager_handle.clear_reserved_entries.remote(sample_id, is_validate)
                             # Notify agent loop manager to retry new requests
                             await self._retry_data()
                         else:
                             prompt_to_occupy_requests[sample_id] = alg_entry_infos
                             request_ids = [
-                                sample_id * self.rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
+                                sample_id * rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
                             ]
                             occupy_futures.append(
                                 self.ps_manager_handle.occupy_rollout_instance_request.remote(
                                     prompt_id=sample_id,
                                     request_ids=request_ids,
+                                    is_validate=is_validate
                                 )
                             )
             # Without group sampling (e.g., PPO)
@@ -679,6 +799,7 @@ class PSRL_AgentLoopManager:
                     occupy_futures.append(
                         self.ps_manager_handle.occupy_rollout_instance_request.remote(
                             prompt_id=request_id,
+                            is_validate=is_validate
                         )
                     )
 
@@ -706,42 +827,50 @@ class PSRL_AgentLoopManager:
                     f"buffer {buffer_id} with occupy_num {occupy_num}."
                 )
 
-                if self.rollout_n > 1:
+                if rollout_n > 1:
                     alg_entry_infos = prompt_to_occupy_requests.pop(prompt_entry_info.prompt_id, None)
                     request_ids = [
-                        prompt_entry_info.prompt_id * self.rollout_n + entry_info.request_idx
+                        prompt_entry_info.prompt_id * rollout_n + entry_info.request_idx
                         for entry_info in alg_entry_infos
                     ]
                 else:
                     request_ids = [prompt_entry_info.prompt_id + prompt_entry_info.request_idx]
 
                 # Accumulate data
-                if buffer_id not in self.accumulated_buffers:
-                    self.accumulated_buffers[buffer_id] = {}
-                    self.accumulated_buffer_size[buffer_id] = 0
+                accumulated_buffers = (
+                    self.val_accumulated_buffers if is_validate else self.train_accumulated_buffers
+                )
+                accumulated_buffer_size = (
+                    self.val_accumulated_buffer_size if is_validate else self.train_accumulated_buffer_size
+                )
+                expected_buffer_size = self.val_buffer_size if is_validate else self.ready_entries_per_buffer
+                
+                if buffer_id not in accumulated_buffers:
+                    accumulated_buffers[buffer_id] = {}
+                    accumulated_buffer_size[buffer_id] = 0
                 model_version = prompt_entry_info.get_entry_version()
-                if model_version not in self.accumulated_buffers[buffer_id]:
-                    self.accumulated_buffers[buffer_id][model_version] = []
-                self.accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
-                self.accumulated_buffer_size[buffer_id] += 1
+                if model_version not in accumulated_buffers[buffer_id]:
+                    accumulated_buffers[buffer_id][model_version] = []
+                accumulated_buffers[buffer_id][model_version].append(prompt_entry_info)
+                accumulated_buffer_size[buffer_id] += 1
                 psrl_logger.info(
-                    f"Accumulated buffer {buffer_id} size: "
-                    f"{self.accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer}"
+                    f"Accumulated {'VALIDATION' if is_validate else 'TRAINING'} buffer {buffer_id} size: "
+                    f"{accumulated_buffer_size[buffer_id]}/{expected_buffer_size}"
                 )
                 
                 # Check if the buffer is the earliest waiting buffer
                 # If so, handle the waiting buffer using the abort and truncate strategy
-                if self._buffer_waiters:
-                    min_waiter_buffer_id = min(self._buffer_waiters.keys())
-                    if min_waiter_buffer_id == buffer_id:
+                if self._train_buffer_waiters and not is_validate:
+                    min_train_waiter_buffer_id = min(self._train_buffer_waiters.keys())
+                    if min_train_waiter_buffer_id == buffer_id:
                         await self.handle_waiting_buffer(buffer_id)
 
                 # Check for READY buffers
                 if (
-                    self.accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer
+                    accumulated_buffer_size[buffer_id] == expected_buffer_size
                     and buffer_id not in ready_buffer_ids
                 ):
-                    psrl_logger.info(f"Add buffer {buffer_id} to ready_buffer_ids")
+                    psrl_logger.info(f"Add {'VALIDATION' if is_validate else 'TRAINING'} buffer {buffer_id} to ready_buffer_ids with {occupy_num=}")
                     ready_buffer_ids.add(buffer_id)
 
             # 4. Process abort requests
@@ -752,36 +881,42 @@ class PSRL_AgentLoopManager:
             for buffer_id in sorted(list(ready_buffer_ids)):
                 # Collect all prompt entry infos for the buffer
                 prompt_entry_infos = []
-                for model_version in sorted(list(self.accumulated_buffers[buffer_id].keys())):
-                    prompt_entry_infos.extend(self.accumulated_buffers[buffer_id][model_version])
+                for model_version in sorted(list(accumulated_buffers[buffer_id].keys())):
+                    prompt_entry_infos.extend(accumulated_buffers[buffer_id][model_version])
                 # Get the data buffer from the data pool
-                data_buffer = self.get_buffer_from_data_pool(prompt_entry_infos)
+                data_buffer = self.get_buffer_from_data_pool(prompt_entry_infos, sort_by_prompt_id=is_validate)
                 # Apply buffer post-processing if exists and add to data_buffers
-                add_buffer = self.maybe_add_buffer(buffer_id, data_buffer)
+                add_buffer = self.maybe_add_buffer(buffer_id, data_buffer, is_validate)
                 if add_buffer:
-                    psrl_logger.info(f"Buffer {buffer_id} is READY with {len(self.data_buffers[buffer_id])} entries.")
-                    await self.handle_ready_buffer(buffer_id)
+                    psrl_logger.info(f"{'VALIDATION' if is_validate else 'TRAINING'} buffer {buffer_id} is READY with {len(data_buffer)} entries.")
+                    await self.handle_ready_buffer(buffer_id, is_validate)
                     self.remove_buffer_from_data_pool(prompt_entry_infos)
-                    self.accumulated_buffers.pop(buffer_id)
-                    self.accumulated_buffer_size.pop(buffer_id)
+                    accumulated_buffers.pop(buffer_id)
+                    accumulated_buffer_size.pop(buffer_id)
 
-    def maybe_add_buffer(self, buffer_id, data_buffer) -> bool:
+    def maybe_add_buffer(self, buffer_id, data_buffer, is_validate: bool = False) -> bool:
         """
         Apply buffer post-processing function if defined and add the buffer to data_buffers.
 
         Args:
             buffer_id (int): The ID of the buffer to be added.
             data_buffer (DataProto): The data buffer to be potentially post-processed and added.
+            is_validate (bool): Whether the buffer is for validation.
         Returns:
             bool: whether the buffer was added to data_buffers.
         """
+        if is_validate:
+            self.val_data_buffers[buffer_id] = data_buffer
+            psrl_logger.debug(f"VALIDATION buffer {buffer_id} is added to val_data_buffers without post-processing.")
+            return True
+
         add_buffer = True
         if self.buffer_post_process_fn:
             add_buffer, data_buffer = self._buffer_post_process(buffer_id, data_buffer)
 
         if add_buffer:
-            self.data_buffers[buffer_id] = data_buffer
-            psrl_logger.debug(f"Buffer {buffer_id} is added to data_buffers after post-processing.")
+            self.train_data_buffers[buffer_id] = data_buffer
+            psrl_logger.debug(f"TRAINING buffer {buffer_id} is added to train_data_buffers after post-processing.")
         return add_buffer
 
     async def _group_post_process(self, entry_infos: list[EntryInfo]) -> bool:
@@ -797,6 +932,9 @@ class PSRL_AgentLoopManager:
             bool: whether the group data is reserved
         """
         assert self.group_post_process_fn is not None, "Group post-processing function is not set."
+        assert all(not entry_info.is_validate for entry_info in entry_infos), (
+            "Group post-processing should not be applied to validation data."
+        )
 
         request_ids = [entry_info.prompt_id * self.rollout_n + entry_info.request_idx for entry_info in entry_infos]
         data_list = [self.pop_from_data_pool(request_id) for request_id in request_ids]
@@ -820,6 +958,7 @@ class PSRL_AgentLoopManager:
 
         This method applies the buffer post-processing function to the data
         in the buffer and stores the processed data if valid.
+        Note that the buffer post process only targets training data.
 
         Args:
             buffer_id (int): The ID of the buffer to process
@@ -834,10 +973,10 @@ class PSRL_AgentLoopManager:
         processed_buffer_data = self.buffer_post_process_fn(buffer_data)
         if not processed_buffer_data or len(processed_buffer_data) < len(buffer_data):
             # Clear entries from accumulated_data_buffer
-            self.accumulated_buffers.pop(buffer_id, None)
-            self.accumulated_buffer_size.pop(buffer_id, None)
-            self.accumulated_buffers[buffer_id] = {}
-            self.accumulated_buffer_size[buffer_id] = 0
+            self.train_accumulated_buffers.pop(buffer_id, None)
+            self.train_accumulated_buffer_size.pop(buffer_id, None)
+            self.train_accumulated_buffers[buffer_id] = {}
+            self.train_accumulated_buffer_size[buffer_id] = 0
             if processed_buffer_data is not None:
                 prompt_entry_infos = self.extract_entry_infos_from_data(processed_buffer_data)
                 for entry_info in prompt_entry_infos:
@@ -846,10 +985,10 @@ class PSRL_AgentLoopManager:
                         if isinstance(entry_info.model_version, list)
                         else entry_info.model_version
                     )
-                    if model_version not in self.accumulated_buffers[buffer_id]:
-                        self.accumulated_buffers[buffer_id][model_version] = []
-                    self.accumulated_buffers[buffer_id][model_version].append(entry_info)
-                    self.accumulated_buffer_size[buffer_id] += 1
+                    if model_version not in self.train_accumulated_buffers[buffer_id]:
+                        self.train_accumulated_buffers[buffer_id][model_version] = []
+                    self.train_accumulated_buffers[buffer_id][model_version].append(entry_info)
+                    self.train_accumulated_buffer_size[buffer_id] += 1
             return False, None
         else:
             return True, processed_buffer_data
@@ -865,8 +1004,10 @@ class PSRL_AgentLoopManager:
         Returns:
             List[EntryInfo]: List of extracted EntryInfo objects
         """
+        is_validate = data.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         entry_infos = {}
-        if self.rollout_n > 1:
+        if rollout_n > 1:
             parent_ids = data.non_tensor_batch["parent_id"].tolist()
             rollout_instance_ids = data.non_tensor_batch["rollout_instance_id"].tolist()
             request_ids = data.non_tensor_batch["uid"].tolist()
@@ -877,11 +1018,11 @@ class PSRL_AgentLoopManager:
                 if parent_id in entry_infos:
                     entry_info = entry_infos[parent_id]
                     if isinstance(entry_info.request_idx, list):
-                        entry_info.request_idx.append(request_id % self.rollout_n)
+                        entry_info.request_idx.append(request_id % rollout_n)
                     else:
                         entry_info.request_idx = [
                             entry_info.request_idx,
-                            request_id % self.rollout_n,
+                            request_id % rollout_n,
                         ]
                     if isinstance(entry_info.model_version, list):
                         entry_info.model_version.append(model_version)
@@ -893,9 +1034,10 @@ class PSRL_AgentLoopManager:
                 else:
                     entry_info = EntryInfo(
                         rollout_instance_id=rollout_instance_id,
-                        request_idx=request_id % self.rollout_n,
+                        request_idx=request_id % rollout_n,
                         prompt_id=parent_id,
                         model_version=model_version,
+                        is_validate=is_validate,
                     )
                     entry_infos.append(entry_info)
         else:
@@ -910,57 +1052,94 @@ class PSRL_AgentLoopManager:
                     request_idx=0,
                     prompt_id=request_id,
                     model_version=model_version,
+                    is_validate=is_validate,
                 )
                 entry_infos.append(entry_info)
         return entry_infos
 
-    def log_ready_buffer(self, buffer_id: int):
-        """Log the ready buffer."""
-        if buffer_id not in self.logged_ready_buffer_ids:
+    def log_ready_buffer(self, buffer_id: int, is_validate: bool = False):
+        """Log the ready buffer.
+
+        Args:
+            buffer_id (int): The ID of the buffer that is ready.
+            is_validate (bool): Whether the buffer is for validation data.
+        """
+        logged_ready_buffer_ids = (
+            self.logged_ready_val_buffer_ids if is_validate else self.logged_ready_train_buffer_ids
+        )
+        if buffer_id not in logged_ready_buffer_ids:
             log_single_event(
-                f"Buffer {buffer_id} is ready",
+                f"{'TRAINING' if not is_validate else 'VALIDATION'} buffer {buffer_id} is ready",
                 psrl_logger,
                 event_type=EventType.BUFFER_READY,
             )
-            self.logged_ready_buffer_ids.add(buffer_id)
+            logged_ready_buffer_ids.add(buffer_id)
 
-    async def handle_ready_buffer(self, buffer_id: int):
+    async def handle_ready_buffer(self, buffer_id: int, is_validate: bool = False):
         """
         Handle the ready buffer.
         
         Args:
             buffer_id (int): The ID of the buffer that is ready.
+            is_validate (bool): Whether the buffer is for validation data.
         """
+        # Handle ready validation buffer
+        if is_validate:
+            assert len(self.val_data_buffers) == 1, "For validation, there should be only one buffer."
+            ready_buffer_id = list(self.val_data_buffers.keys())[0]
+            self.log_ready_buffer(ready_buffer_id, is_validate)
+            assert ready_buffer_id is not None, "Ready buffer ID should not be None for validation."
+            if buffer_id in self._val_buffer_waiters:
+                buffer_data = self.consume_buffer(buffer_id, is_validate=True)
+                assert len(self._val_buffer_waiters[buffer_id]) == 1, (
+                    f"Expected only one waiter for buffer {buffer_id}, "
+                    f"but found {len(self._val_buffer_waiters[buffer_id])}."
+                )
+                # Set the result for all futures
+                for fut in self._val_buffer_waiters[buffer_id]:
+                    if not fut.done():
+                        fut.set_result(buffer_data)
+                # Remove the key after waking all waiters
+                del self._val_buffer_waiters[buffer_id]
+            else:
+                psrl_logger.warning(f"No waiters found for VALIDATION buffer {buffer_id} when trying to awake.")
+            await self.ps_manager_handle.maybe_delete_buffer.remote(ready_buffer_id, is_validate)
+            return
+        
+        # Handle ready training buffer
         # Check whether there exists ready buffer for training
-        self.log_ready_buffer(buffer_id)
-
+        self.log_ready_buffer(buffer_id, is_validate)
         psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
         aborted_request_ids = await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id)
         if aborted_request_ids:
             self.remove_from_data_pool(aborted_request_ids)
 
-        min_ready_buffer_id = min(self.data_buffers.keys(), default=None)
-        if min_ready_buffer_id is not None:
+        min_train_ready_buffer_id = min(self.train_data_buffers.keys(), default=None)
+        if min_train_ready_buffer_id is not None:
             # Wake all Futures waiting for this buffer
-            if min_ready_buffer_id in self._buffer_waiters:
-                buffer_data = self.consume_buffer(min_ready_buffer_id)
-                assert len(self._buffer_waiters[min_ready_buffer_id]) == 1, (
-                    f"Expected only one waiter for buffer {min_ready_buffer_id}, but found {len(self._buffer_waiters[min_ready_buffer_id])}."
+            if min_train_ready_buffer_id in self._train_buffer_waiters:
+                buffer_data = self.consume_buffer(min_train_ready_buffer_id, is_validate=False)
+                assert len(self._train_buffer_waiters[min_train_ready_buffer_id]) == 1, (
+                    f"Expected only one waiter for buffer {min_train_ready_buffer_id}, "
+                    f"but found {len(self._train_buffer_waiters[min_train_ready_buffer_id])}."
                 )
                 # Set the result for all futures
-                for fut in self._buffer_waiters[min_ready_buffer_id]:
+                for fut in self._train_buffer_waiters[min_train_ready_buffer_id]:
                     if not fut.done():
                         fut.set_result(buffer_data)
                 # Remove the key after waking all waiters
-                del self._buffer_waiters[buffer_id]
+                del self._train_buffer_waiters[min_train_ready_buffer_id]
             else:
-                psrl_logger.warning(f"No waiters found for buffer {buffer_id} when trying to awake.")
-                
+                psrl_logger.warning(f"No waiters found for TRAINING buffer {min_train_ready_buffer_id} when trying to awake.")
+                     
     async def handle_waiting_buffer(self, buffer_id: int):
-        """Handle the waiting buffer."""
-        # WIP(lhy): Implement the retry and truncate strategy
+        """Handle the waiting buffer. Only training buffer needs to be handled.
+        
+        Args:
+            buffer_id (int): The ID of the buffer that is waiting.
+        """
         if self.config.psrl.proactive_filter_strategy.method == "retry":
-            gap = self.ready_entries_per_buffer - self.accumulated_buffer_size[buffer_id]
+            gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
             if gap == 0:
                 return
             assert gap > 0, f"Gap should be greater than 0, but got {gap}"
@@ -968,10 +1147,10 @@ class PSRL_AgentLoopManager:
                 psrl_logger.info(f"Trying to abort the rest {gap} entries in buffer {buffer_id} and move some occupied entries from other buffers to make it ready.")
                 # Guarantee other buffers have enough entries to make it ready
                 total_available_entries = 0
-                for other_buffer_id in sorted(list(self.accumulated_buffers.keys()), reverse=True):
+                for other_buffer_id in sorted(list(self.train_accumulated_buffers.keys()), reverse=True):
                     if other_buffer_id == buffer_id:
                         break
-                    total_available_entries += sum(len(self.accumulated_buffers[other_buffer_id][model_version]) for model_version in self.accumulated_buffers[other_buffer_id].keys())
+                    total_available_entries += sum(len(self.train_accumulated_buffers[other_buffer_id][model_version]) for model_version in self.train_accumulated_buffers[other_buffer_id].keys())
                 if total_available_entries < gap:
                     psrl_logger.info(f"Not enough entries in other buffers to make buffer {buffer_id} ready, the gap is {gap}, but only {total_available_entries} entries are available")
                     return
@@ -983,100 +1162,121 @@ class PSRL_AgentLoopManager:
                 # Then, move the occupied entries from other buffers to the buffer
                 total_moved_entries = 0
                 moved_occupied_entry_infos = list()
-                for other_buffer_id in sorted(list(self.accumulated_buffers.keys()), reverse=True):
+                for other_buffer_id in sorted(list(self.train_accumulated_buffers.keys()), reverse=True):
                     if other_buffer_id == buffer_id:
                         break
-                    for model_version in sorted(list(self.accumulated_buffers[other_buffer_id].keys())):
+                    for model_version in sorted(list(self.train_accumulated_buffers[other_buffer_id].keys())):
                         moved_entry_infos = []
-                        for entry_info in self.accumulated_buffers[other_buffer_id][model_version]:
+                        for entry_info in self.train_accumulated_buffers[other_buffer_id][model_version]:
                             moved_entry_infos.append(entry_info)
                             total_moved_entries += 1
                             if total_moved_entries == gap:
                                 break
-                        if model_version not in self.accumulated_buffers[buffer_id]:
-                            self.accumulated_buffers[buffer_id][model_version] = []
+                        if model_version not in self.train_accumulated_buffers[buffer_id]:
+                            self.train_accumulated_buffers[buffer_id][model_version] = []
                         for moved_entry_info in moved_entry_infos:
                             moved_occupied_entry_infos.append(moved_entry_info)
-                            self.accumulated_buffers[buffer_id][model_version].append(moved_entry_info)
-                            self.accumulated_buffer_size[buffer_id] += 1
-                            self.accumulated_buffers[other_buffer_id][model_version].remove(moved_entry_info)
-                            self.accumulated_buffer_size[other_buffer_id] -= 1
+                            self.train_accumulated_buffers[buffer_id][model_version].append(moved_entry_info)
+                            self.train_accumulated_buffer_size[buffer_id] += 1
+                            self.train_accumulated_buffers[other_buffer_id][model_version].remove(moved_entry_info)
+                            self.train_accumulated_buffer_size[other_buffer_id] -= 1
                         if total_moved_entries == gap:
                             break
-                    for model_version in list(self.accumulated_buffers[other_buffer_id].keys()):
-                        if len(self.accumulated_buffers[other_buffer_id][model_version]) == 0:
-                            self.accumulated_buffers[other_buffer_id].pop(model_version)
+                    for model_version in list(self.train_accumulated_buffers[other_buffer_id].keys()):
+                        if len(self.train_accumulated_buffers[other_buffer_id][model_version]) == 0:
+                            self.train_accumulated_buffers[other_buffer_id].pop(model_version)
                     if total_moved_entries == gap:
                         break
-                for other_buffer_id in list(self.accumulated_buffers.keys()):
-                    if len(self.accumulated_buffers[other_buffer_id]) == 0:
-                        self.accumulated_buffers.pop(other_buffer_id)
-                        self.accumulated_buffer_size.pop(other_buffer_id)
+                for other_buffer_id in list(self.train_accumulated_buffers.keys()):
+                    if len(self.train_accumulated_buffers[other_buffer_id]) == 0:
+                        self.train_accumulated_buffers.pop(other_buffer_id)
+                        self.train_accumulated_buffer_size.pop(other_buffer_id)
                 # Finally, notify the PS manager to move the occupied entries to the buffer 
                 await self.ps_manager_handle.move_occupied_entries.remote(moved_occupied_entry_infos, buffer_id)
                 psrl_logger.info(f"Moved {total_moved_entries} occupied entries (the total gap is {gap}) from other buffers to buffer {buffer_id}.")
                 for _ in range(aborted_entry_num):
-                    await self._retry_data()
-                            
+                    await self._retry_data()                   
         elif self.config.psrl.proactive_filter_strategy.method == "truncate":
             raise NotImplementedError("Truncate strategy is not implemented yet.")
-        
         else:
-            pass
+            raise ValueError(f"Invalid proactive filter strategy: {self.config.psrl.proactive_filter_strategy.method}")
 
     async def wait_for_training_batch(self, buffer_id: int) -> DataProto:
         """Await a training batch for a specific buffer ID."""
-        await self.ps_manager_handle.ensure_buffer_exists.remote(buffer_id)
+        await self.ps_manager_handle.ensure_train_buffer_exists.remote(buffer_id)
 
-        if buffer_id in self.data_buffers:
+        if buffer_id in self.train_data_buffers:
             # If the buffer is ready, return immediately
-            psrl_logger.info(f"Buffer {buffer_id} is ready, returning immediately.")
+            psrl_logger.info(f"TRAINING Buffer {buffer_id} is ready, returning immediately.")
             return self.consume_buffer(buffer_id)
 
-        # WIP(lhy): Support more consumption strategies
+        # TODO(lhy): Support more consumption strategies
         # 1. Truncate if buffer status is STUCK
         # 2. Abort the RESERVED entry if buffer status is STUCK and move some OCCUPIED entries from other buffers
-        if buffer_id in self.accumulated_buffers:
+        if buffer_id in self.train_accumulated_buffers:
             async with AsyncBusyPollingRayLock(self.ps_manager_handle):
                 await self.handle_waiting_buffer(buffer_id)
                 
-                if self.accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer:
+                if self.train_accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer:
                     prompt_entry_infos = []
-                    for model_version in sorted(list(self.accumulated_buffers[buffer_id].keys())):
-                        prompt_entry_infos.extend(self.accumulated_buffers[buffer_id][model_version])
+                    for model_version in sorted(list(self.train_accumulated_buffers[buffer_id].keys())):
+                        prompt_entry_infos.extend(self.train_accumulated_buffers[buffer_id][model_version])
                     # Get the data buffer from the data pool
                     data_buffer = self.get_buffer_from_data_pool(prompt_entry_infos)
                     # Apply buffer post-processing if exists and add to data_buffers
-                    add_buffer = self.maybe_add_buffer(buffer_id, data_buffer)
+                    add_buffer = self.maybe_add_buffer(buffer_id, data_buffer, is_validate=False)
                     if add_buffer:
-                        psrl_logger.info(f"Buffer {buffer_id} is READY with {len(self.data_buffers[buffer_id])} entries.")
-                        await self.handle_ready_buffer(buffer_id)
-                        self.remove_buffer_from_data_pool(prompt_entry_infos)
-                        self.accumulated_buffers.pop(buffer_id)
-                        self.accumulated_buffer_size.pop(buffer_id)
-                        psrl_logger.info(f"Buffer {buffer_id} is ready after the abort and truncate strategy, returning immediately.")
+                        psrl_logger.info(f"TRAINING Buffer {buffer_id} is READY with {len(self.train_data_buffers[buffer_id])} entries.")
+                        await self.handle_ready_buffer(buffer_id, is_validate=False)
+                        self.remove_buffer_from_data_pool(prompt_entry_infos, is_validate=False)
+                        self.train_accumulated_buffers.pop(buffer_id)
+                        self.train_accumulated_buffer_size.pop(buffer_id)
+                        psrl_logger.info(f"TRAINING Buffer {buffer_id} is ready after the abort and truncate strategy, return immediately.")
                         return self.consume_buffer(buffer_id)
 
         # If the buffer is still not ready after the abort and truncate strategy, wait for it to be ready
-        psrl_logger.info(f"Buffer {buffer_id} is not ready, waiting for it to be ready.")
+        psrl_logger.info(f"TRAINING Buffer {buffer_id} is not ready, waiting for it to be ready.")
         fut = asyncio.get_event_loop().create_future()
-        if buffer_id not in self._buffer_waiters:
-            self._buffer_waiters[buffer_id] = []
-        self._buffer_waiters[buffer_id].append(fut)
+        if buffer_id not in self._train_buffer_waiters:
+            self._train_buffer_waiters[buffer_id] = []
+        self._train_buffer_waiters[buffer_id].append(fut)
+        result = await fut
+        # Once resumed, return
+        return result
+
+    async def wait_for_validation_batch(self, buffer_id: int) -> DataProto:
+        """Await a validate batch for a specific buffer ID."""
+        await self.ps_manager_handle.ensure_validate_buffer_exists.remote()
+
+        if buffer_id in self.val_data_buffers:
+            # If the buffer is ready, return immediately
+            psrl_logger.info(f"VALIDATION buffer {buffer_id} is ready, returning immediately.")
+            return self.consume_validate_buffer(buffer_id)
+
+        psrl_logger.info(f"VALIDATION buffer {buffer_id} is not ready, waiting for it to be ready.")
+        fut = asyncio.get_event_loop().create_future()
+        if buffer_id not in self._val_buffer_waiters:
+            self._val_buffer_waiters[buffer_id] = []
+        self._val_buffer_waiters[buffer_id].append(fut)
         result = await fut
         # Once resumed, return
         return result
 
     # ------- DATA POOL MANAGEMENT -------
 
-    def log_buffer(self, buffer_id: int):
+    def log_buffer(self, buffer_id: int, is_validate: bool = False):
         """Log the buffer version tag distribution and staleness.
 
         Args:
             buffer_id (int): The ID of the buffer to log.
+            is_validate (bool): Whether the buffer is for validation data.
         """
-        assert buffer_id in self.data_buffers, f"Buffer {buffer_id} not found in data buffers."
-        version_tags = self.data_buffers[buffer_id].non_tensor_batch["version_tag"].tolist()
+        if is_validate:
+            assert buffer_id in self.val_data_buffers, f"VALIDATION buffer {buffer_id} not found in validation data buffers."
+            version_tags = self.val_data_buffers[buffer_id].non_tensor_batch["version_tag"].tolist()
+        else:
+            assert buffer_id in self.train_data_buffers, f"TRAINING buffer {buffer_id} not found in data buffers."
+            version_tags = self.train_data_buffers[buffer_id].non_tensor_batch["version_tag"].tolist()
 
         # Count different version_tags
         version_tag_counts = Counter(version_tags)
@@ -1089,34 +1289,37 @@ class PSRL_AgentLoopManager:
             staleness_dict[version_tag] = staleness
 
         # Log statistics
-        psrl_logger.info(f"Buffer {buffer_id} version tag distribution:")
+        psrl_logger.info(f"{'VALIDATION' if is_validate else 'TRAINING'} buffer {buffer_id} version tag distribution:")
         for version_tag in sorted(version_tag_counts.keys()):
             count = version_tag_counts[version_tag]
             percentage = (count / total_count) * 100
             staleness = staleness_dict[version_tag]
             psrl_logger.info(f"version_tag={version_tag}: count={count} ({percentage:.2f}%), staleness={staleness}")
 
-    def consume_buffer(self, buffer_id: int) -> DataProto:
+    def consume_buffer(self, buffer_id: int, is_validate: bool = False) -> DataProto:
         """
         Consume (retrieve and remove) all data from the specified buffer.
 
         Args:
             buffer_id (int): The ID of the buffer to consume.
+            is_validate (bool): Whether the buffer is for validation data.
         Returns:
             DataProto: The concatenated data from the buffer.
         Raises:
             AssertionError: If the buffer is not in READY state.
         """
 
-        self.log_buffer(buffer_id)
-        buffer = self.data_buffers.pop(buffer_id, None)
-        assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
+        self.log_buffer(buffer_id, is_validate)
+        buffer = (
+            self.val_data_buffers.pop(buffer_id, None) if is_validate else self.train_data_buffers.pop(buffer_id, None)
+        )
+        assert buffer is not None, f"{'VALIDATION' if is_validate else 'TRAINING'} buffer {buffer_id} not found or already consumed."
         # NOTE(linsh): we will delete buffer during aborting requests of specific versions
         # This is because the inflight requests of the remaining entries
         # in the buffer can still be utilized for training
         return buffer
 
-    def get_buffer_from_data_pool(self, entry_infos: list[EntryInfo]) -> DataProto:
+    def get_buffer_from_data_pool(self, entry_infos: list[EntryInfo], sort_by_prompt_id: bool = False) -> DataProto:
         """Retrieve data buffers from the internal data pool based on entry information.
 
         This method is used to fetch specific data buffers that have been stored
@@ -1124,23 +1327,27 @@ class PSRL_AgentLoopManager:
 
         Args:
             entry_infos (List[EntryInfo]): List of EntryInfo objects specifying which buffers to retrieve.
-
+            sort_by_prompt_id (bool): Whether to sort the entry_infos by prompt_id before retrieval.
         Returns:
             List[DataProto]: List of DataProto objects corresponding to the requested buffers.
         """
         data_list = []
+        if sort_by_prompt_id:
+            entry_infos = sorted(entry_infos, key=lambda x: x.prompt_id)
         for entry_info in entry_infos:
             prompt_id = entry_info.prompt_id
             request_idxs = entry_info.request_idx
+            is_validate = entry_info.is_validate
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+            alg_rollout_n = self.val_rollout_n if is_validate else self.alg_rollout_n
             if not isinstance(request_idxs, list):
                 request_idxs = [request_idxs]
-            assert len(request_idxs) == self.alg_rollout_n, (
-                f"EntryInfo for prompt {prompt_id} has {len(request_idxs)} request indices, "
-                f"expected {self.alg_rollout_n}."
+            assert len(request_idxs) == alg_rollout_n, (
+                f"EntryInfo for prompt {prompt_id} has {len(request_idxs)} request indices, expected {alg_rollout_n}."
             )
 
             for request_idx in request_idxs:
-                request_id = prompt_id * self.rollout_n + request_idx
+                request_id = prompt_id * rollout_n + request_idx
                 data = self.data_pool.get(request_id, None)
                 assert data is not None, (
                     f"Buffer for request {request_id} (idx {request_idx} for prompt {prompt_id}) "
@@ -1161,10 +1368,12 @@ class PSRL_AgentLoopManager:
         for entry_info in entry_infos:
             prompt_id = entry_info.prompt_id
             request_idxs = entry_info.request_idx
+            is_validate = entry_info.is_validate
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             if not isinstance(request_idxs, list):
                 request_idxs = [request_idxs]
             for request_idx in request_idxs:
-                request_id = prompt_id * self.rollout_n + request_idx
+                request_id = prompt_id * rollout_n + request_idx
                 if request_id in self.data_pool:
                     del self.data_pool[request_id]
 

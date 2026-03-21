@@ -1,4 +1,7 @@
 #!/bin/bash
+set -e
+set -o pipefail
+trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 VLLM_PATH=${VLLM_PATH:-}
 VERL_PATH=${VERL_PATH:-}
@@ -13,16 +16,16 @@ echo "0. Install uv to boost installation speed"
 python -m pip install uv
 
 echo "1. Install pytorch and tensordict"
-python -m uv pip install --no-cache-dir "torch==2.9.1" "torchvision==0.24.1" "torchaudio==2.9.1" --index-url https://download.pytorch.org/whl/cu128
-python -m uv pip install --no-cache-dir "triton==3.5.1" "tensordict==0.10.0" torchdata
+python -m uv pip install "torch==2.9.1" "torchvision==0.24.1" "torchaudio==2.9.1" --index-url https://download.pytorch.org/whl/cu128
+python -m uv pip install "triton==3.5.1" "tensordict==0.10.0" torchdata
 
 echo "2. Install basic packages"
 python -m uv pip install "transformers[hf_xet]>=4.55.4" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
     "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko sortedcontainers \
     ray[default]==2.49.1 codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
-    pytest py-spy pre-commit ruff meson ninja pynvml requests einops trl
+    pytest py-spy pre-commit ruff meson ninja pynvml requests einops trl==0.26.2
 
-python -m uv pip uninstall -y pynvml nvidia-ml-py
+python -m uv pip uninstall pynvml nvidia-ml-py
 python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
 
 echo "4. Install FlashAttention and FlashInfer"
@@ -31,7 +34,7 @@ FLASH_ATTN_CUDA_ARCHS=128 \
 FLASH_ATTENTION_FORCE_BUILD="TRUE" \
 FLASH_ATTENTION_FORCE_CXX11_ABI="FALSE" \
 FLASH_ATTENTION_SKIP_CUDA_BUILD="FALSE" \
-python -m uv pip install -U "flash-attn==2.8.1" --no-build-isolation
+python -m uv pip install --no-cache-dir --no-build-isolation "flash-attn==2.8.1" 
 
 # Install flashinfer-python
 python -m uv pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.5.3"

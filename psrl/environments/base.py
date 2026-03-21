@@ -1,0 +1,165 @@
+from abc import ABC, abstractmethod
+from typing import Any, Generic, SupportsFloat, TypedDict, TypeVar
+
+import ray
+from omegaconf import DictConfig
+from verl import DataProto
+
+ConversationType = list[dict[str, str]]
+
+ObsType = TypeVar("ObsType")
+ActType = TypeVar("ActType")
+
+
+class EnvStepOutput(TypedDict):
+    observation: ObsType
+    reward: SupportsFloat
+    done: bool
+    info: dict[str, Any] | None = None
+
+
+class Environment(ABC, Generic[ObsType, ActType]):
+    """Abstract base class for a reinforcement learning environment.
+
+    This class defines the interface for environments used in the RL training loop.
+    Environments manage the interaction between agents and tasks, processing actions
+    and returning observations and rewards.
+
+    Type Parameters:
+        ObsType: Type of observations returned by the environment
+        ActType: Type of actions accepted by the environment
+
+    Attributes:
+        reward_manager: Ray actor handle for computing rewards
+        task: Current task being processed
+    """
+
+    _class_initialized = False
+    _registry: dict[str, type["Environment"]] = {}
+
+    def __init__(self, config: DictConfig, reward_manager: ray.actor.ActorHandle):
+        """Initialize the environment.
+
+        Args:
+            config: Configuration object containing training settings
+            reward_manager: Ray actor handle for computing rewards
+        """
+        self.init_class(config=config)
+        self.reward_manager = reward_manager
+        self.task = None
+
+    @classmethod
+    def init_class(cls, config: DictConfig, **kwargs):
+        """Perform heavy initialization work shared across all instances.
+
+        This method is called only once per class to avoid redundant initialization.
+
+        Args:
+            config (DictConfig): Configuration object containing training settings.
+            **kwargs: Additional keyword arguments from configuration.
+        """
+        if cls._class_initialized:
+            return
+        cls._class_initialized = True
+
+    @abstractmethod
+    async def reset(self, task: DataProto, **kwargs) -> tuple[ObsType, dict]:
+        """Resets the environment to an initial state and returns the initial observation.
+
+        This method should initialize the environment for a new episode based on the
+        given task, resetting any internal state and returning the first observation.
+
+        Args:
+            task: DataProto containing the initial task/prompt
+            **kwargs: Additional keyword arguments
+
+        Returns:
+            tuple: (initial_observation, info_dict) where initial_observation is the
+                   starting observation and info_dict contains additional metadata
+        """
+        return None, {}
+
+    @abstractmethod
+    async def step(self, action: ActType) -> EnvStepOutput:
+        """
+        Takes an action in the environment.
+
+        Executes the given action and returns the resulting observation, reward,
+        done flag, and any additional information.
+
+        Args:
+            action: The action to take in the environment
+
+        Returns:
+            EnvStepOutput: Dictionary containing:
+                - observation: The next observation after taking the action
+                - reward: The reward obtained from taking the action
+                - done: Whether the episode has terminated
+                - info: Additional information (metadata, diagnostics, etc.)
+        """
+        pass
+
+    @abstractmethod
+    async def close(self) -> None:
+        """Cleans up resources used by the environment.
+
+        This method should release any resources held by the environment,
+        such as file handles, network connections, or external processes.
+        """
+        pass
+
+    @property
+    @abstractmethod
+    def state(self) -> Any:
+        """Returns the current state of the environment.
+
+        Returns:
+            Any: A representation of the current environment state, typically
+                 a dictionary containing relevant state information
+        """
+        pass
+
+    @classmethod
+    def get_environment(cls, name: str, *args, **kwargs) -> "Environment":
+        """
+        Get an environment instance by name from the registry.
+
+        Args:
+            name: The name of the environment to retrieve
+            *args: Positional arguments to pass to the environment constructor
+            **kwargs: Keyword arguments to pass to the environment constructor
+
+        Returns:
+            Environment: An instance of the requested environment
+
+        Raises:
+            ValueError: If the environment is not found in the registry
+        """
+        if name not in cls._registry:
+            raise ValueError(f"Unknown environment: {name}")
+        return cls._registry[name](*args, **kwargs)
+
+    @classmethod
+    def register(cls, name: str):
+        """
+        Decorator to register an environment class with the registry.
+
+        Args:
+            name: The name to register the environment under
+
+        Returns:
+            The decorator function
+
+        Example:
+            @Environment.register("tool_env")
+            class ToolEnvironment(Environment):
+                async def step(self, action):
+                    # implementation
+                    pass
+        """
+
+        def decorator(subclass: type["Environment"]) -> type["Environment"]:
+            cls._registry[name] = subclass
+            return subclass
+
+        return decorator

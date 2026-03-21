@@ -2,6 +2,7 @@ import logging
 import os
 import time
 
+import ray
 import torch
 from omegaconf import DictConfig
 
@@ -26,6 +27,7 @@ from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
     GLOBAL_GEN_CLIENT_NAME,
     GLOBAL_META_SERVER_NAME,
+    GLOBAL_PS_CLIENT_NAME,
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
@@ -146,6 +148,16 @@ class vLLMWorkerExtension:
 
         return get_tensor_model_parallel_rank()
 
+    def get_node_id(self) -> str:
+        """Get the node id of the vllm worker."""
+        if not hasattr(self, "node_id"):
+            self.node_id = None
+
+        if self.node_id is not None:
+            return self.node_id
+        self.node_id = ray.get_runtime_context().get_node_id()
+        return self.node_id
+
     def init_nixl_client(
         self,
         nixl_config: DictConfig,
@@ -174,25 +186,46 @@ class vLLMWorkerExtension:
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
-    def nixl_protocol(self, config: DictConfig):
-        # Register the state dict and sharding dict to the NIXL client
-        psrl_logger.info("nixl client protocol step 0: convert_vllm_inplace")
+    def nixl_convert_params(self, config: DictConfig):
+        """Convert the model parameters to unified format.
+
+        Args:
+            config (DictConfig): Configuration object containing training settings.
+        """
         vllm_model = self.model_runner.model
         if isinstance(vllm_model, CUDAGraphWrapper):
             vllm_model = vllm_model.unwrap()
         param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
-        unified_state_dict, local_sharding_dict = convert_vllm_inplace(
+        self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
             param_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
         )
+
+    def nixl_protocol(self, config: DictConfig, mode: str = "full"):
+        """Run the NIXL server protocol.
+
+        Args:
+            config (DictConfig): Configuration object containing training settings.
+            mode (str): Mode of registration, either 'meta' or 'full'.
+                'meta' mode converts to meta tensors and skip registering their memory.
+                'full' mode converts to full tensors.
+
+            NOTE: ps storage may init with meta tensors, the register step would be different.
+        """
+        # Register the state dict and sharding dict to the NIXL client
+        meta_only = mode == "meta"
+        if self.unified_state_dict is None or self.local_sharding_dict is None:
+            self.nixl_convert_params(config)
         psrl_logger.info("nixl client protocol step 1: connect_to_server")
         self.nixl_storage_client.connect_to_server()
         psrl_logger.info("nixl client protocol step 2: send_local_sharding")
-        self.nixl_storage_client.send_local_sharding(local_sharding_dict)
+        self.nixl_storage_client.send_local_sharding(self.local_sharding_dict)
         psrl_logger.info("nixl client protocol step 3: wait_for_server_sharding")
         unified_sharding_dict = self.nixl_storage_client.wait_for_server_sharding()
         # psrl_logger.info(f"unified_sharding_dict: {unified_sharding_dict}")
         psrl_logger.info("nixl client protocol step 4: register_local_tensors")
-        self.nixl_storage_client.register_local_tensors(unified_state_dict, unified_sharding_dict)
+        self.nixl_storage_client.register_local_tensors(
+            self.unified_state_dict, unified_sharding_dict, meta_only=meta_only
+        )
         psrl_logger.info("nixl client protocol step 5: send_local_info")
         self.nixl_storage_client.send_local_info()
         psrl_logger.info("nixl client protocol step 6: wait_for_server_info")
@@ -202,10 +235,57 @@ class vLLMWorkerExtension:
         psrl_logger.info("nixl client protocol step 8: wait_for_server_temp_mappings")
         self.nixl_storage_client.wait_for_server_temp_mappings()
         psrl_logger.info("nixl client protocol done.")
-        self.unified_state_dict = unified_state_dict
         self.unified_sharding_dict = unified_sharding_dict
 
+    def nixl_register_after_wake_up(self):
+        """Register the model parameters to NIXL after wake up from sleep.
+
+        After sleep/wake_up, the physical memory backing the model weights
+        has changed while virtual addresses remain the same. This method performs
+        local re-registration:
+        1. Reset nixl agent (clears UCX rcache)
+        2. Re-registers memory with new physical pages (generates new rkeys)
+        """
+        torch.cuda.synchronize()
+        # Reset nixl agent and reregister to handle physical memory changes
+        self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
+
+    def nixl_deregister(self):
+        """Deregister the model parameters from NIXL."""
+        self.nixl_storage_client.deregister_local_tensors()
+
+    def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
+        """
+        Send local NIXL info to the specified destination agents.
+        """
+        if isinstance(dst_agent_names, str):
+            dst_agent_names = [dst_agent_names]
+        self.nixl_storage_client.send_local_info_to(dst_agent_names)
+
+    def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict):
+        """
+        Update local NIXL info to the PS worker on the same node with this worker and PS manager.
+        """
+        node_id = self.get_node_id()
+        dst_ps_worker_idx = ps_worker_node_id_to_idxs[node_id]
+        dst_agent_names = [f"{GLOBAL_PS_CLIENT_NAME}_{dst_ps_worker_idx}", GLOBAL_META_SERVER_NAME]
+        self.nixl_send_local_info_to(dst_agent_names)
+
+    def nixl_wait_for_update_infos(self, info_num: int):
+        """Wait for infos of updated clients for global synchronization.
+
+        Args:
+            info_num (int): Number of infos to wait for.
+        """
+        self.nixl_storage_client.wait_for_update_infos(info_num)
+
     def nixl_pull_model_core(self, ps_nixl_agent_names, ps_nixl_gen_storage_client_names):
+        """Pull the model parameters from PS workers via NIXL.
+
+        Args:
+            ps_nixl_agent_names (list[str]): List of PS NIXL agent names
+            ps_nixl_train_storage_client_names (list[str]): List of PS NIXL train storage client names
+        """
         if not hasattr(self, "pull_times"):
             self.pull_times = 0
         self.pull_times += 1
@@ -234,6 +314,8 @@ class vLLMWorkerExtension:
             )
             # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
+        self.cuda_synchronize()
+        self.nixl_storage_client.clear_intermediate_cached_data()
         time_end = time.time()
         psrl_logger.info(
             f"{self.nixl_storage_client}: NIXL pull model core done ({self.pull_times} times). "
@@ -241,6 +323,7 @@ class vLLMWorkerExtension:
         )
 
     def estimate_max_model_len(self):
+        """Estimate the maximum model length that can fit in the available KV cache memory."""
         assert hasattr(self, "available_kv_cache_memory_bytes"), "available_kv_cache_memory_bytes must be set"
         assert hasattr(self, "vllm_config"), "vllm_config must be set"
         kv_cache_spec = self.get_kv_cache_spec()

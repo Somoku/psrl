@@ -11,6 +11,7 @@ __all__ = [
     "AgentLoopConfig",
     "TraceConfig",
     "ServerConfig",
+    "PrometheusConfig",
     "RolloutConfig",
 ]
 
@@ -26,20 +27,17 @@ class SamplingConfig(BaseConfig):
 
 @dataclass
 class MultiTurnConfig(BaseConfig):
-    _mutable_fields = {"max_assistant_turns", "max_user_turns"}
+    _mutable_fields = {"max_turns"}
 
     enable: bool = False
-    max_assistant_turns: int | None = None
+    max_turns: int | None = None
     tool_config_path: str | None = None
-    max_user_turns: int | None = None
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"
-    interaction_config_path: str | None = None
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
-    num_repeat_rollouts: int = 1
 
 
 @dataclass
@@ -49,11 +47,30 @@ class CustomAsyncServerConfig(BaseConfig):
 
 
 @dataclass
+class EnvironmentConfig(BaseConfig):
+    name: str | None = MISSING
+    step_timeout: float | None = None
+
+
+@dataclass
+class AgentDataConfig(BaseConfig):
+    name: str | None = MISSING
+
+
+@dataclass
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
     agent_loop_config_path: str | None = None
     route_strategy: str = "round_robin"
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
+    trajectory_timeout: float | None = None
+    env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
+    data: AgentDataConfig = field(default_factory=AgentDataConfig)
+    retry_limit: int = 1
+    raise_on_error: bool = True
+    gamma: float = 0.0
+    reward_bonus_coeff: float = 0.0
+    traj_reward_mode: str = "traj"
 
 
 @dataclass
@@ -73,6 +90,22 @@ class ServerConfig(BaseConfig):
     retry_delay: float = 2.0
     max_connections: int = 1000
     max_start_wait_time: float = 300.0
+
+
+@dataclass
+class PrometheusConfig(BaseConfig):
+    """
+    Configuration for Prometheus server
+    """
+
+    # whether enable prometheus on server mode rollout
+    enable: bool = False
+    # Port number that Prometheus listens on, default is 9090
+    port: int = 9090
+    # Path to Prometheus configuration file
+    file: str = "/tmp/ray/session_latest/metrics/prometheus/prometheus.yml"
+    # Specify served_model_name to avoid displaying overly long model paths in Grafana
+    served_model_name: str | None = None
 
 
 @dataclass
@@ -138,6 +171,9 @@ class RolloutConfig(BaseConfig):
 
     # Server configuration for sglang server mode
     server: ServerConfig = field(default_factory=ServerConfig)
+
+    # Use Prometheus to collect and monitor rollout statistics
+    prometheus: PrometheusConfig = field(default_factory=PrometheusConfig)
 
     update_weights_bucket_megabytes: int = 512
 

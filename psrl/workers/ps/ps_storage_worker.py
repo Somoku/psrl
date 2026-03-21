@@ -1,9 +1,12 @@
+import gc
+import json
 import os
 from dataclasses import dataclass
 
 import torch
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
+from safetensors import safe_open
 from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
 from verl.utils.fs import copy_to_local
 
@@ -59,6 +62,11 @@ class PSStorageWorker:
         self.train_meta_hf_model: torch.nn.Module | None = None
         self.gen_meta_hf_model: torch.nn.Module | None = None
 
+        # Map: canonical_checkpoint_key -> [alias_keys_not_in_checkpoint].
+        # Built by init_model(); used by load_weights_to_registered_tensors()
+        # to handle tied-weight models (e.g. tie_word_embeddings=True).
+        self._tied_weights_alias_map: dict[str, list[str]] = {}
+
         # NIXL
         self.nixl_multi_storage_clients = None
 
@@ -110,7 +118,8 @@ class PSStorageWorker:
                 ],
                 nixl_config=self.psrl_config.nixl,
                 nixl_interface=self.nixl_interface,
-                # client_group_id=self.get_replica_id()
+                # client_group_id=self.get_replica_id(),
+                logging_path=self.psrl_config.logging_path,
             )
         else:
             raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
@@ -179,6 +188,23 @@ class PSStorageWorker:
             )
         self._nixl_protocol_phase2()
 
+    def nixl_wait_for_update_infos(self, info_num: int):
+        """Wait for update infos from the storage client.
+
+        Args:
+            info_num (int): Number of infos to wait for
+        """
+        self.nixl_multi_storage_clients.wait_for_update_infos(info_num)
+
+    def nixl_broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
+        """Broadcast updated client infos to destination agents.
+
+        Args:
+            dst_agent_names (list[str]): List of destination agent names
+            update_client_names (list[str]): List of updated client names
+        """
+        self.nixl_multi_storage_clients.broadcast_update_client_infos(dst_agent_names, update_client_names)
+
     def get_nixl_agent_name(self) -> str:
         """Get the name of the NIXL agent."""
         return self.agent_name
@@ -192,7 +218,22 @@ class PSStorageWorker:
         return self.client_for_pull_name
 
     def init_model(self):
-        """Initialize the model."""
+        """
+        Initialize the model skeleton on the meta device.
+
+        Only the parameter shapes / dtypes are materialised here; no actual
+        weight data is loaded.  Call ``load_weights_to_registered_tensors()``
+        *after* the full NIXL protocol (``nixl_protocol()``) has completed so
+        that all meta-device tensors have been replaced by real allocated
+        buffers, and only then copy the checkpoint weights into them.
+
+        Side effect: builds ``self._tied_weights_alias_map`` (canonical_key ->
+        list[alias_key]) while the meta model is still alive.  This map is
+        required by ``load_weights_to_registered_tensors`` to handle models
+        that use tied embeddings (e.g. ``tie_word_embeddings=True``), where
+        ``lm_head.weight`` is not saved to disk but must still be filled from
+        ``model.embed_tokens.weight``.
+        """
         local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
         model_config = AutoConfig.from_pretrained(
             local_path,
@@ -203,8 +244,7 @@ class PSStorageWorker:
         else:
             model_class = AutoModelForCausalLM
 
-        if self.psrl_config.ps_mode == "nixl_cpu":
-            # Initialize the model on meta device
+        if self.psrl_config.ps_mode in ("nixl_cpu", "nixl_gpu"):
             with init_empty_weights():
                 self.train_meta_hf_model = model_class.from_config(
                     model_config,
@@ -219,10 +259,280 @@ class PSStorageWorker:
                         torch_dtype=self.storage_plan.gen_model_dtype,
                         trust_remote_code=self.model_config.get("trust_remote_code", False),
                     )
-        elif self.psrl_config.ps_mode == "nixl_gpu":
-            raise NotImplementedError("NIXL GPU mode is not implemented yet.")
         else:
             raise ValueError(f"Invalid PS mode: {self.psrl_config.ps_mode}")
+
+        # Build the tied-weights alias map while the meta model is alive.
+        # train and gen share the same architecture, so one model suffices.
+        self._tied_weights_alias_map = self._build_tied_weights_alias_map(
+            self.train_meta_hf_model, local_path
+        )
+        if self._tied_weights_alias_map:
+            psrl_logger.info(
+                f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}"
+            )
+        psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
+
+    @staticmethod
+    def _build_tied_weights_alias_map(
+        meta_model: torch.nn.Module,
+        local_path: str,
+    ) -> dict[str, list[str]]:
+        """
+        Build a map  canonical_checkpoint_key -> [alias_keys_not_in_checkpoint].
+
+        Transformers models with ``tie_word_embeddings=True`` (and similar
+        architectures) have some state-dict keys (e.g. ``lm_head.weight``) that
+        are NOT stored in the checkpoint because they are identical to another
+        parameter (e.g. ``model.embed_tokens.weight``).  The model exposes these
+        via ``model._tied_weights_keys``.
+
+        Algorithm
+        ---------
+        1.  Collect all alias keys from ``model._tied_weights_keys``.
+        2.  Collect all canonical keys = state_dict keys that are NOT aliases.
+        3.  Discover which keys actually exist in the checkpoint (using the
+            safetensors index.json or a single shard scan) — the canonical keys.
+        4.  For each alias key that is missing from the checkpoint, find a
+            canonical key whose (shape, dtype) matches.  This is safe because
+            tied parameters are by definition identical tensors; clashes are
+            extremely unlikely and are guarded by an assertion.
+
+        Returns
+        -------
+        dict mapping  checkpoint_key -> [alias1, alias2, ...]
+        """
+        tied_aliases: set[str] = set(getattr(meta_model, "_tied_weights_keys", []))
+        if not tied_aliases:
+            return {}
+
+        sd = meta_model.state_dict()
+
+        # Keys actually present in the checkpoint
+        ckpt_keys = PSStorageWorker._get_checkpoint_keys(local_path)
+
+        # Build (shape, dtype) -> canonical_key map (only for keys IN checkpoint)
+        shape_dtype_to_canonical: dict[tuple, str] = {}
+        for key in sd:
+            if key not in tied_aliases and key in ckpt_keys:
+                sig = (tuple(sd[key].shape), sd[key].dtype)
+                if sig in shape_dtype_to_canonical:
+                    # Two distinct canonical keys with same shape/dtype — ambiguous.
+                    # Log a warning; we will still use the first match but the
+                    # alias copy may use the wrong source for this edge case.
+                    psrl_logger.warning(
+                        f"_build_tied_weights_alias_map: ambiguous shape/dtype {sig} shared by "
+                        f"'{shape_dtype_to_canonical[sig]}' and '{key}'. "
+                        f"Tied alias resolution may pick the wrong canonical key."
+                    )
+                else:
+                    shape_dtype_to_canonical[sig] = key
+
+        # For each alias key NOT in checkpoint, find its canonical counterpart
+        canonical_to_aliases: dict[str, list[str]] = {}
+        for alias in tied_aliases:
+            if alias in ckpt_keys:
+                # Alias is actually saved in checkpoint (unusual but possible for
+                # some checkpoints that include redundant keys) — no mapping needed.
+                continue
+            assert alias in sd, (
+                f"_build_tied_weights_alias_map: alias key '{alias}' from "
+                f"_tied_weights_keys not found in model state_dict."
+            )
+            sig = (tuple(sd[alias].shape), sd[alias].dtype)
+            canonical = shape_dtype_to_canonical.get(sig)
+            assert canonical is not None, (
+                f"_build_tied_weights_alias_map: cannot find a canonical checkpoint key "
+                f"for alias '{alias}' with shape/dtype {sig}. "
+                f"Available canonical keys with their shapes: "
+                f"{[(k, tuple(sd[k].shape), sd[k].dtype) for k in sd if k not in tied_aliases and k in ckpt_keys]}"
+            )
+            canonical_to_aliases.setdefault(canonical, []).append(alias)
+            psrl_logger.info(
+                f"_build_tied_weights_alias_map: '{alias}' (alias) <- '{canonical}' (canonical), shape={sig[0]}"
+            )
+
+        return canonical_to_aliases
+
+    @staticmethod
+    def _get_checkpoint_keys(local_path: str) -> set[str]:
+        """
+        Return the set of parameter names actually stored in the checkpoint.
+
+        Uses the safetensors index.json weight_map when present (O(1) scan),
+        otherwise opens the single shard and lists its keys.
+        """
+        index_json = os.path.join(local_path, "model.safetensors.index.json")
+        single_sf = os.path.join(local_path, "model.safetensors")
+
+        if os.path.isfile(index_json):
+            with open(index_json) as fh:
+                index = json.load(fh)
+            return set(index.get("weight_map", index).keys())
+
+        if os.path.isfile(single_sf):
+            with safe_open(single_sf, framework="pt", device="cpu") as f:
+                return set(f.keys())
+
+        raise FileNotFoundError(
+            f"No safetensors checkpoint found under '{local_path}' for key scanning."
+        )
+
+    # ------------------------------------------------------------------
+    # Post-protocol weight loading
+    # ------------------------------------------------------------------
+
+    def load_weights_to_registered_tensors(self):
+        """
+        Stream HuggingFace checkpoint weights into the already-registered NIXL
+        buffers (``_original_tensor_mapping`` entries inside each sub-client).
+
+        Must be called **after** ``nixl_protocol()`` has completed so that all
+        meta-device tensors have been replaced by real allocated slices.
+
+        Memory strategy
+        ---------------
+        * Checkpoint shards are opened lazily with ``safetensors.safe_open``
+          (one file at a time, one tensor at a time).
+        * Each source tensor is immediately deleted after being copied into the
+          registered destination(s), so peak extra RAM equals roughly the size
+          of a single parameter tensor.
+        * When train and gen clients share the same underlying buffers
+          (``train_gen_model_share() == True``) the copy is done only once.
+        * Tied-weight aliases (e.g. ``lm_head.weight`` when
+          ``tie_word_embeddings=True``) are filled from their canonical
+          checkpoint key using ``_tied_weights_alias_map`` built at
+          ``init_model()`` time.
+        """
+        assert self.nixl_multi_storage_clients is not None, (
+            "NIXL clients must be initialized (call init_nixl_client()) before loading weights."
+        )
+        assert hasattr(self, "_tied_weights_alias_map"), (
+            "load_weights_to_registered_tensors: _tied_weights_alias_map not found — "
+            "init_model() must be called before this method."
+        )
+
+        local_path = copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
+        shard_files = self._discover_safetensors_shards(local_path)
+        psrl_logger.info(f"load_weights_to_registered_tensors: {len(shard_files)} shard file(s) under {local_path}")
+
+        push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        pull_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_pull_name)
+        shared = self.storage_plan.train_gen_model_share()
+
+        # Collect all keys expected by every sub-client (registered parameter names).
+        expected_keys: set[str] = set(push_client.local_client_info.tensor_infos.keys())
+        if not shared:
+            expected_keys |= set(pull_client.local_client_info.tensor_infos.keys())
+
+        # Alias keys are NOT in the checkpoint; they will be filled from their
+        # canonical counterparts when those canonical keys are loaded.
+        all_alias_keys: set[str] = set()
+        for aliases in self._tied_weights_alias_map.values():
+            all_alias_keys.update(aliases)
+
+        # Keys we expect to find directly in checkpoint files
+        direct_expected_keys: set[str] = expected_keys - all_alias_keys
+
+        loaded_keys: set[str] = set()
+
+        for shard_file in shard_files:
+            psrl_logger.info(f"load_weights_to_registered_tensors: opening {shard_file}")
+            with safe_open(shard_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    if key not in direct_expected_keys and key not in self._tied_weights_alias_map:
+                        continue  # key not needed by this PS worker
+
+                    src_tensor = f.get_tensor(key)  # CPU tensor, one at a time
+
+                    # Load the canonical key itself (if expected)
+                    if key in direct_expected_keys:
+                        push_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                        if not shared:
+                            pull_client.load_state_dict_into_registered_tensors({key: src_tensor})
+                        loaded_keys.add(key)
+
+                    # Also fill any tied-weight aliases that map to this canonical key.
+                    # The alias tensors have the same shape/dtype as the canonical key
+                    # but occupy independent registered buffers (because the meta model
+                    # allocated separate storage for each of them).
+                    for alias_key in self._tied_weights_alias_map.get(key, []):
+                        if alias_key not in expected_keys:
+                            continue  # this PS worker doesn't hold this alias
+                        psrl_logger.info(
+                            f"load_weights_to_registered_tensors: filling alias "
+                            f"'{alias_key}' from canonical '{key}'"
+                        )
+                        push_client.load_state_dict_into_registered_tensors({alias_key: src_tensor})
+                        if not shared:
+                            pull_client.load_state_dict_into_registered_tensors({alias_key: src_tensor})
+                        loaded_keys.add(alias_key)
+
+                    del src_tensor
+
+        # All expected keys should be loaded (direct or via alias)
+        missing = expected_keys - loaded_keys
+        if missing:
+            raise RuntimeError(
+                f"load_weights_to_registered_tensors: {len(missing)} key(s) not found "
+                f"in checkpoint (and not covered by any tied-weight alias): "
+                f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}"
+            )
+        alias_loaded = loaded_keys & all_alias_keys
+        psrl_logger.info(
+            f"load_weights_to_registered_tensors: loaded {len(loaded_keys)}/{len(expected_keys)} key(s) "
+            f"({len(alias_loaded)} via tied-weight alias)."
+        )
+
+        gc.collect()
+
+    @staticmethod
+    def _discover_safetensors_shards(local_path: str) -> list[str]:
+        """
+        Return an ordered list of absolute safetensors shard file paths.
+
+        Looks for (in priority order):
+        1. ``model.safetensors.index.json``  — multi-shard checkpoint
+        2. ``model.safetensors``             — single-file checkpoint
+
+        Raises a helpful ``FileNotFoundError`` / ``RuntimeError`` for unknown
+        or unsupported (pytorch_model.bin) formats.
+        """
+        index_json = os.path.join(local_path, "model.safetensors.index.json")
+        single_sf = os.path.join(local_path, "model.safetensors")
+
+        if os.path.isfile(index_json):
+            with open(index_json) as fh:
+                index = json.load(fh)
+            # weight_map: param_name -> relative shard filename
+            weight_map: dict[str, str] = index.get("weight_map", index)
+            # Deduplicate while preserving encounter order
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for rel_path in weight_map.values():
+                if rel_path not in seen:
+                    seen.add(rel_path)
+                    ordered.append(os.path.join(local_path, rel_path))
+            return ordered
+
+        if os.path.isfile(single_sf):
+            return [single_sf]
+
+        # Legacy pytorch_model.bin — not supported
+        pt_bin = os.path.join(local_path, "pytorch_model.bin")
+        pt_idx = os.path.join(local_path, "pytorch_model.bin.index.json")
+        if os.path.isfile(pt_bin) or os.path.isfile(pt_idx):
+            raise RuntimeError(
+                f"Checkpoint at '{local_path}' uses pytorch_model.bin format, which is not supported. "
+                "Convert it to safetensors first:\n"
+                "  python -c \"from transformers import AutoModel; m = AutoModel.from_pretrained('<path>'); "
+                "m.save_pretrained('<path>', safe_serialization=True)\""
+            )
+
+        raise FileNotFoundError(
+            f"No safetensors checkpoint found under '{local_path}'. "
+            "Expected 'model.safetensors' or 'model.safetensors.index.json'."
+        )
 
     def _build_transfer_key_cache(self, src_original_state_dict):
         self._transfer_key_cache = {"src_dict_id": id(src_original_state_dict)}
@@ -264,3 +574,13 @@ class PSStorageWorker:
 
     def shutdown(self):
         self.nixl_multi_storage_clients.shutdown()
+
+    def debug_log_info(self, label: str = ""):
+        """
+        Log info for both push (train) and pull (gen) clients on this PS worker.
+        Called via Ray RPC from the train worker for precision debugging.
+        """
+        push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        pull_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_pull_name)
+        push_client.log_shard_info(label=label)
+        pull_client.log_shard_info(label=label)

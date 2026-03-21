@@ -8,9 +8,11 @@ import ray
 from omegaconf import DictConfig
 from tensordict import TensorDict
 from verl import DataProto
+from vllm.sampling_params import RequestOutputKind
 
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
+from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.request_queue import (
     MultiPriorityRequestQueue,
     PriorityRequestQueue,
@@ -27,11 +29,13 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
+@ray.remote
 class RolloutRouter:
     def __init__(
         self,
         config: DictConfig,
         ps_manager_handle,
+        tokenizer,
         rollout_wg_list,
     ):
         """Initialize the rollout router.
@@ -45,26 +49,34 @@ class RolloutRouter:
         """
         self.config = config
         self.staleness = self.config.psrl.staleness
+        self.n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
+        self.n_validate_instances = (
+            self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
+        )
+
+        # TODO(linsh): currently we only support balance strategy on rollout instances
+        # we may extend it to validate instances in the future with dynamic routing strategy
         if self.config.psrl.redundant_rollout.enable:
             self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
             self.balanced_concurrent_seqs_per_instance = (
                 self.config.psrl.redundant_rollout.redundant_global_batch_size
                 * self.rollout_n
-                // self.config.psrl.deployment.n_rollout_instances
+                // self.n_rollout_instances
             )
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
             self.balanced_concurrent_seqs_per_instance = (
-                self.config.psrl.staleness_buffer_entries
-                * self.rollout_n
-                // self.config.psrl.deployment.n_rollout_instances
+                self.config.psrl.staleness_buffer_entries * self.rollout_n // self.n_rollout_instances
             )
+
+        self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         self.ps_manager_handle = ps_manager_handle
+        self.tokenizer = tokenizer
         self.rollout_wg_list = rollout_wg_list
         self.rollout_wg_size = len(rollout_wg_list)
-        assert self.rollout_wg_size == self.config.psrl.deployment.n_rollout_instances, (
+        assert self.rollout_wg_size == self.n_rollout_instances + self.n_validate_instances, (
             "Rollout worker group size must match the number of deployment instances"
         )
 
@@ -84,9 +96,8 @@ class RolloutRouter:
                 request_sort_indicator=RequestSortIndicator(self.config.psrl.routing_strategy.request_sort_indicator),
             )
         self.routing_lock = asyncio.Lock()
-        self.routing_status_update_event = asyncio.Event()
         self._is_routing = False
-        self._interrupt_routing = False
+        self._pause_routing = False
         self.scheduler_task = None  # Will be created in async context
         # Track the inflight request ids for each instance (i.e., request that is being generated
         # and is not yet completed or queued in the priority queue): {instance_id: [request_id, ...]}
@@ -97,6 +108,10 @@ class RolloutRouter:
         self.request_futures = {}  # Track request futures: {request_id: Future}
         # Track the version after synchronization for each instance: {instance_id: ps_model_version}
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
+        # Track the instance ids that are currently paused (not available for routing)
+        self.currently_paused_instance_ids = set()
+        # Track requests in sticky session: {request_id: bool}
+        self.sticky_session_requests = {}
 
         # Build logger
         self.log_prefix = "RolloutRouter"
@@ -179,10 +194,6 @@ class RolloutRouter:
             {instance_id: instance_to_engine_status[instance_id] for instance_id in filtered_instance_ids}
         )
 
-        # Notify the scheduler that status has been updated
-        if len(filtered_instance_ids) > 0:
-            self.routing_status_update_event.set()
-
     async def update_currently_syncing_instances(self, instance_ids: list[int], ps_model_version: int):
         """Update the currently syncing instances.
 
@@ -192,6 +203,40 @@ class RolloutRouter:
         """
         for instance_id in instance_ids:
             self.instance_to_version_after_sync[instance_id] = ps_model_version
+
+    async def enter_sticky_session(self, request_id: int):
+        """Mark a request as entering sticky session.
+
+        Args:
+            request_id (int): The request ID to mark.
+        """
+        self.sticky_session_requests[request_id] = True
+
+    async def exit_sticky_session(self, request_id: int):
+        """Mark a request as exiting sticky session.
+
+        Args:
+            request_id (int): The request ID to unmark.
+        """
+        self.sticky_session_requests.pop(request_id, None)
+
+    async def pause_instances(self, instance_ids: list[int]):
+        """Notify the router about paused instances.
+
+        Args:
+            instance_ids (List[int]): List of instance IDs that are paused.
+        """
+        for instance_id in instance_ids:
+            self.currently_paused_instance_ids.add(instance_id)
+
+    async def resume_instances(self, instance_ids: list[int]):
+        """Notify the router about resumed instances.
+
+        Args:
+            instance_ids (List[int]): List of instance IDs that are resumed.
+        """
+        for instance_id in instance_ids:
+            self.currently_paused_instance_ids.discard(instance_id)
 
     def _choose_new_rollout_instance(self, request: DataProto) -> int:
         """Select the best rollout instance for handling the generation request.
@@ -205,23 +250,47 @@ class RolloutRouter:
         # Ensure the whole routing process is atomic from the PS manager side
         # psrl_logger.info(f"Choosing new rollout instance for request {request.non_tensor_batch['uid'][0]}")
         request_id = request.non_tensor_batch["uid"][0]
+        is_validate = request.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         assert "version_tag" in request.non_tensor_batch, (
             "Request must have 'version_tag' for routing"
         )
         needed_model_version = request.non_tensor_batch["version_tag"][0]
 
-        # 1. Filter the rollout instances that can tolerate the needed staleness of the request
+        # 1. Filter the rollout instances that are not paused and can tolerate the needed staleness of the request
         # This guarantees that the gen worker will have no ahead-of-time version tag when generating
+        if self.config.psrl.fuse_rollout_with_validate:
+            available_instance_ids = set(range(self.rollout_wg_size))
+        else:
+            # If not fusing rollout with validate, separate the instance IDs for rollout and validate
+            available_instance_ids = set(
+                range(self.rollout_wg_size - self.n_validate_instances)
+                if not is_validate
+                else range(self.rollout_wg_size - self.n_validate_instances, self.rollout_wg_size)
+            )
+        available_instance_ids = available_instance_ids - self.currently_paused_instance_ids
         candidates = [
-            i for i, version in self.instance_to_version_after_sync.items() if version >= needed_model_version
+            i
+            for i, version in self.instance_to_version_after_sync.items()
+            if i in available_instance_ids and version >= needed_model_version
         ]
-        # psrl_logger.info(f"Candidates for request {request_id}: {candidates}")
+        psrl_logger.debug(
+            f"Routing candidates of request {request_id} is {candidates}, where "
+            f"available instance: {available_instance_ids}, "
+            f"instance_to_version: {self.instance_to_version_after_sync}"
+        )
 
         # 2. If forbidden global migration and the request is a partial rollout request,
         # only consider the specific instance for routing
         if "rollout_instance_id" in request.non_tensor_batch and not self.config.psrl.sync_and_mig_strategy.mig.enable:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             assert old_instance_id in candidates, f"Old rollout instance {old_instance_id} is not in the candidates"
+            candidates = [old_instance_id]
+
+        # 2.5. If request is in sticky session, keep the existing instance
+        if self.sticky_session_requests.get(request_id, False) and "rollout_instance_id" in request.non_tensor_batch:
+            old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
+            assert old_instance_id in candidates, f"Sticky session instance {old_instance_id} is not in the candidates"
             candidates = [old_instance_id]
 
         # 3. If forbidden group sampling on multiple instances, only consider the
@@ -231,7 +300,7 @@ class RolloutRouter:
             group_request_instance_ids = [
                 instance_id
                 for incomplete_request_id, instance_id in self.incomplete_request_to_instance.items()
-                if incomplete_request_id // self.rollout_n == request_id // self.rollout_n
+                if incomplete_request_id // rollout_n == request_id // rollout_n
             ]
             if len(group_request_instance_ids) > 0:
                 first_instance = group_request_instance_ids[0]
@@ -255,7 +324,9 @@ class RolloutRouter:
                 set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
             )
             can_reserve_results = ray.get(
-                self.ps_manager_handle.can_reserve_request.remote(request_id, all_candidate_model_versions)
+                self.ps_manager_handle.can_reserve_request.remote(
+                    request_id, all_candidate_model_versions, is_validate=is_validate
+                )
             )
             candidates = [
                 candidate
@@ -283,7 +354,9 @@ class RolloutRouter:
                 set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
             )
             indicator_results = ray.get(
-                self.ps_manager_handle.get_reserve_indicator.remote(request_id, all_candidate_model_versions)
+                self.ps_manager_handle.get_reserve_indicator.remote(
+                    request_id, all_candidate_model_versions, is_validate=is_validate
+                )
             )
             for candidate in candidates:
                 version = self.instance_to_version_after_sync[candidate]
@@ -321,6 +394,7 @@ class RolloutRouter:
                         rollout_instance_ids=chosen_rollout_instance,
                         request_ids=request_id,
                         model_versions=needed_model_version,
+                        is_validate=is_validate,
                     )
                 )
             # Otherwise, the request is already reserved
@@ -331,6 +405,7 @@ class RolloutRouter:
                     self.ps_manager_handle.update_request_instance_id.remote(
                         request_id=request_id,
                         new_instance_id=chosen_rollout_instance,
+                        is_validate=is_validate,
                     )
                 )
         else:
@@ -409,11 +484,12 @@ class RolloutRouter:
 
         # Consolidate batch results
         if "raw_response_ids" in non_tensor_batch:
-            raw_response_ids = non_tensor_batch["raw_response_ids"]
+            raw_response_ids = non_tensor_batch.pop("raw_response_ids")
+            raw_response_ids = np.fromiter(raw_response_ids.tolist(), dtype=object)
         else:
             raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
 
-        raw_response_ids += np.fromiter(response_ids_list, dtype=object)
+        raw_response_ids = raw_response_ids + np.fromiter(response_ids_list, dtype=object)
         non_tensor_batch["raw_response_ids"] = raw_response_ids
 
         if "response_unpadded_len" in non_tensor_batch:
@@ -427,10 +503,11 @@ class RolloutRouter:
         # Update rollout_log_probs
         if self.config.psrl.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
-                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+                curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
+                curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
             else:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
-            curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)
+            curr_rollout_log_probs = curr_rollout_log_probs + np.fromiter(all_log_prob_list, dtype=object)
             non_tensor_batch["rollout_log_probs"] = curr_rollout_log_probs
 
         batch = TensorDict(
@@ -441,6 +518,7 @@ class RolloutRouter:
         )
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
 
+    @rollout_trace_op
     async def generate_async(
         self,
         request: DataProto,
@@ -454,9 +532,6 @@ class RolloutRouter:
             DataProto or None: Generated result or None if request is invalid.
         """
         assert len(request) == 1, "RolloutRouter only supports single request generation."
-        assert "rollout_instance_id" not in request.non_tensor_batch, (
-            "Rollout instance ID should not be provided in the original request"
-        )
         if self.scheduler_task is None:
             if self.config.psrl.routing_strategy.enable_multi_priority_queue:
                 task_coro = self._multi_priority_queue_routing_loop()
@@ -469,9 +544,11 @@ class RolloutRouter:
             psrl_logger.info("Started routing loop")
 
         request_id = request.non_tensor_batch["uid"][0]
+        is_validate = request.meta_info.get("validate", False)
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             [request_id],
             PSRL_RequestStatus.ROLLOUT_ROUTING,
+            is_validate=is_validate,
         )
         if not update_status_success[0]:
             # Means the request is aborted
@@ -484,7 +561,6 @@ class RolloutRouter:
         # Add request to priority queue
         self.requests_to_route.put(request)
         # psrl_logger.info(f"Adding request {request_id} to priority queue")
-        self.routing_status_update_event.set()
         # Wait for the request to be processed
         with log_dual_events(
             f"Routing request {request_id} and waiting for it to be processed",
@@ -507,25 +583,24 @@ class RolloutRouter:
         assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
         assert not self.request_futures[request_id].done(), f"Request {request_id} should not be done"
         self.request_futures[request_id].set_result(result)
-        if request_id in self.incomplete_request_to_instance:
-            self.incomplete_request_to_instance.pop(request_id)
+        self.incomplete_request_to_instance.pop(request_id, None)
+        self.sticky_session_requests.pop(request_id, None)
 
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests."""
         return self._is_routing
 
-    async def interrupt_routing(self):
+    async def pause_routing(self):
         """Interrupt the routing."""
         async with self.routing_lock:
             psrl_logger.info("Interrupting routing")
-            self._interrupt_routing = True
+            self._pause_routing = True
 
     async def resume_routing(self):
         """Resume the routing."""
         async with self.routing_lock:
             psrl_logger.info("Resuming routing")
-            self._interrupt_routing = False
-        self.routing_status_update_event.set()
+            self._pause_routing = False
 
     async def _single_priority_queue_routing_loop(self):
         """Continuous routing loop for a single priority queue.
@@ -542,7 +617,7 @@ class RolloutRouter:
                 AsyncBusyPollingRayLock(self.ps_manager_handle),
             ):
                 # psrl_logger.info("Acquired lock")
-                while not self.requests_to_route.empty() and not self._interrupt_routing:
+                while not self.requests_to_route.empty() and not self._pause_routing:
                     self._is_routing = True
                     request = self.requests_to_route.pop()
                     assert request is not None, "Request should not be None in priority queue"
@@ -575,14 +650,6 @@ class RolloutRouter:
                     task = asyncio.create_task(task_coro)
                     # To avoid silent error in async tasks
                     task.add_done_callback(lambda f: f.result())
-            """
-            if is_stuck:
-                self._is_routing = False
-                self.routing_status_update_event.clear()
-                await self.routing_status_update_event.wait()
-            else:
-                await asyncio.sleep(0)
-            """
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
             await asyncio.sleep(sleep_time)
@@ -617,7 +684,7 @@ class RolloutRouter:
                     #     f"Processing requests in priority queue {queue_id}, "
                     #     f"there are {request_queue.size()} requests in the queue"
                     # )
-                    while not request_queue.empty() and not self._interrupt_routing:
+                    while not request_queue.empty() and not self._pause_routing:
                         request = request_queue.pop()
                         assert request is not None, "Request should not be None in priority queue"
                         request_id = request.non_tensor_batch["uid"][0]
@@ -646,16 +713,6 @@ class RolloutRouter:
                     # psrl_logger.info(f"There are {len(remain_requests)} requests left in priority queue {queue_id}, putting them back to the queue")
                     for request in remain_requests:
                         request_queue.put(request)
-            """
-            if is_stuck:
-                self._is_routing = False
-                self.routing_status_update_event.clear()
-                # psrl_logger.info("Routing is stuck, waiting for routing status update event")
-                await self.routing_status_update_event.wait()
-                # psrl_logger.info("Routing is resumed")
-            else:
-                await asyncio.sleep(0)
-            """
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
             if route_num > 0:
@@ -678,6 +735,8 @@ class RolloutRouter:
         #     f"to rollout instance {new_instance_id}"
         # )
         request_id = request.non_tensor_batch["uid"][0]
+        is_validate = request.meta_info.get("validate", False)
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         request.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
         assert "version_tag" in request.non_tensor_batch, (
             "Request must have 'version_tag' for routing"
@@ -698,6 +757,7 @@ class RolloutRouter:
             [request_id],
             PSRL_RequestStatus.ROLLOUT_DISPATCHED,
             model_version=request.non_tensor_batch["version_tag"].tolist(),
+            is_validate=request.meta_info.get("validate", False),
         )
         # psrl_logger.info(
         #     f"Update request {request_id} status to "
@@ -710,17 +770,35 @@ class RolloutRouter:
             # Add request to inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].append(request_id)
 
+            # Set sampling params
+            rollout_config = self.config.gen_actor_rollout_ref.rollout
+            sampling_params = dict(
+                n=1,
+                logprobs=0,  # can be set to 0 and let actor to recompute
+                temperature=rollout_config.temperature,
+                top_p=rollout_config.top_p,
+                repetition_penalty=rollout_config.get("repetition_penalty", 1.0),
+                output_kind=RequestOutputKind.CUMULATIVE,
+                detokenize=False,
+            )
+
+            # override sampling params for validation
+            if request.meta_info.get("validate", False):
+                val_config = self.config.train_actor_rollout_ref.rollout.val_kwargs
+                sampling_params["top_k"] = val_config.top_k
+                sampling_params["top_p"] = val_config.top_p
+                sampling_params["temperature"] = val_config.temperature
+
             # Generate response
             # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")
             consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async(
-                "generate_async", request
+                "generate_async", request, sampling_params
             )
 
             # Change engine status
             self.route_strategy.pop_request(request, new_instance_id)
             # Remove request from inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
-            self.routing_status_update_event.set()
 
             # Check if request was interrupted and needs to be requeued
             if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
@@ -747,7 +825,7 @@ class RolloutRouter:
                 return
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
                 response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
-                parent_prompt_id = request_id // self.rollout_n
+                parent_prompt_id = request_id // rollout_n
                 psrl_logger.debug(
                     f"Request {request_id} on instance {new_instance_id} of "
                     f"parent prompt {parent_prompt_id} completed successfully, "
@@ -805,10 +883,12 @@ class RolloutRouter:
                     filtered_request_ids = [
                         request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]
                     ]
+                    is_validate_list = [request.meta_info.get("validate", False) for request in filtered_requests]
                     can_reserve = await self.ps_manager_handle.can_reserve_request.remote(
                         filtered_request_ids,
                         [instance_version],
                         without_new_reserve_entry=False,
+                        is_validate=is_validate_list,
                     )
                     filtered_request_ids = [
                         request_id for i, request_id in enumerate(filtered_request_ids) if can_reserve[i] == [True]

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from omegaconf import MISSING
 from verl.base_config import BaseConfig
 
-__all__ = ["OptimizerConfig", "FSDPOptimizerConfig", "McoreOptimizerConfig"]
+__all__ = ["OptimizerConfig", "FSDPOptimizerConfig", "McoreOptimizerConfig", "build_optimizer"]
 
 
 @dataclass
@@ -103,3 +103,59 @@ class McoreOptimizerConfig(OptimizerConfig):
     lr_wsd_decay_steps: int | None = None
     use_checkpoint_opt_param_scheduler: bool = False
     override_optimizer_config: dict | None = None
+
+
+def build_optimizer(parameters, config: FSDPOptimizerConfig):
+    """Build an optimizer based on the configuration.
+
+    Dynamically imports and instantiates an optimizer class from the specified module.
+
+    Args:
+        parameters: Model parameters to optimize
+        config: FSDPOptimizerConfig with optimizer settings
+
+    Returns:
+        Optimizer instance
+
+    Examples:
+        # PyTorch AdamW
+        config.optimizer_impl = "torch.optim"
+        config.optimizer = "AdamW"
+
+        # TorchAO AdamW with bf16 stochastic rounding
+        config.optimizer_impl = "torchao.optim"
+        config.optimizer = "_AdamW"
+        config.override_optimizer_config = {"bf16_stochastic_round": True}
+
+        # BitsAndBytes AdamW 8bit
+        config.optimizer_impl = "bitsandbytes.optim"
+        config.optimizer = "AdamW8bit"
+    """
+    import importlib
+
+    optimizer_args = {
+        "lr": config.lr,
+        "weight_decay": config.weight_decay,
+    }
+
+    optimizer_name_lower = config.optimizer.lower()
+    if "adam" in optimizer_name_lower or "ademamix" in optimizer_name_lower:
+        optimizer_args["betas"] = config.betas
+
+    if config.override_optimizer_config is not None:
+        optimizer_args.update(config.override_optimizer_config)
+
+    try:
+        module = importlib.import_module(config.optimizer_impl)
+        optimizer_cls = getattr(module, config.optimizer)
+    except ImportError as e:
+        raise ImportError(
+            f"Failed to import module '{config.optimizer_impl}'. Make sure the package is installed. Error: {e}"
+        ) from e
+    except AttributeError as e:
+        raise AttributeError(
+            f"Optimizer '{config.optimizer}' not found in module '{config.optimizer_impl}'. "
+            f"Available optimizers: {dir(module)}"
+        ) from e
+
+    return optimizer_cls(parameters, **optimizer_args)

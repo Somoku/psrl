@@ -128,7 +128,7 @@ engine_kwargs:
 # Sampling parameters used during validation.
 val_kwargs:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.SamplingConfig
 
   # sampling parameters for validation
@@ -150,20 +150,17 @@ val_kwargs:
 # Multi-turn interaction config for tools or chat.
 multi_turn:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.MultiTurnConfig
 
   # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
   enable: False
 
   # null for no limit (default max_length // 3)
-  max_assistant_turns: null
+  max_turns: null
 
   # null for no tool
   tool_config_path: null
-
-  # null for no limit (default max_length // 3)
-  max_user_turns: null
 
   # max parallel call for tools in single turn
   max_parallel_calls: 1
@@ -173,9 +170,6 @@ multi_turn:
 
   # truncate side of tool response: left, middle, right
   tool_response_truncate_side: middle
-
-  # null for no interaction
-  interaction_config_path: null
 
   # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
   # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
@@ -195,9 +189,6 @@ multi_turn:
   # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
   format: hermes
 
-  # Number of repeat rollouts for each interaction
-  num_repeat_rollouts: null
-
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False 
@@ -205,7 +196,7 @@ calculate_log_probs: False
 # [Experimental] agent loop based rollout configs
 agent:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.AgentLoopConfig
 
   # Number of agent loop workers
@@ -226,7 +217,7 @@ agent:
   # custom async server configs
   custom_async_server:
 
-    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
     _target_: psrl.workers.config.CustomAsyncServerConfig
 
     # Path to the custom async server implementation
@@ -234,6 +225,40 @@ agent:
 
     # Class name of the custom async server class (e.g. AsyncvLLMServer)
     name: null
+  
+  # Max time (in seconds) allowed for each agent trajectory before timing out.
+  # If set to null, there is no timeout enforced.
+  trajectory_timeout: null
+  
+  # Environment configuration for the agent loop.
+  env:
+    
+    # Environment class name
+    name: null
+
+    # Timeout (in seconds) for each step in the environment.
+    step_timeout: null
+
+  # Agent data configuration for the agent loop.
+  data:
+  
+    # Agent data class name
+    name: null
+
+  # Maximum number of retries for each trajectory in case of failures.
+  retry_limit: 1
+
+  # Whether raise error in agent loop
+  raise_on_error: True
+
+  # Discount factor for Monte Carlo return calculation in reward.
+  gamma: 0.0 # no discounting
+  
+  # Coefficient for reward bonus shaping.
+  reward_bonus_coeff: 0.0 # no reward shaping
+
+  # Trajectory reward calculation mode: step or traj
+  traj_reward_mode: traj
 
 # Specifies the tensor bucket size (in megabytes) for batch weight updates during rollout operations.
 # This parameter controls the maximum payload size for a single weight update request.
@@ -252,7 +277,7 @@ update_weights_bucket_megabytes: 512
 # trace rollout data
 trace:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: psrl.workers.config.TraceConfig
 
   # trace backend, support mlflow, weave
@@ -281,7 +306,7 @@ enable_rollout_routing_replay: False
 # profile the rollout model in `generate_sequence` 
 profiler:
 
-  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.utils.profiler.ProfilerConfig
 
   # profiler tool, default same as profiler.tool in global config
@@ -302,3 +327,21 @@ profiler:
 
   # specific tool config
   tool_config: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config,null}
+
+# prometheus configuration for vllm server mode
+prometheus:
+
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: psrl.workers.config.PrometheusConfig
+
+  # whether enable prometheus on server mode rollout
+  enable: false
+
+  # Port number that Prometheus listens on, default is 9090
+  port: 9090
+
+  # Path to Prometheus configuration file
+  file: /tmp/ray/session_latest/metrics/prometheus/prometheus.yml
+
+  # Specify served_model_name to avoid displaying overly long model paths in Grafana
+  served_model_name: ${oc.select:train_actor_rollout_ref.model.path,null}

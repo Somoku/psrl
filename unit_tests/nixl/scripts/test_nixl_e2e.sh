@@ -1,11 +1,14 @@
 #!/bin/bash
 set -xeuo pipefail
 
-export PSRL_LOGGING_PATH=${PSRL_WORKSPACE}/psrl/unit_tests/nixl/log
+PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
+export PSRL_LOGGING_PATH=${PSRL_PATH}/unit_tests/nixl/log
 export PSRL_LOGGING_LEVEL=INFO
-cd ${PSRL_WORKSPACE}/psrl/unit_tests/nixl
+cd ${PSRL_PATH}/unit_tests/nixl
 
 CASE=1
+
+# NOTE(lhy): HSDP/FSDP precision is not aligned, because we use FSDP1 in the unit test.
 
 # HSDP 16 GPUs Case
 if [ $CASE -eq 0 ]; then
@@ -17,7 +20,7 @@ if [ $CASE -eq 0 ]; then
         test.fsdp_hybrid.fsdp_size=8 \
         test.gen.tensor_parallel_size=2 \
         test.gen.pipeline_parallel_size=2 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct \
+        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct \
         2>&1 | tee test_nixl_e2e.log
 fi
 

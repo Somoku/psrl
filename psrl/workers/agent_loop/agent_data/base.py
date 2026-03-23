@@ -107,6 +107,8 @@ class Trajectory:
     parent_id: int | None = None
     # Current rollout instance ID
     curr_rollout_instance_id: int | None = None
+    # Current version tag
+    curr_version_tag: int | None = None
 
     # List of Step objects comprising this trajectory
     steps: list[Step] = field(default_factory=list)
@@ -416,6 +418,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
     def update_trajectory_state_from_output(self, output: DataProto, **kwargs):
         """Update trajectory state based on model output dataproto."""
         self.trajectory.curr_rollout_instance_id = output.non_tensor_batch.get("rollout_instance_id", [None])[0]
+        self.trajectory.curr_version_tag = output.non_tensor_batch.get("version_tag", [None])[0]
         self.get_current_step().info["rollout_instance_id"] = output.non_tensor_batch.get(
             "rollout_instance_id", [None]
         )[0]
@@ -437,6 +440,8 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         )
         if self.trajectory.curr_rollout_instance_id is not None:
             request.non_tensor_batch["rollout_instance_id"] = np.array([self.trajectory.curr_rollout_instance_id])
+        if self.trajectory.curr_version_tag is not None:
+            request.non_tensor_batch["version_tag"] = np.array([self.trajectory.curr_version_tag])
 
         return request
 

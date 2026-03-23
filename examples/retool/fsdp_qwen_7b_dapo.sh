@@ -4,7 +4,7 @@ set -xeuo pipefail
 project_name='retool'
 experiment_name='DAPO-Qwen2.5-7B-AIME-fsdp2-stream-nixl-staleness_0'
 
-source ${PSRL_WORKSPACE}/env/psrl_agent.sh
+source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
@@ -21,7 +21,7 @@ test_files="['$aime_2025']"
 CKPT_ROOT=${CKPT_ROOT:-$PWD}
 default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
-tool_config_path=${PSRL_PATH}/examples/precision_test/retool/sandbox_fusion_tool_config.yaml
+tool_config_path=${PSRL_PATH}/examples/retool/sandbox_fusion_tool_config.yaml
 
 GEN_TP=2 # TP in the generation side
 GEN_PP=1 # PP in the generation side
@@ -92,9 +92,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.rollout_n=${n_resp_per_prompt} \
     psrl.staleness=0 \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
-    psrl.gen_mode=stream \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_PATH}/examples/precision_test/retool/fsdp_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/retool/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -108,7 +107,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.nixl.server_port=23456 \
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    gen_actor_rollout_ref.rollout.mode=psrl_async \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -129,7 +127,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    train_actor_rollout_ref.rollout.mode=psrl_async \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -179,9 +176,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     data.train_batch_size=${train_prompt_bsz} \
     data.return_raw_chat=True \
     data.filter_overlong_prompts=True \
-    data.custom_cls.path=${PSRL_PATH}/examples/precision_test/retool/retool.py \
+    data.custom_cls.path=${PSRL_PATH}/examples/retool/retool.py \
     data.custom_cls.name=CustomRLHFDataset \
-    custom_reward_function.path=${PSRL_PATH}/examples/precision_test/retool/retool.py \
+    custom_reward_function.path=${PSRL_PATH}/examples/retool/retool.py \
     custom_reward_function.name=compute_score \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \

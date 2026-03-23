@@ -239,7 +239,7 @@ class PSRL_AgentLoopWorker:
             with log_dual_events(
                 f"Agent loop with requests {requests.non_tensor_batch['uid']}",
                 psrl_logger,
-                level=logging.DEBUG,
+                level=logging.INFO,
                 event_type=EventType.GEN,
             ):
                 retry_limit = self.config.gen_actor_rollout_ref.rollout.agent.retry_limit

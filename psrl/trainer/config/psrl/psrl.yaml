@@ -125,10 +125,10 @@ status_collection:
 memory_logger:
 
   # Whether to enable memory logger
-  enable: True
+  enable: False
 
   # Logging interval in seconds
-  interval_seconds: 20
+  interval_seconds: 30
 
 # Redundant rollout config
 redundant_rollout:
@@ -279,9 +279,6 @@ proactive_filter_strategy:
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:
 
-  # Parameter server mode: storage_server or meta_server
-  server_mode: meta_server
-
   # Server IP address
   server_ip: ${psrl.ps_manager_ip}
 
@@ -289,7 +286,7 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 16
+  max_pinned_temp_memory_slots: 64
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
@@ -339,4 +336,4 @@ tms:
   # Whether to enable TMS on NIXL temp buffers
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
-  enable_nixl: False
+  enable_nixl: True

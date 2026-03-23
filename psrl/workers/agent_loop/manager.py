@@ -489,7 +489,6 @@ class PSRL_AgentLoopManager:
             is_validate = data.meta_info.get("validate", False)
             assert not is_validate, "Training data must have validate=False in meta_info"
             batch_size = len(data)
-            self._request_counter += batch_size
             psrl_logger.debug(f"Got {len(data)} requests from data queue")
 
             # Wait for version update in ps
@@ -504,12 +503,15 @@ class PSRL_AgentLoopManager:
                     await asyncio.sleep(0.1)
                 self.curr_ps_version_tag = expected_ps_version
                 psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
-                 
-            # Initialize the version tag to -1 for all requests 
-            # The version tag will be updated after routing to the instance  
+
+            # Initialize the version tag to -1 for all requests
+            # The version tag will be updated after routing to the instance
             data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
             # Dispatch data to agent loop workers
-            await self._inner_dispatch_data(data, is_validate) 
+            await self._inner_dispatch_data(data, is_validate)
+            # Increment counter after dispatch so _get_expected_ps_version reflects the number
+            # of requests that have actually been sent out.
+            self._request_counter += batch_size
             
         psrl_logger.info("Agent loop manager train dispatch task stopped.")
             
@@ -712,7 +714,7 @@ class PSRL_AgentLoopManager:
                         is_validate=is_validate,
                     )
                     self.rollout_request_tracker[sample_id].append(entry_info)
-                    psrl_logger.debug(
+                    psrl_logger.info(
                         f"Store data for prompt {sample_id} with info {entry_info}, "
                         f"request num: {len(self.rollout_request_tracker[sample_id])}"
                     )
@@ -1138,7 +1140,9 @@ class PSRL_AgentLoopManager:
         Args:
             buffer_id (int): The ID of the buffer that is waiting.
         """
-        if self.config.psrl.proactive_filter_strategy.method == "retry":
+        if self.config.psrl.proactive_filter_strategy.method is None:
+            return
+        elif self.config.psrl.proactive_filter_strategy.method == "retry":
             gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
             if gap == 0:
                 return

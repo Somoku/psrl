@@ -96,33 +96,28 @@ class PSStorageWorker:
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.train_meta_hf_model and self.gen_meta_hf_model, \
         #     "The HuggingFace models must be initialized before calling init_nixl_client."
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
-            # TODO(lhy): maybe support train and gen use different ps mode
-            self.agent_name = f"{GLOBAL_PS_CLIENT_NAME}_{self.rank}"
-            self.client_for_push_name = f"{self.agent_name}_for_push"
-            self.client_for_pull_name = f"{self.agent_name}_for_pull"
-            self.nixl_multi_storage_clients = NIXLMultiStorageClients(
-                agent_name=self.agent_name,
-                multi_client_names=[
-                    self.client_for_push_name,
-                    self.client_for_pull_name,
-                ],
-                server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=self.use_gpu,
-                multi_client_types=[
-                    NIXLClientType.PS_FOR_PUSH,
-                    NIXLClientType.PS_FOR_PULL,
-                ],
-                nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
-                # client_group_id=self.get_replica_id(),
-                logging_path=self.psrl_config.logging_path,
-            )
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.use_gpu = self.psrl_config.ps_mode == "nixl_gpu"
+        # TODO(lhy): maybe support train and gen use different ps mode
+        self.agent_name = f"{GLOBAL_PS_CLIENT_NAME}_{self.rank}"
+        self.client_for_push_name = f"{self.agent_name}_for_push"
+        self.client_for_pull_name = f"{self.agent_name}_for_pull"
+        self.nixl_multi_storage_clients = NIXLMultiStorageClients(
+            agent_name=self.agent_name,
+            multi_client_names=[
+                self.client_for_push_name,
+                self.client_for_pull_name,
+            ],
+            server_name=GLOBAL_META_SERVER_NAME,
+            use_gpu=self.use_gpu,
+            multi_client_types=[
+                NIXLClientType.PS_FOR_PUSH,
+                NIXLClientType.PS_FOR_PULL,
+            ],
+            nixl_config=self.psrl_config.nixl,
+            nixl_interface=self.nixl_interface,
+            # client_group_id=self.get_replica_id(),
+            logging_path=self.psrl_config.logging_path,
+        )
         psrl_logger.info(
             f"NIXL multi storage clients initialized on port {self.nixl_multi_storage_clients.client_port}."
         )
@@ -278,81 +273,31 @@ class PSStorageWorker:
         meta_model: torch.nn.Module,
         local_path: str,
     ) -> dict[str, list[str]]:
+        """Build a map canonical_checkpoint_key -> [alias_keys_not_in_checkpoint].
+
+        Currently only handles the tie_word_embeddings case:
+        model.embed_tokens.weight (canonical) <- lm_head.weight (alias).
         """
-        Build a map  canonical_checkpoint_key -> [alias_keys_not_in_checkpoint].
-
-        Transformers models with ``tie_word_embeddings=True`` (and similar
-        architectures) have some state-dict keys (e.g. ``lm_head.weight``) that
-        are NOT stored in the checkpoint because they are identical to another
-        parameter (e.g. ``model.embed_tokens.weight``).  The model exposes these
-        via ``model._tied_weights_keys``.
-
-        Algorithm
-        ---------
-        1.  Collect all alias keys from ``model._tied_weights_keys``.
-        2.  Collect all canonical keys = state_dict keys that are NOT aliases.
-        3.  Discover which keys actually exist in the checkpoint (using the
-            safetensors index.json or a single shard scan) — the canonical keys.
-        4.  For each alias key that is missing from the checkpoint, find a
-            canonical key whose (shape, dtype) matches.  This is safe because
-            tied parameters are by definition identical tensors; clashes are
-            extremely unlikely and are guarded by an assertion.
-
-        Returns
-        -------
-        dict mapping  checkpoint_key -> [alias1, alias2, ...]
-        """
-        tied_aliases: set[str] = set(getattr(meta_model, "_tied_weights_keys", []))
-        if not tied_aliases:
+        cfg = getattr(meta_model, "config", None)
+        if cfg is None or not getattr(cfg, "tie_word_embeddings", False):
             return {}
 
-        sd = meta_model.state_dict()
-
-        # Keys actually present in the checkpoint
         ckpt_keys = PSStorageWorker._get_checkpoint_keys(local_path)
+        canonical = "model.embed_tokens.weight"
+        alias = "lm_head.weight"
 
-        # Build (shape, dtype) -> canonical_key map (only for keys IN checkpoint)
-        shape_dtype_to_canonical: dict[tuple, str] = {}
-        for key in sd:
-            if key not in tied_aliases and key in ckpt_keys:
-                sig = (tuple(sd[key].shape), sd[key].dtype)
-                if sig in shape_dtype_to_canonical:
-                    # Two distinct canonical keys with same shape/dtype — ambiguous.
-                    # Log a warning; we will still use the first match but the
-                    # alias copy may use the wrong source for this edge case.
-                    psrl_logger.warning(
-                        f"_build_tied_weights_alias_map: ambiguous shape/dtype {sig} shared by "
-                        f"'{shape_dtype_to_canonical[sig]}' and '{key}'. "
-                        f"Tied alias resolution may pick the wrong canonical key."
-                    )
-                else:
-                    shape_dtype_to_canonical[sig] = key
+        # If lm_head.weight is already in the checkpoint, no alias mapping needed.
+        if alias in ckpt_keys:
+            return {}
 
-        # For each alias key NOT in checkpoint, find its canonical counterpart
-        canonical_to_aliases: dict[str, list[str]] = {}
-        for alias in tied_aliases:
-            if alias in ckpt_keys:
-                # Alias is actually saved in checkpoint (unusual but possible for
-                # some checkpoints that include redundant keys) — no mapping needed.
-                continue
-            assert alias in sd, (
-                f"_build_tied_weights_alias_map: alias key '{alias}' from "
-                f"_tied_weights_keys not found in model state_dict."
-            )
-            sig = (tuple(sd[alias].shape), sd[alias].dtype)
-            canonical = shape_dtype_to_canonical.get(sig)
-            assert canonical is not None, (
-                f"_build_tied_weights_alias_map: cannot find a canonical checkpoint key "
-                f"for alias '{alias}' with shape/dtype {sig}. "
-                f"Available canonical keys with their shapes: "
-                f"{[(k, tuple(sd[k].shape), sd[k].dtype) for k in sd if k not in tied_aliases and k in ckpt_keys]}"
-            )
-            canonical_to_aliases.setdefault(canonical, []).append(alias)
-            psrl_logger.info(
-                f"_build_tied_weights_alias_map: '{alias}' (alias) <- '{canonical}' (canonical), shape={sig[0]}"
-            )
-
-        return canonical_to_aliases
+        assert canonical in ckpt_keys, (
+            f"_build_tied_weights_alias_map: tie_word_embeddings=True but "
+            f"'{canonical}' not found in checkpoint under '{local_path}'."
+        )
+        psrl_logger.info(
+            f"_build_tied_weights_alias_map: '{alias}' (alias) <- '{canonical}' (canonical)"
+        )
+        return {canonical: [alias]}
 
     @staticmethod
     def _get_checkpoint_keys(local_path: str) -> set[str]:

@@ -16,7 +16,9 @@ TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
 
 GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
+
 VAL_TP=1 # TP in the training side for validation
+VAL_PP=1 # PP in the training side for validation
 
 NNODES=2
 NGPUS_PER_NODE=8
@@ -28,6 +30,9 @@ GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs pe
 
 TRAIN_NNODES=1 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
+
+VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
+VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
 adv_estimator=grpo
 use_kl_in_reward=False
@@ -75,9 +80,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
+    psrl.deployment.n_validate_instances=${VAL_INSTANCES} \
+    psrl.deployment.validate_nnodes_per_instance=1 \
+    psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.nixl.server_mode=meta_server \
     psrl.nixl.server_port=23456 \
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \

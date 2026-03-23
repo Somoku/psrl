@@ -832,17 +832,9 @@ class PSManager(RequestStatusTracker):
 
         Args:
             expected_agents (int): Number of expected NIXL clients to connect
-
-        Raises:
-            ValueError: If server_mode is invalid or deprecated
         """
         self.expected_agents = expected_agents
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
 
     def nixl_protocol(self):
         """Execute the NIXL protocol for distributed communication setup.

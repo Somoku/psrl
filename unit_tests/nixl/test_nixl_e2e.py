@@ -584,10 +584,10 @@ def test_nixl_e2e(cfg: DictConfig):
             "logging_path": log_dir,
             "ps_manager_ip": listen_ip,
             "nixl": {
-                "server_mode": cfg.nixl.server_mode,
                 "server_ip": cfg.nixl.server_ip,
                 "server_port": cfg.nixl.server_port,
                 "max_pinned_temp_memory_slots": cfg.nixl.max_pinned_temp_memory_slots,
+                "enable_tms_for_temp_buffers": cfg.nixl.enable_tms_for_temp_buffers,
             },
             "ps_mode": cfg.ps.mode,
         }

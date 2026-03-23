@@ -252,8 +252,8 @@ class RolloutRouter:
         request_id = request.non_tensor_batch["uid"][0]
         is_validate = request.meta_info.get("validate", False)
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-        assert "version_tag" in request.non_tensor_batch, (
-            "Request must have 'version_tag' for routing"
+        assert "version_tag" in request.non_tensor_batch and request.non_tensor_batch["version_tag"][0] != None, (
+            "Request must have 'version_tag' for routing and it must not be None"
         )
         needed_model_version = request.non_tensor_batch["version_tag"][0]
 
@@ -560,7 +560,7 @@ class RolloutRouter:
         self.request_futures[request_id] = result_future
         # Add request to priority queue
         self.requests_to_route.put(request)
-        # psrl_logger.info(f"Adding request {request_id} to priority queue")
+        psrl_logger.info(f"Adding request {request_id} to priority queue")
         # Wait for the request to be processed
         with log_dual_events(
             f"Routing request {request_id} and waiting for it to be processed",
@@ -826,7 +826,7 @@ class RolloutRouter:
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
                 response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
                 parent_prompt_id = request_id // rollout_n
-                psrl_logger.debug(
+                psrl_logger.info(
                     f"Request {request_id} on instance {new_instance_id} of "
                     f"parent prompt {parent_prompt_id} completed successfully, "
                     f"length is {response_len}"

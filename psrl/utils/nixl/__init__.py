@@ -14,7 +14,7 @@ from .nixl_spec import (
     NIXLSharding,
     NIXLTensorInfo,
 )
-from .server import NIXLMetaServer, NIXLStorageServer
+from .server import NIXLMetaServer
 
 __all__ = [
     "NIXLSharding",
@@ -22,7 +22,6 @@ __all__ = [
     "NIXLClientType",
     "NIXLClientInfo",
     "NIXLInterface",
-    "NIXLStorageServer",
     "NIXLMetaServer",
     "NIXLStorageClient",
     "NIXLMultiStorageClients",

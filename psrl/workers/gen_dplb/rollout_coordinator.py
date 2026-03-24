@@ -7,15 +7,15 @@ import aiohttp
 import numpy as np
 import ray
 
+from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
     log_dual_events,
 )
-from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.gen_dplb.stats_collector import EngineStats
-from psrl.workers.gen_dplb.utils import RolloutInstanceId, DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT
+from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, RolloutInstanceId
 from psrl.workers.gen_dplb.zmq_queue import ZMQPullQueue
 
 psrl_logger = logging.getLogger(__file__)
@@ -108,9 +108,7 @@ class RolloutCoordinator(CommandExtension):
 
         # Version tracking
         # The latest stale model version of each instance
-        self.instance_to_latest_stale_model_version: dict[
-            RolloutInstanceId, int
-        ] = {}
+        self.instance_to_latest_stale_model_version: dict[RolloutInstanceId, int] = {}
         # Track the model version of each instance
         self.instance_to_model_version: dict[RolloutInstanceId, int] = {}
         # Tracks model version each instance will have after its next sync.
@@ -199,9 +197,7 @@ class RolloutCoordinator(CommandExtension):
         expected = running
         actual = data.get("running")
         if actual is not None and bool(actual) != expected:
-            raise RuntimeError(
-                f"Unexpected routing loop state after {path}: expected={expected}, got={actual}"
-            )
+            raise RuntimeError(f"Unexpected routing loop state after {path}: expected={expected}, got={actual}")
 
     async def _fetch_filtered_request_meta(self, version_tag: int) -> list[tuple[int, bool]]:
         data = await self._gateway_get_json("/routing_loop/filter", params={"version_tag": version_tag})
@@ -369,7 +365,7 @@ class RolloutCoordinator(CommandExtension):
         if self.sync_task is not None:
             await self.sync_task
             psrl_logger.info("Finished sync task.")
-        '''
+        """
         tasks_to_wait = [self.command_handler_task]
         if self.sync_task is not None:
             tasks_to_wait.append(self.sync_task)
@@ -380,7 +376,7 @@ class RolloutCoordinator(CommandExtension):
 
         # Wait for tasks to finish with timeout
         await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-        '''
+        """
         psrl_logger.info("All background tasks have been stopped.")
         self.status_queue.close()
         if self.gateway_client is not None and not self.gateway_client.closed:
@@ -511,7 +507,7 @@ class RolloutCoordinator(CommandExtension):
         psrl_logger.info("Starting to process ZMQ status stream")
         while not self.stop_process_status_queue:
             # Naive implementation version
-            '''
+            """
             recv_stats = await self.status_queue.get_async(block=True, timeout=None)
             replica_id = self.replica_idx_to_replica_id.get(recv_stats.replica_idx)
             if replica_id is None:
@@ -522,8 +518,8 @@ class RolloutCoordinator(CommandExtension):
                 f"Updated engine status for instance "
                 f"{instance_id}: {self.instance_to_engine_status[instance_id]} "
             )
-            '''
-            
+            """
+
             # Coalesce implementation version
             try:
                 recv_stats = await self.status_queue.get_async(
@@ -554,10 +550,9 @@ class RolloutCoordinator(CommandExtension):
                 latest_by_instance[instance_id] = next_stats
 
             # Apply only the newest snapshot per instance
-            # psrl_logger.info(f"Received {len(latest_by_instance)} engine stats updates, updating instance_to_engine_status with {latest_by_instance}...")
+            # psrl_logger.info(f"Received {len(latest_by_instance)} engine stats updates, updating instance_to_engine_status with {latest_by_instance}...")  # noqa: E501
             self.instance_to_engine_status.update(latest_by_instance)
         psrl_logger.info("Stopped processing ZMQ status stream.")
-
 
     async def _sync_status_to_router(self):
         """
@@ -782,8 +777,8 @@ class RolloutCoordinator(CommandExtension):
             event_type=EventType.OTHER,
         ):
             for instance_id in instance_ids:
-                self.instance_to_latest_stale_model_version[instance_id] = (
-                    self.instance_to_model_version.get(instance_id, 0)
+                self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
+                    instance_id, 0
                 )
 
             if self.use_rust_gateway:
@@ -828,8 +823,7 @@ class RolloutCoordinator(CommandExtension):
             if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
                 await self._wait_interrupted_partial_requests_loop_back(instance_ids)
                 psrl_logger.info(
-                    f"All interrupted requests on the synchronized instances "
-                    f"{instance_ids} have been looped back"
+                    f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
                 )
 
             if self.use_rust_gateway:
@@ -857,7 +851,7 @@ class RolloutCoordinator(CommandExtension):
             "Partial rollout is only supported when status collection is enabled"
         )
         assert self.config.psrl.partial_rollout.enable, "Partial rollout is not enabled"
-        
+
         if self.use_rust_gateway:
             return await self._check_should_sync(instance_id)
         else:
@@ -868,7 +862,7 @@ class RolloutCoordinator(CommandExtension):
         instance_status = self.instance_to_engine_status[instance_id]
         if instance_status.get_waiting_queue_size() > 0:
             return False
-        
+
         # 1. Check if there are any requests version satisfies the condition before synchronization
         current_instance_version = self.instance_to_version_after_sync[instance_id]
         if await self.ps_manager.check_aborted_model_versions.remote(current_instance_version):
@@ -876,14 +870,12 @@ class RolloutCoordinator(CommandExtension):
         else:
             filtered_request_meta = await self._fetch_filtered_request_meta(current_instance_version)
             filtered_request_ids = [request_meta[0] for request_meta in filtered_request_meta]
-        
+
         # 2. Check if there are any requests
         # that can be RESERVED for the instance but no need to reserve new entry
         # before synchronization
         if len(filtered_request_ids) > 0:
-            is_aborted = await self.ps_manager.check_aborted_requests.remote(
-                filtered_request_ids, remove=False
-            )
+            is_aborted = await self.ps_manager.check_aborted_requests.remote(filtered_request_ids, remove=False)
             filtered_request_ids = [
                 request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]
             ]
@@ -897,13 +889,13 @@ class RolloutCoordinator(CommandExtension):
                 for i, request_id in enumerate(filtered_request_ids)
                 if can_reserve_without_new_reserve_entry[i] == [True]
             ]
-        
+
         # If there are requests that can still be routed to the instance
         # before synchronization without new reserve entry
         # we will not attempt to synchronize with PS
         if len(filtered_request_ids) > 0 and self.config.psrl.sync_and_mig_strategy.sync.check_req_before_sync:
             return False
-        
+
         # 3. Check indicator to determine whether to synchronize with PS
         if self.config.psrl.sync_and_mig_strategy.sync.indicator == "request_num":
             # Check whether request num is above threshold
@@ -997,9 +989,7 @@ class RolloutCoordinator(CommandExtension):
             filtered_request_meta = await self._fetch_filtered_request_meta(instance_version)
             filtered_request_ids = [meta[0] for meta in filtered_request_meta]
             if len(filtered_request_ids) > 0:
-                is_aborted = await self.ps_manager.check_aborted_requests.remote(
-                    filtered_request_ids, remove=False
-                )
+                is_aborted = await self.ps_manager.check_aborted_requests.remote(filtered_request_ids, remove=False)
                 filtered_request_ids = [
                     request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]
                 ]
@@ -1015,7 +1005,7 @@ class RolloutCoordinator(CommandExtension):
                 ]
             if len(filtered_request_ids) == 0:
                 filtered_instance_ids.append(instance_id)
-            
+
         candidate_migrate_instance_ids = []  # (instance_id, ratio)
         for starved_instance_id in filtered_instance_ids:
             for instance_id in self.instance_ids:
@@ -1026,7 +1016,7 @@ class RolloutCoordinator(CommandExtension):
                     > self.instance_to_version_after_sync[starved_instance_id]
                 ):
                     continue
-                
+
                 if self.config.psrl.sync_and_mig_strategy.mig.indicator == "request_num":
                     request_num = instance_to_status[instance_id].get_waiting_and_running_queue_size()
                     starved_request_num = instance_to_status[starved_instance_id].get_waiting_and_running_queue_size()
@@ -1052,7 +1042,7 @@ class RolloutCoordinator(CommandExtension):
                     raise ValueError(
                         f"Unknown migrate indicator: {self.config.psrl.sync_and_mig_strategy.mig.indicator}"
                     )
-                
+
                 if ratio > self.config.psrl.sync_and_mig_strategy.mig.threshold:
                     # psrl_logger.info(
                     #     f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
@@ -1060,7 +1050,7 @@ class RolloutCoordinator(CommandExtension):
                     #     f"(version {self.instance_to_version_after_sync[starved_instance_id]})"
                     # )
                     candidate_migrate_instance_ids.append((instance_id, ratio))
-        
+
         # We choose the instance with the highest ratio to migrate
         # TODO(lhy): support multiple instances to migrate and finer-grained migration strategy
         # Currently, we only support one instance to migrate,
@@ -1093,4 +1083,3 @@ class RolloutCoordinator(CommandExtension):
             replica_id, dp_rank = instance_id
             futures.append(self.server_handles[replica_id].wait_for_requests_to_drain.remote())
         await asyncio.gather(*futures)
-

@@ -4,9 +4,8 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
-from vllm.utils.mem_constants import GiB_bytes
-from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.utils.mem_utils import format_gib
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
@@ -71,7 +70,7 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
-        
+
         # If the KV cache has just been woken up,
         # the internal state of cache_engine must be reset,
         # especially the FP8 scaling factor.
@@ -129,7 +128,5 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
-        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
-            self.model_runner, "_init_kv_zero_meta"
-        ):
+        if kv_cache_config.needs_kv_cache_zeroing and hasattr(self.model_runner, "_init_kv_zero_meta"):
             self.model_runner._init_kv_zero_meta()

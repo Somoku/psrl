@@ -5,28 +5,27 @@ import json
 import logging
 import os
 import time
-import aiohttp
+from collections.abc import Callable
 from dataclasses import dataclass
 from pprint import pprint
-from collections.abc import Callable
 from typing import Any
 
+import aiohttp
 import ray
 import vllm.entrypoints.cli.serve
 import vllm.entrypoints.grpc_server
 from ray.actor import ActorHandle
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
-from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.ray_utils import get_event_loop
+from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.device import get_resource_name
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.net_utils import is_valid_ipv6_address
+from verl.utils.profiler import build_vllm_profiler_args
+from verl.utils.ray_utils import get_event_loop
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
-from verl.workers.rollout.utils import run_unvicorn
-from verl.utils.profiler import build_vllm_profiler_args
-from verl.single_controller.ray import RayWorkerGroup
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -41,7 +40,6 @@ from verl.workers.rollout.vllm_rollout.vllm_async_server import (
 )
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
@@ -62,8 +60,8 @@ from psrl.utils.logger import (
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.gen_dplb.stats_collector import DPLBStatCollector
+from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
 from psrl.workers.gen_dplb.zmq_queue import ZMQPullQueue, ZMQPushQueue
-from psrl.workers.gen_dplb.utils import TokenOutput, DEFAULT_TIMEOUT, DEFAULT_MAX_CONNECTIONS
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 get_encoding()
@@ -172,7 +170,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
         """Launch the vLLM HTTP server with PSRL-specific setup.
-        
+
         NOTE(verl): This method is adapted from the original vLLMHttpServer.launch_server in verl.
         The main differences are:
         1. Additional setup for PSRL features (e.g., rollout scheduler, stat collector, scheduler abort processor).
@@ -524,10 +522,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         """
         import time as _time
 
-        import grpc
         from grpc_reflection.v1alpha import reflection
         from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
         from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        import grpc
 
         start_time = _time.time()
         servicer = VllmEngineServicer(engine_client, start_time)
@@ -706,7 +705,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             worker_id = data.get("worker_id")
             if not worker_id:
                 raise ValueError(f"Missing worker_id in gateway response: {data}")
-            
+
             self.base_worker_id = worker_id
             psrl_logger.info(
                 "Registered rollout server to gateway: replica=%s, worker_id=%s, addr=%s",
@@ -1078,7 +1077,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # Step 1. Interrupt generation if needed
         if pause_generation:
             await self.pause_generation(clear_cache=False)
-            psrl_logger.info(f"Generation paused on replica {self.get_replica_idx()} instance {data_parallel_rank} for sync with PS")
+            psrl_logger.info(
+                f"Generation paused on replica {self.get_replica_idx()} instance {data_parallel_rank} for sync with PS"
+            )
 
         # Step 2. Pull model from PS
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
@@ -1144,9 +1145,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         elif isinstance(data_parallel_rank, int):
             data_parallel_ranks = [data_parallel_rank]
 
-        pulled_instance_ids = [
-            (self.base_worker_id, data_parallel_rank) for data_parallel_rank in data_parallel_ranks
-        ]
+        pulled_instance_ids = [(self.base_worker_id, data_parallel_rank) for data_parallel_rank in data_parallel_ranks]
         await ps_manager_handle.pull_model_state_dict_nixl.remote(
             pulled_instance_ids
         )  # This only updates the model version
@@ -1217,16 +1216,16 @@ class PSRL_vLLMReplica(vLLMReplica):
         tag: str = "rollout",
     ):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
-        
+
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
         self.tag = tag
-        
+
         self.local_replica_rank = local_replica_rank
         self.data_parallel_size = config.data_parallel_size
         self.tensor_parallel_size = config.tensor_model_parallel_size
         self.pipeline_parallel_size = config.pipeline_model_parallel_size
-        
+
         self.servers: list[ActorHandle] = []
         self.server_class = ray.remote(PSRL_vLLMHttpServer)
 
@@ -1268,7 +1267,9 @@ class PSRL_vLLMReplica(vLLMReplica):
         for node_rank in range(nnodes):
             workers = self.workers[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
             node_cuda_visible_devices = ",".join(
-                worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
+                worker_cuda_visible_devices[
+                    node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node
+                ]
             )
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
             name = (
@@ -1296,12 +1297,14 @@ class PSRL_vLLMReplica(vLLMReplica):
                 elif self.psrl_config.tms.range == "all":
                     vllm_patch_env = "TMS"
 
-                env_vars.update({
-                    "LD_PRELOAD": dynlib_path,
-                    "TMS_INIT_ENABLE": "0",
-                    "TMS_INIT_ENABLE_CPU_BACKUP": "0",
-                    "PSRL_VLLM_PATCHES": vllm_patch_env,
-                })
+                env_vars.update(
+                    {
+                        "LD_PRELOAD": dynlib_path,
+                        "TMS_INIT_ENABLE": "0",
+                        "TMS_INIT_ENABLE_CPU_BACKUP": "0",
+                        "PSRL_VLLM_PATCHES": vllm_patch_env,
+                    }
+                )
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -1344,7 +1347,7 @@ class PSRL_vLLMReplica(vLLMReplica):
             if is_valid_ipv6_address(server_address)
             else f"{server_address}:{server_port}"
         )
-        
+
         # Only keep one server handle for PSRL
         server_handle = self.servers[0]
         self.servers = [server_handle]

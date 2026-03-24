@@ -2,7 +2,6 @@ import warnings
 from dataclasses import dataclass, field
 
 from omegaconf import MISSING
-
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 from verl.workers.config.model import MtpConfig
@@ -84,7 +83,7 @@ class TraceConfig(BaseConfig):
     backend: str | None = None
     token2text: bool = False
     max_samples_per_step_per_worker: int | None = None
-    
+
     def __post_init__(self):
         if self.max_samples_per_step_per_worker is not None and self.max_samples_per_step_per_worker < 0:
             raise ValueError("`max_samples_per_step_per_worker` must be a non-negative integer or null.")

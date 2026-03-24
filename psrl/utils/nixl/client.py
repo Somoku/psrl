@@ -12,7 +12,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.common.utils import lazy_import_to_globals
-from psrl.utils.logger import deprecated, get_worker_info
+from psrl.utils.logger import deprecated
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
@@ -1523,11 +1523,9 @@ class NIXLMultiStorageClients:
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
         # Initialize NIXL agent
-        self.client_port = (
-            find_free_port_with_scope(
-                replica_idx=replica_idx,
-                worker_index=worker_index,
-            )
+        self.client_port = find_free_port_with_scope(
+            replica_idx=replica_idx,
+            worker_index=worker_index,
         )
         self.agent = nixl_agent(self.agent_name, nixl_agent_config(True, True, self.client_port))
 

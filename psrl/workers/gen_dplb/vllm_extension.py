@@ -2,7 +2,6 @@ import logging
 import os
 import time
 
-import ray
 import torch
 from omegaconf import DictConfig
 from torch.distributed.tensor import DTensor
@@ -17,11 +16,9 @@ from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
     GLOBAL_GEN_CLIENT_NAME,
     GLOBAL_META_SERVER_NAME,
-    GLOBAL_PS_CLIENT_NAME,
     NIXLClientType,
     NIXLStorageClient,
 )
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

@@ -137,7 +137,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 use_gpu=True,
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
-                replica_idx=0, # replica idx is not necessary
+                replica_idx=0,  # replica idx is not necessary
                 worker_index=self.rank,
                 # client_group_id=self.get_replica_id()
                 logging_path=self.psrl_config.logging_path,
@@ -456,7 +456,9 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
             with adapter_ctx:
-                output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
+                output, entropys, layers_topk_idx = self.actor.compute_log_prob(
+                    data=data, calculate_entropy=not is_lora
+                )
             tensors = {"ref_log_prob": output} if is_lora else {"recomputed_log_probs": output}
             if not is_lora:
                 tensors["entropys"] = entropys

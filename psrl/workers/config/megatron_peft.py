@@ -1,5 +1,6 @@
 """PEFT configuration of Megatron for VERL."""
 
+
 def get_peft_cls(model_config, bridge, provider, dtype=None):
     """Get PEFT class from model config.
 

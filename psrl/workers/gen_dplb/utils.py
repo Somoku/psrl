@@ -1,6 +1,5 @@
-from typing import Any
 from dataclasses import dataclass
-from pydantic import BaseModel
+from typing import Any
 
 # (worker_id, data_parallel_rank)
 RolloutInstanceId = tuple[str, int]
@@ -9,6 +8,7 @@ INVALID_ROLLOUT_INSTANCE_ID: RolloutInstanceId = ("", -1)
 # Default configuration constants
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_CONNECTIONS = 2000
+
 
 @dataclass
 class TokenInput:
@@ -26,6 +26,7 @@ class TokenInput:
     """the current response length for this generation"""
     is_validate: bool = False
     """whether this request is for validation purpose"""
+
 
 @dataclass
 class TokenOutput:

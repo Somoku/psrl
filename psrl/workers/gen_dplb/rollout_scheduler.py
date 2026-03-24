@@ -1,6 +1,5 @@
 import logging
 import os
-import time
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
@@ -32,15 +31,9 @@ class RolloutScheduler(Scheduler):
         if self.connector_prefix_cache_stats is not None:
             connector_prefix_cache_stats = self.connector_prefix_cache_stats
             self.connector_prefix_cache_stats = PrefixCacheStats()
-        eviction_events = (
-            self.kv_metrics_collector.drain_events()
-            if self.kv_metrics_collector is not None
-            else []
-        )
+        eviction_events = self.kv_metrics_collector.drain_events() if self.kv_metrics_collector is not None else []
         spec_stats = spec_decoding_stats
-        connector_stats_payload = (
-            kv_connector_stats.data if kv_connector_stats else None
-        )
+        connector_stats_payload = kv_connector_stats.data if kv_connector_stats else None
         req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
         req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
         # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:

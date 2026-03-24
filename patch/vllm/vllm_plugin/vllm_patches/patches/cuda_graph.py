@@ -1,6 +1,7 @@
 import logging
 import os
 from contextlib import ExitStack
+from typing import Any
 from unittest.mock import patch
 
 import torch
@@ -11,7 +12,6 @@ from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
-    BatchDescriptor,
     get_forward_context,
     is_forward_context_available,
 )
@@ -44,10 +44,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
         batch_descriptor = forward_context.batch_descriptor
         cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
-        if (
-            cudagraph_runtime_mode == CUDAGraphMode.NONE
-            or cudagraph_runtime_mode != self.runtime_mode
-        ):
+        if cudagraph_runtime_mode == CUDAGraphMode.NONE or cudagraph_runtime_mode != self.runtime_mode:
             # CUDAGraphMode.NONE could mean the profile run, a warmup run, or
             # running without cudagraphs.
             # We do not trigger capture/replay if the runtime mode is not
@@ -59,9 +56,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
         assert batch_descriptor is not None
         if batch_descriptor not in self.concrete_cudagraph_entries:
             # create a new entry for this batch descriptor
-            self.concrete_cudagraph_entries[batch_descriptor] = CUDAGraphEntry(
-                batch_descriptor=batch_descriptor
-            )
+            self.concrete_cudagraph_entries[batch_descriptor] = CUDAGraphEntry(batch_descriptor=batch_descriptor)
 
         entry = self.concrete_cudagraph_entries[batch_descriptor]
 
@@ -71,7 +66,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
                 # capturing is fast, we don't need to log it for every
                 # shape. E.g. we only log it for the first subgraph in
                 # piecewise mode.
-                logger.debug(
+                psrl_logger.debug(
                     "Capturing a cudagraph on (%s,%s)",
                     self.runtime_mode.name,
                     entry.batch_descriptor,
@@ -79,9 +74,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
             # validate that cudagraph capturing is legal at this point.
             validate_cudagraph_capturing_enabled()
 
-            input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
+            input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
@@ -94,9 +87,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
                     stack.enter_context(patch("gc.collect", lambda: None))
-                    stack.enter_context(
-                        patch("torch.accelerator.empty_cache", lambda: None)
-                    )
+                    stack.enter_context(patch("torch.accelerator.empty_cache", lambda: None))
 
                 if self.graph_pool is not None:
                     set_graph_pool_id(self.graph_pool)
@@ -111,7 +102,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
                 with torch_memory_saver.cuda_graph(
                     cudagraph,
                     pool=self.graph_pool,
-                    stream=current_stream(),
+                    stream=current_stream(),  # noqa: F821
                     tag="graph",
                 ):
                     # `output` is managed by pytorch's cudagraph pool
@@ -144,9 +135,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
 
         if self.is_debugging_mode:
             # check if the input addresses are the same
-            new_input_addresses = [
-                x.data_ptr() for x in args if isinstance(x, torch.Tensor)
-            ]
+            new_input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             assert new_input_addresses == entry.input_addresses, (
                 f"Input addresses for cudagraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "

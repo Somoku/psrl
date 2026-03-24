@@ -7,20 +7,20 @@ import os
 import sys
 import warnings
 from functools import partial
-from omegaconf import DictConfig
 from typing import Any, cast
 
 import ray
 import torch
-
+from omegaconf import DictConfig
 from verl import DataProto
+from verl.trainer.config.config import ModuleConfig
 from verl.utils.reward_score import default_compute_score
 from verl.utils.transferqueue_utils import tqbridge
-from verl.trainer.config.config import ModuleConfig
 from verl.workers.config.reward import RewardManagerConfig
 from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewardFn
 
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
+
 
 def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
     """Calls `raw_fn` by merging `extra_kwargs` into call-time `kwargs`, with `extra_kwargs` taking precedence.

@@ -10,7 +10,6 @@ import torch
 from omegaconf import OmegaConf
 from verl.utils.device import auto_set_device
 
-from psrl.workers.gen_dplb.vllm_rollout import PSRL_ServerAdapter
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.reward import load_reward_manager
 from psrl.trainer.ppo.utils import PSRL_Role, need_reference_policy
@@ -18,6 +17,7 @@ from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
 )
+from psrl.workers.gen_dplb.vllm_rollout import PSRL_ServerAdapter
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -56,7 +56,7 @@ def run_ppo(config) -> None:
         default_runtime_env = get_ppo_ray_runtime_env()
         default_runtime_env["env_vars"]["PSRL_LOGGING_PATH"] = config.psrl.logging_path
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
-        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})        
+        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
         if config.transfer_queue.enable:
             # Add runtime environment variables for transfer queue
             runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
@@ -341,9 +341,8 @@ class TaskRunner:
 
         # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
         # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
-        from psrl.utils.dataset.rl_dataset import collate_fn
-
         from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
+        from psrl.utils.dataset.rl_dataset import collate_fn
 
         # Load post-processor from configuration
         group_post_process_fn = load_group_post_processor(config)

@@ -62,8 +62,10 @@ class PSManagerStateServicer(psrl_manager_pb2_grpc.PSManagerStateServicer):
             )
 
             flat_results: list[bool] = []
-            if len(request_ids) == 1 and isinstance(results, list) and (
-                len(results) == 0 or isinstance(results[0], bool)
+            if (
+                len(request_ids) == 1
+                and isinstance(results, list)
+                and (len(results) == 0 or isinstance(results[0], bool))
             ):
                 flat_results = [bool(v) for v in results]
             else:
@@ -96,10 +98,7 @@ class PSManagerStateServicer(psrl_manager_pb2_grpc.PSManagerStateServicer):
             if len(request_ids) == 0:
                 return psrl_manager_pb2.ReserveRolloutInstanceRequestsResp(success=True)
 
-            instance_ids = [
-                (iid.worker_id, iid.dp_rank)
-                for iid in request.rollout_instance_ids
-            ]
+            instance_ids = [(iid.worker_id, iid.dp_rank) for iid in request.rollout_instance_ids]
             model_versions = list(request.model_versions)
 
             instance_ids = _maybe_broadcast(instance_ids, len(request_ids), "rollout_instance_ids")
@@ -192,10 +191,7 @@ class PSManagerStateServicer(psrl_manager_pb2_grpc.PSManagerStateServicer):
 
             status = PSRL_RequestStatus[request.status]
             model_versions = list(request.model_versions)
-            rollout_instance_ids = [
-                (iid.worker_id, iid.dp_rank)
-                for iid in request.rollout_instance_ids
-            ]
+            rollout_instance_ids = [(iid.worker_id, iid.dp_rank) for iid in request.rollout_instance_ids]
 
             model_versions = _maybe_broadcast(model_versions or [-1], len(request_ids), "model_versions")
             rollout_instance_ids = _maybe_broadcast(
@@ -217,6 +213,7 @@ class PSManagerStateServicer(psrl_manager_pb2_grpc.PSManagerStateServicer):
         except Exception as exc:  # noqa: BLE001
             self._handle_exception(context, exc)
             return psrl_manager_pb2.UpdateRequestStatusResp(succeeded=[])
+
 
 class PSManagerGrpcServer:
     def __init__(self, ps_manager):

@@ -1,8 +1,8 @@
+import asyncio
 import json
 import logging
 import os
 import uuid
-import asyncio
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -61,11 +61,11 @@ from psrl.utils.nixl import (
     GLOBAL_TRAIN_CLIENT_NAME,
 )
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
-from psrl.workers.agent_loop.router import RolloutRouter
-from psrl.workers.gen_dplb.rollout_gateway import RolloutGateway
-from psrl.workers.gen_dplb.vllm_async_server import PSRL_vLLMReplica, GenInterface
-from psrl.workers.gen_dplb.rollout_coordinator import RolloutCoordinator
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
+from psrl.workers.agent_loop.router import RolloutRouter
+from psrl.workers.gen_dplb.rollout_coordinator import RolloutCoordinator
+from psrl.workers.gen_dplb.rollout_gateway import RolloutGateway
+from psrl.workers.gen_dplb.vllm_async_server import GenInterface, PSRL_vLLMReplica
 from psrl.workers.ps import (
     PSClassWithInitArgs,
     PSManager,
@@ -590,9 +590,7 @@ class PSRL_RayPPOTrainer:
                 self.config.psrl.ps_manager_ip,
                 self.ps_manager_grpc_port,
             )
-            self.rollout_gateway_url = ray.get(
-                self.rollout_router.launch_router.remote()
-            )
+            self.rollout_gateway_url = ray.get(self.rollout_router.launch_router.remote())
             psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}")
         else:
             self.rollout_router = RolloutRouter.remote(
@@ -631,7 +629,9 @@ class PSRL_RayPPOTrainer:
             timeout=self._gateway_http_timeout,
         )
         resp.raise_for_status()
-        psrl_logger.info(f"After control action {action} over {instance_ids}, resp = {resp.json() if resp.content else {}}")
+        psrl_logger.info(
+            f"After control action {action} over {instance_ids}, resp = {resp.json() if resp.content else {}}"
+        )
         return resp.json() if resp.content else {}
 
     def start_rollout_coordinator(self):
@@ -1000,9 +1000,8 @@ class PSRL_RayPPOTrainer:
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
-        
-        return metric_dict
 
+        return metric_dict
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():
@@ -1015,11 +1014,7 @@ class PSRL_RayPPOTrainer:
         # 1. register to rollout router
         for replica in rollout_replicas:
             if self.config.psrl.rollout_gateway.enable:
-                futures.append(
-                    replica.servers[0].register_server_to_gateway.remote(
-                        self.rollout_gateway_url
-                    )
-                )
+                futures.append(replica.servers[0].register_server_to_gateway.remote(self.rollout_gateway_url))
             else:
                 futures.append(
                     self.rollout_router.add_worker.remote(
@@ -1029,15 +1024,14 @@ class PSRL_RayPPOTrainer:
                         replica.tensor_parallel_size,
                         replica.pipeline_parallel_size,
                         is_validate=False if replica.tag == "rollout" else True,
-                ))
+                    )
+                )
         results = ray.get(futures)
-        
+
         # 2. register to ps manager
         futures = []
         for replica in rollout_replicas:
-            futures.append(
-                replica.servers[0].register_rollout_instances_to_ps.remote()
-            )
+            futures.append(replica.servers[0].register_rollout_instances_to_ps.remote())
         ray.get(futures)
 
         # 3. register to rollout coordinator
@@ -1103,8 +1097,8 @@ class PSRL_RayPPOTrainer:
                         gen_interface=gen_interface,
                         gpus_per_node=(
                             self.config.psrl.deployment.rollout_ngpus_per_node_per_instance
-                            if tag == "rollout" else
-                            self.config.psrl.deployment.validate_ngpus_per_node_per_instance
+                            if tag == "rollout"
+                            else self.config.psrl.deployment.validate_ngpus_per_node_per_instance
                         ),
                         tag=tag,
                     )
@@ -1118,13 +1112,13 @@ class PSRL_RayPPOTrainer:
         self.tag_to_server_handles[tag].extend([replica._server_handle for replica in rollout_replicas])
         psrl_logger.info(f"Current server num of {tag} is {len(self.tag_to_server_handles[tag])}")
         self.server_addresses.extend([replica._server_address for replica in rollout_replicas])
-        
+
         # Update Prometheus configuration with server addresses
         if rollout_config.prometheus.enable:
             if rollout_config.disable_log_stats:
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(rollout_config.prometheus, self.server_addresses, rollout_config.name)
-        
+
         self.register_rollout_servers(rollout_replicas)
 
     def init_workers(self):
@@ -1185,7 +1179,7 @@ class PSRL_RayPPOTrainer:
             )
             rollout_resource_pool = self.resource_pool_manager.get_resource_pool(PSRL_Role.Rollout, i)
             self.resource_pool_to_cls[rollout_resource_pool][f"rollout_{i}"] = rollout_cls
-        
+
         # map validate resource pool to validate cls
         for i in range(self.n_validate_instances):
             rollout_config = self.config.train_actor_rollout_ref.rollout
@@ -1586,7 +1580,9 @@ class PSRL_RayPPOTrainer:
 
         psrl_logger.info("Step 2 - Waking up validation instances...")
         # Allocate rollout space and register
-        ray.get([self.tag_to_server_handles["validate"][i].nixl_wake_up.remote() for i in range(self.n_validate_instances)])
+        ray.get(
+            [self.tag_to_server_handles["validate"][i].nixl_wake_up.remote() for i in range(self.n_validate_instances)]
+        )
 
         psrl_logger.info("Step 3 - Syncing with ps manager...")
         # sync with server
@@ -1598,7 +1594,9 @@ class PSRL_RayPPOTrainer:
             tp_size = len(worker_names)
             for rank in range(len(worker_names)):
                 updated_client_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{rank}")
-            futures.append(self.tag_to_server_handles["validate"][i].nixl_send_local_info_to.remote(GLOBAL_META_SERVER_NAME))
+            futures.append(
+                self.tag_to_server_handles["validate"][i].nixl_send_local_info_to.remote(GLOBAL_META_SERVER_NAME)
+            )
         # wait for ps manager to collect all infos
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.n_validate_instances * tp_size))
         ray.get(futures)
@@ -1664,11 +1662,21 @@ class PSRL_RayPPOTrainer:
 
         psrl_logger.info("Step 2 - Interrupting generation of validation instances...")
         # interrupt generation and sleep
-        ray.get([self.tag_to_server_handles["validate"][i].pause_generation.remote(clear_cache=False) for i in range(self.n_validate_instances)])
+        ray.get(
+            [
+                self.tag_to_server_handles["validate"][i].pause_generation.remote(clear_cache=False)
+                for i in range(self.n_validate_instances)
+            ]
+        )
 
         psrl_logger.info("Step 3 - Putting validation instances to sleep...")
         # sleep validation instances and deregister from NIXL
-        ray.get([self.tag_to_server_handles["validate"][i].nixl_sleep.remote(level=2) for i in range(self.n_validate_instances)])
+        ray.get(
+            [
+                self.tag_to_server_handles["validate"][i].nixl_sleep.remote(level=2)
+                for i in range(self.n_validate_instances)
+            ]
+        )
 
         psrl_logger.info("Step 4 - Waking up training actor...")
         # Allocate trainer space and register
@@ -1757,8 +1765,18 @@ class PSRL_RayPPOTrainer:
         # 1. ps storage workers
         futures.extend(self.ps_wg.execute_all_async("nixl_wait_for_update_infos", 1))
         # 2. rollout workers
-        futures.extend([self.tag_to_server_handles["rollout"][i].nixl_wait_for_update_infos.remote(1) for i in range(self.n_rollout_instances)])
-        futures.extend([self.tag_to_server_handles["validate"][i].nixl_wait_for_update_infos.remote(1) for i in range(self.n_validate_instances)])
+        futures.extend(
+            [
+                self.tag_to_server_handles["rollout"][i].nixl_wait_for_update_infos.remote(1)
+                for i in range(self.n_rollout_instances)
+            ]
+        )
+        futures.extend(
+            [
+                self.tag_to_server_handles["validate"][i].nixl_wait_for_update_infos.remote(1)
+                for i in range(self.n_validate_instances)
+            ]
+        )
         # 3. actor workers
         futures.extend(self.actor_wg.execute_all_async("nixl_wait_for_update_infos", 1))
         ray.get(futures)

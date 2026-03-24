@@ -20,16 +20,14 @@ import os
 import re
 import traceback
 from collections import defaultdict
-from typing import Optional
 
 import datasets
 import numpy as np
 import torch
+import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, ListConfig
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-
-import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
@@ -88,7 +86,7 @@ class RLHFDataset(Dataset):
         data_files: str | list[str],
         tokenizer: PreTrainedTokenizer,
         config: DictConfig,
-        processor: Optional[ProcessorMixin] = None,
+        processor: ProcessorMixin | None = None,
         max_samples: int = -1,
     ):
         if not isinstance(data_files, list | ListConfig):
@@ -197,7 +195,8 @@ class RLHFDataset(Dataset):
                         )
                         if image_key in doc and doc[image_key]:
                             images = [
-                                process_image(image, image_patch_size=self.image_patch_size) for image in doc[image_key]
+                                process_image(image, image_patch_size=self.image_patch_size)
+                                for image in doc[image_key]
                             ]
                         else:
                             images = None

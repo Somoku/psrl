@@ -1,5 +1,6 @@
 import enum
 from dataclasses import dataclass
+from functools import wraps
 
 import numpy as np
 
@@ -9,16 +10,18 @@ from psrl.workers.gen_dplb.utils import RolloutInstanceId
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
 
+
 def _state_locked(func):
     """Protect request metadata maps shared across Ray actor and gRPC threads."""
 
     @wraps(func)
     def _wrapped(self, *args, **kwargs):
-        lock = getattr(self, "_state_lock")
+        lock = self._state_lock
         with lock:
             return func(self, *args, **kwargs)
 
     return _wrapped
+
 
 class EntryCategory(enum.Enum):
     """Enum for the category of an entry in the buffer.
@@ -579,7 +582,8 @@ class StalenessInventory:
             candidate_ids = [
                 bid
                 for bid in pending_buffers
-                if model_version <= bid <= model_version + self.staleness and bid not in self._ready_for_delete_buffer_ids
+                if model_version <= bid <= model_version + self.staleness
+                and bid not in self._ready_for_delete_buffer_ids
             ]
             if not candidate_ids:
                 # Cases where no PENDING buffers are available
@@ -1093,7 +1097,7 @@ class StalenessInventory:
 
         old_buffer_id, old_entry_id = self.data_tracker[prompt_id]
         entry_info = self.buffers[old_buffer_id].entries[old_entry_id].entry_info
-        # psrl_logger.info(f"Entry Info of {prompt_id} ({old_buffer_id}, {old_entry_id}) is {entry_info}, with {self.buffers[old_buffer_id].entries[old_entry_id].category}")
+        # psrl_logger.info(f"Entry Info of {prompt_id} ({old_buffer_id}, {old_entry_id}) is {entry_info}, with {self.buffers[old_buffer_id].entries[old_entry_id].category}")  # noqa: E501
 
         model_version = entry_info.get_entry_version()
         if self.is_validate:

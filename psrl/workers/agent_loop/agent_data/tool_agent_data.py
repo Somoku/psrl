@@ -2,7 +2,6 @@ import json
 import logging
 import os
 
-import numpy as np
 import ray
 from omegaconf import DictConfig
 from transformers import AutoTokenizer

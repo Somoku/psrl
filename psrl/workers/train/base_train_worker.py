@@ -8,7 +8,6 @@ import ray
 import torch.distributed as dist
 from omegaconf import DictConfig
 
-
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 

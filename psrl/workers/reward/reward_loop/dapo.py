@@ -4,8 +4,8 @@ import inspect
 from verl import DataProto
 
 from psrl.utils.reward_score import default_compute_score_async
-from psrl.workers.reward.reward_loop.registry import register
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
+from psrl.workers.reward.reward_loop.registry import register
 
 
 @register("dapo")

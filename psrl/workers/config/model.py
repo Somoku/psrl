@@ -3,7 +3,6 @@ from typing import Any
 
 from omegaconf import MISSING
 from transformers import AutoConfig
-
 from verl.base_config import BaseConfig
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
@@ -108,7 +107,7 @@ class HFModelConfig(BaseConfig):
     target_parameters: list[str] | None = None  # for lora adapter on nn.Parameter
 
     exclude_modules: str | None = None
-    
+
     # megatron lora config
     lora: dict[str, Any] = field(default_factory=dict)
 

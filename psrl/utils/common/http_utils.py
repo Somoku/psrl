@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import socket
 from typing import Any
 
@@ -73,6 +72,7 @@ _http_client: aiohttp.ClientSession | None = None
 
 # Maximum concurrency for the global HTTP client
 _client_concurrency: int = 256
+
 
 async def _ensure_http_client() -> aiohttp.ClientSession:
     global _http_client

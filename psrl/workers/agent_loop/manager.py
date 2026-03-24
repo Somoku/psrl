@@ -4,7 +4,6 @@ import os
 from collections import Counter
 
 import numpy as np
-import requests
 import torch
 from omegaconf import DictConfig
 from tensordict import TensorDict
@@ -23,7 +22,6 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import AsyncBusyPollingRayLock
-from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
 
@@ -463,7 +461,7 @@ class PSRL_AgentLoopManager:
 
             batch_size = len(data)
             self._request_counter += batch_size
-            # psrl_logger.info(f"Got {len(data)} requests from data queue with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, total request count: {self._request_counter}")
+            # psrl_logger.info(f"Got {len(data)} requests from data queue with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, total request count: {self._request_counter}")  # noqa: E501
 
             # Wait for version update in ps
             # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
@@ -574,7 +572,7 @@ class PSRL_AgentLoopManager:
             is_validate (bool): Whether the data is for validation.
         """
 
-        # psrl_logger.info(f"Dispatching {len(data)} requests to agent loop workers with request_id: {data.non_tensor_batch.get('uid', 'N/A')}")
+        # psrl_logger.info(f"Dispatching {len(data)} requests to agent loop workers with request_id: {data.non_tensor_batch.get('uid', 'N/A')}")  # noqa: E501
         # Update request status from PENDING to RUNNING
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
@@ -583,7 +581,7 @@ class PSRL_AgentLoopManager:
             model_version=data.non_tensor_batch["version_tag"].tolist(),
             is_validate=is_validate,
         )
-        # psrl_logger.info(f"Updated request status to RUNNING for {len(data)} requests with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, success: {update_status_success}")
+        # psrl_logger.info(f"Updated request status to RUNNING for {len(data)} requests with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, success: {update_status_success}")  # noqa: E501
         if not update_status_success:
             return
 
@@ -594,12 +592,12 @@ class PSRL_AgentLoopManager:
                 continue
 
             # Dispatch data to the corresponding worker
-            # psrl_logger.info(f"Dispatching {len(worker_data)} requests to worker {worker_index} with request_id: {worker_data.non_tensor_batch.get('uid', 'N/A')}")
+            # psrl_logger.info(f"Dispatching {len(worker_data)} requests to worker {worker_index} with request_id: {worker_data.non_tensor_batch.get('uid', 'N/A')}")  # noqa: E501
             tasks = []
             for i in range(rollout_n):
                 tasks.append(self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i : i + 1]))
             await asyncio.gather(*tasks)
-            # psrl_logger.info(f"Dispatched {len(worker_data)} requests to worker {worker_index} with request_id: {worker_data.non_tensor_batch.get('uid', 'N/A')}")
+            # psrl_logger.info(f"Dispatched {len(worker_data)} requests to worker {worker_index} with request_id: {worker_data.non_tensor_batch.get('uid', 'N/A')}")  # noqa: E501
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
         """Create a dispatch plan for distributing data across workers.

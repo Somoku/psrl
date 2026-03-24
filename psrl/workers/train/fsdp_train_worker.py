@@ -153,7 +153,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 use_gpu=True,
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
-                replica_idx=0, # replica idx is not necessary
+                replica_idx=0,  # replica idx is not necessary
                 worker_index=self.rank,
                 # client_group_id=self.get_replica_id()
                 logging_path=self.psrl_config.logging_path,

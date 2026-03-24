@@ -27,7 +27,7 @@ class GenerateAgentLoop(AgentLoopBase):
         """
         # psrl_logger.info(f"Before running request with id = {request.non_tensor_batch['uid'][0]}")
         output = await self.generate_sequence(request)
-        # psrl_logger.info(f"After running request with id = {request.non_tensor_batch['uid'][0]} with output = {output}")
+        # psrl_logger.info(f"After running request with id = {request.non_tensor_batch['uid'][0]} with output = {output}")  # noqa: E501
         if output is not None:
             response_ids = output.token_ids
             response_ids = response_ids[: self.response_length]

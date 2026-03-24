@@ -12,7 +12,6 @@ from vllm.v1.metrics.loggers import StatLoggerBase
 from vllm.v1.metrics.stats import IterationStats, MultiModalCacheStats, SchedulerStats
 
 from psrl.utils.logger import FileOnlyHandler
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -206,9 +205,15 @@ class DPLBStatCollector(StatLoggerBase):
 
         if scheduler_stats is not None:
             scheduler_stats = {
-                "need_to_abort_reqs": scheduler_stats.need_to_abort_reqs if scheduler_stats.need_to_abort_reqs else None,
-                "req_id_to_prompt_token_num": scheduler_stats.req_id_to_prompt_token_num if scheduler_stats.req_id_to_prompt_token_num else {},
-                "req_id_to_response_token_num": scheduler_stats.req_id_to_response_token_num if scheduler_stats.req_id_to_response_token_num else {},
+                "need_to_abort_reqs": scheduler_stats.need_to_abort_reqs
+                if scheduler_stats.need_to_abort_reqs
+                else None,
+                "req_id_to_prompt_token_num": scheduler_stats.req_id_to_prompt_token_num
+                if scheduler_stats.req_id_to_prompt_token_num
+                else {},
+                "req_id_to_response_token_num": scheduler_stats.req_id_to_response_token_num
+                if scheduler_stats.req_id_to_response_token_num
+                else {},
                 "num_running_reqs": scheduler_stats.num_running_reqs,
                 "num_waiting_reqs": scheduler_stats.num_waiting_reqs,
                 "kv_cache_usage": scheduler_stats.kv_cache_usage,
@@ -292,7 +297,7 @@ class DPLBStatCollector(StatLoggerBase):
             or curr_time - self.last_push_to_queue_time
             >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0
         ):
-            # psrl_logger.info(f"Putting snapshot to output queue (model version {self.model_version}, instance_id {(self.replica_idx, engine_idx)}): {snapshot}")
+            # psrl_logger.info(f"Putting snapshot to output queue (model version {self.model_version}, instance_id {(self.replica_idx, engine_idx)}): {snapshot}")  # noqa: E501
             self.output_queue.put_nowait(
                 EngineStats(
                     replica_idx=self.replica_idx,

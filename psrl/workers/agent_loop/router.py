@@ -20,8 +20,8 @@ from psrl.workers.agent_loop.route_strategy import (
     get_route_strategy_class,
 )
 from psrl.workers.gen_dplb.stats_collector import EngineStats
-from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.gen_dplb.utils import RolloutInstanceId, TokenInput, TokenOutput
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -41,11 +41,11 @@ class RolloutRouter:
     # 启动 sglang router，传入路由策略相关参数
     # add_worker -> 计算相关参数，调用 sglang router 的 "{base_url}/workers"
     #               并传入额外相关参数
-    #               (TP, PP 由 server_info 得到，balanced_concurrent_seqs_per_instance 为 policy 侧固定参数，max_model_len 由 engine stats 传入)
-    # update_instance_status -> 由 coordinator 定期调用，改写到 Rust 端，通过 "{base_url}/push_engine_stats" 接口传入，供路由策略使用
-    # pause/resume/is_routing -> 改写到 Rust 端，通过 "{base_url}/request_queue/pause" 等接口控制，用于管理 PSRL 策略的路由循环的暂停和恢复
-    # routing_loop -> 改写到 Rust 端，放在 router.rs 内运行，`route_typed_request_once()` 调用时变成加入请求队列，等待结果。
-    # _route_single_request -> 涉及实际的调用，改写到 Rust 端，注意做 partial rollout 时的相关处理，在调用前后进行 PS manager 的交互。
+    #               (TP, PP 由 server_info 得到，balanced_concurrent_seqs_per_instance 为 policy 侧固定参数，max_model_len 由 engine stats 传入)  # noqa: E501
+    # update_instance_status -> 由 coordinator 定期调用，改写到 Rust 端，通过 "{base_url}/push_engine_stats" 接口传入，供路由策略使用  # noqa: E501
+    # pause/resume/is_routing -> 改写到 Rust 端，通过 "{base_url}/request_queue/pause" 等接口控制，用于管理 PSRL 策略的路由循环的暂停和恢复  # noqa: E501
+    # routing_loop -> 改写到 Rust 端，放在 router.rs 内运行，`route_typed_request_once()` 调用时变成加入请求队列，等待结果。  # noqa: E501
+    # _route_single_request -> 涉及实际的调用，改写到 Rust 端，注意做 partial rollout 时的相关处理，在调用前后进行 PS manager 的交互。  # noqa: E501
     # pause/resume_instance -> 改为 delete/add worker
     # wait_interrupted_partial_requests_loop_back -> 替换为对 vllm worker 的 `wait_for_requests_to_drain` 调用。
     # check_should_migrate/sync -> 迁移到 coordinator 调用，router 侧暴露接口供 coordinator 调用以查询和触发迁移。
@@ -216,7 +216,8 @@ class RolloutRouter:
 
         self.server_handles[replica_id] = server_handle
         self.instance_to_tp_pp.update(
-            {(replica_id, i): f"TP{tensor_parallel_size}_PP{pipeline_parallel_size}"} for i in range(data_parallel_size)
+            {(replica_id, i): f"TP{tensor_parallel_size}_PP{pipeline_parallel_size}"}
+            for i in range(data_parallel_size)
         )
         new_instance_ids = [(replica_id, i) for i in range(data_parallel_size)]
         self.instance_ids.update(new_instance_ids)
@@ -241,7 +242,7 @@ class RolloutRouter:
             balanced_concurrent_seqs_per_instance=balanced_concurrent_seqs_per_instance,
             instance_to_tp_pp=self.instance_to_tp_pp,
         )
-    
+
         return replica_id
 
     async def update_instance_status(self, instance_to_engine_status: dict[RolloutInstanceId, EngineStats]):
@@ -262,10 +263,7 @@ class RolloutRouter:
                 continue
             filtered_instance_ids.append(instance_id)
 
-        filtered_stats = {
-            instance_id: instance_to_engine_status[instance_id]
-            for instance_id in filtered_instance_ids
-        }
+        filtered_stats = {instance_id: instance_to_engine_status[instance_id] for instance_id in filtered_instance_ids}
         self.route_strategy.update_instance_to_engine_status(filtered_stats)
 
         # Notify the scheduler that status has been updated

@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 
-from psrl.utils.common.http_utils import find_available_port
-
 import torch
+
+from psrl.utils.common.http_utils import find_available_port
 
 
 def lcm(a, b):

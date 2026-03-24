@@ -1,7 +1,7 @@
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
-from collections.abc import Callable
 
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
@@ -90,7 +90,6 @@ class EngineConfig(BaseConfig):
 
     full_determinism: bool = False
     router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
-
 
     def __post_init__(self):
         pass

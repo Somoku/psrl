@@ -1,6 +1,6 @@
 import ray
-
 from verl.workers.rollout.vllm_rollout import ServerAdapter
+
 
 class PSRL_ServerAdapter(ServerAdapter):
     def get_node_id(self) -> str:

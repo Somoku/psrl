@@ -11,9 +11,9 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from verl import DataProto
 from verl.utils import hf_processor, hf_tokenizer
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.rollout.utils import get_max_position_embeddings
 
 from psrl.utils.common.http_utils import init_http_client
@@ -21,8 +21,8 @@ from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig, TerminateReason
-from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.config.model import HFModelConfig
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -61,7 +61,7 @@ class PSRL_AgentLoopWorker:
                     f"should be less than or equal to "
                     f"max_position_embeddings ({max_position_embeddings})"
                 )
-        
+
         model_path = config.gen_actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.gen_actor_rollout_ref.model.path)
@@ -72,7 +72,7 @@ class PSRL_AgentLoopWorker:
         self.ps_manager_handle = ps_manager_handle
         self.agent_loop_manager = None
         self.reward_manager = None
-        
+
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0

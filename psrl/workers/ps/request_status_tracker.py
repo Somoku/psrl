@@ -8,23 +8,24 @@ from omegaconf import DictConfig
 
 from psrl.utils.logger import DualOutputHandler, deprecated, get_ps_logger
 from psrl.utils.server.command import Command, CommandType
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
+from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.staleness_controller import EntryInfo
-from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID
 
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
+
 
 def _state_locked(func):
     """Protect request metadata maps shared across Ray actor and gRPC threads."""
 
     @wraps(func)
     def _wrapped(self, *args, **kwargs):
-        lock = getattr(self, "_state_lock")
+        lock = self._state_lock
         with lock:
             return func(self, *args, **kwargs)
 
     return _wrapped
+
 
 # NOTE(lhy): This is the status of the requests in the PSRL system.
 # It is different from the RequestStatus in vLLM, which is the status of the requests in the scheduler.

@@ -1,13 +1,13 @@
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import wraps
 
 import ray
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
+from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     EventType,
     deprecated,
@@ -18,7 +18,6 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.utils.ray import add_busy_polling_lock
-from psrl.utils.common.http_utils import find_available_port
 from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 from psrl.workers.ps.request_status_tracker import RequestStatusTracker, _state_locked
@@ -505,9 +504,10 @@ class PSManager(RequestStatusTracker):
             model_versions = [model_versions]
 
         for rollout_instance_id in rollout_instance_ids:
-            assert rollout_instance_id == INVALID_ROLLOUT_INSTANCE_ID or rollout_instance_id in self.rollout_instance_tracker, (
-                f"Rollout instance {rollout_instance_id} is not registered."
-            )
+            assert (
+                rollout_instance_id == INVALID_ROLLOUT_INSTANCE_ID
+                or rollout_instance_id in self.rollout_instance_tracker
+            ), f"Rollout instance {rollout_instance_id} is not registered."
 
         # Initialize the reserved entry and buffer ids
         entry_ids = []
@@ -1161,8 +1161,7 @@ class PSManager(RequestStatusTracker):
         assert self.psrl_config.ps_mode == "cpu", "pull_model_state_dict_cpu should only be used in 'cpu' mode."
         assert self.model_store is not None, "Model instance is not initialized."
 
-        if not isinstance(rollout_instance_ids, list):
-            rollout_instance_ids = [rollout_instance_ids]
+        instance_ids = rollout_instance_id if isinstance(rollout_instance_id, list) else [rollout_instance_id]
 
         log_single_event(
             f"Rollout instance {rollout_instance_id} pulling latest model "
@@ -1170,11 +1169,13 @@ class PSManager(RequestStatusTracker):
             psrl_logger,
             event_type=EventType.PULL,
         )
-        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_ids)
+        self._update_rollout_instance_model_version_tag_to_latest(instance_ids)
         return self.model_store.model_state_dict
 
     @_state_locked
-    def pull_model_state_dict_cpu_ref(self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]) -> ray.ObjectRef:
+    def pull_model_state_dict_cpu_ref(
+        self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]
+    ) -> ray.ObjectRef:
         """
         Return the ray object_ref for the latest model state dict. Only used in 'cpu_ref' mode.
         This is a fast operation (no large data transfer here).
@@ -1187,7 +1188,7 @@ class PSManager(RequestStatusTracker):
         """
         assert self.psrl_config.ps_mode == "cpu_ref", "get_model_state_dict_ref should only be used in 'cpu_ref' mode."
         assert self.model_store is not None, "Model instance is not initialized."
-        
+
         if not isinstance(rollout_instance_ids, list):
             rollout_instance_ids = [rollout_instance_ids]
 
@@ -1211,7 +1212,7 @@ class PSManager(RequestStatusTracker):
             "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         )
         assert self.model_store is not None, "Model instance is not initialized."
-        
+
         if not isinstance(rollout_instance_ids, list):
             rollout_instance_ids = [rollout_instance_ids]
 

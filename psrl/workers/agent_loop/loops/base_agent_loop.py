@@ -1,28 +1,27 @@
-import os
 import asyncio
 import base64
 import logging
-from contextlib import nullcontext
+import os
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 
 import numpy as np
 import ray
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
-from vllm.sampling_params import RequestOutputKind
 
 from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
+from psrl.workers.agent_loop.sticky_session import sticky_session
+
 # from psrl.utils.common.http_utils import post
 from psrl.workers.gen_dplb.utils import TokenInput, TokenOutput
-from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
-from psrl.workers.agent_loop.sticky_session import sticky_session
-from psrl.workers.config.model import HFModelConfig
-
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 class AgentLoopBase(ABC):
     _class_initialized = False
@@ -175,10 +174,7 @@ class AgentLoopBase(ABC):
             if sampling_params.get("logprobs") is not None:
                 raw_logprobs = first.get("meta_info", {}).get("output_token_logprobs")
                 if raw_logprobs is not None:
-                    log_probs = [
-                        next((lp for lp in per_pos if lp is not None), 0.0)
-                        for per_pos in raw_logprobs
-                    ]
+                    log_probs = [next((lp for lp in per_pos if lp is not None), 0.0) for per_pos in raw_logprobs]
 
             psrl_logger.info(
                 "[PSRL-DEBUG] request_id=%s: SMG /generate response: "
@@ -244,18 +240,18 @@ class AgentLoopBase(ABC):
         non_tensor_batch = request.non_tensor_batch
         version_tag = non_tensor_batch["version_tag"][0]
         is_validate = request.meta_info.get("validate", False)
-        
+
         if "parent_id" in non_tensor_batch:
             req_prompt_id = non_tensor_batch["parent_id"][0]
         else:
             req_prompt_id = non_tensor_batch["uid"][0]
         # psrl_logger.info(f"Inner {req_prompt_id=}, {non_tensor_batch['uid'][0]=}")
-        
+
         if "rollout_instance_id" in non_tensor_batch:
             rollout_instance_id = non_tensor_batch["rollout_instance_id"][0]
         else:
             rollout_instance_id = None
-        
+
         if "raw_prompt_ids" not in non_tensor_batch:
             input_ids = request.batch["input_ids"][0]
             raw_prompt_ids = _pre_process_inputs(self.tokenizer.pad_token_id, input_ids)
@@ -268,7 +264,7 @@ class AgentLoopBase(ABC):
             raw_response_ids = non_tensor_batch["raw_response_ids"][0]
         else:
             raw_response_ids = []
-        
+
         if isinstance(raw_response_ids, np.ndarray):
             raw_response_ids = raw_response_ids.tolist()
         raw_prompt_ids.extend(raw_response_ids)
@@ -282,7 +278,6 @@ class AgentLoopBase(ABC):
             cu_response_len=len(raw_response_ids),
             is_validate=is_validate,
         )
-        
 
     def _get_sampling_params(self, request: TokenInput):
         is_validate = request.is_validate
@@ -510,7 +505,7 @@ class AgentLoopBase(ABC):
                 raise RuntimeError("Agent loop run did not return a valid DataProto output.")
         except asyncio.TimeoutError:
             psrl_logger.error(
-                "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",
+                "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",  # noqa: E501
                 request.non_tensor_batch.get("uid", "N/A"),
                 exc_info=True,
             )
@@ -523,4 +518,3 @@ class AgentLoopBase(ABC):
                 )
                 return None, TerminateReason.ERROR
             raise e
-

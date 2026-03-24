@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -169,6 +170,15 @@ class PSRL_RayPPOTrainer:
         self.n_validate_instances = (
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
+        
+        if self.config.psrl.redundant_rollout.enable:
+            self.max_concurrency = self.config.psrl.redundant_rollout.redundant_rollout_n * \
+                self.config.psrl.redundant_rollout.redundant_global_batch_size * \
+                (self.config.psrl.staleness + 1)
+        else:
+            self.max_concurrency = self.config.psrl.rollout_n * \
+                self.config.psrl.staleness_buffer_entries * \
+                (self.config.psrl.staleness + 1)
 
         # define in-reward KL control
         # kl loss control currently not suppoorted
@@ -518,7 +528,7 @@ class PSRL_RayPPOTrainer:
             return
 
         # Initialize the agent loop manager
-        self.agent_loop_manager = ray.remote(PSRL_AgentLoopManager).remote(
+        self.agent_loop_manager = ray.remote(PSRL_AgentLoopManager).options(max_concurrency=self.max_concurrency).remote(
             self.config,
             self.data_queue_size,
             self.agent_loop_workers,
@@ -545,7 +555,8 @@ class PSRL_RayPPOTrainer:
             psrl_logger.warning("Agent loop manager is not initialized, skipping stop operation.")
 
     def init_rollout_router(self):
-        self.rollout_router = RolloutRouter.remote(
+        """Initialize the rollout router for routing requests to rollout instances."""
+        self.rollout_router = RolloutRouter.options(max_concurrency=self.max_concurrency).remote(
             self.config,
             self.ps_manager_handle,
             self.tokenizer,
@@ -1279,10 +1290,12 @@ class PSRL_RayPPOTrainer:
         self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.n_rollout_instances)]
         self.validate_wg_list = [all_wg[f"validate_{i}"] for i in range(self.n_validate_instances)]
         self.init_rollout_router()
+        max_concurrency_per_worker = self.max_concurrency // self.config.gen_actor_rollout_ref.rollout.agent.num_workers
         for i in range(self.config.gen_actor_rollout_ref.rollout.agent.num_workers):
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
+                    max_concurrency=max_concurrency_per_worker
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
@@ -1517,20 +1530,26 @@ class PSRL_RayPPOTrainer:
         if not self.config.psrl.colocate_validate_and_train or self.is_rollout_mode_in_actor:
             return
 
+        _switch_start = time.time()
         psrl_logger.info("Switching to rollout mode...")
 
+        _t = time.time()
         psrl_logger.info("Step 1 - Deregistering actor clients from NIXL...")
         # actor_wg nixl client deregister weight memory
         release_futures = self.actor_wg.execute_all_async("nixl_sleep", "full")
         ray.get(release_futures)
+        psrl_logger.info(f"Step 1 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 2 - Waking up validation instances...")
         # Allocate rollout space and register
         futures = []
         for i in range(self.n_validate_instances):
             futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_wake_up"))
         ray.get(futures)
+        psrl_logger.info(f"Step 2 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 3 - Syncing with ps manager...")
         # sync with server
         updated_client_names = []  # to collect all updated client names for broadcasting
@@ -1545,11 +1564,15 @@ class PSRL_RayPPOTrainer:
         # wait for ps manager to collect all infos
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.n_validate_instances * tp_size))
         ray.get(futures)
+        psrl_logger.info(f"Step 3 done in {time.time() - _t:.2f}s.")
 
         # broadcast to other clients
+        _t = time.time()
         psrl_logger.info("Step 4 - PS manager broadcasting updated client infos...")
         self._broadcast_updated_client_infos_from_ps_manager(updated_client_names)
+        psrl_logger.info(f"Step 4 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 5 - Syncing validation instances' model weights & status with PS...")
         # sync validation instances with ps
         # the generation will be resumed in the rollout coordinator
@@ -1560,14 +1583,18 @@ class PSRL_RayPPOTrainer:
             )
         )
         ray.get(self.rollout_coordinator.sync_with_ps.remote(resumed_instance_ids))
+        psrl_logger.info(f"Step 5 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 6 - Resuming validation instances...")
         # resume validation instances in router and coordinator
         futures = []
         futures.append(self.rollout_router.resume_instances.remote(resumed_instance_ids))
         futures.append(self.rollout_coordinator.resume_instances.remote(resumed_instance_ids))
         ray.get(futures)
+        psrl_logger.info(f"Step 6 done in {time.time() - _t:.2f}s.")
 
+        psrl_logger.info(f"Switched to rollout mode in {time.time() - _switch_start:.2f}s.")
         self.is_rollout_mode_in_actor = True
 
     def switch_to_trainer_mode(self):
@@ -1588,10 +1615,10 @@ class PSRL_RayPPOTrainer:
         if not self.config.psrl.colocate_validate_and_train or not self.is_rollout_mode_in_actor:
             return
 
+        _switch_start = time.time()
         psrl_logger.info("Switching to trainer mode...")
 
-        psrl_logger.info("Notifying agent loop workers about paused instances...")
-
+        _t = time.time()
         psrl_logger.info("Step 1 - Pausing validation instances...")
         # pause validation instances in router and coordinator
         futures = []
@@ -1602,25 +1629,33 @@ class PSRL_RayPPOTrainer:
         futures.append(self.rollout_router.pause_instances.remote(paused_instance_ids))
         futures.append(self.rollout_coordinator.pause_instances.remote(paused_instance_ids))
         ray.get(futures)
+        psrl_logger.info(f"Step 1 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 2 - Interrupting generation of validation instances...")
         # interrupt generation and sleep
         futures = []
         for i in range(self.n_validate_instances):
             futures.append(self.validate_wg_list[i].execute_rank_zero_async("interrupt_generation"))
         ray.get(futures)
+        psrl_logger.info(f"Step 2 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 3 - Putting validation instances to sleep...")
         # sleep validation instances and deregister from NIXL
         futures = []
         for i in range(self.n_validate_instances):
             futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_sleep"))
         ray.get(futures)
+        psrl_logger.info(f"Step 3 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 4 - Waking up training actor...")
         # Allocate trainer space and register
         ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
+        psrl_logger.info(f"Step 4 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 5 - Syncing with ps manager...")
         # sync with server
         update_client_names = []  # to collect all updated client names for broadcasting
@@ -1632,14 +1667,20 @@ class PSRL_RayPPOTrainer:
         # receiver side: ps manager
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.actor_wg.world_size))
         ray.get(futures)
+        psrl_logger.info(f"Step 5 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 6 - PS manager broadcasting updated client infos...")
         self._broadcast_updated_client_infos_from_ps_manager(update_client_names)
+        psrl_logger.info(f"Step 6 done in {time.time() - _t:.2f}s.")
 
+        _t = time.time()
         psrl_logger.info("Step 7 - Pulling actor model from PS...")
         # pull actor model
         ray.get(self.actor_wg.execute_all_async("pull_model"))
+        psrl_logger.info(f"Step 7 done in {time.time() - _t:.2f}s.")
 
+        psrl_logger.info(f"Switched to trainer mode in {time.time() - _switch_start:.2f}s.")
         self.is_rollout_mode_in_actor = False
 
     def _make_broadcast_plan(self, src_agent_names, dst_agent_names) -> dict:

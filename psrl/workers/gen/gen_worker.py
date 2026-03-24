@@ -60,6 +60,7 @@ class GenInterface:
 
 
 class PSRL_GenWorker(Worker):
+    
     @staticmethod
     def configure_worker(
         config,
@@ -803,6 +804,7 @@ class PSRL_GenWorker(Worker):
         self._async_resume_event.set()
         self._async_interrupt_event.clear()
 
+    # @ray.method(concurrency_group="control")
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def sync_with_ps(self, ps_version: int, interrupt_generation: bool = False) -> int:
         """

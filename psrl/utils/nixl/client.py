@@ -2,6 +2,7 @@ import logging
 import os
 import pickle
 import time
+from collections import defaultdict
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -405,21 +406,55 @@ class NIXLStorageClient:
                 reg_descs = self._register_memory(mem_type, reg_list)
                 self._track_registered_desc(reg_descs)
 
-            # Rebuild desc bytes for all shards
+            # Rebuild desc bytes for all shards. Group by mem_type to batch all
+            # get_xfer_descs calls: O(mem_types) round-trips instead of O(N_shards).
+
+            # Precompute {shard_idx: local_pos} for each key: O(1) lookup vs O(S) list.index()
+            reregister_shard_pos_cache: dict[str, dict] = {
+                key: {s: i for i, s in enumerate(ti.sharding.shard_indices)}
+                for key, ti in self.local_client_info.tensor_infos.items()
+            }
+
+            # --- contig_desc_slice_map ---
+            contig_by_memtype: dict[str, list[tuple]] = defaultdict(list)
             for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
                 slice_addr, slice_len, device_id, mem_type = slice_info
-                desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
-                self.local_client_info.tensor_infos[key].desc_bytes_list[
-                    self.local_client_info.tensor_infos[key].sharding.shard_indices.index(shard_idx)
-                ] = desc_bytes
+                contig_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
 
+            for mem_type, entries in contig_by_memtype.items():
+                batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+                xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+                assert xfer_descs.descCount() == len(entries), (
+                    f"{self.client_name}: re-register get_xfer_descs returned {xfer_descs.descCount()} descs "
+                    f"for {len(entries)} contig inputs (mem_type={mem_type})."
+                )
+                desc_type = xfer_descs.getType()
+                for i, (key, shard_idx, _, _, _) in enumerate(entries):
+                    single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
+                    desc_bytes = self.agent.get_serialized_descs(single)
+                    local_pos = reregister_shard_pos_cache[key][shard_idx]
+                    self.local_client_info.tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
+
+            # --- temp_desc_slice_map ---
+            temp_by_memtype: dict[str, list[tuple]] = defaultdict(list)
             for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
                 slice_addr, slice_len, device_id, mem_type = slice_info
-                desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
-                self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
-                self.local_client_info.tensor_infos[key].temp_desc_bytes_list[
-                    self.local_client_info.tensor_infos[key].sharding.shard_indices.index(shard_idx)
-                ] = desc_bytes
+                temp_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
+
+            for mem_type, entries in temp_by_memtype.items():
+                batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+                xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+                assert xfer_descs.descCount() == len(entries), (
+                    f"{self.client_name}: re-register get_xfer_descs returned {xfer_descs.descCount()} descs "
+                    f"for {len(entries)} temp inputs (mem_type={mem_type})."
+                )
+                desc_type = xfer_descs.getType()
+                for i, (key, shard_idx, _, _, _) in enumerate(entries):
+                    single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
+                    desc_bytes = self.agent.get_serialized_descs(single)
+                    self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
+                    local_pos = reregister_shard_pos_cache[key][shard_idx]
+                    self.local_client_info.tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
             return
 
         tms_ctx = torch_memory_saver.region(tag="nixl") if self.enable_tms_for_temp_buffers else nullcontext()
@@ -689,20 +724,66 @@ class NIXLStorageClient:
                     reg_descs = self._register_memory(mem_type, reg_list)
                     self._track_registered_desc(reg_descs)
 
+                # Precompute {shard_idx: local_pos} once per key: O(1) lookup vs O(S) list.index()
+                shard_pos_cache: dict[str, dict] = {
+                    key: {s: i for i, s in enumerate(ti.sharding.shard_indices)}
+                    for key, ti in tensor_infos.items()
+                }
+
+                # Group by mem_type to batch get_xfer_descs calls: O(mem_types) round-trips instead of O(N_shards).
+                psrl_logger.info(
+                    f"{self.client_name}: [timing] register_local_tensors batch xfer_descs: "
+                    f"contig_desc_slice_map={len(self.contig_desc_slice_map)}, "
+                    f"temp_desc_slice_map={len(self.temp_desc_slice_map)}"
+                )
+                _t_xfer_descs = time.time()
+
+                # --- contig_desc_slice_map ---
+                contig_by_memtype: dict[str, list[tuple]] = defaultdict(list)
                 for (key, shard_idx), slice_info in self.contig_desc_slice_map.items():
                     slice_addr, slice_len, device_id, mem_type = slice_info
-                    desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
-                    tensor_infos[key].desc_bytes_list[tensor_infos[key].sharding.shard_indices.index(shard_idx)] = (
-                        desc_bytes
-                    )
+                    contig_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
 
+                for mem_type, entries in contig_by_memtype.items():
+                    batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+                    xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+                    assert xfer_descs.descCount() == len(entries), (
+                        f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
+                        f"for {len(entries)} contig inputs (mem_type={mem_type})."
+                    )
+                    desc_type = xfer_descs.getType()
+                    for i, (key, shard_idx, _, _, _) in enumerate(entries):
+                        # Re-wrap as a single-element list, then serialize
+                        single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
+                        desc_bytes = self.agent.get_serialized_descs(single)
+                        local_pos = shard_pos_cache[key][shard_idx]
+                        tensor_infos[key].desc_bytes_list[local_pos] = desc_bytes
+
+                # --- temp_desc_slice_map ---
+                temp_by_memtype: dict[str, list[tuple]] = defaultdict(list)
                 for (key, shard_idx), slice_info in self.temp_desc_slice_map.items():
                     slice_addr, slice_len, device_id, mem_type = slice_info
-                    desc_bytes = self._build_xfer_desc_bytes(slice_addr, slice_len, device_id, mem_type)
-                    self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
-                    tensor_infos[key].temp_desc_bytes_list[
-                        tensor_infos[key].sharding.shard_indices.index(shard_idx)
-                    ] = desc_bytes
+                    temp_by_memtype[mem_type].append((key, shard_idx, slice_addr, slice_len, device_id))
+
+                for mem_type, entries in temp_by_memtype.items():
+                    batch_tuples = [(addr, length, dev) for (_, _, addr, length, dev) in entries]
+                    xfer_descs = self.agent.get_xfer_descs(batch_tuples, mem_type=mem_type)
+                    assert xfer_descs.descCount() == len(entries), (
+                        f"{self.client_name}: get_xfer_descs returned {xfer_descs.descCount()} descs "
+                        f"for {len(entries)} temp inputs (mem_type={mem_type})."
+                    )
+                    desc_type = xfer_descs.getType()
+                    for i, (key, shard_idx, _, _, _) in enumerate(entries):
+                        single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
+                        desc_bytes = self.agent.get_serialized_descs(single)
+                        self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
+                        local_pos = shard_pos_cache[key][shard_idx]
+                        tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
+
+                psrl_logger.info(
+                    f"{self.client_name}: [timing] register_local_tensors batch xfer_descs done in "
+                    f"{time.time() - _t_xfer_descs:.3f}s"
+                )
 
             # Create the client info
             self.local_client_info = NIXLClientInfo(
@@ -826,7 +907,9 @@ class NIXLStorageClient:
             notifs = self.agent.get_new_notifs()
             if self.server_name in notifs and notifs[self.server_name]:
                 notification_bytes = notifs[self.server_name][0]
+                _t0 = time.time()
                 notification_data = pickle.loads(notification_bytes)
+                _t1 = time.time()
                 # Process client infos
                 if isinstance(notification_data, dict) and "client_infos" in notification_data:
                     # New format: includes communication plan
@@ -846,6 +929,14 @@ class NIXLStorageClient:
                         info = NIXLClientInfo.deserialize(info_bytes)
                         self._all_client_infos[client_name] = info
                         self._comm_plan = None
+                _t2 = time.time()
+                psrl_logger.info(
+                    f"{self.client_name}: [timing] wait_for_server_info deserialization: "
+                    f"pickle.loads={_t1 - _t0:.3f}s, "
+                    f"NIXLClientInfo.deserialize={_t2 - _t1:.3f}s, "
+                    f"n_infos={len(all_client_infos)}, "
+                    f"payload_bytes={len(notification_bytes)}"
+                )
                 break
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for meta server client infos.")

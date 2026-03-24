@@ -8,6 +8,21 @@ from functools import lru_cache
 import ray
 import torch
 
+# Fast dtype lookup used by NIXLShardMetaInfo.deserialize to avoid eval() / getattr overhead.
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "torch.bfloat16": torch.bfloat16,
+    "torch.float32": torch.float32,
+    "torch.float16": torch.float16,
+    "torch.float8_e4m3fn": torch.float8_e4m3fn,
+    "torch.float8_e5m2": torch.float8_e5m2,
+    "torch.int8": torch.int8,
+    "torch.int16": torch.int16,
+    "torch.int32": torch.int32,
+    "torch.int64": torch.int64,
+    "torch.uint8": torch.uint8,
+    "torch.bool": torch.bool,
+}
+
 
 def lcm(a, b):
     """Least common multiple, a and b are ints"""
@@ -411,6 +426,34 @@ class NIXLShardMetaInfo:
     stride: tuple[int, ...]
     is_contiguous: bool
 
+    def serialize(self) -> tuple:
+        """
+        Serialize the shard metadata to a compact primitive tuple.
+
+        Returns:
+            tuple: ``(dtype_str, device_str, shape_tuple, stride, is_contiguous)``
+        """
+        return (str(self.dtype), str(self.device), tuple(self.shape), self.stride, self.is_contiguous)
+
+    @staticmethod
+    def deserialize(t: tuple) -> "NIXLShardMetaInfo":
+        """
+        Deserialize shard metadata from a compact primitive tuple.
+
+        Args:
+            t (tuple): Tuple produced by :py:meth:`serialize`.
+
+        Returns:
+            NIXLShardMetaInfo: Reconstructed metadata object.
+        """
+        return NIXLShardMetaInfo(
+            dtype=_DTYPE_MAP[t[0]],
+            device=torch.device(t[1]),
+            shape=torch.Size(t[2]),
+            stride=t[3],
+            is_contiguous=t[4],
+        )
+
     def can_xfer_to(self, other: "NIXLShardMetaInfo") -> bool:
         """Check if the shard can be transferred to another shard"""
         # xfer from non-contiguous shards is not supported
@@ -456,13 +499,13 @@ class NIXLTensorInfo:
     def get_all_temp_descs(self, agent):
         return [agent.deserialize_descs(b) if b is not None else None for b in self.temp_desc_bytes_list]
 
-    def serialize(self):
-        """Serialize the tensor descriptor info"""
+    def serialize(self) -> bytes:
+        """Serialize the tensor descriptor info."""
         return pickle.dumps(self)
 
     @staticmethod
-    def deserialize(data):
-        """Deserialize tensor descriptor info"""
+    def deserialize(data: bytes) -> "NIXLTensorInfo":
+        """Deserialize tensor descriptor info."""
         return pickle.loads(data)
 
     @property
@@ -508,13 +551,13 @@ class NIXLClientInfo:
         """Get tensor descriptor info for specific key"""
         return self.tensor_infos[key]
 
-    def serialize(self):
-        """Serialize client info"""
+    def serialize(self) -> bytes:
+        """Serialize client info to bytes."""
         return pickle.dumps(self)
 
     @staticmethod
-    def deserialize(data):
-        """Deserialize client info"""
+    def deserialize(data: bytes) -> "NIXLClientInfo":
+        """Deserialize client info from bytes."""
         return pickle.loads(data)
 
 

@@ -10,7 +10,12 @@ Principle 2: When running scripts or inspecting the environment, please activate
 
 Principle 3: At all times, including when you are reading my code, if you identify a better design, you could interrupt the current task to consider refactoring. Discuss the refactoring with me before proceeding.
 
-Principle 4: At all times, add more comments and use assertions where appropriate. Ensure that any newly added code remains consistent with the existing style, including comments, logging formats, and the way exceptions and assertions are written.
+## Style Guides
+
+Detailed coding conventions are maintained as separate reference files under `.claude/rules/`.
+Claude must read and apply these guides when writing or modifying code.
+
+- **Comment & Documentation Style** → [`.claude/rules/comment_style.md`](.claude/rules/comment_style.md)
 
 ## Project Overview
 

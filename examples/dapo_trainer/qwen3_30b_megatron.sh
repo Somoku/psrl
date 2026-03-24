@@ -191,8 +191,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=True \
-    trainer.test_freq=5 \
+    trainer.val_before_train=False \
+    trainer.test_freq=2 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

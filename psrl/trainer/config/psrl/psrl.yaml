@@ -114,12 +114,12 @@ status_collection:
   dump_logging_to_file_interval_in_ms: 500
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
-  # Here 10 means sync every 0.01 second
-  engine_sync_interval_in_ms: 10
+  # Here 10 means sync every 0.1 second
+  engine_sync_interval_in_ms: 100
 
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
-  # Here 10 means sync every 0.01 second
-  coordinator_sync_interval_in_ms: 10
+  # Here 10 means sync every 0.1 second
+  coordinator_sync_interval_in_ms: 100
 
 # Memory logger config
 memory_logger:
@@ -143,10 +143,10 @@ redundant_rollout:
   alg_rollout_n: ${psrl.rollout_n}
 
   # Actual global batch size (>= algorithm requirement)
-  redundant_global_batch_size: null
+  redundant_global_batch_size: ${psrl.staleness_buffer_entries}
 
   # Actual number of responses (>= algorithm requirement)
-  redundant_rollout_n: null
+  redundant_rollout_n: ${psrl.rollout_n}
 
 # Partial rollout config
 partial_rollout:
@@ -166,7 +166,7 @@ routing_strategy:
   method: request_num_balance
 
   # Check interval in millisecond for rollout routing
-  check_interval_in_ms: 10
+  check_interval_in_ms: 500
 
   # Whether to prioritize short requests
   # Available options: "short_length", "long_length", "small_id"

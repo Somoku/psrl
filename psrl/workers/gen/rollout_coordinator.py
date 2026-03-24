@@ -358,7 +358,7 @@ class RolloutCoordinator(CommandExtension):
                 command_type = command.type
                 command_id = command.get_kwargs()["id"]
                 command_args = command.get_args()
-                psrl_logger.debug(
+                psrl_logger.info(
                     f"Receive command: type = {command_type}, kwargs = {command.get_kwargs()}, args = {command_args}"
                 )
 
@@ -676,8 +676,9 @@ class RolloutCoordinator(CommandExtension):
                     instance_id, 0
                 )
             await self.rollout_router.pause_routing.remote()
-            psrl_logger.info("Interrupted routing for synchronization")
+            psrl_logger.info("Paused routing for synchronization")
             await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
+            psrl_logger.info("Updated currently syncing instances")
             await self.exec_command(
                 Command(
                     type=CommandType.SYNC,
@@ -687,7 +688,9 @@ class RolloutCoordinator(CommandExtension):
                 ),
                 blocking=True,
             )
+            psrl_logger.info("Executed SYNC command")
             if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                psrl_logger.info("Waiting for interrupted partial requests loop back")
                 await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(instance_ids)
                 psrl_logger.info(
                     f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"

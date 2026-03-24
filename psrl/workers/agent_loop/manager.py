@@ -714,7 +714,7 @@ class PSRL_AgentLoopManager:
                         is_validate=is_validate,
                     )
                     self.rollout_request_tracker[sample_id].append(entry_info)
-                    psrl_logger.info(
+                    psrl_logger.debug(
                         f"Store data for prompt {sample_id} with info {entry_info}, "
                         f"request num: {len(self.rollout_request_tracker[sample_id])}"
                     )

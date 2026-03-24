@@ -6,6 +6,7 @@ import torch
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.utils.mem_utils import format_gib
 from vllm.v1.worker.gpu_worker import Worker
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
@@ -14,13 +15,13 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.12.0")
+@min_vllm_version("0.14.0")
 class TMSWorkerPatch(vLLMPatch[Worker]):
     """
     Replace cuMemAllocator with torch_memory_saver
     for better memory management.
 
-    Compatible with vLLM 0.12.0+
+    Compatible with vLLM 0.14.0+
     """
 
     def sleep(self, level: int = 1) -> None:
@@ -50,8 +51,8 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         assert freed_bytes >= 0, "Memory usage increased after sleeping."
         psrl_logger.info(
             "Sleep mode freed %.2f GiB memory, %.2f GiB memory is still in use.",
-            freed_bytes / GiB_bytes,
-            used_bytes / GiB_bytes,
+            format_gib(freed_bytes),
+            format_gib(used_bytes),
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
@@ -70,6 +71,16 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
                 if name in self._sleep_saved_buffers:
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
+        
+        # If the KV cache has just been woken up,
+        # the internal state of cache_engine must be reset,
+        # especially the FP8 scaling factor.
+        if (
+            (tags is None or "kv_cache" in tags)
+            and self.cache_config.cache_dtype.startswith("fp8")
+            and hasattr(self.model_runner, "init_fp8_kv_scales")
+        ):
+            self.model_runner.init_fp8_kv_scales()
 
         free_bytes_after_wake_up, total = torch.cuda.mem_get_info()
         increased_bytes = free_bytes_before_wake_up - free_bytes_after_wake_up
@@ -77,8 +88,8 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         assert increased_bytes >= 0, "Memory usage increased after waking up."
         psrl_logger.info(
             "Wake up mode increased %.2f GiB memory, %.2f GiB memory is still in use.",
-            increased_bytes / GiB_bytes,
-            used_bytes / GiB_bytes,
+            format_gib(increased_bytes),
+            format_gib(used_bytes),
         )
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
@@ -92,6 +103,10 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
+
+        # Update local config with adjusted num blocks after profiling,
+        # so that it's available to the warmup stage.
+        self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
@@ -107,3 +122,14 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
         else:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+
+        if self.model_config.enable_return_routed_experts:
+            self.model_runner.init_routed_experts_capturer()
+
+        # Build KV-zero metadata outside the CuMem pool so the bookkeeping
+        # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
+        # allocator and are not discarded during sleep/wake cycles.
+        if kv_cache_config.needs_kv_cache_zeroing and hasattr(
+            self.model_runner, "_init_kv_zero_meta"
+        ):
+            self.model_runner._init_kv_zero_meta()

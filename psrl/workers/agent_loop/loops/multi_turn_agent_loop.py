@@ -10,7 +10,6 @@ from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
-from psrl.workers.agent_loop.sticky_session import sticky_session
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -99,10 +98,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
 
             # TODO: check unnecessary fields in output data_proto and
             # check redundant padding in single-request case
-            async with sticky_session(self.rollout_router, request):
-                output = await self.rollout_router.generate_async.remote(
-                    self.agent_data.prepare_generation_request(request)
-                )
+            output = await self.generate_sequence(
+                self.agent_data.prepare_generation_request(request),
+                is_sticky_session=True,
+            )
 
             if output is None:
                 return None, TerminateReason.ABORTED

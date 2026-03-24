@@ -22,6 +22,7 @@ class CheckpointConfig(BaseConfig):
     save_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
     load_contents: list[str] = field(default_factory=lambda: ["model", "optimizer", "extra"])
     async_save: bool = False
+    mbridge_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -54,6 +55,7 @@ class BaseModelConfig(BaseConfig):
         override_config (dict): Hugging Face config override.
         external_lib (Optional[str]): External model implementation (optional).
         trust_remote_code (bool): Whether to trust remote code from Hugging Face models.
+        lora (dict[str, Any]): LoRA configuration dictionary.
     """
 
     path: str = "~/models/deepseek-llm-7b-chat"
@@ -61,6 +63,7 @@ class BaseModelConfig(BaseConfig):
     override_config: dict[str, Any] = field(default_factory=dict)
     external_lib: str | None = None
     trust_remote_code: bool = False
+    lora: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -76,38 +79,3 @@ class ModuleConfig(BaseConfig):
 
     path: str | None = None
     name: str | None = None
-
-
-@dataclass
-class RewardManagerConfig(BaseConfig):
-    """Configuration for reward manager.
-
-        A reward manager defines the mechanism of computing rule-based reward and handling different reward sources.
-
-    Args:
-        source (str): Source of the reward manager. Options: ``"register"``, ``"importlib"``. Default: ``"register"``.
-        name (str, optional):
-            - When ``source`` is ``"register"``, the name is used in `get_reward_manager_cls(name)``.
-                See ``verl/experimental/reward/reward_manager.py`` for options. Default: ``"naive"``.
-            - When ``source`` is ``"importlib"``, the name is used in ``getattr(module, name)``,
-                e.g., ``"DAPORewardManager"``.
-        module (ModuleConfig, optional): Optional configuration for the external module defining the reward manager,
-    """
-
-    source: str = "register"
-    name: str = "naive"
-    module: ModuleConfig | None = field(default_factory=ModuleConfig)
-
-    def __post_init__(self):
-        super().__post_init__()
-        if self.source == "register":
-            from verl.workers.reward_manager.registry import REWARD_MANAGER_REGISTRY
-
-            assert self.name in REWARD_MANAGER_REGISTRY, (
-                f"Reward manager is not registered: {self.name=} ,{REWARD_MANAGER_REGISTRY.keys()=}"
-            )
-        elif self.source == "importlib":
-            # NOTE: The existence is not checked since it depends on which machine the config is initialized on.
-            assert self.module is not None and self.module.path is not None, (
-                "When source is importlib, module.path should be set."
-            )

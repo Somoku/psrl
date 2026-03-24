@@ -5,22 +5,19 @@ import logging
 import os
 import random
 import socket
+from typing import Any
 
-import httpx
+import aiohttp
 
 psrl_logger = logging.getLogger(__name__)
 
 
 def find_available_port(base_port: int):
     """Find an available port starting from base_port."""
-    port = base_port + random.randint(100, 1000)
-    while True:
-        if is_port_available(port):
-            return port
-        if port < 60000:
-            port += 42
-        else:
-            port -= 43
+    port = base_port
+    while not is_port_available(port):
+        port += 1
+    return port
 
 
 def is_port_available(port):
@@ -72,17 +69,32 @@ def get_host_info():
 
 
 # Global HTTP client for POST/GET requests
-_http_client: httpx.AsyncClient | None = None
+_http_client: aiohttp.ClientSession | None = None
 
 # Maximum concurrency for the global HTTP client
-_client_concurrency: int = 0
+_client_concurrency: int = 256
+
+async def _ensure_http_client() -> aiohttp.ClientSession:
+    global _http_client
+    if _http_client is None or _http_client.closed:
+        connector = aiohttp.TCPConnector(
+            limit=_client_concurrency,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        # Respect configured request timeout when provided.
+        _http_client = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=None),
+        )
+    return _http_client
 
 
-async def _post(client, url, payload, max_retries=60):
+async def _post(client, url, payload, max_retries=5, headers: dict[str, str] | None = None):
     """POST JSON payload with retries.
 
     Args:
-        client: httpx.AsyncClient instance.
+        client: aiohttp.ClientSession instance.
         url: URL to POST to.
         payload: JSON-serializable payload to send.
         max_retries: Maximum number of retries on failure.
@@ -90,25 +102,83 @@ async def _post(client, url, payload, max_retries=60):
     retry_count = 0
     while retry_count < max_retries:
         try:
-            response = await client.post(url, json=payload or {})
-            response.raise_for_status()
-            try:
-                output = response.json()
-            except json.JSONDecodeError:
-                output = response.text
+            async with client.post(url, json=payload or {}, headers=headers) as response:
+                base_worker_id = response.headers.get("x-base-worker-id", None)
+                target_dp_rank = response.headers.get("x-target-dp-rank", None)
+
+                if response.status >= 400:
+                    response_text = await response.text()
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=response_text,
+                        headers=response.headers,
+                    )
+                try:
+                    output = await response.json(content_type=None)
+                    output["header_info"] = {
+                        "base_worker_id": base_worker_id,
+                        "target_dp_rank": target_dp_rank,
+                    }
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    output = await response.text()
         except Exception as e:
             retry_count += 1
-
-            if isinstance(e, httpx.HTTPStatusError):
-                response_text = e.response.text
-            else:
-                response_text = None
-
             psrl_logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
+                "Error: %s, retrying... (attempt %s/%s, url=%s)",
+                e,
+                retry_count,
+                max_retries,
+                url,
             )
             if retry_count >= max_retries:
-                psrl_logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
+                psrl_logger.info("Max retries (%s) reached, failing... (url=%s)", max_retries, url)
+                raise e
+            await asyncio.sleep(1)
+            continue
+        break
+
+    return output
+
+
+async def _get(client, url, params=None, max_retries=5, headers: dict[str, str] | None = None):
+    """GET JSON payload with retries."""
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            async with client.get(url, params=params, headers=headers) as response:
+                base_worker_id = response.headers.get("x-base-worker-id", None)
+                target_dp_rank = response.headers.get("x-target-dp-rank", None)
+
+                if response.status >= 400:
+                    response_text = await response.text()
+                    raise aiohttp.ClientResponseError(
+                        request_info=response.request_info,
+                        history=response.history,
+                        status=response.status,
+                        message=response_text,
+                        headers=response.headers,
+                    )
+                try:
+                    output = await response.json(content_type=None)
+                    output["header_info"] = {
+                        "base_worker_id": base_worker_id,
+                        "target_dp_rank": target_dp_rank,
+                    }
+                except (aiohttp.ContentTypeError, json.JSONDecodeError):
+                    output = await response.text()
+        except Exception as e:
+            retry_count += 1
+            psrl_logger.info(
+                "Error: %s, retrying... (attempt %s/%s, url=%s)",
+                e,
+                retry_count,
+                max_retries,
+                url,
+            )
+            if retry_count >= max_retries:
+                psrl_logger.info("Max retries (%s) reached, failing... (url=%s)", max_retries, url)
                 raise e
             await asyncio.sleep(1)
             continue
@@ -119,34 +189,18 @@ async def _post(client, url, payload, max_retries=60):
 
 def init_http_client(server_concurrency: int, rollout_engine_num: int):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
-    global _http_client, _client_concurrency
+    global _client_concurrency
 
     _client_concurrency = server_concurrency * rollout_engine_num
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
-        )
 
 
-async def post(url, payload, max_retries=60):
+async def post(url, payload, max_retries=5, headers: dict[str, str] | None = None):
     """POST JSON payload using the global HTTP client."""
-    if _http_client is None:
-        raise RuntimeError(
-            "HTTP client is not initialized. Call psrl.utils.common.http_utils.init_http_client() "
-            "once in this process (e.g., in each Ray actor/worker __init__) before calling post()."
-        )
-    return await _post(_http_client, url, payload, max_retries)
+    client = await _ensure_http_client()
+    return await _post(client, url, payload, max_retries=max_retries, headers=headers)
 
 
-async def get(url):
+async def get(url, params: dict[str, Any] | None = None, max_retries=5, headers: dict[str, str] | None = None):
     """GET JSON payload using the global HTTP client."""
-    if _http_client is None:
-        raise RuntimeError(
-            "HTTP client is not initialized. Call psrl.utils.common.http_utils.init_http_client() "
-            "once in this process (e.g., in each Ray actor/worker __init__) before calling get()."
-        )
-    response = await _http_client.get(url)
-    response.raise_for_status()
-    output = response.json()
-    return output
+    client = await _ensure_http_client()
+    return await _get(client, url, params=params, max_retries=max_retries, headers=headers)

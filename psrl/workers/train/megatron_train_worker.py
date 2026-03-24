@@ -32,7 +32,6 @@ from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
     GLOBAL_TRAIN_CLIENT_NAME,
     NIXLClientType,
-    NIXLInterface,
     NIXLStorageClient,
 )
 from psrl.utils.ray import exclusive_push_model_context
@@ -82,7 +81,6 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         role: str,
         psrl_config: DictConfig,
         train_interface: TrainInterface,
-        nixl_interface: NIXLInterface,
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
         PSRL_BaseTrainWorker.__init__(
@@ -91,7 +89,6 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self.world_size,
             psrl_config,
             train_interface,
-            nixl_interface,
         )
 
         self.layer_name_mapping = {
@@ -140,7 +137,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 use_gpu=True,
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
+                replica_idx=0, # replica idx is not necessary
+                worker_index=self.rank,
                 # client_group_id=self.get_replica_id()
                 logging_path=self.psrl_config.logging_path,
             )
@@ -395,7 +393,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         lazy_import_to_globals("megatron.core", "DistributedDataParallel", "DDP")
         lazy_import_many_to_globals(
             "verl.utils.megatron.router_replay_patch",
-            ["RouterReplay", "RouterReplayAction"],
+            ["RouterReplay", "RouterReplayAction", "apply_router_replay_patch"],
         )
 
         skip_load_weight = init_mode == "empty"
@@ -437,10 +435,13 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-
-            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
+                log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=psrl_logger)
+            is_lora = data.meta_info.pop("is_lora", False)
+            adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
+            config_source = self.config.ref if is_lora else self.config.rollout
+            data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
 
             for k, v in data.batch.items():
                 if k != "routed_experts":
@@ -454,9 +455,15 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if self.enable_routing_replay and self.config.actor.router_replay.mode == "R3":
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
-            output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-            output = DataProto.from_dict(tensors={"recomputed_log_probs": output, "entropys": entropys})
-
+            with adapter_ctx:
+                output, entropys, layers_topk_idx = self.actor.compute_log_prob(data=data, calculate_entropy=not is_lora)
+            tensors = {"ref_log_prob": output} if is_lora else {"recomputed_log_probs": output}
+            if not is_lora:
+                tensors["entropys"] = entropys
+            output = DataProto.from_dict(
+                tensors=tensors,
+                meta_info={"temperature": self.config.rollout.temperature},
+            )
             if self.config.actor.router_replay.mode == "R2":
                 output.batch["routed_experts"] = layers_topk_idx
             if self.config.actor.router_replay.mode in ["R2", "R3"]:
@@ -467,6 +474,13 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if self._is_offload_param:
                 offload_megatron_model_to_cpu(self.actor_module)
             aggressive_empty_cache(force_sync=True)
+
+            for k, v in data.batch.items():
+                if k != "routed_experts":
+                    data.batch[k] = v.to(get_device_id())
+                else:
+                    data.batch[k] = v
+
             return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))

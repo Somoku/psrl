@@ -19,7 +19,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
-from psrl.workers.reward.reward_loop import load_reward_loop_manager
+from psrl.workers.reward.reward_loop.registry import load_reward_loop_manager
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -379,7 +379,7 @@ class RewardManager(CommandExtension):
                 PSRL_RequestStatus.REWARD_RUNNING,
                 is_validate=is_validate,
             )
-            if not update_status_success[0]:
+            if not update_status_success:
                 return None
 
             if rollout_n > 1:
@@ -430,8 +430,7 @@ class RewardManager(CommandExtension):
                             PSRL_RequestStatus.REWARD_COMPLETED,
                             is_validate=is_validate,
                         )
-                        complete_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-                        if complete_request_idxs:
+                        if update_status_success:
                             results[request_id] = result
         return results
 

@@ -6,7 +6,6 @@ from contextlib import nullcontext
 from typing import TYPE_CHECKING, Any
 
 import nixl._bindings as nixlBind
-import ray
 import torch
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
@@ -19,10 +18,10 @@ from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
-    NIXLInterface,
     NIXLSharding,
     NIXLShardMetaInfo,
     NIXLTensorInfo,
+    find_free_port_with_scope,
 )
 
 if TYPE_CHECKING:
@@ -69,7 +68,8 @@ class NIXLStorageClient:
         use_gpu: bool,
         client_type: NIXLClientType,
         nixl_config: DictConfig,
-        nixl_interface: NIXLInterface | None = None,
+        replica_idx: int = 0,
+        worker_index: int = 0,
         binded_agent: nixl_agent | None = None,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
@@ -87,7 +87,6 @@ class NIXLStorageClient:
         self.max_pinned_temp_memory_slots = (
             nixl_config.max_pinned_temp_memory_slots
         )  # None means no pinned temp memory
-        self.nixl_interface = nixl_interface if nixl_interface is not None else NIXLInterface()
         self.client_group_id = client_group_id
         self.enable_nixl_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
 
@@ -99,10 +98,9 @@ class NIXLStorageClient:
 
         # Initialize NIXL agent
         if binded_agent is None:
-            self.client_port = (
-                0
-                if self.nixl_interface.port_scanner is None
-                else ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
+            self.client_port = find_free_port_with_scope(
+                replica_idx=replica_idx,
+                worker_index=worker_index,
             )
             self.agent = nixl_agent(self.client_name, nixl_agent_config(True, True, self.client_port))
         else:
@@ -510,7 +508,7 @@ class NIXLStorageClient:
                     shard_meta_info_list.append(meta_info)
 
                     # Check if the shard is contiguous
-                    psrl_logger.info(
+                    psrl_logger.debug(
                         f"{self.client_name} key {key} shard {shard_indices[local_pos]} "
                         f"register local tensor with shape {local_sharded_tensor.shape} and "
                         f"dtype {local_sharded_tensor.dtype}, is_contiguous = {is_contiguous}"
@@ -518,7 +516,7 @@ class NIXLStorageClient:
                     if not meta_only:
                         if local_sharded_tensor.is_contiguous():
                             # Contiguous shard: batch register
-                            if binded_meta_tensor_mapping is not None:
+                            if binded_meta_tensor_mapping is None:
                                 storage_key = self._record_region_registration(local_sharded_tensor)
                             slice_addr = int(local_sharded_tensor.data_ptr())
                             slice_len = int(local_sharded_tensor.numel() * local_sharded_tensor.element_size())
@@ -1511,7 +1509,8 @@ class NIXLMultiStorageClients:
         use_gpu: bool,
         multi_client_types: list[NIXLClientType],
         nixl_config: DictConfig,
-        nixl_interface: NIXLInterface | None = None,
+        replica_idx: int = 0,
+        worker_index: int = 0,
         client_group_id: int = -1,  # -1 is the default client group
     ):
         self.agent_name = agent_name
@@ -1523,13 +1522,12 @@ class NIXLMultiStorageClients:
         assert nixl_config.server_mode == "meta_server", "NIXLMultiStorageClient only supports meta_server mode"
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
-        self.nixl_interface = nixl_interface if nixl_interface is not None else NIXLInterface()
-
         # Initialize NIXL agent
         self.client_port = (
-            0
-            if self.nixl_interface.port_scanner is None
-            else ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
+            find_free_port_with_scope(
+                replica_idx=replica_idx,
+                worker_index=worker_index,
+            )
         )
         self.agent = nixl_agent(self.agent_name, nixl_agent_config(True, True, self.client_port))
 
@@ -1543,7 +1541,8 @@ class NIXLMultiStorageClients:
                     use_gpu,
                     client_type,
                     nixl_config,
-                    nixl_interface,
+                    replica_idx=replica_idx,
+                    worker_index=worker_index,
                     binded_agent=self.agent,
                     client_group_id=client_group_id,
                 )

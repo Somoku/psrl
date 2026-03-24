@@ -13,7 +13,6 @@ from verl.single_controller.base.decorator import (
     make_nd_compute_dataproto_dispatch_fn,
     register,
 )
-from verl.utils.device import get_device_id
 from verl.utils.fsdp_utils import (
     fsdp_version,
     load_fsdp_model_to_gpu,
@@ -37,7 +36,6 @@ from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
     GLOBAL_TRAIN_CLIENT_NAME,
     NIXLClientType,
-    NIXLInterface,
     NIXLStorageClient,
 )
 from psrl.utils.ray import exclusive_push_model_context
@@ -105,7 +103,6 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         role: str,
         psrl_config: DictConfig,
         train_interface: TrainInterface,
-        nixl_interface: NIXLInterface,
     ) -> None:
         ActorRolloutRefWorker.__init__(self, config, role)
         PSRL_BaseTrainWorker.__init__(
@@ -114,7 +111,6 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self.world_size,
             psrl_config,
             train_interface,
-            nixl_interface,
         )
 
         if self.psrl_config.tms.range in ["train", "all"]:
@@ -157,7 +153,8 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 use_gpu=True,
                 client_type=NIXLClientType.PUSH_SIDE,
                 nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
+                replica_idx=0, # replica idx is not necessary
+                worker_index=self.rank,
                 # client_group_id=self.get_replica_id()
                 logging_path=self.psrl_config.logging_path,
             )
@@ -386,20 +383,29 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-            data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
-            data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
-            data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-
             is_lora = data.meta_info.pop("is_lora", False)
             adapter_ctx = self.actor.actor_module.disable_adapter() if is_lora else nullcontext()
-            data = data.to(get_device_id())
+            config_source = self.config.ref if is_lora else self.config.rollout
+            data.meta_info["micro_batch_size"] = config_source.log_prob_micro_batch_size_per_gpu
+            data.meta_info["max_token_len"] = config_source.log_prob_max_token_len_per_gpu
+            data.meta_info["use_dynamic_bsz"] = config_source.log_prob_use_dynamic_bsz
             # perform recompute log_prob
+            calculate_entropy = not is_lora
             with self.ulysses_sharding_manager:
-                data = self.ulysses_sharding_manager.preprocess_data(data)
                 with adapter_ctx:
-                    output, entropys = self.actor.compute_log_prob(data=data, calculate_entropy=True)
-                output = DataProto.from_dict(tensors={"recomputed_log_probs": output, "entropys": entropys})
-                output = self.ulysses_sharding_manager.postprocess_data(output)
+                    outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
+                if not is_lora:
+                    tensors = {"recomputed_log_probs": outputs["log_probs"]}
+                else:
+                    tensors = {"ref_log_prob": outputs["log_probs"]}
+                if calculate_entropy:
+                    tensors["entropys"] = outputs["entropys"]
+                if "sum_pi_squared" in outputs:
+                    tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+                output = DataProto.from_dict(
+                    tensors=tensors,
+                    meta_info={"temperature": self.config.rollout.temperature},
+                )
 
             output = output.to("cpu")
 
@@ -410,6 +416,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
             if self._is_offload_param:
                 offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+                log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=psrl_logger)
 
             return output
 

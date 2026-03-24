@@ -45,22 +45,42 @@ MAX_JOB=$MAX_JOBS python -m pip install -v --disable-pip-version-check --no-cach
 popd
 rm -rf apex_src
 
-echo "6. Install vllm and verl"
+echo "6. Install SMG (with PSRL policies)"
+# Check if Rust is installed
+if ! command -v cargo &> /dev/null; then
+    echo "Error: Rust/Cargo not found. Please install Rust first:"
+    echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    echo "  source \$HOME/.cargo/env"
+    exit 1
+fi
+
+echo "Building SMG from source..."
+pushd $THIRD_PARTY_PATH
+git clone https://github.com/Somoku/smg.git -b psrl_dev
+cd smg
+# Build release binary with PSRL policies
+cargo build --release
+python -m uv pip install -e crates/grpc_client/python/
+python -m uv pip install -e crates/psrl_state/python/
+python -m uv pip install -e grpc_servicer/
+
+echo "Build python binding of smg..."
+python -m uv pip install maturin
+cd bindings/python
+maturin develop --features vendored-openssl
+popd
+
+# Verify the binding is importable
+python -c "from smg.router import Router; print('  ✓ smg.router binding installed successfully')" || {
+    echo "Error: smg.router binding failed to install"
+    exit 1
+}
+
+echo "7. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    # NOTE(linsh): Current patch will modify cpp files,
-    # so we need to apply the patch before building vllm
-    # we can update it until v0.14.0 is released
-    git clone -b v0.12.0 https://github.com/vllm-project/vllm.git
+    git clone -b releases/v0.18.0 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$THIRD_PARTY_PATH/vllm
-    cd $VLLM_PATH
-    cp $PSRL_PATH/patch/vllm/v0.12.0.patch .
-    git apply v0.12.0.patch
-    rm v0.12.0.patch
-    # Apply R3 patch (remove it after merged into vllm main branch)
-    cp $PSRL_PATH/patch/vllm/R3.patch .
-    git apply R3.patch
-    rm R3.patch
     popd
 fi
 pushd $VLLM_PATH
@@ -74,20 +94,23 @@ if [ -z "$VERL_PATH" ]; then
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     cd $VERL_PATH
-    git checkout 3824689
+    git checkout 712de01c
     popd
 fi
 pushd $VERL_PATH
 python -m uv pip install -e .
 popd
 
-# pushd $PSRL_PATH/patch/vllm
-# bash apply_patch.sh
-# popd
+pushd $PSRL_PATH/patch/vllm
+bash apply_patch.sh
+popd
 
 echo "8. Apply patch for verl"
 pushd $PSRL_PATH/patch/verl
 bash apply_patch.sh
 popd
+
+echo "9. Install torch_memory_saver"
+python -m uv pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@d64a6394d1e09c613fab90260054cecc2684586d --no-cache-dir --force-reinstall
 
 echo "Successfully installed all basic packages"

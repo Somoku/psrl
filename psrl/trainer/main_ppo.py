@@ -8,10 +8,12 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
-from verl.trainer.ppo.reward import load_reward_manager
+from verl.utils.device import auto_set_device
 
+from psrl.workers.gen_dplb.vllm_rollout import PSRL_ServerAdapter
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from psrl.trainer.ppo.utils import PSRL_Role
+from psrl.trainer.ppo.reward import load_reward_manager
+from psrl.trainer.ppo.utils import PSRL_Role, need_reference_policy
 from psrl.utils.post_processor import (
     load_buffer_post_processor,
     load_group_post_processor,
@@ -39,6 +41,7 @@ def seed_everything(seed: int):
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
+    auto_set_device(config)
     run_ppo(config)
 
 
@@ -53,7 +56,13 @@ def run_ppo(config) -> None:
         default_runtime_env = get_ppo_ray_runtime_env()
         default_runtime_env["env_vars"]["PSRL_LOGGING_PATH"] = config.psrl.logging_path
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
-        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
+        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})        
+        if config.transfer_queue.enable:
+            # Add runtime environment variables for transfer queue
+            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
+            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            runtime_env_kwargs["env_vars"] = runtime_env_vars
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
@@ -104,8 +113,6 @@ class TaskRunner:
         """Add actor rollout worker based on the actor strategy."""
         from verl.single_controller.ray import RayWorkerGroup
 
-        from psrl.workers.gen.gen_worker import PSRL_GenWorker
-
         if config.train_actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
             assert config.critic.strategy in [
                 "fsdp",
@@ -134,10 +141,10 @@ class TaskRunner:
         else:
             raise NotImplementedError
 
-        self.role_worker_mapping[PSRL_Role.Rollout] = ray.remote(PSRL_GenWorker)
+        self.role_worker_mapping[PSRL_Role.Rollout] = ray.remote(PSRL_ServerAdapter)
         self.role_worker_mapping[PSRL_Role.Actor] = ray.remote(PSRL_TrainWorker)
         if config.psrl.colocate_validate_and_train:
-            self.role_worker_mapping[PSRL_Role.Validate] = ray.remote(PSRL_GenWorker)
+            self.role_worker_mapping[PSRL_Role.Validate] = ray.remote(PSRL_ServerAdapter)
 
         return actor_rollout_cls, ray_worker_group_cls
 
@@ -168,6 +175,9 @@ class TaskRunner:
 
             reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
             resource_pool_spec["reward_pool"] = reward_pool
+        else:
+            config.reward_model.nnodes = deployment_config.train_nnodes
+            config.reward_model.n_gpus_per_node = deployment_config.train_ngpus_per_node
 
         # Set the resource pool spec for each rollout instance.
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
@@ -239,17 +249,11 @@ class TaskRunner:
 
         self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(CriticWorker)
 
-    def add_reward_model_worker(self, config):
+    def add_reward_model_resource_pool(self, config):
         """Add reward model worker if enabled."""
         if config.reward_model.enable:
-            if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
-            else:
-                raise NotImplementedError
-
-            self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
+            # we do not use reward model workers, so we only register reward model in resource pool
+            # without continue to register reward model worker in role mapping
             if config.reward_model.enable_resource_pool:
                 self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
             else:
@@ -257,7 +261,7 @@ class TaskRunner:
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""
-        if config.algorithm.use_kl_in_reward or config.train_actor_rollout_ref.actor.use_kl_loss:
+        if need_reference_policy(config):
             self.role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[PSRL_Role.RefPolicy] = ["train_pool"]
 
@@ -296,7 +300,7 @@ class TaskRunner:
         # - for code related prompt, we send to a sandbox if there are test cases
         # finally, we combine all the rewards together
         # The reward type depends on the tag of the data
-        self.add_reward_model_worker(config)
+        self.add_reward_model_resource_pool(config)
 
         # Add a reference policy worker if KL loss or KL reward is used.
         self.add_ref_policy_worker(config, actor_rollout_cls)
@@ -337,7 +341,7 @@ class TaskRunner:
 
         # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
         # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
-        from verl.utils.dataset.rl_dataset import collate_fn
+        from psrl.utils.dataset.rl_dataset import collate_fn
 
         from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
@@ -358,7 +362,6 @@ class TaskRunner:
             collate_fn=collate_fn,
             group_post_process_fn=group_post_process_fn,
             buffer_post_process_fn=buffer_post_process_fn,
-            device_name=config.trainer.device,
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()

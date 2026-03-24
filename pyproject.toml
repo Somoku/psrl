@@ -14,12 +14,21 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = [
+    "aiohttp>=3.9.0",
     "cachetools>=5.0.0",
     "vllm-psrl-patches @ file:patch/vllm/vllm_plugin",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
     "License :: OSI Approved :: Apache Software License",
+]
+
+
+[project.optional-dependencies]
+grpc = [
+    "grpcio>=1.60.0",
+    "grpcio-tools>=1.60.0",
+    "protobuf>=4.25.0",
 ]
 
 [project.urls]

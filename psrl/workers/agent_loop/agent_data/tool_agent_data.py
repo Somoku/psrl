@@ -12,6 +12,7 @@ from psrl.environments.base import ConversationType, Environment
 from psrl.environments.tool_env import ToolAction
 from psrl.tools.tool_parser.base import ToolParser
 from psrl.workers.agent_loop.agent_data.base import AgentData, Trajectory
+from psrl.workers.gen_dplb.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -210,14 +211,14 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         # Check if response length limit is reached
         return self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length
 
-    async def update_from_model_token_ids(self, output: DataProto, **kwargs) -> tuple[ToolAction, bool]:
+    async def update_from_model_token_ids(self, output: TokenOutput, **kwargs) -> tuple[ToolAction, bool]:
         """Update agent data from model token ids output.
 
         Extracts generated token IDs from model output, parses tool calls if present,
         and updates the trajectory with the assistant's response.
 
         Args:
-            output: DataProto containing model-generated token IDs and logprobs
+            output: TokenOutput containing model-generated token IDs and logprobs
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -232,11 +233,16 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         self.update_trajectory_state_from_output(output)
 
-        response_ids = output.non_tensor_batch.pop("raw_response_ids", [None])[0]
-        rollout_logprobs = output.non_tensor_batch.pop("rollout_log_probs", [None])[0]
+        response_ids = output.token_ids
+        rollout_logprobs = output.log_probs
+        routed_experts = output.routed_experts.tolist()
 
         # Update trajectory state with model-generated tokens
-        self.append_assistant_tokens(response_ids, logprobs=rollout_logprobs)
+        self.append_assistant_tokens(
+            response_ids,
+            logprobs=rollout_logprobs,
+            routed_experts=routed_experts,
+        )
 
         # Decode response text and create assistant message
         assistant_content = self.tokenizer.decode(response_ids, skip_special_tokens=True)
@@ -256,10 +262,11 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         # Compute step reward if using step-level reward mode
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
-            output.non_tensor_batch["__num_turns__"] = np.array(
-                [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
-            )
-            self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(output)
+            raise NotImplementedError
+            # output.non_tensor_batch["__num_turns__"] = np.array(
+            #     [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
+            # )
+            # self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(output)
 
         # Check if response length limit is reached
         if self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:

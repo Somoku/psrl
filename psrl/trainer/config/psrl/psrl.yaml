@@ -320,7 +320,7 @@ validate_on_psrl: True
 colocate_validate_and_train: True
 
 # Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
-fuse_rollout_with_validate: False
+fuse_rollout_with_validate: True
 
 # Whether to use torch_memory_saver (TMS) for GPU management
 tms:
@@ -340,3 +340,11 @@ tms:
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
   enable_nixl: True
+
+rollout_gateway:
+
+  # Whether to enable rollout gateway
+  enable: True
+
+  # Max concurrency per instance
+  max_concurrency: 256

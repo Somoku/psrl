@@ -87,7 +87,7 @@ class PSRL_vLLMRollout:
                 self.inference_engine = None
                 return
 
-        model_path = model_config.local_path
+        model_path = model_config.path
         tokenizer = model_config.tokenizer
         model_hf_config = model_config.hf_config
         trust_remote_code = model_config.trust_remote_code

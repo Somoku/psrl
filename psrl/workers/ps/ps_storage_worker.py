@@ -13,7 +13,6 @@ from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
     GLOBAL_PS_CLIENT_NAME,
     NIXLClientType,
-    NIXLInterface,
     NIXLMultiStorageClients,
 )
 
@@ -50,12 +49,10 @@ class PSStorageWorker:
         storage_plan: PSStoragePlan,
         model_config: DictConfig,
         psrl_config: DictConfig,
-        nixl_interface: NIXLInterface,
     ) -> None:
         self.storage_plan = storage_plan
         self.model_config = model_config
         self.psrl_config = psrl_config
-        self.nixl_interface = nixl_interface
         self.train_meta_hf_model: torch.nn.Module | None = None
         self.gen_meta_hf_model: torch.nn.Module | None = None
 
@@ -109,7 +106,8 @@ class PSStorageWorker:
                     NIXLClientType.PS_FOR_PULL,
                 ],
                 nixl_config=self.psrl_config.nixl,
-                nixl_interface=self.nixl_interface,
+                replica_idx=self.get_replica_id(),
+                worker_index=self.rank,
                 # client_group_id=self.get_replica_id()
             )
         else:

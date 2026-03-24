@@ -5,6 +5,9 @@ _target_: psrl.workers.config.RolloutConfig
 # currently we only support vllm
 name: vllm
 
+# sync: LLM, async: AsyncLLM
+mode: async
+
 # Whether to disable the attention
 disable_attn: ${oc.select:psrl.profile.disable_attn,False}
 
@@ -53,11 +56,11 @@ tensor_model_parallel_size: 2
 # DP size for rollout
 data_parallel_size: 1
 
-# PP size for rollout. Not effective for hf and sync mode
-pipeline_model_parallel_size: 1
-
 # EP size for rollout. If EP enabled, EP size should be equal to DP size * TP size
 expert_parallel_size: 1
+
+# PP size for rollout. Not effective for hf and sync mode
+pipeline_model_parallel_size: 1
 
 # max number of tokens in a batch
 max_num_batched_tokens: 8192
@@ -77,7 +80,10 @@ enable_prefix_caching: True
 # The behavior of returned logprobs from rollout engine: raw_logprobs, processed_logprobs
 # raw_logprobs means the values before applying any logit processors, like bad words.
 # processed_logprobs means the values after applying all processors, including temperature and top_k/top_p.
-logprobs_mode: raw_logprobs
+logprobs_mode: processed_logprobs
+
+# scheduling policy for vllm rollout
+scheduling_policy: fcfs
 
 # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
@@ -124,6 +130,9 @@ engine_kwargs:
 
   # sglang engine config
   sglang: {}
+
+  # trtllm engine config
+  trtllm: {}
 
 # Sampling parameters used during validation.
 val_kwargs:
@@ -260,19 +269,31 @@ agent:
   # Trajectory reward calculation mode: step or traj
   traj_reward_mode: traj
 
-# Specifies the tensor bucket size (in megabytes) for batch weight updates during rollout operations.
-# This parameter controls the maximum payload size for a single weight update request.
-# Reference: https://github.com/volcengine/verl/pull/2418
-# Currently only supported in SGLang rollout implementations
-# Larger values may improve throughput but increase memory overhead
-# Detailed performance comparison:
-# https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/issues/169#issuecomment-3070686720
-# Default value (512MB) is optimized for typical GPU memory configurations
-# For the best performance of `rebuild_cuda_tensor`, it is recommended to:
-# 1. Enable `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`
-# 2. Manually set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
-# when using Tensor Parallelism (TP) >= 8.
-update_weights_bucket_megabytes: 512
+# Checkpoint Engine config for update weights from trainer to rollout
+checkpoint_engine:
+
+  # Target class for checkpoint engine config
+  _target_: verl.workers.config.CheckpointEngineConfig
+
+  # Backend for checkpoint engine: naive, nccl, nixl, hccl
+  backend: naive
+
+  # Specifies the tensor bucket size (in megabytes) for batch weight updates during rollout operations.
+  # This parameter controls the maximum payload size for a single weight update request.
+  # Reference: https://github.com/volcengine/verl/pull/2418
+  # Currently only supported in SGLang rollout implementations
+  # Larger values may improve throughput but increase memory overhead
+  # Detailed performance comparison:
+  # https://github.com/zhaochenyang20/Awesome-ML-SYS-Tutorial/issues/169#issuecomment-3070686720
+  # Default value (512MB) is optimized for typical GPU memory configurations
+  # For the best performance of `rebuild_cuda_tensor`, it is recommended to:
+  # 1. Enable `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES`
+  # 2. Manually set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`
+  # when using Tensor Parallelism (TP) >= 8.
+  update_weights_bucket_megabytes: 2048
+
+  # Additional keyword arguments to pass to the checkpoint engine constructor
+  engine_kwargs: {}
 
 # trace rollout data
 trace:
@@ -285,6 +306,12 @@ trace:
 
   # whether translate token id to text in output
   token2text: False
+
+  # Maximum number of unique samples to trace per agent worker per training step.
+  # If null, all samples are traced. If set to N, each agent loop worker will randomly
+  # select N unique samples to trace (including all their rollouts for GRPO).
+  # Total traces per step = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample
+  max_samples_per_step_per_worker: null
 
 # When enabled (True), the trainer will attempt to load previously generated rollout data from the specified directory instead of computing new rollouts.
 # If no cached data is found or loading fails, new rollouts will be generated and automatically saved.
@@ -326,7 +353,39 @@ profiler:
   save_path: ${oc.select:global_profiler.save_path,null}
 
   # specific tool config
-  tool_config: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config,null}
+  tool_config:
+
+    # npu config
+    npu:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.NPUToolConfig
+
+      # Contents to profile, can be empty
+      # options: npu, cpu, memory, shapes, module, stack
+      contents: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config.npu.contents,[]}
+
+      # Collection level, optional values: level_none, level0, level1, level2.
+      level: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config.npu.level,level0}
+
+      # Whether to automatically parse the data.
+      analysis: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config.npu.analysis,false}
+
+      # True for each task has its own database, False for all tasks in one training step share one database.
+      discrete: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config.npu.discrete,false}
+
+    # torch profiler config
+    torch:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+
+      # Contents to profile, can be empty
+      # options: cuda, cpu, memory, shapes, stack
+      contents: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
+
+      # True for each task has its own database, False for all tasks in one training step share one database.
+      discrete: ${oc.select:train_actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
 
 # prometheus configuration for vllm server mode
 prometheus:
@@ -345,3 +404,18 @@ prometheus:
 
   # Specify served_model_name to avoid displaying overly long model paths in Grafana
   served_model_name: ${oc.select:train_actor_rollout_ref.model.path,null}
+
+# type of quantization in vllm, currently support fp8 and torchao
+quantization: null
+
+# extra quantization information serialized in a config file, e.g. torchao_config.json
+quantization_config_file: null
+
+# for huge model, layered summon can save memory (prevent OOM) but make it slower
+layered_summon: False
+
+# MTP configuration, reuse model configuration
+mtp: ${oc.select:train_actor_rollout_ref.model.mtp, null}
+
+# QAT configuration (inherited from actor.qat)
+qat: ${oc.select:train_actor_rollout_ref.actor.qat,null}

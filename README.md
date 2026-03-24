@@ -12,8 +12,17 @@ PSRL is a post-training framework for LLMs that supports both synchronous and as
 - Python 3.10+
 - PyTorch 2.9.0
 - CUDA 12.8
+- Rust and Cargo
 
 ```bash
+# Rust prerequisite installation
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Verify installation
+rustc --version
+cargo --version
+
 # Use conda to manage the environment
 conda create -n psrl python=3.11
 conda activate psrl

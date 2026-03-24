@@ -1,16 +1,30 @@
 import enum
+import threading
 from enum import Enum
+from functools import wraps
 
 import ray
 from omegaconf import DictConfig
 
 from psrl.utils.logger import DualOutputHandler, deprecated, get_ps_logger
 from psrl.utils.server.command import Command, CommandType
+from psrl.workers.gen_dplb.utils import RolloutInstanceId
 from psrl.workers.ps.staleness_controller import EntryInfo
+from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID
 
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
 
+def _state_locked(func):
+    """Protect request metadata maps shared across Ray actor and gRPC threads."""
+
+    @wraps(func)
+    def _wrapped(self, *args, **kwargs):
+        lock = getattr(self, "_state_lock")
+        with lock:
+            return func(self, *args, **kwargs)
+
+    return _wrapped
 
 # NOTE(lhy): This is the status of the requests in the PSRL system.
 # It is different from the RequestStatus in vLLM, which is the status of the requests in the scheduler.
@@ -51,6 +65,7 @@ class RequestStatusTracker:
 
     def __init__(self, psrl_config: DictConfig):
         self.psrl_config = psrl_config
+        self._state_lock = threading.RLock()
         self._request_id_to_status: dict[int, PSRL_RequestStatus] = {}  # Maps request ID to their statuses
         self._request_infos = {}  # Maps request IDs to EntryInfo objects
         # Maps statuses to sets of request IDs for quick access
@@ -89,12 +104,13 @@ class RequestStatusTracker:
         """Set the reference to the reward manager."""
         self.reward_manager = reward_manager
 
+    @_state_locked
     def update_request_status(
         self,
         request_id: list[int] | int,
         status: list[PSRL_RequestStatus] | PSRL_RequestStatus,
         model_version: list[int] | int = -1,
-        rollout_instance_id: list[int] | int = -1,
+        rollout_instance_id: list[RolloutInstanceId] | RolloutInstanceId = INVALID_ROLLOUT_INSTANCE_ID,
         is_validate: bool = False,
     ) -> list[bool] | bool:
         """Update the status of requests.
@@ -107,7 +123,8 @@ class RequestStatusTracker:
             request_id (Union[List[int], int]): The unique identifier(s) of the request(s)
             status (Union[List[PSRL_RequestStatus], PSRL_RequestStatus]): The new status(es) to set
             model_version (int, optional): The model version of the request. Defaults to -1
-            rollout_instance_id (int, optional): The instance ID of the rollout worker. Defaults to -1
+            rollout_instance_id (RolloutInstanceId, optional):
+                The instance ID of the rollout worker. Defaults to (-1, -1)
             is_validate (bool, optional): Whether the request is for validation. Defaults to False
 
         Returns:
@@ -141,7 +158,7 @@ class RequestStatusTracker:
 
             # If the request is stale, we should not update its status
             if req_id in self._request_infos:
-                if rollout_instance_id[i] != -1:
+                if rollout_instance_id[i] != INVALID_ROLLOUT_INSTANCE_ID:
                     self._request_infos[req_id].rollout_instance_id = rollout_instance_id[i]
                 if model_version[i] != -1:
                     self._request_infos[req_id].model_version = model_version[i]
@@ -169,7 +186,7 @@ class RequestStatusTracker:
             else:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
 
-        return request_update_success
+        return request_update_success[0] if len(request_update_success) == 1 else request_update_success
 
     def get_request_status(self, request_id: list[int] | int):
         """Get the current status of requests.
@@ -242,10 +259,11 @@ class RequestStatusTracker:
         """
         return self._status_to_request_ids.get(status, set())
 
+    @_state_locked
     def add_request(
         self,
         request_id: list[int] | int,
-        rollout_instance_id: list[int] | int = -1,
+        rollout_instance_id: list[RolloutInstanceId] | RolloutInstanceId = INVALID_ROLLOUT_INSTANCE_ID,
         model_version: list[int] | int = -1,
         status: (list[PSRL_RequestStatus] | PSRL_RequestStatus) = PSRL_RequestStatus.PENDING,
         is_validate: list[bool] | bool = False,
@@ -255,8 +273,8 @@ class RequestStatusTracker:
 
         Args:
             request_id (Union[List[int], int]): The unique identifier(s) of the request(s).
-            rollout_instance_id (Union[List[int], int], optional):
-                The instance ID(s) of the rollout worker(s). Defaults to -1.
+            rollout_instance_id (Union[List[RolloutInstanceId], RolloutInstanceId], optional):
+                The instance ID(s) of the rollout worker(s). Defaults to (-1, -1).
             model_version (Union[List[int], int], optional):
                 The model version(s) of the request(s). Defaults to -1.
             status (Union[List[PSRL_RequestStatus], PSRL_RequestStatus], optional):
@@ -445,6 +463,7 @@ class RequestStatusTracker:
 
         return classified_requests
 
+    @_state_locked
     def get_recorded_child_requests(self, parent_id: list[int] | int, is_validate: bool = False) -> set[int]:
         """
         Get the recorded child requests for a given parent request ID.
@@ -560,12 +579,12 @@ class RequestStatusTracker:
         assert version >= 0, "Version must be a non-negative integer."
         return {req_id for req_id, info in self._request_infos.items() if info.model_version == version}
 
-    def get_dispatched_requests_of_instance(self, instance_id: int) -> set[int]:
+    def get_dispatched_requests_of_instance(self, instance_id: RolloutInstanceId) -> set[int]:
         """
         Get all dispatched requests associated with a specific rollout instance.
 
         Args:
-            instance_id (int): The ID of the rollout instance to filter requests by.
+            instance_id (RolloutInstanceId): The ID of the rollout instance to filter requests by.
 
         Returns:
             set[int]: A set of requests that are dispatched to the specified instance.

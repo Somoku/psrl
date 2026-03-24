@@ -118,7 +118,7 @@ ENV/
 .vscode
 
 # Mac
-.DS_Store
+*.DS_Store
 
 # vim
 *.swp
@@ -129,6 +129,8 @@ ENV/
 # data
 *.parquet
 
+# rust
+target/
 
 # local logs
 logs
@@ -137,4 +139,3 @@ outputs
 
 
 models/
-data/

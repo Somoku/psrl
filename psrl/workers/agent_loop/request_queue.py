@@ -3,7 +3,8 @@ from collections.abc import Callable, Iterator
 from enum import Enum
 
 from sortedcontainers import SortedDict
-from verl import DataProto
+
+from psrl.workers.gen_dplb.utils import TokenInput
 
 
 class RequestSortIndicator(Enum):
@@ -27,65 +28,50 @@ class RequestSortIndicator(Enum):
         raise ValueError(f"{value!r} is not a valid {cls.__name__}")
 
 
-def get_priority_by_version(request: DataProto, staleness: int) -> int:
+def get_priority_by_version(request: TokenInput) -> int:
     """Get the priority value for a request based on version tag.
 
     Args:
-        request (DataProto): The request to get priority for.
-        staleness (int): The staleness tolerance for version.
+        request (TokenInput): The request to get priority for.
 
     Returns:
         int: Priority value (lower is higher priority).
     """
-    assert len(request) == 1, "Request must be a single request"
-    if "version_tag" in request.non_tensor_batch:
-        if request.non_tensor_batch["version_tag"][0] == -1:
-            # Means that the request is not allocated a version tag yet
-            # (new request that is not routed yet when enabled dynamic version tag)
-            # It should have the lowest priority
-            return float("inf")
-        return request.non_tensor_batch["version_tag"][0]
-    elif "min_version_limit" in request.non_tensor_batch:
-        return request.non_tensor_batch["min_version_limit"][0] - staleness
-    else:
-        raise AssertionError("Request must have either 'version_tag' or 'min_version_limit'")
+    version_tag = request.version_tag
+    if version_tag == -1:
+        return float("inf")
+    return version_tag
 
 
 def get_priority_by_version_and_token_num(
-    request: DataProto, staleness: int, short_request_first: bool = False
+    request: TokenInput, short_request_first: bool = False
 ) -> tuple[int, int, int]:
     """Get the priority value for a request based on version tag and token number.
 
     Args:
-        request (DataProto): The request to get priority for.
-        staleness (int): The staleness tolerance for version.
+        request (TokenInput): The request to get priority for.
         short_request_first (bool): Whether to prioritize short requests.
 
     Returns:
         Tuple[int, int, int]: Priority value (lower is higher priority).
     """
     # Prioritize validation requests than training requests
-    is_validate = request.meta_info.get("validate", False)
-    validate_priority = not is_validate
-    version_priority = get_priority_by_version(request, staleness)
-    assert "raw_prompt_ids" in request.non_tensor_batch, "raw_prompt_ids is required in non_tensor_batch"
-    prompt_token_num = len(request.non_tensor_batch["raw_prompt_ids"][0])
-    if "response_unpadded_len" in request.non_tensor_batch:
-        response_token_num = request.non_tensor_batch["response_unpadded_len"][0]
-    else:
-        response_token_num = 0
+    validate_priority = not request.is_validate
+    version_priority = get_priority_by_version(request)
+    input_ids = request.input_ids
+    input_token_num = len(input_ids)
     if short_request_first:
-        token_num_priority = prompt_token_num + response_token_num
+        token_num_priority = input_token_num
     else:
-        token_num_priority = -(prompt_token_num + response_token_num)
+        token_num_priority = -input_token_num
     return (validate_priority, version_priority, token_num_priority)
 
 
-def get_priority_by_version_and_id(request: DataProto, staleness: int) -> tuple[int, int, int]:
+def get_priority_by_version_and_id(request: TokenInput) -> tuple[int, int, int]:
     """Get the priority value for a request based on version tag and ID."""
-    is_validate = request.meta_info.get("validate", False)
+    is_validate = request.is_validate
     validate_priority = not is_validate
-    version_priority = get_priority_by_version(request, staleness)
+    version_priority = get_priority_by_version(request)
     id_priority = request.non_tensor_batch["uid"][0]
     return (validate_priority, version_priority, id_priority)
 
@@ -104,40 +90,40 @@ class PriorityRequestQueue:
         self._request_sort_indicator = request_sort_indicator
         self._counter = 0  # To ensure FIFO for same priority items
 
-    def put(self, request: DataProto) -> None:
+    def put(self, request: TokenInput) -> None:
         """Put a request into the priority queue.
 
         Args:
             request (DataProto): The request to enqueue.
         """
         if self._request_sort_indicator == RequestSortIndicator.SHORT_LENGTH:
-            priority = get_priority_by_version_and_token_num(request, self._staleness, True)
+            priority = get_priority_by_version_and_token_num(request, True)
         elif self._request_sort_indicator == RequestSortIndicator.LONG_LENGTH:
-            priority = get_priority_by_version_and_token_num(request, self._staleness, False)
+            priority = get_priority_by_version_and_token_num(request, False)
         elif self._request_sort_indicator == RequestSortIndicator.SMALL_ID:
-            priority = get_priority_by_version_and_id(request, self._staleness)
+            priority = get_priority_by_version_and_id(request)
         else:
             raise ValueError(f"Invalid sort indicator: {self._request_sort_indicator}")
         # Use counter to maintain FIFO order for items with same priority
         heapq.heappush(self._queue, (priority, self._counter, request))
         self._counter += 1
 
-    def pop(self) -> DataProto | None:
+    def pop(self) -> TokenInput | None:
         """Pop the highest priority request from the queue.
 
         Returns:
-            Optional[DataProto]: The highest priority request, or None if queue is empty.
+            Optional[TokenInput]: The highest priority request, or None if queue is empty.
         """
         if self._queue:
             _, _, request = heapq.heappop(self._queue)
             return request
         return None
 
-    def peek(self) -> DataProto | None:
+    def peek(self) -> TokenInput | None:
         """Peek at the highest priority request without removing it.
 
         Returns:
-            Optional[DataProto]: The highest priority request, or None if queue is empty.
+            Optional[TokenInput]: The highest priority request, or None if queue is empty.
         """
         if self._queue:
             _, _, request = self._queue[0]
@@ -160,12 +146,11 @@ class PriorityRequestQueue:
         """
         return len(self._queue)
 
-    def iter_priority(self) -> Iterator[DataProto]:
+    def iter_priority(self) -> Iterator[TokenInput]:
         """Iterate over all requests in priority order (highest priority first).
 
         Yields:
-            DataProto: Requests in priority order.
-
+            TokenInput: Requests in priority order.
         Example:
             for request in queue.iter_priority():
                 print(request)
@@ -178,17 +163,17 @@ class PriorityRequestQueue:
             yield request
 
     def filter_by_condition(
-        self, condition: Callable[[DataProto], bool], guarantee_order: bool = True
-    ) -> list[DataProto]:
+        self, condition: Callable[[TokenInput], bool], guarantee_order: bool = True
+    ) -> list[TokenInput]:
         """Filter requests by a condition and return them sorted by priority.
 
         Args:
-            condition (Callable[[DataProto], bool]): A function that takes a request
+            condition (Callable[[TokenInput], bool]): A function that takes a request
                 and returns True if it should be included in the result.
             guarantee_order (bool): Whether to guarantee the order of the filtered requests.
 
         Returns:
-            List[DataProto]: Filtered requests sorted by priority (highest priority first).
+            List[TokenInput]: Filtered requests sorted by priority (highest priority first).
 
         Example:
             # Filter requests with version_tag == 5
@@ -220,14 +205,14 @@ class MultiPriorityRequestQueue:
     def __init__(
         self,
         staleness: int,
-        queue_selector: Callable[[DataProto, int], int] = get_priority_by_version,
+        queue_selector: Callable[[TokenInput], int] = get_priority_by_version,
         request_sort_indicator: RequestSortIndicator = RequestSortIndicator.SMALL_ID,
     ) -> None:
         """Initialize the multi-priority queue.
 
         Args:
             staleness (int): The staleness tolerance for version comparison.
-            queue_selector (Callable[[DataProto, int], int]): A function that takes a request and staleness
+            queue_selector (Callable[[TokenInput], int]): A function that takes a request
                 and returns the queue ID (int) to which the request should be routed.
             request_sort_indicator (RequestSortIndicator): The sort indicator for the priority queue.
         """
@@ -236,16 +221,16 @@ class MultiPriorityRequestQueue:
         self._request_sort_indicator = request_sort_indicator
         self._queues = SortedDict(lambda x: x)
 
-    def put(self, request: DataProto) -> None:
+    def put(self, request: TokenInput) -> None:
         """Put a request into the appropriate priority queue.
 
         The queue is selected based on the queue_selector function. If the selected
         queue doesn't exist, it will be created automatically.
 
         Args:
-            request (DataProto): The request to enqueue.
+            request (TokenInput): The request to enqueue.
         """
-        queue_id = self._queue_selector(request, self._staleness)
+        queue_id = self._queue_selector(request)
         if queue_id not in self._queues:
             self._queues[queue_id] = PriorityRequestQueue(self._staleness, self._request_sort_indicator)
         self._queues[queue_id].put(request)
@@ -304,7 +289,7 @@ class MultiPriorityRequestQueue:
         """
         yield from self._queues.items()
 
-    def iter_all_requests(self, queue_order: list[int] | None = None) -> Iterator[tuple[int, DataProto]]:
+    def iter_all_requests(self, queue_order: list[int] | None = None) -> Iterator[tuple[int, TokenInput]]:
         """Iterate over all requests from all queues.
 
         Args:
@@ -313,7 +298,7 @@ class MultiPriorityRequestQueue:
                 arbitrary order.
 
         Yields:
-            Tuple[int, DataProto]: (queue_id, request) pairs.
+            Tuple[int, TokenInput]: (queue_id, request) pairs.
 
         Example:
             for queue_id, request in multi_queue.iter_all_requests():
@@ -328,7 +313,7 @@ class MultiPriorityRequestQueue:
                 for request in queue.iter_priority():
                     yield (queue_id, request)
 
-    def iter_requests_by_queue(self, queue_id: int) -> Iterator[DataProto]:
+    def iter_requests_by_queue(self, queue_id: int) -> Iterator[TokenInput]:
         """Iterate over all requests in a specific queue in priority order.
 
         Args:
@@ -397,11 +382,11 @@ class MultiPriorityRequestQueue:
             if queue.empty():
                 self.remove_queue(queue_id)
 
-    def filter_by_condition(self, condition: Callable[[DataProto], bool]) -> list[DataProto]:
+    def filter_by_condition(self, condition: Callable[[TokenInput], bool]) -> list[TokenInput]:
         """Filter requests by a condition and return them sorted by priority.
 
         Args:
-            condition (Callable[[DataProto], bool]): A function that takes a request
+            condition (Callable[[TokenInput], bool]): A function that takes a request
                 and returns True if it should be included in the result.
         """
         return [request for _, request in self.iter_all_requests() if condition(request)]

@@ -63,7 +63,7 @@ class DataProcessor:
         self._val_sample_idx = 0
 
         if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from psrl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
             self.collate_fn = default_collate_fn
         else:

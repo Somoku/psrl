@@ -64,9 +64,9 @@ class ResourcePoolManager:
 
         self._check_resource_available()
 
-    def get_resource_pool(self, role: PSRL_Role, instance_id: int = 0) -> RayResourcePool:
-        """Get the resource pool of the worker_cls for the given instance_id."""
-        return self.resource_pool_dict[self.mapping[role][instance_id]]
+    def get_resource_pool(self, role: PSRL_Role, replica_idx: int = 0) -> RayResourcePool:
+        """Get the resource pool of the worker_cls for the given replica_idx."""
+        return self.resource_pool_dict[self.mapping[role][replica_idx]]
 
     def get_n_gpus(self) -> int:
         """Get the number of gpus in this cluster."""
@@ -267,10 +267,19 @@ def PSRL_compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["parent_id"]
         elif "uid" in data.non_tensor_batch:  # optional
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
-        else:
-            pass
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # Add sum_pi_squared for Optimal Token Baseline
+        if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
+            # Check if sum_pi_squared is available
+            assert "sum_pi_squared" in data.batch, (
+                "Step-dependent optimal baseline requires sum_pi_squared from actor. "
+                "Please set actor.calculate_sum_pi_squared=True in config."
+            )
+            adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+            # Get pre-computed rollout IS weights if available
+            rollout_is_weights = data.batch.get("rollout_is_weights", None)
+            adv_kwargs["rollout_is_weights"] = rollout_is_weights
 
         # calculate advantage estimator
         advantages, returns = adv_estimator_fn(**adv_kwargs)

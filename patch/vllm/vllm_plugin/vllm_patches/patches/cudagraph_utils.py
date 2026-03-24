@@ -19,12 +19,12 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.12.0")
+@min_vllm_version("0.14.0")
 class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
     """
     Replace `torch.cuda.graph()` with `torch_memory_saver.cuda_graph()`
 
-    Compatible with vLLM 0.12.0+
+    Compatible with vLLM 0.14.0+
     """
 
     def capture_graph(
@@ -38,7 +38,10 @@ class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
     ) -> None:
         num_reqs = min(num_tokens, self.max_num_reqs)
         input_ids = input_buffers.input_ids[:num_tokens]
-        positions = input_buffers.positions[:num_tokens]
+        if not self.uses_mrope:
+            positions = input_buffers.positions[:num_tokens]
+        else:
+            positions = input_buffers.mrope_positions[:, :num_tokens]
         attn_metadata = prepare_inputs_to_capture(
             num_reqs,
             num_tokens,

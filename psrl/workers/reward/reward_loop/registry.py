@@ -5,7 +5,6 @@ from functools import partial
 from typing import Any
 
 from omegaconf import DictConfig
-from verl.trainer.ppo.reward import get_custom_reward_fn
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
@@ -78,6 +77,8 @@ def load_reward_loop_manager(
     Returns:
         `(RewardLoopManagerBase)`: The reward loop manager instance.
     """
+    from psrl.trainer.ppo.reward import get_custom_reward_fn
+
     # Try to get a custom reward function based on the configuration
     # user defined reward manager can be registered in custom_reward_fn
     compute_score = get_custom_reward_fn(config)

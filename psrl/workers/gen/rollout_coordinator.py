@@ -194,6 +194,7 @@ class RolloutCoordinator(CommandExtension):
         wg_idx_range = range(self.rollout_wg_size, self.gen_wg_size) if tag == "validate" else range(wg_size)
         instance_to_max_model_len = {i: max(max_model_lens[j]) for i, j in zip(wg_idx_range, range(wg_size))}
         # Use the max model len to budget the kv cache size for each instance
+        # TODO(linsh): refactor it
         await self.rollout_router.init_route_strategy.remote(instance_to_max_model_len=instance_to_max_model_len)
 
     async def init_nixl_client(self):

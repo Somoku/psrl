@@ -4,7 +4,6 @@ import os
 import numpy as np
 from verl import DataProto
 
-from psrl.workers.agent_loop.gateway_client import RolloutGatewayClient
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
 
@@ -26,29 +25,37 @@ class GenerateAgentLoop(AgentLoopBase):
             Tuple[DataProto, TerminateReason]:
                 Generated response with metadata and termination reason.
         """
-        if self.config.psrl.server_rollout.enable:
-            gateway_client = RolloutGatewayClient.from_config(self.config)
-            output = await gateway_client.generate_async(request)
-        else:
-            output = await self.rollout_router.generate_async.remote(request)
+        # psrl_logger.info(f"Before running request with id = {request.non_tensor_batch['uid'][0]}")
+        output = await self.generate_sequence(request)
+        # psrl_logger.info(f"After running request with id = {request.non_tensor_batch['uid'][0]} with output = {output}")
         if output is not None:
-            response_ids = output.non_tensor_batch["raw_response_ids"][0]
+            response_ids = output.token_ids
             response_ids = response_ids[: self.response_length]
             response_mask = [1] * len(response_ids)
-            output.non_tensor_batch["raw_response_ids"] = np.array([response_ids])
-            output.non_tensor_batch["response_mask"] = np.array([response_mask])
-            output.non_tensor_batch["__num_turns__"] = np.array([2])
-            if "rollout_log_probs" in output.non_tensor_batch:
-                rollout_log_probs = output.non_tensor_batch["rollout_log_probs"][0]
+            interrupted = output.interrupted
+            interrupted_by_scheduler = output.interrupted_by_scheduler
+            rollout_instance_id = output.rollout_instance_id
+            request.non_tensor_batch["raw_response_ids"] = np.array([response_ids])
+            request.non_tensor_batch["response_mask"] = np.array([response_mask])
+            request.non_tensor_batch["__num_turns__"] = np.array([2])
+            request.non_tensor_batch["interrupted"] = np.array([interrupted])
+            request.non_tensor_batch["interrupted_by_scheduler"] = np.array([interrupted_by_scheduler])
+            request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id])
+            if output.log_probs is not None:
+                rollout_log_probs = output.log_probs
                 rollout_log_probs = rollout_log_probs[: self.response_length]
-                output.non_tensor_batch["rollout_log_probs"] = np.array([rollout_log_probs])
+                request.non_tensor_batch["rollout_log_probs"] = np.array([rollout_log_probs], dtype=object)
+            if output.routed_experts is not None:
+                routed_experts = output.routed_experts
+                request.non_tensor_batch["routed_experts"] = np.array([routed_experts], dtype=object)
         else:
             # Indicate that the request is aborted
             return None, TerminateReason.UNKNOWN
 
-        reward_input = output
+        reward_input = request
         reward_result = await self.reward_manager.compute_score.remote(reward_input)
         if not self.config.reward_model.launch_reward_fn_async:
-            output = self._post_process_and_merge_reward(reward_result, output)
+            output = self._post_process_and_merge_reward(reward_result, request)
+        # psrl_logger.info(f"output of {request.non_tensor_batch['uid'][0]} = {output}")
 
         return output, TerminateReason.FINISHED

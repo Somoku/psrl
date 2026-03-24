@@ -89,7 +89,7 @@ class PSRL_AgentLoopManager:
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
 
-        self._request_counter = 0  # For version tag setting
+        self._request_counter = -1  # For version tag setting
 
         self._dispatch_idx = 0
         self._val_buffer_id = 0
@@ -144,20 +144,6 @@ class PSRL_AgentLoopManager:
         self._batch_keys = None
         self._non_tensor_batch_keys = None
         self._meta_info_keys = None
-
-        if self.config.psrl.server_rollout.enable:
-            # Get server addresses from rollout gateway
-            response = requests.get(f"{rollout_gateway_url}/list_workers")
-            response.raise_for_status()
-            engines = response.json().get("engines", {})
-            server_addresses = [addr for addr in engines.values()]
-            rollout_config = self.config.gen_actor_rollout_ref.rollout
-
-            # Update Prometheus configuration with server addresses
-            if rollout_config.prometheus.enable:
-                if rollout_config.disable_log_stats:
-                    raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
-                update_prometheus_config(rollout_config.prometheus, server_addresses)
 
         # Build logger
         self.log_prefix = "AgentLoopManager"
@@ -450,7 +436,7 @@ class PSRL_AgentLoopManager:
         """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_train_dispatch_task:
             if not self.train_data_queue.empty():
-                data = await self.train_data_queue.get_nowait()
+                data = self.train_data_queue.get_nowait()
             else:
                 await asyncio.sleep(0)
                 continue
@@ -458,7 +444,7 @@ class PSRL_AgentLoopManager:
             # Receive END signal to stop processing data queue
             if data is None:
                 psrl_logger.info("Received END signal, stopping agent loop manager train dispatch task.")
-                self.stop_dispatch_task = True
+                self.stop_train_dispatch_task = True
                 continue
 
             if not self._data_keys_initialized:
@@ -477,7 +463,7 @@ class PSRL_AgentLoopManager:
 
             batch_size = len(data)
             self._request_counter += batch_size
-            psrl_logger.debug(f"Got {len(data)} requests from data queue")
+            # psrl_logger.info(f"Got {len(data)} requests from data queue with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, total request count: {self._request_counter}")
 
             # Wait for version update in ps
             # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
@@ -492,8 +478,8 @@ class PSRL_AgentLoopManager:
                 self.curr_ps_version_tag = expected_ps_version
                 psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
 
-                # Initialize the version tag to -1 for all requests
-                data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
+            # Initialize the version tag to -1 for all requests
+            data.non_tensor_batch["version_tag"] = np.array([-1] * batch_size, dtype=int)
 
             # Dispatch data to agent loop workers
             await self._inner_dispatch_data(data, is_validate)
@@ -544,7 +530,7 @@ class PSRL_AgentLoopManager:
         Args:
             data (DataProto | None): Data to be retried. If None, the new data from the data queue will be used.
         """
-        if self.running_loop and not self.stop_dispatch_task:
+        if self.running_loop and not self.stop_train_dispatch_task:
             # If data is None, the new data from the data queue will be used.
             if data is None:
                 if not self.train_data_queue.empty():
@@ -588,6 +574,7 @@ class PSRL_AgentLoopManager:
             is_validate (bool): Whether the data is for validation.
         """
 
+        # psrl_logger.info(f"Dispatching {len(data)} requests to agent loop workers with request_id: {data.non_tensor_batch.get('uid', 'N/A')}")
         # Update request status from PENDING to RUNNING
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
@@ -596,20 +583,23 @@ class PSRL_AgentLoopManager:
             model_version=data.non_tensor_batch["version_tag"].tolist(),
             is_validate=is_validate,
         )
-        dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-        if not dispatch_request_idxs:
+        # psrl_logger.info(f"Updated request status to RUNNING for {len(data)} requests with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, success: {update_status_success}")
+        if not update_status_success:
             return
 
-        dispatch_data = data.select_idxs(dispatch_request_idxs)
-        dispatch_plan = self.get_dispatch_plan(dispatch_data)
+        dispatch_plan = self.get_dispatch_plan(data)
 
         for worker_index, worker_data in dispatch_plan.items():
             if not worker_data:
                 continue
 
             # Dispatch data to the corresponding worker
+            # psrl_logger.info(f"Dispatching {len(worker_data)} requests to worker {worker_index} with request_id: {worker_data.non_tensor_batch.get('uid', 'N/A')}")
+            tasks = []
             for i in range(rollout_n):
-                self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i : i + 1])
+                tasks.append(self.agent_loop_workers[worker_index].add_agent_program.remote(worker_data[i : i + 1]))
+            await asyncio.gather(*tasks)
+            # psrl_logger.info(f"Dispatched {len(worker_data)} requests to worker {worker_index} with request_id: {worker_data.non_tensor_batch.get('uid', 'N/A')}")
 
     def get_dispatch_plan(self, data: DataProto) -> dict[int, DataProto]:
         """Create a dispatch plan for distributing data across workers.
@@ -704,7 +694,7 @@ class PSRL_AgentLoopManager:
                     if sample_id not in self.rollout_request_tracker:
                         self.rollout_request_tracker[sample_id] = []
                     entry_info = EntryInfo(
-                        rollout_instance_id=int(request_data.non_tensor_batch["rollout_instance_id"][i]),
+                        rollout_instance_id=request_data.non_tensor_batch["rollout_instance_id"][i],
                         request_idx=int(request_data.non_tensor_batch["uid"][i]) % rollout_n,
                         prompt_id=int(request_data.non_tensor_batch["parent_id"][i]),
                         model_version=request_data.non_tensor_batch["version_tag"][i],
@@ -882,7 +872,7 @@ class PSRL_AgentLoopManager:
                 add_buffer = self.maybe_add_buffer(buffer_id, data_buffer, is_validate)
                 if add_buffer:
                     psrl_logger.info(f"Buffer {buffer_id} is READY with {len(data_buffer)} entries.")
-                    await self.handle_ready_buffer(buffer_id)
+                    await self.handle_ready_buffer(buffer_id, is_validate)
                     self.remove_buffer_from_data_pool(prompt_entry_infos)
                     accumulated_buffers.pop(buffer_id)
                     accumulated_buffer_size.pop(buffer_id)
@@ -1082,9 +1072,10 @@ class PSRL_AgentLoopManager:
         self.log_ready_buffer(buffer_id, is_validate)
 
         psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
-        aborted_request_ids = await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id, is_validate)
-        if aborted_request_ids:
-            self.remove_from_data_pool(aborted_request_ids)
+        if not is_validate:
+            aborted_request_ids = await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id)
+            if aborted_request_ids:
+                self.remove_from_data_pool(aborted_request_ids)
 
         if is_validate:
             min_ready_buffer_id = list(self.val_data_buffers.keys())[0]
@@ -1274,19 +1265,12 @@ class PSRL_AgentLoopManager:
             data (DataProto): Data to be dispatched for validation sequence generation.
         """
         batch_size = len(data) // self.val_rollout_n
-        if self.config.psrl.gen_mode == "stream":
-            for i in range(batch_size):
-                await self.ps_manager_handle.add_request.remote(
-                    data.non_tensor_batch["uid"][i * self.val_rollout_n : (i + 1) * self.val_rollout_n].tolist(),
-                    is_validate=True,
-                )
-                await self.put_data(data[i * self.val_rollout_n : (i + 1) * self.val_rollout_n], is_validate=True)
-        else:
+        for i in range(batch_size):
             await self.ps_manager_handle.add_request.remote(
-                data.non_tensor_batch["uid"].tolist(),
+                data.non_tensor_batch["uid"][i * self.val_rollout_n : (i + 1) * self.val_rollout_n].tolist(),
                 is_validate=True,
             )
-            await self.put_data(data, is_validate=True)
+            await self.put_data(data[i * self.val_rollout_n : (i + 1) * self.val_rollout_n], is_validate=True)
         self._val_buffer_id += 1
 
         return self._val_buffer_id - 1

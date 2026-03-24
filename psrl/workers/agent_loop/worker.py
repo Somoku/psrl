@@ -13,6 +13,8 @@ from verl import DataProto
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.rollout.utils import get_max_position_embeddings
 
 from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.dataset.utils import _pre_process_inputs
@@ -20,6 +22,7 @@ from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig, TerminateReason
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
+from psrl.workers.config.model import HFModelConfig
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -33,8 +36,7 @@ class PSRL_AgentLoopWorker:
         self,
         config: DictConfig,
         ps_manager_handle,
-        rollout_router,
-        rollout_wg_list,
+        rollout_router: ray.actor.ActorHandle | str,
     ):
         """Initialize agent loop worker.
 
@@ -42,10 +44,24 @@ class PSRL_AgentLoopWorker:
             config (DictConfig): Configuration containing model and rollout settings.
             ps_manager_handle: Handle to the parameter server manager.
             rollout_router: Handle to the rollout router actor.
-            rollout_wg_list: List of rollout worker groups.
             rollout_queue: Queue for storing completed rollout results.
         """
         self.config = config
+        self.model_config = omega_conf_to_dataclass(
+            self.config.train_actor_rollout_ref.model,
+            dataclass_type=HFModelConfig,
+        )
+        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
+        if self.config.gen_actor_rollout_ref.rollout.max_model_len is None:
+            self.config.gen_actor_rollout_ref.rollout.max_model_len = max_position_embeddings
+        else:
+            if self.config.gen_actor_rollout_ref.rollout.max_model_len > max_position_embeddings:
+                raise ValueError(
+                    f"max_model_len ({self.config.gen_actor_rollout_ref.rollout.max_model_len}) "
+                    f"should be less than or equal to "
+                    f"max_position_embeddings ({max_position_embeddings})"
+                )
+        
         model_path = config.gen_actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.gen_actor_rollout_ref.model.path)
@@ -54,9 +70,18 @@ class PSRL_AgentLoopWorker:
 
         self.rollout_router = rollout_router
         self.ps_manager_handle = ps_manager_handle
-        self.rollout_wg_list = rollout_wg_list
         self.agent_loop_manager = None
         self.reward_manager = None
+        
+        n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
+        n_validate_instances = (
+            self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
+        )
+
+        init_http_client(
+            server_concurrency=self.config.psrl.rollout_gateway.max_concurrency,
+            rollout_engine_num=n_rollout_instances + n_validate_instances,
+        )
 
         self.agent_programs = set()
         self.pending_program_queue = deque()
@@ -80,13 +105,6 @@ class PSRL_AgentLoopWorker:
             trace_config.get("backend"),
             trace_config.get("token2text", False),
         )
-
-        if self.config.psrl.server_rollout.enable:
-            # Initialize HTTP client
-            init_http_client(
-                server_concurrency=self.config.psrl.server_rollout.server_concurrency,
-                rollout_engine_num=len(self.rollout_wg_list),
-            )
 
         # Build logger
         # TODO(lhy): support >1 workers
@@ -116,11 +134,7 @@ class PSRL_AgentLoopWorker:
             data (DataProto or None): Data to process, or None to signal termination.
         """
         if isinstance(data, DataProto):
-            # Prioritize retry requests
-            if "min_version_limit" in data.non_tensor_batch:
-                self.pending_program_queue.appendleft(data)
-            else:
-                self.pending_program_queue.append(data)
+            self.pending_program_queue.append(data)
         elif data is None:
             self.pending_program_queue.append(None)
         else:
@@ -132,28 +146,30 @@ class PSRL_AgentLoopWorker:
             return
 
         # Start the background task to process data
+        self.stop_busy_loop_task = False
         self.running_loop = asyncio.get_running_loop()
         self.busy_loop_task = self.running_loop.create_task(self._launch_agent_loop())
         self.busy_loop_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
-    def stop_busy_loop(self):
+    async def stop_busy_loop(self):
         """Stop the busy loop and wait for the current task to complete."""
         if not self.busy_loop_task or self.busy_loop_task.done():
             return
 
         self.stop_busy_loop_task = True
         # Wait for the background task to finish
-        self.running_loop.run_until_complete(self.busy_loop_task)
+        await asyncio.gather(self.busy_loop_task)
 
     async def _launch_agent_loop(self):
         """Main loop that processes agent programs from the pending queue."""
         while not self.stop_busy_loop_task:
             if len(self.pending_program_queue) > 0:
                 program = self.pending_program_queue.popleft()
+                # psrl_logger.info(f"Processing program: {program.non_tensor_batch['uid'].tolist()[0]}")
                 if program is None:
                     self.stop_busy_loop_task = True
                     continue
-                await self.generate_trajectories(program)
+                await self.generate_trajectory(program)
             await asyncio.sleep(0)
 
     def _create_task_done_callback(self, task):
@@ -169,28 +185,24 @@ class PSRL_AgentLoopWorker:
 
         return task_done_callback
 
-    async def generate_trajectories(self, batch: DataProto) -> DataProto:
+    async def generate_trajectory(self, request: DataProto) -> DataProto:
         """Generate trajectories using the specified agent type based on configuration.
 
         This method only create the task (agent_loop) and add the task to the agent_programs set.
         But the task is not await here so different agent_loop can be run in parallel.
 
         Args:
-            batch (DataProto): Input batch containing prompts and metadata.
+            request (DataProto): Input request containing prompts and metadata.
 
         Returns:
             DataProto: Generated trajectories and associated data.
         """
         # by default, we assume it's a generation-only agent
         default_agent_name = "generate_only_agent"
+        assert len(request) == 1, "Only support single request for generation"
+        agent_name = request.non_tensor_batch.pop("agent_name", [default_agent_name])[0]
 
-        agent_names = batch.non_tensor_batch.pop(
-            "agent_name", np.array([default_agent_name] * len(batch), dtype=object)
-        )
-        assert np.all(agent_names == agent_names[0]), "All agent names must be the same for generation-only agents."
-        agent_name = agent_names[0]
-
-        task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
+        task = asyncio.create_task(self._run_agent_loop(agent_name, request))
         task.add_done_callback(self._create_task_done_callback(task))
         self.agent_programs.add(task)
 
@@ -310,9 +322,7 @@ class PSRL_AgentLoopWorker:
                     level=logging.DEBUG,
                     event_type=EventType.OTHER,
                 ):
-                    dispatch_request_idxs = [i for i, success in enumerate(update_status_success) if success]
-                    if dispatch_request_idxs:
-                        output = output.select_idxs(dispatch_request_idxs)
+                    if update_status_success:
                         # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into
                         # the result queue, so we process the data inside the reward manager
                         # output = self._post_process(output)

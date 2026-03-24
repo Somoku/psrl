@@ -8,7 +8,6 @@ import ray
 import torch.distributed as dist
 from omegaconf import DictConfig
 
-from psrl.utils.nixl import GLOBAL_META_SERVER_NAME, GLOBAL_PS_CLIENT_NAME, NIXLInterface
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -31,14 +30,12 @@ class PSRL_BaseTrainWorker:
         worker_world_size: int,
         psrl_config: DictConfig,
         train_interface: TrainInterface,
-        nixl_interface: NIXLInterface,
     ):
         # Basic debug
         self.worker_rank = worker_rank
         self.worker_world_size = worker_world_size
         self.psrl_config = psrl_config
         self.train_interface = train_interface
-        self.nixl_interface = nixl_interface
         # NIXL
         self.node_id = None
         self.nixl_storage_client = None
@@ -311,15 +308,6 @@ class PSRL_BaseTrainWorker:
             self.wait_for_nixl_push_completion()
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-
-    def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict[str, int]):
-        """
-        Update local NIXL info to the PS workers on the same node with this train worker.
-        """
-        node_id = self.get_node_id()
-        dst_ps_worker_idx = ps_worker_node_id_to_idxs[node_id]
-        dst_agent_names = [f"{GLOBAL_PS_CLIENT_NAME}_{dst_ps_worker_idx}", GLOBAL_META_SERVER_NAME]
-        self.nixl_storage_client.send_local_info_to(dst_agent_names)
 
     def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
         """

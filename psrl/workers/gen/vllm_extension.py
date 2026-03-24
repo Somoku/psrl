@@ -29,7 +29,6 @@ from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
     GLOBAL_PS_CLIENT_NAME,
     NIXLClientType,
-    NIXLInterface,
     NIXLStorageClient,
 )
 
@@ -161,15 +160,9 @@ class vLLMWorkerExtension:
     def init_nixl_client(
         self,
         nixl_config: DictConfig,
-        nixl_interface_after_rpc: dict | NIXLInterface,
         instance_id: int,
         logging_path: str | None = None,
     ):
-        # Reconstruct the nixl_interface (the RPC call serializes the nixl_interface to a dict)
-        if isinstance(nixl_interface_after_rpc, dict):
-            nixl_interface = NIXLInterface(port_scanner=nixl_interface_after_rpc["port_scanner"])
-        else:
-            nixl_interface = nixl_interface_after_rpc
         # NIXL attributes
         self.unified_state_dict = None
         self.unified_sharding_dict = None
@@ -180,7 +173,8 @@ class vLLMWorkerExtension:
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=nixl_config,
-            nixl_interface=nixl_interface,
+            replica_idx=instance_id,
+            worker_index=self.get_instance_local_rank(),
             # client_group_id=instance_id,
             logging_path=logging_path,
         )

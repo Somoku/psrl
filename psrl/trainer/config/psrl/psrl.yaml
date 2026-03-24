@@ -121,6 +121,16 @@ status_collection:
   # Here 10 means sync every 0.01 second
   coordinator_sync_interval_in_ms: 10
 
+  # Stats recorder config
+  stats_recorder:
+
+    # Whether to enable periodic per-replica JSONL stats dump.
+    # When enabled, writes one file per (replica_id, dp_rank) to psrl.logging_path.
+    enable: False
+
+    # Snapshot interval in seconds
+    interval_in_s: 5.0
+
 # Redundant rollout config
 redundant_rollout:
 

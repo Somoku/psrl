@@ -98,10 +98,12 @@ class RolloutCoordinator(CommandExtension):
         self.sync_task = None
         self.process_status_queue_task = None
         self.sync_status_to_router_task = None
+        self.stats_recorder_task = None
         self.stop_command_handler = False
         self.stop_sync_and_migrate = False
         self.stop_process_status_queue = False
         self.stop_sync_status_to_router = False
+        self.stop_stats_recorder = False
 
         # Asyncio event loop order control
         self._is_init_nixl_client = asyncio.Event()
@@ -125,6 +127,20 @@ class RolloutCoordinator(CommandExtension):
         self.log_prefix = "RolloutCoordinator"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info("Initialized RolloutCoordinator")
+
+        # Stats recorder (opt-in)
+        self._stats_recorder = None
+        if self.config.psrl.status_collection.stats_recorder.enable:
+            from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+
+            self._stats_recorder = StatsRecorder(
+                self.config.psrl,
+                os.path.expanduser(self.config.psrl.logging_path),
+            )
+            self._stats_recorder.write_config(
+                routing_strategy=self.config.psrl.routing_strategy.method,
+                partial_rollout=self.config.psrl.partial_rollout.enable,
+            )
 
     def add_worker(
         self,
@@ -337,6 +353,11 @@ class RolloutCoordinator(CommandExtension):
                 "Rollout migration is only supported when partial rollout is enabled"
             )
 
+        # Start the stats recorder loop (opt-in)
+        if self.config.psrl.status_collection.stats_recorder.enable:
+            self.stats_recorder_task = self.running_loop.create_task(self._stats_recorder_loop())
+            self.stats_recorder_task.add_done_callback(lambda f: f.result())
+
     async def stop_busy_loop(self):
         """
         Stop all background tasks and clean up resources.
@@ -344,6 +365,7 @@ class RolloutCoordinator(CommandExtension):
         This method gracefully shuts down:
         - Command handler task
         - Engine status sync task
+        - Stats recorder task (if enabled)
         """
         if self.command_handler_task is None or self.command_handler_task.done():
             return
@@ -353,6 +375,7 @@ class RolloutCoordinator(CommandExtension):
         self.stop_sync_and_migrate = True
         self.stop_sync_status_to_router = True
         self.stop_process_status_queue = True
+        self.stop_stats_recorder = True
 
         psrl_logger.info("Before waiting for all background tasks")
         await self.command_handler_task
@@ -365,18 +388,11 @@ class RolloutCoordinator(CommandExtension):
         if self.sync_task is not None:
             await self.sync_task
             psrl_logger.info("Finished sync task.")
-        """
-        tasks_to_wait = [self.command_handler_task]
-        if self.sync_task is not None:
-            tasks_to_wait.append(self.sync_task)
-        if self.process_status_queue_task is not None:
-            tasks_to_wait.append(self.process_status_queue_task)
-        if self.sync_status_to_router_task is not None:
-            tasks_to_wait.append(self.sync_status_to_router_task)
-
-        # Wait for tasks to finish with timeout
-        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
-        """
+        if self.stats_recorder_task is not None:
+            await self.stats_recorder_task
+            psrl_logger.info("Finished stats recorder task.")
+        if self._stats_recorder is not None:
+            self._stats_recorder.close()
         psrl_logger.info("All background tasks have been stopped.")
         self.status_queue.close()
         if self.gateway_client is not None and not self.gateway_client.closed:
@@ -583,6 +599,16 @@ class RolloutCoordinator(CommandExtension):
             else:
                 await self.rollout_router.update_instance_status.remote(self.instance_to_engine_status)
         psrl_logger.info("Stopped syncing engine status to router.")
+
+    async def _stats_recorder_loop(self):
+        """Periodically snapshot per-replica stats to JSONL files."""
+        psrl_logger.info("Starting stats recorder loop")
+        interval = self.config.psrl.status_collection.stats_recorder.interval_in_s
+        while not self.stop_stats_recorder:
+            await asyncio.sleep(interval)
+            if not self.stop_stats_recorder:
+                self._stats_recorder.record(self.instance_to_engine_status)
+        psrl_logger.info("Stopped stats recorder loop.")
 
     async def _is_routing(self) -> bool:
         """Check if any agent loop worker is currently routing requests

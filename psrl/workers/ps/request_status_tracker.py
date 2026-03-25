@@ -37,7 +37,8 @@ class PSRL_RequestStatus(Enum):
     ROLLOUT_ROUTING: Request is in the router and is waiting for a specific instance to be dispatched
     ROLLOUT_DISPATCHED: Request is dispatched to the instance engine
     ROLLOUT_RUNNING: Request is in the instance engine and is being rolled out
-    ROLLOUT_INTERRUPTED: Rollout was interrupted by the user for Partial Rollout, put into replay buffer
+    ROLLOUT_INTERRUPTED: Rollout was interrupted (by coordinator for Partial Rollout, or by
+        scheduler via KV cache preemption), put into replay buffer
     REWARD_RUNNING: Request is running in the reward manager
     REWARD_COMPLETED: Request is completed in the reward manager
     COMPLETED: Request is completed (generic completed state)
@@ -49,7 +50,6 @@ class PSRL_RequestStatus(Enum):
     ROLLOUT_DISPATCHED = enum.auto()
     ROLLOUT_RUNNING = enum.auto()
     ROLLOUT_INTERRUPTED = enum.auto()
-    ROLLOUT_INTERRUPTED_BY_SCHEDULER = enum.auto()
     ROLLOUT_COMPLETED = enum.auto()
     REWARD_RUNNING = enum.auto()
     REWARD_COMPLETED = enum.auto()

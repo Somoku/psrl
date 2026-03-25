@@ -762,23 +762,9 @@ class RolloutRouter:
 
             # Check if request was interrupted and needs to be requeued
             update_status = output.update_status
-            if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
+            if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
                 psrl_logger.debug(
-                    f"Request {request.request_id} on instance {instance_id} was interrupted "
-                    "by scheduler (most likely due to kv cache full and preemption), requeueing"
-                )
-                # Put back in priority queue for partial rollout
-                # Ensure that the consolidated output has the rollout instance id recorded
-                output.rollout_instance_id = instance_id
-                self._store_partial_rollout_output(request, output)
-                updated_input = self._update_request_input(request, output)
-                self.requests_to_route.put(updated_input)
-                # No result to set since the request is not completed
-                return
-            elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
-                psrl_logger.debug(
-                    f"Request {request.request_id} on instance {instance_id} was interrupted "
-                    "(due to model synchronization when enabled partial rollout), requeueing"
+                    f"Request {request.request_id} on instance {instance_id} was interrupted, requeueing"
                 )
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded

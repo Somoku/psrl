@@ -971,18 +971,12 @@ class PSRL_GenWorker(Worker):
             result = self.rollout.post_process_outputs(request, vllm_output)
 
             interrupted = result.non_tensor_batch["interrupted"][0]
-            interrupted_by_scheduler = result.non_tensor_batch["interrupted_by_scheduler"][0]
 
-            # Update the request status to ROLLOUT_INTERRUPTED_BY_SCHEDULER or ROLLOUT_INTERRUPTED or RUNNING,
-            if interrupted_by_scheduler:
-                update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER
-                # psrl_logger.info(f"Request {request_ids[0]} is interrupted by scheduler (preemption)")
-            elif interrupted:
+            # Update the request status to ROLLOUT_INTERRUPTED or ROLLOUT_COMPLETED
+            if interrupted:
                 update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
-                # psrl_logger.info(f"Request {request_ids[0]} is interrupted (partial rollout)")
             else:
                 update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
-                # psrl_logger.info(f"Request {request_ids[0]} is completed (finished generation)")
             update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
                 request_ids.tolist(),
                 update_status,

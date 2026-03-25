@@ -32,7 +32,6 @@ class EngineStats:
             "total_elapsed_time": 0.0,
             "elapsed_time_since_last_record": 0.0,
             "scheduler_stats": {
-                "need_to_abort_reqs": None,
                 "req_id_to_prompt_token_num": {},
                 "req_id_to_response_token_num": {},
                 "num_running_reqs": 0,
@@ -104,8 +103,6 @@ class DPLBStatCollector(StatLoggerBase):
         self.last_dump_to_file_time = None
         self.last_push_to_queue_time = None
         self.output_queue = None
-        self.scheduler_abort_queue = None
-        self._scheduler_abort_seq = 0
 
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
@@ -138,18 +135,6 @@ class DPLBStatCollector(StatLoggerBase):
             output_queue: Ray queue for sending status updates to coordinator
         """
         self.output_queue = output_queue
-
-    def init_scheduler_abort_queue(self, scheduler_abort_queue):
-        """
-        Initialize the scheduler abort queue for receiving abort requests.
-
-        Args:
-            scheduler_abort_queue: queue for receiving abort requests
-        """
-        self.scheduler_abort_queue = scheduler_abort_queue
-
-    def get_scheduler_abort_seq(self) -> int:
-        return self._scheduler_abort_seq
 
     def record_model_version_update(self, model_version: int, engine_index: int):
         """
@@ -205,9 +190,6 @@ class DPLBStatCollector(StatLoggerBase):
 
         if scheduler_stats is not None:
             scheduler_stats = {
-                "need_to_abort_reqs": scheduler_stats.need_to_abort_reqs
-                if scheduler_stats.need_to_abort_reqs
-                else None,
                 "req_id_to_prompt_token_num": scheduler_stats.req_id_to_prompt_token_num
                 if scheduler_stats.req_id_to_prompt_token_num
                 else {},
@@ -220,7 +202,6 @@ class DPLBStatCollector(StatLoggerBase):
             }
         else:
             scheduler_stats = {
-                "need_to_abort_reqs": None,
                 "req_id_to_prompt_token_num": {},
                 "req_id_to_response_token_num": {},
                 "num_running_reqs": 0,
@@ -307,13 +288,6 @@ class DPLBStatCollector(StatLoggerBase):
                 )
             )
             self.last_push_to_queue_time = curr_time
-
-        # Put abort requests to the abort queue if any
-        if self.scheduler_abort_queue is not None and snapshot["scheduler_stats"]["need_to_abort_reqs"] is not None:
-            self._scheduler_abort_seq += 1
-            self.scheduler_abort_queue.put_nowait(
-                (self._scheduler_abort_seq, snapshot["scheduler_stats"]["need_to_abort_reqs"])
-            )
 
     def log_engine_initialized(self):
         """

@@ -15,6 +15,7 @@ import ray
 import vllm.entrypoints.cli.serve
 import vllm.entrypoints.grpc_server
 from ray.actor import ActorHandle
+from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 from verl.single_controller.ray import RayWorkerGroup
@@ -22,7 +23,6 @@ from verl.utils.device import get_resource_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.profiler import build_vllm_profiler_args
-from verl.utils.ray_utils import get_event_loop
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
@@ -61,7 +61,7 @@ from psrl.utils.logger import (
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.gen_dplb.stats_collector import DPLBStatCollector
 from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
-from psrl.workers.gen_dplb.zmq_queue import ZMQPullQueue, ZMQPushQueue
+from psrl.workers.gen_dplb.zmq_queue import ZMQPushQueue
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 get_encoding()
@@ -385,9 +385,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # NOTE(linsh): setup rollout scheduler for PSRL
         args["scheduler_cls"] = "psrl.workers.gen_dplb.rollout_scheduler.RolloutScheduler"
-        max_num_waiting_reqs_after_preemption = self.psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption
         args["additional_config"] = {
-            "max_num_waiting_reqs_after_preemption": max_num_waiting_reqs_after_preemption,
             "max_model_len_used_in_estimation": self.config.max_model_len
             * self.psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
         }
@@ -417,13 +415,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self._master_sock.close()
             await self.run_server(server_args)
 
-            # NOTE(linsh): start abort processor task for PSRL
-            loop = get_event_loop()
-            self._scheduler_abort_processor_task = loop.create_task(self._scheduler_abort_processor_loop())
-            self._scheduler_abort_processor_task.add_done_callback(
-                lambda f: f.result()
-            )  # To avoid silent error in async tasks
-
             self.log_prefix = f"vLLMHTTPServer_Replica{self.get_replica_idx()}"
             psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized on {get_worker_info()}.")
@@ -437,6 +428,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        # NOTE(linsh): wire preemption_notification_threshold into SchedulerConfig for PSRL.
+        # This replaces the old additional_config["max_num_waiting_reqs_after_preemption"] mechanism
+        # and enables gateway_preemption_req_ids in SchedulerStats, consumed by PSRLPreemptionStatLogger.
+        vllm_config.scheduler_config.preemption_notification_threshold = (
+            self.psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption
+        )
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -445,17 +442,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        # NOTE(linsh): use scheduler abort queue for global scheduling in PSRL
-        # Initialize abort queue, events, and request ids for async mode
-        scheduler_abort_endpoint = f"inproc://scheduler-abort-{self.get_replica_idx()}-{os.getpid()}"
-        self.scheduler_abort_queue = ZMQPullQueue(endpoint=scheduler_abort_endpoint)
-        self.scheduler_abort_push_queue = ZMQPushQueue(endpoint=scheduler_abort_endpoint, drop_on_full=False)
-        self.scheduler_abort_requests = set()
-        self._scheduler_abort_processed_seq = 0
-        self._scheduler_abort_progress_event = asyncio.Event()
-        self._scheduler_abort_processor_task = None
-
         # NOTE(linsh): enable custom stat collection for PSRL
+        self.preemption_queue: asyncio.Queue = asyncio.Queue()
+        self.psrl_preemption_logger = PreemptionStatLogger(
+            vllm_config,
+            engine_index=0,
+            preemption_queue=self.preemption_queue,
+        )
         if not self.config.disable_log_stats and self.psrl_config.status_collection.enable:
             self.stat_collector = DPLBStatCollector(
                 vllm_config,
@@ -465,10 +458,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self.stat_collector.begin_record()
             self.status_queue = ZMQPushQueue(self.gen_interface.status_endpoint)
             self.stat_collector.init_output_queue(self.status_queue)
-            self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_push_queue)
             for data_parallel_rank in range(self.config.data_parallel_size):
                 self.stat_collector.record_model_version_update(0, data_parallel_rank)
-            kwargs["stat_loggers"] = [self.stat_collector]
+            kwargs["stat_loggers"] = [self.stat_collector, self.psrl_preemption_logger]
+        else:
+            kwargs["stat_loggers"] = [self.psrl_preemption_logger]
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
@@ -529,7 +523,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         import grpc
 
         start_time = _time.time()
-        servicer = VllmEngineServicer(engine_client, start_time)
+        servicer = VllmEngineServicer(engine_client, start_time, preemption_queue=self.preemption_queue)
 
         server = grpc.aio.server(
             options=[
@@ -843,12 +837,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        # Ensure all abort requests in the queue are processed before starting generation
-        # NOTE(lhy): currently, only the preempted requests are put into the abort queue.
-        # Other requests are aborted (e.g., partial rollout) directly by the scheduler.
-        if self.scheduler_abort_queue is not None:
-            await self._wait_for_all_scheduler_abort_requests_processed()
-
         #### Generation ####
 
         generator = self.engine.generate(
@@ -883,7 +871,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # Determine stop reason from finish_reason
         interrupted = False
-        interrupted_by_scheduler = False
         finish_reason = final_res.outputs[0].finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
@@ -893,27 +880,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         else:
             stop_reason = finish_reason  # for more stop reason in the future
 
-        if request_id in self.scheduler_abort_requests:
-            assert interrupted, "Requests interrupted by the scheduler should also have finish_reason 'abort'."
-            interrupted_by_scheduler = True
-            self.scheduler_abort_requests.discard(request_id)
-        else:
-            psrl_logger.info(
-                f"Request {request_id} is not interrupted by the scheduler (not in {self.scheduler_abort_requests}). "
-                f"It is interrupted by the synchronization (i.e., partial rollout)."
-            )
-            interrupted_by_scheduler = False
-
         # Update the request status
-        if interrupted_by_scheduler:
-            update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER
-            # psrl_logger.info(f"Request {request_id} is interrupted by scheduler (preemption)")
-        elif interrupted:
+        if interrupted:
             update_status = PSRL_RequestStatus.ROLLOUT_INTERRUPTED
-            # psrl_logger.info(f"Request {request_id} is interrupted (partial rollout)")
         else:
             update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
-            # psrl_logger.info(f"Request {request_id} is completed (finished generation)")
 
         update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
             request_id,
@@ -938,53 +909,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             interrupted=interrupted,
-            interrupted_by_scheduler=interrupted_by_scheduler,
             update_status=update_status,
         )
-
-    ###### Scheduler Abort Processing Loop ######
-
-    async def _scheduler_abort_processor_loop(self):
-        """Background loop that processes abort requests from the queue."""
-        while True:
-            # Wait for first abort request using blocking receive.
-            first_msg = await self.scheduler_abort_queue.get_async(block=True)
-            if first_msg is None:  # Sentinel value to stop the loop
-                break
-
-            first_seq, first_request_ids = first_msg
-            processed_seq = first_seq
-            merged_request_ids = set(first_request_ids)
-
-            # Drain pending abort requests and coalesce.
-            while True:
-                next_msg = await self.scheduler_abort_queue.get_async(block=False)
-                if next_msg is None:
-                    break
-                next_seq, next_request_ids = next_msg
-                processed_seq = max(processed_seq, next_seq)
-                merged_request_ids.update(next_request_ids)
-
-            # Mark interrupted-by-scheduler requests.
-            request_ids = list(merged_request_ids)
-            self.scheduler_abort_requests.update(request_ids)
-
-            # Process the abort request
-            await self.engine.abort(request_ids)
-
-            # Advance processed sequence and wake waiters.
-            self._scheduler_abort_processed_seq = max(self._scheduler_abort_processed_seq, processed_seq)
-            self._scheduler_abort_progress_event.set()
-
-    async def _wait_for_all_scheduler_abort_requests_processed(self):
-        """Wait until the abort queue is empty and all pending abort requests are processed."""
-        if self.scheduler_abort_queue is None or self.stat_collector is None:
-            return
-
-        target_seq = self.stat_collector.get_scheduler_abort_seq()
-        while self._scheduler_abort_processed_seq < target_seq:
-            await self._scheduler_abort_progress_event.wait()
-            self._scheduler_abort_progress_event.clear()
 
     ###### NIXL Integration ######
 

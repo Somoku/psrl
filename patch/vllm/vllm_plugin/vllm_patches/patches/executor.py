@@ -10,12 +10,12 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.14.0")
+@min_vllm_version("0.18.0")
 class TMSExecutorPatch(vLLMPatch[Executor]):
     """
     Add graph sleep support in TMS.
 
-    Compatible with vLLM 0.14.0+
+    Compatible with vLLM 0.18.0+
     """
 
     def sleep(self, level: int = 1):

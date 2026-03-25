@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-0}
 project_name=psrl_example
-experiment_name=DAPO-Qwen2.5-0.5B-megatron-staleness_${staleness}
+experiment_name=DAPO-Qwen2.5-3B-megatron-staleness_${staleness}
 fix_weight=${2:-False}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -11,21 +11,21 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct
-DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-0.5B-Instruct
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-3B-Instruct
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
-TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
-TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
+TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
+TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
 
 GEN_DP=1
-GEN_TP=2 # TP in the generation side
+GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 VAL_DP=1
-VAL_TP=2 # TP in the training side for validation
+VAL_TP=1 # TP in the training side for validation
 VAL_PP=1
 
-TRAIN_TP=2 # TP in the training side 
+TRAIN_TP=1 # TP in the training side 
 TRAIN_PP=1 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 TRAIN_EP=1 # EP in the training side
@@ -52,9 +52,9 @@ use_kl_loss=False
 kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-max_prompt_length=$((1024 * 2))
-max_response_length=$((1024 * 2))
-packing_length=$((1024 * 4))
+max_prompt_length=$((1024 * 1))
+max_response_length=$((1024 * 4))
+packing_length=$((1024 * 10))
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 2))
 overlong_penalty_factor=1.0
@@ -63,11 +63,11 @@ train_prompt_bsz=64
 redundant_train_prompt_bsz=64
 n_resp_per_prompt=8
 redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=64
+train_prompt_mini_bsz=16
 
 # Algorithm
 temperature=1
-top_p=0.6
+top_p=1
 top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
 val_top_p=0.7
 filter_groups_metric=acc
@@ -109,30 +109,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
     psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=False \
+    psrl.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.method="throughput_optimal" \
-    psrl.routing_strategy.candidate_sort_indicator=reserve_capability \
-    psrl.routing_strategy.enable_multi_priority_queue=True \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_7b.json \
-    psrl.routing_strategy.delta_throughput_threshold=0.2 \
-    psrl.routing_strategy.request_budget=1024 \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=512 \
-    \
-    psrl.sync_and_mig_strategy.method="status_based" \
-    psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
-    psrl.sync_and_mig_strategy.sync.threshold=0.6 \
-    psrl.sync_and_mig_strategy.sync.check_req_before_sync=False \
-    psrl.sync_and_mig_strategy.mig.enable=False \
-    psrl.sync_and_mig_strategy.mig.indicator="throughput" \
-    psrl.sync_and_mig_strategy.mig.threshold=5 \
-    psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
-    psrl.sync_and_mig_strategy.mig.stop_threshold=10 \
-    \
-    psrl.proactive_filter_strategy.method="retry" \
-    psrl.proactive_filter_strategy.threshold=4 \
+    psrl.status_collection.stats_recorder.enable=True \
+    psrl.status_collection.stats_recorder.interval_in_s=3.0 \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
@@ -215,8 +195,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.val_before_train=False \
-    trainer.test_freq=200 \
+    trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=10 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
 

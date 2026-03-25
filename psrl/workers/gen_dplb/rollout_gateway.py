@@ -161,7 +161,7 @@ class RolloutGateway:
             prometheus_port=find_available_port(base_port=4000),
             request_timeout_secs=2**64 - 1,  # u64::MAX — effectively unlimited
             # log / auth / tls
-            log_level="info",
+            log_level="warn",
             log_dir=self.config.psrl.logging_path,
             api_key=None,
             disable_health_check=True,

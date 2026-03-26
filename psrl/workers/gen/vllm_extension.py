@@ -24,6 +24,7 @@ from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
 from psrl.utils.nixl import (
     GLOBAL_GEN_CLIENT_NAME,
     GLOBAL_META_SERVER_NAME,
@@ -189,9 +190,15 @@ class vLLMWorkerExtension:
         vllm_model = self.model_runner.model
         if isinstance(vllm_model, CUDAGraphWrapper):
             vllm_model = vllm_model.unwrap()
-        param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
+        param_mapping = (
+            None
+            if isinstance(vllm_model, SupportsWeightLayoutSpec)
+            else create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
+        )
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
-            param_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
+            vllm_model,
+            tp_rank=self.get_instance_local_tp_rank(),
+            parameter_mapping=param_mapping,
         )
 
     def nixl_protocol(self, config: DictConfig, mode: str = "full"):

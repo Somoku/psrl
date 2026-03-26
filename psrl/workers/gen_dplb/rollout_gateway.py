@@ -155,6 +155,9 @@ class RolloutGateway:
                 self._cfg_get("psrl.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
             ),
             psrl_mig_enable=bool(self._cfg_get("psrl.sync_and_mig_strategy.mig.enable", False)),
+            # tito
+            enable_tito=True,
+            tito_max_entries_per_session=-1,
             # service discovery
             service_discovery=False,
             # observability / request

@@ -48,6 +48,7 @@ nixl:
   server_ip: ${network.listen_ip}
   server_port: ${network.listen_port}
   max_pinned_temp_memory_slots: 4
+  enable_tms_for_temp_buffers: False # TMS (torch_memory_saver) is not used in unit tests
 
 # PS configuration
 ps:

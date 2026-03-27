@@ -81,6 +81,9 @@ class ResourcePoolManager:
         }
 
         # check total required gpus can be satisfied
+        # Use a small epsilon to avoid false failure from float precision (e.g. 64.0 vs 64.00000000000004)
+        # when resource_num_per_bundle has floats like 0.9/0.1; real shortages (e.g. 64.9) still fail.
+        _GPU_EPS = 1e-9
         total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
             [
@@ -89,7 +92,7 @@ class ResourcePoolManager:
                 for n_gpus in process_on_nodes
             ]
         )
-        if total_available_gpus < total_required_gpus:
+        if total_available_gpus < total_required_gpus - _GPU_EPS:
             raise ValueError(
                 f"Total available GPUs {total_available_gpus} is less than total desired GPUs {total_required_gpus}"
             )

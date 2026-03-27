@@ -904,17 +904,9 @@ class PSManager(RequestStatusTracker):
 
         Args:
             expected_agents (int): Number of expected NIXL clients to connect
-
-        Raises:
-            ValueError: If server_mode is invalid or deprecated
         """
         self.expected_agents = expected_agents
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
 
     def nixl_protocol(self):
         """Execute the NIXL protocol for distributed communication setup.
@@ -996,6 +988,11 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_agent_names = ray.get(ps_nixl_agent_name_futures)
         self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
         self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
+        psrl_logger.info(
+            f"PS worker group initialized with NIXL agent names: {self.ps_nixl_agent_names}, "
+            f"train storage client names: {self.ps_nixl_train_storage_client_names}, "
+            f"gen storage client names: {self.ps_nixl_gen_storage_client_names}"
+        )
 
     def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:
         """Get the PS worker handle by the client name."""

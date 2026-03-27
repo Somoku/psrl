@@ -36,7 +36,6 @@ class PSRL_AgentLoopManager:
         data_queue_size: int,
         agent_loop_workers,
         ps_manager_handle,
-        rollout_gateway_url,
         group_post_process_fn=None,
         buffer_post_process_fn=None,
     ):
@@ -460,7 +459,6 @@ class PSRL_AgentLoopManager:
             assert not is_validate, "Training data must have validate=False in meta_info"
 
             batch_size = len(data)
-            self._request_counter += batch_size
             # psrl_logger.info(f"Got {len(data)} requests from data queue with request_id: {data.non_tensor_batch.get('uid', 'N/A')}, total request count: {self._request_counter}")  # noqa: E501
 
             # Wait for version update in ps
@@ -481,6 +479,9 @@ class PSRL_AgentLoopManager:
 
             # Dispatch data to agent loop workers
             await self._inner_dispatch_data(data, is_validate)
+            # Increment counter after dispatch so _get_expected_ps_version reflects the number
+            # of requests that have actually been sent out.
+            self._request_counter += batch_size
             await asyncio.sleep(0)  # Yield control to the event loop
 
     async def _val_dispatch_data(self):
@@ -1103,6 +1104,8 @@ class PSRL_AgentLoopManager:
     async def handle_waiting_buffer(self, buffer_id: int):
         """Handle the waiting buffer."""
         # WIP(lhy): Implement the retry and truncate strategy
+        if self.config.psrl.proactive_filter_strategy.method is None:
+            return
         if self.config.psrl.proactive_filter_strategy.method == "retry":
             gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
             if gap == 0:

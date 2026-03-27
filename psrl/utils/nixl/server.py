@@ -2,8 +2,6 @@ import logging
 import os
 import pickle
 import time
-from copy import deepcopy
-
 import torch
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
@@ -21,91 +19,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
-@deprecated("Use NIXLMetaServer instead")
-class NIXLStorageServer:
-    """
-    NIXL initiator (server): holds the state dict, registers tensors, and notifies all clients with its descs.
-    """
-
-    def __init__(self, server_name: str, server_ip: str, server_port: int = 23456, cuda: int = -1):
-        self.server_name = server_name
-        self.server_ip = server_ip
-        self.server_port = server_port
-        self.cuda = cuda
-        self.state_dict: dict[str, torch.Tensor] = {}
-        self.tensor_infos: dict[str, NIXLTensorInfo] = {}
-        self.agent = nixl_agent(self.server_name, nixl_agent_config(True, True, self.server_port))
-        self.client_infos: set[str] = set()
-        self._init_device()
-
-    def _init_device(self):
-        if self.cuda >= 0:
-            torch.set_default_device(f"cuda:{self.cuda}")
-        else:
-            torch.set_default_device("cpu")
-
-    def register_state_dict(self, state_dict: dict[str, torch.Tensor]):
-        """
-        Register each tensor in the state_dict with NIXL. Build key->desc mapping.
-        """
-        self.state_dict = state_dict
-        for key, tensor in state_dict.items():
-            desc = self.agent.register_memory([tensor])
-            if not desc:
-                raise RuntimeError(f"Memory registration failed for key {key}.")
-            desc_bytes = self.agent.get_serialized_descs(desc)
-            self.tensor_infos[key] = NIXLTensorInfo(
-                desc_bytes_list=[desc_bytes],
-                shard_dim=-1,
-                shard_mesh=1,
-                shard_indices=[0],
-            )
-
-    def wait_for_client_infos(self, expected_clients: int = 1, timeout: float = 600.0):
-        """
-        Wait for all clients to connect and synchronize metadata.
-        """
-        start = time.time()
-        while len(self.client_infos) < expected_clients:
-            notifs = self.agent.get_new_notifs()
-            for client_name in notifs:
-                self.client_infos.add(client_name)
-            if time.time() - start > timeout:
-                raise TimeoutError("Timeout waiting for clients.")
-            time.sleep(0.1)
-
-    def get_serialized_descs(self) -> dict[str, bytes]:
-        """
-        Return a dict mapping key to serialized desc for all tensors.
-        """
-        return {k: info.desc for k, info in self.tensor_infos.items()}
-
-    def notify_all_client_infos(self):
-        """
-        Notify all connected clients with the server's infos.
-        """
-        # Use ClientInfo to serialize
-        for client in self.client_infos:
-            info = NIXLClientInfo(
-                name=self.server_name,
-                type=NIXLClientType.PS,
-                tensor_infos=self.tensor_infos,
-                meta=self.agent.get_agent_metadata(),
-            )
-            self.agent.send_notif(client, info.serialize())
-
-    def shutdown(self):
-        [self.agent.remove_remote_agent(client) for client in self.client_infos]
-        self.agent.invalidate_local_metadata(self.server_ip, self.server_port)
-        for info in self.tensor_infos.values():
-            self.agent.deregister_memory(info.get_desc(self.agent, 0))
-
-
 class NIXLMetaServer:
-    """
-    NIXL meta server: only stores client meta and desc info, not state dict.
-    """
-
     def __init__(self, server_name: str, nixl_config: DictConfig):
         self.server_name = server_name
         self.server_ip = nixl_config.server_ip
@@ -158,7 +72,7 @@ class NIXLMetaServer:
                         continue
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for agents.")
-            time.sleep(0.1)
+            time.sleep(0.01)
         self._is_all_client_shardings_recved = True
         psrl_logger.info(
             f"All {len(self.client_sharding_dicts)} clients of {expected_agents} agents "
@@ -190,7 +104,7 @@ class NIXLMetaServer:
                         continue
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for agents.")
-            time.sleep(0.1)
+            time.sleep(0.01)
         self._is_all_client_infos_recved = True
         psrl_logger.info(
             f"All {len(self.client_infos)} clients of {expected_agents} agents "
@@ -223,7 +137,7 @@ class NIXLMetaServer:
                         continue
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for agents temp mappings.")
-            time.sleep(0.1)
+            time.sleep(0.01)
         self._is_all_temp_mappings_recved = True
         psrl_logger.info(
             f"All {len(self._client_temp_mappings)} clients of {expected_agents} agents "
@@ -236,10 +150,12 @@ class NIXLMetaServer:
         """
         assert self._is_all_client_shardings_recved, "Not all clients sent sharding yet."
         assert not self.client_unified_sharding_dicts, "Unified sharding already made."
+        _t_start = time.time()
         # We first need to guarantee that all client shardings have the same keys
         all_keys = set()
         for client_name, sharding_dict in self.client_sharding_dicts.items():
             all_keys.update(sharding_dict.keys())
+        _t_keys = time.time()
         # Then we can make the unified sharding for each client
         # That is, for each key, we need to find the new representation
         # of (shard_dim, shard_mesh, shard_indices) for the mutual slice of all clients
@@ -256,10 +172,16 @@ class NIXLMetaServer:
             for client_name, sharding_dict in self.client_sharding_dicts.items():
                 if client_name not in self.client_unified_sharding_dicts:
                     self.client_unified_sharding_dicts[client_name] = {}
-                self.client_unified_sharding_dicts[client_name][key] = deepcopy(sharding_dict[key])
-                self.client_unified_sharding_dicts[client_name][key].refactor_based_on_finer_shard_mesh(
-                    finest_shard_mesh
-                )
+                # NOTE(claude): mutate in-place — client_sharding_dicts is never read after
+                # make_unified_sharding, so deepcopy is unnecessary.
+                sharding_dict[key].refactor_based_on_finer_shard_mesh(finest_shard_mesh)
+                self.client_unified_sharding_dicts[client_name][key] = sharding_dict[key]
+        psrl_logger.info(
+            f"[timing] make_unified_sharding done: total={time.time() - _t_start:.3f}s, "
+            f"collect_keys={_t_keys - _t_start:.3f}s, "
+            f"refactor={time.time() - _t_keys:.3f}s, "
+            f"n_clients={len(self.client_sharding_dicts)}, n_keys={len(all_keys)}"
+        )
 
     def make_comm_plan(self):
         """
@@ -289,23 +211,63 @@ class NIXLMetaServer:
                 client_sharding_dicts[client_name] = sharding_dict
             self.agent.send_notif(agent_name, pickle.dumps(client_sharding_dicts))
 
+    def _get_relevant_client_names_for_agent(self, agent_name: str) -> set[str]:
+        """
+        Return the names of clients that a given agent actually needs to communicate with.
+        Used to filter the client_infos broadcast so that each agent only receives the entries
+        it needs rather than the full set of all registered clients.
+
+        Only the initiating side needs the remote descriptors, so the rules are:
+          - PUSH_SIDE needs: all PS_FOR_PUSH (train pushes to PS)
+          - PULL_SIDE needs: all PS_FOR_PULL (gen pulls from PS)
+          - PS clients do not initiate transfers and need no remote infos beyond their own.
+        """
+        my_clients: set[str] = set(self.connected_clients[agent_name])
+        relevant: set[str] = set(my_clients)  # always include own clients
+
+        # Determine which types this agent's clients have.
+        my_types: set[NIXLClientType] = {
+            self.client_infos[c].type for c in my_clients if c in self.client_infos
+        }
+
+        # Initiating side → counterpart type mapping.
+        type_needs: dict[NIXLClientType, NIXLClientType] = {
+            NIXLClientType.PUSH_SIDE: NIXLClientType.PS_FOR_PUSH,
+            NIXLClientType.PULL_SIDE: NIXLClientType.PS_FOR_PULL,
+        }
+        needed_types: set[NIXLClientType] = {
+            dst for src, dst in type_needs.items() if src in my_types
+        }
+
+        for client_name, client_info in self.client_infos.items():
+            if client_info.type in needed_types:
+                relevant.add(client_name)
+
+        return relevant
+
     def notify_all_client_infos_and_comm_plan(self):
         """
-        Notify all connected clients with all client infos and optional comm plan.
+        Notify all connected agents with relevant client infos and the comm plan.
+
+        Each agent only receives the client infos it actually communicates with according
+        to the comm plan, rather than the full set of all registered clients.
         """
         assert self._is_all_client_infos_recved, "Not all clients sent client infos yet."
         assert self.comm_plan, "Communication plan not made yet."
-        # Prepare notification data
-        notification_data = {
-            "client_infos": {
-                client_name: self.client_infos[client_name].serialize() for client_name in self.client_infos
-            },
-            "comm_plan": self.comm_plan.serialize() if self.comm_plan else None,
+
+        # Serialize each client info exactly once up front (avoid repeated serialization per agent)
+        all_serialized: dict[str, bytes] = {
+            name: info.serialize() for name, info in self.client_infos.items()
         }
-        payload = pickle.dumps(notification_data)
+        comm_plan_bytes: bytes | None = self.comm_plan.serialize() if self.comm_plan else None
 
         for agent_name in self.connected_clients:
-            # Send notification with client infos and optional comm plan
+            # Filter to only the client infos this agent actually needs
+            relevant = self._get_relevant_client_names_for_agent(agent_name)
+            payload = pickle.dumps({
+                "client_infos": {n: all_serialized[n] for n in relevant if n in all_serialized},
+                "comm_plan": comm_plan_bytes,
+            })
             self.agent.send_notif(agent_name, payload)
 
     def notify_all_client_temp_mappings(self):
@@ -339,13 +301,14 @@ class NIXLMetaServer:
                             client_info = NIXLClientInfo.deserialize(info)
                             self.client_infos[client_name] = client_info
                             self._client_temp_mappings[client_name] = client_temp_mapping
+                            self._add_client(agent_name, client_name)
                             already_recved_agents.add(agent_name)
                     except Exception as e:
                         psrl_logger.error(f"Failed to parse updated client infos from agent {agent_name}: {e}")
                         raise
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for agents.")
-            time.sleep(0.1)
+            time.sleep(0.01)
 
         psrl_logger.info(
             f"{self.server_name}: Successfully received all {len(already_recved_agents)}/{expected_agents} "

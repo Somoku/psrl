@@ -3,6 +3,7 @@ import os
 
 import torch
 
+from .memory_logger import get_all_gpu_memory_info
 
 def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
     # Log environment variables
@@ -40,6 +41,9 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
         psrl_logger.log(level, f"torch.cuda.current_device() failed: {e}")
         cur_dev = None
 
+    # Per-device memory info (shared with memory_logger)
+    device_infos = get_all_gpu_memory_info(unit="MB")
+
     # For each device: print properties and memory usage
     for i in range(dev_count):
         # Device properties
@@ -53,27 +57,16 @@ def log_env_info(psrl_logger: logging.Logger, level: int = logging.INFO):
         except Exception as e:
             psrl_logger.log(level, f"Device {i}: get_device_properties failed: {e}")
 
-        # Memory allocated and reserved by PyTorch
-        try:
-            allocated = torch.cuda.memory_allocated(i)
-            reserved = torch.cuda.memory_reserved(i)
-            psrl_logger.log(
-                level,
-                f"Device {i}: memory_allocated={allocated / 1024**2:.2f} MB, "
-                f"memory_reserved={reserved / 1024**2:.2f} MB",
-            )
-        except Exception as e:
-            psrl_logger.log(level, f"Device {i}: memory usage query failed: {e}")
-
-        # Free & total memory from CUDA context (cudaMemGetInfo equivalent)
-        try:
-            free_mem, total_mem = torch.cuda.mem_get_info(i)
-            psrl_logger.log(
-                level,
-                f"Device {i}: mem_get_info: free={free_mem / 1024**2:.2f} MB, total={total_mem / 1024**2:.2f} MB",
-            )
-        except Exception as e:
-            psrl_logger.log(level, f"Device {i}: mem_get_info failed: {e}")
+        # Memory allocated, reserved, and mem_get_info (from memory_logger)
+        info = device_infos[i]
+        psrl_logger.log(
+            level,
+            f"Device {i}: memory_allocated={info['allocated']} MB, memory_reserved={info['reserved']} MB",
+        )
+        psrl_logger.log(
+            level,
+            f"Device {i}: mem_get_info: free={info['free']} MB, total={info['total']} MB",
+        )
 
         # Current stream / default stream for this device
         try:

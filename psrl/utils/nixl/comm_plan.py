@@ -252,25 +252,50 @@ class CommunicationPlanner:
                     source_client_groups.keys()
                 )
 
+        # Precompute key -> list of source clients once per unique restriction-group set,
+        # rather than re-scanning for every (target_client, key) pair: O(G × C_s) total
+        # instead of O(N_targets × N_keys × G × C_s).
+        # key_to_sources_by_restriction[restriction_key] = {key: [src_client, ...]}
+        key_to_sources_by_restriction: dict[tuple, dict[str, list[str]]] = {}
+        for target_client_group_id in target_client_groups.keys():
+            restrict_ids = restrict_target_to_source_client_group_mapping[target_client_group_id]
+            # Use a frozen tuple as cache key (group restriction sets are small and reused)
+            restriction_key = tuple(sorted(restrict_ids))
+            if restriction_key not in key_to_sources_by_restriction:
+                key_to_srcs: dict[str, list[str]] = {}
+                for src_group_id in restrict_ids:
+                    for src_client in source_client_groups[src_group_id]:
+                        for key in clients[src_client].tensor_infos:
+                            key_to_srcs.setdefault(key, []).append(src_client)
+                key_to_sources_by_restriction[restriction_key] = key_to_srcs
+
+        # Lazily build {shard: local_pos} per (source_client, key) on first use:
+        # O(1) lookup vs O(S) list.index() per call.
+        shard_pos_maps: dict[tuple[str, str], dict] = {}  # (source_client, key) -> {shard: local_pos}
+
+        def get_shard_pos_map(src: str, key: str) -> dict:
+            cache_key = (src, key)
+            if cache_key not in shard_pos_maps:
+                shard_pos_maps[cache_key] = {
+                    s: i for i, s in enumerate(clients[src].tensor_infos[key].sharding.shard_indices)
+                }
+            return shard_pos_maps[cache_key]
+
         # For each target client, process all its keys
         for target_client_group_id, target_client_group in target_client_groups.items():
+            restrict_ids = restrict_target_to_source_client_group_mapping[target_client_group_id]
+            restriction_key = tuple(sorted(restrict_ids))
+            key_to_srcs = key_to_sources_by_restriction[restriction_key]
+
             for target_client in target_client_group:
                 target_info = clients[target_client]
 
                 for key, target_tensor_info in target_info.tensor_infos.items():
-                    # Find all source clients with the same key
-                    available_source_clients = []
-                    restrict_source_client_group_ids = restrict_target_to_source_client_group_mapping[
-                        target_client_group_id
-                    ]
-                    for source_client_group_id in restrict_source_client_group_ids:
-                        for source_client in source_client_groups[source_client_group_id]:
-                            source_info = clients[source_client]
-                            if key in source_info.tensor_infos:
-                                available_source_clients.append(source_client)
-                    if not available_source_clients:
+                    # Use the precomputed key->sources mapping and a set for O(1) discard,
+                    # avoiding O(G × C_s) per-key scan and O(C_s) list.remove().
+                    if key not in key_to_srcs:
                         client_keys_info = {}
-                        for source_client_group_id in restrict_source_client_group_ids:
+                        for source_client_group_id in restrict_ids:
                             for source_client in source_client_groups[source_client_group_id]:
                                 client_keys_info[source_client] = list(clients[source_client].tensor_infos.keys())
                         error_msg = (
@@ -279,6 +304,10 @@ class CommunicationPlanner:
                             f"keys of them are {client_keys_info}"
                         )
                         raise AssertionError(error_msg)
+
+                    # Build a working set for this (target_client, key) assignment round:
+                    # set.discard() is O(1) vs list.remove() O(C_s).
+                    available_source_clients: set[str] = set(key_to_srcs[key])
 
                     # Get all shards needed by target client
                     needed_shards = set(target_tensor_info.sharding.shard_indices)
@@ -300,15 +329,15 @@ class CommunicationPlanner:
                         # Find source client with optimal network connection and minimum data volume
                         min_volume_client = min(available_source_clients, key=sort_key)
 
-                        source_info = clients[min_volume_client]
-                        source_tensor_info = source_info.tensor_infos[key]
+                        source_tensor_info = clients[min_volume_client].tensor_infos[key]
 
                         # Find shards this client can provide (and needed by the target client)
                         available_shards = (
                             set(source_tensor_info.sharding.shard_indices) - assigned_shards
                         ) & needed_shards
                         if not available_shards:
-                            available_source_clients.remove(min_volume_client)
+                            # O(1) set discard vs O(C_s) list.remove()
+                            available_source_clients.discard(min_volume_client)
                             if not available_source_clients:
                                 break
                             continue
@@ -329,10 +358,9 @@ class CommunicationPlanner:
                                 comm_plan[target_client][key] = {}
                             comm_plan[target_client][key][min_volume_client] = shards_to_assign
 
-                        # Update data volume (considering bandwidth)
-                        local_indices = [
-                            source_tensor_info.sharding.shard_indices.index(shard) for shard in shards_to_assign
-                        ]
+                        # O(1) lookup via precomputed shard_pos_map vs O(S) list.index()
+                        shard_pos_map = get_shard_pos_map(min_volume_client, key)
+                        local_indices = [shard_pos_map[shard] for shard in shards_to_assign]
                         shard_size_bytes = sum(
                             source_tensor_info.get_shard_size_bytes(local_idx) for local_idx in local_indices
                         )
@@ -340,8 +368,8 @@ class CommunicationPlanner:
                         volume_increase = shard_size_bytes / (bandwidth_gbps * 1e9)  # Convert to time
                         source_client_volumes[min_volume_client] += volume_increase
 
-                        # Remove the client from the list of available clients
-                        available_source_clients.remove(min_volume_client)
+                        # O(1) set discard vs O(C_s) list.remove()
+                        available_source_clients.discard(min_volume_client)
                         if not available_source_clients:
                             break
 

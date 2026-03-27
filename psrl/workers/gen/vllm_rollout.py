@@ -560,8 +560,7 @@ class PSRL_vLLMRollout:
         non_tensor_batch["raw_response_ids"] = raw_response_ids
 
         if "response_unpadded_len" in non_tensor_batch:
-            curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
-            curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
+            curr_response_unpadded_len = non_tensor_batch["response_unpadded_len"]
         else:
             curr_response_unpadded_len = [0] * batch_size
         response_unpadded_len = [curr_response_unpadded_len[i] + response_len_list[i] for i in range(batch_size)]
@@ -572,7 +571,8 @@ class PSRL_vLLMRollout:
         # Update rollout_log_probs
         if self.psrl_config.log_prob.enable_rollout_engine_log_prob:
             if "rollout_log_probs" in non_tensor_batch:
-                curr_rollout_log_probs = non_tensor_batch["rollout_log_probs"]
+                curr_rollout_log_probs = non_tensor_batch.pop("rollout_log_probs")
+                curr_rollout_log_probs = np.fromiter(curr_rollout_log_probs.tolist(), dtype=object)
             else:
                 curr_rollout_log_probs = np.fromiter(([] for _ in range(batch_size)), dtype=object)
             curr_rollout_log_probs += np.fromiter(all_log_prob_list, dtype=object)

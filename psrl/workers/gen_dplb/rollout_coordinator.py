@@ -183,11 +183,11 @@ class RolloutCoordinator(CommandExtension):
     def get_status_sink_endpoint(self) -> str:
         return self.status_sink_endpoint
 
-    async def _gateway_post_json(self, path: str, payload):
+    async def _gateway_post_json(self, path: str, payload, params: dict | None = None):
         if self.gateway_base_url is None:
             raise RuntimeError("Rust gateway base url is not initialized")
         url = f"{self.gateway_base_url}{path}"
-        async with self.gateway_client.post(url, json=payload) as resp:
+        async with self.gateway_client.post(url, json=payload, params=params) as resp:
             resp.raise_for_status()
             text = await resp.text()
             if not text.strip():
@@ -208,8 +208,13 @@ class RolloutCoordinator(CommandExtension):
 
     async def _set_routing_loop_running(self, running: bool):
         path = "/routing_loop/resume" if running else "/routing_loop/pause"
+        # When pausing, pass wait=true so the call only returns after the routing loop
+        # finishes its current dispatch round (is_routing becomes false). This prevents
+        # a race where update_currently_syncing_instances and the SYNC command are issued
+        # while the loop is still assigning requests using the pre-sync version.
+        params = {"wait": "true"} if not running else {}
         psrl_logger.info(f"Setting routing loop running state to {running} via {path}")
-        data = await self._gateway_post_json(path, payload={})
+        data = await self._gateway_post_json(path, payload={}, params=params)
         expected = running
         actual = data.get("running")
         if actual is not None and bool(actual) != expected:
@@ -811,7 +816,7 @@ class RolloutCoordinator(CommandExtension):
                 await self._set_routing_loop_running(False)
             else:
                 await self.rollout_router.pause_routing.remote()
-            psrl_logger.info("Interrupted routing for synchronization")
+            psrl_logger.info("Paused routing for synchronization")
 
             if self.use_rust_gateway:
                 for instance_id in instance_ids:
@@ -983,7 +988,7 @@ class RolloutCoordinator(CommandExtension):
                     await self._set_routing_loop_running(False)
                 else:
                     await self.rollout_router.pause_routing.remote()
-                psrl_logger.info("Interrupted routing for migration")
+                psrl_logger.info("Paused routing for migration")
                 await self.exec_command(
                     Command(
                         type=CommandType.ABORT,

@@ -111,15 +111,15 @@ status_collection:
   dump_logging_to_file_level: generation
 
   # Logging interval in milliseconds
-  dump_logging_to_file_interval_in_ms: 2000
+  dump_logging_to_file_interval_in_ms: 500
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
-  # Here 10 means sync every 0.01 second
-  engine_sync_interval_in_ms: 10
+  # Here 10 means sync every 0.1 second
+  engine_sync_interval_in_ms: 100
 
   # Coordinator sync interval in millisecond (rollout coordinator after collecting engine status from all vllm engines -> router)
-  # Here 10 means sync every 0.01 second
-  coordinator_sync_interval_in_ms: 10
+  # Here 10 means sync every 0.1 second
+  coordinator_sync_interval_in_ms: 100
 
   # Stats recorder config
   stats_recorder:
@@ -130,6 +130,15 @@ status_collection:
 
     # Snapshot interval in seconds
     interval_in_s: 5.0
+
+# Memory logger config
+memory_logger:
+
+  # Whether to enable memory logger
+  enable: False
+
+  # Logging interval in seconds
+  interval_seconds: 30
 
 # Redundant rollout config
 redundant_rollout:
@@ -144,10 +153,10 @@ redundant_rollout:
   alg_rollout_n: ${psrl.rollout_n}
 
   # Actual global batch size (>= algorithm requirement)
-  redundant_global_batch_size: null
+  redundant_global_batch_size: ${psrl.staleness_buffer_entries}
 
   # Actual number of responses (>= algorithm requirement)
-  redundant_rollout_n: null
+  redundant_rollout_n: ${psrl.rollout_n}
 
 # Partial rollout config
 partial_rollout:
@@ -167,7 +176,7 @@ routing_strategy:
   method: request_num_balance
 
   # Check interval in millisecond for rollout routing
-  check_interval_in_ms: 10
+  check_interval_in_ms: 500
 
   # Whether to prioritize short requests
   # Available options: "short_length", "long_length", "small_id"
@@ -280,9 +289,6 @@ proactive_filter_strategy:
 # NIXL config for `nixl_cpu` weight synchronization
 nixl:
 
-  # Parameter server mode: storage_server or meta_server
-  server_mode: meta_server
-
   # Server IP address
   server_ip: ${psrl.ps_manager_ip}
 
@@ -290,7 +296,7 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 8
+  max_pinned_temp_memory_slots: 64
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
@@ -323,9 +329,6 @@ retry_bound: -1
 # Ratio over retry bound
 retry_ratio: 1.0
 
-# Whether to validate on PSRL rollout workers
-validate_on_psrl: True
-
 # Whether to colocate validate and training workers
 colocate_validate_and_train: True
 
@@ -339,7 +342,7 @@ tms:
   #  - "null": disable TMS
   #  - "train": enable TMS for training workers only
   #  - "all": enable TMS for both rollout and training workers
-  range: train
+  range: all
 
   # Whether to enable TMS on CUDA graphs
   # When enabled, CUDA graphs will be released by TMS to save GPU memory

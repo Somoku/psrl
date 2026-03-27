@@ -15,7 +15,6 @@ from verl.single_controller.base.decorator import (
 from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.profiler import GPUMemoryLogger, log_gpu_memory_usage
 from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
@@ -24,9 +23,12 @@ from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
+    MemoryLogger,
     deprecated,
     get_worker_info,
+    gpu_memory_logger_decorator,
     log_dual_events,
+    log_tensor,
 )
 from psrl.utils.nixl import (
     GLOBAL_META_SERVER_NAME,
@@ -106,6 +108,17 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {get_worker_info()}.")
 
+        # Memory logger (periodic + on-demand GPU memory log, same path/prefix pattern with Mem suffix)
+        if torch.cuda.is_available() and self.psrl_config.memory_logger.enable:
+            self.memory_logger = MemoryLogger(
+                self.psrl_config.logging_path,
+                f"{self.log_prefix}_Mem",
+                interval_seconds=self.psrl_config.memory_logger.interval_seconds,
+            )
+            self.memory_logger.start()
+        else:
+            self.memory_logger = None
+
     @property
     def is_train_representative_rank(self) -> bool:
         """
@@ -128,31 +141,21 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
-        if self.psrl_config.nixl.server_mode == "storage_server":
-            raise ValueError("Storage server mode is deprecated.")
-        elif self.psrl_config.nixl.server_mode == "meta_server":
-            self.nixl_storage_client = NIXLStorageClient(
-                client_name=f"{GLOBAL_TRAIN_CLIENT_NAME}_{self.rank}",
-                server_name=GLOBAL_META_SERVER_NAME,
-                use_gpu=True,
-                client_type=NIXLClientType.PUSH_SIDE,
-                nixl_config=self.psrl_config.nixl,
-                replica_idx=0,  # replica idx is not necessary
-                worker_index=self.rank,
-                # client_group_id=self.get_replica_id()
-                logging_path=self.psrl_config.logging_path,
-            )
-        else:
-            raise ValueError(f"Invalid NIXL server mode: {self.psrl_config.nixl.server_mode}")
+        self.nixl_storage_client = NIXLStorageClient(
+            client_name=f"{GLOBAL_TRAIN_CLIENT_NAME}_{self.rank}",
+            server_name=GLOBAL_META_SERVER_NAME,
+            use_gpu=True,
+            client_type=NIXLClientType.PUSH_SIDE,
+            nixl_config=self.psrl_config.nixl,
+            replica_idx=0,  # replica idx is not necessary
+            worker_index=self.rank,
+            # client_group_id=self.get_replica_id()
+            logging_path=self.psrl_config.logging_path,
+        )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
     def nixl_convert_params(self):
-        """Convert the Megatron model parameters for NIXL storage client.
-
-        Args:
-            meta_only: If True, convert to meta tensors instead of actual tensors.
-                       Use this when the model is in sleep state (storage released).
-        """
+        """Convert the Megatron model parameters for NIXL storage client."""
         lazy_import_to_globals("psrl.utils.converter.megatron_converter", "convert_megatron_inplace")
         parameter_mapping = create_parameter_mapping("Megatron", copy_to_local(self.config.model.path))
         self.unified_state_dict, self.local_sharding_dict = convert_megatron_inplace(
@@ -198,29 +201,37 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         psrl_logger.info("nixl client protocol done.")
         self.unified_sharding_dict = unified_sharding_dict
 
-    def nixl_sleep(self):
+    def nixl_sleep(self, mode: str = "full"):
         """Deregister local tensors and put model weights to sleep state."""
-        self.sleep()
+        self.sleep_megatron_model()
+        if mode == "meta":
+            return
         self.nixl_storage_client.deregister_local_tensors()
 
-    def sleep(self):
+    def sleep_megatron_model(self):
         """
         Release GPU memory for model weights without CPU offloading.
         The model metadata (shape, dtype, etc.) is preserved for later wake_up.
         """
-        log_gpu_memory_usage(f"Before TrainWorker_R{self.rank} sleep", psrl_logger, level=logging.INFO)
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
+
+        # NOTE(lhy): aggressive_empty_cache is used to ensure no torch reserved memory exists
+        # so torch won't trigger cudaFree from the mempool side
+        # otherwise it will cause double cuMemRelease (first pause, then free) in tms
+        aggressive_empty_cache(force_sync=True)
         # Release GPU memory for actor_module parameters
         if self.psrl_config.tms.range in ["train", "all"]:
             torch_memory_saver.pause()
         else:
             self._sleep_megatron_model(self.actor_module)
 
-        aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage(f"After TrainWorker_R{self.rank} sleep", psrl_logger, level=logging.INFO)
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} sleep")
 
     @deprecated(
         "This method is deprecated, it's reserved as an example "
-        "for FSDP manual memory management. Use torch_memory_saver instead."
+        "for Megatron manual memory management. Use torch_memory_saver instead."
     )
     def _sleep_megatron_model(self, models):
         """
@@ -264,21 +275,19 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         This method restores GPU memory allocation and performs NIXL re-registration
         to handle memory changes after sleep/wake_up cycle.
         """
-        self.wake_up()
+        self.wake_up_megatron_model()
 
         # Re-register the state dict and sharding dict to the NIXL client
         self.nixl_storage_client.register_local_tensors(self.unified_state_dict, self.unified_sharding_dict)
 
-    @deprecated(
-        "This method is deprecated, it's reserved as an example "
-        "for FSDP manual memory management. Use torch_memory_saver instead."
-    )
-    def wake_up(self):
+    def wake_up_megatron_model(self):
         """
         Restore GPU memory allocation for model weights without restoring data.
         The actual data will be transferred via NIXL.
         """
-        log_gpu_memory_usage(f"Before TrainWorker_R{self.rank} wake_up", psrl_logger, level=logging.INFO)
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} wake_up")
+
         # Restore GPU memory allocation for actor_module
         if self.psrl_config.tms.range in ["train", "all"]:
             torch_memory_saver.resume()
@@ -286,8 +295,14 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             self._wake_up_megatron_model(self.actor_module)
 
         aggressive_empty_cache(force_sync=True)
-        log_gpu_memory_usage(f"After TrainWorker_R{self.rank} wake_up", psrl_logger, level=logging.INFO)
 
+        if self.memory_logger is not None:
+            self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} wake_up")
+
+    @deprecated(
+        "This method is deprecated, it's reserved as an example "
+        "for Megatron manual memory management. Use torch_memory_saver instead."
+    )
     def _wake_up_megatron_model(self, models):
         """
         Restore GPU memory allocation for Megatron model without restoring data.
@@ -419,23 +434,18 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         pass
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def build_rollout(self, trust_remote_code: bool = False):
         ActorRolloutRefWorker._build_rollout(self, trust_remote_code=trust_remote_code)
 
     # The log_prob in training side may need to be recomputed
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(
-        role="megatron actor",
-        logger=psrl_logger,
-        level=logging.INFO,
-        log_only_rank_0=False,
-    )
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def compute_log_prob(self, data: DataProto):
         with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-                log_gpu_memory_usage("After load actor params and grad during compute_log_prob", logger=psrl_logger)
             is_lora = data.meta_info.pop("is_lora", False)
             adapter_ctx = self.peft_cls.disable_adapter(self.actor_module) if is_lora else nullcontext()
             config_source = self.config.ref if is_lora else self.config.rollout
@@ -486,12 +496,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @GPUMemoryLogger(
-        role="megatron actor",
-        logger=psrl_logger,
-        level=logging.INFO,
-        log_only_rank_0=False,
-    )
+    @gpu_memory_logger_decorator(log_only_rank_0=False)
     def update_actor(self, data: DataProto):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
@@ -505,3 +510,28 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
                 PSRL_BaseTrainWorker.push_model(self)
         return output
+
+    def _debug_log_train_model_info(self, label: str, max_elements: int = 10):
+        """Debug log Megatron train model tensor statistics."""
+
+        def _iter_model_chunks():
+            model = self.actor_module
+            if isinstance(model, (list, tuple)):
+                yield from enumerate(model)
+            else:
+                yield 0, model
+
+        for chunk_idx, model_chunk in _iter_model_chunks():
+            chunk_module = unwrap_model(model_chunk) if unwrap_model is not None else model_chunk
+            for tensor_type, named_tensors in (
+                ("param", chunk_module.named_parameters()),
+                ("buffer", chunk_module.named_buffers()),
+            ):
+                for name, tensor in named_tensors:
+                    log_tensor(
+                        tensor=tensor,
+                        psrl_logger=psrl_logger,
+                        log_prefix=label,
+                        name=f"chunk={chunk_idx}, {tensor_type}={name}",
+                        max_elements=max_elements,
+                    )

@@ -1,6 +1,12 @@
-from .data_logger import log_data_protocol
+from .data_logger import log_data_protocol, log_tensor
 from .deprecated import deprecated
 from .env_logger import log_env_info
+from .memory_logger import (
+    MemoryLogger,
+    get_all_gpu_memory_info,
+    gpu_memory_logger_decorator,
+    log_gpu_memory_now,
+)
 from .ps_logger import get_ps_logger, setup_ps_logger
 from .ray_logger import (
     DualOutputHandler,
@@ -23,8 +29,13 @@ __all__ = [
     "log_end_event",
     "EventType",
     "log_data_protocol",
+    "log_tensor",
     "log_env_info",
     "deprecated",
     "get_ps_logger",
     "setup_ps_logger",
+    "MemoryLogger",
+    "get_all_gpu_memory_info",
+    "gpu_memory_logger_decorator",
+    "log_gpu_memory_now",
 ]

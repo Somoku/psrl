@@ -1,0 +1,34 @@
+name: gpu_unit_tests
+
+on:
+  push:
+    branches: [main, base_agentic_rl]
+    paths:
+      - "**/*.py"
+      - ".github/workflows/gpu_unit_tests.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  gpu_unit_tests:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install psrl with GPU dependencies
+        run: |
+          source /jizhicfs/johnnyslin/env/psrl.sh
+          pip install -e ".[grpc,test]"
+      - name: Run GPU + Ray tests
+        run: |
+          source /jizhicfs/johnnyslin/env/psrl.sh
+          pytest -m "not cpu_test" \
+            --ignore=tests/nixl \
+            -x \
+            tests/

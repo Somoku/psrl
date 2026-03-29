@@ -8,6 +8,7 @@ import numpy as np
 import ray
 import torch
 from omegaconf import OmegaConf
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer.ppo.reward import load_reward_manager
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -42,6 +43,77 @@ def main(config):
     run_ppo(config)
 
 
+@ray.remote(num_gpus=1, num_cpus=0)
+class _GpuSlotReserver:
+    """Lightweight Ray actor that holds a GPU slot without touching CUDA.
+
+    Used to prevent Ray from scheduling job workers onto nodes that the job
+    does not intend to use, which would otherwise cause multiple validate
+    instances to land on the same GPU when the cluster has excess capacity.
+    """
+
+    def ping(self) -> str:
+        return "ok"
+
+
+def _reserve_excess_nodes(config) -> list:
+    """Block GPU slots on nodes that are not needed by this job.
+
+    Reads psrl.deployment.total_nnodes from config. If null/None, does
+    nothing. Otherwise, compares against the live cluster node count and
+    creates one _GpuSlotReserver actor per GPU on every excess node to
+    prevent Ray from scheduling job workers there.
+
+    Args:
+        config: Hydra config with psrl.deployment fields.
+
+    Returns:
+        list: The list of _GpuSlotReserver actor handles (kept alive by caller).
+    """
+    total_nnodes = config.psrl.deployment.get("total_nnodes", None)
+    if total_nnodes is None:
+        return []
+    total_nnodes = int(total_nnodes)
+
+    alive_gpu_nodes = sorted(
+        [n for n in ray.nodes() if n["Alive"] and n["Resources"].get("GPU", 0) > 0],
+        key=lambda n: n["NodeID"],
+    )
+    cluster_nnodes = len(alive_gpu_nodes)
+
+    if cluster_nnodes <= total_nnodes:
+        psrl_logger.info(
+            f"Cluster has {cluster_nnodes} GPU nodes, job needs {total_nnodes}; no reservation needed."
+        )
+        return []
+
+    excess_nodes = alive_gpu_nodes[total_nnodes:]
+    reservers = []
+    for node in excess_nodes:
+        node_id = node["NodeID"]
+        n_gpus = int(node["Resources"]["GPU"])
+        psrl_logger.info(
+            f"Reserving {n_gpus} GPU slot(s) on excess node {node['NodeManagerAddress']} "
+            f"(node_id={node_id}) to prevent stray worker placement."
+        )
+        for _ in range(n_gpus):
+            actor = _GpuSlotReserver.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=False
+                )
+            ).remote()
+            reservers.append(actor)
+
+    # Verify actors are ready before proceeding so placement is confirmed.
+    ray.get([r.ping.remote() for r in reservers])
+    print(
+        f"[PSRL] Reserved {len(reservers)} GPU slot(s) across "
+        f"{len(excess_nodes)} excess node(s) "
+        f"(cluster={cluster_nnodes}, job needs={total_nnodes})."
+    )
+    return reservers
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config) -> None:
     # Check if Ray is not initialized
@@ -58,6 +130,10 @@ def run_ppo(config) -> None:
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
+
+    # NOTE(claude): keep the handle list alive for the entire job lifetime so Ray
+    # does not garbage-collect the reservation actors before the job finishes.
+    _slot_reservers = _reserve_excess_nodes(config)
 
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete

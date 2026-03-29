@@ -35,9 +35,9 @@ class VllmConverter(BaseConverter):
     """Convert vLLM model to a unified format (i.e., HuggingFace) and generate sharding info."""
 
     def __init__(self, parameter_mapping: ParameterMapping, tp_rank: int | None = 1):
+        super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
         self.tp_rank = tp_rank
-        self.model_info = parameter_mapping.get_model_info()
         self.mappings = parameter_mapping.get_mappings()
         self.fused_mappings: dict[str, tuple[MappingType, list[tuple[str, int]]]] = {}
         for vllm_name, hf_name, mapping_type, shard_id in self.mappings:
@@ -79,8 +79,11 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module)
                 sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(
+                        new_param_name, new_param, sharding
+                    )
                     converted_state_dict[new_param_name] = new_param
-                    sharding_dict[new_param_name] = sharding
+                    sharding_dict[new_param_name] = sharding_for_param
 
         # Handle lm_head separately
         if lm_head_module is not None and (lm_head_module_prefix not in seen_module_prefixes):
@@ -91,8 +94,11 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module)
                 sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(
+                        new_param_name, new_param, sharding
+                    )
                     converted_state_dict[new_param_name] = new_param
-                    sharding_dict[new_param_name] = sharding
+                    sharding_dict[new_param_name] = sharding_for_param
 
         return converted_state_dict, sharding_dict
 
@@ -256,7 +262,9 @@ class VllmConverter(BaseConverter):
 
 
 def convert_vllm_inplace(
-    parameter_mapping: ParameterMapping, model, tp_rank: int = 0
+    parameter_mapping: ParameterMapping, 
+    model, 
+    tp_rank: int = 0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
     Convenience function to convert vLLM model to unified state dict and sharding info.

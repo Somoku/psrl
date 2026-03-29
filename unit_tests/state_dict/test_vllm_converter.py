@@ -47,7 +47,10 @@ def example_with_real_model():
         print(f"[rank{rank}] {name}: {param.shape}")
 
     # Convert to HuggingFace format
-    param_mapping = create_parameter_mapping(model_class, model_path)
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained(model_path)
+    param_mapping = create_parameter_mapping(model_class, model_config)
     hf_state_dict, sharding = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=rank)
 
     # Save the converted state dict for each rank

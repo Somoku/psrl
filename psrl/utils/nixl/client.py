@@ -1650,9 +1650,39 @@ class NIXLStorageClient:
             tensor_info = tensor_infos[key]
             sharding = tensor_info.sharding
 
-            # Produce the same shards that were registered.
-            # For the default (no-op) sharding this returns [src_tensor] as-is.
-            src_shards = sharding.get_local_sharded_tensors(src_tensor)
+            # When the registered tensors are 3D (e.g. QKV weights reshaped for Megatron
+            # group-interleaved layout) but the checkpoint tensor is still 2D, reshape
+            # src_tensor to the full unsharded 3D shape before slicing.
+            # Full shape is derived from any registered shard: for each sharded dim,
+            # multiply the shard's size by the total shard count in that dim.
+            dst_tensor_sample = None
+            for shard_idx_sample in sharding.shard_indices:
+                dst_sample = self._original_tensor_mapping.get((key, shard_idx_sample))
+                if dst_sample is not None:
+                    dst_tensor_sample = dst_sample
+                    break
+            if dst_tensor_sample is not None and dst_tensor_sample.ndim != src_tensor.ndim:
+                # Reconstruct full unsharded 3D shape from the registered shard shape.
+                full_shape = list(dst_tensor_sample.shape)
+                for dim, count in sharding.shard_mesh.items():
+                    full_shape[dim] *= count
+                src_tensor_full = src_tensor.reshape(full_shape)
+                # Slice each shard using the GLOBAL shard_mesh, not _local_shard_mesh.
+                # _local_shard_mesh only counts how many shard_indices this worker holds (= 1),
+                # so get_local_sharded_tensors() would be a no-op on the reconstructed tensor.
+                shard_dims = list(sharding.shard_mesh.keys())
+                shard_counts = list(sharding.shard_mesh.values())
+                src_shards = []
+                for shard_idx in sharding.shard_indices:
+                    shard = src_tensor_full
+                    for i_dim, (dim, count) in enumerate(zip(shard_dims, shard_counts)):
+                        shard_size = shard.shape[dim] // count
+                        shard = shard.narrow(dim, shard_idx[i_dim] * shard_size, shard_size)
+                    src_shards.append(shard)
+            else:
+                # Produce the same shards that were registered.
+                # For the default (no-op) sharding this returns [src_tensor] as-is.
+                src_shards = sharding.get_local_sharded_tensors(src_tensor)
 
             assert len(src_shards) == len(sharding.shard_indices), (
                 f"[{self.client_name}] key={key!r}: sharding produced {len(src_shards)} shards "

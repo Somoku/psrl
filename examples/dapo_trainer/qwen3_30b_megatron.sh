@@ -101,7 +101,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.nixl.server_port=23456 \
+    psrl.deployment.total_nnodes=${NNODES} \
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
@@ -191,8 +191,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=False \
-    trainer.test_freq=2 \
+    trainer.val_before_train=True \
+    trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
     trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

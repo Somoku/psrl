@@ -131,7 +131,10 @@ class MegatronClient:
         from psrl.utils.converter import create_parameter_mapping
         from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 
-        parameter_mapping = create_parameter_mapping("Megatron", self.model_path)
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(self.model_path)
+        parameter_mapping = create_parameter_mapping("Megatron", model_config)
         unified_state_dict, sharding_dict = convert_megatron_inplace(parameter_mapping, self.model)
         self.print(f"[Rank {self.rank}] Model converted: {unified_state_dict}")
         self.print(f"[Rank {self.rank}] Sharding dict: {sharding_dict}")

@@ -7,8 +7,6 @@ GLOBAL_TOPOLOGY = NetworkTopology()
 # Global port scanner instance
 GLOBAL_PORT_SCANNER = PortScanner.remote()
 
-# Global name
-GLOBAL_META_SERVER_NAME = "NIXLMetaServer"
-GLOBAL_TRAIN_CLIENT_NAME = "NIXLTrainClient"
-GLOBAL_GEN_CLIENT_NAME = "NIXLGenClient"
-GLOBAL_PS_CLIENT_NAME = "NIXLPSClient"
+# NOTE(claude): All NIXL string constants (NIXL_META_SERVER_NAME and client-name
+# prefixes) have been moved to psrl.utils.common.nixl_names, which is the single
+# source of truth for NIXL identifiers

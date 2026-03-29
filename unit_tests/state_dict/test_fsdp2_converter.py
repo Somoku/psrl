@@ -51,7 +51,9 @@ def example_with_real_model():
         print(f"[rank{rank}] {name}: {param.to_local().shape}, {param.placements}")
 
     # Convert to HuggingFace format
-    hf_state_dict, sharding = convert_fsdp_inplace("fsdp2", fsdp_model)
+    from psrl.utils.converter import create_parameter_mapping
+    parameter_mapping = create_parameter_mapping("FSDP", model.config)
+    hf_state_dict, sharding = convert_fsdp_inplace(parameter_mapping, fsdp_model, fsdp_strategy="fsdp2")
 
     # Save the converted state dict for each rank
     print("=" * 50)

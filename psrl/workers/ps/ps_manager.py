@@ -80,9 +80,10 @@ class PSManager(RequestStatusTracker):
         self.rollout_instance_tracker: dict[
             int, RolloutInstanceStatus
         ] = {}  # Maps rollout instance IDs to their corresponding info
-        self.model_store: ModelStore | None = (
-            None  # The current model store, which contains the model state dict and version tag
-        )
+        # NOTE(lhy): Initialized at version 0 (representing the loaded checkpoint before any
+        # training step). This avoids a None check in pull_model_state_dict_nixl during the
+        # initial pull that happens before the first training push.
+        self.model_store: ModelStore = ModelStore(version_tag=0)
 
         # Staleness buffer management for training
         self.staleness_inventory: StalenessInventory | None = (
@@ -810,11 +811,13 @@ class PSManager(RequestStatusTracker):
         assert rollout_instance_id in self.rollout_instance_tracker, (
             f"Rollout instance {rollout_instance_id} is not registered."
         )
-        assert self.rollout_coordinator is not None, (
-            "Rollout coordinator is not set. Please set it before updating rollout instance model version."
-        )
 
         if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
+            # NOTE(lhy): rollout_coordinator is only used when the version actually changes.
+            # At init-time (version 0 → 0), this branch is skipped, so coordinator need not be bound yet.
+            assert self.rollout_coordinator is not None, (
+                "Rollout coordinator is not set. Please set it before updating rollout instance model version."
+            )
             self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
             # Sync the rollout instance model version in the rollout coordinator
             self.rollout_coordinator.set_rollout_instance_model_version.remote(
@@ -943,6 +946,29 @@ class PSManager(RequestStatusTracker):
             "The PS worker group must be initialized before calling get_ps_nixl_gen_storage_client_name."
         )
         return self.ps_nixl_gen_storage_client_names
+
+    def get_ps_nixl_train_storage_client_name_for_node(
+        self, node_id: str
+    ) -> str | None:
+        """
+        Return the NIXL train storage client name for the PS worker on the given node.
+
+        Builds a node_id → client_name mapping lazily on first call and caches it.
+        Returns None if no PS worker is found on the given node (caller should fall back).
+
+        Args:
+            node_id (str): Ray node ID of the requesting worker.
+
+        Returns:
+            str | None: The NIXL train storage client name, or None if not found.
+        """
+        if not hasattr(self, "_ps_node_id_to_train_client_name"):
+            self._ps_node_id_to_train_client_name: dict[str, str] = {}
+            for worker in self.ps_worker_group._workers:
+                worker_node_id = ray.get(worker.get_node_id.remote())
+                client_name = ray.get(worker.get_nixl_train_storage_client_name.remote())
+                self._ps_node_id_to_train_client_name[worker_node_id] = client_name
+        return self._ps_node_id_to_train_client_name.get(node_id, None)
 
     # ------- MODEL PUSH/PULL -------
     # Now we separate the control plane and data plane (ps_model = "nixl_cpu" or "nixl_gpu"),

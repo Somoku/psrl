@@ -1289,7 +1289,8 @@ class PSRL_AgentLoopManager:
         # Calculate staleness for each version_tag
         staleness_dict = {}
         for version_tag in version_tag_counts.keys():
-            staleness = buffer_id - version_tag
+            # For validation, we don't need to calculate staleness
+            staleness = buffer_id - version_tag if not is_validate else None
             staleness_dict[version_tag] = staleness
 
         # Log statistics

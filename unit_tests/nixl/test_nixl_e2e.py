@@ -292,9 +292,14 @@ class TrainClientActor:
     def protocol(self, model_path):
         self.print("step0: convert_fsdp/megatron_inplace")
         if self.engine_type == "fsdp" or self.engine_type == "fsdp_hybrid":
-            state_dict, sharding = convert_fsdp_inplace("fsdp", self.model)
+            from transformers import AutoConfig
+            model_config = AutoConfig.from_pretrained(model_path)
+            parameter_mapping = create_parameter_mapping("FSDP", model_config)
+            state_dict, sharding = convert_fsdp_inplace(parameter_mapping, self.model)
         elif self.engine_type == "megatron":
-            parameter_mapping = create_parameter_mapping("Megatron", model_path)
+            from transformers import AutoConfig
+            model_config = AutoConfig.from_pretrained(model_path)
+            parameter_mapping = create_parameter_mapping("Megatron", model_config)
             state_dict, sharding = convert_megatron_inplace(parameter_mapping, self.model)
         # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
@@ -455,7 +460,9 @@ class GenClientActor:
 
     def protocol(self, model_path):
         self.print("step0: convert_vllm_inplace")
-        param_mapping = create_parameter_mapping(type(self.model), model_path)
+        from transformers import AutoConfig
+        model_config = AutoConfig.from_pretrained(model_path)
+        param_mapping = create_parameter_mapping(type(self.model), model_config)
         state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.tp_rank)
         # self.print(f"state_dict keys: {list(state_dict.keys())}")
         self.state_dict = state_dict

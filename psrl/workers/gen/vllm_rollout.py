@@ -502,7 +502,7 @@ class PSRL_vLLMRollout:
                 interrupted_by_scheduler_list.append(True)
                 self.scheduler_abort_requests.remove(str(uid))
             else:
-                psrl_logger.info(
+                psrl_logger.debug(
                     f"Request {uid} is not interrupted by the scheduler (not in {self.scheduler_abort_requests}). "
                     f"It is interrupted by the synchronization (i.e., partial rollout)."
                 )

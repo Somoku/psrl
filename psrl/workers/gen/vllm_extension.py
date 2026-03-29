@@ -24,10 +24,9 @@ from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import gen_client_name, ps_agent_name
 from psrl.utils.nixl import (
-    GLOBAL_GEN_CLIENT_NAME,
-    GLOBAL_META_SERVER_NAME,
-    GLOBAL_PS_CLIENT_NAME,
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
@@ -175,8 +174,8 @@ class vLLMWorkerExtension:
         self.unified_sharding_dict = None
         # Initialize the NIXL client
         self.nixl_storage_client = NIXLStorageClient(
-            client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{self.get_instance_local_rank()}",
-            server_name=GLOBAL_META_SERVER_NAME,
+            client_name=gen_client_name(instance_id, self.get_instance_local_rank()),
+            server_name=NIXL_META_SERVER_NAME,
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=nixl_config,
@@ -192,12 +191,20 @@ class vLLMWorkerExtension:
         Args:
             config (DictConfig): Configuration object containing training settings.
         """
+        from transformers import AutoConfig
+
         vllm_model = self.model_runner.model
         if isinstance(vllm_model, CUDAGraphWrapper):
             vllm_model = vllm_model.unwrap()
-        param_mapping = create_parameter_mapping(type(vllm_model), copy_to_local(config.model.path))
+        model_config = AutoConfig.from_pretrained(
+            copy_to_local(config.model.path),
+            trust_remote_code=config.model.get("trust_remote_code", False),
+        )
+        parameter_mapping = create_parameter_mapping(type(vllm_model), model_config)
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
-            param_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
+            parameter_mapping, 
+            vllm_model, 
+            tp_rank=self.get_instance_local_tp_rank()
         )
 
     def nixl_protocol(self, config: DictConfig, mode: str = "full"):
@@ -268,7 +275,7 @@ class vLLMWorkerExtension:
         """
         node_id = self.get_node_id()
         dst_ps_worker_idx = ps_worker_node_id_to_idxs[node_id]
-        dst_agent_names = [f"{GLOBAL_PS_CLIENT_NAME}_{dst_ps_worker_idx}", GLOBAL_META_SERVER_NAME]
+        dst_agent_names = [ps_agent_name(dst_ps_worker_idx), NIXL_META_SERVER_NAME]
         self.nixl_send_local_info_to(dst_agent_names)
 
     def nixl_wait_for_update_infos(self, info_num: int):

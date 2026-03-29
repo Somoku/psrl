@@ -78,6 +78,13 @@ deployment:
 
   # GPU number for trainer in every node
   train_ngpus_per_node: 1
+
+  # Total number of GPU nodes this job needs across all roles.
+  # When set, excess nodes in the Ray cluster are blocked from scheduling
+  # so that colocated validate workers cannot spill onto idle nodes.
+  # Set to the same value as NNODES in the launch script.
+  # null means no restriction (default).
+  total_nnodes: null
   
   # Rollout with heterogeneous strategies across different instances
   heterogeneous_rollout:

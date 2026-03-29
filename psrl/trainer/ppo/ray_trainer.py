@@ -53,12 +53,10 @@ from psrl.utils.logger import (
     log_data_protocol,
     log_dual_events,
 )
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
 from psrl.utils.nixl import (
-    GLOBAL_GEN_CLIENT_NAME,
-    GLOBAL_META_SERVER_NAME,
     GLOBAL_PORT_SCANNER,
-    GLOBAL_PS_CLIENT_NAME,
-    GLOBAL_TRAIN_CLIENT_NAME,
     NIXLInterface,
 )
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
@@ -162,9 +160,9 @@ class PSRL_RayPPOTrainer:
             f"Initializing PSRL_RayPPOTrainer with is_rollout_mode_in_actor: {self.is_rollout_mode_in_actor}"
         )
 
-        # Mappings from worker to node id and ps index for NIXL
-        self.worker_to_node_id = {}
-        self.worker_to_ps_idx = {}
+        # Mappings from WorkerKey to Ray node id and PS instance index for NIXL.
+        self.worker_to_node_id: dict[WorkerKey, str] = {}
+        self.worker_to_ps_idx: dict[WorkerKey, int] = {}
 
         self.n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         self.n_validate_instances = (
@@ -1338,7 +1336,7 @@ class PSRL_RayPPOTrainer:
                     for node_id in rollout_instance_node_ids:
                         ps_node_ids.add(node_id)
                     self.worker_to_node_id.update(
-                        {f"rollout_I{i}_R{idx}": node_id for idx, node_id in enumerate(rollout_instance_node_ids)}
+                        {WorkerKey("rollout", i, idx): node_id for idx, node_id in enumerate(rollout_instance_node_ids)}
                     )
 
                 # Get all actor instances' distinct node ids
@@ -1346,7 +1344,7 @@ class PSRL_RayPPOTrainer:
                 for node_id in actor_instance_node_ids:
                     ps_node_ids.add(node_id)
                 self.worker_to_node_id.update(
-                    {f"actor_R{idx}": node_id for idx, node_id in enumerate(actor_instance_node_ids)}
+                    {WorkerKey("actor", 0, idx): node_id for idx, node_id in enumerate(actor_instance_node_ids)}
                 )
 
                 # Get all validate instances' distinct node ids
@@ -1355,7 +1353,7 @@ class PSRL_RayPPOTrainer:
                     for node_id in validate_instance_node_ids:
                         ps_node_ids.add(node_id)
                     self.worker_to_node_id.update(
-                        {f"validate_I{i}_R{idx}": node_id for idx, node_id in enumerate(validate_instance_node_ids)}
+                        {WorkerKey("validate", i, idx): node_id for idx, node_id in enumerate(validate_instance_node_ids)}
                     )
 
                 ps_spec_list = []
@@ -1386,6 +1384,10 @@ class PSRL_RayPPOTrainer:
                     nixl_client_futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
                 # Init model skeleton on meta device; weights are loaded after NIXL protocol completes.
                 model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
+                # NOTE(claude): dispatch preload immediately into each PS actor's serial queue; it will
+                # start as soon as that actor's init_model completes, overlapping with gen/val/train
+                # model initialization and NIXL protocol to hide disk I/O latency.
+                preload_futures = self.ps_wg.execute_all_async("preload_checkpoint_to_cpu")
                 psrl_logger.info("PS model initialized successfully!")
             elif self.config.psrl.ps_mode == "nixl_gpu":
                 raise NotImplementedError("PS mode 'nixl_gpu' is not implemented yet")
@@ -1398,13 +1400,9 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info("Initializing models in all rollout instances")
         # start rollout coordinator
         self.init_rollout_coordinator()
-        # simutaneously init all rollout instances
-        rollout_init_futures = []
-        for i in range(self.n_rollout_instances):
-            rollout_init_futures.append(
-                self.rollout_wg_list[i].execute_rank_zero_async("init_and_register_model", "full")
-            )
-        model_init_futures.extend(rollout_init_futures)
+        # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
+        # for rollout indices, which init_nixl_client waits on.
+        model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -1445,11 +1443,12 @@ class PSRL_RayPPOTrainer:
             psrl_logger.info("Initializing validation model")
             # NOTE(linsh): here we must use rollout coordinator to init model
             # for setting init event inside it.
-            model_init_futures.append(self.rollout_coordinator.init_model.remote("validate", "full"))
+            model_init_futures.append(self.rollout_coordinator.init_model.remote("validate", "empty"))
             ray.get(model_init_futures)
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             ray.get(self.rollout_coordinator.init_route_strategy.remote("all"))
+        
         else:
             # init validate wg -> offload -> init actor wg
             # ray.get(model_init_futures)
@@ -1476,10 +1475,11 @@ class PSRL_RayPPOTrainer:
 
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
-            self.actor_wg.init_model("full")
+            self.actor_wg.init_model("empty")
             nixl_client_futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
             ray.get(nixl_client_futures)
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
+
         psrl_logger.info("All workers' models initialized successfully!")
 
         # initialize NIXL
@@ -1503,16 +1503,30 @@ class PSRL_RayPPOTrainer:
                 ray.get(futures)
 
             # Now that all NIXL buffers are allocated (meta tensors replaced),
-            # stream checkpoint weights into the PS registered tensors.
-            # TODO(lhy): change all loading logic to this, not only val_before_train
-            # (disk -> PS CPUs -> train/gen GPUs)
-            if self.is_rollout_mode_in_actor:
-                with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
-                    ray.get(self.ps_wg.execute_all_async("load_weights_to_registered_tensors"))
+            # write the preloaded checkpoint tensors into the PS registered buffers.
+            with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
+                # Ensure prefetch finished (likely already done; blocks only if preload
+                # outlasted NIXL protocol, which would be unusual).
+                ray.get(preload_futures)
+                ray.get(self.ps_wg.execute_all_async("write_checkpoint_to_registered_tensors"))
 
+            # Bind the PS worker group to PSManager before initial pull, so that PSManager's
+            # ps_nixl_agent_names are populated and gen workers can call get_ps_nixl_agent_names.
             psrl_logger.info("Binding PS worker group")
-            self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg)
+            ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
             psrl_logger.info("PS worker group bound successfully!")
+
+            # Pull checkpoint weights from PS into gen and actor workers via NIXL.
+            # NOTE(lhy): gen/val/actor workers are now empty-initialized and must pull from PS on startup.
+            # When is_rollout_mode_in_actor is True, the actor is sleeping (meta mode) at this point
+            # and will pull from PS later in switch_to_trainer_mode, so skip here.
+            initial_pull_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
+            with log_dual_events("Initial pull: PS → gen/actor workers", psrl_logger, event_type=EventType.INIT):
+                initial_pull_futures = []
+                initial_pull_futures.append(self.rollout_coordinator.initial_pull_from_ps.remote(initial_pull_tag))
+                if not self.is_rollout_mode_in_actor:
+                    initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model"))
+                ray.get(initial_pull_futures)
 
     def switch_to_rollout_mode(self):
         """Switch the PSRL colocate part to rollout mode for validation.
@@ -1555,12 +1569,12 @@ class PSRL_RayPPOTrainer:
         updated_client_names = []  # to collect all updated client names for broadcasting
         futures = []
         for i in range(self.n_validate_instances):
-            instance_id = self.n_rollout_instances + i
-            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"validate_I{i}_R")]
-            tp_size = len(worker_names)
-            for rank in range(len(worker_names)):
-                updated_client_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{rank}")
-            futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_send_local_info_to", GLOBAL_META_SERVER_NAME))
+            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
+            for rank in range(tp_size):
+                updated_client_names.append(
+                    WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
+                )
+            futures.append(self.validate_wg_list[i].execute_rank_zero_async("nixl_send_local_info_to", NIXL_META_SERVER_NAME))
         # wait for ps manager to collect all infos
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.n_validate_instances * tp_size))
         ray.get(futures)
@@ -1661,9 +1675,9 @@ class PSRL_RayPPOTrainer:
         update_client_names = []  # to collect all updated client names for broadcasting
         futures = []
         for i in range(self.actor_wg.world_size):
-            update_client_names.append(f"{GLOBAL_TRAIN_CLIENT_NAME}_{i}")
+            update_client_names.append(train_client_name(i))
         # sender side: actor workers
-        futures.extend(self.actor_wg.execute_all_async("nixl_send_local_info_to", GLOBAL_META_SERVER_NAME))
+        futures.extend(self.actor_wg.execute_all_async("nixl_send_local_info_to", NIXL_META_SERVER_NAME))
         # receiver side: ps manager
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.actor_wg.world_size))
         ray.get(futures)
@@ -1707,32 +1721,32 @@ class PSRL_RayPPOTrainer:
         Args:
             updated_client_names (list): List of updated client names to broadcast.
         """
-        src_agent_names = [GLOBAL_META_SERVER_NAME]
+        src_agent_names = [NIXL_META_SERVER_NAME]
         dst_agent_names = []
-        # 1. ps storage workers
-        ps_worker_num = self.ps_wg.world_size
-        for i in range(ps_worker_num):
-            dst_agent_names.append(f"{GLOBAL_PS_CLIENT_NAME}_{i}")
+        # 1. PS storage workers
+        for i in range(self.ps_wg.world_size):
+            dst_agent_names.append(ps_agent_name(i))
         # 2. rollout workers
         for i in range(self.n_rollout_instances):
-            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"rollout_I{i}_R")]
-            for rank in range(len(worker_names)):
-                dst_agent_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{i}_R{rank}")
+            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "rollout" and k.instance_id == i)
+            for rank in range(tp_size):
+                dst_agent_names.append(WorkerKey("rollout", i, rank).to_nixl_client_name())
+        # 3. validate workers
         for i in range(self.n_validate_instances):
-            worker_names = [name for name in self.worker_to_ps_idx if name.startswith(f"validate_I{i}_R")]
-            instance_id = self.n_rollout_instances + i
-            for rank in range(len(worker_names)):
-                dst_agent_names.append(f"{GLOBAL_GEN_CLIENT_NAME}_I{instance_id}_R{rank}")
-        # 3. actor workers
-        actor_worker_num = self.actor_wg.world_size
-        for i in range(actor_worker_num):
-            dst_agent_names.append(f"{GLOBAL_TRAIN_CLIENT_NAME}_{i}")
+            tp_size = sum(1 for k in self.worker_to_ps_idx if k.role == "validate" and k.instance_id == i)
+            for rank in range(tp_size):
+                dst_agent_names.append(
+                    WorkerKey("validate", i, rank).to_nixl_client_name(self.n_rollout_instances)
+                )
+        # 4. actor workers
+        for i in range(self.actor_wg.world_size):
+            dst_agent_names.append(train_client_name(i))
         psrl_logger.debug(f"Destination agent names for broadcasting: {dst_agent_names}")
 
         broadcast_plan = self._make_broadcast_plan(src_agent_names, dst_agent_names)
         futures = []
         for src_agent, dst_agents in broadcast_plan.items():
-            if src_agent == GLOBAL_META_SERVER_NAME:
+            if src_agent == NIXL_META_SERVER_NAME:
                 futures.append(
                     self.ps_manager_handle.nixl_broadcast_update_client_infos.remote(dst_agents, updated_client_names)
                 )

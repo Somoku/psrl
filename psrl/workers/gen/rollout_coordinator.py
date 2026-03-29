@@ -20,6 +20,8 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RolloutCoordinator(CommandExtension):
+    DEFAULT_AWAIT_TIMEOUT_S = 500
+
     def __init__(
         self,
         config,
@@ -103,7 +105,9 @@ class RolloutCoordinator(CommandExtension):
         self.stop_broadcast_status_to_router = False
 
         # Asyncio event loop order control
-        self._is_init_model = asyncio.Event()
+        # Track model initialization per worker group to support partial init on
+        # rollout/validate subsets independently.
+        self._is_init_model_events = [asyncio.Event() for _ in range(self.gen_wg_size)]
         self._is_init_nixl_client = asyncio.Event()
 
         # Version tracking
@@ -143,22 +147,65 @@ class RolloutCoordinator(CommandExtension):
         for instance_id in instance_ids:
             self.stop_process_status_queue[instance_id] = True
 
-    def _get_wg_list_and_size(self, tag: str):
-        """Get the worker group list and size based on the given tag.
+    def _get_wgs(self, tag: str):
+        """Get worker groups and their global indices based on tag.
 
         Args:
             tag (str): Tag to specify which instances to get ('rollout', 'validate', 'all')
         Returns:
-            tuple: (worker group list, worker group size)
+            tuple: (worker group list, global wg indices)
         """
         if tag == "rollout":
-            return self.rollout_wg_list, self.rollout_wg_size
+            return self.rollout_wg_list, list(range(self.rollout_wg_size))
         elif tag == "validate":
-            return self.validate_wg_list, self.validate_wg_size
+            return self.validate_wg_list, list(range(self.rollout_wg_size, self.gen_wg_size))
         elif tag == "all":
-            return self.gen_wg_list, self.gen_wg_size
+            return self.gen_wg_list, list(range(self.gen_wg_size))
         else:
-            raise ValueError(f"Unknown tag {tag} for getting worker group list and size")
+            raise ValueError(f"Unknown tag {tag} for getting worker groups")
+
+    async def _wait_for_init_model(self, tag: str, func_name: str):
+        """Wait until all worker groups under the tag finish model init."""
+        _, wg_indices = self._get_wgs(tag)
+        if not wg_indices:
+            return
+
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(self._is_init_model_events[idx].wait() for idx in wg_indices)),
+                timeout=self.DEFAULT_AWAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"[{func_name}] timed out after {self.DEFAULT_AWAIT_TIMEOUT_S}s "
+                f"while waiting model init for tag={tag}, wg={wg_indices}"
+            ) from e
+
+    async def _await_futures_with_timeout(self, futures, func_name: str, tag: str, wg_indices: list[int]):
+        """Await futures with a unified timeout and detailed context on timeout."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.gather(*futures),
+                timeout=self.DEFAULT_AWAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"[{func_name}] timed out after {self.DEFAULT_AWAIT_TIMEOUT_S}s "
+                f"while waiting futures for tag={tag}, wg={wg_indices}"
+            ) from e
+
+    async def _wait_for_nixl_client(self, func_name: str):
+        """Wait until NIXL client initialization is complete."""
+        try:
+            await asyncio.wait_for(
+                self._is_init_nixl_client.wait(),
+                timeout=self.DEFAULT_AWAIT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"[{func_name}] timed out after {self.DEFAULT_AWAIT_TIMEOUT_S}s "
+                "while waiting NIXL client initialization"
+            ) from e
 
     async def init_model(self, tag: str = "rollout", init_mode: str = "full"):
         """Init the model on rollout instances and register to ps manager.
@@ -169,12 +216,13 @@ class RolloutCoordinator(CommandExtension):
                 'full' mode will load the full model weights,
                 'empty' mode will load dummy model weights.
         """
-        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        wg_list, wg_indices = self._get_wgs(tag)
         futures = []
-        for i in range(wg_size):
+        for i in range(len(wg_list)):
             futures.append(wg_list[i].execute_rank_zero_async("init_and_register_model", init_mode))
-        await asyncio.gather(*futures)
-        self._is_init_model.set()
+        await self._await_futures_with_timeout(futures, "init_model", tag, wg_indices)
+        for idx in wg_indices:
+            self._is_init_model_events[idx].set()
 
     async def init_route_strategy(self, tag: str = "rollout"):
         """Init the route strategy on rollout instances.
@@ -186,26 +234,31 @@ class RolloutCoordinator(CommandExtension):
             tag (str): Tag to specify which instances to initialize ('rollout', 'validate', 'all')
         """
         assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
-        await self._is_init_model.wait()
+        await self._wait_for_init_model(tag, "init_route_strategy")
 
-        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        wg_list, wg_indices = self._get_wgs(tag)
         futures = []
-        for i in range(wg_size):
+        for i in range(len(wg_list)):
             futures.append(wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
-        max_model_lens = await asyncio.gather(*futures)
+        max_model_lens = await self._await_futures_with_timeout(
+            futures, "init_route_strategy", tag, wg_indices
+        )
         psrl_logger.info(f"Max model lens on {tag} instances: {max_model_lens}")
-        wg_idx_range = range(self.rollout_wg_size, self.gen_wg_size) if tag == "validate" else range(wg_size)
-        instance_to_max_model_len = {i: max(max_model_lens[j]) for i, j in zip(wg_idx_range, range(wg_size))}
+        instance_to_max_model_len = {
+            wg_idx: max(max_model_lens[j]) for j, wg_idx in enumerate(wg_indices)
+        }
         # Use the max model len to budget the kv cache size for each instance
         await self.rollout_router.init_route_strategy.remote(instance_to_max_model_len=instance_to_max_model_len)
 
     async def init_nixl_client(self):
         """Init the NIXL client on rollout and validate instances."""
-        await self._is_init_model.wait()
+        await self._wait_for_init_model("all", "init_nixl_client")
         futures = []
         for i in range(self.gen_wg_size):
             futures.append(self.gen_wg_list[i].execute_rank_zero_async("init_nixl_client"))
-        await asyncio.gather(*futures)
+        await self._await_futures_with_timeout(
+            futures, "init_nixl_client", "all", self._get_wgs("all")[1]
+        )
         psrl_logger.info(f"Initialized NIXL client on all {self.gen_wg_size} instances.")
         self._is_init_nixl_client.set()
 
@@ -216,7 +269,7 @@ class RolloutCoordinator(CommandExtension):
             full_tag (str): Tag to specify which instances to run the protocol
                             in 'full' mode ('rollout', 'validate', 'all')
         """
-        await self._is_init_nixl_client.wait()
+        await self._wait_for_nixl_client("nixl_protocol")
 
         if full_tag == "all":
             full_tag_list = ["full"] * self.gen_wg_size
@@ -230,15 +283,40 @@ class RolloutCoordinator(CommandExtension):
         futures = []
         for i in range(self.gen_wg_size):
             futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_protocol", full_tag_list[i]))
-        await asyncio.gather(*futures)
+        await self._await_futures_with_timeout(
+            futures, "nixl_protocol", "all", self._get_wgs("all")[1]
+        )
 
     async def nixl_convert_params(self):
         """Convert the model parameters to unified format on rollout and validate instances."""
-        await self._is_init_nixl_client.wait()
+        await self._wait_for_nixl_client("nixl_convert_params")
         futures = []
         for i in range(self.gen_wg_size):
             futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_convert_params"))
-        await asyncio.gather(*futures)
+        await self._await_futures_with_timeout(
+            futures, "nixl_convert_params", "all", self._get_wgs("all")[1]
+        )
+
+    async def initial_pull_from_ps(self, tag: str = "rollout") -> None:
+        """
+        Force an initial weight pull from PS to all specified gen workers via NIXL.
+
+        This is called exactly once at initialization, after the NIXL protocol
+        completes and PS buffers are populated via preload_checkpoint_to_cpu() and
+        write_checkpoint_to_registered_tensors().
+        Because both the PS and workers start at version 0, the version-based skip
+        check inside GenWorker.sync_with_ps (curr_version >= ps_version) would
+        incorrectly suppress the pull — so we call nixl_pull_model_async directly
+        on each worker group instead of going through the SYNC command path.
+
+        Args:
+            tag (str): Which instances to pull into ('rollout', 'validate', 'all').
+        """
+        await self._wait_for_init_model(tag, "initial_pull_from_ps")
+        wg_list, wg_indices = self._get_wgs(tag)
+        futures = [wg_list[i].execute_rank_zero_async("nixl_pull_model_async") for i in range(len(wg_list))]
+        await self._await_futures_with_timeout(futures, "initial_pull_from_ps", tag, wg_indices)
+        psrl_logger.info(f"Initial PS pull complete for {len(wg_list)} {tag!r} instance(s).")
 
     async def sleep(self, tag: str = "all"):
         """Make rollout instances sleep and release GPU memory.
@@ -246,13 +324,13 @@ class RolloutCoordinator(CommandExtension):
         Args:
             tag (str): Tag to specify which instances to sleep ('rollout', 'validate', 'all')
         """
-        await self._is_init_model.wait()
+        await self._wait_for_init_model(tag, "sleep")
 
-        wg_list, wg_size = self._get_wg_list_and_size(tag)
+        wg_list, wg_indices = self._get_wgs(tag)
         futures = []
-        for i in range(wg_size):
+        for i in range(len(wg_list)):
             futures.append(wg_list[i].execute_rank_zero_async("sleep"))
-        await asyncio.gather(*futures)
+        await self._await_futures_with_timeout(futures, "sleep", tag, wg_indices)
 
     async def start_busy_loop(self):
         """
@@ -264,7 +342,7 @@ class RolloutCoordinator(CommandExtension):
         3. Starts a task to broadcast the engine status to the agent loop workers (i.e., router).
         4. Starts a task to synchronize rollout instances with PS.
         """
-        await self._is_init_model.wait()
+        await self._wait_for_init_model("rollout", "start_busy_loop")
 
         if self.command_handler_task is not None and not self.command_handler_task.done():
             return

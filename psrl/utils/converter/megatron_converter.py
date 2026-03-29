@@ -21,6 +21,7 @@ class MegatronConverter(BaseConverter):
     """Convert Megatron model to a unified format (i.e., HuggingFace) and generate sharding info."""
 
     def __init__(self, parameter_mapping: ParameterMapping, mpu: ParallelStates | None = None):
+        super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
 
         self.parameter_mapping.disable_tie_word_embeddings()
@@ -33,7 +34,6 @@ class MegatronConverter(BaseConverter):
             self.mpu = mpu
         else:
             self.mpu = self.bridge.mpu
-        self.model_info = parameter_mapping.get_model_info()
 
     def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
@@ -204,7 +204,11 @@ class MegatronConverter(BaseConverter):
         return NIXLSharding(**kwargs)
 
 
-def convert_megatron_inplace(parameter_mapping: ParameterMapping, model, mpu: ParallelStates | None = None):
+def convert_megatron_inplace(
+    parameter_mapping: ParameterMapping, 
+    model, 
+    mpu: ParallelStates | None = None,
+):
     """
     Convenience function to convert Megatron model to unified state dict and sharding info.
     Args:

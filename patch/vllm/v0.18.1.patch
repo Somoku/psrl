@@ -1,0 +1,122 @@
+From 560e50bf9c1fb2d1c74bec417bfd4ea0d4033349 Mon Sep 17 00:00:00 2001
+From: Somoku <linsh0@protonmail.com>
+Date: Fri, 3 Apr 2026 13:26:13 +0800
+Subject: [PATCH] [PATCH] v0.18.1
+
+---
+ vllm/model_executor/models/qwen2.py | 13 ++++++++++++-
+ vllm/v1/engine/async_llm.py         |  9 +++++++++
+ vllm/v1/engine/output_processor.py  |  5 +++++
+ vllm/v1/metrics/loggers.py          | 13 ++++++++-----
+ vllm/v1/metrics/stats.py            |  4 ++++
+ 5 files changed, 38 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 27aa6175b..19549d78e 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -189,6 +189,13 @@ class Qwen2Attention(nn.Module):
+             if attn_type == AttentionType.ENCODER_ONLY
+             else Attention
+         )
++        
++        self.disable_attn = False
++        import os
++        if "VLLM_DISABLE_ATTN" in os.environ and os.environ["VLLM_DISABLE_ATTN"] == "1":
++            print("Hijacking the attention in Qwen2 to forbid the use of the attention.")
++            self.disable_attn = True
++        
+         self.attn = attn_cls(
+             self.num_heads,
+             self.head_dim,
+@@ -231,7 +238,11 @@ class Qwen2Attention(nn.Module):
+             k = k.view(total_tokens, self.kv_size)
+ 
+         q, k = self.rotary_emb(positions, q, k)
+-        attn_output = self.attn(q, k, v)
++        # For profiling, we hijack here to forbid the use of the attention.
++        if self.disable_attn:
++            attn_output = q
++        else:
++            attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+index 7ff324f12..16f33c001 100644
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -709,6 +709,15 @@ class AsyncLLM(EngineClient):
+ 
+         self.output_handler = asyncio.create_task(output_handler())
+ 
++    async def abort_all(self, internal: bool = False) -> int:
++        """Abort all requests in OutputProcessor and EngineCore."""
++        all_request_ids = self.output_processor.abort_all(internal=internal)
++        await self.engine_core.abort_requests_async(all_request_ids)
++
++        if self.log_requests:
++            logger.info("Aborted all requests %s.", ",".join(all_request_ids))
++        return len(all_request_ids)
++
+     async def abort(
+         self, request_id: str | Iterable[str], internal: bool = False
+     ) -> None:
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index f9e965092..5501c8fb0 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -443,6 +443,11 @@ class OutputProcessor:
+             assert state.queue is not None
+             state.queue.put(e)
+ 
++    def abort_all(self, internal: bool = False) -> list[str]:
++        abort_request_ids = list(self.request_states.keys())
++        self.abort_requests(abort_request_ids, internal=internal)
++        return abort_request_ids
++
+     def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
+         """Abort a list of requests.
+ 
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 5d5877d16..43a063b2e 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -1284,11 +1284,14 @@ class StatLoggerManager:
+                     custom_prometheus_logger = True
+             else:
+                 # per engine logger
+-                global_stat_logger = PerEngineStatLoggerAdapter(
+-                    vllm_config=vllm_config,
+-                    engine_indexes=self.engine_indexes,
+-                    per_engine_stat_logger_factory=stat_logger_factory,  # type: ignore[arg-type]
+-                )
++                if not isinstance(stat_logger_factory, Callable):
++                    global_stat_logger = stat_logger_factory
++                else:
++                    global_stat_logger = PerEngineStatLoggerAdapter(
++                        vllm_config=vllm_config,
++                        engine_indexes=self.engine_indexes,
++                        per_engine_stat_logger_factory=stat_logger_factory,  # type: ignore[arg-type]
++                    )
+             self.stat_loggers.append(global_stat_logger)
+         if not custom_prometheus_logger:
+             self.stat_loggers.append(
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 45f002e01..0df2835d7 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -170,6 +170,10 @@ class KVCacheEvictionEvent:
+ @dataclass
+ class SchedulerStats:
+     """Stats associated with the scheduler."""
++    # NOTE(lhy): we need to add this field to the scheduler stats for PSRL.
++    need_to_abort_reqs: list[str] = field(default_factory=list)
++    req_id_to_prompt_token_num: dict[str, int] | None = None
++    req_id_to_response_token_num: dict[str, int] | None = None
+ 
+     num_running_reqs: int = 0
+     num_waiting_reqs: int = 0
+-- 
+2.43.0
+

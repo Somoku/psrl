@@ -130,7 +130,6 @@ class MegatronClient:
         """Convert model"""
         from psrl.utils.converter import create_parameter_mapping
         from psrl.utils.converter.megatron_converter import convert_megatron_inplace
-
         from transformers import AutoConfig
 
         model_config = AutoConfig.from_pretrained(self.model_path)

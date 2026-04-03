@@ -1,10 +1,10 @@
 import logging
 import os
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import ray
 import torch
-from contextlib import nullcontext
 from omegaconf import DictConfig
 from torch.distributed.tensor import DTensor
 from verl import DataProto
@@ -22,8 +22,10 @@ from verl.utils.fsdp_utils import (
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.common.utils import lazy_import_to_globals
+from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.logger import (
@@ -36,14 +38,12 @@ from psrl.utils.logger import (
     log_dual_events,
     log_tensor,
 )
-from psrl.utils.ray import exclusive_push_model_context
-from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.nixl import (
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
 )
+from psrl.utils.ray import exclusive_push_model_context
 from psrl.workers.train import PSRL_BaseTrainWorker, TrainInterface
 
 if TYPE_CHECKING:
@@ -489,7 +489,7 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
-                
+
             data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
             data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
             data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
@@ -523,7 +523,11 @@ class PSRL_FSDPTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
         torch.cuda.synchronize()
-        context_manager = exclusive_push_model_context(self.train_interface.ps_manager_handle) if self.is_train_representative_rank else nullcontext()
+        context_manager = (
+            exclusive_push_model_context(self.train_interface.ps_manager_handle)
+            if self.is_train_representative_rank
+            else nullcontext()
+        )
         with context_manager:
             with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
                 PSRL_BaseTrainWorker.push_model(self)

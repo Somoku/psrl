@@ -60,7 +60,6 @@ def make_xfer_tag(
 
 
 class NIXLStorageClient:
-
     def __init__(
         self,
         client_name: str,
@@ -384,8 +383,9 @@ class NIXLStorageClient:
     ):
         """
         Register local tensors with NIXL. Build key->desc mapping.
-        Currently only support all tensors are within binded_meta_tensor_mapping or not within binded_meta_tensor_mapping.
-        
+        Currently only support all tensors are within binded_meta_tensor_mapping
+        or not within binded_meta_tensor_mapping.
+
         Args:
             state_dict: {key: torch.Tensor}
             sharding_dict: {key: NIXLSharding}
@@ -571,7 +571,9 @@ class NIXLStorageClient:
                         if binded_meta_tensor_mapping is None and meta_buffer is not None:
                             local_sharded_tensor = meta_buffer.get_tensor((key, shard_indices[local_pos]))
                         elif binded_meta_tensor_mapping is not None:
-                            assert (key, shard_indices[local_pos]) in binded_meta_tensor_mapping, f"Key {key} shard {shard_indices[local_pos]} not found in binded_meta_tensor_mapping."
+                            assert (key, shard_indices[local_pos]) in binded_meta_tensor_mapping, (
+                                f"Key {key} shard {shard_indices[local_pos]} not found in binded_meta_tensor_mapping."
+                            )
                             local_sharded_tensor = binded_meta_tensor_mapping[(key, shard_indices[local_pos])]
                         else:
                             local_sharded_tensor = tbd_local_sharded_tensor
@@ -708,17 +710,20 @@ class NIXLStorageClient:
                     sharding=sharding,
                     shard_meta_infos=shard_meta_info_list,
                 )
-                
+
             if binded_meta_tensor_mapping is not None:
-                assert self.temp_desc_slice_map == {}, f"temp_desc_slice_map must be empty when binded_meta_tensor_mapping is provided, \
+                assert self.temp_desc_slice_map == {}, (
+                    f"temp_desc_slice_map must be empty when binded_meta_tensor_mapping is provided, \
                     but got {self.temp_desc_slice_map}."
+                )
 
             # Batch register all tensors and cache the reg list once.
             if not meta_only and self._mtype_to_reg_region_lists:
                 for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
                     if not reg_list:
                         continue
-                    # NOTE(lhy): do not call _merge_contiguous_regions here. See the docstring of _merge_contiguous_regions for more details.
+                    # NOTE(lhy): do not call _merge_contiguous_regions here.
+                    # See the docstring of _merge_contiguous_regions for more details.
                     # reg_list = self._merge_contiguous_regions(reg_list)
                     # self._mtype_to_reg_region_lists[mem_type] = reg_list
                     reg_descs = self._register_memory(mem_type, reg_list)
@@ -726,8 +731,7 @@ class NIXLStorageClient:
 
                 # Precompute {shard_idx: local_pos} once per key: O(1) lookup vs O(S) list.index()
                 shard_pos_cache: dict[str, dict] = {
-                    key: {s: i for i, s in enumerate(ti.sharding.shard_indices)}
-                    for key, ti in tensor_infos.items()
+                    key: {s: i for i, s in enumerate(ti.sharding.shard_indices)} for key, ti in tensor_infos.items()
                 }
 
                 # Group by mem_type to batch get_xfer_descs calls: O(mem_types) round-trips instead of O(N_shards).
@@ -1571,9 +1575,7 @@ class NIXLStorageClient:
                             # Non-contiguous shard: copy data from temporary to original
                             original_tensor = self._get_local_original_tensor(key, shard_idx)
                             if original_tensor is None:
-                                raise RuntimeError(
-                                    f"No original tensor mapping found for key {key} shard {shard_idx}"
-                                )
+                                raise RuntimeError(f"No original tensor mapping found for key {key} shard {shard_idx}")
                             contiguous_tensor = self._get_local_temp_tensor(key, shard_idx)
                             if contiguous_tensor is None:
                                 raise RuntimeError(
@@ -1641,7 +1643,7 @@ class NIXLStorageClient:
         )
 
         tensor_infos = self.local_client_info.tensor_infos
-        
+
         for key, src_tensor in state_dict.items():
             if key not in tensor_infos:
                 # This key is not held by this PS worker — skip silently.

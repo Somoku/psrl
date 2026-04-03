@@ -79,9 +79,7 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module)
                 sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
-                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(
-                        new_param_name, new_param, sharding
-                    )
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
 
@@ -94,9 +92,7 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module)
                 sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
-                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(
-                        new_param_name, new_param, sharding
-                    )
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
 
@@ -262,8 +258,8 @@ class VllmConverter(BaseConverter):
 
 
 def convert_vllm_inplace(
-    parameter_mapping: ParameterMapping, 
-    model, 
+    parameter_mapping: ParameterMapping,
+    model,
     tp_rank: int = 0,
 ) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """

@@ -5,7 +5,12 @@ from collections import OrderedDict
 import torch
 from torch.nn import Parameter
 
-from psrl.utils.converter.model_mappings import ParameterMapping, is_qkv_weight, make_slice_parameter, reshape_qkv_to_3d
+from psrl.utils.converter.model_mappings import (
+    ParameterMapping,
+    is_qkv_weight,
+    make_slice_parameter,
+    reshape_qkv_to_3d,
+)
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
@@ -112,8 +117,7 @@ class BaseConverter(ABC):
         else:
             # Case C: fine-grained sharding spills from dim=0 into dim=1.
             assert ws % G_global == 0, (
-                f"FSDP world size ({ws}) is not divisible by G_global={G_global} "
-                f"for {param_name}."
+                f"FSDP world size ({ws}) is not divisible by G_global={G_global} for {param_name}."
             )
             steps = ws // G_global
             reshaped = make_slice_parameter(param.data.reshape(1, rows, H), param)

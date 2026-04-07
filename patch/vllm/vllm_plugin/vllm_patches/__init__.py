@@ -101,4 +101,10 @@ def register_patches():
     # Apply patches based on environment configuration
     manager.apply_from_env()
 
+    # Always apply profiling patches: they are idempotent and gated at
+    # runtime by `log_stats`, so there is no cost when profiling is off.
+    from vllm_patches.patches.profiling import apply_profiling_patches
+
+    apply_profiling_patches()
+
     logger.info("=" * 60)

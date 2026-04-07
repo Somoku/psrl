@@ -14,7 +14,7 @@ from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
-    GLOBAL_META_SERVER_NAME,
+    NIXL_META_SERVER_NAME,
     GLOBAL_PORT_SCANNER,
     NIXLClientType,
     NIXLInterface,
@@ -501,7 +501,7 @@ class GenClientActor:
                     ps_client_name,
                     key,
                     "gen_pull",
-                    merge_and_cache_xfer=True,
+                    merge_and_cache_xfer=False,
                 )
                 # end_time = time.time()
                 if len(shards_to_transfer) > 0:
@@ -565,7 +565,7 @@ def test_nixl_e2e(cfg: DictConfig):
     )
     listen_ip = cfg.network.listen_ip
     print(f"meta server listen_ip: {listen_ip}")
-    server_name = GLOBAL_META_SERVER_NAME
+    server_name = NIXL_META_SERVER_NAME
     backend = cfg.network.backend
     torch_port_train = cfg.network.torch_port_train
     torch_port_gen = cfg.network.torch_port_gen

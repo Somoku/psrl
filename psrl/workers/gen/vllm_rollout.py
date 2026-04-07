@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Sequence
 from pprint import pprint
@@ -36,6 +37,7 @@ except ImportError:
 
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import deprecated
+from psrl.utils.profiling.event_converter import events_to_profiling_records
 from psrl.workers.config import HFModelConfig, RolloutConfig
 from psrl.workers.gen import StatCollector
 
@@ -453,6 +455,8 @@ class PSRL_vLLMRollout:
         self,
         prompts: DataProto,
         outputs: (RequestOutput | PoolingRequestOutput | list[RequestOutput | PoolingRequestOutput]),
+        accumulated_events: list | None = None,
+        generation_start_wall_ts: float = 0.0,
     ) -> DataProto:
         """
         Post-process vLLM outputs to convert them back into DataProto format.
@@ -464,11 +468,14 @@ class PSRL_vLLMRollout:
         4. Build final DataProto with updated tensors and metadata
 
         Args:
-            prompts: Original input DataProto containing prompts
-            outputs: vLLM generation outputs (single output or list of outputs)
+            prompts (DataProto): Original input DataProto containing prompts.
+            outputs (RequestOutput | PoolingRequestOutput | list): vLLM generation outputs.
+            accumulated_events (list | None): Profiling events accumulated during streaming generation.
+            generation_start_wall_ts (float): Wall-clock timestamp when generation started.
+            generation_end_wall_ts (float): Wall-clock timestamp when generation ended.
 
         Returns:
-            Updated DataProto with generated responses and proper formatting
+            DataProto: Updated DataProto with generated responses and proper formatting.
         """
 
         if not isinstance(outputs, list):
@@ -573,6 +580,34 @@ class PSRL_vLLMRollout:
         if self.config.enable_rollout_routing_replay:
             non_tensor_batch["routed_experts"] = np.fromiter(routed_experts_list, dtype=object)
 
+        # --- Per-trajectory profiling data ---
+        enable_profiling = self.psrl_config.profile.trajectory.enable
+        if enable_profiling and accumulated_events:
+            for i, uid in enumerate(uid_list):
+                vllm_output = outputs[i] if isinstance(outputs, list) else outputs
+                num_cached = getattr(vllm_output, "num_cached_tokens", 0) or 0
+                total_seq_len = len(getattr(vllm_output, "prompt_token_ids", []) or []) + response_len_list[i]
+                prefill_records, decode_records = events_to_profiling_records(
+                    events=accumulated_events,
+                    num_cached_tokens=num_cached,
+                    total_seq_len=total_seq_len,
+                    num_output_tokens=response_len_list[i],
+                )
+                non_tensor_batch["profiling_prefill_records"] = np.array(
+                    [prefill_records], dtype=object
+                )
+                non_tensor_batch["profiling_decode_records"] = np.array(
+                    [decode_records], dtype=object
+                )
+                non_tensor_batch["profiling_generation_start_wall_ts"] = np.array(
+                    [generation_start_wall_ts], dtype=float
+                )
+                # NOTE(claude): generation_end_wall_ts is wall-clock only, used by
+                # TurnProfilingCollector to estimate env turn duration between turns
+                non_tensor_batch["profiling_generation_end_wall_ts"] = np.array(
+                    [time.time()], dtype=float
+                )
+
         batch = TensorDict(
             {
                 "input_ids": prompts.batch["input_ids"],  # [bs, prompt_length]
@@ -649,8 +684,15 @@ class PSRL_vLLMRollout:
 
         completed_rollout = []
         for completed_task in asyncio.as_completed(tasks):
-            prompt_idx, output = await completed_task
-            completed_rollout.append(self.post_process_outputs(prompts[prompt_idx : prompt_idx + 1], output))
+            prompt_idx, output, accumulated_events, gen_start_ts = await completed_task
+            completed_rollout.append(
+                self.post_process_outputs(
+                    prompts[prompt_idx : prompt_idx + 1],
+                    output,
+                    accumulated_events=accumulated_events,
+                    generation_start_wall_ts=gen_start_ts,
+                )
+            )
 
         return DataProto.concat(completed_rollout)
 
@@ -692,22 +734,23 @@ class PSRL_vLLMRollout:
         sampling_params: SamplingParams,
         uid: str | None = None,
         max_tokens: int | None = None,
-    ) -> tuple[int, RequestOutput]:
+    ) -> tuple[int, RequestOutput, list, float]:
         """
         Generate a single sequence asynchronously using vLLM.
 
         This method creates an async generation task for a single prompt and
-        waits for completion, returning the final output.
+        waits for completion, returning the final output along with profiling data.
 
         Args:
-            idx: Index of the prompt in the batch
-            prompt_tokens: Either token IDs list or dict with prompt data
-            sampling_params: Sampling parameters for generation
-            uid: Unique identifier for the request (optional)
+            idx (int): Index of the prompt in the batch.
+            prompt_tokens (dict[str, Any] | list[int]): Either token IDs list or dict with prompt data.
+            sampling_params (SamplingParams): Sampling parameters for generation.
+            uid (str | None): Unique identifier for the request.
+            max_tokens (int | None): Maximum number of tokens to generate.
 
         Returns:
-            Tuple of (prompt_idx, final_request_output)
-            prompt_idx is the index of the prompt in the batch
+            tuple[int, RequestOutput, list, float]: (prompt_idx, final_request_output,
+                accumulated_events, generation_start_wall_ts)
         """
         # Ensure all abort requests in the queue are processed before starting generation
         # NOTE(lhy): currently, only the preempted requests are put into the abort queue.
@@ -721,14 +764,23 @@ class PSRL_vLLMRollout:
             sampling_params.max_tokens = int(max_tokens)
 
         request_id = str(uuid.uuid4()) if uid is None else uid
+
+        accumulated_events: list = []
+        generation_start_wall_ts = time.time()
+
         task = self.inference_engine.generate(
             prompt=TokensPrompt(**prompt_tokens),
             sampling_params=sampling_params,
             request_id=request_id,
         )
         async for output in task:
+            # Accumulate profiling events from each streaming output.
+            if hasattr(output, "events") and output.events:
+                accumulated_events.extend(output.events)
+                output.events = None  # Avoid double-counting
             last_output = output
-        return idx, last_output
+
+        return idx, last_output, accumulated_events, generation_start_wall_ts
 
     async def interrupt_all_requests_async(self) -> int:
         """

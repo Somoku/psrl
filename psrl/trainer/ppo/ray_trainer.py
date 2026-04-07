@@ -1516,6 +1516,15 @@ class PSRL_RayPPOTrainer:
             ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
             psrl_logger.info("PS worker group bound successfully!")
 
+            # When broadcast_init is enabled, rank-0's checkpoint weights are broadcast to
+            # all other PS workers via NIXL GPU-Direct using a binary-tree topology, avoiding
+            # N independent disk reads. Skip this block on the existing path (enabled=False).
+            if self.config.psrl.broadcast_init.enabled:
+                with log_dual_events(
+                    "Broadcast init: PS rank-0 → all workers", psrl_logger, event_type=EventType.INIT
+                ):
+                    ray.get(self.ps_manager_handle._coordinate_broadcast_init.remote())
+
             # Pull checkpoint weights from PS into gen and actor workers via NIXL.
             # NOTE(lhy): gen/val/actor workers are now empty-initialized and must pull from PS on startup.
             # When is_rollout_mode_in_actor is True, the actor is sleeping (meta mode) at this point

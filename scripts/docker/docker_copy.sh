@@ -1,39 +1,33 @@
 #!/bin/bash
 # set -v
 
-# This script load the sandbox_fusion_server docker image from tar file to all worker nodes.
-# Requires SANDBOX_NODE_NUM and SANDBOX_NODE_IPS (env or args: $1=SANDBOX_NODE_IPS, $2=SANDBOX_NODE_NUM).
+# Copy a shared-fs docker image tar to all cluster nodes and docker load.
+#
+# Positional (override env when non-empty; use "" only to skip a slot intentionally):
+#   $1=DOCKER_NODE_IPS   $2=DOCKER_NODE_NUM   $3=DOCKER_IMAGE_DIR   $4=DOCKER_IMAGE_FILE
+# Env (same names): DOCKER_NODE_IPS, DOCKER_NODE_NUM, DOCKER_IMAGE_DIR, DOCKER_IMAGE_FILE
+#
+# Example:
+#   ./docker_copy.sh '28.49.196.175:8,28.49.196.77:8' 8 /jizhicfs/.../SandboxFusion code_sandbox_server.tar
 
-[ -n "$1" ] && SANDBOX_NODE_IPS="$1"
-[ -n "$2" ] && SANDBOX_NODE_NUM="$2"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=docker_common.sh
+. "$SCRIPT_DIR/docker_common.sh"
 
-SANDBOX_SERVER_PATH=${SANDBOX_SERVER_PATH:-"/jizhicfs/johnnyslin/sandbox-docker/SandboxFusion"}
+[ -n "$1" ] && DOCKER_NODE_IPS="$1"
+[ -n "$2" ] && DOCKER_NODE_NUM="$2"
+[ -n "$3" ] && DOCKER_IMAGE_DIR="$3"
+[ -n "$4" ] && DOCKER_IMAGE_FILE="$4"
 
-if [ -z "$SANDBOX_NODE_IPS" ]; then
-    echo "Error: SANDBOX_NODE_IPS is not set"
-    exit 1
-fi
+DOCKER_IMAGE_DIR=${DOCKER_IMAGE_DIR:-"/jizhicfs/johnnyslin/sandbox-docker/SandboxFusion"}
+DOCKER_IMAGE_FILE=${DOCKER_IMAGE_FILE:-"code_sandbox_server.tar"}
 
-if [ -z "$SANDBOX_NODE_NUM" ]; then
-    SANDBOX_NODE_NUM=$(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | wc -l)
-fi
+docker_cluster_init || exit 1
+hosts_str=$(docker_cluster_hosts_csv)
 
-mapfile -t hosts < <(echo "$SANDBOX_NODE_IPS" | sed "s/:.//g; s/,/\\n/g" | head -n $SANDBOX_NODE_NUM)
-if [ ${#hosts[@]} -eq 0 ]; then
-    echo "Error: SANDBOX_NODE_IPS is empty or invalid"
-    exit 1
-fi
-
-MANAGER=${hosts[0]}
-WORKERS=("${hosts[@]:0}")
-
-# Build comma-separated host list for parallel pssh
-hosts_str=$(IFS=,; echo "${hosts[*]}")
-
-# 3. Copy tar and load image on all nodes in parallel (pssh fans out to all hosts concurrently)
 echo "=== Copying tar to all nodes in parallel ==="
-pssh -t 3600 -H "$hosts_str" -i "cp $SANDBOX_SERVER_PATH/code_sandbox_server.tar /tmp/"
+pssh -t 3600 -H "$hosts_str" -i "cp $DOCKER_IMAGE_DIR/$DOCKER_IMAGE_FILE /tmp/"
 echo "=== Loading docker image on all nodes in parallel ==="
-pssh -t 3600 -H "$hosts_str" -i "docker load -i /tmp/code_sandbox_server.tar && rm /tmp/code_sandbox_server.tar"
+pssh -t 3600 -H "$hosts_str" -i "docker load -i /tmp/$DOCKER_IMAGE_FILE && rm /tmp/$DOCKER_IMAGE_FILE"
 
 echo "=== Copy completed ==="

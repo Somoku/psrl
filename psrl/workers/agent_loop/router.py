@@ -696,6 +696,183 @@ class RolloutRouter:
                 psrl_logger.debug(f"Routing {route_num} requests in multi priority queue routing loop, time cost: {time.time() - begin_time} seconds")
             await asyncio.sleep(sleep_time)
 
+    def _profiling_accumulate_and_overwrite(
+        self,
+        consolidated_output: DataProto,
+        request: DataProto,
+        reroute_trigger: str,
+    ) -> None:
+        """
+        Accumulate profiling records from the current engine call and overwrite
+        the transient RESUME trigger.
+
+        Called when a request is rerouted (preempt_resume or partial_rollout_resume).
+        Records are stored in non_tensor_batch for persistence across reroutes.
+
+        Args:
+            consolidated_output (DataProto): Output from the current engine call.
+            request (DataProto): The original request (contains accumulated records
+                from previous reroutes, if any).
+            reroute_trigger (str): The trigger to assign
+                ("preempt_resume" or "partial_rollout_resume").
+        """
+        enable_profiling = self.config.psrl.profile.trajectory.enable
+        if not enable_profiling:
+            return
+
+        ntb = consolidated_output.non_tensor_batch
+
+        # Get current call's records
+        curr_prefill = ntb.get("profiling_prefill_records", [None])[0]
+        curr_decode = ntb.get("profiling_decode_records", [None])[0]
+        if not curr_prefill:
+            return
+
+        # Determine trigger for the first record of this engine call.
+        # If this is the first engine call (no accumulated records yet), use INITIAL.
+        # Otherwise use the reroute trigger.
+        accumulated_prefill = request.non_tensor_batch.get(
+            "_profiling_accumulated_prefill_records", [None]
+        )[0]
+        if accumulated_prefill is None or len(accumulated_prefill) == 0:
+            curr_prefill[0]["trigger"] = "initial"
+        else:
+            curr_prefill[0]["trigger"] = reroute_trigger
+
+        # Compute router_wait_s for rerouted calls.
+        reroute_submit_ts = float(
+            request.non_tensor_batch.get("_profiling_reroute_submit_ts", [0.0])[0]
+        )
+        gen_start_ts = float(ntb.get("profiling_generation_start_wall_ts", [0.0])[0])
+        if reroute_submit_ts > 0 and gen_start_ts > 0:
+            curr_prefill[0]["router_wait_s"] = max(gen_start_ts - reroute_submit_ts, 0.0)
+
+        # Accumulate into consolidated_output's non_tensor_batch (persists across reroutes).
+        if accumulated_prefill is None:
+            accumulated_prefill = []
+        accumulated_prefill = list(accumulated_prefill) + list(curr_prefill)
+
+        accumulated_decode = request.non_tensor_batch.get(
+            "_profiling_accumulated_decode_records", [None]
+        )[0]
+        if accumulated_decode is None:
+            accumulated_decode = []
+        if curr_decode:
+            accumulated_decode = list(accumulated_decode) + list(curr_decode)
+
+        consolidated_output.non_tensor_batch["_profiling_accumulated_prefill_records"] = np.array(
+            [accumulated_prefill], dtype=object
+        )
+        consolidated_output.non_tensor_batch["_profiling_accumulated_decode_records"] = np.array(
+            [accumulated_decode], dtype=object
+        )
+
+        # Save first generation start ts if this is the first call.
+        first_start_ts = float(
+            request.non_tensor_batch.get("_profiling_first_gen_start_ts", [0.0])[0]
+        )
+        if first_start_ts == 0.0:
+            first_start_ts = gen_start_ts
+        consolidated_output.non_tensor_batch["_profiling_first_gen_start_ts"] = np.array(
+            [first_start_ts], dtype=float
+        )
+
+        # Record reroute submit timestamp for the next call's router_wait computation.
+        consolidated_output.non_tensor_batch["_profiling_reroute_submit_ts"] = np.array(
+            [time.time()], dtype=float
+        )
+
+        # Record the reroute trigger so _profiling_finalize knows what to use.
+        consolidated_output.non_tensor_batch["_profiling_last_reroute_trigger"] = np.array(
+            [reroute_trigger], dtype=object
+        )
+
+    def _profiling_finalize(
+        self,
+        consolidated_output: DataProto,
+        request: DataProto,
+    ) -> None:
+        """
+        Finalize profiling data when a model turn completes.
+
+        Merges any accumulated records from previous reroutes with the final
+        engine call's records and overwrites the RESUME trigger on the first record.
+
+        Args:
+            consolidated_output (DataProto): Output from the final engine call.
+            request (DataProto): The original request.
+        """
+        enable_profiling = self.config.psrl.profile.trajectory.enable
+        if not enable_profiling:
+            return
+
+        ntb = consolidated_output.non_tensor_batch
+
+        # Get final call's records.
+        curr_prefill = ntb.get("profiling_prefill_records", [None])[0]
+        curr_decode = ntb.get("profiling_decode_records", [None])[0]
+
+        # Get accumulated records from previous reroutes.
+        accumulated_prefill = request.non_tensor_batch.get(
+            "_profiling_accumulated_prefill_records", [None]
+        )[0]
+        accumulated_decode = request.non_tensor_batch.get(
+            "_profiling_accumulated_decode_records", [None]
+        )[0]
+
+        if accumulated_prefill is not None and len(accumulated_prefill) > 0:
+            # This is a rerouted request — merge accumulated + current.
+            if curr_prefill:
+                # Use the stored trigger from the last reroute.
+                last_reroute_trigger = str(
+                    request.non_tensor_batch.get(
+                        "_profiling_last_reroute_trigger", ["preempt_resume"]
+                    )[0]
+                )
+                curr_prefill[0]["trigger"] = last_reroute_trigger
+                # Compute router_wait for this final rerouted call.
+                reroute_submit_ts = float(
+                    request.non_tensor_batch.get("_profiling_reroute_submit_ts", [0.0])[0]
+                )
+                gen_start_ts = float(ntb.get("profiling_generation_start_wall_ts", [0.0])[0])
+                if reroute_submit_ts > 0 and gen_start_ts > 0:
+                    curr_prefill[0]["router_wait_s"] = max(gen_start_ts - reroute_submit_ts, 0.0)
+
+                all_prefill = list(accumulated_prefill) + list(curr_prefill)
+            else:
+                all_prefill = list(accumulated_prefill)
+
+            all_decode = list(accumulated_decode) if accumulated_decode else []
+            if curr_decode:
+                all_decode = all_decode + list(curr_decode)
+
+            # Use the first generation start ts from the first call.
+            first_start_ts = float(
+                request.non_tensor_batch.get("_profiling_first_gen_start_ts", [0.0])[0]
+            )
+
+            ntb["profiling_prefill_records"] = np.array([all_prefill], dtype=object)
+            ntb["profiling_decode_records"] = np.array([all_decode], dtype=object)
+            if first_start_ts > 0:
+                ntb["profiling_generation_start_wall_ts"] = np.array(
+                    [first_start_ts], dtype=float
+                )
+        else:
+            # First (and only) engine call — just overwrite RESUME to INITIAL.
+            if curr_prefill and len(curr_prefill) > 0:
+                curr_prefill[0]["trigger"] = "initial"
+
+        # Clean up internal accumulation fields.
+        for key in [
+            "_profiling_accumulated_prefill_records",
+            "_profiling_accumulated_decode_records",
+            "_profiling_first_gen_start_ts",
+            "_profiling_reroute_submit_ts",
+            "_profiling_last_reroute_trigger",
+        ]:
+            ntb.pop(key, None)
+            request.non_tensor_batch.pop(key, None)
+
     async def _route_single_request(self, request: DataProto, new_instance_id: int):
         """Route a single request to a rollout instance.
 
@@ -784,6 +961,9 @@ class RolloutRouter:
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
+                self._profiling_accumulate_and_overwrite(
+                    consolidated_output, request, "preempt_resume"
+                )
                 self.requests_to_route.put(consolidated_output)
                 # No result to set since the request is not completed
                 return
@@ -795,6 +975,9 @@ class RolloutRouter:
                 # Put back in priority queue for partial rollout
                 # Ensure that the consolidated output has the rollout instance id recorded
                 consolidated_output.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
+                self._profiling_accumulate_and_overwrite(
+                    consolidated_output, request, "partial_rollout_resume"
+                )
                 self.requests_to_route.put(consolidated_output)
                 # No result to set since the request is not completed
                 return
@@ -806,6 +989,7 @@ class RolloutRouter:
                     f"parent prompt {parent_prompt_id} completed successfully, "
                     f"length is {response_len}"
                 )
+                self._profiling_finalize(consolidated_output, request)
                 result = consolidated_output
             else:
                 # Means the request is aborted

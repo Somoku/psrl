@@ -954,12 +954,19 @@ class PSRL_GenWorker(Worker):
             ):
                 vllm_outputs = await self.rollout.raw_generate_sequences_async(request, sampling_params)
 
-            vllm_output = vllm_outputs[0][1] if isinstance(vllm_outputs, list) else vllm_outputs[1]
+            # Unpack the 4-tuple: (idx, RequestOutput, events, start_ts)
+            raw_output = vllm_outputs[0] if isinstance(vllm_outputs, list) else vllm_outputs
+            _, vllm_output, accumulated_events, gen_start_ts = raw_output
             assert len(vllm_output.outputs) == 1, (
                 f"Expected no repeat in generation, got {len(vllm_output.outputs)} outputs."
             )
 
-            result = self.rollout.post_process_outputs(request, vllm_output)
+            result = self.rollout.post_process_outputs(
+                request,
+                vllm_output,
+                accumulated_events=accumulated_events,
+                generation_start_wall_ts=gen_start_ts,
+            )
 
             interrupted = result.non_tensor_batch["interrupted"][0]
             interrupted_by_scheduler = result.non_tensor_batch["interrupted_by_scheduler"][0]

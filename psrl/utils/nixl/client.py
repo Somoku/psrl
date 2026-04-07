@@ -1149,10 +1149,12 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
-            # Contiguous xfer can be merged and executed together later
+            # Contiguous xfer can be merged and executed together later.
+            # NOTE(claude): Use continue (not return) here so all shards are processed before returning.
+            # Returning inside the loop would silently skip all remaining shards for this key.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
-                return []
+                continue
             # Real xfer
             try:
                 if running_key is not None and running_shard_idx is not None:
@@ -1202,6 +1204,10 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client READ transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
+        # Return [] so the caller knows there is nothing to wait on immediately.
+        if merge_and_cache_xfer:
+            return []
         return shards_to_transfer
 
     def client_write(
@@ -1320,9 +1326,11 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
+            # NOTE(claude): Use continue (not return) here so all shards are processed before returning.
+            # Returning inside the loop would silently skip all remaining shards for this key.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("WRITE", local_desc, remote_desc, target_agent, tag, target_client))
-                return []
+                continue
             # Real xfer
             try:
                 if (key, shard_idx) in self._write_contiguous_event_cache:
@@ -1356,6 +1364,10 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client WRITE transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
+        # Return [] so the caller knows there is nothing to wait on immediately.
+        if merge_and_cache_xfer:
+            return []
         return shards_to_transfer
 
     def clear_intermediate_cached_data(self):

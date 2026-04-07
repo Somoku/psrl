@@ -29,17 +29,19 @@ class BaseConverter(ABC):
         sharding: NIXLSharding,
     ) -> tuple[Parameter, NIXLSharding]:
         """
-        Conditionally reshape a 2D Q/K/V weight to 3D group-interleaved layout and
-        update the sharding descriptor to match the new tensor shape.
+        Conditionally reshape a 1D or 2D Q/K/V weight or bias to 3D group-interleaved
+        layout and update the sharding descriptor to match the new tensor shape.
 
         Returns unchanged (param, sharding) if self.model_info does not contain
-        num_heads, param_name is not a Q/K/V weight, or param is not 2-dimensional.
+        num_heads, param_name is not a Q/K/V weight or bias, or param is not 1D or 2D.
 
         Local head counts are derived from the sharding descriptor:
           - dim=0 sharding: num_heads_local = num_heads // ws (may be 0 for fine-grained FSDP)
           - dim=1 sharding: all heads present on this rank; use global counts
 
-        Reshape rule: (rows, H) -> (G_eff, rows // G_eff, H)
+        Reshape rule:
+          For 2D weights: (rows, H) -> (G_eff, rows // G_eff, H).
+          For 1D biases:  (rows,)   -> (G_eff, rows // G_eff, 1).
         where G_eff = gcd(num_heads_local, num_kv_heads_local).
 
         Sharding update — three cases based on ws and G_global = gcd(num_heads, num_kv_heads):
@@ -47,6 +49,7 @@ class BaseConverter(ABC):
           Case A — shard_dim_2d == 1 (hidden dim sharded):
             Hidden shifts from index 1 -> 2 after reshape.
             New sharding: shard_mesh={2: ws}, shard_indices=[(rank,)].
+            Impossible for 1D bias (no hidden dim to shard).
 
           Case B — shard_dim_2d == 0, ws <= G_global (coarse head sharding):
             Each rank holds whole head groups; shard_mesh={0: ws} stays valid in 3D.
@@ -61,14 +64,14 @@ class BaseConverter(ABC):
 
         Args:
             param_name (str): Fully-qualified parameter name.
-            param (Parameter): The 2D parameter tensor.
+            param (Parameter): The 1D or 2D parameter tensor.
             sharding (NIXLSharding): Existing sharding descriptor for this param.
 
         Returns:
             tuple[Parameter, NIXLSharding]: Reshaped param and updated sharding.
         """
         num_heads = self.model_info.get("num_heads")
-        if num_heads is None or not is_qkv_weight(param_name) or param.ndim != 2:
+        if num_heads is None or not is_qkv_weight(param_name) or param.ndim not in (1, 2):
             return param, sharding
 
         num_kv_heads = self.model_info["num_kv_heads"]
@@ -77,7 +80,8 @@ class BaseConverter(ABC):
         shard_dim_2d = next(iter(sharding.shard_mesh.keys()))
         ws = next(iter(sharding.shard_mesh.values()))
         rank = sharding.shard_indices[0][0]
-        rows, H = param.shape
+        rows = param.shape[0]
+        H = param.shape[1] if param.ndim == 2 else 1
 
         # Derive local head counts from the sharding descriptor.
         if shard_dim_2d == 0:
@@ -90,6 +94,10 @@ class BaseConverter(ABC):
 
         if shard_dim_2d == 1:
             # Case A: hidden dim sharded; hidden moves from dim=1 to dim=2 after reshape.
+            assert param.ndim == 2, (
+                f"shard_dim=1 requires a 2D parameter (hidden dim must exist), "
+                f"but {param_name} is {param.ndim}D."
+            )
             reshaped = reshape_qkv_to_3d(
                 make_slice_parameter(param.data, param),
                 num_heads_local=num_heads_local,

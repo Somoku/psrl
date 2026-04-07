@@ -49,20 +49,25 @@ def reshape_qkv_to_3d(
     head_size: int,
 ) -> Parameter:
     """
-    Reshape a 2D Q/K/V weight tensor into the 3D group-interleaved layout used by
-    slice_qkv_proj_megatron, so that all three sides (Megatron/PS/vLLM) register
-    the same shape with NIXL and can_xfer_to passes.
+    Reshape a 1D or 2D Q/K/V weight or bias tensor into the 3D group-interleaved
+    layout used by slice_qkv_proj_megatron, so that all three sides
+    (Megatron/PS/vLLM) register the same shape with NIXL and can_xfer_to passes.
+
+    For 2D weights: (rows, hidden) -> (G, rows // G, hidden).
+    For 1D biases:  (rows,)       -> (G, rows // G, 1).
 
     Args:
-        param (Parameter): 2D tensor of shape (rows, hidden) where rows is either
-            num_heads_local * head_size (for Q) or num_kv_heads_local * head_size (for K/V).
+        param (Parameter): 1D tensor of shape (rows,) or 2D tensor of shape
+            (rows, hidden), where rows is num_heads_local * head_size (for Q)
+            or num_kv_heads_local * head_size (for K/V).
         num_heads_local (int): Number of Q heads on this TP rank.
         num_kv_heads_local (int): Number of KV heads on this TP rank.
         head_size (int): Dimension of each head.
 
     Returns:
         Parameter: View of shape (num_groups_local, heads_per_group * head_size, hidden)
-            where num_groups_local = gcd(num_heads_local, num_kv_heads_local).
+            where num_groups_local = gcd(num_heads_local, num_kv_heads_local)
+            and hidden is 1 for 1D bias inputs.
     """
     import math
 

@@ -249,6 +249,31 @@ class TestReshapeQKVTo3D(unittest.TestCase):
         param, result = self._run(rows, H, num_heads=32, num_kv_heads=8, head_size=128)
         self.assertEqual(result.numel(), rows * H)
 
+    def test_1d_bias_shape(self):
+        # num_heads=8, num_kv_heads=8, head_size=64 -> G=8
+        # Q bias: (512,) -> (8, 64, 1)
+        data = torch.randn(512)
+        param = Parameter(data.clone())
+        result = reshape_qkv_to_3d(param, num_heads_local=8, num_kv_heads_local=8, head_size=64)
+        self.assertEqual(result.shape, (8, 64, 1))
+
+    def test_1d_bias_storage_shared(self):
+        data = torch.randn(512)
+        param = Parameter(data.clone())
+        result = reshape_qkv_to_3d(param, num_heads_local=8, num_kv_heads_local=8, head_size=64)
+        self.assertEqual(
+            result.data.untyped_storage().data_ptr(),
+            param.data.untyped_storage().data_ptr(),
+        )
+
+    def test_1d_bias_gqa(self):
+        # num_heads=32, num_kv_heads=8, head_size=128 -> G=8
+        # Q bias: (4096,) -> (8, 512, 1)
+        data = torch.randn(4096)
+        param = Parameter(data.clone())
+        result = reshape_qkv_to_3d(param, num_heads_local=32, num_kv_heads_local=8, head_size=128)
+        self.assertEqual(result.shape, (8, 512, 1))
+
 
 # ---------------------------------------------------------------------------
 # slice_qkv_proj
@@ -377,11 +402,12 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         self.assertIs(out_p, param)
         self.assertIs(out_s, sharding)
 
-    def test_noop_1d_param(self):
+    def test_noop_1d_non_qkv_param(self):
+        """1D non-QKV params (e.g. layernorm) are still no-ops."""
         conv = _make_converter()
         param = _make_param((4096,))
         sharding = _default_sharding()
-        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.input_layernorm.weight", param, sharding)
         self.assertIs(out_p, param)
         self.assertIs(out_s, sharding)
 
@@ -576,6 +602,94 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
             )
             self.assertEqual(out_p.ndim, 3, f"Expected 3D for {name}")
 
+    # -----------------------------------------------------------------------
+    # 1D bias support
+    # -----------------------------------------------------------------------
+
+    def test_1d_bias_case_b_default_sharding(self):
+        """1D Q bias with default sharding (ws=1) -> Case B, reshaped to 3D."""
+        num_heads, num_kv_heads, head_size = 32, 8, 128
+        rows = num_heads * head_size  # 4096
+        param = _make_param((rows,))
+        sharding = _default_sharding()
+        conv = _make_converter(num_heads, num_kv_heads, head_size)
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
+            "model.layers.0.self_attn.q_proj.bias", param, sharding
+        )
+        G = math.gcd(num_heads, num_kv_heads)  # 8
+        self.assertEqual(out_p.shape, (G, num_heads // G * head_size, 1))
+        self.assertIs(out_s, sharding)
+
+    def test_1d_bias_case_b_tp_sharded(self):
+        """1D K bias with shard_dim=0, ws=4 <= G=8 -> Case B."""
+        num_heads, num_kv_heads, head_size = 32, 8, 128
+        ws = 4
+        rows = num_kv_heads // ws * head_size  # 2*128 = 256
+        param = _make_param((rows,))
+        sharding = _sharding(shard_dim=0, ws=ws, rank=1)
+        conv = _make_converter(num_heads, num_kv_heads, head_size)
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
+            "model.layers.0.self_attn.k_proj.bias", param, sharding
+        )
+        G_eff = math.gcd(num_kv_heads // ws, num_kv_heads // ws)  # gcd(2,2) = 2
+        self.assertEqual(out_p.shape, (G_eff, rows // G_eff, 1))
+        self.assertIs(out_s, sharding)
+
+    def test_1d_bias_case_c(self):
+        """1D Q bias with shard_dim=0, ws=16 > G=8 -> Case C."""
+        num_heads, num_kv_heads, head_size = 32, 8, 128
+        ws = 16
+        rows = num_heads // ws * head_size  # 2*128 = 256
+        param = _make_param((rows,))
+        sharding = _sharding(shard_dim=0, ws=ws, rank=5)
+        conv = _make_converter(num_heads, num_kv_heads, head_size)
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
+            "model.layers.0.self_attn.q_proj.bias", param, sharding
+        )
+        G_global = math.gcd(num_heads, num_kv_heads)  # 8
+        steps = ws // G_global  # 2
+        self.assertEqual(out_p.shape, (1, rows, 1))
+        self.assertEqual(out_s.shard_mesh, OrderedDict([(0, G_global), (1, steps)]))
+        self.assertEqual(out_s.shard_indices, [(5 // steps, 5 % steps)])
+
+    def test_1d_bias_case_a_assertion(self):
+        """1D bias with shard_dim=1 is impossible -> should raise AssertionError."""
+        num_heads, num_kv_heads, head_size = 32, 8, 128
+        rows = num_heads * head_size
+        param = _make_param((rows,))
+        sharding = _sharding(shard_dim=1, ws=2, rank=0)
+        conv = _make_converter(num_heads, num_kv_heads, head_size)
+        with self.assertRaises(AssertionError):
+            conv.maybe_reshape_qkv_to_3d(
+                "model.layers.0.self_attn.q_proj.bias", param, sharding
+            )
+
+    def test_1d_bias_storage_shared(self):
+        """1D bias reshape must share storage with original param."""
+        num_heads, num_kv_heads, head_size = 32, 8, 128
+        rows = num_heads * head_size
+        param = _make_param((rows,))
+        sharding = _default_sharding()
+        conv = _make_converter(num_heads, num_kv_heads, head_size)
+        out_p, _ = conv.maybe_reshape_qkv_to_3d(
+            "model.layers.0.self_attn.q_proj.bias", param, sharding
+        )
+        self.assertEqual(
+            out_p.data.untyped_storage().data_ptr(),
+            param.data.untyped_storage().data_ptr(),
+        )
+
+    def test_noop_0d_param(self):
+        """0D (scalar) params should still be no-ops."""
+        conv = _make_converter()
+        param = Parameter(torch.tensor(1.0))
+        sharding = _default_sharding()
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
+            "model.layers.0.self_attn.q_proj.bias", param, sharding
+        )
+        self.assertIs(out_p, param)
+        self.assertIs(out_s, sharding)
+
 
 # ---------------------------------------------------------------------------
 # HFConverter.convert_state_and_sharding_dict
@@ -590,6 +704,24 @@ def _make_minimal_hf_model(num_heads=32, num_kv_heads=8, head_size=128, hidden=4
                 "model.layers.0.self_attn.q_proj.weight": torch.randn(num_heads * head_size, hidden),
                 "model.layers.0.self_attn.k_proj.weight": torch.randn(num_kv_heads * head_size, hidden),
                 "model.layers.0.self_attn.v_proj.weight": torch.randn(num_kv_heads * head_size, hidden),
+                "model.layers.0.mlp.gate_proj.weight": torch.randn(11008, hidden),
+            }
+
+    return FakeModel()
+
+
+def _make_minimal_hf_model_with_bias(num_heads=32, num_kv_heads=8, head_size=128, hidden=4096):
+    """Build a tiny fake HF-like model with QKV weights and biases."""
+
+    class FakeModel:
+        def state_dict(self):
+            return {
+                "model.layers.0.self_attn.q_proj.weight": torch.randn(num_heads * head_size, hidden),
+                "model.layers.0.self_attn.q_proj.bias": torch.randn(num_heads * head_size),
+                "model.layers.0.self_attn.k_proj.weight": torch.randn(num_kv_heads * head_size, hidden),
+                "model.layers.0.self_attn.k_proj.bias": torch.randn(num_kv_heads * head_size),
+                "model.layers.0.self_attn.v_proj.weight": torch.randn(num_kv_heads * head_size, hidden),
+                "model.layers.0.self_attn.v_proj.bias": torch.randn(num_kv_heads * head_size),
                 "model.layers.0.mlp.gate_proj.weight": torch.randn(11008, hidden),
             }
 
@@ -684,6 +816,22 @@ class TestHFConverter(unittest.TestCase):
         state, sharding = convert_hf_inplace(HFParameterMapping(config), model)
         self.assertIn("model.layers.0.self_attn.q_proj.weight", state)
         self.assertEqual(state["model.layers.0.self_attn.q_proj.weight"].ndim, 3)
+
+    def test_qkv_biases_are_3d(self):
+        """QKV biases (1D) should be reshaped to 3D with hidden=1."""
+        num_heads, num_kv_heads, head_size, hidden = 32, 8, 128, 4096
+        G = math.gcd(num_heads, num_kv_heads)
+        model = _make_minimal_hf_model_with_bias(num_heads, num_kv_heads, head_size, hidden)
+        conv = self._converter(num_heads, num_kv_heads, head_size, hidden)
+        state, _ = conv.convert_state_and_sharding_dict(model)
+        # Q bias: (4096,) -> (8, 512, 1)
+        q_bias = state["model.layers.0.self_attn.q_proj.bias"]
+        self.assertEqual(q_bias.ndim, 3)
+        self.assertEqual(q_bias.shape, (G, num_heads // G * head_size, 1))
+        # K bias: (1024,) -> (8, 128, 1)
+        k_bias = state["model.layers.0.self_attn.k_proj.bias"]
+        self.assertEqual(k_bias.ndim, 3)
+        self.assertEqual(k_bias.shape, (G, num_kv_heads // G * head_size, 1))
 
 
 # ---------------------------------------------------------------------------

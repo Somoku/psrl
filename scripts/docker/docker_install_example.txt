@@ -1,0 +1,10 @@
+# Image tar: DOCKER_IMAGE_DIR + DOCKER_IMAGE_FILE (positional $1 $2; legacy env DOCKER_IMAGE_NAME still works)
+DOCKERHUB_MIRROR=docker.m.daocloud.io \
+DOCKER_INSTALL_METHOD=skopeo \
+/jizhicfs/lhy/psrl_agent/scripts/docker/docker_install.sh \
+/jizhicfs/lhy/docker_images python_3.11-slim.tar python:3.11-slim
+
+# Push tar to cluster (reuse same dir + tar name as install)
+# DOCKER_NODE_IPS=... DOCKER_NODE_NUM=8 \
+#   /jizhicfs/lhy/psrl_agent/scripts/docker/docker_copy.sh "$DOCKER_NODE_IPS" "$DOCKER_NODE_NUM" \
+#   /jizhicfs/lhy/docker_images python_3.11-slim.tar

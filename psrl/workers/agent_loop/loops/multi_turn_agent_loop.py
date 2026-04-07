@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 from verl import DataProto
 
 from psrl.environments.base import Environment
+from psrl.utils.profiling.collector import TurnProfilingCollector
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
@@ -50,6 +51,41 @@ def _set_multi_turn_aggregates(
             multi_turn_metrics[f"multi_turn/{name}_all_turns"] = 0
             multi_turn_metrics[f"multi_turn/max_{name}_all_turns"] = 0
             multi_turn_metrics[f"multi_turn/min_{name}_all_turns"] = 0
+
+
+def _finalize_profiling(
+    profiling_collector: TurnProfilingCollector | None,
+    request: DataProto,
+    result: DataProto | None,
+    config: DictConfig,
+) -> None:
+    """
+    Finalize profiling data, write to JSONL, and strip profiling fields.
+
+    Args:
+        profiling_collector (TurnProfilingCollector | None): The collector, or
+            None if profiling is disabled.
+        request (DataProto): The original request (for request_id).
+        result (DataProto | None): The finalized output (for cleanup).
+        config (DictConfig): Config for output path.
+    """
+    if profiling_collector is None or result is None:
+        return
+
+    request_id = int(request.non_tensor_batch.get("uid", [0])[0])
+    profiling_data = profiling_collector.finalize(request_id)
+    if profiling_data is not None:
+        output_path = config.psrl.profile.trajectory.output_dir + "/trajectory_profiling.jsonl"
+        profiling_data.write_jsonl(output_path)
+
+    # Strip profiling fields from non_tensor_batch before returning to trainer.
+    for key in [
+        "profiling_generation_start_wall_ts",
+        "profiling_generation_end_wall_ts",
+        "profiling_prefill_records",
+        "profiling_decode_records",
+    ]:
+        result.non_tensor_batch.pop(key, None)
 
 
 @register("multi_turn_agent")
@@ -100,6 +136,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
         generate_times: list[float] = []
         env_step_times: list[float] = []
 
+        # Per-trajectory profiling
+        enable_profiling = self.config.psrl.profile.trajectory.enable
+        profiling_collector = TurnProfilingCollector() if enable_profiling else None
+
         env_class = request.non_tensor_batch.get(
             "env_class", [self.config.gen_actor_rollout_ref.rollout.agent.env.name]
         )[0]
@@ -148,7 +188,9 @@ class MultiTurnAgentLoop(AgentLoopBase):
                 generate_times,
                 env_step_times,
             )
-            return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+            finalized = await self.agent_data.finalize_output(request)
+            _finalize_profiling(profiling_collector, request, finalized, self.config)
+            return finalized, TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
         for _ in range(self.max_turns):
             # Currently we still use token-in-token-out generation,
@@ -158,9 +200,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
             # check redundant padding in single-request case
             async with sticky_session(self.rollout_router, request):
                 with _append_timer(generate_times):
-                    output = await self.rollout_router.generate_async.remote(
-                        self.agent_data.prepare_generation_request(request)
-                    )
+                    gen_request = self.agent_data.prepare_generation_request(request)
+                    if profiling_collector is not None:
+                        profiling_collector.on_turn_submit()
+                    output = await self.rollout_router.generate_async.remote(gen_request)
 
             if output is None:
                 _set_multi_turn_aggregates(
@@ -168,7 +211,12 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     generate_times,
                     env_step_times,
                 )
+                _finalize_profiling(profiling_collector, request, None, self.config)
                 return None, TerminateReason.ABORTED
+
+            # Record profiling data for this turn.
+            if profiling_collector is not None:
+                profiling_collector.on_turn_complete(output)
 
             # TODO: we may implement `update_from_model_chat_completion` in the future.
             action, overlong_terminate = await self.agent_data.update_from_model_token_ids(output)
@@ -179,7 +227,9 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     generate_times,
                     env_step_times,
                 )
-                return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                finalized = await self.agent_data.finalize_output(request)
+                _finalize_profiling(profiling_collector, request, finalized, self.config)
+                return finalized, TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             try:
                 with _append_timer(env_step_times):
@@ -194,7 +244,9 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     generate_times,
                     env_step_times,
                 )
-                return await self.agent_data.finalize_output(request), TerminateReason.ENV_TIMEOUT
+                finalized = await self.agent_data.finalize_output(request)
+                _finalize_profiling(profiling_collector, request, finalized, self.config)
+                return finalized, TerminateReason.ENV_TIMEOUT
 
             overlong_terminate = await self.agent_data.update_from_env(observation, reward, done, info)
 
@@ -204,7 +256,9 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     generate_times,
                     env_step_times,
                 )
-                return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                finalized = await self.agent_data.finalize_output(request)
+                _finalize_profiling(profiling_collector, request, finalized, self.config)
+                return finalized, TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             if done:
                 _set_multi_turn_aggregates(
@@ -212,11 +266,15 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     generate_times,
                     env_step_times,
                 )
-                return await self.agent_data.finalize_output(request), TerminateReason.FINISHED
+                finalized = await self.agent_data.finalize_output(request)
+                _finalize_profiling(profiling_collector, request, finalized, self.config)
+                return finalized, TerminateReason.FINISHED
 
         _set_multi_turn_aggregates(
             multi_turn_metrics,
             generate_times,
             env_step_times,
         )
-        return await self.agent_data.finalize_output(request), TerminateReason.MAX_TURNS_EXCEEDED
+        finalized = await self.agent_data.finalize_output(request)
+        _finalize_profiling(profiling_collector, request, finalized, self.config)
+        return finalized, TerminateReason.MAX_TURNS_EXCEEDED

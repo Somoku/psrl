@@ -46,6 +46,15 @@ profile:
   # Useful for analysis
   fix_weight: False
 
+  # Trajectory profiling: per-trajectory re-prefill tracking
+  trajectory:
+
+    # Whether to enable per-trajectory profiling
+    enable: True
+
+    # Output directory for profiling JSONL files
+    output_dir: ${psrl.logging_path}/trajectory_profiling
+
 # Config for logprobs
 log_prob:
 
@@ -115,10 +124,10 @@ status_collection:
 
   # The level of logging to file
   # Available options: "none", "partial_rollout", "prompt", "generation", "all"
-  dump_logging_to_file_level: generation
+  dump_logging_to_file_level: all
 
   # Logging interval in milliseconds
-  dump_logging_to_file_interval_in_ms: 500
+  dump_logging_to_file_interval_in_ms: 2000
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
   # Here 10 means sync every 0.1 second
@@ -293,10 +302,19 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 64
+  max_pinned_temp_memory_slots: 16
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
+# Broadcast initialization: rank-0 PS worker reads checkpoint, distributes to others via NIXL.
+broadcast_init:
+
+  # Set to true to use rank-0 broadcast initialization instead of each worker reading disk.
+  enabled: false
+
+  # Broadcast algorithm. Supported: binary_tree. Reserved for future: ring.
+  algorithm: binary_tree
 
 # Post processor for group requests in streaming mode
 group_post_process:
@@ -344,3 +362,35 @@ tms:
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
   enable_nixl: True
+
+# LMCache KV cache offloading configuration.
+# When enabled, vLLM offloads KV cache to the specified backend (CPU by default),
+# enabling prefix cache hits across multi-turn agent loop turns without re-prefill.
+lmcache:
+
+  # Whether to enable LMCache KV offloading in vLLM
+  enable: False
+
+  # Backend for offloaded KV: cpu, disk, or remote (Phase 2)
+  backend: cpu
+
+  # Total offload budget in GiB across all TP ranks
+  offload_size_gb: 10.0
+
+  # Token chunk size for hashing
+  chunk_size: 256
+
+  # Full LMCache YAML config path (overrides the fields above when set)
+  config_file: null
+
+  # Local disk path when backend is disk
+  disk_path: null
+
+  # Max disk usage in GiB when using disk backend
+  max_disk_size_gb: 50.0
+
+  # Remote server URL (Phase 2) when backend is remote
+  remote_url: null
+
+  # Whether to clear stale KV cache after model weight pull from PS
+  clear_on_weight_update: True

@@ -227,11 +227,12 @@ class StatCollector(StatLoggerBase):
                 "num_finished_reqs": len(getattr(iteration_stats, "finished_requests", [])),
                 # "max_time_to_first_tokens": np.max(time_to_first_tokens_iter),
                 # "max_inter_token_latencies": np.max(inter_token_latencies_iter),
-                "avg_time_to_first_tokens": np.mean(time_to_first_tokens_iter),
-                "avg_inter_token_latencies": np.mean(inter_token_latencies_iter),
+                "avg_time_to_first_tokens": np.mean(time_to_first_tokens_iter).item(),
+                "avg_inter_token_latencies": np.mean(inter_token_latencies_iter).item(),
             }
+            avg_itl = iteration_stats_entry["avg_inter_token_latencies"]
             snapshot["generation_throughput"] = (
-                num_generation_reqs / iteration_stats_entry["avg_inter_token_latencies"]
+                num_generation_reqs / avg_itl if avg_itl > 0.0 else 0.0
             )
             snapshot["iteration_stats"] = iteration_stats_entry
 

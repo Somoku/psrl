@@ -104,7 +104,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         return initial_observation, info
 
-    async def step(self, action: ToolAction) -> EnvStepOutput:
+    async def step(self, action: ToolAction, tools_kwargs: dict | None = None) -> EnvStepOutput:
         """Execute a step in the environment by calling tools.
 
         Takes a tool action (one or more tool calls) from the agent, executes
@@ -112,6 +112,8 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         Args:
             action: Tool action - either a single tool call dict or list of tool calls
+            tools_kwargs: Optional per-sample kwargs forwarded to each tool call
+                (e.g. sandbox credentials).  Keyed by tool name.
 
         Returns:
             EnvStepOutput: Dictionary containing:
@@ -150,12 +152,14 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                 info={},
             )
 
+        tools_kwargs = tools_kwargs or {}
+
         # Execute tool calls with an explicit concurrency cap to control latency spikes.
         sem = asyncio.Semaphore(self.max_parallel_calls)
 
         async def _guarded_call(tc: dict):
             async with sem:
-                return await self._call_tool(tc)
+                return await self._call_tool(tc, tools_kwargs)
 
         tool_outputs = await asyncio.gather(*[_guarded_call(tc) for tc in action])
 
@@ -173,7 +177,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             info={},
         )
 
-    async def _call_tool(self, tool_call: dict) -> dict[str, str]:
+    async def _call_tool(self, tool_call: dict, tools_kwargs: dict | None = None) -> dict[str, str]:
         """Call a single tool and format the response.
 
         Executes the specified tool with the provided arguments, handles errors,
@@ -182,6 +186,9 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         Args:
             tool_call: Dictionary containing tool call information with structure:
                       {"function": {"name": str, "arguments": str (JSON)}}
+            tools_kwargs: Optional per-sample kwargs keyed by tool name.  When
+                present, the matching entry is merged into the keyword arguments
+                passed to the tool.
 
         Returns:
             tuple: (tool_message, tool_reward) where:
@@ -197,6 +204,12 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             # Extract tool name and arguments from tool call
             tool_name = tool_call["function"]["name"]
             tool_args = json.loads(tool_call["function"]["arguments"])
+
+            # Merge per-sample extra kwargs for this tool (if any).
+            if tools_kwargs:
+                extra = tools_kwargs.get(tool_name, {})
+                if extra:
+                    tool_args = {**extra, **tool_args}
 
             # Retrieve and execute the tool
             tool = self.tools.get_tool(tool_name)

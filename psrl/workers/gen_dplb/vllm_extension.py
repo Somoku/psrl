@@ -9,14 +9,14 @@ from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
+from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+from psrl.utils.common.worker_naming import gen_client_name
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
-from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
 from psrl.utils.nixl import (
-    GLOBAL_GEN_CLIENT_NAME,
-    GLOBAL_META_SERVER_NAME,
     NIXLClientType,
     NIXLStorageClient,
 )
@@ -98,8 +98,8 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         self.unified_sharding_dict = None
         # Initialize the NIXL client
         self.nixl_storage_client = NIXLStorageClient(
-            client_name=f"{GLOBAL_GEN_CLIENT_NAME}_I{replica_idx}_R{self.get_instance_local_rank()}",
-            server_name=GLOBAL_META_SERVER_NAME,
+            client_name=gen_client_name(replica_idx, self.get_instance_local_rank()),
+            server_name=NIXL_META_SERVER_NAME,
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=nixl_config,

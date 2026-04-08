@@ -8,10 +8,10 @@ test_communication_planner: CPU-only; NIXLTensorInfo is constructable without th
   testing the planner's routing/assignment logic).
 """
 
-import pytest
-import torch
 from collections import OrderedDict
 
+import pytest
+import torch
 from psrl.utils.nixl.comm_plan import (
     NIXLClientInfo,
     NIXLClientType,
@@ -148,20 +148,16 @@ def test_communication_planner():
         for key, ps_plans in key_plans.items():
             for ps_client, shards in ps_plans.items():
                 link_type = global_comm_planner._get_link_type_for_test(push_client, ps_client)
-                assert link_type is not None, \
-                    f"Expected non-None link type for {push_client} -> {ps_client}"
-                assert isinstance(link_type, LinkType), \
-                    f"Expected LinkType instance, got {type(link_type)}"
+                assert link_type is not None, f"Expected non-None link type for {push_client} -> {ps_client}"
+                assert isinstance(link_type, LinkType), f"Expected LinkType instance, got {type(link_type)}"
 
     # Verify PULL_SIDE <- PS_FOR_PULL plan has entries and link types are valid
     for pull_client, key_plans in comm_plan.rollout_pull_from_ps_plan.items():
         for key, ps_plans in key_plans.items():
             for ps_client, shards in ps_plans.items():
                 link_type = global_comm_planner._get_link_type_for_test(ps_client, pull_client)
-                assert link_type is not None, \
-                    f"Expected non-None link type for {ps_client} -> {pull_client}"
-                assert isinstance(link_type, LinkType), \
-                    f"Expected LinkType instance, got {type(link_type)}"
+                assert link_type is not None, f"Expected non-None link type for {ps_client} -> {pull_client}"
+                assert isinstance(link_type, LinkType), f"Expected LinkType instance, got {type(link_type)}"
 
 
 def test_network_topology_integration():
@@ -172,10 +168,10 @@ def test_network_topology_integration():
     topology = NetworkTopology()
 
     # Register four clients with different topological relationships
-    topology.register_client("client_A", "192.168.1.1", 0)   # GPU 0 on node 1
-    topology.register_client("client_B", "192.168.1.1", 1)   # GPU 1 on node 1 (same node, diff GPU)
+    topology.register_client("client_A", "192.168.1.1", 0)  # GPU 0 on node 1
+    topology.register_client("client_B", "192.168.1.1", 1)  # GPU 1 on node 1 (same node, diff GPU)
     topology.register_client("client_C", "192.168.1.1", -1)  # CPU on node 1
-    topology.register_client("client_D", "192.168.1.2", 0)   # GPU 0 on node 2 (different node)
+    topology.register_client("client_D", "192.168.1.2", 0)  # GPU 0 on node 2 (different node)
 
     link_aa = topology.get_link_type("client_A", "client_A")
     link_ab = topology.get_link_type("client_A", "client_B")
@@ -183,20 +179,20 @@ def test_network_topology_integration():
     link_ad = topology.get_link_type("client_A", "client_D")
 
     # Verify specific link types based on PSRL topology heuristics
-    assert link_aa == LinkType.LOCAL          # same GPU → local memory
-    assert link_ab == LinkType.NVLINK         # same node, different GPU → NVLink
-    assert link_ac == LinkType.PCIE           # same node, CPU (gpu_id=-1) → PCIe
+    assert link_aa == LinkType.LOCAL  # same GPU → local memory
+    assert link_ab == LinkType.NVLINK  # same node, different GPU → NVLink
+    assert link_ac == LinkType.PCIE  # same node, CPU (gpu_id=-1) → PCIe
     assert link_ad in (LinkType.IB, LinkType.IB_PCIE)  # different node → InfiniBand
 
     # All bandwidths must be positive
-    bw_local  = topology.get_bandwidth_gbps("client_A", "client_A")
+    bw_local = topology.get_bandwidth_gbps("client_A", "client_A")
     bw_nvlink = topology.get_bandwidth_gbps("client_A", "client_B")
-    bw_pcie   = topology.get_bandwidth_gbps("client_A", "client_C")
-    bw_ib     = topology.get_bandwidth_gbps("client_A", "client_D")
-    assert bw_local  > 0
+    bw_pcie = topology.get_bandwidth_gbps("client_A", "client_C")
+    bw_ib = topology.get_bandwidth_gbps("client_A", "client_D")
+    assert bw_local > 0
     assert bw_nvlink > 0
-    assert bw_pcie   > 0
-    assert bw_ib     > 0
+    assert bw_pcie > 0
+    assert bw_ib > 0
     # LOCAL (1000 Gbps) is fastest; NVLINK is fast intra-node
     assert bw_local >= bw_nvlink, f"Expected LOCAL ({bw_local}) >= NVLINK ({bw_nvlink})"
 

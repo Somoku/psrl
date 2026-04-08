@@ -129,6 +129,15 @@ class Trajectory:
     response_logprobs: list[float] = field(default_factory=list)
     routed_experts: list[int] = field(default_factory=list)
 
+    # Per-turn reward signals
+    # Rewards collected from tool execution at each user turn.
+    tool_rewards: list[float] = field(default_factory=list)
+    # Rewards collected from an Interaction at each user turn (e.g. human feedback).
+    turn_scores: list[float] = field(default_factory=list)
+
+    # Arbitrary extra fields for dynamic addition (e.g. tools_kwargs, interaction_kwargs).
+    extra_fields: dict = field(default_factory=dict)
+
 
 ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
@@ -318,8 +327,12 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         return
 
     @abstractmethod
-    def encode_observation(self, observation: ObsType, *, is_init: bool) -> tuple[list[int], bool]:
-        """Encode an environment observation into token IDs.
+    async def encode_observation(self, observation: ObsType, *, is_init: bool) -> tuple[list[int], bool]:
+        """Encode an environment observation into token IDs (async).
+
+        Implementations should offload blocking tokenizer calls to the default
+        executor (``asyncio.get_running_loop().run_in_executor(None, ...)``) so
+        the event loop is not blocked.
 
         Default implementation indicates "not implemented" so subclasses can
         keep implementing `update_from_env` directly.
@@ -400,6 +413,14 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             NotImplementedError: Must be implemented by subclasses.
         """
         raise NotImplementedError(f"{self.__class__.__name__} must implement update_from_model_token_ids method.")
+
+    def prepare_chat_completion_request(self) -> tuple[list[dict], list[dict] | None]:
+        """Build (messages, tools) for the chat completion API.
+
+        Returns:
+            Tuple of (messages list, tools list or None).
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} must implement prepare_chat_completion_request method.")
 
     async def update_from_model_chat_completion(self, output: Any, **kwargs) -> tuple[ActType, bool]:
         """Update agent data from model chat completion output.
@@ -526,12 +547,16 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         if len(self.trajectory.routed_experts) > 0:
             non_tensor_batch["routed_experts"] = np.array([self.trajectory.routed_experts])
 
+        # Propagate per-turn reward signals for downstream reward shaping.
+        non_tensor_batch["turn_scores"] = np.array([self.trajectory.turn_scores], dtype=object)
+        non_tensor_batch["tool_rewards"] = np.array([self.trajectory.tool_rewards], dtype=object)
+
         data = DataProto(non_tensor_batch=non_tensor_batch, meta_info=request.meta_info)
 
         output: DataProto = data
 
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
-            assert not self.config.reward_model.launch_reward_fn_async, (
+            assert not self.config.reward.launch_reward_fn_async, (
                 "Asynchronous reward computation is not supported in 'step' traj_reward_mode."
             )
             self.trajectory.reward = np.sum([self.compute_step_reward(step) for step in self.trajectory.steps])
@@ -541,7 +566,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             output = self._post_process_and_merge_reward(reward_result, data)
         elif self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "traj":
             reward_result = await self.reward_manager.compute_score.remote(data)
-            if not self.config.reward_model.launch_reward_fn_async:
+            if not self.config.reward.launch_reward_fn_async:
                 output = self._post_process_and_merge_reward(reward_result, data)
         else:
             raise ValueError(

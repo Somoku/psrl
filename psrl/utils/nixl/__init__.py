@@ -1,12 +1,8 @@
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+
 from .client import NIXLMultiStorageClients, NIXLStorageClient
+from .global_vars import GLOBAL_TOPOLOGY
 from .meta_buffer import MetaBuffer
-from .global_vars import (
-    GLOBAL_GEN_CLIENT_NAME,
-    GLOBAL_META_SERVER_NAME,
-    GLOBAL_PS_CLIENT_NAME,
-    GLOBAL_TOPOLOGY,
-    GLOBAL_TRAIN_CLIENT_NAME,
-)
 from .nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
@@ -25,10 +21,7 @@ __all__ = [
     "NIXLStorageClient",
     "NIXLMultiStorageClients",
     "GLOBAL_TOPOLOGY",
-    "GLOBAL_META_SERVER_NAME",
-    "GLOBAL_TRAIN_CLIENT_NAME",
-    "GLOBAL_GEN_CLIENT_NAME",
-    "GLOBAL_PS_CLIENT_NAME",
+    "NIXL_META_SERVER_NAME",
     "find_free_port_with_scope",
     "MetaBuffer",
 ]

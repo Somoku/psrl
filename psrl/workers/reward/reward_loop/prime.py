@@ -7,8 +7,8 @@ import psutil
 from verl import DataProto
 
 from psrl.utils.reward_score import default_compute_score_async
+from psrl.workers.reward.reward_loop import register
 from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
-from psrl.workers.reward.reward_loop.registry import register
 
 
 async def single_compute_score(
@@ -46,22 +46,19 @@ class PrimeRewardLoopManager(RewardLoopManagerBase):
         self,
         config,
         tokenizer,
-        compute_score=None,
-        reward_model_router=None,
-        reward_model_tokenizer=None,
+        compute_score,
         is_validate=False,
+        **reward_kwargs,
     ):
-        super().__init__(config, tokenizer, is_validate)
+        super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        self.reward_model_router = reward_model_router
-        self.reward_model_tokenizer = reward_model_tokenizer
 
         # PRIME specific config
-        self.num_examine = config.reward_model.get("reward_kwargs", {}).get("num_examine", 1) if is_validate else 0
-        self.reward_fn_key = config.reward_model.get("reward_kwargs", {}).get("reward_fn_key", "data_source")
-        self.num_processes = config.reward_model.get("reward_kwargs", {}).get("num_processes", 64)
-        self.timeout = config.reward_model.get("reward_kwargs", {}).get("timeout", 300.0)
+        self.num_examine = reward_kwargs.get("num_examine", 1)
+        self.reward_fn_key = reward_kwargs.get("reward_fn_key", "data_source")
+        self.num_processes = reward_kwargs.get("num_processes", 64)
+        self.timeout = reward_kwargs.get("timeout", 300.0)
 
         self.already_print_data_sources = {}
 

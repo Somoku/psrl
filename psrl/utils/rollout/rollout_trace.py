@@ -22,6 +22,10 @@ class RolloutTraceConfig:
         token2text (bool): Whether to convert tokens to text in traces. Defaults to False.
         project_name (str): Name of the project for tracing.
         experiment_name (str): Name of the experiment for tracing.
+        max_samples_per_step_per_worker (Optional[int]): Maximum number of unique samples to trace
+            per worker per step. If None, all samples are traced. If set, each worker will randomly
+            select up to this many unique samples to trace (including all their rollouts for GRPO).
+            Total traces = max_samples_per_step_per_worker * num_workers * n_rollouts_per_sample.
     """
 
     _instance: Optional["RolloutTraceConfig"] = None
@@ -31,6 +35,7 @@ class RolloutTraceConfig:
     _initialized: bool = False
     project_name: str = None
     experiment_name: str = None
+    max_samples_per_step_per_worker: int | None = None
 
     def __new__(cls, *args, **kwargs):
         """Ensure singleton pattern: only one instance exists.
@@ -55,7 +60,14 @@ class RolloutTraceConfig:
         return cls._instance
 
     @classmethod
-    def init(cls, project_name: str, experiment_name: str, backend: str, token2text: bool = False):
+    def init(
+        cls,
+        project_name: str,
+        experiment_name: str,
+        backend: str,
+        token2text: bool = False,
+        max_samples_per_step_per_worker: int | None = None,
+    ):
         """Initialize the tracing configuration with the specified backend.
 
         Sets up the tracing backend (Weave or MLflow) and initializes the client.
@@ -76,6 +88,7 @@ class RolloutTraceConfig:
         config.token2text = token2text
         config.project_name = project_name
         config.experiment_name = experiment_name
+        config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
 
         # Initialize backend-specific client
         if backend == "weave":

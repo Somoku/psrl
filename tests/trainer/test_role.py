@@ -7,8 +7,15 @@ pytestmark = pytest.mark.cpu_test
 class TestPSRLRole:
     def test_all_expected_roles_exist(self):
         expected = {
-            "Actor", "Rollout", "ActorRollout", "Critic", "RefPolicy",
-            "RewardModel", "ActorRolloutRef", "Validate", "DummyPolicy",
+            "Actor",
+            "Rollout",
+            "ActorRollout",
+            "Critic",
+            "RefPolicy",
+            "RewardModel",
+            "ActorRolloutRef",
+            "Validate",
+            "DummyPolicy",
         }
         actual = {r.name for r in PSRL_Role}
         assert expected == actual

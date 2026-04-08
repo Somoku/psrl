@@ -12,10 +12,11 @@ from typing import Any
 
 import aiohttp
 import ray
-import vllm.entrypoints.cli.serve
-import vllm.entrypoints.grpc_server
+from grpc_reflection.v1alpha import reflection
 from ray.actor import ActorHandle
+from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
+from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
 from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 from verl.single_controller.ray import RayWorkerGroup
@@ -23,9 +24,9 @@ from verl.utils.device import get_resource_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.profiler import build_vllm_profiler_args
-from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode
+from verl.workers.rollout.utils import qwen2_5_vl_dedup_image_tokens
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -34,7 +35,6 @@ from verl.workers.rollout.vllm_rollout.utils import (
     get_vllm_max_lora_rank,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
-    _qwen2_5_vl_dedup_image_tokens,
     vLLMHttpServer,
     vLLMReplica,
 )
@@ -43,12 +43,14 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
-from vllm.outputs import RequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestOutput
+from vllm.pooling_params import PoolingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.engine import PauseMode
 from vllm.v1.engine.async_llm import AsyncLLM
 
+import grpc
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -74,9 +76,10 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class GenInterface:
     """Info for the PSRL GenWorker."""
 
+    role: str
     rollout_replica_idx: int
-    ps_manager_handle: ray.actor.ActorHandle
-    status_endpoint: str
+    ps_manager_handle: ray.actor.ActorHandle | None = None  # None for reward model (no PS sync)
+    status_endpoint: str | None = None  # None / "" → no ZMQ status reporting (reward model path)
 
 
 class PSRL_vLLMHttpServer(vLLMHttpServer):
@@ -149,6 +152,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # For async model pulling
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        # NOTE(linsh): determine at construction time whether this server runs a pooling model
+        # (e.g., reward / embedding model) so that generate() can dispatch to encode() accordingly.
+        self.is_pooling_model = config.get("runner", "generate") == "pooling"
+        # Populated in run_server() once the engine is up; None for generative models.
+        self.pooling_params: PoolingParams | None = None
+
     async def is_init_model(self):
         self._is_init_model.set()
 
@@ -168,13 +177,18 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             data_parallel_rank=data_parallel_rank,
         )
 
-    async def launch_server(self, master_address: str = None, master_port: int = None, dp_rpc_port: int = None):
+    def _get_worker_extension_cls(self) -> str:
+        return "psrl.workers.gen_dplb.vllm_extension.vLLMWorkerExtension"
+
+    async def launch_server(
+        self, master_address: str | None = None, master_port: int | None = None, dp_rpc_port: int | None = None
+    ):
         """Launch the vLLM HTTP server with PSRL-specific setup.
 
-        NOTE(verl): This method is adapted from the original vLLMHttpServer.launch_server in verl.
+        AGENT(verl): This method is adapted from the original vLLMHttpServer.launch_server in verl.
         The main differences are:
         1. Additional setup for PSRL features (e.g., rollout scheduler, stat collector, scheduler abort processor).
-        2. Self-defined worker extension for PSRL.
+        2. Use gRPC mode.
         """
         if self.node_rank != 0:
             assert master_address and master_port and dp_rpc_port, (
@@ -192,15 +206,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if self.config.cudagraph_capture_sizes:
             engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
+        self._preprocess_engine_kwargs(engine_kwargs)
+
         # Override default generation config from hugging face model config,
         # user can still override them by passing kwargs in each request.
-        override_generation_config = dict(
-            temperature=self.config.temperature,
-            top_k=self.config.top_k,
-            top_p=self.config.top_p,
-            repetition_penalty=1.0,
-            max_new_tokens=self.config.response_length,
-        )
+        override_generation_config = self._get_override_generation_config()
         psrl_logger.info(f"override_generation_config: {override_generation_config}")
 
         psrl_logger.info(f"enable_sleep_mode: {self.config.enable_sleep_mode}")
@@ -209,52 +219,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
             set_expandable_segments(True)
 
-        quantization = self.config.quantization
-        hf_overrides = {}
-
-        # Handle QAT (Quantization-Aware Training) configuration
-        qat_config_dict = getattr(self.config, "qat", {}) or {}
-        if qat_config_dict.get("enable", False):
-            # QAT uses compressed-tensors quantization, apply patches for dynamic weight loading
-            from verl.utils.qat import QATConfig, apply_qat_patches, load_quantization_config
-
-            apply_qat_patches()
-
-            # Load quantization config from JSON file
-            qat_config = QATConfig(**qat_config_dict)
-            quantization_config_dict = load_quantization_config(qat_config)
-            hf_overrides["quantization_config"] = quantization_config_dict
-            quantization = "compressed-tensors"
-
-            psrl_logger.info("QAT quantization config injected to vLLM async server")
-        elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao"]
-            if quantization not in _SUPPORTED_QUANTIZATION:
-                raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
-
-            if quantization == "fp8":
-                # Ignore MoE router layers for FP8 quantization
-                all_mlp_gate_layers = []
-                for layer in range(self.model_config.hf_config.num_hidden_layers):
-                    all_mlp_gate_layers.append(f"model.layers.{layer}.mlp.gate")
-
-                FP8_BLOCK_QUANT_KWARGS = {
-                    "activation_scheme": "dynamic",
-                    "fmt": "e4m3",
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
-                    "ignored_layers": all_mlp_gate_layers,
-                }
-                hf_overrides["quantization_config"] = dict(FP8_BLOCK_QUANT_KWARGS)
-                # Apply vllm fp8 patches
-                # Will remove the patch after vllm support on-the-fly quant for rollout natively.
-                apply_vllm_fp8_patches()
-                # for subprocesses patching
-                os.environ["VERL_VLLM_FP8_QUANT_ENABLED"] = "1"
-
-        if quantization is not None and self.config.quantization_config_file is not None:
-            hf_overrides["quantization_config_file"] = self.config.quantization_config_file
+        quantization, hf_overrides = self._apply_quantization()
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
@@ -273,13 +238,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         compilation_config = json.dumps(compilation_config)
         args = {
-            "grpc": True,
+            "grpc": True,  # AGENT(VERL): use gRPC server in PSRL, different from verl
             "dtype": self.config.dtype,
             "load_format": self.config.load_format,
             "skip_tokenizer_init": False,
             "distributed_executor_backend": "mp",
-            # NOTE(linsh): use self-defined worker extension for PSRL
-            "worker_extension_cls": "psrl.workers.gen_dplb.vllm_extension.vLLMWorkerExtension",
+            "worker_extension_cls": self._get_worker_extension_cls(),
             "trust_remote_code": self.model_config.trust_remote_code,
             "max_model_len": self.config.max_model_len,
             "max_num_seqs": self.config.max_num_seqs,
@@ -288,7 +252,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "enable_prefix_caching": self.config.enable_prefix_caching,
             "enable_sleep_mode": self.config.enable_sleep_mode,
             "logprobs_mode": self.config.logprobs_mode,
-            "disable_custom_all_reduce": True,
             "enforce_eager": self.config.enforce_eager,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
@@ -299,6 +262,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "hf_overrides": hf_overrides,
             "scheduling_policy": self.config.scheduling_policy,
             "compilation_config": compilation_config,
+            # AGENT(VERL): thread runner/task through for pooling model support in PSRL
+            "runner": self.config.get("runner", "generate"),
+            "task": self.config.get("task", "generate"),
             **engine_kwargs,
         }
 
@@ -317,34 +283,33 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # mtp
-        if self.config.mtp.enable and self.config.mtp.enable_rollout:
+        # mtp (None for diffusion models; only LLM models use speculative decoding)
+        if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             speculative_config = {
                 "method": self.config.mtp.method,
                 "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
             }
             args["speculative_config"] = speculative_config
 
-        if self.config.expert_parallel_size > 1:
+        if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"
             )
             data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
             assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
-                f"num workers ({len(self.workers)}) should be equal to dp_size_local "
+                f"num workers ({len(self.workers)}) should be equal to "
+                f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
             )
-            f"({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
+            dp_args = {
+                "data_parallel_size": self.config.data_parallel_size,
+                "data_parallel_size_local": data_parallel_size_local,
+                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
+                "data_parallel_address": self._master_address,
+                "data_parallel_rpc_port": self._dp_rpc_port,
+            }
+            args.update(dp_args)
 
-            args.update(
-                {
-                    "enable_expert_parallel": self.config.expert_parallel_size > 1,
-                    "data_parallel_size": self.config.data_parallel_size,
-                    "data_parallel_size_local": data_parallel_size_local,
-                    "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
-                    "data_parallel_address": self._master_address,
-                    "data_parallel_rpc_port": self._dp_rpc_port,
-                }
-            )
+        args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
 
         # used for torch.distributed.init_process_group
         if self.nnodes > 1:
@@ -383,11 +348,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if self.config.enable_rollout_routing_replay:
             args.update({"enable_return_routed_experts": True})
 
-        # NOTE(linsh): setup rollout scheduler for PSRL
+        # AGENT(VERL): setup rollout scheduler for PSRL
         args["scheduler_cls"] = "psrl.workers.gen_dplb.rollout_scheduler.RolloutScheduler"
         args["additional_config"] = {
             "max_model_len_used_in_estimation": self.config.max_model_len
             * self.psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
+            "enable_weights_cpu_backup": self.config.enable_weights_cpu_backup,
         }
 
         server_args = ["serve", self.model_config.path] + build_cli_args_from_config(args)
@@ -396,8 +362,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             pprint(server_args)
             psrl_logger.info(f"{server_args=}")
 
-        CMD_MODULES = [vllm.entrypoints.cli.serve]
-        parser = FlexibleArgumentParser(description="vLLM CLI")
+        CMD_MODULES = self._get_cli_modules()
+        parser = FlexibleArgumentParser(description=self._get_cli_description())
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}
         for cmd_module in CMD_MODULES:
@@ -412,22 +378,24 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # 3. launch server
         if self.node_rank == 0:
-            self._master_sock.close()
             await self.run_server(server_args)
+        else:
+            await self.run_headless(server_args)
 
+        # AGENT(VERL): log server launch completion for PSRL
+        if self.node_rank == 0:
             self.log_prefix = f"vLLMHTTPServer_Replica{self.get_replica_idx()}"
             psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized on {get_worker_info()}.")
-        else:
-            # TODO: avoid connect before master_sock close
-            await asyncio.sleep(3)
-            await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
+        # AGENT(VERL): wire preemption_notification_threshold into vLLM config for PSRL,
+        # so that the engine can trigger preemption notifications to PSRL when needed.
+
         # NOTE(linsh): wire preemption_notification_threshold into SchedulerConfig for PSRL.
         # This replaces the old additional_config["max_num_waiting_reqs_after_preemption"] mechanism
         # and enables gateway_preemption_req_ids in SchedulerStats, consumed by PSRLPreemptionStatLogger.
@@ -442,6 +410,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
+        # AGENT(VERL): apply stat logger patch for PSRL
         # NOTE(linsh): enable custom stat collection for PSRL
         self.preemption_queue: asyncio.Queue = asyncio.Queue()
         self.psrl_preemption_logger = PreemptionStatLogger(
@@ -454,9 +423,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 vllm_config,
                 self.psrl_config,
                 self.get_replica_idx(),
+                self.gen_interface.role,
             )
             self.stat_collector.begin_record()
-            self.status_queue = ZMQPushQueue(self.gen_interface.status_endpoint)
+            _endpoint = self.gen_interface.status_endpoint or ""
+            self.status_queue = ZMQPushQueue(_endpoint)
             self.stat_collector.init_output_queue(self.status_queue)
             for data_parallel_rank in range(self.config.data_parallel_size):
                 self.stat_collector.record_model_version_update(0, data_parallel_rank)
@@ -472,30 +443,32 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
         )
 
-        """
-        # TODO(linsh): support multi api server and one HTTP server
-        build_app_sig = inspect.signature(build_app)
-        supported_tasks: tuple[Any, ...] = ()
-        if "supported_tasks" in build_app_sig.parameters:
-            supported_tasks = await engine_client.get_supported_tasks()
-            app = build_app(args, supported_tasks)
-        else:
-            app = build_app(args)
-
-        init_app_sig = inspect.signature(init_app_state)
-        if "vllm_config" in init_app_sig.parameters:
-            await init_app_state(engine_client, vllm_config, app.state, args)
-        elif "supported_tasks" in init_app_sig.parameters:
-            await init_app_state(engine_client, app.state, args, supported_tasks)
-        else:
-            await init_app_state(engine_client, app.state, args)
-        """
         if self.replica_rank == 0 and self.node_rank == 0:
             psrl_logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
+
+        # AGENT(VERL): use gRPC server instead of HTTP server in PSRL
 
         self.engine = engine_client
         # self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
         self._server_port = await self._start_grpc_server(engine_client)
+
+        # NOTE(linsh): initialize PoolingParams for pooling models (e.g., reward / embedding models).
+        # For generative models this remains None and is never used.
+        if self.is_pooling_model:
+            normalize = self.config.reward_kwargs.get("normalize", False)
+            use_activation = self.config.reward_kwargs.get("use_activation", False)
+            pooling_task = self.config.get("task", "classify")
+            self.pooling_params = PoolingParams(
+                normalize=normalize,
+                use_activation=use_activation,
+                task=pooling_task,
+            )
+            psrl_logger.info(
+                "Initialized PoolingParams for pooling model: normalize=%s, use_activation=%s, task=%s",
+                normalize,
+                use_activation,
+                pooling_task,
+            )
 
     async def _start_grpc_server(self, engine_client: "AsyncLLM") -> int:
         """Start a gRPC server backed by *engine_client* and return the bound port.
@@ -514,15 +487,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             - ``smg_grpc_proto``  (``smg/crates/grpc_client/python/``)
             - ``smg-grpc-servicer`` (``smg/grpc_servicer/``)
         """
-        import time as _time
-
-        from grpc_reflection.v1alpha import reflection
-        from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
-        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
-
-        import grpc
-
-        start_time = _time.time()
+        start_time = time.time()
         servicer = VllmEngineServicer(engine_client, start_time, preemption_queue=self.preemption_queue)
 
         server = grpc.aio.server(
@@ -562,6 +527,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self.node_rank,
         )
         return port
+
+    # AGENT(VERL): PSRL-specific async methods for server control and coordination.
+    # We add `data_parallel_rank` parameters to these methods to support DP-aware control in PSRL.
+
+    async def is_sleeping(self, data_parallel_rank: int | None = None) -> bool:
+        return await self.engine.is_sleeping(data_parallel_rank=data_parallel_rank)
 
     async def sleep(self, level: int, data_parallel_rank: int | None = None):
         await self.engine.sleep(level, data_parallel_rank=data_parallel_rank)
@@ -609,6 +580,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         Returns:
             The number of requests that were aborted.
         """
+        # AGENT(VERL): the implementation is different from verl, skip when bump dependency.
+
         if not data_parallel_rank:
             request_states_snapshot = list(self.engine.output_processor.request_states.items())
             request_ids = [req_id for req_id, _ in request_states_snapshot]
@@ -640,11 +613,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self.engine.abort(request_ids)
         return len(request_ids)
 
-    async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
-        raise NotImplementedError(
-            "abort_request is not deprecated in PSRL_vLLMHttpServer, please use 'abort_requests' instead."
-        )
-
     def get_replica_idx(self) -> int:
         return self.gen_interface.rollout_replica_idx
 
@@ -655,6 +623,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         return self.active_task_num.get(data_parallel_rank, 0)
 
     async def register_rollout_instances_to_ps(self):
+        if self.gen_interface.ps_manager_handle is None:
+            return  # reward model: no PS instance registration
         if hasattr(self, "_is_rollout_instance_registered"):
             return
         if not self.psrl_config.rollout_gateway.enable:
@@ -664,9 +634,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.curr_rollout_instance_model_version = [0] * self.get_instance_num()
         self._is_rollout_instance_registered = True
 
-    async def register_server_to_gateway(self, gateway_url: str) -> str:
+    async def register_server_to_gateway(self, gateway_url: str) -> str | None:
         if self.node_rank != 0:
-            return
+            return None
         max_model_len = await self.estimate_max_model_len()
         # Register to rollout gateway
         gateway_url = gateway_url.rstrip("/")
@@ -756,6 +726,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         is_validate: bool = False,
     ) -> TokenOutput | None:
         """Generate sequence with token-in-token-out."""
+        # NOTE(linsh): for pooling models (e.g., reward / embedding models), route to the
+        # encode path instead of the autoregressive generation path.
+        if self.is_pooling_model:
+            return await self._encode_internal(
+                prompt_ids=prompt_ids,
+                request_id=request_id,
+                data_parallel_rank=data_parallel_rank,
+                version_tag=version_tag,
+                is_validate=is_validate,
+            )
+
         curr_rollout_instance_model_version = self.curr_rollout_instance_model_version[data_parallel_rank]
         # The router should guarantee the request is assigned to a rollout instance
         # that can directly generate with the needed model version.
@@ -774,22 +755,25 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
             version_tag = curr_rollout_instance_model_version
             # Update version tag in staleness inventory
-            await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(
-                request_id, version_tag, is_validate
-            )
+            if self.gen_interface.ps_manager_handle is not None:
+                await self.gen_interface.ps_manager_handle.update_request_version_tag.remote(
+                    request_id, version_tag, is_validate
+                )
 
         rollout_instance_id = (self.base_worker_id, data_parallel_rank)
-        # Update the request status to ROLLOUT_RUNNING
-        update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
-            request_id,
-            PSRL_RequestStatus.ROLLOUT_RUNNING,
-            rollout_instance_id=rollout_instance_id,
-            model_version=version_tag,
-            is_validate=is_validate,
-        )
+        # Update the request status to ROLLOUT_RUNNING.
+        # Reward model path (ps_manager_handle is None): skip status tracking and always continue.
+        if self.gen_interface.ps_manager_handle is not None:
+            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
+                request_id,
+                PSRL_RequestStatus.ROLLOUT_RUNNING,
+                rollout_instance_id=rollout_instance_id,
+                model_version=version_tag,
+                is_validate=is_validate,
+            )
 
-        if not update_status_success:
-            return None
+            if not update_status_success:
+                return None
 
         #### Pre processing before generation ####
 
@@ -819,7 +803,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
-        prompt_ids = _qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
         # TODO(linsh): support multi-modal
 
@@ -886,13 +870,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         else:
             update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
 
-        update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
-            request_id,
-            update_status,
-            is_validate=is_validate,
-        )
-        if not update_status_success:
-            return None
+        if self.gen_interface.ps_manager_handle is not None:
+            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
+                request_id,
+                update_status,
+                is_validate=is_validate,
+            )
+            if not update_status_success:
+                return None
 
         num_preempted = None
 
@@ -910,6 +895,98 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             num_preempted=num_preempted,
             interrupted=interrupted,
             update_status=update_status,
+        )
+
+    async def _encode_internal(
+        self,
+        prompt_ids: list[int],
+        request_id: str,
+        data_parallel_rank: int = 0,
+        version_tag: int | None = None,
+        is_validate: bool = False,
+    ) -> TokenOutput | None:
+        """
+        Encode (pool) a sequence for reward-model / embedding inference.
+
+        This is the pooling-model counterpart to the autoregressive generation path in
+        ``generate()``.  It calls ``self.engine.encode()`` with ``self.pooling_params``
+        and returns a ``TokenOutput`` whose ``pooling_output`` field carries the
+        resulting embedding / classification tensor.
+
+        Pooling requests are non-preemptible (single forward pass, no KV-cache growth)
+        so ``interrupted`` is always ``False``.
+
+        Args:
+            prompt_ids (list[int]): Input token IDs.
+            request_id (str): Unique request identifier.
+            data_parallel_rank (int): DP rank to route the request to.
+            version_tag (int | None): Model version required for this request.
+            is_validate (bool): Whether this request is for validation.
+
+        Returns:
+            TokenOutput | None: Pooling result, or None if the request was aborted
+            by the PS manager before processing.
+        """
+        assert self.is_pooling_model, "_encode_internal must only be called when is_pooling_model is True."
+        assert self.pooling_params is not None, (
+            "pooling_params must be initialized before calling _encode_internal. Ensure run_server() has completed."
+        )
+
+        rollout_instance_id = (self.base_worker_id, data_parallel_rank)
+        # Update the request status to ROLLOUT_RUNNING.
+        if self.gen_interface.ps_manager_handle is not None:
+            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
+                request_id,
+                PSRL_RequestStatus.ROLLOUT_RUNNING,
+                rollout_instance_id=rollout_instance_id,
+                model_version=version_tag,
+                is_validate=is_validate,
+            )
+            if not update_status_success:
+                return None
+
+        prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+
+        if data_parallel_rank not in self.active_task_num:
+            self.active_task_num[data_parallel_rank] = 0
+        self.active_task_num[data_parallel_rank] += 1
+        self.log_active_tasks(data_parallel_rank, task_added=True)
+
+        # Run the pooling forward pass.
+        generator = self.engine.encode(
+            prompt=prompt,
+            pooling_params=self.pooling_params,
+            request_id=request_id,
+            data_parallel_rank=data_parallel_rank,
+        )
+        final_res: PoolingRequestOutput | None = None
+        async for output in generator:
+            final_res = output
+        assert final_res is not None, f"Pooling engine returned no output for request {request_id}."
+
+        pooling_output = final_res.outputs.data  # torch.Tensor
+
+        # Pooling requests are non-interruptible by design.
+        update_status = PSRL_RequestStatus.ROLLOUT_COMPLETED
+        if self.gen_interface.ps_manager_handle is not None:
+            update_status_success = await self.gen_interface.ps_manager_handle.update_request_status.remote(
+                request_id,
+                update_status,
+                is_validate=is_validate,
+            )
+            if not update_status_success:
+                return None
+
+        self.active_task_num[data_parallel_rank] -= 1
+        self.log_active_tasks(data_parallel_rank, task_done=True)
+
+        return TokenOutput(
+            token_ids=[],
+            pooling_output=pooling_output,
+            stop_reason="completed",
+            interrupted=False,
+            update_status=update_status,
+            rollout_instance_id=rollout_instance_id,
         )
 
     ###### NIXL Integration ######
@@ -1047,6 +1124,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self.clear_kv_cache(data_parallel_rank=data_parallel_rank)
 
     async def nixl_pull_model(self, data_parallel_rank: int | None = None) -> None:
+        assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
             "nixl_pull_model should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         )
@@ -1078,6 +1156,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         psrl_logger.info("NIXL pull model done.")
 
     async def ray_pull_model(self, data_parallel_rank: int | None = None) -> None:
+        assert self.gen_interface.ps_manager_handle is not None, "ray_pull_model requires a PS manager handle"
         ps_manager_handle = self.gen_interface.ps_manager_handle
 
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
@@ -1169,9 +1248,12 @@ class PSRL_vLLMReplica(vLLMReplica):
 
     async def launch_servers(self):
         """Launch http server in each node."""
+        # AGENT(VERL): sync with verl's update
         assert len(self.workers) == self.world_size, (
             f"worker number {len(self.workers)} not equal to world size {self.world_size}"
         )
+
+        self._validate_launch_requirements()
 
         # get (node_id, CUDA_VISIBLE_DEVICES) of all workers
         worker_infos = await asyncio.gather(
@@ -1198,13 +1280,23 @@ class PSRL_vLLMReplica(vLLMReplica):
                 ]
             )
             node_id = worker_node_ids[node_rank * gpus_per_replica_node]
-            name = (
-                f"vllm_server_{self.replica_rank}_{node_rank}"
-                if not self.is_reward_model
-                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
-            )
+            prefix = self._get_server_name_prefix()
+            if self.is_reward_model:
+                name = f"{prefix}server_reward_{self.replica_rank}_{node_rank}"
+            elif self.is_teacher_model:
+                name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
+            else:
+                name = f"{prefix}server_{self.replica_rank}_{node_rank}"
+
+            # AGENT(VERL): PSRL-specific environment variables.
             env_vars = {
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                # To prevent hanging or crash during synchronization of weights between actor and rollout
+                # in disaggregated mode. See:
+                # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+                # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                "NCCL_CUMEM_ENABLE": "0",
                 "VLLM_DISABLE_ATTN": "1" if self.config.disable_attn else "0",
             }
             if self.psrl_config.tms.range == "all" or self.psrl_config.tms.enable_nixl:
@@ -1239,6 +1331,7 @@ class PSRL_vLLMReplica(vLLMReplica):
                 ),
                 runtime_env={"env_vars": env_vars},
                 name=name,
+                max_concurrency=self.max_concurrency,
             ).remote(
                 psrl_config=self.psrl_config,
                 config=self.config,
@@ -1274,7 +1367,7 @@ class PSRL_vLLMReplica(vLLMReplica):
             else f"{server_address}:{server_port}"
         )
 
-        # Only keep one server handle for PSRL
+        # AGENT(VERL): Only keep one server handle for PSRL
         server_handle = self.servers[0]
         self.servers = [server_handle]
         await self.servers[0].is_init_model.remote()

@@ -3,9 +3,8 @@
 This test allocates GPU memory across two Ray actors sharing the same GPU
 and verifies memory allocation is reported correctly.
 """
-import pytest
-import time
 
+import pytest
 import ray
 
 

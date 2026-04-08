@@ -7,12 +7,16 @@ from contextlib import nullcontext
 
 import numpy as np
 import ray
-from omegaconf import DictConfig
-from transformers import AutoTokenizer
+import torch
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
 from verl import DataProto
+from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
+from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.utils.tokenizer import normalize_token_ids
 
 from psrl.utils.dataset.utils import _pre_process_inputs
-from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
+from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
 from psrl.workers.agent_loop.sticky_session import sticky_session
 
 # from psrl.utils.common.http_utils import post
@@ -24,31 +28,32 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class AgentLoopBase(ABC):
-    _class_initialized = False
     # Debug counter - print for first N requests to check input/output correctness
     _debug_request_count: int = 0
     _debug_max_requests: int = 3
 
     def __init__(
         self,
-        trainer_config: DummyConfig,
+        trainer_config: DictConfigWrap,
         rollout_router: ray.actor.ActorHandle | str,
         reward_manager: ray.actor.ActorHandle,
         ps_manager_handle: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
+        processor: AutoProcessor,
+        dataset_cls: type[RLHFDataset],
+        data_config: DictConfigWrap,
         **kwargs,
     ):
         """Initialize agent loop instance.
         Base class for agent loops that process requests and interact with LLM servers.
 
         Args:
-            trainer_config (DummyConfig): Wrapper containing trainer configuration.
+            trainer_config (DictConfigWrap): Wrapper containing trainer configuration.
             rollout_router (ray.actor.ActorHandle): Router for distributing requests to LLM servers.
             ps_manager_handle (ray.actor.ActorHandle): Handle to parameter server manager.
             tokenizer (AutoTokenizer): Tokenizer for processing text messages.
             **kwargs: Additional keyword arguments.
         """
-        self.init_class(trainer_config.config, **kwargs)
         self.config = trainer_config.config
         self.model_config = self.config.gen_actor_rollout_ref.model
         self.rollout_config = self.config.gen_actor_rollout_ref.rollout
@@ -62,28 +67,105 @@ class AgentLoopBase(ABC):
         self.reward_manager = reward_manager
         self.ps_manager_handle = ps_manager_handle
         self.tokenizer = tokenizer
+        self.processor = processor
+        self.dataset_cls = dataset_cls
+        self.data_config = data_config.config
+        self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
+        self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = asyncio.get_running_loop()
 
-    @classmethod
-    def init_class(cls, config: DictConfig, **kwargs):
-        """Perform heavy initialization work shared across all instances.
-
-        This method is called only once per class to avoid redundant initialization.
+    async def process_vision_info(self, messages: list[dict]) -> dict:
+        """Extract images and videos from messages.
 
         Args:
-            config (DictConfig): Configuration object containing training settings.
-            **kwargs: Additional keyword arguments from configuration.
-        """
-        if cls._class_initialized:
-            return
-        cls._class_initialized = True
+            messages (list[dict]): Input messages.
 
-        cls.prompt_length = config.gen_actor_rollout_ref.rollout.prompt_length
-        cls.response_length = config.gen_actor_rollout_ref.rollout.response_length
+        Returns:
+            dict: Multi-modal data with keys "images" and "videos".
+        """
+        multi_modal_data = {}
+        if self.processor is not None:
+            images, videos = await self.dataset_cls.process_vision_info(
+                messages, image_patch_size=self.processor.image_processor.patch_size, config=self.data_config
+            )
+            if images is not None:
+                multi_modal_data["images"] = images
+            if videos is not None:
+                multi_modal_data["videos"] = videos
+
+        return multi_modal_data
+
+    async def apply_chat_template(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        images: list[Image.Image] | None = None,
+        videos: list[tuple[torch.Tensor, dict]] | None = None,
+        remove_system_prompt: bool = False,
+    ):
+        """Apply chat template to messages with optional tools, images, and videos.
+
+        Args:
+            messages (list[dict]): Input messages.
+            tools (list[dict], optional): Tools schemas. Defaults to None.
+            images (list[Image.Image], optional): Input images. Defaults to None.
+            videos (list[tuple[torch.Tensor, dict]], optional): Input videos. Defaults to None.
+            remove_system_prompt (bool, optional): Whether to remove system prompt. Defaults to False.
+
+        Returns:
+            list[int]: Prompt token ids.
+        """
+        if self.processor is not None:
+            raw_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.processor,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+
+            # split the videos and according metadatas
+            if videos is not None:
+                videos, video_metadatas = zip(*videos, strict=False)
+                videos, video_metadatas = list(videos), list(video_metadatas)
+            else:
+                video_metadatas = None
+
+            model_inputs = self.processor(
+                text=[raw_prompt],
+                images=images,
+                videos=videos,
+                video_metadata=video_metadatas,
+                return_tensors="pt",
+                do_sample_frames=False,
+            )
+            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+        else:
+            tokenized_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.tokenizer,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            prompt_ids = normalize_token_ids(tokenized_prompt)
+
+        if remove_system_prompt:
+            prompt_ids = prompt_ids[len(self.system_prompt) :]
+
+        return prompt_ids
 
     async def generate_sequence(self, request: DataProto, is_sticky_session: bool = False) -> DataProto:
         # psrl_logger.info(f"Inside {request.non_tensor_batch['uid'][0]=}")
-        request_input = self.pre_process_inputs(request)
+        request_input = await self.pre_process_inputs(request)
         # psrl_logger.info(f"After process: {request_input.request_id=}")
         sampling_params = self._get_sampling_params(request_input)
         if self.config.psrl.rollout_gateway.enable:
@@ -216,6 +298,7 @@ class AgentLoopBase(ABC):
                 token_ids=token_ids,
                 log_probs=log_probs,
                 routed_experts=routed_experts,
+                multi_modal_data=request_input.multi_modal_data,
                 stop_reason=finish_reason,
                 interrupted=interrupted,
                 update_status=PSRL_RequestStatus.ROLLOUT_COMPLETED,
@@ -236,7 +319,7 @@ class AgentLoopBase(ABC):
                 )
         return output
 
-    def pre_process_inputs(self, request: DataProto) -> TokenInput:
+    async def pre_process_inputs(self, request: DataProto) -> TokenInput:
         non_tensor_batch = request.non_tensor_batch
         version_tag = non_tensor_batch["version_tag"][0]
         is_validate = request.meta_info.get("validate", False)
@@ -252,9 +335,34 @@ class AgentLoopBase(ABC):
         else:
             rollout_instance_id = None
 
+        multi_modal_data = None
         if "raw_prompt_ids" not in non_tensor_batch:
-            input_ids = request.batch["input_ids"][0]
-            raw_prompt_ids = _pre_process_inputs(self.tokenizer.pad_token_id, input_ids)
+            if "input_ids" in request.batch and request.batch["input_ids"] is not None:
+                # Legacy path: DataProto carries padded input_ids tensor.
+                input_ids = request.batch["input_ids"][0]
+                raw_prompt_ids = _pre_process_inputs(self.tokenizer.pad_token_id, input_ids)
+            elif "raw_prompt" in non_tensor_batch:
+                messages = list(non_tensor_batch["raw_prompt"][0])
+
+                # 1. extract images and videos from messages
+                multi_modal_data = await self.process_vision_info(messages)
+                images = multi_modal_data.get("images")
+                videos = multi_modal_data.get("videos")
+
+                # 2. apply chat template and tokenize
+                raw_prompt_ids = await self.apply_chat_template(
+                    messages,
+                    images=images,
+                    videos=videos,
+                )
+                non_tensor_batch["raw_prompt_ids"] = np.array([raw_prompt_ids])
+            else:
+                raise ValueError(
+                    "Request must contain 'raw_prompt_ids', 'raw_prompt', or 'input_ids' "
+                    "to build generation input. Got keys: "
+                    f"batch={list(request.batch.keys()) if request.batch else []}, "
+                    f"non_tensor_batch={list(non_tensor_batch.keys())}"
+                )
         else:
             raw_prompt_ids = non_tensor_batch["raw_prompt_ids"][0]
             if isinstance(raw_prompt_ids, np.ndarray):
@@ -276,6 +384,7 @@ class AgentLoopBase(ABC):
             rollout_instance_id=rollout_instance_id,
             version_tag=version_tag,
             cu_response_len=len(raw_response_ids),
+            multi_modal_data=multi_modal_data,
             is_validate=is_validate,
         )
 
@@ -310,9 +419,7 @@ class AgentLoopBase(ABC):
             top_p=float(self.rollout_config.top_p),
             top_k=top_k,
             repetition_penalty=float(self.rollout_config.get("repetition_penalty", 1.0)),
-            # output_kind=RequestOutputKind.CUMULATIVE,
             detokenize=False,
-            # max_tokens=1,
             max_new_tokens=max_tokens,
         )
 

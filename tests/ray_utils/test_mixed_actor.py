@@ -85,5 +85,5 @@ def test_mixed_concurrent_calls(ray_cluster):
     print(f"[{time.strftime('%X')}] <-- MixedActor.sync_method(9) 返回：{res1}")
     res2 = ray.get(ref2)
     print(f"[{time.strftime('%X')}] <-- MixedActor.async_method(7) 返回：{res2}")
-    assert res1 == 81   # 9 * 9
-    assert res2 == 49   # 7 * 7
+    assert res1 == 81  # 9 * 9
+    assert res2 == 49  # 7 * 7

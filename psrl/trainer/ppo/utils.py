@@ -1,10 +1,10 @@
 import enum
-import warnings
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 
+import numpy as np
 import ray
-import torch
 from omegaconf import DictConfig
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -13,8 +13,7 @@ from verl.single_controller.ray import RayResourcePool
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
-from verl.trainer.ppo.utils import WorkerType
-from verl.utils.torch_functional import masked_mean
+from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
 class PSRL_Role(Enum):
@@ -26,6 +25,7 @@ class PSRL_Role(Enum):
     RewardModel = enum.auto()
     ActorRolloutRef = enum.auto()
     Validate = enum.auto()
+    TeacherModel = enum.auto()
     DummyPolicy = enum.auto()
 
 
@@ -109,94 +109,6 @@ class PSRL_DummyWorker(Worker):
         return
 
 
-def need_reference_policy(
-    role_worker_mapping: dict[PSRL_Role, WorkerType],
-) -> bool:
-    """Given a role worker mapping, do we need ref policy."""
-    return PSRL_Role.RefPolicy in role_worker_mapping
-
-
-def need_reward_model(
-    role_worker_mapping: dict[PSRL_Role, WorkerType],
-) -> bool:
-    """Given a role worker mapping, do we need reward model."""
-    return PSRL_Role.RewardModel in role_worker_mapping
-
-
-def need_critic(config: DictConfig) -> bool:
-    """Given a config, do we need critic."""
-    if config.critic.enable is not None:
-        return bool(config.critic.enable)
-    elif config.algorithm.adv_estimator == AdvantageEstimator.GAE:
-        return True
-    else:
-        warnings.warn(
-            "Disabled critic as algorithm.adv_estimator != gae. If it is not intended, please set critic.enable=True",
-            stacklevel=2,
-        )
-        return False
-
-
-def compute_response_mask(data: DataProto):
-    """Compute the attention mask for the response part of the sequence.
-
-    This function extracts the portion of the attention mask that corresponds to the model's response,
-    which is used for masking computations that should only apply to response tokens.
-
-    Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-
-    Returns:
-        torch.Tensor: The attention mask for the response tokens.
-    """
-    responses = data.batch["responses"]
-    response_length = responses.size(1)
-    attention_mask = data.batch["attention_mask"]
-    return attention_mask[:, -response_length:]
-
-
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
-    """Apply KL penalty to the token-level rewards.
-
-    This function computes the KL divergence between the reference policy and current policy,
-    then applies a penalty to the token-level rewards based on this divergence.
-
-    Args:
-        data (DataProto): The data containing batched model outputs and inputs.
-        kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
-        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
-
-    Returns:
-        tuple: A tuple containing:
-            - The updated data with token-level rewards adjusted by KL penalty
-            - A dictionary of metrics related to the KL penalty
-    """
-    response_mask = data.batch["response_mask"]
-    token_level_scores = data.batch["token_level_scores"]
-    batch_size = data.batch.batch_size[0]
-
-    # compute kl between ref_policy and current policy
-    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
-    kld = core_algos.kl_penalty(
-        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
-    )  # (batch_size, response_length)
-    kld = kld * response_mask
-    beta = kl_ctrl.value
-
-    token_level_rewards = token_level_scores - beta * kld
-
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
-    current_kl = torch.mean(current_kl, dim=0).item()
-
-    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
-    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
-    data.batch["token_level_rewards"] = token_level_rewards
-
-    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
-
-    return data, metrics
-
-
 def PSRL_compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -224,6 +136,9 @@ def PSRL_compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
+    # AGENT(VERL): PSRL use `parent_id` instead of `uid` to index the response group for GRPO
+    # and be the index for a single prompt.
+
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
@@ -272,6 +187,10 @@ def PSRL_compute_advantage(
             adv_kwargs["index"] = data.non_tensor_batch["uid"]
         if "reward_baselines" in data.batch:  # optional
             adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+        # GDPO: pass raw data for per-dimension reward extraction
+        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["batch"] = data.batch
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -280,6 +199,8 @@ def PSRL_compute_advantage(
                 "Please set actor.calculate_sum_pi_squared=True in config."
             )
             adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
             adv_kwargs["rollout_is_weights"] = rollout_is_weights
@@ -289,3 +210,118 @@ def PSRL_compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
     return data
+
+
+def _stats_to_timestamps(stats) -> dict | None:
+    if stats is None:
+        return None
+
+    if hasattr(stats, "__len__") and len(stats) > 0 and not hasattr(stats, "arrival_time"):
+        stats = stats[0]
+
+    arrival = getattr(stats, "arrival_time", None)
+    ft_latency = getattr(stats, "first_token_latency", None)
+    ft_ts_mono = getattr(stats, "first_token_ts", None)
+    last_ts_mono = getattr(stats, "last_token_ts", None)
+
+    if arrival is None:
+        return None
+
+    arrival_ts = float(arrival)
+    ttft_ts = None
+    finish_ts = None
+
+    if ft_latency is not None:
+        ttft_ts = arrival_ts + float(ft_latency)
+
+    if ft_latency is not None and ft_ts_mono is not None and last_ts_mono is not None:
+        decode_dur = float(last_ts_mono) - float(ft_ts_mono)
+        finish_ts = arrival_ts + float(ft_latency) + decode_dur
+
+    if ttft_ts is None and finish_ts is None:
+        return None
+
+    return {
+        "arrival_ts": arrival_ts,
+        "ttft_ts": ttft_ts,
+        "finish_ts": finish_ts,
+    }
+
+
+def extract_gen_rm_token_num(extra_info: dict) -> int:
+    rm_generated_token_num = 0
+    stack = [extra_info]
+    while stack:
+        current_info = stack.pop()
+        for key, value in current_info.items():
+            if key == "rm_output_len" and isinstance(value, (int, float, np.integer, np.floating)):
+                rm_generated_token_num += int(value)
+            elif isinstance(value, dict):
+                stack.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        stack.append(item)
+    return rm_generated_token_num
+
+
+def record_rollout_rm_metrics(data: DataProto, output_path: str | None = None) -> list[dict]:
+    """Extract rollout/reward timestamps from DataProto and optionally write to jsonl.
+
+    Output format (one line per .jsonl):
+        {
+            "uid": 123,
+            "rollout_metrics": {"arrival_ts": xxx, "ttft_ts": xxx, "finish_ts": xxx},
+            "reward_metrics": {"gen/default/Qwen3-8B": {"arrival_ts": xxx, "ttft_ts": xxx, "finish_ts": xxx}}
+        }
+
+    Args:
+        data: DataProto containing meta_info['rollout_metrics'],
+            meta_info['reward_metrics'] and non_tensor_batch['uid'].
+        output_path: If provided, append each record of this batch to the jsonl file.
+
+    Returns:
+        List of records (dict) for each sample in this batch.
+    """
+    meta = getattr(data, "meta_info", None) or {}
+    rollout_metrics_arr = meta.get("rollout_metrics")
+    reward_metrics_arr = meta.get("reward_metrics")
+    uids = data.non_tensor_batch.get("uid", None)
+    if uids is not None and hasattr(uids, "tolist"):
+        uids = uids.tolist()
+    batch_size = data.batch.batch_size[0]
+    if uids is None or len(uids) != batch_size:
+        uids = list(range(batch_size))
+
+    records = []
+    for i in range(batch_size):
+        rec = {"uid": int(uids[i]) if np.issubdtype(type(uids[i]), np.integer) else uids[i]}
+
+        if rollout_metrics_arr is not None and i < len(rollout_metrics_arr):
+            rec["rollout_metrics"] = _stats_to_timestamps(rollout_metrics_arr[i])
+        else:
+            rec["rollout_metrics"] = None
+
+        if reward_metrics_arr is not None and i < len(reward_metrics_arr):
+            rm_dict = reward_metrics_arr[i]
+            if isinstance(rm_dict, dict):
+                rec["reward_metrics"] = {}
+                for key, val in rm_dict.items():
+                    if val is None or (hasattr(val, "__len__") and len(val) == 0):
+                        continue
+                    ts = _stats_to_timestamps(val)
+                    if ts is not None:
+                        rec["reward_metrics"][key] = ts
+            else:
+                rec["reward_metrics"] = None
+        else:
+            rec["reward_metrics"] = None
+
+        records.append(rec)
+
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    return records

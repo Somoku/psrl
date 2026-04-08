@@ -49,6 +49,7 @@ class VllmConverter(BaseConverter):
     """Convert vLLM model to a unified format (i.e., HuggingFace) and generate sharding info."""
 
     def __init__(self, parameter_mapping: ParameterMapping | None, tp_rank: int | None = 1):
+        super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
         self.tp_rank = tp_rank
 
@@ -62,15 +63,16 @@ class VllmConverter(BaseConverter):
 
         for packed_suffix, hf_suffix, shard_id in stacked_params:
             if packed_suffix not in fused_mappings:
-                mapping_type = MappingType.QKV_SPLIT if isinstance(shard_id, str) \
-                               else MappingType.GATE_UP_PROJ_SPLIT
+                mapping_type = MappingType.QKV_SPLIT if isinstance(shard_id, str) else MappingType.GATE_UP_PROJ_SPLIT
                 fused_mappings[packed_suffix] = ParamMappingEntry(mapping_type=mapping_type, is_full_path=False)
             int_shard_id = QKV_SHARD_ID_MAP[shard_id] if isinstance(shard_id, str) else shard_id
             fused_mappings[packed_suffix].mappings.append((hf_suffix, int_shard_id))
 
         for full_packed, full_hf, shard_id in extra_stacked_params:
             if full_packed not in fused_mappings:
-                fused_mappings[full_packed] = ParamMappingEntry(mapping_type=MappingType.GATE_UP_PROJ_SPLIT, is_full_path=True)
+                fused_mappings[full_packed] = ParamMappingEntry(
+                    mapping_type=MappingType.GATE_UP_PROJ_SPLIT, is_full_path=True
+                )
             int_shard_id = QKV_SHARD_ID_MAP[shard_id] if isinstance(shard_id, str) else shard_id
             fused_mappings[full_packed].mappings.append((full_hf, int_shard_id))
 
@@ -85,9 +87,13 @@ class VllmConverter(BaseConverter):
                 w2_by_suffix.setdefault(packed_suffix, []).append((hf_suffix, expert_id))
 
         for suffix, entries in w13_by_suffix.items():
-            fused_mappings[suffix] = ParamMappingEntry(mapping_type=MappingType.FUSED_MOE_W13_SPLIT, mappings=entries, is_full_path=False)
+            fused_mappings[suffix] = ParamMappingEntry(
+                mapping_type=MappingType.FUSED_MOE_W13_SPLIT, mappings=entries, is_full_path=False
+            )
         for suffix, entries in w2_by_suffix.items():
-            fused_mappings[suffix] = ParamMappingEntry(mapping_type=MappingType.FUSED_MOE_W2_SPLIT, mappings=entries, is_full_path=False)
+            fused_mappings[suffix] = ParamMappingEntry(
+                mapping_type=MappingType.FUSED_MOE_W2_SPLIT, mappings=entries, is_full_path=False
+            )
 
         return fused_mappings
 
@@ -175,8 +181,9 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
                 sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
-                    sharding_dict[new_param_name] = sharding
+                    sharding_dict[new_param_name] = sharding_for_param
 
         # Handle lm_head separately
         if lm_head_module is not None and (lm_head_module_prefix not in seen_module_prefixes):
@@ -187,8 +194,9 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
                 sharding = self.get_sharding_for_param(module, param_name)
                 for new_param_name, new_param in new_params.items():
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
-                    sharding_dict[new_param_name] = sharding
+                    sharding_dict[new_param_name] = sharding_for_param
 
         return converted_state_dict, sharding_dict
 
@@ -213,9 +221,7 @@ class VllmConverter(BaseConverter):
             if not matched:
                 continue
             if mapping_type == MappingType.DIRECT:
-                assert len(mappings) == 1, (
-                    f"Mapping type is DIRECT for {vllm_name}, but got {len(mappings)} mappings"
-                )
+                assert len(mappings) == 1, f"Mapping type is DIRECT for {vllm_name}, but got {len(mappings)} mappings"
                 new_param = param
                 hf_name = mappings[0][0]
                 new_param_name = hf_name if is_full_path else full_name.replace(vllm_name, hf_name)
@@ -266,9 +272,7 @@ class VllmConverter(BaseConverter):
                 ep_size = getattr(module, "ep_size", 1)
                 # NOTE(zym) Though module has attribute "ep_rank", the value is incorrect,
                 # and now we only have dp=1, so we use tp_rank as ep_rank
-                ep_rank = (
-                    self.tp_rank if ep_size > 1 else 0
-                )  # considering the case where not enable_expert_parallel
+                ep_rank = self.tp_rank if ep_size > 1 else 0  # considering the case where not enable_expert_parallel
                 num_experts = model_info["num_experts"]
                 num_experts_per_ep_rank = num_experts // ep_size
                 local_experts_start_id = ep_rank * num_experts_per_ep_rank

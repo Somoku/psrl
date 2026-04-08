@@ -47,7 +47,10 @@ def example_with_real_model():
         print(f"[rank{rank}] {name}: {param.shape}")
 
     # Convert to HuggingFace format
-    param_mapping = create_parameter_mapping(model_class, model_path)
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained(model_path)
+    param_mapping = create_parameter_mapping(model_class, model_config)
     hf_state_dict, sharding = convert_vllm_inplace(param_mapping, vllm_model, tp_rank=rank)
 
     # Save the converted state dict for each rank
@@ -67,9 +70,9 @@ def test_new_api_no_parameter_mapping():
     """
     import torch
     import torch.distributed as dist
+    from psrl.utils.converter.vllm_converter import convert_vllm_inplace
     from vllm import LLM
     from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
-    from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -87,8 +90,9 @@ def test_new_api_no_parameter_mapping():
     vllm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
 
     # Verify the model implements SupportsWeightLayoutSpec
-    assert isinstance(vllm_model, SupportsWeightLayoutSpec), \
+    assert isinstance(vllm_model, SupportsWeightLayoutSpec), (
         f"{type(vllm_model).__name__} must implement SupportsWeightLayoutSpec"
+    )
 
     # New API: no parameter_mapping needed
     hf_state_dict, sharding = convert_vllm_inplace(vllm_model, tp_rank=rank)
@@ -104,11 +108,9 @@ def test_new_api_no_parameter_mapping():
     assert any("q_proj" in n for n in param_names), "q_proj must appear after QKV decomposition"
     assert any("k_proj" in n for n in param_names), "k_proj must appear after QKV decomposition"
     assert any("v_proj" in n for n in param_names), "v_proj must appear after QKV decomposition"
-    assert not any("qkv_proj" in n for n in param_names), \
-        "qkv_proj must NOT appear — must be split into q/k/v"
+    assert not any("qkv_proj" in n for n in param_names), "qkv_proj must NOT appear — must be split into q/k/v"
     assert any("gate_proj" in n for n in param_names), "gate_proj must appear after gate_up split"
-    assert not any("gate_up_proj" in n for n in param_names), \
-        "gate_up_proj must NOT appear — must be split"
+    assert not any("gate_up_proj" in n for n in param_names), "gate_up_proj must NOT appear — must be split"
 
     print(f"[rank{rank}] PASS: {len(hf_state_dict)} parameters converted")
     for name in sorted(hf_state_dict.keys())[:5]:
@@ -146,8 +148,7 @@ def test_spec_consistency():
     state_dict_keys = set(vllm_model.state_dict().keys())
     for packed_suffix, hf_suffix, shard_id in spec.stacked_params:
         found = any(packed_suffix in k for k in state_dict_keys)
-        assert found, \
-            f"Spec entry '{packed_suffix}' not found in model state dict — spec may be stale"
+        assert found, f"Spec entry '{packed_suffix}' not found in model state dict — spec may be stale"
 
     print(f"[rank{rank}] PASS: spec consistency verified, {len(spec.stacked_params)} stacked entries")
 
@@ -157,6 +158,7 @@ def test_spec_consistency():
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "consistency":
         test_spec_consistency()
     else:

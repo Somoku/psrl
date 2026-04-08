@@ -7,9 +7,14 @@ from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
 
 from .model import HFModelConfig
-from .rollout import SamplingConfig, ServerConfig
+from .rollout import PoolingConfig, RolloutConfig, SamplingConfig, ServerConfig
 
-__all__ = ["SandboxFusionConfig", "RewardModelDataProcessorConfig", "RewardModelConfig"]
+__all__ = [
+    "SandboxFusionConfig",
+    "RewardModelConfig",
+    "SingleRewardModelConfig",
+    "MultiRewardModelConfig",
+]
 
 
 def get_custome_process_fn(file_path, function_name):
@@ -58,24 +63,6 @@ class SandboxFusionConfig(BaseConfig):
 
 
 @dataclass
-class RewardModelDataProcessorConfig(BaseConfig):
-    path: str | None = None
-    preprocess_fn_name: str | None = None
-    postprocess_fn_name: str | None = None
-
-    def get_process_fn(self):
-        preprocess_fn = get_custome_process_fn(
-            file_path=self.path,
-            function_name=self.preprocess_fn_name,
-        )
-        postprocess_fn = get_custome_process_fn(
-            file_path=self.path,
-            function_name=self.postprocess_fn_name,
-        )
-        return preprocess_fn, postprocess_fn
-
-
-@dataclass
 class RewardModelConfig(BaseConfig):
     _mutable_fields = BaseConfig._mutable_fields
 
@@ -95,7 +82,6 @@ class RewardModelConfig(BaseConfig):
 
     # for generative reward model
     sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
-    data_processor_config: RewardModelDataProcessorConfig = field(default_factory=RewardModelDataProcessorConfig)
     max_new_tokens: int = 4096
 
     engine_kwargs: dict = field(default_factory=dict)
@@ -107,3 +93,55 @@ class RewardModelConfig(BaseConfig):
     model_config: HFModelConfig = field(default_factory=HFModelConfig)
     # Server configuration for sglang server mode
     server_config: ServerConfig = field(default_factory=ServerConfig)
+
+
+@dataclass
+class SingleRewardModelConfig(BaseConfig):
+    """Configuration for a single reward model in the multi-reward model setup.
+
+    Args:
+        reward_loop_type (Optional[str]): Type of reward loop (naive, dapo, gen, None).
+        reward_fn (Optional[str]): Reward function name (default, None).
+        reward_model_name (Optional[str]): Name of the model.
+        enable_resource_pool (bool): Whether to enable resource pool.
+        n_gpus_per_node (int): Number of GPUs per node.
+        num_replicas (int): Number of replicas.
+        nnodes (int): Number of nodes.
+        rollout_ngpus_per_instance_per_node (int): Number of GPUs per instance per node for rollout.
+        rollout_nnodes_per_instance (int): Number of nodes per instance for rollout.
+        model (HFModelConfig): Model configuration.
+        rollout (RolloutConfig): Rollout configuration.
+        sampling_config (SamplingConfig): Sampling configuration.
+        pooling_config (PoolingConfig): Pooling configuration.
+        sandbox_fusion (SandboxFusionConfig): Sandbox fusion configuration.
+    """
+
+    reward_loop_type: str | None = None
+    reward_fn: list[str] | None = None
+    reward_model_name: str | None = None
+    enable_resource_pool: bool = False
+    n_gpus_per_node: int = 0
+    num_replicas: int = 1
+    nnodes: int = 1
+    rollout_ngpus_per_instance_per_node: int = 1
+    rollout_nnodes_per_instance: int = 1
+    model: HFModelConfig = field(default_factory=HFModelConfig)
+    rollout: RolloutConfig = field(default_factory=RolloutConfig)
+    sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
+    pooling_config: PoolingConfig = field(default_factory=PoolingConfig)
+    sandbox_fusion: SandboxFusionConfig = field(default_factory=SandboxFusionConfig)
+
+
+@dataclass
+class MultiRewardModelConfig(BaseConfig):
+    """Configuration for multi-reward model setup.
+
+    Args:
+        launch_reward_fn_async (bool): Whether to launch reward function asynchronously.
+        reward_models (list[SingleRewardModelConfig]): List of reward model configurations.
+        profiler (ProfilerConfig): Profiler configuration.
+    """
+
+    launch_reward_fn_async: bool = False
+    reward_models: list[SingleRewardModelConfig] = field(default_factory=list)
+    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)

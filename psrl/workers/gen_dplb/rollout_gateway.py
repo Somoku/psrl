@@ -48,6 +48,8 @@ class RolloutGateway:
         self.smg_url = None
         self.smg_request_timeout_secs = None
         self.router_process = None
+        self.session_router_process = None
+        self.session_router_url = None
 
         self.ps_manager_grpc_ip = ps_manager_grpc_ip
         self.ps_manager_grpc_port = ps_manager_grpc_port
@@ -175,7 +177,7 @@ class RolloutGateway:
 
     def launch_router(self) -> str:
         if self.smg_url is not None:
-            return
+            return self.smg_url
 
         # Get host from Ray actor runtime context
         self.smg_ip = ray.util.get_node_ip_address().strip("[]")
@@ -188,8 +190,8 @@ class RolloutGateway:
         self.router_process = multiprocessing.Process(
             target=_run_smg,
             args=(router_args,),
+            daemon=True,
         )
-        self.router_process.daemon = True  # Set the process as a daemon
         self.router_process.start()
         # Wait 3 seconds
         time.sleep(3)
@@ -198,7 +200,48 @@ class RolloutGateway:
         self.smg_url = f"http://{self.smg_ip}:{self.smg_port}"
         return self.smg_url
 
+    def launch_session_router(self) -> str:
+        """Launch the SessionRouter process alongside the SMG router.
+
+        Returns:
+            str: The session router URL.
+        """
+        if not self.smg_url:
+            raise RuntimeError("SMG router must be launched before session router")
+
+        from psrl.utils.common.http_utils import find_available_port
+
+        session_port = find_available_port(base_port=8200)
+        session_ip = self.smg_ip
+
+        def _run_session_router(smg_url, host, port):
+            import uvicorn
+
+            from psrl.workers.gen_dplb.session_router import SessionRouter
+
+            router = SessionRouter(smg_url=smg_url)
+            uvicorn.run(router.app, host=host, port=port, log_level="warning")
+
+        self.session_router_process = multiprocessing.Process(
+            target=_run_session_router,
+            args=(self.smg_url, session_ip, session_port),
+        )
+        self.session_router_process.daemon = True
+        self.session_router_process.start()
+        time.sleep(1)
+        assert self.session_router_process.is_alive(), "Session router failed to start"
+        self.session_router_url = f"http://{session_ip}:{session_port}"
+        psrl_logger.info("Session router launched at %s", self.session_router_url)
+        return self.session_router_url
+
     def shutdown_router(self):
+        if self.session_router_process is not None:
+            self.session_router_process.terminate()
+            self.session_router_process.join()
+            psrl_logger.info("Session router process terminated")
+            self.session_router_process = None
+            self.session_router_url = None
+
         if self.smg_url is None:
             return
 

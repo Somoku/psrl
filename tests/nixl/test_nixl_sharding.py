@@ -3,7 +3,6 @@ from collections import OrderedDict
 
 import pytest
 import torch
-
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 pytestmark = pytest.mark.cpu_test

@@ -8,25 +8,38 @@ from torch.distributed.tensor import DTensor
 from verl.utils.fsdp_utils import fsdp_version
 
 from psrl.utils.converter.base_converter import BaseConverter
+from psrl.utils.converter.model_mappings import ParameterMapping
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
 class FSDPConverter(BaseConverter):
-    """Converter for FSDP/FSDP2 model"""
+    """Converter for FSDP/FSDP2 model."""
 
-    def __init__(self, fsdp_strategy):
+    def __init__(self, fsdp_strategy: str, parameter_mapping: ParameterMapping):
+        """
+        Args:
+            fsdp_strategy (str): FSDP strategy, either 'fsdp' or 'fsdp2'.
+            parameter_mapping (ParameterMapping): Parameter mapping instance carrying
+                model_info (num_heads, num_kv_heads, head_size). Use FSDPParameterMapping
+                to enable Q/K/V 3D reshaping for NIXL shape compatibility between
+                FSDP train workers and the PS.
+        """
+        super().__init__(parameter_mapping)
         self.fsdp_strategy = fsdp_strategy
 
     def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
         Convert FSDP/FSDP2 model to unified state dict and sharding info.
+
         Args:
-            model: The FSDP/FSDP2 model instance
+            model: The FSDP/FSDP2 model instance.
+
         Returns:
-            (converted_state_dict, sharding_dict)
+            tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]: A pair of
+                (converted_state_dict, sharding_dict).
         """
-        # Determine the FSDP strategy and convert accordingly
-        # fsdp_state_dict will be (name, DTensor) pairs
+        # Determine the FSDP strategy and convert accordingly.
+        # fsdp_state_dict will be (name, DTensor) pairs.
         if self.fsdp_strategy == "fsdp":
             warnings.warn(
                 "FSDP strategy is deprecated beacause it cannot "
@@ -40,13 +53,19 @@ class FSDPConverter(BaseConverter):
         else:
             raise ValueError(f"Unsupported FSDP strategy: {self.fsdp_strategy}")
 
-        # Convert the FSDP state dict to a unified format
+        # Convert the FSDP state dict to a unified format.
         converted_state_dict = {}
         sharding_dict = {}
         for param_name, param in fsdp_state_dict.items():
-            assert isinstance(param, DTensor), f"Expected DTensor for {param_name}, got {type(param)}"
-            converted_state_dict[param_name] = param.to_local()
-            sharding_dict[param_name] = self.get_sharding_for_param(param_name, param)
+            assert isinstance(param, DTensor), f"Expected DTensor for {param_name}, got {type(param)}."
+            local_param = param.to_local()
+            # Compute sharding from original 2D DTensor placements before any reshape.
+            sharding = self.get_sharding_for_param(param_name, param)
+            # NOTE(lhy): Reshape Q/K/V local shards to 3D to match slice_qkv_proj_megatron layout
+            # and update sharding to reflect the new tensor shape.
+            local_param, sharding = self.maybe_reshape_qkv_to_3d(param_name, local_param, sharding)
+            converted_state_dict[param_name] = local_param
+            sharding_dict[param_name] = sharding
         return converted_state_dict, sharding_dict
 
     def get_sharding_for_param(self, param_name: str, param: DTensor) -> NIXLSharding:
@@ -91,14 +110,24 @@ class FSDPConverter(BaseConverter):
         return NIXLSharding(**kwargs)
 
 
-def convert_fsdp_inplace(fsdp_strategy: str, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
+def convert_fsdp_inplace(
+    parameter_mapping: ParameterMapping,
+    model,
+    fsdp_strategy: str = "fsdp2",
+) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
-    Convenience function to convert FSDP/FSDP2 model to unified state dict and sharding info.
+    Convert FSDP/FSDP2 model to unified state dict and sharding info.
+
     Args:
-        fsdp_strategy: FSDP strategy, either 'fsdp' or 'fsdp2'
-        model: The FSDP/FSDP2 model instance
+        fsdp_strategy (str): FSDP strategy, either 'fsdp' or 'fsdp2'.
+        model: The FSDP/FSDP2 model instance.
+        parameter_mapping (ParameterMapping): Parameter mapping instance carrying
+            model_info. Use FSDPParameterMapping to enable Q/K/V 3D reshaping for
+            NIXL shape compatibility between FSDP train workers and the PS.
+
     Returns:
-        (converted_state_dict, sharding_dict)
+        tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]: A pair of
+            (converted_state_dict, sharding_dict).
     """
     if fsdp_strategy == "fsdp":
         assert fsdp_version(model) == 1, "FSDP version 1 is expected for 'fsdp' strategy."
@@ -106,5 +135,5 @@ def convert_fsdp_inplace(fsdp_strategy: str, model) -> tuple[dict[str, torch.Ten
         assert fsdp_version(model) == 2, "FSDP version 2 is expected for 'fsdp2' strategy."
     else:
         raise ValueError(f"Unsupported FSDP strategy: {fsdp_strategy}")
-    converter = FSDPConverter(fsdp_strategy)
+    converter = FSDPConverter(fsdp_strategy, parameter_mapping)
     return converter.convert_state_and_sharding_dict(model)

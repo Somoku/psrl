@@ -1,27 +1,31 @@
 # Modified from verl/experimental/reward/reward_loop/base.py
-import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import Any
 
 from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
+from verl.utils.ray_utils import get_event_loop
+
+RawRewardFn = Callable[..., Any] | None
 
 
 class RewardLoopManagerBase(ABC):
     _class_initialized = False
 
-    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, is_validate: bool = False):
+    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, compute_score: RawRewardFn):
         """Initialize agent loop.
 
         Args:
             config (DictConfig): YAML config.
             tokenizer (AutoTokenizer): Tokenizer for tokenize messages.
-            is_validate (bool): Whether in validation mode.
+            compute_score (RawRewardFn): Function to compute rewards.
         """
         self.config = config
         self.tokenizer = tokenizer
-        self.is_validate = is_validate
-        self.loop = asyncio.get_running_loop()
+        self.compute_score = compute_score
+        self.loop = get_event_loop()
         self.init_class(config, tokenizer)
 
     @classmethod

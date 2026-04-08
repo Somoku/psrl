@@ -13,8 +13,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.common.utils import lazy_import_to_globals
-from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
+from psrl.utils.logger import DualOutputHandler, deprecated, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
@@ -30,7 +29,10 @@ from psrl.utils.nixl.nixl_spec import (
 if TYPE_CHECKING:
     from torch_memory_saver import torch_memory_saver
 else:
-    torch_memory_saver = None  # type: ignore
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except ImportError:
+        torch_memory_saver = None  # type: ignore
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -88,7 +90,8 @@ class NIXLStorageClient:
         self.enable_tms_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
 
         if self.enable_tms_for_temp_buffers:
-            lazy_import_to_globals("torch_memory_saver", "torch_memory_saver")
+            if torch_memory_saver is None:
+                raise ImportError("torch_memory_saver is required when nixl_config.enable_tms_for_temp_buffers=True")
             apply_tms_patch()
 
             psrl_logger.info(f"NIXLStorageClient {self.client_name} enabled TMS for temporary buffers.")
@@ -178,7 +181,6 @@ class NIXLStorageClient:
         self._temp_pinned_idx_mapping = {}
         self.temp_desc_slice_map = {}
 
-
     def _get_local_original_tensor(self, key: str, shard_idx: tuple[int, ...]) -> torch.Tensor | None:
         """Get original tensor mapping for non-contiguous shard"""
         return self._original_tensor_mapping.get((key, shard_idx))
@@ -265,7 +267,7 @@ class NIXLStorageClient:
             region_list: List of (base_addr, nbytes, device_id, mem_type) tuples.
         Returns:
             Merged list of (base_addr, nbytes, device_id, mem_type) tuples.
-        
+
         NOTE(lhy): Do NOT use this on regions from _record_region_registration.
         Each entry there is one untyped_storage = one cudaMalloc allocation.
         Merging two virtually-adjacent allocations is invalid for RDMA/UCX:
@@ -383,7 +385,8 @@ class NIXLStorageClient:
     ):
         """
         Register local tensors with NIXL. Build key->desc mapping.
-        Currently only support all tensors are within binded_meta_tensor_mapping or not within binded_meta_tensor_mapping.
+        Currently only support all tensors are within
+        binded_meta_tensor_mapping or not within binded_meta_tensor_mapping.
 
         Args:
             state_dict: {key: torch.Tensor}
@@ -571,8 +574,9 @@ class NIXLStorageClient:
                         if binded_meta_tensor_mapping is None and meta_buffer is not None:
                             local_sharded_tensor = meta_buffer.get_tensor((key, shard_indices[local_pos]))
                         elif binded_meta_tensor_mapping is not None:
-                            assert (key, shard_indices[local_pos]) in binded_meta_tensor_mapping, \
+                            assert (key, shard_indices[local_pos]) in binded_meta_tensor_mapping, (
                                 f"Key {key} shard {shard_indices[local_pos]} not found in binded_meta_tensor_mapping."
+                            )
                             local_sharded_tensor = binded_meta_tensor_mapping[(key, shard_indices[local_pos])]
                         else:
                             local_sharded_tensor = tbd_local_sharded_tensor
@@ -706,15 +710,18 @@ class NIXLStorageClient:
                 )
 
             if binded_meta_tensor_mapping is not None:
-                assert self.temp_desc_slice_map == {}, f"temp_desc_slice_map must be empty when binded_meta_tensor_mapping is provided, \
+                assert self.temp_desc_slice_map == {}, (
+                    f"temp_desc_slice_map must be empty when binded_meta_tensor_mapping is provided, \
                     but got {self.temp_desc_slice_map}."
+                )
 
             # Batch register all tensors and cache the reg list once.
             if not meta_only and self._mtype_to_reg_region_lists:
                 for mem_type, reg_list in self._mtype_to_reg_region_lists.items():
                     if not reg_list:
                         continue
-                    # NOTE(lhy): do not call _merge_contiguous_regions here. See the docstring of _merge_contiguous_regions for more details.
+                    # NOTE(lhy): do not call _merge_contiguous_regions here.
+                    # See the docstring of _merge_contiguous_regions for more details.
                     # registered separately, causing NIXL errors. Deduplication via
                     # _record_region_registration is the only safe batching.
                     reg_descs = self._register_memory(mem_type, reg_list)
@@ -722,8 +729,7 @@ class NIXLStorageClient:
 
                 # Precompute {shard_idx: local_pos} once per key: O(1) lookup vs O(S) list.index()
                 shard_pos_cache: dict[str, dict] = {
-                    key: {s: i for i, s in enumerate(ti.sharding.shard_indices)}
-                    for key, ti in tensor_infos.items()
+                    key: {s: i for i, s in enumerate(ti.sharding.shard_indices)} for key, ti in tensor_infos.items()
                 }
 
                 # Group by mem_type to batch get_xfer_descs calls: O(mem_types) round-trips instead of O(N_shards).
@@ -796,7 +802,7 @@ class NIXLStorageClient:
                 f"temp pinned idx mapping is: {self._temp_pinned_idx_mapping}, "
                 f"temp meta mapping is: {self._temp_meta_mapping}"
             )
-            
+
             if binded_meta_tensor_mapping is None:
                 self._ensure_all_tensor_registered_high_level()
             psrl_logger.info(f"{self.client_name} all local tensors are registered.")
@@ -1571,9 +1577,7 @@ class NIXLStorageClient:
                             # Non-contiguous shard: copy data from temporary to original
                             original_tensor = self._get_local_original_tensor(key, shard_idx)
                             if original_tensor is None:
-                                raise RuntimeError(
-                                    f"No original tensor mapping found for key {key} shard {shard_idx}"
-                                )
+                                raise RuntimeError(f"No original tensor mapping found for key {key} shard {shard_idx}")
                             contiguous_tensor = self._get_local_temp_tensor(key, shard_idx)
                             if contiguous_tensor is None:
                                 raise RuntimeError(
@@ -1645,9 +1649,39 @@ class NIXLStorageClient:
             tensor_info = tensor_infos[key]
             sharding = tensor_info.sharding
 
-            # Produce the same shards that were registered.
-            # For the default (no-op) sharding this returns [src_tensor] as-is.
-            src_shards = sharding.get_local_sharded_tensors(src_tensor)
+            # When the registered tensors are 3D (e.g. QKV weights reshaped for Megatron
+            # group-interleaved layout) but the checkpoint tensor is still 2D, reshape
+            # src_tensor to the full unsharded 3D shape before slicing.
+            # Full shape is derived from any registered shard: for each sharded dim,
+            # multiply the shard's size by the total shard count in that dim.
+            dst_tensor_sample = None
+            for shard_idx_sample in sharding.shard_indices:
+                dst_sample = self._original_tensor_mapping.get((key, shard_idx_sample))
+                if dst_sample is not None:
+                    dst_tensor_sample = dst_sample
+                    break
+            if dst_tensor_sample is not None and dst_tensor_sample.ndim != src_tensor.ndim:
+                # Reconstruct full unsharded 3D shape from the registered shard shape.
+                full_shape = list(dst_tensor_sample.shape)
+                for dim, count in sharding.shard_mesh.items():
+                    full_shape[dim] *= count
+                src_tensor_full = src_tensor.reshape(full_shape)
+                # Slice each shard using the GLOBAL shard_mesh, not _local_shard_mesh.
+                # _local_shard_mesh only counts how many shard_indices this worker holds (= 1),
+                # so get_local_sharded_tensors() would be a no-op on the reconstructed tensor.
+                shard_dims = list(sharding.shard_mesh.keys())
+                shard_counts = list(sharding.shard_mesh.values())
+                src_shards = []
+                for shard_idx in sharding.shard_indices:
+                    shard = src_tensor_full
+                    for i_dim, (dim, count) in enumerate(zip(shard_dims, shard_counts)):
+                        shard_size = shard.shape[dim] // count
+                        shard = shard.narrow(dim, shard_idx[i_dim] * shard_size, shard_size)
+                    src_shards.append(shard)
+            else:
+                # Produce the same shards that were registered.
+                # For the default (no-op) sharding this returns [src_tensor] as-is.
+                src_shards = sharding.get_local_sharded_tensors(src_tensor)
 
             assert len(src_shards) == len(sharding.shard_indices), (
                 f"[{self.client_name}] key={key!r}: sharding produced {len(src_shards)} shards "

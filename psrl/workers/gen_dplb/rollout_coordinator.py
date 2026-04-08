@@ -2,12 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import aiohttp
 import numpy as np
 import ray
 
 from psrl.utils.common.http_utils import find_available_port
+from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -183,6 +185,27 @@ class RolloutCoordinator(CommandExtension):
     def get_status_sink_endpoint(self) -> str:
         return self.status_sink_endpoint
 
+    def get_all_instance_ids(self) -> list:
+        """Return all registered (replica_id, dp_rank) instance IDs, sorted for determinism."""
+        return sorted(self.instance_ids)
+
+    def _get_sleep_level(self) -> int:
+        """Sleep level for server.sleep(). Rollout uses level=2 (full GPU release). Subclasses may override."""
+        return 2
+
+    async def _do_sleep_instance(self, replica_id: str, data_parallel_rank: int) -> None:
+        """Execute sleep on one (replica_id, dp_rank). Rollout path uses nixl_sleep. Subclasses may override."""
+        await self.server_handles[replica_id].nixl_sleep.remote(
+            level=self._get_sleep_level(),
+            data_parallel_rank=data_parallel_rank,
+        )
+
+    async def _do_wake_up_instance(self, replica_id: str, data_parallel_rank: int) -> None:
+        """Execute wake_up on one (replica_id, dp_rank). Rollout path uses nixl_wake_up. Subclasses may override."""
+        await self.server_handles[replica_id].nixl_wake_up.remote(
+            data_parallel_rank=data_parallel_rank,
+        )
+
     async def _gateway_post_json(self, path: str, payload, params: dict | None = None):
         if self.gateway_base_url is None:
             raise RuntimeError("Rust gateway base url is not initialized")
@@ -297,6 +320,11 @@ class RolloutCoordinator(CommandExtension):
         for server_handle in self.server_handles.values():
             futures.append(server_handle.nixl_convert_params.remote())
         await asyncio.gather(*futures)
+
+    async def initial_pull_from_ps(self, tag: str = "rollout") -> None:
+        futures = [server_handle.pull_model.remote() for server_handle in self._tag_to_server(tag)]
+        await asyncio.gather(*futures)
+        psrl_logger.info(f"Initial PS pull complete for {len(futures)} replicas with tag {tag}.")
 
     async def sleep(self, tag: str = "all"):
         """Make rollout instances sleep and release GPU memory.
@@ -497,26 +525,86 @@ class RolloutCoordinator(CommandExtension):
                         f"with PS model version {curr_ps_model_version}"
                     )
 
-                    # Sync with PS (interrupt, pull model, and resume generation)
-                    sync_futures = []
+                    # Skip instances that are sleeping
+                    is_sleeping = await asyncio.gather(
+                        *[
+                            self.server_handles[instance_id[0]].is_sleeping.remote(data_parallel_rank=instance_id[1])
+                            for instance_id in instance_ids
+                        ]
+                    )
+                    sync_instance_ids = [
+                        instance_id for instance_id, sleeping in zip(instance_ids, is_sleeping) if not sleeping
+                    ]
+                    sleeping_instance_ids = [
+                        instance_id for instance_id, sleeping in zip(instance_ids, is_sleeping) if sleeping
+                    ]
+                    if sleeping_instance_ids:
+                        psrl_logger.info(f"Skipping SYNC for sleeping instances: {sleeping_instance_ids}")
 
-                    for instance_id in instance_ids:
-                        replica_id, data_parallel_rank = instance_id
-                        sync_future = self.server_handles[replica_id].sync_with_ps.remote(
-                            curr_ps_model_version,
-                            pause_generation=True,
-                            data_parallel_rank=data_parallel_rank,
-                        )
-                        sync_futures.append(sync_future)
-
-                    # Post process the command result
-                    if wait_model_sync:
-                        await asyncio.gather(*sync_futures)
+                    if not sync_instance_ids:
                         self._complete_command(command_id, None)
                     else:
-                        # NOTE(linsh): sometimes it's not necessary for the caller to wait for pulling from PS
-                        self._complete_command(command_id, None)
-                        await asyncio.gather(*sync_futures)  # Wait for the sync to complete
+                        # Sync with PS (interrupt, pull model, and resume generation)
+                        sync_futures = []
+
+                        for instance_id in instance_ids:
+                            replica_id, data_parallel_rank = instance_id
+                            sync_future = self.server_handles[replica_id].sync_with_ps.remote(
+                                curr_ps_model_version,
+                                pause_generation=True,
+                                data_parallel_rank=data_parallel_rank,
+                            )
+                            sync_futures.append(sync_future)
+
+                        # Post process the command result
+                        if wait_model_sync:
+                            await asyncio.gather(*sync_futures)
+                            self._complete_command(command_id, None)
+                        else:
+                            # NOTE(linsh): sometimes it's not necessary for the caller to wait for pulling from PS
+                            self._complete_command(command_id, None)
+                            await asyncio.gather(*sync_futures)  # Wait for the sync to complete
+                elif command_type == CommandType.SLEEP:
+                    instance_ids = command_args.get("instance_ids", None)
+                    if not isinstance(instance_ids, list):
+                        instance_ids = [instance_ids]
+                    if instance_ids is None:
+                        raise ValueError("SLEEP command must contain 'instance_ids' in args.")
+
+                    # Pause routing to prevent new requests from being dispatched
+                    # to the instances that are going to sleep
+                    if self.use_rust_gateway:
+                        await self._set_routing_loop_running(False)
+                    else:
+                        await self.rollout_router.pause_routing.remote()
+
+                    sleep_futures = []
+                    for instance_id in instance_ids:
+                        replica_id, data_parallel_rank = instance_id
+                        sleep_futures.append(self._do_sleep_instance(replica_id, data_parallel_rank))
+                    await asyncio.gather(*sleep_futures)
+                    self._complete_command(command_id, None)
+                elif command_type == CommandType.WAKE_UP:
+                    instance_ids = command_args.get("instance_ids", None)
+                    if not isinstance(instance_ids, list):
+                        instance_ids = [instance_ids]
+                    if instance_ids is None:
+                        raise ValueError("WAKE_UP command must contain 'instance_ids' in args.")
+                    psrl_logger.info(f"Received WAKE_UP command for instances {instance_ids}")
+
+                    wake_up_futures = []
+                    for instance_id in instance_ids:
+                        replica_id, data_parallel_rank = instance_id
+                        wake_up_futures.append(self._do_wake_up_instance(replica_id, data_parallel_rank))
+                    await asyncio.gather(*wake_up_futures)
+
+                    # Resume routing after the instances have woken up
+                    if self.use_rust_gateway:
+                        await self._set_routing_loop_running(True)
+                    else:
+                        await self.rollout_router.resume_routing.remote()
+
+                    self._complete_command(command_id, None)
                 else:
                     raise ValueError(f"Unknown command type: {command_type}")
 
@@ -574,6 +662,49 @@ class RolloutCoordinator(CommandExtension):
             # psrl_logger.info(f"Received {len(latest_by_instance)} engine stats updates, updating instance_to_engine_status with {latest_by_instance}...")  # noqa: E501
             self.instance_to_engine_status.update(latest_by_instance)
         psrl_logger.info("Stopped processing ZMQ status stream.")
+
+    def get_instance_engine_status_snapshot(self) -> dict[RolloutInstanceId, dict]:
+        """
+        Return a lightweight snapshot map for elastic scaling decisions.
+        """
+        snapshot = {}
+        for instance_id, engine_status in self.instance_to_engine_status.items():
+            snapshot[instance_id] = engine_status.snapshot
+        return snapshot
+
+    async def get_router_backlog_size(self) -> int:
+        """Return pending request count in rollout router queue."""
+        t_enter = time.monotonic()
+        model_tag = str(self.config.gen_actor_rollout_ref.model.path).rstrip("/").split("/")[-1]
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutCoordinator_enter model=%s elapsed_since_entry_s=0.000",
+            model_tag,
+        )
+        if self.rollout_router is None:
+            return 0
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutCoordinator_before_router_rpc model=%s since_enter_s=%.3f",
+            model_tag,
+            time.monotonic() - t_enter,
+        )
+        t_rpc = time.monotonic()
+        if self.use_rust_gateway:
+            # TODO: add `pending_request_num` to the `/routing_loop/status` endpoint in Rust gateway
+            pending = int(self._gateway_get_json("/routing_loop/status").get("pending_request_num", 0))
+            pass
+        else:
+            pending = int(await self.rollout_router.get_pending_request_count.remote())
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutCoordinator_after_router_rpc model=%s pending=%d router_rpc_s=%.3f since_enter_s=%.3f",
+            model_tag,
+            pending,
+            time.monotonic() - t_rpc,
+            time.monotonic() - t_enter,
+        )
+        return pending
 
     async def _sync_status_to_router(self):
         """

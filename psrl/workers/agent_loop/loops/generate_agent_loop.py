@@ -25,9 +25,7 @@ class GenerateAgentLoop(AgentLoopBase):
             Tuple[DataProto, TerminateReason]:
                 Generated response with metadata and termination reason.
         """
-        # psrl_logger.info(f"Before running request with id = {request.non_tensor_batch['uid'][0]}")
         output = await self.generate_sequence(request)
-        # psrl_logger.info(f"After running request with id = {request.non_tensor_batch['uid'][0]} with output = {output}")  # noqa: E501
         if output is not None:
             response_ids = output.token_ids
             response_ids = response_ids[: self.response_length]
@@ -40,12 +38,14 @@ class GenerateAgentLoop(AgentLoopBase):
             request.non_tensor_batch["__num_turns__"] = np.array([2])
             request.non_tensor_batch["interrupted"] = np.array([interrupted])
             request.non_tensor_batch["interrupted_by_scheduler"] = np.array([interrupted_by_scheduler])
+            request.non_tensor_batch["multi_modal_data"] = np.array([output.multi_modal_data], dtype=object)
             request.non_tensor_batch["rollout_instance_id"] = np.array([rollout_instance_id])
             if output.log_probs is not None:
                 rollout_log_probs = output.log_probs
                 rollout_log_probs = rollout_log_probs[: self.response_length]
                 request.non_tensor_batch["rollout_log_probs"] = np.array([rollout_log_probs], dtype=object)
             if output.routed_experts is not None:
+                # TODO(linsh): support router replay
                 routed_experts = output.routed_experts
                 request.non_tensor_batch["routed_experts"] = np.array([routed_experts], dtype=object)
         else:
@@ -54,7 +54,7 @@ class GenerateAgentLoop(AgentLoopBase):
 
         reward_input = request
         reward_result = await self.reward_manager.compute_score.remote(reward_input)
-        if not self.config.reward_model.launch_reward_fn_async:
+        if not self.config.reward.launch_reward_fn_async:
             output = self._post_process_and_merge_reward(reward_result, request)
         # psrl_logger.info(f"output of {request.non_tensor_batch['uid'][0]} = {output}")
 

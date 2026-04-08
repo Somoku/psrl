@@ -1,6 +1,7 @@
 """Tests for WeightLayoutSpec dataclass and SupportsWeightLayoutSpec Protocol."""
+
 import pytest
-from vllm.model_executor.models.interfaces import WeightLayoutSpec, SupportsWeightLayoutSpec
+from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec, WeightLayoutSpec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -43,7 +44,7 @@ class TestWeightLayoutSpec:
         """stacked_params shard_id can be str or int."""
         spec = WeightLayoutSpec(
             stacked_params=[
-                ("qkv_proj", "q_proj", "q"),   # str shard_id
+                ("qkv_proj", "q_proj", "q"),  # str shard_id
                 ("gate_up_proj", "gate_proj", 0),  # int shard_id
             ],
             packing_metadata={},
@@ -55,6 +56,7 @@ class TestWeightLayoutSpec:
 class TestSupportsWeightLayoutSpecProtocol:
     def test_isinstance_check_with_method(self):
         """isinstance check passes for any object with get_weight_layout_spec."""
+
         class FakeModel:
             def get_weight_layout_spec(self):
                 return WeightLayoutSpec(stacked_params=[], packing_metadata={})
@@ -64,6 +66,7 @@ class TestSupportsWeightLayoutSpecProtocol:
 
     def test_isinstance_check_without_method(self):
         """isinstance check fails for objects without the method."""
+
         class PlainModel:
             pass
 

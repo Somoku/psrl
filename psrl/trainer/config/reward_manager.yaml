@@ -1,7 +1,0 @@
-_target_: verl.workers.config.reward.RewardManagerConfig
-source: register
-name: ${oc.select:reward_model.reward_manager,naive}
-module:
-  _target_: verl.trainer.config.config.ModuleConfig
-  path: null
-  name: custom_reward_manager

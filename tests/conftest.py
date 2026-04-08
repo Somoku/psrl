@@ -1,7 +1,48 @@
 # tests/conftest.py
+import importlib.util
+import os
+import sys
+from unittest.mock import MagicMock
+
 import pytest
 from psrl.workers.gen_dplb.utils import RolloutInstanceId  # = tuple[str, int]
 from psrl.workers.ps.staleness_controller import EntryInfo
+
+# ---------------------------------------------------------------------------
+# Load ray-dependent modules without triggering package __init__.py files.
+# This keeps conftest importable in cpu_test environments (no ray / torch).
+# ---------------------------------------------------------------------------
+
+
+def _load_module_direct(dotted_name: str, file_path: str) -> object:
+    """Load a .py file directly by path and register it under dotted_name."""
+    if dotted_name in sys.modules:
+        return sys.modules[dotted_name]
+    spec = importlib.util.spec_from_file_location(dotted_name, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[dotted_name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_HERE = os.path.dirname(__file__)
+_PSRL = os.path.join(_HERE, "../psrl")
+
+# Stub out psrl.utils.logger so staleness_controller can import it on CPU.
+if "psrl.utils.logger" not in sys.modules:
+    sys.modules["psrl.utils.logger"] = MagicMock()
+
+# Load gen_dplb.utils directly (avoids ray via gen_dplb/__init__.py)
+_load_module_direct(
+    "psrl.workers.gen_dplb.utils",
+    os.path.join(_PSRL, "workers/gen_dplb/utils.py"),
+)
+
+# Load staleness_controller directly (avoids ray via ps/__init__.py)
+_load_module_direct(
+    "psrl.workers.ps.staleness_controller",
+    os.path.join(_PSRL, "workers/ps/staleness_controller.py"),
+)
 
 # ── Ray cluster fixtures (used by integration tests only) ────────────────────
 

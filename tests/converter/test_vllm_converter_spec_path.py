@@ -1,21 +1,24 @@
 """Tests for VllmConverter spec-driven fast path and fallback."""
+
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 import torch.nn as nn
-from unittest.mock import MagicMock
-
-from vllm.model_executor.models.interfaces import WeightLayoutSpec, SupportsWeightLayoutSpec
 from psrl.utils.converter.model_mappings import MappingType
 from psrl.utils.converter.vllm_converter import VllmConverter
+from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec, WeightLayoutSpec
 
 pytestmark = pytest.mark.cpu_test
 
 
 class FakeQwen2Model(nn.Module, SupportsWeightLayoutSpec):
     supports_weight_layout_spec = True
+
     def __init__(self):
         super().__init__()
         self.layer = nn.Linear(8, 8, bias=False)
+
     def get_weight_layout_spec(self) -> WeightLayoutSpec:
         return WeightLayoutSpec(
             stacked_params=[
@@ -28,21 +31,25 @@ class FakeQwen2Model(nn.Module, SupportsWeightLayoutSpec):
             packing_metadata={"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 8},
         )
 
+
 class FakeEmptyModel(nn.Module, SupportsWeightLayoutSpec):
     supports_weight_layout_spec = True
+
     def get_weight_layout_spec(self) -> WeightLayoutSpec:
         return WeightLayoutSpec(stacked_params=[], packing_metadata={})
+
 
 class FakeMoEModel(nn.Module, SupportsWeightLayoutSpec):
     supports_weight_layout_spec = True
     NUM_EXPERTS = 2
+
     def get_weight_layout_spec(self) -> WeightLayoutSpec:
         expert_params = []
         for eid in range(self.NUM_EXPERTS):
             expert_params += [
                 ("experts.w13_", f"experts.{eid}.gate_proj.", eid, "w1"),
-                ("experts.w2_",  f"experts.{eid}.down_proj.",  eid, "w2"),
-                ("experts.w13_", f"experts.{eid}.up_proj.",    eid, "w3"),
+                ("experts.w2_", f"experts.{eid}.down_proj.", eid, "w2"),
+                ("experts.w13_", f"experts.{eid}.up_proj.", eid, "w3"),
             ]
         return WeightLayoutSpec(
             stacked_params=[("gate_up_proj", "gate_proj", 0), ("gate_up_proj", "up_proj", 1)],
@@ -50,11 +57,14 @@ class FakeMoEModel(nn.Module, SupportsWeightLayoutSpec):
             expert_params=expert_params,
         )
 
+
 class FakeOuterModel(nn.Module, SupportsWeightLayoutSpec):
     supports_weight_layout_spec = True
+
     def __init__(self):
         super().__init__()
         self.language_model = FakeQwen2Model()
+
     def get_weight_layout_spec(self) -> WeightLayoutSpec:
         return WeightLayoutSpec(stacked_params=[], packing_metadata={})
 
@@ -91,24 +101,24 @@ class TestBuildFusedMappings:
         conv = self._make_converter()
         expert_params = [
             ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
-            ("experts.w2_",  "experts.0.down_proj.",  0, "w2"),
-            ("experts.w13_", "experts.0.up_proj.",    0, "w3"),
+            ("experts.w2_", "experts.0.down_proj.", 0, "w2"),
+            ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
         ]
         result = conv._build_fused_mappings([], [], expert_params)
         assert "experts.w13_" in result
         assert "experts.w2_" in result
         w13_type = result["experts.w13_"].mapping_type
-        w2_type  = result["experts.w2_"].mapping_type
+        w2_type = result["experts.w2_"].mapping_type
         assert w13_type == MappingType.FUSED_MOE_W13_SPLIT
-        assert w2_type  == MappingType.FUSED_MOE_W2_SPLIT
+        assert w2_type == MappingType.FUSED_MOE_W2_SPLIT
 
     def test_w13_shard_id_encoding(self):
         conv = self._make_converter()
         expert_params = [
             ("experts.w13_", "experts.0.gate_proj.", 0, "w1"),
-            ("experts.w13_", "experts.0.up_proj.",   0, "w3"),
+            ("experts.w13_", "experts.0.up_proj.", 0, "w3"),
             ("experts.w13_", "experts.1.gate_proj.", 1, "w1"),
-            ("experts.w13_", "experts.1.up_proj.",   1, "w3"),
+            ("experts.w13_", "experts.1.up_proj.", 1, "w3"),
         ]
         result = conv._build_fused_mappings([], [], expert_params)
         entries = result["experts.w13_"].mappings
@@ -170,17 +180,24 @@ class TestBuildFromSpec:
 
         class InnerModel(nn.Module, SupportsWeightLayoutSpec):
             supports_weight_layout_spec = True
+
             def get_weight_layout_spec(self):
                 return WeightLayoutSpec(
-                    stacked_params=[("qkv_proj", "q_proj", "q"), ("qkv_proj", "k_proj", "k"), ("qkv_proj", "v_proj", "v")],
+                    stacked_params=[
+                        ("qkv_proj", "q_proj", "q"),
+                        ("qkv_proj", "k_proj", "k"),
+                        ("qkv_proj", "v_proj", "v"),
+                    ],
                     packing_metadata={"num_heads": 4, "num_kv_heads": 4, "head_size": 8, "intermediate_size": 16},
                 )
 
         class OuterModel(nn.Module, SupportsWeightLayoutSpec):
             supports_weight_layout_spec = True
+
             def __init__(self):
                 super().__init__()
                 self.model = InnerModel()
+
             def get_weight_layout_spec(self):
                 return self.model.get_weight_layout_spec()  # delegate
 
@@ -197,9 +214,11 @@ class TestBuildFromSpec:
 
         class SimpleMambaLike(nn.Module, SupportsWeightLayoutSpec):
             supports_weight_layout_spec = True
+
             def __init__(self):
                 super().__init__()
                 self.linear = nn.Linear(4, 4, bias=False)
+
             def get_weight_layout_spec(self):
                 return WeightLayoutSpec(stacked_params=[], packing_metadata={})
 
@@ -220,6 +239,7 @@ class TestBuildFromSpec:
         # spec with qkv_proj stacked_params. The sub-module also owns a real qkv_proj param.
         class InnerWithQKV(nn.Module, SupportsWeightLayoutSpec):
             """Sub-module with qkv_proj spec AND a matching qkv_proj parameter."""
+
             supports_weight_layout_spec = True
 
             def __init__(self):
@@ -241,8 +261,7 @@ class TestBuildFromSpec:
                         ("qkv_proj_weight", "k_proj_weight", "k"),
                         ("qkv_proj_weight", "v_proj_weight", "v"),
                     ],
-                    packing_metadata={"num_heads": 2, "num_kv_heads": 2,
-                                      "head_size": 4, "intermediate_size": 8},
+                    packing_metadata={"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 8},
                 )
 
         class OuterEmpty(nn.Module, SupportsWeightLayoutSpec):
@@ -265,9 +284,7 @@ class TestBuildFromSpec:
         )
         assert "language_model.k_proj_weight" in state_dict
         assert "language_model.v_proj_weight" in state_dict
-        assert "language_model.qkv_proj_weight" not in state_dict, (
-            "qkv_proj_weight must be split, not passed through"
-        )
+        assert "language_model.qkv_proj_weight" not in state_dict, "qkv_proj_weight must be split, not passed through"
 
 
 class TestHasPackingSpec:
@@ -289,16 +306,19 @@ class TestVllmConverterIntegration:
             conv.convert_state_and_sharding_dict(model)
 
     def test_fallback_to_parameter_mapping(self):
-        from psrl.utils.converter.model_mappings import ParameterMapping, MappingType
+        from psrl.utils.converter.model_mappings import MappingType, ParameterMapping
 
         class FakeMapping(ParameterMapping):
-            def __init__(self): pass
+            def __init__(self):
+                pass
+
             def get_mappings(self):
                 return [
                     ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
                     ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
                     ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
                 ]
+
             def get_model_info(self):
                 return {"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 8}
 
@@ -318,9 +338,10 @@ class TestConvertParameterExactMatch:
         fused = conv._build_fused_mappings([], extra, [])
         model_info = {"intermediate_size": 8}
 
-        from torch.nn import Parameter
-        import torch
         from unittest.mock import MagicMock
+
+        import torch
+        from torch.nn import Parameter
 
         # Param whose name is a superset of the key (the problematic substring match case)
         scale_param = Parameter(torch.zeros(4))
@@ -330,8 +351,9 @@ class TestConvertParameterExactMatch:
         # "layers.0.mlp.w13.weight_scale" contains "layers.0.mlp.w13.weight" as substring
         result = conv.convert_parameter("layers.0.mlp.w13.weight_scale", scale_param, mock_module, fused, model_info)
         # With exact match fix, this should NOT match and should passthrough
-        assert result == {"layers.0.mlp.w13.weight_scale": scale_param}, \
+        assert result == {"layers.0.mlp.w13.weight_scale": scale_param}, (
             "Full-path key must use exact match, not substring match"
+        )
 
 
 class TestConvertParameterSplitting:
@@ -355,6 +377,7 @@ class TestConvertParameterSplitting:
     def test_qkv_split_produces_correct_output_names(self):
         """Pattern A: qkv_proj is split into q_proj, k_proj, v_proj with correct shapes."""
         from vllm.model_executor.layers.linear import QKVParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_qkv(conv)
         # num_heads=2, num_kv_heads=2, head_size=4 → q=8, k=8, v=8, total=24
@@ -366,7 +389,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.self_attn.qkv_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
 
         assert set(result.keys()) == {
@@ -381,6 +407,7 @@ class TestConvertParameterSplitting:
     def test_qkv_split_original_key_absent(self):
         """Pattern A: qkv_proj key must NOT appear in the output dict."""
         from vllm.model_executor.layers.linear import QKVParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_qkv(conv)
         model_info = {"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 16}
@@ -391,14 +418,19 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.self_attn.qkv_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
-        assert not any("qkv_proj" in k for k in result), \
+        assert not any("qkv_proj" in k for k in result), (
             f"qkv_proj should not appear in output keys, got {set(result.keys())}"
+        )
 
     def test_gate_up_split_produces_correct_output_names(self):
         """Pattern A: gate_up_proj is split into gate_proj and up_proj with correct shapes."""
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_gate_up(conv)
         model_info = {"intermediate_size": 8}
@@ -410,7 +442,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.mlp.gate_up_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
 
         assert set(result.keys()) == {
@@ -423,6 +458,7 @@ class TestConvertParameterSplitting:
     def test_gate_up_split_original_key_absent(self):
         """Pattern A: gate_up_proj key must NOT appear in the output dict."""
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_gate_up(conv)
         model_info = {"intermediate_size": 8}
@@ -433,14 +469,19 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.mlp.gate_up_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
-        assert not any("gate_up_proj" in k for k in result), \
+        assert not any("gate_up_proj" in k for k in result), (
             f"gate_up_proj should not appear in output keys, got {set(result.keys())}"
+        )
 
     def test_pattern_b_gate_up_with_w1_w3_names(self):
         """Pattern B (InternLM2): gate_up_proj splits to w1/w3, not gate_proj/up_proj."""
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
         conv = self._make_converter()
         stacked = [("gate_up_proj", "w1", 0), ("gate_up_proj", "w3", 1)]
         fused = conv._build_fused_mappings(stacked, [], [])
@@ -452,7 +493,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.mlp.gate_up_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
 
         assert set(result.keys()) == {
@@ -465,6 +509,7 @@ class TestConvertParameterSplitting:
     def test_pattern_e_extra_stacked_params_full_path_output(self):
         """Pattern E (Arctic): extra_stacked_params use full paths as both input and output names."""
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
         conv = self._make_converter()
         extra = [
             ("layers.0.residual_mlp.w13.weight", "layers.0.residual_mlp.w1.weight", 0),
@@ -479,7 +524,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "layers.0.residual_mlp.w13.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
 
         # Full-path keys: output names are the hf_names directly, not suffix-substituted
@@ -493,6 +541,7 @@ class TestConvertParameterSplitting:
     def test_unmatched_param_passes_through(self):
         """Params not matching any fused_mappings key are returned unchanged."""
         from vllm.model_executor.layers.linear import RowParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_qkv(conv)
         model_info = {"num_heads": 2, "num_kv_heads": 2, "head_size": 4}
@@ -503,7 +552,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.self_attn.o_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
         assert list(result.keys()) == ["model.layers.0.self_attn.o_proj.weight"]
         assert result["model.layers.0.self_attn.o_proj.weight"] is param
@@ -511,6 +563,7 @@ class TestConvertParameterSplitting:
     def test_qkv_split_tensor_data_is_correct_slice(self):
         """Verify q/k/v tensors are actual slices of the original (not copies)."""
         from vllm.model_executor.layers.linear import QKVParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_qkv(conv)
         model_info = {"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 16}
@@ -523,7 +576,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.self_attn.qkv_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
 
         q = result["model.layers.0.self_attn.q_proj.weight"]
@@ -538,6 +594,7 @@ class TestConvertParameterSplitting:
     def test_gate_up_split_tensor_data_is_correct_slice(self):
         """Verify gate/up tensors are correct halves of the fused weight."""
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
         conv = self._make_converter()
         fused = self._make_fused_mappings_for_gate_up(conv)
         model_info = {"intermediate_size": 8}
@@ -549,7 +606,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.mlp.gate_up_proj.weight",
-            param, module, fused, model_info,
+            param,
+            module,
+            fused,
+            model_info,
         )
 
         gate = result["model.layers.0.mlp.gate_proj.weight"]
@@ -564,13 +624,16 @@ class TestConvertParameterSplitting:
         from psrl.utils.converter.model_mappings import ParameterMapping
 
         class QKVMapping(ParameterMapping):
-            def __init__(self): pass
+            def __init__(self):
+                pass
+
             def get_mappings(self):
                 return [
                     ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
                     ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
                     ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
                 ]
+
             def get_model_info(self):
                 return {"num_heads": 2, "num_kv_heads": 2, "head_size": 4, "intermediate_size": 8}
 
@@ -609,7 +672,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.self_attn.qkv_proj.weight",
-            param, mock_module, fused, model_info,
+            param,
+            mock_module,
+            fused,
+            model_info,
         )
         assert set(result.keys()) == {
             "model.layers.0.self_attn.q_proj.weight",
@@ -620,6 +686,7 @@ class TestConvertParameterSplitting:
     def test_fused_moe_w13_split_produces_per_expert_output(self):
         """Pattern A MoE: w13_weight is split into per-expert gate_proj and up_proj params."""
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
         conv = self._make_converter()
 
         NUM_EXPERTS = 2
@@ -627,8 +694,8 @@ class TestConvertParameterSplitting:
         for eid in range(NUM_EXPERTS):
             expert_params += [
                 ("experts.w13_weight", f"experts.{eid}.gate_proj.weight", eid, "w1"),
-                ("experts.w2_weight",  f"experts.{eid}.down_proj.weight",  eid, "w2"),
-                ("experts.w13_weight", f"experts.{eid}.up_proj.weight",   eid, "w3"),
+                ("experts.w2_weight", f"experts.{eid}.down_proj.weight", eid, "w2"),
+                ("experts.w13_weight", f"experts.{eid}.up_proj.weight", eid, "w3"),
             ]
         fused = conv._build_fused_mappings([], [], expert_params)
         model_info = {"num_experts": NUM_EXPERTS, "intermediate_size": 4}
@@ -641,7 +708,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.mlp.experts.w13_weight",
-            w13_param, module, fused, model_info,
+            w13_param,
+            module,
+            fused,
+            model_info,
         )
 
         # All 4 gate+up projections for 2 experts should appear
@@ -651,9 +721,7 @@ class TestConvertParameterSplitting:
             "model.layers.0.mlp.experts.1.gate_proj.weight",
             "model.layers.0.mlp.experts.1.up_proj.weight",
         }
-        assert set(result.keys()) == expected_keys, (
-            f"Expected per-expert gate/up keys, got {set(result.keys())}"
-        )
+        assert set(result.keys()) == expected_keys, f"Expected per-expert gate/up keys, got {set(result.keys())}"
         # Each slice should have shape (intermediate, in_features) = (4, 2)
         for key in expected_keys:
             assert result[key].shape == (4, 2), f"{key} shape {result[key].shape} != (4, 2)"
@@ -661,12 +729,12 @@ class TestConvertParameterSplitting:
     def test_fused_moe_w2_split_produces_per_expert_output(self):
         """Pattern A MoE: w2_weight is split into per-expert down_proj params."""
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+
         conv = self._make_converter()
 
         NUM_EXPERTS = 2
         expert_params = [
-            ("experts.w2_weight", f"experts.{eid}.down_proj.weight", eid, "w2")
-            for eid in range(NUM_EXPERTS)
+            ("experts.w2_weight", f"experts.{eid}.down_proj.weight", eid, "w2") for eid in range(NUM_EXPERTS)
         ]
         fused = conv._build_fused_mappings([], [], expert_params)
         model_info = {"num_experts": NUM_EXPERTS, "intermediate_size": 4}
@@ -679,7 +747,10 @@ class TestConvertParameterSplitting:
 
         result = conv.convert_parameter(
             "model.layers.0.mlp.experts.w2_weight",
-            w2_param, module, fused, model_info,
+            w2_param,
+            module,
+            fused,
+            model_info,
         )
 
         expected_keys = {
@@ -698,17 +769,19 @@ class TestGetShardingForParam:
     def test_column_parallel_tp2_shards_dim0(self):
         """ColumnParallelLinear with tp_size=2 → shard_dim=0."""
         from vllm.model_executor.layers.linear import ColumnParallelLinear
+
         conv = self._make_converter(tp_rank=1)
         module = MagicMock(spec=ColumnParallelLinear)
         module.tp_size = 2
         sharding = conv.get_sharding_for_param(module, "weight")
-        assert 0 in sharding.shard_mesh          # sharded on dim 0
-        assert sharding.shard_mesh[0] == 2       # tp_size=2
-        assert sharding.shard_indices == [(1,)]   # tp_rank=1
+        assert 0 in sharding.shard_mesh  # sharded on dim 0
+        assert sharding.shard_mesh[0] == 2  # tp_size=2
+        assert sharding.shard_indices == [(1,)]  # tp_rank=1
 
     def test_merged_column_parallel_tp2_shards_dim0(self):
         """MergedColumnParallelLinear with tp_size=2 → shard_dim=0 (same as ColumnParallel)."""
         from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+
         conv = self._make_converter(tp_rank=0)
         module = MagicMock(spec=MergedColumnParallelLinear)
         module.tp_size = 2
@@ -720,6 +793,7 @@ class TestGetShardingForParam:
     def test_qkv_parallel_tp2_shards_dim0(self):
         """QKVParallelLinear with tp_size=2 → shard_dim=0."""
         from vllm.model_executor.layers.linear import QKVParallelLinear
+
         conv = self._make_converter(tp_rank=0)
         module = MagicMock(spec=QKVParallelLinear)
         module.tp_size = 2
@@ -730,17 +804,19 @@ class TestGetShardingForParam:
     def test_row_parallel_tp2_shards_dim1(self):
         """RowParallelLinear with tp_size=2 → shard_dim=1."""
         from vllm.model_executor.layers.linear import RowParallelLinear
+
         conv = self._make_converter(tp_rank=0)
         module = MagicMock(spec=RowParallelLinear)
         module.tp_size = 2
         sharding = conv.get_sharding_for_param(module, "weight")
-        assert 1 in sharding.shard_mesh          # sharded on dim 1
+        assert 1 in sharding.shard_mesh  # sharded on dim 1
         assert sharding.shard_mesh[1] == 2
-        assert sharding.shard_indices == [(0,)]   # tp_rank=0
+        assert sharding.shard_indices == [(0,)]  # tp_rank=0
 
     def test_row_parallel_tp2_rank1_shard_index(self):
         """RowParallelLinear with tp_size=2 and tp_rank=1 → shard_index=(1,)."""
         from vllm.model_executor.layers.linear import RowParallelLinear
+
         conv = self._make_converter(tp_rank=1)
         module = MagicMock(spec=RowParallelLinear)
         module.tp_size = 2
@@ -750,6 +826,7 @@ class TestGetShardingForParam:
     def test_tp1_row_parallel_returns_default_sharding(self):
         """RowParallelLinear with tp_size=1 returns default (no sharding)."""
         from vllm.model_executor.layers.linear import RowParallelLinear
+
         conv = self._make_converter(tp_rank=0)
         module = MagicMock(spec=RowParallelLinear)
         module.tp_size = 1
@@ -760,6 +837,7 @@ class TestGetShardingForParam:
     def test_tp1_column_parallel_returns_default_sharding(self):
         """ColumnParallelLinear with tp_size=1 → default sharding (no split)."""
         from vllm.model_executor.layers.linear import ColumnParallelLinear
+
         conv = self._make_converter(tp_rank=0)
         module = MagicMock(spec=ColumnParallelLinear)
         module.tp_size = 1
@@ -770,17 +848,18 @@ class TestGetShardingForParam:
     def test_replicated_linear_treated_as_tp1(self):
         """ReplicatedLinear with tp_size>1 is treated as unsharded (tp_size effectively 1)."""
         from vllm.model_executor.layers.linear import ReplicatedLinear
+
         conv = self._make_converter(tp_rank=0)
         module = MagicMock(spec=ReplicatedLinear)
-        module.tp_size = 4   # world size, but not actually sharded
+        module.tp_size = 4  # world size, but not actually sharded
         sharding = conv.get_sharding_for_param(module, "weight")
-        assert sharding.shard_mesh == {0: 1}     # treated as unsharded
+        assert sharding.shard_mesh == {0: 1}  # treated as unsharded
         assert sharding.shard_indices == [(0,)]
 
     def test_tp1_no_module_type_returns_default_sharding(self):
         """Any module with tp_size=1 (or missing tp_size) returns default sharding."""
         conv = self._make_converter(tp_rank=0)
-        module = MagicMock()   # no spec, unknown type
+        module = MagicMock()  # no spec, unknown type
         module.tp_size = 1
         sharding = conv.get_sharding_for_param(module, "weight")
         assert sharding.shard_mesh == {0: 1}
@@ -789,7 +868,7 @@ class TestGetShardingForParam:
     def test_unsupported_module_type_raises(self):
         """Unknown module type with tp_size>1 raises ValueError."""
         conv = self._make_converter(tp_rank=0)
-        module = MagicMock()   # no spec → not isinstance of any known type
+        module = MagicMock()  # no spec → not isinstance of any known type
         module.tp_size = 2
         with pytest.raises(ValueError, match="Unsupported module type"):
             conv.get_sharding_for_param(module, "weight")

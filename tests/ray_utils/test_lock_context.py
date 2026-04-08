@@ -136,8 +136,7 @@ def test_no_lock_loses_updates(ray_cluster):
 
     final_no_lock = ray.get(counter1.read.remote())
     # With concurrent reads and sleeps, race conditions cause lost updates
-    assert final_no_lock <= NUM_WORKERS, \
-        f"Expected final_no_lock <= {NUM_WORKERS}, got {final_no_lock}"
+    assert final_no_lock <= NUM_WORKERS, f"Expected final_no_lock <= {NUM_WORKERS}, got {final_no_lock}"
 
 
 def test_lock_serializes_counter(ray_cluster):
@@ -148,5 +147,4 @@ def test_lock_serializes_counter(ray_cluster):
     ray.get(futures_with_lock)
 
     final_with_lock = ray.get(counter2.read.remote())
-    assert final_with_lock == NUM_WORKERS, \
-        f"Expected count={NUM_WORKERS} with lock, got {final_with_lock}"
+    assert final_with_lock == NUM_WORKERS, f"Expected count={NUM_WORKERS} with lock, got {final_with_lock}"

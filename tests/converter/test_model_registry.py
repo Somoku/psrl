@@ -1,9 +1,8 @@
 # tests/converter/test_model_registry.py
 """Tests for the ParameterMapping model registry (create_parameter_mapping, register_model)."""
-import pytest
-from unittest.mock import MagicMock
 
-from psrl.utils.converter.model_mappings import ModelRegistry, ParameterMapping, register_model
+import pytest
+from psrl.utils.converter.model_mappings import ModelRegistry, ParameterMapping
 
 pytestmark = pytest.mark.cpu_test
 
@@ -72,11 +71,13 @@ class TestGlobalModelRegistry:
     def test_megatron_model_registered(self):
         """The Megatron model mapping is registered by the megatron_modeling import."""
         from psrl.utils.converter import model_registry
+
         # megatron_modeling.py registers "Megatron" via @register_model
         assert "Megatron" in model_registry._mappings
 
     def test_model_registry_importable(self):
-        from psrl.utils.converter import model_registry, create_parameter_mapping, register_model
+        from psrl.utils.converter import create_parameter_mapping, model_registry, register_model
+
         assert model_registry is not None
         assert callable(create_parameter_mapping)
         assert callable(register_model)

@@ -34,15 +34,10 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
             model = self.model_runner.model
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
-        if level == 1:
-            raise NotImplementedError(
-                "Level 1 sleep is not implemented for TMS because we always need to save kv cache."
-            )
-        else:
-            torch_memory_saver.pause("weights")
-            torch_memory_saver.pause("kv_cache")
-            if os.environ.get("PSRL_VLLM_PATCHES", "") == "TMS:GRAPH":
-                torch_memory_saver.pause("graph")
+        torch_memory_saver.pause("weights")
+        torch_memory_saver.pause("kv_cache")
+        if os.environ.get("PSRL_VLLM_PATCHES", "") == "TMS:GRAPH":
+            torch_memory_saver.pause("graph")
 
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
@@ -96,7 +91,11 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
         if self.vllm_config.model_config.enable_sleep_mode:
             from torch_memory_saver import torch_memory_saver
 
-            return torch_memory_saver.region(tag=tag)
+            enable_weights_cpu_backup = self.vllm_config.additional_config.get("enable_weights_cpu_backup", False)
+            return torch_memory_saver.region(
+                tag=tag,
+                enable_cpu_backup=enable_weights_cpu_backup,
+            )
         else:
             return nullcontext()
 

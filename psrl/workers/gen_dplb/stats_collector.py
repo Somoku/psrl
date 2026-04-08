@@ -83,6 +83,7 @@ class DPLBStatCollector(StatLoggerBase):
         vllm_config: VllmConfig,
         psrl_config: DictConfig,
         replica_idx: int,
+        role: str,
     ):
         """
         Initialize the StatCollector.
@@ -93,6 +94,7 @@ class DPLBStatCollector(StatLoggerBase):
         """
         self.vllm_config = vllm_config
         self.psrl_config = psrl_config
+        self.role = role
 
         self.replica_idx = replica_idx
 
@@ -106,7 +108,7 @@ class DPLBStatCollector(StatLoggerBase):
 
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
-            self.log_prefix = f"DPLBStatCollector_I{self.replica_idx}"
+            self.log_prefix = f"DPLBStatCollector_{self.role}_I{self.replica_idx}"
             psrl_logger.propagate = False
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
             psrl_logger.info(f"Initialized DPLBStatCollector for replica {self.replica_idx}.")

@@ -24,6 +24,8 @@ class TokenInput:
     """the version tag of the model used for this generation"""
     cu_response_len: int | None = None
     """the current response length for this generation"""
+    multi_modal_data: dict | None = None
+    """the multi-modal data for this generation, e.g., image/video features or metadata"""
     is_validate: bool = False
     """whether this request is for validation purpose"""
 
@@ -36,6 +38,12 @@ class TokenOutput:
     """logprobs of response token ids"""
     routed_experts: Any | None = None
     """routed experts of response token ids"""
+    # NOTE(linsh): pooling_output carries the embedding/classification tensor returned by
+    # vLLM pooling models (e.g., reward models). It is None for generative models.
+    pooling_output: Any | None = None
+    """pooling output tensor for pooling/reward models (torch.Tensor or None)"""
+    multi_modal_data: dict | None = None
+    """the multi-modal data for this generation, e.g., image/video features or metadata"""
     stop_reason: str | None = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: int | None = None

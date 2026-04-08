@@ -4,28 +4,24 @@ import inspect
 from verl import DataProto
 
 from psrl.utils.reward_score import default_compute_score_async
-from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
-from psrl.workers.reward.reward_loop.registry import register
+from psrl.workers.reward.reward_loop import register
+from psrl.workers.reward.reward_loop.base import RewardManagerBase
 
 
 @register("naive")
-class NaiveRewardLoopManager(RewardLoopManagerBase):
+class NaiveRewardManager(RewardManagerBase):
     """The reward manager."""
 
     def __init__(
         self,
         config,
         tokenizer,
-        compute_score=None,
-        reward_model_router=None,
-        reward_model_tokenizer=None,
-        is_validate=False,
+        compute_score,
+        **reward_kwargs,
     ):
-        super().__init__(config, tokenizer, is_validate)
+        super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        self.reward_model_router = reward_model_router
-        self.reward_model_tokenizer = reward_model_tokenizer
 
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
@@ -38,6 +34,10 @@ class NaiveRewardLoopManager(RewardLoopManagerBase):
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
+        if tool_extra_fields is not None:
+            extra_info.update(tool_extra_fields.items())
+
         num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
         rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
         extra_info["num_turns"] = num_turns

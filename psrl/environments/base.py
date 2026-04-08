@@ -80,7 +80,7 @@ class Environment(ABC, Generic[ObsType, ActType]):
         return None, {}
 
     @abstractmethod
-    async def step(self, action: ActType) -> EnvStepOutput:
+    async def step(self, action: ActType, **kwargs) -> EnvStepOutput:
         """
         Takes an action in the environment.
 
@@ -89,6 +89,7 @@ class Environment(ABC, Generic[ObsType, ActType]):
 
         Args:
             action: The action to take in the environment
+            **kwargs: Additional keyword arguments (e.g. tools_kwargs for ToolEnvironment)
 
         Returns:
             EnvStepOutput: Dictionary containing:

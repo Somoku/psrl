@@ -7,6 +7,7 @@ import ray
 from omegaconf import DictConfig
 from vllm.sampling_params import RequestOutputKind
 
+from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
@@ -172,6 +173,20 @@ class RolloutRouter:
         return self._is_routing
 
     @ray.method(concurrency_group="control")
+    def get_pending_request_count(self) -> int:
+        """Return current number of requests waiting in router queue."""
+        t0 = time.monotonic()
+        log_elastic_rm_backlog_diag(psrl_logger, "stage=RolloutRouter_enter")
+        n = int(self.requests_to_route.size())
+        log_elastic_rm_backlog_diag(
+            psrl_logger,
+            "stage=RolloutRouter_exit pending=%d body_s=%.6f",
+            n,
+            time.monotonic() - t0,
+        )
+        return n
+
+    @ray.method(concurrency_group="control")
     async def pause_routing(self):
         self._pause_routing = True
         # NOTE: asyncio lock cannot be shared across Ray concurrency groups (each group has its
@@ -322,9 +337,7 @@ class RolloutRouter:
         self,
         request: TokenInput,
     ) -> RolloutInstanceId | None:
-        assert request.version_tag is not None, (
-            "Request must have a valid version_tag (not None)"
-        )
+        assert request.version_tag is not None, "Request must have a valid version_tag (not None)"
         request_id = request.request_id
         version_tag = request.version_tag
         rollout_instance_id = request.rollout_instance_id
@@ -355,10 +368,21 @@ class RolloutRouter:
             not self.config.psrl.sync_and_mig_strategy.mig.enable
             or self.sticky_session_requests.get(request_id, False)
         ):
-            assert rollout_instance_id in candidates, (
-                f"Old rollout instance {rollout_instance_id} is not in the candidates"
-            )
-            candidates = [rollout_instance_id]
+            # TODO: implement similar skip logic for Rust gateway
+            if rollout_instance_id in candidates:
+                candidates = [rollout_instance_id]
+            else:
+                # Elastic scale/sleep may invalidate historical rollout_instance_id.
+                # Degrade gracefully to current candidate set instead of crashing router loop.
+                psrl_logger.warning(
+                    (
+                        "Old rollout instance %s is not in candidates for request %s; "
+                        "fallback to normal routing. candidates=%s"
+                    ),
+                    rollout_instance_id,
+                    request_id,
+                    candidates,
+                )
 
         # 3. If forbidden group sampling on multiple instances, only consider the
         # instance that other requests in the same group are already routed to

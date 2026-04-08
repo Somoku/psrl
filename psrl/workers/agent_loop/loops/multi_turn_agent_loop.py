@@ -2,14 +2,16 @@ import asyncio
 import logging
 import os
 
-from omegaconf import DictConfig
+import ray
+from transformers import AutoProcessor, AutoTokenizer
 from verl import DataProto
+from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from psrl.environments.base import Environment
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
-from psrl.workers.agent_loop.loops.utils import TerminateReason, register
+from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -28,25 +30,31 @@ class MultiTurnAgentLoop(AgentLoopBase):
     5. Finalizes and returns the generated response along with termination metadata.
     """
 
-    @classmethod
-    def init_class(cls, config: DictConfig, **kwargs) -> None:
-        """Perform heavy initialization work shared across all instances.
-
-        This method is called only once per class to avoid redundant initialization.
-
-        Args:
-            config (DictConfig): Configuration object containing training settings.
-            **kwargs: Additional keyword arguments from configuration.
-        """
-        if cls._class_initialized:
-            return
-        cls._class_initialized = True
-
-        cls.prompt_length = config.gen_actor_rollout_ref.rollout.prompt_length
-        cls.response_length = config.gen_actor_rollout_ref.rollout.response_length
-
-        cls.max_turns = config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-        cls.env_step_timeout = config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
+    def __init__(
+        self,
+        trainer_config: DictConfigWrap,
+        rollout_router: ray.actor.ActorHandle | str,
+        reward_manager: ray.actor.ActorHandle,
+        ps_manager_handle: ray.actor.ActorHandle,
+        tokenizer: AutoTokenizer,
+        processor: AutoProcessor,
+        dataset_cls: type[RLHFDataset],
+        data_config: DictConfigWrap,
+        **kwargs,
+    ):
+        super().__init__(
+            trainer_config=trainer_config,
+            rollout_router=rollout_router,
+            reward_manager=reward_manager,
+            ps_manager_handle=ps_manager_handle,
+            tokenizer=tokenizer,
+            processor=processor,
+            dataset_cls=dataset_cls,
+            data_config=data_config,
+            **kwargs,
+        )
+        self.max_turns = trainer_config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
+        self.env_step_timeout = trainer_config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
     @rollout_trace_op
     async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
@@ -87,6 +95,9 @@ class MultiTurnAgentLoop(AgentLoopBase):
 
         self.agent_data.init_trajectory(request)
 
+        # Extract per-sample tools_kwargs (populated by init_trajectory via extra_fields).
+        tools_kwargs: dict = self.agent_data.trajectory.extra_fields.get("tools_kwargs", {})
+
         overlong_terminate = await self.agent_data.update_from_env(observation, 0, False, info)
 
         if overlong_terminate:
@@ -113,7 +124,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
                 return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             try:
-                env_step_output = await asyncio.wait_for(self.env.step(action), timeout=self.env_step_timeout)
+                env_step_output = await asyncio.wait_for(
+                    self.env.step(action, tools_kwargs=tools_kwargs),
+                    timeout=self.env_step_timeout,
+                )
                 observation = env_step_output["observation"]
                 reward = env_step_output["reward"]
                 done = env_step_output["done"]

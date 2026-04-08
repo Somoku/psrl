@@ -7,101 +7,90 @@ defaults:
 
   - model_engine: dp
 
-  # train_actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
-  - actor@train_actor_rollout_ref.actor: ${model_engine}_actor
+  # Use veRL-standard `actor_rollout_ref` namespace for Hydra defaults loading.
+  # PSRL Python code accesses `train_actor_rollout_ref` and `gen_actor_rollout_ref`,
+  # which are defined below as alias bridges via OmegaConf interpolation.
 
-  # Rollout model config in trainer.
-  - rollout@train_actor_rollout_ref.rollout: rollout
+  # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
+  - actor@actor_rollout_ref.actor: ${model_engine}_actor
 
-  # Rollout model config in gen worker.
+  # Rollout model config for training.
+  - rollout@actor_rollout_ref.rollout: rollout
+
+  # Rollout model config for generation.
   - rollout@gen_actor_rollout_ref.rollout: rollout
 
   # Model config.
-  - model@train_actor_rollout_ref.model: hf_model
-
-  # Model config.
-  - model@gen_actor_rollout_ref.model: hf_model
+  - model@actor_rollout_ref.model: hf_model
 
   # data: trainer/config/data/data.yaml
   - data@data: data
 
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
-  - ref@train_actor_rollout_ref.ref: ${model_engine}_ref
+  - ref@actor_rollout_ref.ref: ${model_engine}_ref
 
-  # Model config for trainer.
-  - model@train_actor_rollout_ref.model: hf_model
-
-  # Model config for gen worker.
-  - model@gen_actor_rollout_ref.model: hf_model
-  
   # Critic model config.
   - critic@critic: ${model_engine}_critic
+  - model@critic.model: hf_model
 
-  # Reward model config.
-  - reward_model@reward_model: ${model_engine}_reward_model
-
-  # (Rule-based) Reward manager config.
-  - reward_manager@reward_manager
+  # Reward config.
+  - reward@reward: reward
 
   # Rollout correction config.
   - algorithm@algorithm.rollout_correction: rollout_correction
+
+  # distillation config
+  - distillation@distillation: distillation
 
   # load the reference default config, then apply the fields in the current yaml
   # self config override anything above
   - _self_
 
-# config for actor and reference model
-train_actor_rollout_ref:
+# ===== PSRL alias bridges (Python code zero-change) =====
+# train_actor_rollout_ref is a direct alias of actor_rollout_ref.
+# Any Hydra CLI override to actor_rollout_ref automatically propagates.
+train_actor_rollout_ref: ${actor_rollout_ref}
 
-  # path to the megatron model
-  path: ~/models/deepseek-llm-7b-chat
-
-  # custom chat template for the model
-  custom_chat_template: null
-
-  # whether to use external libs for the model
-  external_lib: null
-
-  # Whether it's a hybrid engine, currently only supports hybrid engine
-  hybrid_engine: True
-
-  # Timeout for operations executed against the process group
-  nccl_timeout: 600
-
-  # Rollout instance config.
-  rollout:
-
-    # for huge model, layered summon can save memory (prevent OOM) but make it slower
-    layered_summon: False
-
-# config for rollout model
+# gen_actor_rollout_ref has its own overrides for the generation side.
 gen_actor_rollout_ref:
 
   # Whether it's a hybrid engine, currently only supports hybrid engine
-  hybrid_engine: False
-
-  # path to the huggingface model, same as trainer
-  path: ${oc.select:train_actor_rollout_ref.model.path}
+  hybrid_engine: true
 
   # Timeout for operations executed against the process group
   nccl_timeout: 600
 
-  # Rollout instance config.
+  # Rollout model config.
   rollout:
 
-    # Which loader to use for rollout model weights: dummy_dtensor, hf, megatron, etc.
-    # safetensors (for huge model, and set use_shm=True); dummy_dtensor: randomly init model weight
-    load_format: auto
+    # (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
+    enable_weights_cpu_backup: False
 
-    # for huge model, layered summon can save memory (prevent OOM) but make it slower
-    layered_summon: False
+    # vLLM runner mode. Must be 'pooling' for reward / embedding models.
+    runner: generate
+
+    # vLLM task type forwarded to the engine.
+    # Common values: 'classify' (reward models), 'embed' (embedding models).
+    task: generate
+
+    # Pooling params for vLLM-based pooling reward models.
+    reward_kwargs:
+
+      # Whether to L2-normalise the output embedding vector.
+      normalize: False
+
+      # Whether to apply an activation function (e.g., sigmoid) to the logit output.
+      use_activation: False
+
+  # Share model config from actor_rollout_ref
+  model: ${oc.select:actor_rollout_ref.model}
 
 # config for the algorithm
 algorithm:
 
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-  _target_: psrl.trainer.config.AlgoConfig
+  _target_: verl.trainer.config.AlgoConfig
 
   # Discount factor for future rewards
   gamma: 1.0
@@ -125,7 +114,7 @@ algorithm:
   kl_ctrl:
 
     # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
-    _target_: psrl.trainer.config.KLControlConfig
+    _target_: verl.trainer.config.KLControlConfig
 
     # KL control type: "fixed" or "adaptive"
     type: fixed
@@ -150,12 +139,12 @@ algorithm:
 
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
-  
+
   # Group filtering settings for group post-processing
   filter_groups:
 
     # Metric to use for filtering: null, acc, seq_final_reward, seq_reward...
-    metric: null 
+    metric: null
 
 # config for the trainer
 trainer:
@@ -255,7 +244,7 @@ global_profiler:
   # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.utils.profiler.ProfilerConfig
 
-  # Profiling tool: choose between nsys, npu, torch, torch_memory
+  # Profiling tool: choose between nsys, npu, torch, torch_memory, precision_debugger
   tool: null
 
   # profile steps
@@ -338,6 +327,32 @@ global_profiler:
 
       # devices, record_context etc.
       kw_args: {}
+
+    # msprobe precision debugger
+    precision_debugger:
+
+      # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+      _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+
+      # Enable msprobe precision debugger
+      enable: False
+
+      # Path to msprobe config json
+      config_path: null
+
+      # Data directory for msprobe dumps
+      data_dir: "outputs/precision_debug"
+
+      # Profile steps
+      steps: null
+
+      # Profile stages
+      # Supported stages: actor_update, actor_compute_log_prob, ref_compute_log_prob,
+      # compute_values, critic_update, compute_rm_score
+      stages: null
+
+      # Whether to fail on unknown stage or missing msprobe
+      strict: False
 
 # configs for TransferQueue
 transfer_queue:

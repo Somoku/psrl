@@ -9,8 +9,9 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl import DataProto
+from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
-from psrl.utils.dataset.utils import create_rl_dataset, create_rl_sampler
+from psrl.utils.dataset.utils import create_multi_rl_datasets
 from psrl.utils.logger import DualOutputHandler, log_data_protocol
 
 psrl_logger = logging.getLogger(__file__)
@@ -56,14 +57,23 @@ class DataProcessor:
         # Dataset and dataloader attributes
         self.tokenizer = tokenizer
         self.processor = processor
-        self.train_dataloader_iter = None
-        self.val_dataloader_iter = None
+        self.train_dataloader_iters = None
+        self.val_dataloader_iters = None
+        # train_datasets_ratios is set here for multi-dataset mode;
+        # in legacy mode it will be overridden to [1.0] in build_train_and_val_dataset().
+        if self.config.data.get("use_multi_dataset", True):
+            self.train_datasets_ratios = self.config.data.train_datasets_ratios
+        else:
+            self.train_datasets_ratios = [1.0]
+        self._validate_data_config()
+        self._val_dataloader_idx = 0  # Index for round-robin selection of validation dataloaders
+
         self.global_steps = 0
         self._train_sample_idx = 0
         self._val_sample_idx = 0
 
         if collate_fn is None:
-            from psrl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
             self.collate_fn = default_collate_fn
         else:
@@ -102,6 +112,28 @@ class DataProcessor:
         self.total_training_steps = None
         self._create_dataloader()
 
+    def _validate_data_config(self) -> None:
+        """Validate the data configuration for consistency.
+
+        In multi-dataset mode (use_multi_dataset=True), train_datas and
+        train_datasets_ratios must both be set.
+
+        In legacy mode (use_multi_dataset=False), train_files must be set.
+        If train_datas is also set, a warning is emitted (it will be ignored).
+        """
+        if self.config.data.get("use_multi_dataset", True):
+            if not self.config.data.get("train_datas"):
+                raise ValueError("use_multi_dataset=True requires 'train_datas' to be set in data config.")
+            if not self.config.data.get("train_datasets_ratios"):
+                raise ValueError("use_multi_dataset=True requires 'train_datasets_ratios' to be set in data config.")
+        else:
+            if not self.config.data.get("train_files"):
+                raise ValueError("use_multi_dataset=False requires 'train_files' to be set in data config.")
+            if self.config.data.get("train_datas"):
+                psrl_logger.warning(
+                    "use_multi_dataset=False but 'train_datas' is set in data config — it will be ignored."
+                )
+
     def set_reward_manager(self, reward_manager_handle: ray.actor.ActorHandle):
         self.reward_manager_handle = reward_manager_handle
 
@@ -110,24 +142,83 @@ class DataProcessor:
 
     # ------- Dataset and Dataloader Building Methods -------
     def build_train_and_val_dataset(self) -> None:
-        """Build the training and validation datasets."""
-        self.train_dataset = create_rl_dataset(
-            self.config.data.train_files,
-            self.config.data,
-            self.tokenizer,
-            self.processor,
-        )
-        self.val_dataset = create_rl_dataset(
-            self.config.data.val_files, self.config.data, self.tokenizer, self.processor
-        )
+        """Build the training and validation datasets.
+
+        Behavior depends on ``config.data.use_multi_dataset``:
+
+        * ``True`` (default): uses PSRL multi-dataset path.  Each entry in
+          ``config.data.train_datas`` / ``config.data.val_datas`` is turned into
+          a separate ``RLHFDataset``; oversampling is applied so that all datasets
+          contribute the same number of batches per epoch.
+
+        * ``False``: falls back to the veRL-native single-dataset path.
+          ``config.data.train_files`` / ``config.data.val_files`` are used; no
+          oversampling is performed, and ``train_datasets_ratios`` is forced to
+          ``[1.0]`` so that the rest of the dataloader pipeline sees a
+          single-element list transparently.
+        """
+        if self.config.data.get("use_multi_dataset", True):
+            # ── Multi-dataset path (PSRL) ──────────────────────────────────────
+            self.train_datasets = create_multi_rl_datasets(
+                self.config.data.train_datas,
+                self.tokenizer,
+                self.processor,
+            )
+
+            dataset_sizes = [len(dataset) for dataset in self.train_datasets]
+            rough_batch_sizes = [
+                int(self.config.data.train_batch_size * ratio) for ratio in self.train_datasets_ratios
+            ]
+            rough_num_batches = [
+                dataset_size // rough_batch_size
+                for dataset_size, rough_batch_size in zip(dataset_sizes, rough_batch_sizes)
+            ]
+            max_num_batches = max(rough_num_batches) if rough_num_batches else 0
+            oversample_ratios = [
+                max_num_batches / rough_num_batches[i] if rough_num_batches[i] > 0 else 1.0
+                for i in range(len(self.train_datasets))
+            ]
+            for dataset, oversample_ratio in zip(self.train_datasets, oversample_ratios):
+                dataset.over_sample_dataset(oversample_ratio)
+
+            self.val_datasets = create_multi_rl_datasets(
+                self.config.data.val_datas,
+                self.tokenizer,
+                self.processor,
+            )
+        else:
+            # ── Legacy path (veRL-compatible) ──────────────────────────────────
+            # Single dataset wrapped in a list so the rest of the pipeline
+            # (build_train_dataloader, _concat_and_shuffle_batch_dicts, etc.)
+            # works transparently without any further changes.
+            self.train_datasets = [
+                create_rl_dataset(
+                    data_paths=self.config.data.train_files,
+                    data_config=self.config.data,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    max_samples=self.config.data.get("train_max_samples", -1),
+                )
+            ]
+            self.val_datasets = [
+                create_rl_dataset(
+                    data_paths=self.config.data.val_files,
+                    data_config=self.config.data,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    max_samples=self.config.data.get("val_max_samples", -1),
+                )
+            ]
+            # Force single-element ratio so build_train_dataloader works unchanged.
+            self.train_datasets_ratios = [1.0]
 
     def build_train_sampler(self) -> None:
         """Build the training sampler."""
-        assert self.train_dataset is not None, (
-            "Train dataset is not built yet. Call build_train_and_val_dataset() first."
+        assert self.train_datasets is not None, (
+            "Train datasets are not built yet. Call build_train_and_val_dataset() first."
         )
 
-        self.train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+        self.train_samplers = [create_rl_sampler(self.config.data, dataset) for dataset in self.train_datasets]
 
     def build_train_dataloader(self) -> None:
         """Build the training dataloader.
@@ -136,26 +227,42 @@ class DataProcessor:
         Note that the batch size is determined by `gen_batch_size` in the configuration,
         use `train_batch_size` as fallback.
         """
-        assert self.train_dataset is not None, (
-            "Train dataset is not built yet. Call build_train_and_val_dataset() first."
+        assert self.train_datasets is not None, (
+            "Train datasets are not built yet. Call build_train_and_val_dataset() first."
         )
-        assert self.train_sampler is not None, "Train sampler is not built yet. Call build_train_sampler() first."
+        assert self.train_samplers is not None, "Train samplers are not built yet. Call build_train_sampler() first."
+        assert len(self.train_datasets) == len(self.train_samplers), (
+            "The number of train datasets and train samplers must be the same."
+        )
+        assert len(self.train_datasets_ratios) == len(self.train_datasets), (
+            "The number of train datasets and train datasets ratios must be the same."
+        )
 
         if self.config.psrl.redundant_rollout.enable:
-            batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
+            total_batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
         else:
-            batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+            total_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
 
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=batch_size,
-            num_workers=self.config.data.get("dataloader_num_workers", 8),
-            drop_last=True,
-            collate_fn=self.collate_fn,
-            sampler=self.train_sampler,
-        )
-        assert len(self.train_dataloader) >= 1, "Train dataloader is empty!"
-        print(f"Size of train dataloader: {len(self.train_dataloader)}")
+        batch_sizes = [int(total_batch_size * ratio) for ratio in self.train_datasets_ratios]
+        batch_sizes[-1] = total_batch_size - sum(batch_sizes[:-1])
+        psrl_logger.info(f"---Train Datasets--- batch sizes: {batch_sizes}, total batch size: {total_batch_size}")
+
+        num_workers = self.config.data["dataloader_num_workers"]
+
+        self.train_dataloaders = [
+            StatefulDataLoader(
+                dataset=dataset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                drop_last=True,
+                collate_fn=self.collate_fn,
+                sampler=sampler,
+            )
+            for dataset, batch_size, sampler in zip(self.train_datasets, batch_sizes, self.train_samplers)
+        ]
+
+        self.train_dataloader_sizes = [len(dataloader) for dataloader in self.train_dataloaders]
+        psrl_logger.info(f"Size of train dataloader: {self.train_dataloader_sizes}")
 
     def build_val_dataloader(self) -> None:
         """Build the validation dataloader.
@@ -164,19 +271,34 @@ class DataProcessor:
         The batch size is determined by `val_batch_size` in the configuration,
         use the length of the validation dataset as fallback.
         """
+        assert self.val_datasets is not None, (
+            "Validation datasets are not built yet. Call build_train_and_val_dataset() first."
+        )
+
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
-            val_batch_size = len(self.val_dataset)
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            batch_size=val_batch_size,
-            num_workers=self.config.data.get("dataloader_num_workers", 8),
-            shuffle=False,
-            drop_last=False,
-            collate_fn=self.collate_fn,
-        )
-        assert len(self.val_dataloader) >= 1, "Validation dataloader is empty!"
-        print(f"Size of validation dataloader: {len(self.val_dataloader)}")
+            val_batch_sizes = [len(dataset) for dataset in self.val_datasets]
+        else:
+            # Use the same batch size for all validation datasets
+            val_batch_sizes = [val_batch_size] * len(self.val_datasets)
+        psrl_logger.info(f"---Val Datasets--- batch sizes: {val_batch_sizes}")
+
+        num_workers = self.config.data["dataloader_num_workers"]
+
+        self.val_dataloaders = [
+            StatefulDataLoader(
+                dataset=dataset,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                shuffle=self.config.data.get("validation_shuffle", True),
+                drop_last=False,
+                collate_fn=self.collate_fn,
+            )
+            for dataset, batch_size in zip(self.val_datasets, val_batch_sizes)
+        ]
+
+        self.val_dataloader_sizes = [len(dataloader) for dataloader in self.val_dataloaders]
+        psrl_logger.info(f"Size of validation dataloaders: {self.val_dataloader_sizes}")
 
     def _create_dataloader(self):
         """Create the train and validation dataloaders.
@@ -186,15 +308,32 @@ class DataProcessor:
         based on the length of the train dataloader and the total epochs.
         If `total_training_steps` is specified in the configuration, it overrides the calculated value.
         """
+
+        # AGENT(VERL): this logic is mapped to `_create_dataloader(...)` in `verl/trainer/ppo/ray_trainer.py`
+
         self.build_train_and_val_dataset()
         self.build_train_sampler()
         self.build_train_dataloader()
         self.build_val_dataloader()
 
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        total_training_steps = min(self.train_dataloader_sizes) * self.config.trainer.total_epochs
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = min(total_training_steps, self.config.trainer.total_training_steps)
         self.total_training_steps = total_training_steps
+
+    def get_val_data_size(self):
+        """Get the size of the validation dataset."""
+        assert self.val_dataloaders is not None, (
+            "Validation dataloaders are not built yet. Call build_val_dataloader() first."
+        )
+        return sum([len(dataloader.dataset) for dataloader in self.val_dataloaders])
+
+    def get_val_batch_num(self):
+        """Get the number of batches in the validation dataloader."""
+        assert self.val_dataloaders is not None, (
+            "Validation dataloaders are not built yet. Call build_val_dataloader() first."
+        )
+        return sum([len(dataloader) for dataloader in self.val_dataloaders])
 
     def get_total_training_steps(self):
         """Get the total number of training steps."""
@@ -205,54 +344,81 @@ class DataProcessor:
         return self.total_training_steps
 
     # ------- Dataloader Management Methods -------
-    def save_train_dataloader(self, dataloader_local_path: str) -> None:
+    def save_train_dataloader(self, dataloader_local_paths: list[str] | str) -> None:
         """Save the dataloader to a local path for future resume."""
-        assert self.train_dataloader is not None, (
+        assert self.train_dataloaders is not None, (
             "Train dataloader is not built yet. Call build_train_dataloader() first."
         )
+        if not isinstance(dataloader_local_paths, list):
+            dataloader_local_paths = [dataloader_local_paths] * len(self.train_dataloaders)
+        assert len(dataloader_local_paths) == len(self.train_dataloaders), (
+            "The number of dataloader paths must match the number of train dataloaders."
+        )
 
-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
-        psrl_logger.info(f"Train dataloader saved to {dataloader_local_path}")
+        # AGENT(VERL): this logic is mapped to `_save_checkpoint(...)` in `verl/trainer/ppo/ray_trainer.py`
+        # you can find it by searching for `# save dataloader` in that file.
 
-    def load_train_dataloader(self, dataloader_local_path: str) -> None:
+        for i, dataloader in enumerate(self.train_dataloaders):
+            torch.save(dataloader.state_dict(), dataloader_local_paths[i])
+        psrl_logger.info(f"Train dataloader saved to {dataloader_local_paths}")
+
+    def load_train_dataloader(self, dataloader_local_paths: list[str] | str) -> None:
         """Load the dataloader from a local path."""
-        assert self.train_dataloader is not None, (
+        assert self.train_dataloaders is not None, (
             "Train dataloader is not built yet. Call build_train_dataloader() first."
         )
+        if not isinstance(dataloader_local_paths, list):
+            dataloader_local_paths = [dataloader_local_paths] * len(self.train_dataloaders)
+        assert len(dataloader_local_paths) == len(self.train_dataloaders), (
+            "The number of dataloader paths must match the number of train dataloaders."
+        )
 
-        dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-        self.train_dataloader.load_state_dict(dataloader_state_dict)
-        psrl_logger.info(f"Train dataloader loaded from {dataloader_local_path}")
+        # AGENT(VERL): this logic is mapped to `_load_checkpoint(...)` in `verl/trainer/ppo/ray_trainer.py`
+        # you can find it by searching for `# load dataloader` in that file
+        steps_per_epoch = min(self.train_dataloader_sizes)
+        at_epoch_boundary = steps_per_epoch > 0 and self.global_steps % steps_per_epoch == 0
+        if at_epoch_boundary:
+            psrl_logger.info(
+                f"Skipping dataloader state restore: global_steps={self.global_steps} "
+                f"is at an epoch boundary (steps_per_epoch={steps_per_epoch}). "
+                f"The saved state marks the dataloader as exhausted. "
+                f"Next epoch will iterate from scratch."
+            )
+        else:
+            for dataloader, dataloader_local_path in zip(self.train_dataloaders, dataloader_local_paths):
+                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                dataloader.load_state_dict(dataloader_state_dict)
+            psrl_logger.info(f"Train dataloader loaded from {dataloader_local_paths}")
 
     # ------- Data Retrieval Methods -------
-    def get_train_next(self):
-        """Get the next batch of training data.
+    def get_train_next(self) -> dict:
+        """Get the next merged batch from all training dataloaders.
 
-        This method handles the case where the dataloader iterator is exhausted.
-        It will reset the iterator and return the next batch of data.
+        Fetches one batch from each training dataloader, concatenates them with
+        segment-level shuffling (preserving per-dataset row order), and returns
+        the combined dict.
+
+        Lazy-initializes the dataloader iterators on first call.
 
         Returns:
-            The next batch of training data.
+            dict: A merged batch dict from all training datasets.
 
         Raises:
-            StopIteration: If all epochs are finished.
+            StopIteration: When any training dataloader is exhausted (epoch boundary).
+                All iterators are reset before re-raising so the next call starts
+                a fresh epoch.
         """
-        # Initialize the train dataloader iterator if it is None
-        if self.train_dataloader_iter is None:
-            self.train_dataloader_iter = iter(self.train_dataloader)
+        if self.train_dataloader_iters is None:
+            self.train_dataloader_iters = [iter(dl) for dl in self.train_dataloaders]
 
-        epoch = 0
         try:
-            data = next(self.train_dataloader_iter)
+            batch_dicts = [next(it) for it in self.train_dataloader_iters]
         except StopIteration:
-            psrl_logger.debug("Train dataloader iterator exhausted.")
-            epoch += 1
-            if epoch == self.config.trainer.total_epochs:
-                psrl_logger.info("All training epochs completed, stopping data processing.")
-                raise
-            self.train_dataloader_iter = iter(self.train_dataloader)
-            data = next(self.train_dataloader_iter)
-        return data
+            # Reset all iterators so the caller can start the next epoch cleanly.
+            self.train_dataloader_iters = [iter(dl) for dl in self.train_dataloaders]
+            raise
+
+        return self._concat_and_shuffle_batch_dicts(batch_dicts)
 
     def get_val_next(self):
         """Get the next batch of validation data.
@@ -268,23 +434,31 @@ class DataProcessor:
         Raises:
             StopIteration: If the validation dataloader iterator is exhausted.
         """
-        # Initialize the validation dataloader iterator if it is None
-        if self.val_dataloader_iter is None:
-            self.val_dataloader_iter = iter(self.val_dataloader)
+        if self.val_dataloader_iters is None:
+            self.val_dataloader_iters = [iter(dataloader) for dataloader in self.val_dataloaders]
+            self._val_dataloader_idx = 0
 
-        try:
-            data = next(self.val_dataloader_iter)
-        except StopIteration:
-            psrl_logger.info("Validation dataloader iterator exhausted.")
-            self.val_dataloader_iter = iter(self.val_dataloader)
-            raise
-        return data
+        # Sequentially get data from each dataloader, starting from the first one
+        # Continue with the current dataloader until it's exhausted, then move to the next
+        num_dataloaders = len(self.val_dataloader_iters)
 
-    def get_train_len(self):
-        return len(self.train_dataloader)
+        while self._val_dataloader_idx < num_dataloaders:
+            i = self._val_dataloader_idx
+            dataloader_iter = self.val_dataloader_iters[i]
+            try:
+                data = next(dataloader_iter)
+                return data
+            except StopIteration:
+                psrl_logger.info(f"Validation dataloader {i} iterator exhausted.")
+                # Reset the exhausted iterator and move to next dataloader
+                self.val_dataloader_iters[i] = iter(self.val_dataloaders[i])
+                self._val_dataloader_idx += 1
+                continue
 
-    def get_val_len(self):
-        return len(self.val_dataloader)
+        # If we reach here, all dataloaders have been exhausted
+        # Reset index for next epoch
+        self._val_dataloader_idx = 0
+        raise StopIteration("All validation dataloader iterators exhausted.")
 
     def get_val_sample_ids(self, batch_size: int) -> list:
         """
@@ -351,6 +525,120 @@ class DataProcessor:
             self.data_process_thread.join()
             self.data_process_thread = None
 
+    def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        # Keys that must be preserved so the reward manager and agent loop can consume them.
+        # - data_source, reward_model, extra_info, uid: always required by reward manager.
+        # - reward_model_dicts: new RLHFDataset field replacing the old reward_fn_key / reward_model_dict.
+        # - tools_kwargs: per-sample tool execution kwargs (new RLHFDataset field).
+        # - interaction_kwargs: per-sample interaction kwargs (new RLHFDataset field).
+        reward_keys = (
+            set(
+                {
+                    "data_source",
+                    "reward_model",
+                    "extra_info",
+                    "uid",
+                    "reward_model_dicts",
+                    "tools_kwargs",
+                    "interaction_kwargs",
+                }
+            )
+            & batch.non_tensor_batch.keys()
+        )
+
+        # pop those keys for generation
+        batch_keys_to_pop = []
+        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
+        gen_batch = batch.pop(
+            batch_keys=batch_keys_to_pop,
+            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
+        )
+
+        # For agent loop, we need reward model keys to compute score.
+        gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
+
+        return gen_batch
+
+    @staticmethod
+    def _concat_and_shuffle_batch_dicts(batch_dicts: list[dict]) -> dict:
+        """Concatenate batch dicts and shuffle at the dataset-segment level.
+
+        Each dataset's rows are concatenated in a random segment order, but the
+        relative row order *within* each dataset's segment is preserved.
+
+        Args:
+            batch_dicts: One dict per dataset, each mapping feature names to
+                torch.Tensor or np.ndarray of shape (batch_size, *dims).
+
+        Returns:
+            A single dict with all features concatenated along dim 0, with
+            segments arranged in a random order.
+
+        Raises:
+            ValueError: If batch_dicts is empty or any individual dict is empty.
+            TypeError: If a value is neither torch.Tensor nor np.ndarray.
+        """
+        if not batch_dicts:
+            raise ValueError("batch_dicts must not be empty.")
+
+        num_datasets = len(batch_dicts)
+
+        # Validate and collect per-dataset sizes
+        for batch_dict in batch_dicts:
+            if not batch_dict:
+                raise ValueError("Batch dict must not be empty.")
+
+        # Shuffle segment order (dataset-level permutation)
+        segment_order = torch.randperm(num_datasets).tolist() if num_datasets > 1 else [0]
+        shuffled_dicts = [batch_dicts[i] for i in segment_order]
+
+        # Collect the union of all keys, using first occurrence as the type sample
+        key_sample: dict[str, torch.Tensor | np.ndarray] = {}
+        key_order: list[str] = []
+        batch_sizes: list[int] = []
+
+        for batch_dict in shuffled_dicts:
+            first_value = next(iter(batch_dict.values()))
+            batch_sizes.append(len(first_value))
+            for key, value in batch_dict.items():
+                if key not in key_sample:
+                    key_sample[key] = value
+                    key_order.append(key)
+
+        # Concatenate each key across shuffled segments, filling missing keys with zeros/None
+        concatenated: dict = {}
+        for key in key_order:
+            sample_value = key_sample[key]
+            values = [
+                batch_dict[key]
+                if key in batch_dict
+                else DataProcessor._create_placeholder_like(sample_value, batch_size)
+                for batch_dict, batch_size in zip(shuffled_dicts, batch_sizes)
+            ]
+            if isinstance(sample_value, torch.Tensor):
+                concatenated[key] = torch.cat(values, dim=0)
+            elif isinstance(sample_value, np.ndarray):
+                concatenated[key] = np.concatenate(values, axis=0)
+            else:
+                raise TypeError(f"Unsupported value type {type(sample_value)} for key '{key}' in batch concatenation.")
+
+        return concatenated
+
+    @staticmethod
+    def _create_placeholder_like(sample_value: torch.Tensor | np.ndarray, batch_size: int):
+        """Create a placeholder tensor/array matching the sample value's dtype and trailing shape."""
+        if isinstance(sample_value, torch.Tensor):
+            shape = (batch_size, *sample_value.shape[1:])
+            return torch.zeros(shape, dtype=sample_value.dtype)
+        if isinstance(sample_value, np.ndarray):
+            shape = (batch_size, *sample_value.shape[1:])
+            if sample_value.dtype == object:
+                placeholder = np.empty(shape, dtype=object)
+                placeholder[:] = None
+                return placeholder
+            return np.zeros(shape, dtype=sample_value.dtype)
+        raise TypeError(f"Unsupported value type {type(sample_value)} for placeholder creation.")
+
     def _process_data(self):
         """
         Process the training data in a busy loop.
@@ -369,13 +657,18 @@ class DataProcessor:
         assert self.reward_manager_handle is not None, (
             "Reward manager handle is not set. Call `reward_manager_handle()` first."
         )
-        self.train_dataloader_iter = iter(self.train_dataloader)
+        self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
         total_epochs = self.config.trainer.total_epochs
 
         # loop until all epochs are processed
         while not self.stop_data_process:
             try:
-                batch_dict = next(self.train_dataloader_iter)
+                # AGENT(VERL): this process is mapped to the data loading and processing logic in
+                # `fit(...)` in `verl/trainer/ppo/ray_trainer.py`, you can find it by searching for
+                # `batch: DataProto = DataProto.from_single_dict(batch_dict)` in that file.
+
+                batch_dicts = [next(dataloader_iter) for dataloader_iter in self.train_dataloader_iters]
+                batch_dict = self._concat_and_shuffle_batch_dicts(batch_dicts)
                 batch_size = len(batch_dict[list(batch_dict.keys())[0]])
 
                 # Generate training sample IDs with cyclic wrapping to avoid overflow
@@ -391,47 +684,24 @@ class DataProcessor:
                 else:
                     batch_dict["uid"] = np.array(sample_ids)
 
-                batch_dict = DataProto.from_single_dict(batch_dict)
+                batch: DataProto = DataProto.from_single_dict(batch_dict)
+                batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
 
-                # Pop the keys that are needed for generation to form the generation batch.
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                meta_info_keys_to_pop = []
-                if "multi_modal_inputs" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
-                if "raw_prompt" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "agent_name" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("agent_name")
-                if self.rollout_n > 1:
-                    non_tensor_batch_keys_to_pop.append("parent_id")
-                else:
-                    non_tensor_batch_keys_to_pop.append("uid")
-                if "do_sample" in batch_dict.meta_info:
-                    meta_info_keys_to_pop.append("do_sample")
-
-                if self.config.psrl.colocate:
-                    gen_batch = batch_dict
-                else:
-                    gen_batch = batch_dict.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                        meta_info_keys=meta_info_keys_to_pop,
-                    )
+                # TODO(linsh): check whether get_gen_batch is needed
+                gen_batch = self._get_gen_batch(batch)
+                gen_batch.meta_info["global_steps"] = self.global_steps
 
                 # Store the other batch fields in the request buffer of the reward manager
                 # They will be merged with the reward data.
                 log_data_protocol(
-                    batch_dict,
+                    batch,
                     psrl_logger,
                     self.log_prefix + " before adding request data to ps manager",
                     level=logging.DEBUG,
                 )
                 ray.get(
                     self.reward_manager_handle.add_requests.remote(
-                        {sample_ids[i]: batch_dict[i : i + 1] for i in range(batch_size)}
+                        {sample_ids[i]: batch[i : i + 1] for i in range(batch_size)}
                     )
                 )
 
@@ -466,14 +736,14 @@ class DataProcessor:
                     self.stop_data_process = True
 
             except StopIteration:
-                curr_epoch = self.global_steps // len(self.train_dataloader)
+                curr_epoch = self.global_steps // min(self.train_dataloader_sizes)
                 psrl_logger.debug(f"StopIteration encountered, current epoch: {curr_epoch}/{total_epochs}")
                 if curr_epoch >= total_epochs:
                     psrl_logger.info("All training epochs completed, stopping data processing.")
                     self.stop_data_process = True
                 else:
-                    psrl_logger.debug("Reinitializing train_dataloader_iter for next epoch")
-                    self.train_dataloader_iter = iter(self.train_dataloader)
+                    psrl_logger.debug("Reinitializing train_dataloader_iters for next epoch")
+                    self.train_dataloader_iters = [iter(dl) for dl in self.train_dataloaders]
             except Exception as e:
                 psrl_logger.error(f"Exception in data processing thread: {e}", exc_info=True)
 

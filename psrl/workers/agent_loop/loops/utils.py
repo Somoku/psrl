@@ -1,7 +1,6 @@
 from enum import Enum
 
 from omegaconf import DictConfig
-from pydantic import BaseModel
 
 AGENT_LOOP_REGISTRY: dict[str, dict] = {}
 
@@ -25,13 +24,10 @@ def register(agent_name: str):
     return decorator
 
 
-class DummyConfig:
-    """Wrapper class to make hydra.utils.instantiate compatible with configuration objects.
+class DictConfigWrap:
+    """Wrapper for DictConfig to avoid hydra.utils.instantiate recursive resolve."""
 
-    This class wraps the configuration to provide the expected interface for Hydra instantiation.
-    """
-
-    def __init__(self, config: DictConfig) -> None:
+    def __init__(self, config: DictConfig):
         self.config = config
 
 
@@ -44,27 +40,3 @@ class TerminateReason(Enum):
     ABORTED = "aborted"
     UNKNOWN = "unknown"
     ERROR = "error"
-
-
-class AgentLoopMetrics(BaseModel):
-    """Agent loop performance metrics."""
-
-    generate_sequences: float = 0.0
-    """Time spent on sequence generation in seconds."""
-    tool_calls: float = 0.0
-    """Time spent on tool calls in seconds."""
-
-
-class AgentLoopOutput(BaseModel):
-    """Output data structure from agent loop execution."""
-
-    prompt_ids: list[int]
-    """Prompt token ids."""
-    response_ids: list[int]
-    """Response token ids including LLM generated token, tool response token."""
-    response_mask: list[int]
-    """Response mask, 1 for LLM generated token, 0 for tool response token."""
-    num_turns: int = 0
-    """Number of chat turns, including user, assistant, tool."""
-    metrics: AgentLoopMetrics
-    """Auxiliary performance metrics"""

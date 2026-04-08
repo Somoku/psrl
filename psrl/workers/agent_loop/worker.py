@@ -10,17 +10,16 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from verl import DataProto
-from verl.utils import hf_processor, hf_tokenizer
+from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.fs import copy_to_local
+from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
-from verl.workers.rollout.utils import get_max_position_embeddings
 
 from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
-from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig, TerminateReason
+from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
 from psrl.workers.config.model import HFModelConfig
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -35,38 +34,28 @@ class PSRL_AgentLoopWorker:
     def __init__(
         self,
         config: DictConfig,
-        ps_manager_handle,
+        ps_manager_handle: ray.actor.ActorHandle,
         rollout_router: ray.actor.ActorHandle | str,
     ):
         """Initialize agent loop worker.
 
         Args:
             config (DictConfig): Configuration containing model and rollout settings.
-            ps_manager_handle: Handle to the parameter server manager.
-            rollout_router: Handle to the rollout router actor.
-            rollout_queue: Queue for storing completed rollout results.
+            ps_manager_handle (ray.actor.ActorHandle): Handle to the parameter server manager.
+            rollout_router (ray.actor.ActorHandle | str): Handle to the rollout router actor.
         """
         self.config = config
-        self.model_config = omega_conf_to_dataclass(
-            self.config.train_actor_rollout_ref.model,
-            dataclass_type=HFModelConfig,
-        )
-        max_position_embeddings = get_max_position_embeddings(self.model_config.hf_config)
-        if self.config.gen_actor_rollout_ref.rollout.max_model_len is None:
-            self.config.gen_actor_rollout_ref.rollout.max_model_len = max_position_embeddings
-        else:
-            if self.config.gen_actor_rollout_ref.rollout.max_model_len > max_position_embeddings:
-                raise ValueError(
-                    f"max_model_len ({self.config.gen_actor_rollout_ref.rollout.max_model_len}) "
-                    f"should be less than or equal to "
-                    f"max_position_embeddings ({max_position_embeddings})"
-                )
+        model_config = config.gen_actor_rollout_ref.model
+        self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+        self.distillation_config = config.get("distillation", None)
+        self.distillation_enabled = is_distillation_enabled(self.distillation_config)
+        if self.distillation_enabled:
+            raise NotImplementedError("Distillation is not supported in PSRL yet.")
 
-        model_path = config.gen_actor_rollout_ref.model.path
-        self.model_name = "/".join(model_path.split("/")[-2:])
-        local_path = copy_to_local(config.gen_actor_rollout_ref.model.path)
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
-        self.processor = hf_processor(local_path, trust_remote_code=True)
+        self.dataset_cls = get_dataset_class(config.data)
+
+        self.tokenizer = self.model_config.tokenizer
+        self.processor = self.model_config.processor
 
         self.rollout_router = rollout_router
         self.ps_manager_handle = ps_manager_handle
@@ -96,6 +85,10 @@ class PSRL_AgentLoopWorker:
             agent_loop_configs = OmegaConf.load(agent_loop_config_path)
             for agent_loop_config in agent_loop_configs:
                 AGENT_LOOP_REGISTRY[agent_loop_config.name] = agent_loop_config
+        if self.model_config.get("custom_chat_template", None) is not None:
+            if self.model_config.processor is not None:
+                self.model_config.processor.chat_template = self.model_config.custom_chat_template
+            self.model_config.tokenizer.chat_template = self.model_config.custom_chat_template
 
         # Initialize rollout trace config
         trace_config = self.config.gen_actor_rollout_ref.rollout.get("trace", {})
@@ -104,6 +97,7 @@ class PSRL_AgentLoopWorker:
             self.config.trainer.experiment_name,
             trace_config.get("backend"),
             trace_config.get("token2text", False),
+            trace_config.get("max_samples_per_step_per_worker", None),
         )
 
         # Build logger
@@ -241,11 +235,14 @@ class PSRL_AgentLoopWorker:
 
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
-                trainer_config=DummyConfig(config=self.config),
+                trainer_config=DictConfigWrap(config=self.config),
                 rollout_router=self.rollout_router,
                 reward_manager=self.reward_manager,
                 ps_manager_handle=self.ps_manager_handle,
                 tokenizer=self.tokenizer,
+                processor=self.processor,
+                dataset_cls=self.dataset_cls,
+                data_config=DictConfigWrap(self.config.data),
             )
 
             with log_dual_events(

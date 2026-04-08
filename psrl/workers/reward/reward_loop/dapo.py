@@ -4,33 +4,29 @@ import inspect
 from verl import DataProto
 
 from psrl.utils.reward_score import default_compute_score_async
-from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
-from psrl.workers.reward.reward_loop.registry import register
+from psrl.workers.reward.reward_loop import register
+from psrl.workers.reward.reward_loop.base import RewardManagerBase
 
 
 @register("dapo")
-class DAPORewardLoopManager(RewardLoopManagerBase):
+class DAPORewardManager(RewardManagerBase):
     """Reward loop for DAPO."""
 
     def __init__(
         self,
         config,
         tokenizer,
-        compute_score=None,
-        reward_model_router=None,
-        reward_model_tokenizer=None,
-        is_validate=False,
+        compute_score,
+        **reward_kwargs,
     ):
-        super().__init__(config, tokenizer, is_validate)
+        super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
         # DAPO Reward Config
-        overlong_buffer_cfg = config.reward_model.get("reward_kwargs", {}).get("overlong_buffer_cfg", None)
+        overlong_buffer_cfg = reward_kwargs.get("overlong_buffer_cfg", None)
         self.overlong_buffer_cfg = overlong_buffer_cfg
-        self.max_resp_len = config.reward_model.get("reward_kwargs", {}).get("max_resp_len", None)
-        self.reward_model_router = reward_model_router
-        self.reward_model_tokenizer = reward_model_tokenizer
+        self.max_resp_len = reward_kwargs.get("max_resp_len", None)
 
         if self.overlong_buffer_cfg is not None:
             assert self.max_resp_len is not None, (
@@ -38,6 +34,11 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
             )
             assert self.max_resp_len >= self.overlong_buffer_cfg.len, (
                 "max_resp_len must be larger than overlong_buffer.len"
+            )
+            assert not self.overlong_buffer_cfg.enable or self.overlong_buffer_cfg.len > 0, (
+                "overlong_buffer.len must be positive when overlong penalty is enabled,"
+                f"but got {self.overlong_buffer_cfg.len}."
+                "To disable the overlong penalty, set overlong_buffer.enable = False"
             )
 
     async def run_single(self, data: DataProto) -> dict:
@@ -51,10 +52,6 @@ class DAPORewardLoopManager(RewardLoopManagerBase):
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
-        num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
-        rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
-        extra_info["num_turns"] = num_turns
-        extra_info["rollout_reward_scores"] = rollout_reward_scores
 
         response_str = await self.loop.run_in_executor(
             None,

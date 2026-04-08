@@ -36,6 +36,7 @@ except ImportError:
     _use_compilation_mode = False
 
 from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
 from psrl.utils.logger import deprecated
 from psrl.utils.profiling.event_converter import events_to_profiling_records
 from psrl.workers.config import HFModelConfig, RolloutConfig
@@ -43,6 +44,26 @@ from psrl.workers.gen import StatCollector
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+# Event type constants matching `EngineCoreEventType` values.
+_FIRST_TOKEN_TYPE = 4
+_LAST_TOKEN_TYPE = 5
+
+
+class _SyntheticEvent:
+    """
+    Lightweight stand-in for `EngineCoreEvent`.
+
+    Used to synthesize a `LAST_TOKEN` event for aborted requests that exited
+    without going through vLLM's normal `stopped=True` path.  Only `.type`
+    and `.timestamp` are needed by `_split_into_segments`.
+    """
+
+    __slots__ = ("type", "timestamp")
+
+    def __init__(self, event_type: int, ts: float):
+        self.type = event_type
+        self.timestamp = ts
 
 
 class PSRL_vLLMRollout:
@@ -224,6 +245,15 @@ class PSRL_vLLMRollout:
             **lora_kwargs,
             **engine_kwargs,
         )
+
+        # --- LMCache KV cache offloading integration ---
+        lmcache_cfg = LMCacheConfig(**psrl_config.get("lmcache", {}))
+        self.kv_cache_manager = KVCacheManager(lmcache_cfg)
+        # Set env vars BEFORE AsyncEngineArgs creation so that LMCache reads them.
+        self.kv_cache_manager.apply_env_vars()
+        # Merge LMCache engine kwargs (kv_offloading_backend, kv_offloading_size).
+        lmcache_engine_kwargs = self.kv_cache_manager.get_engine_kwargs()
+        llm_kwargs.update(lmcache_engine_kwargs)
 
         if self.config.prometheus.enable:
             assert self.psrl_config.server_rollout.enable, (
@@ -779,6 +809,29 @@ class PSRL_vLLMRollout:
                 accumulated_events.extend(output.events)
                 output.events = None  # Avoid double-counting
             last_output = output
+
+        # NOTE(claude): Synthesize LAST_TOKEN for aborted requests. When a
+        # request is cancelled (partial rollout, scheduler abort), vLLM does
+        # not call `_update_request_with_output` with `stopped=True`, so
+        # LAST_TOKEN is never recorded. Without it, `event_converter` falls
+        # back to `first_token_ts` as `decode_end_ts`, producing
+        # `decode_duration_s = 0`. Using `time.monotonic()` here gives a
+        # close approximation — it uses the same `CLOCK_MONOTONIC` clock as
+        # vLLM's `EngineCoreEvent.new_event` (see
+        # `third_party/vllm/vllm/v1/engine/__init__.py`).
+        if accumulated_events:
+            has_first = any(
+                int(getattr(e, "type", 0)) == _FIRST_TOKEN_TYPE
+                for e in accumulated_events
+            )
+            has_last = any(
+                int(getattr(e, "type", 0)) == _LAST_TOKEN_TYPE
+                for e in accumulated_events
+            )
+            if has_first and not has_last:
+                accumulated_events.append(
+                    _SyntheticEvent(_LAST_TOKEN_TYPE, time.monotonic())
+                )
 
         return idx, last_output, accumulated_events, generation_start_wall_ts
 

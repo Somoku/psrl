@@ -7,6 +7,11 @@ from pathlib import Path
 
 import numpy as np
 
+# Tracks which JSONL paths have already been opened for writing in this
+# process. The first write truncates any existing file; subsequent writes
+# append. This ensures each process run starts with a clean output file.
+_jsonl_initialized_paths: set[str] = set()
+
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
@@ -339,12 +344,26 @@ class TrajectoryProfilingData:
 
     def write_jsonl(self, path: str | Path) -> None:
         """
-        Append this trajectory's profiling data to a JSONL file.
+        Write this trajectory's profiling data to a JSONL file.
+
+        On the first call within the current process for a given `path`, any
+        existing file at that path is truncated so that each run starts fresh.
+        Subsequent calls within the same process append to the file.
 
         Args:
             path (str | Path): Path to the JSONL file.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a") as f:
+
+        # Truncate on first write per process so each run starts with a clean
+        # file rather than appending to data from a previous run.
+        resolved = str(path.resolve())
+        if resolved not in _jsonl_initialized_paths:
+            _jsonl_initialized_paths.add(resolved)
+            open_mode = "w"
+        else:
+            open_mode = "a"
+
+        with open(path, open_mode) as f:
             f.write(json.dumps(self.to_dict(), cls=_NumpySafeEncoder) + "\n")

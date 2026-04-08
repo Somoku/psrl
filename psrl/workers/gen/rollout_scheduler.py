@@ -71,6 +71,22 @@ class RolloutScheduler(Scheduler):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
+        # NOTE(claude): Record QUEUED immediately after PREEMPTED to mark the
+        # moment the request re-enters the waiting queue. This gives
+        # `_split_into_segments` the QUEUED event it needs to open a new
+        # segment for the eventual re-schedule, so scheduler_wait_s for the
+        # resume segment is measured from this point rather than from the
+        # original submission.
+        if self.log_stats:
+            request.record_event(EngineCoreEventType.QUEUED, timestamp)
+
+        # NOTE(claude): Save the current output token count as the baseline for
+        # the next scheduling cycle. The FIRST_TOKEN event fires when
+        # `num_output_tokens` first exceeds this baseline, correctly identifying
+        # the prefill→decode boundary after a preemption even though
+        # `_output_token_ids` is not cleared on preemption.
+        request._psrl_cycle_output_token_baseline = request.num_output_tokens
+
         # NOTE(lhy): We examine the number of waiting requests to
         # determine whether to abort the preempted request.
         # Once aborted, the preempted request will be put back to

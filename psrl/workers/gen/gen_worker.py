@@ -5,7 +5,7 @@ import queue
 import time
 import warnings
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -28,6 +28,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_generation_config, update_model_config
 
 from psrl.utils.common.http_utils import find_available_port
+from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -236,6 +237,13 @@ class PSRL_GenWorker(Worker):
         # For async model pulling
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
+        # KV cache manager for trajectory-level operations.
+        # Engine is attached after rollout initialization in `_build_rollout`.
+        _lmcache_raw = OmegaConf.to_container(
+            self.psrl_config.get("lmcache", OmegaConf.create()), resolve=True
+        )
+        self.kv_cache_manager = KVCacheManager(LMCacheConfig(**(_lmcache_raw or {})))
+
         # Build logger
         # Only the representative rank will build the logger
         if self.is_instance_representative_rank:
@@ -388,6 +396,116 @@ class PSRL_GenWorker(Worker):
         await self._is_init_nixl_client.wait()
         assert self.rollout, "Rollout must be initialized before calling nixl_wait_for_update_infos."
         await self._collective_rpc("nixl_wait_for_update_infos", args=(info_num,))
+
+    # --- KV cache management methods (called by RolloutRouter) ---
+
+    async def kv_get_cache_info(self, tokens: list[int]) -> dict | None:
+        """
+        Query GPU prefix-cache and LMCache backend usage for the given tokens.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            dict | None: Serialisable dict of `TrajectoryCacheInfo` fields, or
+                None if the engine is not yet attached.
+        """
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. "
+            "Call init_model() before calling kv_get_cache_info."
+        )
+        assert tokens, "tokens must be a non-empty list."
+        info = await self.kv_cache_manager.get_cache_info(tokens)
+        return asdict(info)
+
+    async def kv_pin(self, tokens: list[int], targets: list[str]) -> bool:
+        """
+        Pin the cached prefix blocks/chunks for `tokens`.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+            targets (list[str]): Subset of `["gpu", "backend"]`.
+
+        Returns:
+            bool: True if all requested pins succeeded.
+        """
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. "
+            "Call init_model() before calling kv_pin."
+        )
+        assert tokens, "tokens must be a non-empty list."
+        assert targets, "targets must be a non-empty list."
+        assert all(t in ("gpu", "backend") for t in targets), (
+            f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+        )
+        return await self.kv_cache_manager.pin(tokens, targets)
+
+    async def kv_unpin(self, tokens: list[int], targets: list[str]) -> bool:
+        """
+        Unpin the cached prefix blocks/chunks for `tokens`.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+            targets (list[str]): Subset of `["gpu", "backend"]`.
+
+        Returns:
+            bool: True if all requested unpins succeeded.
+        """
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. "
+            "Call init_model() before calling kv_unpin."
+        )
+        assert tokens, "tokens must be a non-empty list."
+        assert targets, "targets must be a non-empty list."
+        assert all(t in ("gpu", "backend") for t in targets), (
+            f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+        )
+        return await self.kv_cache_manager.unpin(tokens, targets)
+
+    async def kv_clear_from_backend(self, tokens: list[int]) -> int:
+        """
+        Remove the cached prefix chunks for `tokens` from the LMCache backend.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            int: Number of chunks removed.
+        """
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. "
+            "Call init_model() before calling kv_clear_from_backend."
+        )
+        assert tokens, "tokens must be a non-empty list."
+        return await self.kv_cache_manager.clear_from_backend(tokens)
+
+    async def kv_transfer(
+        self,
+        tokens: list[int],
+        src: tuple[str, str],
+        dst: tuple[str, str],
+        copy: bool = False,
+    ) -> bool:
+        """
+        Transfer the cached prefix of a trajectory to another (instance, backend).
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+            src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)`.
+            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)`.
+            copy (bool): If True, keep data at source as well.
+
+        Returns:
+            bool: True if the Controller acknowledged the move request.
+        """
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. "
+            "Call init_model() before calling kv_transfer."
+        )
+        assert tokens, "tokens must be a non-empty list."
+        assert len(src) == 2, f"src must be a 2-tuple, got length {len(src)}."
+        assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
+        return await self.kv_cache_manager.transfer(tokens, src, dst, copy)
 
     def get_node_id(self) -> str:
         """
@@ -544,6 +662,9 @@ class PSRL_GenWorker(Worker):
 
         # Don't keep the dummy data in memory
         await rollout.inference_engine.reset_mm_cache()
+
+        self.kv_cache_manager.attach_engine(rollout.inference_engine)
+        psrl_logger.info("[KVCacheManager]: Engine attached after rollout initialization.")
 
         return rollout
 

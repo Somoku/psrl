@@ -124,10 +124,10 @@ status_collection:
 
   # The level of logging to file
   # Available options: "none", "partial_rollout", "prompt", "generation", "all"
-  dump_logging_to_file_level: all
+  dump_logging_to_file_level: prompt
 
   # Logging interval in milliseconds
-  dump_logging_to_file_interval_in_ms: 2000
+  dump_logging_to_file_interval_in_ms: 10
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
   # Here 10 means sync every 0.1 second
@@ -368,29 +368,56 @@ tms:
 # enabling prefix cache hits across multi-turn agent loop turns without re-prefill.
 lmcache:
 
-  # Whether to enable LMCache KV offloading in vLLM
+  # Whether to enable LMCache KV offloading in vLLM.
   enable: False
 
-  # Backend for offloaded KV: cpu, disk, or remote (Phase 2)
+  # Backend for offloaded KV: "cpu", "disk", or "remote" (Phase 2).
   backend: cpu
 
-  # Total offload budget in GiB across all TP ranks
+  # Total offload budget in GiB, summed across all TP ranks.
+  # vLLM automatically divides this by the number of KV ranks (TP x PP) to
+  # compute the per-rank budget passed to LMCache as max_local_cpu_size.
+  # Do NOT set LMCACHE_MAX_LOCAL_CPU_SIZE as an env var — that would apply
+  # the total budget to every rank, overcounting memory.
   offload_size_gb: 10.0
 
-  # Token chunk size for hashing
+  # Token chunk size for hash-based KV indexing (must divide the block size).
   chunk_size: 256
 
-  # Full LMCache YAML config path (overrides the fields above when set)
+  # Full LMCache YAML config path.  When set, overrides all individual fields.
   config_file: null
 
-  # Local disk path when backend is disk
+  # Whether to clear stale KV cache after model weight pull from PS.
+  clear_on_weight_update: True
+
+  # --- CPU backend ---
+
+  # GiB of CPU memory to keep free and never use for KV offloading.
+  reserve_local_cpu_size: 0.0
+
+  # --- Disk backend ---
+
+  # Filesystem path for disk-backed KV storage (required when backend=disk).
   disk_path: null
 
-  # Max disk usage in GiB when using disk backend
+  # Max disk usage in GiB when using the disk backend.
   max_disk_size_gb: 50.0
 
-  # Remote server URL (Phase 2) when backend is remote
+  # --- Remote backend (Phase 2) ---
+
+  # Remote LMCache server URL (e.g., "redis://host:6379").
   remote_url: null
 
-  # Whether to clear stale KV cache after model weight pull from PS
-  clear_on_weight_update: True
+  # --- Cache behaviour ---
+
+  # Also cache KV from decode steps (increases memory, helps multi-turn reuse).
+  save_decode_cache: False
+
+  # Persist a chunk even when not fully filled (helps short prompts < chunk_size).
+  save_unfull_chunk: False
+
+  # Eviction policy: "LRU" (default) or "FIFO".
+  cache_policy: LRU
+
+  # Overlap KV cache retrieval with prefill computation to reduce TTFT.
+  enable_async_loading: False

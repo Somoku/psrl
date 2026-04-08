@@ -20,7 +20,8 @@ from verl.utils.device import get_device_id
 from verl.utils.fs import copy_to_local
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
-from vllm.v1.core.kv_cache_utils import estimate_max_model_len
+from vllm.distributed.kv_transfer import get_kv_transfer_group
+from vllm.v1.core.kv_cache_utils import estimate_max_model_len, hash_block_tokens
 
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
@@ -348,3 +349,382 @@ class vLLMWorkerExtension:
         # Restore the actual max model length
         self.vllm_config.model_config.max_model_len = actual_max_model_len
         return estimated_max_model_len
+
+    # --- LMCache KV cache management methods ---
+    # Invoked via `collective_rpc` from `KVCacheManager`.
+
+    def _get_lmcache_engine(self):
+        """
+        Return the `LMCacheEngine` from the active KV transfer group.
+
+        The KV transfer group is initialised by vLLM during startup when
+        `kv_transfer_config` is set.  `get_kv_transfer_group()` returns the
+        `LMCacheConnectorV1` instance, which holds `._lmcache_engine`.
+
+        Returns:
+            LMCacheEngine: The `cache_engine` from the active KV transfer group.
+        """
+        connector = get_kv_transfer_group()
+        assert connector is not None, (
+            "KV transfer group is None. "
+            "Ensure kv_transfer_config is set during vLLM engine initialization."
+        )
+        assert hasattr(connector, "_lmcache_engine"), (
+            f"Connector {type(connector).__name__} does not have _lmcache_engine attribute. "
+            "Expected LMCacheConnectorV1."
+        )
+        engine = connector._lmcache_engine.cache_engine
+        assert engine is not None, "LMCacheEngine cache_engine is None."
+        return engine
+
+    def _get_lmcache_chunk_keys(self, tokens: list[int]) -> list:
+        """
+        Convert a token sequence to a list of `CacheEngineKey` objects.
+
+        Uses the token database attached to the `LMCacheEngine`.
+
+        Args:
+            tokens (list[int]): Full token sequence.
+
+        Returns:
+            list: `CacheEngineKey` objects for each chunk.
+        """
+        engine = self._get_lmcache_engine()
+        triples = engine.token_database.process_tokens(tokens)
+        # `process_tokens` returns `(start, end, key)` triples; extract the keys.
+        return [key for _, _, key in triples]
+
+    def _get_lmcache_total_bytes(self) -> int:
+        """
+        Return the total byte capacity of the LMCache local CPU backend allocator.
+
+        Returns:
+            int: Total bytes, or 0 if the allocator does not expose `total_size`.
+        """
+        engine = self._get_lmcache_engine()
+        backend = engine.storage_manager.local_cpu_backend
+        allocator = backend.memory_allocator
+        # `MixedMemoryAllocator` / `PagedCpuGpuMemoryAllocator` expose `total_size`.
+        return int(getattr(allocator, "total_size", 0))
+
+    def _iter_gpu_prefix_blocks(self, tokens: list[int]):
+        """
+        Yield GPU `KVCacheBlock` objects forming the longest contiguous cached prefix.
+
+        Uses `block_pool.cached_block_hash_to_block` to map per-block token
+        hashes to blocks, stopping at the first miss (prefix semantics).
+
+        Args:
+            tokens (list[int]): Full token sequence.
+
+        Yields:
+            KVCacheBlock: Blocks in prefix order.
+        """
+        from vllm.v1.core.kv_cache_utils import (
+            BlockHash,
+            init_none_hash,
+            make_block_hash_with_group_id,
+        )
+
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        block_size = block_pool.hash_block_size
+
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils import (
+                get_caching_hash_fn,
+            )
+            hash_fn = get_caching_hash_fn()
+        except ImportError:
+            import hashlib
+            # NOTE(claude): Fall back to SHA-256 when the LMCache integration utils are
+            # unavailable (e.g., in unit tests without the full vLLM install).
+            hash_fn = lambda data: hashlib.sha256(str(data).encode()).digest()  # noqa: E731
+        except Exception as e:
+            import hashlib
+            psrl_logger.warning(
+                f"[LMCache] Failed to load get_caching_hash_fn, falling back to SHA-256: {e!r}."
+            )
+            hash_fn = lambda data: hashlib.sha256(str(data).encode()).digest()  # noqa: E731
+
+        # `NONE_HASH` in `kv_cache_utils` must be initialised before calling
+        # `hash_block_tokens`.  `init_none_hash` is idempotent once called.
+        init_none_hash(hash_fn)
+
+        prev_hash: BlockHash | None = None
+        num_full_blocks = len(tokens) // block_size
+        for block_idx in range(num_full_blocks):
+            start = block_idx * block_size
+            end = start + block_size
+            chunk = tokens[start:end]
+            block_hash = hash_block_tokens(hash_fn, prev_hash, chunk, None)
+            prev_hash = block_hash
+
+            # `kv_cache_group_id=0` for standard (non-MLA) models.
+            key = make_block_hash_with_group_id(block_hash, 0)
+            block = block_pool.cached_block_hash_to_block.get_one_block(key)
+            if block is None:
+                return  # prefix break
+            yield block
+
+    def lmcache_get_cache_info(self, tokens: list[int]) -> dict:
+        """
+        Return GPU prefix-cache and LMCache backend usage statistics for `tokens`.
+
+        The returned dict matches `TrajectoryCacheInfo` field names so that
+        `KVCacheManager.get_cache_info` can construct it with
+        ``TrajectoryCacheInfo(**raw)``.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            dict: Cache usage statistics.
+        """
+        assert tokens, "tokens must be a non-empty list."
+        # GPU side
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        gpu_blocks = list(self._iter_gpu_prefix_blocks(tokens))
+        gpu_cached_blocks = len(gpu_blocks)
+        block_size = block_pool.hash_block_size
+        gpu_cached_tokens = gpu_cached_blocks * block_size
+        gpu_total_blocks = block_pool.num_gpu_blocks
+        gpu_usage_pct = (
+            gpu_cached_blocks / gpu_total_blocks if gpu_total_blocks > 0 else 0.0
+        )
+
+        # LMCache backend side
+        engine = self._get_lmcache_engine()
+        keys = self._get_lmcache_chunk_keys(tokens)
+        lmcache_hit_count, _ = engine.storage_manager.batched_contains(keys)
+        # Chunk size from LMCache config; fall back to 256 tokens.
+        chunk_size = getattr(engine.token_database, "chunk_size", 256)
+        lmcache_cached_tokens = lmcache_hit_count * chunk_size
+        # Estimate bytes: each full chunk occupies (chunk_size × hidden_dim × dtype_size).
+        # Use `get_full_chunk_size_bytes` if available on the backend.
+        backend = engine.storage_manager.local_cpu_backend
+        try:
+            chunk_bytes = backend.get_full_chunk_size_bytes()
+        except Exception as e:
+            psrl_logger.warning(
+                f"[LMCache] get_full_chunk_size_bytes unavailable, bytes will be 0: {e!r}."
+            )
+            chunk_bytes = 0
+        lmcache_bytes = lmcache_hit_count * chunk_bytes
+        lmcache_total_bytes = self._get_lmcache_total_bytes()
+        lmcache_usage_pct = (
+            lmcache_bytes / lmcache_total_bytes if lmcache_total_bytes > 0 else 0.0
+        )
+
+        return {
+            "total_tokens": len(tokens),
+            "lmcache_cached_chunks": lmcache_hit_count,
+            "lmcache_cached_tokens": lmcache_cached_tokens,
+            "lmcache_bytes": lmcache_bytes,
+            "lmcache_total_bytes": lmcache_total_bytes,
+            "lmcache_usage_pct": lmcache_usage_pct,
+            "gpu_cached_blocks": gpu_cached_blocks,
+            "gpu_cached_tokens": gpu_cached_tokens,
+            "gpu_total_blocks": gpu_total_blocks,
+            "gpu_usage_pct": gpu_usage_pct,
+            # NOTE(claude): PSRL pin state is tracked in `KVCacheManager`, not
+            # in the worker — returning False here is always correct.
+            "gpu_pinned": False,
+            "backend_pinned": False,
+        }
+
+    def lmcache_pin_backend(self, tokens: list[int]) -> int:
+        """
+        Pin the cached backend chunks for `tokens` to prevent LRU eviction.
+
+        Uses `LocalCPUBackend.get_blocking()` rather than `batched_contains(pin=True)`.
+
+        The `pin=True` path increments `MemoryObjMetadata.pin_count`, which
+        `PinMonitor` **force-zeros** after `pin_timeout_sec` — making it
+        unsuitable for long-lived PSRL holds that span multiple turns.
+
+        `get_blocking()` instead increments `ref_count` from its hot-cache
+        steady-state of 1 to 2.  `MemoryObj.can_evict` requires
+        `ref_count == 1`, so holding `ref_count == 2` permanently blocks LRU
+        candidate selection without involving `PinMonitor`.
+
+        Side effects on backend capacity: if PSRL-pinned chunks leave no
+        evictable candidates in `hot_cache`, new `store()` calls with
+        `busy_loop=False` return `None` (no spin), while `retrieve()` calls
+        with `busy_loop=True` spin at 0.1 s intervals.  A warning is logged
+        when pinned chunks exceed 80 % of `hot_cache`.
+
+        Pinned `MemoryObj` references are stored in `_psrl_pinned_memory_objs`
+        on the worker instance, keyed by `CacheEngineKey`.  Re-pinning an
+        already pinned key is a no-op (idempotent; `ref_count` stays balanced).
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            int: Number of chunks newly pinned (`ref_count` incremented).
+        """
+        assert tokens, "tokens must be a non-empty list."
+        if not hasattr(self, "_psrl_pinned_memory_objs"):
+            # Map from CacheEngineKey → MemoryObj for all PSRL-pinned backend chunks.
+            self._psrl_pinned_memory_objs: dict = {}
+
+        engine = self._get_lmcache_engine()
+        keys = self._get_lmcache_chunk_keys(tokens)
+        backend = engine.storage_manager.local_cpu_backend
+
+        pinned = 0
+        for key in keys:
+            if key in self._psrl_pinned_memory_objs:
+                # Already pinned by PSRL — skip to keep ref_count balanced.
+                continue
+            # `get_blocking` acquires `cpu_lock`, checks `hot_cache`, and calls
+            # `ref_count_up()` before returning.  This raises ref_count to 2,
+            # making can_evict=False for the returned object.
+            memory_obj = backend.get_blocking(key)
+            if memory_obj is None:
+                # Chunk not present in backend (prefix may be shorter than key list).
+                continue
+            self._psrl_pinned_memory_objs[key] = memory_obj
+            pinned += 1
+
+        # Warn when PSRL-pinned chunks are a large fraction of hot_cache —
+        # LMCache store() calls return None (busy_loop=False path) and
+        # retrieve() calls spin (busy_loop=True path) when no evictable candidate
+        # exists.
+        hot_cache_size = len(backend.hot_cache)
+        if hot_cache_size > 0:
+            psrl_pinned_total = len(self._psrl_pinned_memory_objs)
+            usage_pct = psrl_pinned_total / hot_cache_size
+            if usage_pct > 0.8:
+                psrl_logger.warning(
+                    f"[LMCache] Backend pin pressure: PSRL holds {psrl_pinned_total}/"
+                    f"{hot_cache_size} hot_cache chunks pinned ({usage_pct:.0%}). "
+                    "New store() calls may fail and retrieve() calls may spin "
+                    "until a PSRL pin is released via lmcache_unpin_backend."
+                )
+        return pinned
+
+    def lmcache_unpin_backend(self, tokens: list[int]) -> int:
+        """
+        Unpin the cached backend chunks for `tokens`, allowing LRU eviction.
+
+        Decrements `ref_count` on each `MemoryObj` that PSRL previously pinned
+        via `lmcache_pin_backend`.  Only chunks tracked in
+        `_psrl_pinned_memory_objs` are released, preventing interference with
+        active vLLM request references.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            int: Number of chunks whose `ref_count` was decremented.
+        """
+        assert tokens, "tokens must be a non-empty list."
+        if not hasattr(self, "_psrl_pinned_memory_objs"):
+            self._psrl_pinned_memory_objs: dict = {}
+
+        keys = self._get_lmcache_chunk_keys(tokens)
+        freed = 0
+        for key in keys:
+            memory_obj = self._psrl_pinned_memory_objs.pop(key, None)
+            if memory_obj is None:
+                # Not pinned by PSRL — skip.
+                continue
+            # PSRL's ref is live: hot_cache holds 1, PSRL holds 1 → ref_count >= 2.
+            assert memory_obj.get_ref_count() > 1, (
+                f"Backend chunk ref_count is {memory_obj.get_ref_count()} before "
+                "ref_count_down(). Expected > 1 (PSRL hold + hot_cache hold). "
+                "Possible double-unpin or external ref_count corruption."
+            )
+            memory_obj.ref_count_down()
+            freed += 1
+        return freed
+
+    def lmcache_clear_from_backend(self, tokens: list[int]) -> int:
+        """
+        Remove the cached prefix chunks for `tokens` from the LMCache backend.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            int: Number of chunks removed.
+        """
+        assert tokens, "tokens must be a non-empty list."
+        engine = self._get_lmcache_engine()
+        keys = self._get_lmcache_chunk_keys(tokens)
+        n = engine.storage_manager.batched_remove(keys)
+        return n
+
+    def lmcache_pin_gpu(self, tokens: list[int]) -> int:
+        """
+        Pin the GPU prefix-cache blocks for `tokens` by incrementing `ref_cnt`.
+
+        Only pins blocks that are currently in the free queue (``ref_cnt == 0``).
+        Uses `_psrl_pinned_block_ids` to track which blocks PSRL pinned, so
+        `lmcache_unpin_gpu` cannot accidentally decrement `ref_cnt` for blocks
+        held by active vLLM requests.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            int: Number of blocks newly pinned (moved out of the free queue).
+        """
+        assert tokens, "tokens must be a non-empty list."
+        if not hasattr(self, "_psrl_pinned_block_ids"):
+            self._psrl_pinned_block_ids: set[int] = set()
+
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        pinned = 0
+        blocks_to_touch = []
+        for block in self._iter_gpu_prefix_blocks(tokens):
+            if block.ref_cnt == 0 and block.block_id not in self._psrl_pinned_block_ids:
+                blocks_to_touch.append(block)
+                self._psrl_pinned_block_ids.add(block.block_id)
+                pinned += 1
+        if blocks_to_touch:
+            # NOTE(claude): `block_pool.touch()` expects a tuple of per-group block sequences.
+            # For standard (non-MLA) models there is one KV cache group, so we pass all
+            # blocks as a single-element tuple.
+            block_pool.touch((blocks_to_touch,))
+            # Verify post-condition: `ref_cnt` should be > 0 for all pinned blocks.
+            for block in blocks_to_touch:
+                assert block.ref_cnt > 0, (
+                    f"Block {block.block_id} ref_cnt is {block.ref_cnt} after touch(). "
+                    "Expected > 0."
+                )
+        return pinned
+
+    def lmcache_unpin_gpu(self, tokens: list[int]) -> int:
+        """
+        Unpin the GPU prefix-cache blocks for `tokens` by decrementing `ref_cnt`.
+
+        Only decrements `ref_cnt` for blocks that PSRL itself pinned (tracked in
+        `_psrl_pinned_block_ids`), preventing interference with active requests.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+
+        Returns:
+            int: Number of blocks unpinned.
+        """
+        assert tokens, "tokens must be a non-empty list."
+        if not hasattr(self, "_psrl_pinned_block_ids"):
+            self._psrl_pinned_block_ids: set[int] = set()
+
+        block_pool = self.scheduler.kv_cache_manager.block_pool
+        freed = 0
+        for block in self._iter_gpu_prefix_blocks(tokens):
+            if block.block_id in self._psrl_pinned_block_ids:
+                assert block.ref_cnt > 0, (
+                    f"Block {block.block_id} ref_cnt is {block.ref_cnt} before free_blocks(). "
+                    "Cannot unpin a block with ref_cnt <= 0."
+                )
+                block_pool.free_blocks([block])
+                self._psrl_pinned_block_ids.discard(block.block_id)
+                freed += 1
+        psrl_logger.debug(
+            f"[LMCache] GPU unpin: {freed} blocks released for token sequence of length {len(tokens)}."
+        )
+        return freed

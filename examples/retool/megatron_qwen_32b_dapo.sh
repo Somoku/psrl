@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-staleness=${1:-3}
-project_name=psrl_example
-experiment_name=DAPO-Qwen2.5-32B-megatron-retool-staleness_${staleness}
+staleness=${1:-1}
+project_name=psrl_agent_profile
+experiment_name=DAPO-Qwen2.5-32B-megatron-retool-staleness_${staleness}_no_lmcache
 fix_weight=${2:-False}
 disable_attn=${3:-False}
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -26,7 +26,7 @@ default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
 tool_config_path=${PSRL_PATH}/examples/retool/sandbox_fusion_tool_config.yaml
 
-GEN_TP=1 # TP in the generation side
+GEN_TP=4 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
 VAL_TP=4 # TP in the training side for validation
@@ -65,12 +65,12 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 10))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=64
-redundant_train_prompt_bsz=64
-n_resp_per_prompt=16
-redundant_n_resp_per_prompt=16
-n_resp_per_prompt_val=16
-train_prompt_mini_bsz=64
+train_prompt_bsz=32
+redundant_train_prompt_bsz=32
+n_resp_per_prompt=8
+redundant_n_resp_per_prompt=8
+n_resp_per_prompt_val=8
+train_prompt_mini_bsz=32
 actor_lr=1e-6
 
 # Algorithm

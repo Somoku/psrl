@@ -8,8 +8,10 @@ from torch.nn import Parameter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
     is_qkv_weight,
+    is_q_weight,
     make_slice_parameter,
     reshape_qkv_to_3d,
+    reshape_q_to_5d,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -84,6 +86,8 @@ class BaseConverter(ABC):
         rank = sharding.shard_indices[0][0]
         rows, H = param.shape
 
+        attn_output_gate = self.model_info.get("attn_output_gate", False)
+
         # Derive local head counts from the sharding descriptor.
         if shard_dim_2d == 0:
             num_heads_local = num_heads // ws
@@ -105,6 +109,17 @@ class BaseConverter(ABC):
                 shard_mesh=OrderedDict([(2, ws)]),
                 shard_indices=[(rank,)],
             )
+            if attn_output_gate and is_q_weight(param_name):
+                reshaped = reshape_q_to_5d(
+                    reshaped,
+                    num_heads_local=num_heads_local,
+                    head_size=head_size,
+                )
+                new_sharding = NIXLSharding(
+                    shard_mesh=OrderedDict([(4, ws)]),
+                    shard_indices=[(rank,)],
+                )
+
         elif ws <= G_global:
             # Case B: coarse head sharding, shard_mesh={0: ws} stays valid in 3D.
             reshaped = reshape_qkv_to_3d(
@@ -114,6 +129,12 @@ class BaseConverter(ABC):
                 head_size=head_size,
             )
             new_sharding = sharding
+            if attn_output_gate and is_q_weight(param_name):
+                reshaped = reshape_q_to_5d(
+                    reshaped,
+                    num_heads_local=num_heads_local,
+                    head_size=head_size,
+                )
         else:
             # Case C: fine-grained sharding spills from dim=0 into dim=1.
             assert ws % G_global == 0, (
@@ -125,6 +146,11 @@ class BaseConverter(ABC):
                 shard_mesh=OrderedDict([(0, G_global), (1, steps)]),
                 shard_indices=[(rank // steps, rank % steps)],
             )
+            if attn_output_gate and is_q_weight(param_name):
+                raise NotImplementedError(
+                    "attn_output_gate is not supported for fine-grained sharding (Case C)"
+                )
+
 
         return reshaped, new_sharding
 

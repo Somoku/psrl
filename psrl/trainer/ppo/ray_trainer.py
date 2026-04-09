@@ -1412,7 +1412,10 @@ class PSRL_RayPPOTrainer:
         self.init_rollout_coordinator()
         # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
         # for rollout indices, which init_nixl_client waits on.
-        model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
+        if self.config.psrl.ps_mode == "cpu_ref":
+            model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "full"))
+        else:
+            model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]

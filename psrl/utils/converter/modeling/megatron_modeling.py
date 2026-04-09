@@ -27,6 +27,6 @@ class BridgedMegatronParameterMapping(ParameterMapping):
         # which isn't equal to hidden_size // num_attention_heads.
         # The default get_model_info already handles head_dim via getattr fallback.
         info = super().get_model_info()
-        info["moe_intermediate_size"] = getattr(self.config, "moe_intermediate_size", self.config.intermediate_size)
+        info["moe_intermediate_size"] = getattr(self.config, "moe_intermediate_size", info["intermediate_size"])
         info["shared_expert_intermediate_size"] = getattr(self.config, "shared_expert_intermediate_size", None)
         return info

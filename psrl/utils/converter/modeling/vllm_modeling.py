@@ -86,6 +86,30 @@ class VllmQwen2MoeParameterMapping(ParameterMapping):
         return info
 
 
+# Qwen3 (dense)
+vllm_qwen3_classes = []
+try:
+    from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM, Qwen3Model
+
+    vllm_qwen3_classes = [Qwen3ForCausalLM, Qwen3Model]
+except ImportError as e:
+    warnings.warn(f"Could not import Qwen3 classes: {e}", stacklevel=2)
+
+
+@register_model(["VllmQwen3ForCausalLM", "VllmQwen3Model", "VllmQwen3ForSequenceClassification"] + vllm_qwen3_classes)
+class VllmQwen3ParameterMapping(ParameterMapping):
+    """Parameter mapping for Qwen3 (dense) model."""
+
+    def get_mappings(self):
+        return [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+        ]
+
+
 # Qwen3Moe
 vllm_qwen3_moe_classes = []
 try:
@@ -143,6 +167,48 @@ class VllmQwen3MoeParameterMapping(ParameterMapping):
         info = super().get_model_info()
         info["num_experts"] = self.config.num_experts
         return info
+
+
+# Qwen3.5 (dense, includes linear attention + vision)
+vllm_qwen3_5_classes = []
+try:
+    from vllm.model_executor.models.qwen3_5 import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5ForConditionalGeneration,
+        Qwen3_5Model,
+    )
+
+    vllm_qwen3_5_classes = [Qwen3_5ForCausalLM, Qwen3_5Model, Qwen3_5ForConditionalGeneration]
+except ImportError as e:
+    warnings.warn(f"Could not import Qwen3_5 classes: {e}", stacklevel=2)
+
+
+@register_model(
+    [
+        "VllmQwen3_5ForCausalLM",
+        "VllmQwen3_5Model",
+        "VllmQwen3_5ForConditionalGeneration",
+        "VllmQwen3.5ForCausalLM",
+        "VllmQwen3.5Model",
+        "VllmQwen3.5ForConditionalGeneration",
+    ]
+    + vllm_qwen3_5_classes
+)
+class VllmQwen3_5ParameterMapping(ParameterMapping):
+    """Parameter mapping for Qwen3.5 (dense) model."""
+
+    def get_mappings(self):
+        return [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+            ("in_proj_qkvz", "in_proj_qkv", MappingType.IN_PROJ_QKVZ_SPLIT, 0),
+            ("in_proj_qkvz", "in_proj_z", MappingType.IN_PROJ_QKVZ_SPLIT, 1),
+            ("in_proj_ba", "in_proj_b", MappingType.IN_PROJ_BA_SPLIT, 0),
+            ("in_proj_ba", "in_proj_a", MappingType.IN_PROJ_BA_SPLIT, 1),
+        ]
 
 
 # Mixtral

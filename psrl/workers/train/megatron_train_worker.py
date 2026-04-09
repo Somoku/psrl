@@ -401,15 +401,24 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         next_ps_model_version = curr_ps_model_version + 1
         # Gather the model state dict on rank 0
         psrl_logger.info("Gathering the full state dict on the CPU of the representative rank.")
-        if self.weight_converter is None:
-            self.weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
-        per_tensor_param = per_tensor_generator(
-            self.actor_module,
-            self.actor_model_config,
-            self.weight_converter,
-            self.tf_config,
-            self.layer_name_mapping,
-        )
+        
+        if self.bridge is not None:
+            if self.vanilla_bridge:
+                per_tensor_param = self.bridge.export_weights(self.actor.actor_module)
+            else:
+                per_tensor_param = self.bridge.export_hf_weights(self.actor.actor_module)
+        else:
+            if self.weight_converter is None:
+                self.weight_converter = get_mcore_weight_converter(self.actor_model_config, self.dtype)
+
+            per_tensor_param = per_tensor_generator(
+                self.actor.actor_module,
+                self.actor_model_config,
+                self.weight_converter,
+                self.tf_config,
+                self.layer_name_mapping,
+            )
+
         full_state_dict = {}
         for name, param in per_tensor_param:
             if self.is_train_representative_rank:

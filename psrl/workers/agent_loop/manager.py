@@ -344,7 +344,8 @@ class PSRL_AgentLoopManager:
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
         # TODO(verl): support other multi-modal inputs
         multi_modal_inputs = None
-        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+        # if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+        if False:
             from verl.models.transformers.qwen2_vl import get_rope_index
 
             images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)

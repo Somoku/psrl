@@ -215,16 +215,19 @@ class RewardManager(CommandExtension):
         # Only support Qwen2VLImageProcessor for multi-modal processing currently
         # TODO(verl): support other multi-modal inputs
         multi_modal_inputs = None
-        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)
-            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-            multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
-            multi_modal_inputs.pop("input_ids", None)
-            multi_modal_inputs.pop("attention_mask", None)
+        # print(f"multimodaldebug, {self.processor=}, {self.processor.image_processor.__class__.__name__ if self.processor else None}")
+        # if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
+        #     # images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)
+        #     print(f"{inputs.non_tensor_batch['multi_modal_data']=}")
+        #     images = None
+        #     current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        #     multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
+        #     multi_modal_inputs.pop("input_ids", None)
+        #     multi_modal_inputs.pop("attention_mask", None)
 
-            # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-            # because np.array() only keeps the keys for BatchFeature.
-            multi_modal_inputs = dict(multi_modal_inputs)
+        #     # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+        #     # because np.array() only keeps the keys for BatchFeature.
+        #     multi_modal_inputs = dict(multi_modal_inputs)
 
         batch = TensorDict(
             {

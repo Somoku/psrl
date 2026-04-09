@@ -11,8 +11,12 @@ from torch.nn import Parameter
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
+    slice_qwen3_5_in_proj,
+    slice_qwen3_5_in_proj_qkv,
     slice_gate_up_proj,
     slice_qkv_proj_megatron,
+    slice_attn_conv1d,
+    reshape_visual_block_qkv,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -82,7 +86,7 @@ class MegatronConverter(BaseConverter):
         # NOTE(lhy): a workaround for lm_head
         # if PP is not used and the word embedding is shared
         # we manually set the lm_head
-        if self.mpu.pp_size == 1 and self.parameter_mapping.original_tie_word_embeddings:
+        if self.mpu.pp_rank == self.mpu.pp_size - 1 and self.parameter_mapping.original_tie_word_embeddings:
             for original_name, new_name in self.bridge._DIRECT_MAPPING.items():
                 if "embed_tokens.weight" in new_name and new_name in converted_state_dict:
                     converted_state_dict["lm_head.weight"] = converted_state_dict[new_name]
@@ -112,6 +116,7 @@ class MegatronConverter(BaseConverter):
                     num_heads=self.model_info["num_heads"],
                     num_kv_heads=self.model_info["num_kv_heads"],
                     head_size=self.model_info["head_size"],
+                    attn_output_gate=self.model_info["attn_output_gate"],
                     tp_size=self.mpu.tp_size,
                 )
             except Exception as e:
@@ -122,6 +127,43 @@ class MegatronConverter(BaseConverter):
                 new_param = sliced_params[shard_id]
                 new_param_name = full_hf_name
                 out[new_param_name] = new_param
+            return out
+        elif len(full_hf_names) == 4:
+            assert "in_proj" in full_name, "Only in_proj should have 4 corresponding hf names after split"
+            key_dim = self.model_info.get("linear_key_dim")
+            value_dim = self.model_info.get("linear_value_dim")
+            num_v_heads = self.model_info.get("linear_num_value_heads")
+            if key_dim is None or value_dim is None or num_v_heads is None:
+                raise ValueError(
+                    "Qwen3.5 linear attention dims are missing in model_info for in_proj split; "
+                    f"got linear_key_dim={key_dim}, linear_value_dim={value_dim}, linear_num_value_heads={num_v_heads}."
+                )
+            try:
+                sliced_params = slice_qwen3_5_in_proj(
+                    fused_param=param,
+                    key_dim=key_dim,
+                    value_dim=value_dim,
+                    num_v_heads=num_v_heads,
+                    tp_size=self.mpu.tp_size,
+                    output_dim=0,
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to slice in_proj parameter {full_name} into {full_hf_names}: {e}") from e
+            out = {}
+            for shard_id, full_hf_name in enumerate(full_hf_names):
+                assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {full_name}"
+                new_param = sliced_params[shard_id]
+                if shard_id == 0:
+                    qkv_names = [full_hf_name + "_q", full_hf_name + "_k", full_hf_name + "_v"]
+                    qkv_params = slice_qwen3_5_in_proj_qkv(
+                        fused_param=new_param, 
+                        key_dim=key_dim,
+                        value_dim=value_dim,
+                        tp_size=self.mpu.tp_size,
+                    )
+                    out.update(dict(zip(qkv_names, qkv_params)))
+                    continue
+                out[full_hf_name] = new_param
             return out
         elif len(full_hf_names) == 2:
             assert "linear_fc1" in full_name, "Only linear_fc1 should have 2 corresponding hf names after split"
@@ -169,6 +211,21 @@ class MegatronConverter(BaseConverter):
             assert len(full_hf_names) == 1, (
                 f"Only one corresponding hf name should be transformed for {full_name}, but got {full_hf_names}"
             )
+            hf_name = full_hf_names[0]
+            if "self_attention.conv1d.weight" in full_name:
+                new_param_names = [hf_name + "_q", hf_name + "_k", hf_name + "_v"]
+                new_params = slice_attn_conv1d(
+                    fused_param=param,
+                    num_k_heads=self.model_info["linear_num_key_heads"],
+                    num_v_heads=self.model_info["linear_num_value_heads"],
+                    k_head_size=self.model_info["linear_key_head_dim"],
+                    v_head_size=self.model_info["linear_value_head_dim"],
+                    tp_size=self.mpu.tp_size,
+                )
+                return dict(zip(new_param_names, new_params))
+            if "visual.blocks" in hf_name and "qkv" in hf_name:
+                param = reshape_visual_block_qkv(param)
+                param.partition_dim = 1
             return {full_hf_names[0]: param}
 
     def get_sharding_for_param(self, full_name: str, param: Parameter) -> NIXLSharding:
@@ -193,6 +250,11 @@ class MegatronConverter(BaseConverter):
             )
             shard_indices = [(self.mpu.tp_rank,)]
             shard_dim = param.partition_dim
+
+            if shard_dim == -1:
+                # For dt_bias, A_log, and conv1d.weight, shard_dim should be 0,
+                # but their partition_dim is -1
+                shard_dim = 0
         else:
             shard_size = 1
             shard_indices = [(0,)]

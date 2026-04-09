@@ -1,38 +1,3 @@
-From 088eb9fe9e5c9a2056cb0d4abc10fb11a430f852 Mon Sep 17 00:00:00 2001
-From: Somoku <linsh0@protonmail.com>
-Date: Sat, 17 Jan 2026 20:19:31 +0800
-Subject: [PATCH] Basic patch for PSRL
-
-- safer get_event_loop
-- add spmd vllm rollout back
-- add router replay in megatron
-- add lazy import for megatron v0.15.0
-- disaggregate dist group init from `__init__` to speedup worker startup
-- support specifying resource num per bundle to enable colocate of different resource pools
-- support configure worker-specified env setups through `configure_worker`
-- support tms for weight and optim memory management
----
- recipe/dapo/test_dapo_7b_math.sh              |  24 +-
- recipe/dapo/test_dapo_7b_math_megatron.sh     |  31 +-
- verl/protocol.py                              |   2 +-
- verl/single_controller/base/worker.py         |   3 +-
- verl/single_controller/ray/base.py            |  57 +-
- verl/trainer/config/data/legacy_data.yaml     |   2 +-
- verl/trainer/constants_ppo.py                 |   5 +-
- verl/trainer/sft_trainer.py                   |   2 +-
- verl/utils/checkpoint/__init__.py             |   4 -
- verl/utils/import_utils.py                    |  60 +-
- verl/utils/megatron_utils.py                  |   4 +
- verl/workers/actor/megatron_actor.py          |   3 +
- verl/workers/fsdp_workers.py                  | 513 ++++++++++--------
- verl/workers/megatron_workers.py              | 384 +++++++------
- verl/workers/rollout/base.py                  |   1 +
- verl/workers/rollout/vllm_rollout/__init__.py |   1 +
- .../rollout/vllm_rollout/vllm_rollout.py      |   4 +-
- .../rollout/vllm_rollout/vllm_rollout_spmd.py | 441 +++++++++++++++
- 18 files changed, 1085 insertions(+), 456 deletions(-)
- create mode 100644 verl/workers/rollout/vllm_rollout/vllm_rollout_spmd.py
-
 diff --git a/recipe/dapo/test_dapo_7b_math.sh b/recipe/dapo/test_dapo_7b_math.sh
 index e7fa9926..c6d75bd5 100644
 --- a/recipe/dapo/test_dapo_7b_math.sh
@@ -182,6 +147,27 @@ index a866e968..63188ff6 100644
      trainer.resume_mode=auto \
 -    trainer.log_val_generations=10
 +    trainer.log_val_generations=10 2>&1 | tee ${exp_name}.log
+diff --git a/verl/models/mcore/model_initializer.py b/verl/models/mcore/model_initializer.py
+index 49a30bc9..3c3e4bcd 100644
+--- a/verl/models/mcore/model_initializer.py
++++ b/verl/models/mcore/model_initializer.py
+@@ -71,6 +71,7 @@ class BaseModelInitializer(ABC):
+         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
+         rope_scaling_args = self.get_rope_scaling_args()
+         mtp_block_spec = extra_kwargs.get("mtp_block_spec", None)
++        from verl.utils.megatron_utils import get_hf_rope_theta
+         model = GPTModel(
+             config=self.tfconfig,
+             transformer_layer_spec=transformer_layer_spec,
+@@ -80,7 +81,7 @@ class BaseModelInitializer(ABC):
+             post_process=post_process,
+             share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+             position_embedding_type="rope",
+-            rotary_base=self.hf_config.rope_theta,
++            rotary_base=get_hf_rope_theta(self.hf_config),
+             **rope_scaling_args,
+             mtp_block_spec=mtp_block_spec,
+             **({} if not self.has_vp_stage else {"vp_stage": vp_stage}),
 diff --git a/verl/protocol.py b/verl/protocol.py
 index 43eb26da..0784603d 100644
 --- a/verl/protocol.py
@@ -457,10 +443,48 @@ index 626b6285..f3b21fb9 100644
 +    for name in names:
 +        lazy_import_to_globals(module_path, name, target_globals=target_globals)
 diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
-index c319910d..8d2832ab 100644
+index c319910d..0b96a056 100644
 --- a/verl/utils/megatron_utils.py
 +++ b/verl/utils/megatron_utils.py
-@@ -1054,6 +1054,10 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
+@@ -42,6 +42,37 @@ from verl.utils.model import normalize_model_name
+ from verl.utils.torch_dtypes import PrecisionType
+ 
+ 
++def get_hf_rope_theta(hf_config: PretrainedConfig) -> float:
++    """Return RoPE base frequency theta.
++
++    Most configs expose ``rope_theta`` on the root. Newer models (e.g. Qwen3 in transformers>=5) store it under
++    ``rope_parameters["rope_theta"]``, optionally nested per attention pattern when ``rope_parameters`` maps names
++    to parameter dicts.
++    """
++    # For transformers <= 4.57.6
++    if hasattr(hf_config, "rope_theta"):
++        return hf_config.rope_theta
++    if hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "rope_theta"):
++        return hf_config.text_config.rope_theta
++
++    # For transformers >= 5.0.0, check rope_parameters dict (optionally nested) for rope_theta
++    rp = None
++    if hasattr(hf_config, "rope_parameters"):
++        rp = hf_config.rope_parameters
++    elif hasattr(hf_config, "text_config") and hasattr(hf_config.text_config, "rope_parameters"):
++        rp = hf_config.text_config.rope_parameters
++    if isinstance(rp, dict):
++        if "rope_theta" in rp:
++            return rp["rope_theta"]
++        for v in rp.values():
++            if isinstance(v, dict) and "rope_theta" in v:
++                return v["rope_theta"]
++    raise AttributeError(
++        f"{type(hf_config).__name__} has no rope_theta and no rope_parameters['rope_theta'] — "
++        "cannot determine RoPE base."
++    )
++
++
+ def get_model_config(model):
+     return get_attr_wrapped_model(model, "config", allow_none=False)
+ 
+@@ -1054,6 +1085,10 @@ def get_transformer_layer_offset(pipeline_rank, vp_stage, config: TransformerCon
          inspect.signature(parallel_state.is_pipeline_first_stage).parameters.get("vp_stage", None) is not None
      )
      extra_kwargs = {} if not has_vp_stage else {"ignore_virtual": False, "vp_stage": vp_stage}
@@ -471,6 +495,59 @@ index c319910d..8d2832ab 100644
  
      if config.pipeline_model_parallel_size > 1:
          if hasattr(config, "pipeline_model_parallel_layout") and config.pipeline_model_parallel_layout:
+diff --git a/verl/utils/model.py b/verl/utils/model.py
+index b9d17cfb..d7441ef0 100644
+--- a/verl/utils/model.py
++++ b/verl/utils/model.py
+@@ -34,7 +34,7 @@ from transformers import (
+     AutoModelForImageTextToText,
+     AutoModelForSequenceClassification,
+     AutoModelForTokenClassification,
+-    AutoModelForVision2Seq,
++    AutoModelForImageTextToText,
+     GenerationConfig,
+     MistralForSequenceClassification,
+     PretrainedConfig,
+@@ -620,7 +620,7 @@ def patch_valuehead_model(model) -> None:
+ 
+ 
+ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_code):
+-    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
++    from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForImageTextToText
+ 
+     try:
+         model = AutoModelForTokenClassification.from_pretrained(
+@@ -641,8 +641,8 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
+ 
+     from trl import AutoModelForCausalLMWithValueHead
+ 
+-    if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
+-        module_class = AutoModelForVision2Seq
++    if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
++        module_class = AutoModelForImageTextToText
+     else:
+         module_class = AutoModelForCausalLM
+     ori_model = module_class.from_pretrained(
+@@ -659,7 +659,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
+ 
+ _architecture_to_auto_class = {
+     "ForCausalLM": AutoModelForCausalLM,
+-    "ForVision2Seq": AutoModelForVision2Seq,
++    "ForImageTextToText": AutoModelForImageTextToText,
+     "ForTokenClassification": AutoModelForTokenClassification,
+     "ForSequenceClassification": AutoModelForSequenceClassification,
+ }
+@@ -672,8 +672,8 @@ def get_hf_auto_model_class(hf_config):
+     if has_remote_code:
+         auto_class = next(k for k, v in hf_config.auto_map.items() if hf_config.architectures[0] in v)
+         match auto_class:
+-            case "AutoModelForVision2Seq":
+-                actor_module_class = AutoModelForVision2Seq
++            case "AutoModelForImageTextToText":
++                actor_module_class = AutoModelForImageTextToText
+             case "AutoModelForCausalLM":
+                 actor_module_class = AutoModelForCausalLM
+             case "AutoModelForImageTextToText":
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
 index 466402ca..5ed8a5bc 100644
 --- a/verl/workers/actor/megatron_actor.py
@@ -2231,6 +2308,3 @@ index 00000000..34392a32
 +            model.load_weights(weights)
 +
 +            
--- 
-2.43.0
-

@@ -516,6 +516,8 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         non_tensor_batch["raw_response_ids"] = np.array([self.trajectory.response_ids])
         non_tensor_batch["response_mask"] = np.array([self.trajectory.response_mask])
         non_tensor_batch["rollout_instance_id"] = np.array([self.trajectory.curr_rollout_instance_id])
+        if self.trajectory.curr_version_tag is not None:
+            non_tensor_batch["version_tag"] = np.array([self.trajectory.curr_version_tag])
         non_tensor_batch["__num_turns__"] = np.array(
             [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
         )

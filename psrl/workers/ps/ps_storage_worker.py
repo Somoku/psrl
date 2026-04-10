@@ -671,10 +671,15 @@ class PSStorageWorker:
                     tag="ps_broadcast_init",
                 )
 
-        # Synchronize to ensure all NIXL transfers complete before this method returns,
-        # so that PSManager's ray.get barrier is sufficient to gate the next round.
-        if self.use_gpu:
-            torch.cuda.synchronize()
+        # Poll until every NIXL transfer completes. torch.cuda.synchronize() only covers
+        # CUDA ops and does not block on NIXL network transfers; without explicit wait()
+        # the round barrier (ray.get) would return while data is still in-flight.
+        for child_rank in children:
+            child_client = self._ps_train_client_name_for_rank(child_rank)
+            for key in checkpoint_keys:
+                train_client.wait(key, "ps_broadcast_init", "WRITE", target_client=child_client)
+        train_client.clear_intermediate_cached_data()
+
         psrl_logger.info(
             f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: all transfers done."
         )

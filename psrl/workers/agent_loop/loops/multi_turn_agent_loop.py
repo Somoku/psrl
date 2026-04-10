@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from omegaconf import DictConfig
 from verl import DataProto
@@ -51,6 +51,11 @@ def _set_multi_turn_aggregates(
             multi_turn_metrics[f"multi_turn/{name}_all_turns"] = 0
             multi_turn_metrics[f"multi_turn/max_{name}_all_turns"] = 0
             multi_turn_metrics[f"multi_turn/min_{name}_all_turns"] = 0
+
+
+@asynccontextmanager
+async def _null_async_context():
+    yield
 
 
 def _finalize_profiling(
@@ -198,7 +203,13 @@ class MultiTurnAgentLoop(AgentLoopBase):
 
             # TODO: check unnecessary fields in output data_proto and
             # check redundant padding in single-request case
-            async with sticky_session(self.rollout_router, request):
+            use_sticky_session = self.config.psrl.agentic_rl.sticky_session
+            session_ctx = (
+                sticky_session(self.rollout_router, request)
+                if use_sticky_session
+                else _null_async_context()
+            )
+            async with session_ctx:
                 with _append_timer(generate_times):
                     gen_request = self.agent_data.prepare_generation_request(request)
                     if profiling_collector is not None:

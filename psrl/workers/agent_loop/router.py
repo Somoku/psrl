@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from vllm.sampling_params import RequestOutputKind
 
+from psrl.utils.kv_cache.types import TrajectoryCacheInfo
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
@@ -27,6 +28,15 @@ from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _to_token_list(tokens) -> list:
+    """Convert tokens to a Python list, handling both numpy arrays, tensors, and plain lists."""
+    if isinstance(tokens, list):
+        return tokens
+    if hasattr(tokens, "tolist"):
+        return tokens.tolist()
+    return list(tokens)
 
 
 @ray.remote(concurrency_groups={"control": 1})
@@ -107,8 +117,8 @@ class RolloutRouter:
         # Trajectory-level instance mapping — survives individual turn completion.
         # Upserted on every routing decision; cleared by `kv_unregister`.
         self.complete_request_to_instance: dict[int, int] = {}
-        # Trajectory-level token mapping — updated via `kv_register_turn`.
-        self.complete_request_to_tokens: dict[int, list[int]] = {}
+        # Trajectory-level token mapping — auto-maintained by generate_async / _route_single_request.
+        self.request_to_tokens: dict[int, list[int]] = {}
         self.request_futures = {}  # Track request futures: {request_id: Future}
         # Track the version after synchronization for each instance: {instance_id: ps_model_version}
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
@@ -121,6 +131,53 @@ class RolloutRouter:
         self.log_prefix = "RolloutRouter"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info("Initialized RolloutRouter")
+
+    async def _inject_kv_hit_scores(
+        self,
+        request_id: int,
+        candidates: list[int],
+        route_kwargs: dict,
+    ) -> None:
+        """Query KV cache hit scores for all candidates and store in `route_kwargs`.
+
+        Only runs when `self.config.psrl.routing_strategy.method` is
+        `"kv_cache_aware"`.  Each candidate is queried concurrently via
+        `execute_rank_zero_async("kv_get_cache_info", tokens)`.  Instances that
+        time out or raise are assigned score 0 (graceful degradation).
+
+        Mutates `route_kwargs` in-place by adding the key `"kv_hit_scores"`.
+        """
+        if self.config.psrl.routing_strategy.method != "kv_cache_aware":
+            return
+        assert request_id in self.request_to_tokens, (
+            f"[KV] uid={request_id} not found in request_to_tokens. "
+            "Expected START registration in generate_async before routing."
+        )
+        tokens: list[int] = self.request_to_tokens[request_id]
+        timeout: float = self.config.psrl.routing_strategy.kv_query_timeout_ms / 1000
+        raw_results = await asyncio.gather(
+            *[
+                asyncio.wait_for(
+                    self.rollout_wg_list[i].execute_rank_zero_async(
+                        "kv_get_cache_info", tokens
+                    ),
+                    timeout=timeout,
+                )
+                for i in candidates
+            ],
+            return_exceptions=True,
+        )
+        kv_hit_scores: dict[int, int] = {}
+        for i, result in zip(candidates, raw_results):
+            if isinstance(result, Exception):
+                psrl_logger.warning(
+                    f"[KV]: Cache info RPC failed for instance {i!r}: {result!r}."
+                )
+                kv_hit_scores[i] = 0
+            else:
+                info = TrajectoryCacheInfo(**result)
+                kv_hit_scores[i] = max(info.gpu_cached_tokens, info.lmcache_cached_tokens)
+        route_kwargs["kv_hit_scores"] = kv_hit_scores
 
     def init_route_strategy(self, **kwargs):
         """Initialize the route strategy for the router.
@@ -377,10 +434,13 @@ class RolloutRouter:
             raise ValueError(f"Invalid candidate sort indicator: {self.config.psrl.routing_strategy.candidate_sort_indicator}")
         route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
 
-        # 6. Strategy-based routing
+        # 6. KV hit score query (only active when method == "kv_cache_aware").
+        await self._inject_kv_hit_scores(request_id, candidates, route_kwargs)
+
+        # 7. Strategy-based routing.
         chosen_rollout_instance = self.route_strategy.route(request, candidates=candidates, route_kwargs=route_kwargs)
 
-        # 7. If not None, the request is routed to the chosen rollout instance
+        # 8. If not None, the request is routed to the chosen rollout instance.
         if chosen_rollout_instance is not None:
             # Allocate the version tag and reserve the request for the chosen
             # rollout instance if the request is not routed before
@@ -476,13 +536,24 @@ class RolloutRouter:
             all_log_prob_list.append(log_prob_list)
 
         # Consolidate batch results
+        assert all(isinstance(ids, (list, tuple)) for ids in response_ids_list), (
+            f"response_ids_list elements must be lists, got types: "
+            f"{[type(ids) for ids in response_ids_list]}"
+        )
         if "raw_response_ids" in non_tensor_batch:
             raw_response_ids = non_tensor_batch.pop("raw_response_ids")
+            assert isinstance(raw_response_ids, np.ndarray), (
+                f"raw_response_ids should be np.ndarray, got {type(raw_response_ids)}"
+            )
             raw_response_ids = np.fromiter(raw_response_ids.tolist(), dtype=object)
         else:
             raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
 
         raw_response_ids = raw_response_ids + np.fromiter(response_ids_list, dtype=object)
+        assert isinstance(raw_response_ids, np.ndarray) and raw_response_ids.dtype == object, (
+            f"raw_response_ids after concat should be np.ndarray(dtype=object), "
+            f"got type={type(raw_response_ids)}, dtype={getattr(raw_response_ids, 'dtype', None)}"
+        )
         non_tensor_batch["raw_response_ids"] = raw_response_ids
 
         if "response_unpadded_len" in non_tensor_batch:
@@ -537,6 +608,10 @@ class RolloutRouter:
             psrl_logger.info("Started routing loop")
 
         request_id = request.non_tensor_batch["uid"][0]
+        # Register current token sequence for KV-aware routing (START of turn).
+        raw_prompt_ids = request.non_tensor_batch.get("raw_prompt_ids")
+        self.request_to_tokens[request_id] = _to_token_list(raw_prompt_ids[0])
+        
         is_validate = request.meta_info.get("validate", False)
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             [request_id],
@@ -601,7 +676,7 @@ class RolloutRouter:
             instance_id = self.complete_request_to_instance[uid]
         else:
             return None, None
-        tokens = self.complete_request_to_tokens.get(uid)
+        tokens = self.request_to_tokens.get(uid)
         return instance_id, tokens
 
     def is_routing(self) -> bool:
@@ -984,6 +1059,7 @@ class RolloutRouter:
             # Remove request from inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
 
+            need_reroute = False
             # Check if request was interrupted and needs to be requeued
             if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
                 psrl_logger.debug(
@@ -998,7 +1074,7 @@ class RolloutRouter:
                 )
                 self.requests_to_route.put(consolidated_output)
                 # No result to set since the request is not completed
-                return
+                need_reroute = True
             elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
                 psrl_logger.debug(
                     f"Request {request_id} on instance {new_instance_id} was interrupted "
@@ -1012,7 +1088,7 @@ class RolloutRouter:
                 )
                 self.requests_to_route.put(consolidated_output)
                 # No result to set since the request is not completed
-                return
+                need_reroute = True
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
                 response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
                 parent_prompt_id = request_id // rollout_n
@@ -1032,9 +1108,18 @@ class RolloutRouter:
             # Means the request is aborted
             # psrl_logger.info(f"Request {request_id} is aborted")
             result = None
+            
+        # Update token sequence with prompt + response for next turn's KV routing (END of turn).
+        if consolidated_output is not None:
+            raw_prompt_ids = consolidated_output.non_tensor_batch.get("raw_prompt_ids")
+            raw_response_ids = consolidated_output.non_tensor_batch.get("raw_response_ids")
+            prompt_tokens = _to_token_list(raw_prompt_ids[0])
+            response_tokens = _to_token_list(raw_response_ids[0])
+            self.request_to_tokens[request_id] = prompt_tokens + response_tokens
 
         # Set the result for the request
-        self._set_result(request_id, result)
+        if not need_reroute:
+            self._set_result(request_id, result)
 
     @ray.method(concurrency_group="control")
     async def check_should_migrate(self) -> list[int]:
@@ -1319,24 +1404,6 @@ class RolloutRouter:
     # --- Trajectory KV cache management methods ---
 
     @ray.method(concurrency_group="control")
-    async def kv_register_turn(self, uid: int, tokens: list[int]) -> None:
-        """
-        Record the latest full token sequence for a trajectory after each turn.
-
-        Called by `AgentLoopWorker` after a turn result is received so that the
-        Router has up-to-date tokens ready for any subsequent `kv_*` operation.
-
-        Args:
-            uid (int): Trajectory unique identifier.
-            tokens (list[int]): Full token sequence at the end of this turn.
-        """
-        assert tokens, f"tokens must be a non-empty list for uid={uid}."
-        self.complete_request_to_tokens[uid] = tokens
-        psrl_logger.debug(
-            f"[KV] Registered turn tokens for uid={uid}, len={len(tokens)}."
-        )
-
-    @ray.method(concurrency_group="control")
     async def kv_unregister(self, uid: int) -> None:
         """
         Remove trajectory token and instance records when a trajectory ends.
@@ -1347,7 +1414,7 @@ class RolloutRouter:
             uid (int): Trajectory unique identifier.
         """
         self.complete_request_to_instance.pop(uid, None)
-        self.complete_request_to_tokens.pop(uid, None)
+        self.request_to_tokens.pop(uid, None)
         psrl_logger.debug(f"[KV] Unregistered uid={uid}.")
 
     @ray.method(concurrency_group="control")
@@ -1365,7 +1432,7 @@ class RolloutRouter:
         assert instance_id is not None, f"kv_get_cache_info: uid={uid} not found in any registry."
         assert tokens is not None, (
             f"kv_get_cache_info: uid={uid} found on instance {instance_id} "
-            f"but has no registered tokens. Call kv_register_turn first."
+            f"but has no registered tokens in request_to_tokens."
         )
         assert 0 <= instance_id < len(self.rollout_wg_list), (
             f"kv_get_cache_info: instance_id={instance_id} out of range "
@@ -1391,7 +1458,7 @@ class RolloutRouter:
         assert instance_id is not None, f"kv_pin: uid={uid} not found in any registry."
         assert tokens is not None, (
             f"kv_pin: uid={uid} found on instance {instance_id} "
-            f"but has no registered tokens. Call kv_register_turn first."
+            f"but has no registered tokens in request_to_tokens."
         )
         assert 0 <= instance_id < len(self.rollout_wg_list), (
             f"kv_pin: instance_id={instance_id} out of range "
@@ -1417,7 +1484,7 @@ class RolloutRouter:
         assert instance_id is not None, f"kv_unpin: uid={uid} not found in any registry."
         assert tokens is not None, (
             f"kv_unpin: uid={uid} found on instance {instance_id} "
-            f"but has no registered tokens. Call kv_register_turn first."
+            f"but has no registered tokens in request_to_tokens."
         )
         assert 0 <= instance_id < len(self.rollout_wg_list), (
             f"kv_unpin: instance_id={instance_id} out of range "
@@ -1442,7 +1509,7 @@ class RolloutRouter:
         assert instance_id is not None, f"kv_clear_from_backend: uid={uid} not found in any registry."
         assert tokens is not None, (
             f"kv_clear_from_backend: uid={uid} found on instance {instance_id} "
-            f"but has no registered tokens. Call kv_register_turn first."
+            f"but has no registered tokens in request_to_tokens."
         )
         assert 0 <= instance_id < len(self.rollout_wg_list), (
             f"kv_clear_from_backend: instance_id={instance_id} out of range "
@@ -1476,7 +1543,7 @@ class RolloutRouter:
         assert instance_id is not None, f"kv_transfer: uid={uid} not found in any registry."
         assert tokens is not None, (
             f"kv_transfer: uid={uid} found on instance {instance_id} "
-            f"but has no registered tokens. Call kv_register_turn first."
+            f"but has no registered tokens in request_to_tokens."
         )
         assert 0 <= instance_id < len(self.rollout_wg_list), (
             f"kv_transfer: instance_id={instance_id} out of range "

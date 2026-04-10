@@ -2,7 +2,7 @@
 env_file="${PSRL_WORKSPACE}/env/psrl.sh"
 source ${env_file}
 
-HOSTFILE=${1:-"${PSRL_WORKSPACE}/hosts/64GPUs"}
+HOSTFILE=${1:-"${PSRL_WORKSPACE}/hosts/32GPUs"}
 PORT=8887                # Ray节点通信端口
 DASHBOARD_PORT=8265      # Ray Dashboard端口
 

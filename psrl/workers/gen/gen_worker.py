@@ -239,6 +239,20 @@ class PSRL_GenWorker(Worker):
 
         # KV cache manager for trajectory-level operations.
         # Engine is attached after rollout initialization in `_build_rollout`.
+        # NOTE(lhy): In DP mode (data_parallel_size > 1) you will see a
+        # recurring LMCache ERROR log:
+        #   "PrometheusLogger instance already created with different metadata"
+        # This is a known third-party bug in LMCache's PrometheusLogger
+        # singleton. Root cause: vLLM's DPEngineCoreProc.__init__ mutates
+        # kv_transfer_config.engine_id in-place AFTER the scheduler connector
+        # has already called PrometheusLogger.GetOrCreate(), so the second call
+        # (from LMCacheStatsLogger) sees a different engine_id and triggers the
+        # mismatch check.  role also differs between SCHEDULER and WORKER
+        # connector inits.  Neither field is a Prometheus label; the singleton
+        # is reused correctly and there is no functional impact.  The fix
+        # belongs in third_party/LMCache/lmcache/observability.py (ignore
+        # engine_id/role in the equality check), but touching third-party code
+        # is avoided to keep diffs minimal.
         _lmcache_raw = OmegaConf.to_container(
             self.psrl_config.get("lmcache", OmegaConf.create()), resolve=True
         )

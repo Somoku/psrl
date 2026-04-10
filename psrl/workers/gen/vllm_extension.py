@@ -21,7 +21,7 @@ from verl.utils.fs import copy_to_local
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.distributed.kv_transfer import get_kv_transfer_group
-from vllm.v1.core.kv_cache_utils import estimate_max_model_len, hash_block_tokens
+from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
@@ -362,7 +362,7 @@ class vLLMWorkerExtension:
         `LMCacheConnectorV1` instance, which holds `._lmcache_engine`.
 
         Returns:
-            LMCacheEngine: The `cache_engine` from the active KV transfer group.
+            LMCacheEngine: The `lmcache_engine` from the active KV transfer group.
         """
         connector = get_kv_transfer_group()
         assert connector is not None, (
@@ -373,8 +373,8 @@ class vLLMWorkerExtension:
             f"Connector {type(connector).__name__} does not have _lmcache_engine attribute. "
             "Expected LMCacheConnectorV1."
         )
-        engine = connector._lmcache_engine.cache_engine
-        assert engine is not None, "LMCacheEngine cache_engine is None."
+        engine = connector._lmcache_engine.lmcache_engine
+        assert engine is not None, "LMCacheEngine lmcache_engine is None."
         return engine
 
     def _get_lmcache_chunk_keys(self, tokens: list[int]) -> list:
@@ -407,90 +407,25 @@ class vLLMWorkerExtension:
         # `MixedMemoryAllocator` / `PagedCpuGpuMemoryAllocator` expose `total_size`.
         return int(getattr(allocator, "total_size", 0))
 
-    def _iter_gpu_prefix_blocks(self, tokens: list[int]):
+    def lmcache_get_backend_cache_info(self, tokens: list[int]) -> dict:
         """
-        Yield GPU `KVCacheBlock` objects forming the longest contiguous cached prefix.
+        Return LMCache backend usage statistics for `tokens`.
 
-        Uses `block_pool.cached_block_hash_to_block` to map per-block token
-        hashes to blocks, stopping at the first miss (prefix semantics).
+        Only covers the LMCache backend side.  GPU prefix-cache statistics are
+        queried separately on `RolloutScheduler` via `call_utility_async` from
+        `KVCacheManager`.
 
-        Args:
-            tokens (list[int]): Full token sequence.
-
-        Yields:
-            KVCacheBlock: Blocks in prefix order.
-        """
-        from vllm.v1.core.kv_cache_utils import (
-            BlockHash,
-            init_none_hash,
-            make_block_hash_with_group_id,
-        )
-
-        block_pool = self.scheduler.kv_cache_manager.block_pool
-        block_size = block_pool.hash_block_size
-
-        try:
-            from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils import (
-                get_caching_hash_fn,
-            )
-            hash_fn = get_caching_hash_fn()
-        except ImportError:
-            import hashlib
-            # NOTE(claude): Fall back to SHA-256 when the LMCache integration utils are
-            # unavailable (e.g., in unit tests without the full vLLM install).
-            hash_fn = lambda data: hashlib.sha256(str(data).encode()).digest()  # noqa: E731
-        except Exception as e:
-            import hashlib
-            psrl_logger.warning(
-                f"[LMCache] Failed to load get_caching_hash_fn, falling back to SHA-256: {e!r}."
-            )
-            hash_fn = lambda data: hashlib.sha256(str(data).encode()).digest()  # noqa: E731
-
-        # `NONE_HASH` in `kv_cache_utils` must be initialised before calling
-        # `hash_block_tokens`.  `init_none_hash` is idempotent once called.
-        init_none_hash(hash_fn)
-
-        prev_hash: BlockHash | None = None
-        num_full_blocks = len(tokens) // block_size
-        for block_idx in range(num_full_blocks):
-            start = block_idx * block_size
-            end = start + block_size
-            chunk = tokens[start:end]
-            block_hash = hash_block_tokens(hash_fn, prev_hash, chunk, None)
-            prev_hash = block_hash
-
-            # `kv_cache_group_id=0` for standard (non-MLA) models.
-            key = make_block_hash_with_group_id(block_hash, 0)
-            block = block_pool.cached_block_hash_to_block.get_one_block(key)
-            if block is None:
-                return  # prefix break
-            yield block
-
-    def lmcache_get_cache_info(self, tokens: list[int]) -> dict:
-        """
-        Return GPU prefix-cache and LMCache backend usage statistics for `tokens`.
-
-        The returned dict matches `TrajectoryCacheInfo` field names so that
-        `KVCacheManager.get_cache_info` can construct it with
-        ``TrajectoryCacheInfo(**raw)``.
+        The returned dict is merged with `psrl_get_gpu_cache_info` output in
+        `KVCacheManager.get_cache_info` to construct a `TrajectoryCacheInfo`.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
 
         Returns:
-            dict: Cache usage statistics.
+            dict: Backend cache usage statistics plus `total_tokens`,
+                `gpu_pinned`, and `backend_pinned` sentinel fields.
         """
         assert tokens, "tokens must be a non-empty list."
-        # GPU side
-        block_pool = self.scheduler.kv_cache_manager.block_pool
-        gpu_blocks = list(self._iter_gpu_prefix_blocks(tokens))
-        gpu_cached_blocks = len(gpu_blocks)
-        block_size = block_pool.hash_block_size
-        gpu_cached_tokens = gpu_cached_blocks * block_size
-        gpu_total_blocks = block_pool.num_gpu_blocks
-        gpu_usage_pct = (
-            gpu_cached_blocks / gpu_total_blocks if gpu_total_blocks > 0 else 0.0
-        )
 
         # LMCache backend side
         engine = self._get_lmcache_engine()
@@ -522,10 +457,6 @@ class vLLMWorkerExtension:
             "lmcache_bytes": lmcache_bytes,
             "lmcache_total_bytes": lmcache_total_bytes,
             "lmcache_usage_pct": lmcache_usage_pct,
-            "gpu_cached_blocks": gpu_cached_blocks,
-            "gpu_cached_tokens": gpu_cached_tokens,
-            "gpu_total_blocks": gpu_total_blocks,
-            "gpu_usage_pct": gpu_usage_pct,
             # NOTE(claude): PSRL pin state is tracked in `KVCacheManager`, not
             # in the worker — returning False here is always correct.
             "gpu_pinned": False,
@@ -656,75 +587,3 @@ class vLLMWorkerExtension:
         n = engine.storage_manager.batched_remove(keys)
         return n
 
-    def lmcache_pin_gpu(self, tokens: list[int]) -> int:
-        """
-        Pin the GPU prefix-cache blocks for `tokens` by incrementing `ref_cnt`.
-
-        Only pins blocks that are currently in the free queue (``ref_cnt == 0``).
-        Uses `_psrl_pinned_block_ids` to track which blocks PSRL pinned, so
-        `lmcache_unpin_gpu` cannot accidentally decrement `ref_cnt` for blocks
-        held by active vLLM requests.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            int: Number of blocks newly pinned (moved out of the free queue).
-        """
-        assert tokens, "tokens must be a non-empty list."
-        if not hasattr(self, "_psrl_pinned_block_ids"):
-            self._psrl_pinned_block_ids: set[int] = set()
-
-        block_pool = self.scheduler.kv_cache_manager.block_pool
-        pinned = 0
-        blocks_to_touch = []
-        for block in self._iter_gpu_prefix_blocks(tokens):
-            if block.ref_cnt == 0 and block.block_id not in self._psrl_pinned_block_ids:
-                blocks_to_touch.append(block)
-                self._psrl_pinned_block_ids.add(block.block_id)
-                pinned += 1
-        if blocks_to_touch:
-            # NOTE(claude): `block_pool.touch()` expects a tuple of per-group block sequences.
-            # For standard (non-MLA) models there is one KV cache group, so we pass all
-            # blocks as a single-element tuple.
-            block_pool.touch((blocks_to_touch,))
-            # Verify post-condition: `ref_cnt` should be > 0 for all pinned blocks.
-            for block in blocks_to_touch:
-                assert block.ref_cnt > 0, (
-                    f"Block {block.block_id} ref_cnt is {block.ref_cnt} after touch(). "
-                    "Expected > 0."
-                )
-        return pinned
-
-    def lmcache_unpin_gpu(self, tokens: list[int]) -> int:
-        """
-        Unpin the GPU prefix-cache blocks for `tokens` by decrementing `ref_cnt`.
-
-        Only decrements `ref_cnt` for blocks that PSRL itself pinned (tracked in
-        `_psrl_pinned_block_ids`), preventing interference with active requests.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            int: Number of blocks unpinned.
-        """
-        assert tokens, "tokens must be a non-empty list."
-        if not hasattr(self, "_psrl_pinned_block_ids"):
-            self._psrl_pinned_block_ids: set[int] = set()
-
-        block_pool = self.scheduler.kv_cache_manager.block_pool
-        freed = 0
-        for block in self._iter_gpu_prefix_blocks(tokens):
-            if block.block_id in self._psrl_pinned_block_ids:
-                assert block.ref_cnt > 0, (
-                    f"Block {block.block_id} ref_cnt is {block.ref_cnt} before free_blocks(). "
-                    "Cannot unpin a block with ref_cnt <= 0."
-                )
-                block_pool.free_blocks([block])
-                self._psrl_pinned_block_ids.discard(block.block_id)
-                freed += 1
-        psrl_logger.debug(
-            f"[LMCache] GPU unpin: {freed} blocks released for token sequence of length {len(tokens)}."
-        )
-        return freed

@@ -122,6 +122,7 @@ class AgentLoopBase(ABC):
         Returns:
             DataProto: Processed response data.
         """
+        uid = int(request.non_tensor_batch["uid"][0])
         try:
             coro = self.run(request)
             output, terminate_reason = await asyncio.wait_for(
@@ -146,3 +147,5 @@ class AgentLoopBase(ABC):
                 )
                 return None, TerminateReason.ERROR
             raise e
+        finally:
+            await self.rollout_router.kv_unregister.remote(uid)

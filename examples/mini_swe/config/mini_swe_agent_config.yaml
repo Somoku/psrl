@@ -1,0 +1,16 @@
+- name: mini_swe_agent
+  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
+  sandbox_config:
+    swe_agent_timeout: 1800
+    max_parallel_tasks_per_worker: 4
+    max_model_calls_per_instance: 15
+    environment:
+      environment_class: docker
+      image: "python:3.11-slim"
+  proxy_config:
+    port: 0
+    timeout: 600
+  agent:
+    step_limit: 15
+  model:
+    model_name: "openai/verl-model"

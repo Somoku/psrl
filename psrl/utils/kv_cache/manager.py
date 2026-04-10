@@ -209,6 +209,30 @@ class KVCacheManager:
         # `collective_rpc` returns a list[result]; take rank-0 value.
         return results[0] if isinstance(results, list) else results
 
+    async def _utility(self, method: str, *args) -> object:
+        """
+        Call a `psrl_*` method on the vLLM `EngineCore` via `call_utility_async`.
+
+        Unlike `_rpc` (which dispatches to Worker processes via `collective_rpc`),
+        this routes directly to the `EngineCore` object in the engine-core process.
+        `EngineCore.scheduler` is the `RolloutScheduler` instance, so any method
+        defined on `RolloutScheduler` (and therefore on `EngineCore` via attribute
+        lookup) is reachable here.
+
+        Use this for GPU block-pool operations (`psrl_get_gpu_cache_info`,
+        `psrl_pin_gpu`, `psrl_unpin_gpu`) which must run in the same process
+        as `block_pool` — the EngineCore process.  This is safe for TP>1 because
+        the state is never copied across process boundaries.
+
+        Args:
+            method (str): The `RolloutScheduler` method name to call on EngineCore.
+            *args: Positional arguments forwarded to the method.
+
+        Returns:
+            object: The return value of the called method.
+        """
+        return await self._inference_engine.engine_core.call_utility_async(method, *args)
+
     # --- Public KV cache operations ---
 
     async def get_cache_info(self, tokens: list[int]) -> TrajectoryCacheInfo:
@@ -218,6 +242,11 @@ class KVCacheManager:
         Operations act only on the cached prefix — the longest contiguous run
         of chunks/blocks that exist in the target store.
 
+        GPU-side statistics are queried via `EngineCore.call_utility_async` (so
+        that `block_pool` is accessed in the EngineCore process — correct for
+        TP>1).  LMCache backend statistics are queried via `collective_rpc` on
+        a single Worker (rank-0).
+
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
 
@@ -226,8 +255,13 @@ class KVCacheManager:
         """
         self._assert_engine()
         assert tokens, "tokens must be a non-empty list."
-        raw: dict = await self._rpc("lmcache_get_cache_info", (tokens,))
-        return TrajectoryCacheInfo(**raw)
+        # Query GPU prefix cache and LMCache backend concurrently to halve
+        # round-trip latency (~100ms each when serial → ~100ms total).
+        gpu_info, backend_info = await asyncio.gather(
+            self._utility("psrl_get_gpu_cache_info", tokens),
+            self._rpc("lmcache_get_backend_cache_info", (tokens,)),
+        )
+        return TrajectoryCacheInfo(**gpu_info, **backend_info)
 
     async def pin(self, tokens: list[int], targets: list[str]) -> bool:
         """
@@ -388,7 +422,7 @@ class KVCacheManager:
                 # during inference after the original pin), which causes
                 # _pinned_gpu_blocks to be over-decremented and the budget
                 # constraint to become ineffective.
-                freed: int = await self._rpc("lmcache_unpin_gpu", (oldest_tokens,))
+                freed: int = await self._utility("psrl_unpin_gpu", oldest_tokens)
                 self._pinned_gpu_blocks = max(0, self._pinned_gpu_blocks - freed)
                 psrl_logger.debug(
                     f"[LMCache] GPU pin budget: evicted oldest trajectory "
@@ -404,7 +438,7 @@ class KVCacheManager:
                 )
                 return False
 
-        pinned: int = await self._rpc("lmcache_pin_gpu", (tokens,))
+        pinned: int = await self._utility("psrl_pin_gpu", tokens)
         self._pinned_gpu_blocks += pinned
         self._gpu_pinned_order.append(tokens)
         psrl_logger.debug(
@@ -423,7 +457,7 @@ class KVCacheManager:
         Returns:
             bool: True if the unpin succeeded.
         """
-        freed: int = await self._rpc("lmcache_unpin_gpu", (tokens,))
+        freed: int = await self._utility("psrl_unpin_gpu", tokens)
         self._pinned_gpu_blocks = max(0, self._pinned_gpu_blocks - freed)
         # Remove from order tracking (`deque` does not support arbitrary removal,
         # so rebuild without the evicted entry).

@@ -107,4 +107,10 @@ def register_patches():
 
     apply_profiling_patches()
 
+    # Always attach PSRL GPU block pool forwarding methods to EngineCore so
+    # that `call_utility_async("psrl_*", ...)` calls reach `RolloutScheduler`.
+    from vllm_patches.patches.engine_core import apply_engine_core_patches
+
+    apply_engine_core_patches()
+
     logger.info("=" * 60)

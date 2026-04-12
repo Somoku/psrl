@@ -638,7 +638,7 @@ class ParameterMapping(ABC):
 
         num_heads = _get_attr(text_cfg, "num_attention_heads")
         hidden_size = _get_attr(text_cfg, "hidden_size")
-        intermediate_size = _get_attr(text_cfg, "intermediate_size")
+        intermediate_size = _get_attr(text_cfg, "intermediate_size", None)
         num_kv_heads = _get_attr(text_cfg, "num_key_value_heads", num_heads)
 
         attn_output_gate = _get_attr(text_cfg, "attn_output_gate", False)
@@ -680,6 +680,10 @@ class ParameterMapping(ABC):
                     "linear_value_dim": linear_num_value_heads * linear_value_head_dim,
                 }
             )
+
+        info["num_experts"] = _get_attr(text_cfg, "num_experts", None)
+        info["moe_intermediate_size"] = _get_attr(text_cfg, "moe_intermediate_size", None)
+        info["shared_expert_intermediate_size"] = _get_attr(text_cfg, "shared_expert_intermediate_size", None)
 
         return info
 

@@ -226,6 +226,28 @@ class MegatronConverter(BaseConverter):
             if "visual.blocks" in hf_name and "qkv" in hf_name:
                 param = reshape_visual_block_qkv(param)
                 param.partition_dim = 1
+            if "mlp.experts.linear_fc1.weight" in full_name:
+                name_prefix = hf_name.rsplit('.', 1)[0]
+                expert_id = full_name.split("weight")[1]
+                new_param_names = [
+                    f"{name_prefix}.{expert_id}.gate_proj.weight", 
+                    f"{name_prefix}.{expert_id}.up_proj.weight"
+                ]
+                new_params = slice_gate_up_proj(
+                    fused_param=param,
+                    output_sizes=[
+                        self.model_info["moe_intermediate_size"],
+                        self.model_info["moe_intermediate_size"],
+                    ],
+                    tp_size=self.mpu.etp_size,
+                )
+                return dict(zip(new_param_names, new_params))
+            if "mlp.experts.linear_fc2.weight" in full_name:
+                name_prefix = hf_name.rsplit('.', 1)[0]
+                expert_id = full_name.split("weight")[1]
+                new_param_name = f"{name_prefix}.{expert_id}.down_proj.weight"
+                return {new_param_name: param}
+
             return {full_hf_names[0]: param}
 
     def get_sharding_for_param(self, full_name: str, param: Parameter) -> NIXLSharding:

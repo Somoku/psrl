@@ -211,6 +211,78 @@ class VllmQwen3_5ParameterMapping(ParameterMapping):
         ]
 
 
+# Qwen3.5 MoE
+vllm_qwen3_5moe_classes = []
+try:
+    from vllm.model_executor.models.qwen3_5 import (
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeForConditionalGeneration,
+    )
+
+    vllm_qwen3_5moe_classes = [Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration]
+except ImportError as e:
+    warnings.warn(f"Could not import Qwen3_5 MoE classes: {e}", stacklevel=2)
+
+
+@register_model(
+    [
+        "VllmQwen3_5MoeForCausalLM",
+        "VllmQwen3_5MoeForConditionalGeneration",
+        "VllmQwen3.5MoeForCausalLM",
+        "VllmQwen3.5MoeForConditionalGeneration",
+    ]
+    + vllm_qwen3_5moe_classes
+)
+class VllmQwen3_5MoeParameterMapping(ParameterMapping):
+    """Parameter mapping for Qwen3.5 (moe) model."""
+
+    def get_mappings(self):
+        mapping = [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+            ("in_proj_qkvz", "in_proj_qkv", MappingType.IN_PROJ_QKVZ_SPLIT, 0),
+            ("in_proj_qkvz", "in_proj_z", MappingType.IN_PROJ_QKVZ_SPLIT, 1),
+            ("in_proj_ba", "in_proj_b", MappingType.IN_PROJ_BA_SPLIT, 0),
+            ("in_proj_ba", "in_proj_a", MappingType.IN_PROJ_BA_SPLIT, 1),
+        ]
+        expert_num = self.config.text_config.num_experts
+        for expert_id in range(expert_num):
+            mapping.append(
+                (
+                    "w13_weight",
+                    f"{expert_id}.gate_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id,
+                )
+            )
+            mapping.append(
+                (
+                    "w13_weight",
+                    f"{expert_id}.up_proj.weight",
+                    MappingType.FUSED_MOE_W13_SPLIT,
+                    2 * expert_id + 1,
+                )
+            )
+            mapping.append(
+                (
+                    "w2_weight",
+                    f"{expert_id}.down_proj.weight",
+                    MappingType.FUSED_MOE_W2_SPLIT,
+                    expert_id,
+                )
+            )
+        return mapping
+
+    def get_model_info(self):
+        info = super().get_model_info()
+        info["num_experts"] = self.config.text_config.num_experts
+        info["moe_intermediate_size"] = self.config.text_config.moe_intermediate_size
+        return info
+
+
 # Mixtral
 vllm_mixtral_classes = []
 try:

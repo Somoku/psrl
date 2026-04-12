@@ -11,6 +11,7 @@ __all__ = [
     "VllmQwen3ParameterMapping",
     "VllmQwen3MoeParameterMapping",
     "VllmQwen3_5ParameterMapping",
+    "VllmQwen3_5MoeParameterMapping",
     "VllmMixtralParameterMapping",
     "VllmLlamaParameterMapping",
     "VllmMistralParameterMapping",

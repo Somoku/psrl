@@ -82,8 +82,10 @@ class VllmConverter(BaseConverter):
         for module_prefix, module in model.named_modules():
             if module_prefix.startswith("visual"):
                 module_prefix = f"model.{module_prefix}"
-            if module_prefix.startswith("language_model"):
+            if module_prefix.startswith("language_model.model"):
                 module_prefix = f"model.language_model.{module_prefix[21:]}"
+            if module_prefix.startswith("language_model.lm_head"):
+                module_prefix = f"lm_head"
             seen_module_prefixes.add(module_prefix)
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
@@ -147,6 +149,9 @@ class VllmConverter(BaseConverter):
                     return out
                 elif mapping_type == MappingType.GATE_UP_PROJ_SPLIT:
                     intermediate_size = self.model_info["intermediate_size"]
+                    if intermediate_size is None:
+                        intermediate_size = self.model_info["moe_intermediate_size"]
+                    assert intermediate_size is not None, "Intermediate size must be specified in model_info for gate_up_proj split"
                     try:
                         sliced_params = slice_gate_up_proj(
                             fused_param=param,

@@ -14,7 +14,10 @@ from verl.utils.fs import copy_to_local
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
 from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.hf_converter import convert_hf_inplace
+from psrl.utils.converter.hf_converter import (
+    convert_hf_inplace,
+    maybe_convert_to_smaller_parts
+)
 from psrl.utils.converter.model_mappings import (
     slice_attn_conv1d,
     slice_qwen3_5_in_proj_qkv,
@@ -416,31 +419,9 @@ class PSStorageWorker:
             with safe_open(shard_file, framework="pt", device="cpu") as f:
                 for key in f.keys():
                     full_tensor = f.get_tensor(key)
-                    if "linear_attn.conv1d.weight" in key:
-                        new_param_names = [key + "_q", key + "_k", key + "_v"]
-                        new_params = slice_attn_conv1d(
-                            fused_param=full_tensor,
-                            num_k_heads=self.model_info["linear_num_key_heads"],
-                            num_v_heads=self.model_info["linear_num_value_heads"],
-                            k_head_size=self.model_info["linear_key_head_dim"],
-                            v_head_size=self.model_info["linear_value_head_dim"],
-                            tp_size=1,
-                        )
-                        for new_param_name, new_param in zip(new_param_names, new_params):
-                            cache[new_param_name] = new_param
-                        continue
-                    if "linear_attn.in_proj_qkv.weight" in key:
-                        new_param_names = [key + "_q", key + "_k", key + "_v"]
-                        new_params = slice_qwen3_5_in_proj_qkv(
-                            fused_param=full_tensor,
-                            key_dim=self.model_info["linear_key_dim"],
-                            value_dim=self.model_info["linear_value_dim"],
-                            tp_size=1,
-                        )
-                        for new_param_name, new_param in zip(new_param_names, new_params):
-                            cache[new_param_name] = new_param
-                        continue
-                    cache[key] = full_tensor
+                    param_dict = maybe_convert_to_smaller_parts(self.model_info, key, full_tensor)
+                    for param_name, param in param_dict.items():
+                        cache[param_name] = param
 
         # Expand tied-weight aliases so phase 2 can do a direct key lookup.
         alias_count = 0

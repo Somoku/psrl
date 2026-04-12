@@ -21,12 +21,3 @@ class BridgedMegatronParameterMapping(ParameterMapping):
         raise ValueError(
             "BridgedMegatronParameterMapping is not used for name transformation, please use mbrige instead"
         )
-
-    def get_model_info(self):
-        # NOTE(zym): Some models such as qwen3moe directly provide head_dim,
-        # which isn't equal to hidden_size // num_attention_heads.
-        # The default get_model_info already handles head_dim via getattr fallback.
-        info = super().get_model_info()
-        info["moe_intermediate_size"] = getattr(self.config, "moe_intermediate_size", info["intermediate_size"])
-        info["shared_expert_intermediate_size"] = getattr(self.config, "shared_expert_intermediate_size", None)
-        return info

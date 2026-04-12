@@ -168,6 +168,47 @@ index 49a30bc9..3c3e4bcd 100644
              **rope_scaling_args,
              mtp_block_spec=mtp_block_spec,
              **({} if not self.has_vp_stage else {"vp_stage": vp_stage}),
+diff --git a/verl/models/mcore/registry.py b/verl/models/mcore/registry.py
+index d8c7b2cf..4d29845a 100644
+--- a/verl/models/mcore/registry.py
++++ b/verl/models/mcore/registry.py
+@@ -70,6 +70,8 @@ class SupportedModel(Enum):
+     QWEN3_MOE_VL = "Qwen3VLMoeForConditionalGeneration"
+     QWEN3_VL = "Qwen3VLForConditionalGeneration"
+     GPT_OSS = "GptOssForCausalLM"
++    QWEN3_5 = "Qwen3_5ForConditionalGeneration"
++    QWEN3_5MoE = "Qwen3_5MoeForConditionalGeneration"
+ 
+ 
+ # Registry for model configuration converters
+@@ -117,6 +119,8 @@ MODEL_FORWARD_REGISTRY: dict[SupportedModel, Callable] = {
+     SupportedModel.GLM4_MOE: model_forward_gen(),
+     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: model_forward_gen(),
+     SupportedModel.GPT_OSS: model_forward_gen(),
++    SupportedModel.QWEN3_5: model_forward_gen(True),
++    SupportedModel.QWEN3_5MoE: model_forward_gen(True),
+ }
+ 
+ # Registry for model forward functions
+@@ -136,6 +140,8 @@ MODEL_FORWARD_NOPAD_REGISTRY: dict[SupportedModel, Callable] = {
+     SupportedModel.GLM4_MOE: gptmodel_forward_no_padding,
+     SupportedModel.QWEN3_TOKEN_CLASSIFICATION: gptmodel_forward_no_padding,
+     SupportedModel.GPT_OSS: gptmodel_forward_no_padding,
++    SupportedModel.QWEN3_5: gptmodel_forward_no_padding,
++    SupportedModel.QWEN3_5MoE: gptmodel_forward_no_padding,
+ }
+ 
+ # Registry for model forward functions
+@@ -154,6 +160,9 @@ MODEL_FORWARD_FUSED_REGISTRY: dict[SupportedModel, Callable] = {
+     SupportedModel.DEEPSEEK_V3: fused_forward_model_gen(),
+     SupportedModel.GLM4_MOE: fused_forward_model_gen(),
+     SupportedModel.GPT_OSS: fused_forward_model_gen(),
++    SupportedModel.QWEN3_5: fused_forward_model_gen(True),
++    SupportedModel.QWEN3_5MoE: fused_forward_model_gen(True),
++
+ }
+ 
+ # Registry for model weight converters
 diff --git a/verl/protocol.py b/verl/protocol.py
 index 43eb26da..0784603d 100644
 --- a/verl/protocol.py

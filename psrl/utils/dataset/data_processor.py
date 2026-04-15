@@ -9,9 +9,8 @@ import ray
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 from verl import DataProto
-from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
-from psrl.utils.dataset.utils import create_multi_rl_datasets
+from psrl.utils.dataset.utils import create_multi_rl_datasets, create_rl_dataset, create_rl_sampler
 from psrl.utils.logger import DualOutputHandler, log_data_protocol
 
 psrl_logger = logging.getLogger(__file__)
@@ -452,13 +451,8 @@ class DataProcessor:
                 psrl_logger.info(f"Validation dataloader {i} iterator exhausted.")
                 # Reset the exhausted iterator and move to next dataloader
                 self.val_dataloader_iters[i] = iter(self.val_dataloaders[i])
-                self._val_dataloader_idx += 1
+                self._val_dataloader_idx = (self._val_dataloader_idx + 1) % num_dataloaders
                 continue
-
-        # If we reach here, all dataloaders have been exhausted
-        # Reset index for next epoch
-        self._val_dataloader_idx = 0
-        raise StopIteration("All validation dataloader iterators exhausted.")
 
     def get_val_sample_ids(self, batch_size: int) -> list:
         """
@@ -689,7 +683,7 @@ class DataProcessor:
 
                 # TODO(linsh): check whether get_gen_batch is needed
                 gen_batch = self._get_gen_batch(batch)
-                gen_batch.meta_info["global_steps"] = self.global_steps
+                # gen_batch.meta_info["global_steps"] = self.global_steps
 
                 # Store the other batch fields in the request buffer of the reward manager
                 # They will be merged with the reward data.

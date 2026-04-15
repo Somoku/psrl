@@ -1,9 +1,9 @@
 defaults:
-  - pkg://verl.trainer.config/data/legacy_data
+  - legacy_data
   - _self_
 
 # Use multi-dataset mode, fallback to veRL legacy mode if False.
-use_multi_dataset: True
+use_multi_dataset: False
 
 # Each entry specifies one dataset with its file path, prompt key,
 # sample limit, and per-dataset reward model routing configuration.
@@ -31,26 +31,26 @@ train_datas:
         reward_fn: default
         reward_model_name: null
         reward_coef: 1.0
-      - reward_fn_key: data_source
-        reward_loop_type: gen
-        reward_fn: default
-        reward_model_name: Qwen3-8B
-        reward_coef: 1.0
-  - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/dapo-math-17k.parquet
-    data_source_name: dapo/dapo-math-17k
-    prompt_key: prompt
-    max_samples: -1
-    reward_model_dicts:
-      - reward_fn_key: data_source
-        reward_loop_type: dapo
-        reward_fn: default
-        reward_model_name: null
-        reward_coef: 1.0
-      - reward_fn_key: data_source
-        reward_loop_type: gen
-        reward_fn: default
-        reward_model_name: Qwen3-8B
-        reward_coef: 1.0
+      # - reward_fn_key: data_source
+      #   reward_loop_type: gen
+      #   reward_fn: default
+      #   reward_model_name: Qwen3-8B
+      #   reward_coef: 1.0
+  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/dapo-math-17k.parquet
+  #   data_source_name: dapo/dapo-math-17k
+  #   prompt_key: prompt
+  #   max_samples: -1
+  #   reward_model_dicts:
+  #     - reward_fn_key: data_source
+  #       reward_loop_type: dapo
+  #       reward_fn: default
+  #       reward_model_name: null
+  #       reward_coef: 1.0
+  #     - reward_fn_key: data_source
+  #       reward_loop_type: gen
+  #       reward_fn: default
+  #       reward_model_name: Qwen3-8B
+  #       reward_coef: 1.0
   # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/full-hh-rlhf/data/train.parquet
   #   data_source_name: full-hh-rlhf
   #   prompt_key: prompt
@@ -60,7 +60,7 @@ train_datas:
 
 # Sampling ratios for mixing multiple training datasets (must sum to ~1.0,
 # and must have the same length as train_datas).
-train_datasets_ratios: [0.5, 0.5]
+train_datasets_ratios: [1.0]
 
 # Validation datasets. Each entry has the same structure as train_datas entries,
 # but reward_model_dicts are used only for evaluation reward computation.
@@ -74,12 +74,12 @@ val_datas:
         reward_fn: default
         reward_model_name: null
         reward_coef: 1.0
-  - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/aime-2024.parquet
-    prompt_key: prompt
-    max_samples: -1
-    reward_model_dicts:
-      - reward_fn_key: data_source
-        reward_loop_type: dapo
-        reward_fn: default
-        reward_model_name: null
-        reward_coef: 1.0
+  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/aime-2024.parquet
+  #   prompt_key: prompt
+  #   max_samples: -1
+  #   reward_model_dicts:
+  #     - reward_fn_key: data_source
+  #       reward_loop_type: dapo
+  #       reward_fn: default
+  #       reward_model_name: null
+  #       reward_coef: 1.0

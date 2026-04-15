@@ -47,7 +47,7 @@ class MCPTool(Tool):
         """Call the underlying remote MCP tool.
 
         Returns:
-            ToolOutput: The tool output containing 'content' and optional metadata.
+            ToolOutput: The tool output containing 'text' and optional metadata.
         """
         try:
             if args:
@@ -58,7 +58,7 @@ class MCPTool(Tool):
             else:
                 text, metadata = await coro
             output = {
-                "content": text,
+                "text": text,
                 "score": 0.0,
                 "metadata": metadata,
             }
@@ -72,7 +72,7 @@ class MCPTool(Tool):
             )
             psrl_logger.warning(msg)
             output = {
-                "content": msg,
+                "text": msg,
                 "score": 0.0,
                 "metadata": {
                     "api_request_error": msg,

@@ -24,7 +24,7 @@ from verl.utils.device import get_resource_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.utils.profiler import build_vllm_profiler_args
-from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.config import HFModelConfig
 from verl.workers.rollout.replica import RolloutMode
 from verl.workers.rollout.utils import qwen2_5_vl_dedup_image_tokens
 from verl.workers.rollout.vllm_rollout.utils import (
@@ -61,6 +61,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import shared_pull_model_context_async
+from psrl.workers.config import RolloutConfig
 from psrl.workers.gen_dplb.stats_collector import DPLBStatCollector
 from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
 from psrl.workers.gen_dplb.zmq_queue import ZMQPushQueue
@@ -264,7 +265,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "compilation_config": compilation_config,
             # AGENT(VERL): thread runner/task through for pooling model support in PSRL
             "runner": self.config.get("runner", "generate"),
-            "task": self.config.get("task", "generate"),
             **engine_kwargs,
         }
 
@@ -499,6 +499,18 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 # The default 300 s threshold is too strict for long-running generation.
                 ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
                 ("grpc.keepalive_permit_without_calls", True),
+                # Raise max_ping_strikes from the default of 2 to 0 (unlimited).
+                # During connection establishment (especially when multiple SMG
+                # channels connect simultaneously), HTTP/2 SETTINGS + PING
+                # handshakes can temporarily exceed the min_recv_ping_interval.
+                # The default of 2 strikes causes premature GOAWAY
+                # ("Too many pings") that kills the entire HTTP/2 transport,
+                # including unrelated Generate RPCs sharing the same channel.
+                # Setting to 0 disables the strike counter so the server relies
+                # solely on min_recv_ping_interval for rate-limiting — pings
+                # arriving too fast are silently ignored instead of triggering
+                # a connection-killing GOAWAY.
+                ("grpc.http2.max_ping_strikes", 0),
             ],
         )
         vllm_engine_pb2_grpc.add_VllmEngineServicer_to_server(servicer, server)
@@ -720,6 +732,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
         request_id: str,
+        image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
         priority: int = 0,
         data_parallel_rank: int = 0,
         version_tag: int | None = None,
@@ -732,6 +746,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             return await self._encode_internal(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
+                image_data=image_data,
+                video_data=video_data,
                 data_parallel_rank=data_parallel_rank,
                 version_tag=version_tag,
                 is_validate=is_validate,
@@ -794,7 +810,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             max_tokens = sampling_params.pop("max_new_tokens")
         else:
             # Default to a calculation that considers configured lengths
-            max_tokens = self.config.response_length + self.config.prompt_length - len(prompt_ids)
+            max_tokens = min(
+                self.config.response_length, self.config.response_length + self.config.prompt_length - len(prompt_ids)
+            )
 
         # Clamp max_tokens to the valid range [0, max_possible_tokens]
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
@@ -805,15 +823,16 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
         multi_modal_data = {}
-        # TODO(linsh): support multi-modal
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        if video_data is not None:
+            multi_modal_data["video"] = video_data
 
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
         # Add lora request
         lora_request = None
-        if self.model_config.lora_rank > 0 or (
-            self.model_config.lora.get("rank", 0) > 0 and not self.model_config.lora.get("merge", False)
-        ):
+        if self.lora_as_adapter:
             # Make sure we also check that the lora is already loaded in the engine
             lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
             if lora_loaded:
@@ -901,6 +920,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self,
         prompt_ids: list[int],
         request_id: str,
+        image_data: list[Any] | None = None,
+        video_data: list[Any] | None = None,
         data_parallel_rank: int = 0,
         version_tag: int | None = None,
         is_validate: bool = False,
@@ -945,7 +966,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             if not update_status_success:
                 return None
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        multi_modal_data = {}
+        if image_data is not None:
+            multi_modal_data["image"] = image_data
+        if video_data is not None:
+            multi_modal_data["video"] = video_data
+
+        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
         if data_parallel_rank not in self.active_task_num:
             self.active_task_num[data_parallel_rank] = 0

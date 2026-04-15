@@ -84,7 +84,7 @@ class PSRL_AgentLoopManager:
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
 
-        self._request_counter = -1  # For version tag setting
+        self._request_counter = 0
 
         self._dispatch_idx = 0
         self._val_buffer_id = 0
@@ -306,10 +306,20 @@ class PSRL_AgentLoopManager:
             level=logging.DEBUG,
         )
 
+        batch_size = len(inputs)
+
+        # ── BEGIN shared block with RewardLoopManager._pre_process ───────────────
+        # Keep this block in sync with RewardLoopManager._pre_process in
+        # psrl/workers/reward/reward_manager.py.  Fields produced *below* this block
+        # (response_mask, position_ids, rollout_log_probs, routed_experts, rm_scores)
+        # are training-only and intentionally absent from _pre_process.
+
         # prompts
         self.tokenizer.padding_side = "left"
         if "raw_prompt_ids" not in inputs.non_tensor_batch:
-            batch_size = len(inputs)
+            assert inputs.batch is not None, (
+                "inputs.batch must not be None when raw_prompt_ids is absent from non_tensor_batch"
+            )
             raw_prompt_ids = np.array(
                 [
                     _pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i])
@@ -334,7 +344,7 @@ class PSRL_AgentLoopManager:
             prompt_output["attention_mask"],
         )
 
-        # responses
+        # responses (must be computed before attention_mask/input_ids which depend on them)
         raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
         assert raw_response_ids is not None, "raw_response_ids must be provided in the input batch"
         self.tokenizer.padding_side = "right"
@@ -351,7 +361,18 @@ class PSRL_AgentLoopManager:
             outputs["attention_mask"],
         )
 
-        # response_mask
+        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
+        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
+
+        # multi-modal inputs (per-sample)
+        multi_modal_inputs_list = [
+            self._compute_multi_modal_inputs(inputs[i : i + 1], input_ids[i : i + 1])
+            for i in range(batch_size)
+        ]
+
+        # ── END shared block with RewardLoopManager._pre_process ─────────────────
+
+        # response_mask (training-only: loss mask, not needed by reward functions)
         response_masks = inputs.non_tensor_batch.pop("response_mask", None)
         assert response_masks is not None, "response_masks must be provided in the input batch"
         ## psrl_logger.info("Right pad response masks begin")
@@ -374,11 +395,19 @@ class PSRL_AgentLoopManager:
         # AGENT(VERL): `response_logprobs` and `routed_experts` are handled below.
 
         response_mask = response_mask * response_attention_mask
-        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
-        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
 
-        multi_modal_inputs = self._compute_multi_modal_inputs(inputs, input_ids)
-        position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
+        # position_ids (training-only: required by actor/critic forward pass)
+        position_ids = torch.cat(
+            [
+                self._compute_position_ids(
+                    input_ids[i : i + 1],
+                    attention_mask[i : i + 1],
+                    multi_modal_inputs_list[i],
+                )
+                for i in range(batch_size)
+            ],
+            dim=0,
+        )
 
         batch = TensorDict(
             {
@@ -445,12 +474,11 @@ class PSRL_AgentLoopManager:
         inputs.non_tensor_batch.pop("raw_prompt_ids", None)
         inputs.non_tensor_batch.pop("raw_response_ids", None)
         non_tensor_batch = inputs.non_tensor_batch
-        if multi_modal_inputs is not None:
-            non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
+        if any(mmi is not None for mmi in multi_modal_inputs_list):
+            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         meta_info = inputs.meta_info
         is_validate = meta_info.get("validate", False)
-        # TODO(linsh): check reward computation
         # Reward processing. Only for training data.
         if not is_validate and not self.config.reward.launch_reward_fn_async:
             ## psrl_logger.info("Reward processing begin")
@@ -496,7 +524,7 @@ class PSRL_AgentLoopManager:
 
             if not self._data_keys_initialized:
                 self._data_keys_initialized = True
-                self._batch_keys = list(data.batch.keys())
+                self._batch_keys = list(data.batch.keys()) if data.batch is not None else None
                 self._non_tensor_batch_keys = list(data.non_tensor_batch.keys())
                 self._meta_info_keys = list(data.meta_info.keys())
                 psrl_logger.info(
@@ -551,7 +579,7 @@ class PSRL_AgentLoopManager:
 
             if not self._data_keys_initialized:
                 self._data_keys_initialized = True
-                self._batch_keys = list(data.batch.keys())
+                self._batch_keys = list(data.batch.keys()) if data.batch is not None else None
                 self._non_tensor_batch_keys = list(data.non_tensor_batch.keys())
                 self._meta_info_keys = list(data.meta_info.keys())
                 psrl_logger.info(

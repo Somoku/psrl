@@ -203,7 +203,6 @@ class TaskRunner:
         from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
 
         # AGENT(VERL): skip legacy worker impl
-        # TODO(linsh): check ref_in_actor option
         actor_rollout_cls = ActorRolloutRefWorker
         ray_worker_group_cls = RayWorkerGroup
 
@@ -367,13 +366,6 @@ class TaskRunner:
             else:
                 self.mapping[PSRL_Role.TeacherModel] = "train_pool"
 
-    def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker if KL loss or KL reward is used."""
-        # TODO(linsh): check ref policy being fused into actor worker in new model engine
-        if need_reference_policy(config):
-            self.role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ref_policy_cls)
-            self.mapping[PSRL_Role.RefPolicy] = ["train_pool"]
-
     def add_dummy_worker(self, config):
         from psrl.trainer.ppo.utils import PSRL_DummyWorker
 
@@ -407,9 +399,6 @@ class TaskRunner:
         self.add_reward_model_worker(config)
 
         self.add_teacher_model_resource_pool(config)
-
-        # Add a reference policy worker if KL loss or KL reward is used.
-        self.add_ref_policy_worker(config, actor_rollout_cls)
 
         # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
         self.add_dummy_worker(config)

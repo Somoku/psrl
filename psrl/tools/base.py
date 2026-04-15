@@ -4,17 +4,50 @@ import asyncio
 import importlib.util
 import sys
 import threading
+from collections import defaultdict
 
 # Modified from rllm/rllm/tools/tool_base.py
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from omegaconf import OmegaConf
+from pydantic import BaseModel, model_validator
 
 from psrl.tools.utils import function_to_dict
 
+
+class ToolResponse(BaseModel):
+    """Structured response from a tool execution.
+
+    Mirrors verl's ``ToolResponse``: text/image/video are cleanly separated
+    so that callers (e.g. ToolEnvironment) can build multimodal messages
+    without re-interpreting raw dicts.  image and video must always be lists
+    when non-None — a ``@model_validator`` enforces this contract.
+    """
+
+    text: str | None = None
+    image: list[Any] | None = None
+    video: list[Any] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_list_fields(cls, values):
+        for field in ("image", "video"):
+            val = values.get(field)
+            if val is not None and not isinstance(val, list):
+                raise ValueError(
+                    f"ToolResponse.{field} must be a list, got {type(val)}. "
+                    f"Wrap single items: [{field}=obj] → [{field}=[obj]]."
+                )
+        return values
+
+    def is_empty(self) -> bool:
+        return not self.text and not self.image and not self.video
+
+    def is_text_only(self) -> bool:
+        return bool(self.text) and not self.image and not self.video
 
 @dataclass
 class ToolCall:
@@ -33,7 +66,7 @@ class ToolCall:
 @dataclass
 class ToolOutput:
     name: str
-    output: str | list | dict | None = None
+    output: dict = field(default_factory=lambda: defaultdict())
     error: str | None = None
     metadata: dict | None = None
 

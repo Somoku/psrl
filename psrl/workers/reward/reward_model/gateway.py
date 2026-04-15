@@ -67,8 +67,7 @@ class RewardModelGateway:
             policy_max_prompt_length=32768,
             policy_request_budget=1024,
             # no PSRL staleness routing
-            # TODO(linsh): check if require routing loop
-            enable_routing_loop=False,
+            enable_routing_loop=True,
             enable_multi_priority_queue=False,
             psrl_enable_group_sampling_on_multi_instances=False,
             psrl_check_interval_ms=10,

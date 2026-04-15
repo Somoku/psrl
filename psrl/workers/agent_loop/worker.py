@@ -14,13 +14,13 @@ from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
+from verl.workers.config.model import HFModelConfig
 
 from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
-from psrl.workers.config.model import HFModelConfig
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -324,6 +324,23 @@ class PSRL_AgentLoopWorker:
                         # the result queue, so we process the data inside the reward manager
                         # output = self._post_process(output)
                         await self.agent_loop_manager.put_result.remote(output)
+            elif terminate_reason != TerminateReason.ABORTED:
+                # Generation failed (e.g. HTTP error, timeout) without PSManager being notified.
+                # The SMG already reserved a staleness-inventory entry for this request.
+                # Abort it now so the RESERVED entry is freed and the buffer can make progress.
+                request_ids = requests.non_tensor_batch["uid"]
+                psrl_logger.warning(
+                    f"Generation failed for requests {request_ids.tolist()} "
+                    f"(terminate_reason={terminate_reason.value}), aborting in PSManager."
+                )
+                try:
+                    await self.ps_manager_handle.abort_requests.remote(
+                        request_ids.tolist(),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    psrl_logger.warning(
+                        f"Failed to abort requests {request_ids.tolist()} in PSManager: {e}"
+                    )
 
     # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:

@@ -30,6 +30,7 @@ from verl.workers.config.rollout import (
 )
 from verl.workers.config.rollout import (
     RolloutConfig as _VeRLRolloutConfig,
+    AgentLoopConfig as _VeRLAgentLoopConfig,
 )
 
 
@@ -41,23 +42,6 @@ class PoolingConfig(BaseConfig):
     normalize: bool = False
     # Whether to apply an activation function (e.g., sigmoid) to the output.
     use_activation: bool = False
-
-
-@dataclass
-class RolloutConfig(_VeRLRolloutConfig):
-    """PSRL extension of veRL RolloutConfig.
-
-    Adds pooling-model support fields so that gen_dplb reward/embedding models
-    can be configured to run vLLM in pooling mode instead of generative mode.
-    """
-
-    # vLLM runner type: 'generate' for autoregressive LLMs, 'pooling' for
-    # embedding / reward / classification models.
-    runner: str = "generate"
-    # vLLM task type forwarded to the engine (e.g., 'generate', 'classify', 'embed').
-    task: str = "generate"
-    # Pooling configuration, effective only when runner == 'pooling'.
-    reward_kwargs: PoolingConfig = field(default_factory=PoolingConfig)
 
 
 # PSRL-unique classes not present in veRL
@@ -73,13 +57,10 @@ class AgentDataConfig(BaseConfig):
 
 
 @dataclass
-class AgentLoopConfig(BaseConfig):
+class AgentLoopConfig(_VeRLAgentLoopConfig):
     """PSRL-specific AgentLoopConfig with environment and data sub-configs."""
 
-    num_workers: int = 8
-    agent_loop_config_path: str | None = None
     route_strategy: str = "round_robin"
-    custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
     trajectory_timeout: float | None = None
     env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     data: AgentDataConfig = field(default_factory=AgentDataConfig)
@@ -88,6 +69,33 @@ class AgentLoopConfig(BaseConfig):
     gamma: float = 0.0
     reward_bonus_coeff: float = 0.0
     traj_reward_mode: str = "traj"
+
+
+@dataclass
+class RolloutConfig(_VeRLRolloutConfig):
+    """PSRL extension of veRL RolloutConfig.
+
+    Adds:
+    - pooling-model support (runner, task, reward_kwargs) for gen_dplb reward/embedding models
+    - enable_weights_cpu_backup for TMS-style level-1 CPU sleep
+    - PSRL-specific agent config (AgentLoopConfig with env/data sub-configs)
+    """
+
+    # Whether disable attention in vLLM.
+    disable_attn: bool = False
+    # vLLM runner type: 'generate' for autoregressive LLMs, 'pooling' for
+    # embedding / reward / classification models.
+    runner: str = "generate"
+    # vLLM task type forwarded to the engine (e.g., 'generate', 'classify', 'embed').
+    task: str = "generate"
+    # Pooling configuration, effective only when runner == 'pooling'.
+    reward_kwargs: PoolingConfig = field(default_factory=PoolingConfig)
+
+    # (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
+    enable_weights_cpu_backup: bool = False
+
+    # Override veRL's AgentLoopConfig with PSRL's richer variant (env + data sub-configs).
+    agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
 
 __all__ = [

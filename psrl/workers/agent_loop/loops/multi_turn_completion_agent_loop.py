@@ -89,27 +89,51 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         base = self.gateway_addr.rstrip("/")
         return await get(f"{base}/sessions/{session_id}")
 
-    async def _chat_completion(self, session_id: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def _get_chat_sampling_params(self, is_validate: bool = False) -> dict:
+        """Build sampling params for the TITO chat-completion path.
+
+        Mirrors ``AgentLoopBase._get_sampling_params`` but without input-length
+        awareness (the session server manages accumulated context).  Per-turn
+        generation is bounded by ``rollout_config.response_length``.
+        """
+        top_k = int(self.rollout_config.top_k)
+        if top_k < 0:
+            top_k = 0
+
+        params = dict(
+            temperature=float(self.rollout_config.temperature),
+            top_p=float(self.rollout_config.top_p),
+            top_k=top_k,
+            repetition_penalty=float(self.rollout_config.get("repetition_penalty", 1.0)),
+            max_tokens=int(self.rollout_config.response_length),
+        )
+
+        if is_validate:
+            val_config = self.config.train_actor_rollout_ref.rollout.val_kwargs
+            val_top_k = int(val_config.top_k)
+            if val_top_k < 0:
+                val_top_k = 0
+            params["top_k"] = val_top_k
+            params["top_p"] = float(val_config.top_p)
+            params["temperature"] = float(val_config.temperature)
+
+        return params
+
+    async def _chat_completion(
+        self,
+        session_id: str,
+        messages: list[dict],
+        sampling_params: dict,
+        tools: list[dict] | None = None,
+    ) -> dict:
         """Send a chat-completion request scoped to *session_id*."""
         base = self.gateway_addr.rstrip("/")
         url = f"{base}/sessions/{session_id}/v1/chat/completions"
 
-        payload: dict = {
-            "model": self.model_config.path,
-            "messages": messages,
-        }
+        payload: dict = {"model": self.model_config.path, "messages": messages}
         if tools:
             payload["tools"] = tools
-
-        # Sampling parameters
-        payload["temperature"] = float(self.rollout_config.temperature)
-        payload["top_p"] = float(self.rollout_config.top_p)
-
-        top_k = int(self.rollout_config.top_k)
-        if top_k < 0:
-            top_k = 0
-        if top_k > 0:
-            payload["top_k"] = top_k
+        payload.update(sampling_params)
 
         return await post(url, payload=payload)
 
@@ -139,15 +163,20 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             self.config,
             self.reward_manager,
             self.max_turns,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            dataset_cls=self.dataset_cls,
         )
         self.agent_data = AgentData.get_agent_data(
             data_class,
             self.config,
             self.reward_manager,
-            self.tokenizer,
             self.env,
         )
         self.agent_data.reset()
+
+        is_validate = request.meta_info.get("validate", False)
+        sampling_params = self._get_chat_sampling_params(is_validate)
 
         session_id: str | None = None
         try:
@@ -162,9 +191,6 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
 
             self.agent_data.init_trajectory(request)
 
-            # Extract per-sample tools_kwargs stored by init_trajectory.
-            tools_kwargs: dict = self.agent_data.trajectory.extra_fields.get("tools_kwargs", {})
-
             overlong_terminate = await self.agent_data.update_from_env(observation, 0, False, info)
             if overlong_terminate:
                 return (
@@ -178,7 +204,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
                 messages, tools = self.agent_data.prepare_chat_completion_request()
 
                 # 2. Call chat completion API
-                response = await self._chat_completion(session_id, messages, tools)
+                response = await self._chat_completion(session_id, messages, sampling_params, tools)
 
                 # 3. Parse response and extract action
                 action, overlong_terminate = await self.agent_data.update_from_model_chat_completion(response)
@@ -192,7 +218,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
                 # 4. Step the environment
                 try:
                     env_step_output = await asyncio.wait_for(
-                        self.env.step(action, tools_kwargs=tools_kwargs),
+                        self.env.step(action),
                         timeout=self.env_step_timeout,
                     )
                     observation = env_step_output["observation"]
@@ -218,10 +244,45 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
 
             # --- Retrieve session data and build training arrays ---
             session_data = await self._get_session_data(session_id)
-            accumulated_token_ids = session_data.get("accumulated_token_ids", [])
-            records = session_data.get("records", [])
+            max_trim_tokens = session_data.get("max_trim_tokens", 0)
 
-            training_arrays = build_training_arrays(accumulated_token_ids, records)
+            if "trajectories" in session_data:
+                # Multi-trajectory (retry/concurrent branches) — not expected in normal PSRL flow.
+                # Log a warning and use the first trajectory.
+                psrl_logger.warning(
+                    "TITO session %s has %d trajectories (retry/concurrent branches detected), "
+                    "using first trajectory for training",
+                    session_id,
+                    len(session_data["trajectories"]),
+                )
+                traj = session_data["trajectories"][0]
+                accumulated_token_ids = traj.get("accumulated_token_ids", [])
+                records = traj.get("records", [])
+            else:
+                accumulated_token_ids = session_data.get("accumulated_token_ids", [])
+                records = session_data.get("records", [])
+
+            # Check mismatch reports: any non-assistant_text mismatch is a TITO algorithm
+            # error (e.g. special token count/type mismatch, non-assistant content drift).
+            # These must abort training data construction to avoid silently corrupted samples.
+            # ASSISTANT_TEXT mismatches are expected cross-turn token boundary differences
+            # and are not fatal.
+            for i, record in enumerate(records):
+                mismatch_report = record.get("mismatch_report", [])
+                for entry in mismatch_report:
+                    mtype = entry.get("mismatch_type", "")
+                    if mtype != "assistant_text":
+                        msg = (
+                            f"TITO token ID mismatch at turn {i}: "
+                            f"type={mtype}, pos={entry.get('position')}, "
+                            f"detail={entry.get('detail')}"
+                        )
+                        psrl_logger.error(msg)
+                        raise RuntimeError(msg)
+
+            training_arrays = build_training_arrays(
+                accumulated_token_ids, records, max_trim_tokens=max_trim_tokens
+            )
 
             # Attach training arrays to trajectory for finalize_output
             trajectory = self.agent_data.trajectory

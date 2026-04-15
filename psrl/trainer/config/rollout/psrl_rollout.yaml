@@ -1,0 +1,107 @@
+# PSRL rollout config — incremental extension of veRL's rollout.yaml.
+#
+# Hydra inheritance pattern (mirrors how veRL's megatron_actor.yaml extends actor.yaml):
+#   verl_rollout.yaml  →  symlink to verl/trainer/config/rollout/rollout.yaml
+#   rollout.yaml       →  this file; inherits verl_rollout, then applies PSRL overrides
+#
+# Only PSRL-specific fields live here. All veRL base fields are inherited from verl_rollout.
+
+defaults:
+
+  # Load veRL's canonical rollout config first (via the sibling symlink verl_rollout.yaml).
+  - rollout
+
+  # Apply PSRL overrides/extensions last.
+  - _self_
+
+# Target class for this configuration (PSRL's extended RolloutConfig).
+_target_: psrl.workers.config.RolloutConfig
+
+# PSRL only support vllm backend.
+name: vllm
+
+# Whether disable attention for profiling.
+disable_attn: False
+
+# vLLM runner type: 'generate' for autoregressive LLMs, 'pooling' for
+# embedding / reward / classification models.
+runner: generate
+
+# vLLM task type forwarded to the engine (e.g., 'generate', 'classify', 'embed').
+task: generate
+
+# Pooling params for vLLM-based pooling reward models.
+reward_kwargs:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs.
+  _target_: psrl.workers.config.PoolingConfig
+
+  # Whether to L2-normalise the output embedding vector.
+  normalize: False
+
+  # Whether to apply an activation function (e.g., sigmoid) to the logit output.
+  use_activation: False
+
+# (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
+enable_weights_cpu_backup: False
+
+# [PSRL] Agent loop configuration (overrides veRL's AgentLoopConfig with PSRL variant).
+agent:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs.
+  _target_: psrl.workers.config.AgentLoopConfig
+
+  # Number of agent loop workers.
+  num_workers: 1
+
+  # Custom agent loop config path (list of AgentLoop configs to instantiate).
+  agent_loop_config_path: null
+
+  # Routing strategy for distributing requests across agent loop workers.
+  route_strategy: round_robin
+
+  # Custom async server configs.
+  custom_async_server:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs.
+    _target_: verl.workers.config.CustomAsyncServerConfig
+
+    # Path to the custom async server implementation.
+    path: null
+
+    # Class name of the custom async server class (e.g. AsyncvLLMServer).
+    name: null
+
+  # Max time (in seconds) allowed for each agent trajectory before timing out.
+  # If set to null, there is no timeout enforced.
+  trajectory_timeout: null
+
+  # Environment configuration for the agent loop.
+  env:
+
+    # Environment class name.
+    name: null
+
+    # Timeout (in seconds) for each step in the environment.
+    step_timeout: null
+
+  # Agent data configuration for the agent loop.
+  data:
+
+    # Agent data class name.
+    name: null
+
+  # Maximum number of retries for each trajectory in case of failures.
+  retry_limit: 1
+
+  # Whether to raise error in agent loop.
+  raise_on_error: True
+
+  # Discount factor for Monte Carlo return calculation in reward.
+  gamma: 0.0
+
+  # Coefficient for reward bonus shaping.
+  reward_bonus_coeff: 0.0
+
+  # Trajectory reward calculation mode: 'step' or 'traj'.
+  traj_reward_mode: traj

@@ -616,9 +616,14 @@ class StalenessInventory:
             if not isinstance(tracked_entry_info.request_idx, list):
                 tracked_entry_info.request_idx = [tracked_entry_info.request_idx]
             entry_request_idx = entry_info.request_idx
-            assert entry_request_idx not in tracked_entry_info.request_idx, (
-                f"Entry info {entry_info} already reserved in (buffer {buffer_id}, entry {entry_id})"
-            )
+            if entry_request_idx in tracked_entry_info.request_idx:
+                # Idempotent: this request_idx is already reserved (e.g. due to RolloutGateway retry).
+                # Return the existing reservation instead of asserting.
+                psrl_logger.warning(
+                    f"Entry info {entry_info} is already reserved in (buffer {buffer_id}, entry {entry_id}). "
+                    f"Returning existing reservation (idempotent)."
+                )
+                return buffer_id, entry_id
             tracked_entry_info.request_idx.append(entry_request_idx)
 
             # Update model version

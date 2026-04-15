@@ -15,8 +15,8 @@ HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-3B-Instruct
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
-TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
-TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
+TRAIN_FILE=/jizhicfs/lhy/data/dapo/dapo-math-17k.parquet
+TEST_FILE=/jizhicfs/lhy/data/dapo/aime-2024.parquet
 
 GEN_DP=1
 GEN_TP=1 # TP in the generation side
@@ -26,7 +26,7 @@ VAL_DP=1
 VAL_TP=1 # TP in the training side for validation
 VAL_PP=1
 
-TRAIN_TP=1 # TP in the training side 
+TRAIN_TP=2 # TP in the training side 
 TRAIN_PP=1 # PP in the training side 
 TRAIN_CP=1 # CP in the training side
 TRAIN_EP=1 # EP in the training side
@@ -53,18 +53,18 @@ use_kl_loss=False
 kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-max_prompt_length=$((1024 * 1))
-max_response_length=$((1024 * 4))
-packing_length=$((1024 * 10))
+max_prompt_length=$((1024 * 2))
+max_response_length=$((1024 * 10))
+packing_length=$((1024 * 12))
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 2))
+overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=64
 redundant_train_prompt_bsz=64
 n_resp_per_prompt=8
 redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=16
+train_prompt_mini_bsz=64
 
 # Algorithm
 temperature=1
@@ -114,7 +114,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.status_collection.stats_recorder.enable=True \
     psrl.status_collection.stats_recorder.interval_in_s=3.0 \
     \
-    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     gen_actor_rollout_ref.rollout.data_parallel_size=${GEN_DP} \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -171,12 +170,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     \
-    reward.reward_manager.name=dapo \
-    +reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    +reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward.reward_kwargs.max_resp_len=${max_response_length} \
+    reward.reward_models.0.reward_manager.name=dapo \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.log=False \
+    reward.reward_models.0.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

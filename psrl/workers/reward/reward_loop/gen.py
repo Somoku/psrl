@@ -26,7 +26,7 @@ from psrl.utils.logger import DualOutputHandler
 from psrl.workers.reward.gen_reward_function import DefaultGenRewardFunction, GenRewardFunctionBase
 from psrl.workers.reward.reward_loop import register
 from psrl.workers.reward.reward_loop.base import RewardManagerBase
-from psrl.workers.reward.reward_model.manager import PSRL_RewardModelManager
+from psrl.workers.reward.reward_model.manager import RewardModelManager
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -45,7 +45,7 @@ class GenRewardManager(RewardManagerBase):
         self,
         config,
         tokenizer,
-        reward_model_manager: PSRL_RewardModelManager | None = None,
+        reward_model_manager: RewardModelManager | None = None,
         reward_function: GenRewardFunctionBase | None = None,
         **reward_kwargs,
     ):

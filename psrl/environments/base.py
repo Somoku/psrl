@@ -3,6 +3,7 @@ from typing import Any, Generic, SupportsFloat, TypedDict, TypeVar
 
 import ray
 from omegaconf import DictConfig
+from transformers import AutoProcessor, AutoTokenizer
 from verl import DataProto
 
 ConversationType = list[dict[str, str]]
@@ -13,9 +14,9 @@ ActType = TypeVar("ActType")
 
 class EnvStepOutput(TypedDict):
     observation: ObsType
-    reward: SupportsFloat
+    reward: list[SupportsFloat] # List of rewards for each tool call
     done: bool
-    info: dict[str, Any] | None = None
+    info: dict[str, Any] | None
 
 
 class Environment(ABC, Generic[ObsType, ActType]):
@@ -37,16 +38,30 @@ class Environment(ABC, Generic[ObsType, ActType]):
     _class_initialized = False
     _registry: dict[str, type["Environment"]] = {}
 
-    def __init__(self, config: DictConfig, reward_manager: ray.actor.ActorHandle):
+    def __init__(
+        self,
+        config: DictConfig,
+        reward_manager: ray.actor.ActorHandle,
+        tokenizer: AutoTokenizer,
+        processor: AutoProcessor | None = None,
+        dataset_cls = None,
+    ):
         """Initialize the environment.
 
         Args:
             config: Configuration object containing training settings
             reward_manager: Ray actor handle for computing rewards
+            tokenizer: Tokenizer for converting between text and tokens
+            processor: Optional multimodal processor (e.g. Qwen2VLProcessor).
+            dataset_cls: Optional dataset class for loading data.
         """
         self.init_class(config=config)
+        self.config = config
         self.reward_manager = reward_manager
         self.task = None
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.dataset_cls = dataset_cls
 
     @classmethod
     def init_class(cls, config: DictConfig, **kwargs):

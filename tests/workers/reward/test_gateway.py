@@ -45,8 +45,8 @@ sys.modules["psrl.utils.common.http_utils"].find_available_port = lambda base_po
 sys.modules["psrl.utils.logger"].DualOutputHandler = MagicMock(return_value=MagicMock())
 
 _rm_pkg = _types.ModuleType("psrl.workers.reward.reward_model")
-_rm_pkg.PSRL_RewardModelManager = MagicMock()
-_rm_pkg.PSRL_RewardModelReplica = MagicMock()
+_rm_pkg.RewardModelManager = MagicMock()
+_rm_pkg.RewardModelReplica = MagicMock()
 sys.modules["psrl.workers.reward.reward_model"] = _rm_pkg
 
 _gateway_path = (

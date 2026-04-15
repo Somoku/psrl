@@ -153,6 +153,9 @@ class VllmConverter(BaseConverter):
                     None,
                 )
                 fused_mappings, model_info = self._build_from_spec(sub_spec) if sub_spec else ({}, {})
+            # Sync self.model_info so that maybe_reshape_qkv_to_3d (which reads
+            # self.model_info) sees the packing_metadata from the spec.
+            self.model_info = model_info
         elif self.parameter_mapping is not None:
             fused_mappings, model_info = self._build_from_parameter_mapping()
         else:

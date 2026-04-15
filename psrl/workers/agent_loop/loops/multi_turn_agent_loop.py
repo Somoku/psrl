@@ -78,12 +78,14 @@ class MultiTurnAgentLoop(AgentLoopBase):
             self.config,
             self.reward_manager,
             self.max_turns,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            dataset_cls=self.dataset_cls,
         )
         self.agent_data = AgentData.get_agent_data(
             data_class,
             self.config,
             self.reward_manager,
-            self.tokenizer,
             self.env,
         )
         self.agent_data.reset()
@@ -125,7 +127,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
 
             try:
                 env_step_output = await asyncio.wait_for(
-                    self.env.step(action, tools_kwargs=tools_kwargs),
+                    self.env.step(action),
                     timeout=self.env_step_timeout,
                 )
                 observation = env_step_output["observation"]

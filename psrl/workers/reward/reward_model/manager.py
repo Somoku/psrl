@@ -7,11 +7,12 @@ from omegaconf import DictConfig
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils import hf_tokenizer, omega_conf_to_dataclass
 from verl.utils.fs import copy_to_local
-from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.config import HFModelConfig
 
+from psrl.workers.config import RolloutConfig
 from psrl.workers.gen_dplb.vllm_async_server import GenInterface
 from psrl.workers.reward.reward_model.coordinator import RewardModelCoordinator
-from psrl.workers.reward.reward_model.replica import PSRL_RewardModelReplica
+from psrl.workers.reward.reward_model.replica import RewardModelReplica
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -23,7 +24,7 @@ class RewardModelManager:
 
     Lifecycle:
     1. Creates a ``RewardModelCoordinator`` and retrieves its ZMQ status endpoint.
-    2. For each replica worker-group, creates a ``PSRL_RewardModelReplica``,
+    2. For each replica worker-group, creates a ``RewardModelReplica``,
        calls ``init_model()`` to launch the vLLM HTTP server, then registers
        the server to the smg gateway and to the coordinator.
     3. Exposes ``get_gateway_url()`` for ``GenRewardManager`` to POST requests.
@@ -57,7 +58,7 @@ class RewardModelManager:
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(reward_model_config.rollout)
 
         # ── Coordinator ──────────────────────────────────────────────────────
-        self.reward_model_coordinator = RewardModelCoordinator.remote(
+        self.reward_model_coordinator = ray.remote(RewardModelCoordinator).remote(
             config,
             reward_model_config,
             rollout_router=self.gateway_url,
@@ -65,7 +66,7 @@ class RewardModelManager:
 
         # ── Replicas ─────────────────────────────────────────────────────────
         self.reward_model_wg_list = reward_model_wg_list
-        self.replicas: list[PSRL_RewardModelReplica] = []
+        self.replicas: list[RewardModelReplica] = []
 
         self._initialize_reward_replicas()
         self._register_reward_servers(self.replicas)
@@ -74,7 +75,7 @@ class RewardModelManager:
         ray.get(self.reward_model_coordinator.set_gateway_url.remote(gateway_url))
 
         psrl_logger.info(
-            "PSRL_RewardModelManager for '%s' initialized with %d replica(s).",
+            "RewardModelManager for '%s' initialized with %d replica(s).",
             reward_model_name,
             len(self.replicas),
         )
@@ -90,7 +91,7 @@ class RewardModelManager:
                 status_endpoint=status_endpoint,
                 ps_manager_handle=None,  # reward model: no PS sync
             )
-            replica = PSRL_RewardModelReplica(
+            replica = RewardModelReplica(
                 replica_rank=i,
                 local_replica_rank=i,
                 psrl_config=self.config.psrl,
@@ -104,7 +105,7 @@ class RewardModelManager:
             self.replicas.append(replica)
         self._run_all(init_tasks)
 
-    def _register_reward_servers(self, replicas: list[PSRL_RewardModelReplica]):
+    def _register_reward_servers(self, replicas: list[RewardModelReplica]):
         # Register to gateway
         reg_futures = [replica.servers[0].register_server_to_gateway.remote(self.gateway_url) for replica in replicas]
         worker_ids: list[str] = ray.get(reg_futures)

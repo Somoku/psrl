@@ -54,7 +54,7 @@ train_prompt_bsz=64
 redundant_train_prompt_bsz=64
 n_resp_per_prompt=8
 redundant_n_resp_per_prompt=8
-train_prompt_mini_bsz=16
+train_prompt_mini_bsz=64
 
 # Algorithm
 temperature=1
@@ -97,7 +97,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     psrl.partial_rollout.enable=True \
     \
-    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     gen_actor_rollout_ref.rollout.data_parallel_size=${GEN_DP} \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -126,6 +125,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    train_actor_rollout_ref.actor.strategy=fsdp2 \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
@@ -143,12 +143,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.grad_clip=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \
-    reward.reward_manager.name=dapo \
-    +reward.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    +reward.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    +reward.reward_kwargs.overlong_buffer_cfg.log=False \
-    +reward.reward_kwargs.max_resp_len=${max_response_length} \
+    reward.reward_models.0.reward_manager.name=dapo \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.log=False \
+    reward.reward_models.0.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -164,7 +164,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \

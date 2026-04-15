@@ -11,7 +11,7 @@ from verl.utils.ray_utils import get_event_loop
 RawRewardFn = Callable[..., Any] | None
 
 
-class RewardLoopManagerBase(ABC):
+class RewardManagerBase(ABC):
     _class_initialized = False
 
     def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, compute_score: RawRewardFn):

@@ -85,9 +85,13 @@ def run_tool(tool_calls):
 # ---------------------------------------------------------------------------
 # Verification logic
 # ---------------------------------------------------------------------------
-def verify_training_arrays(accumulated, records, label):
+def verify_training_arrays(accumulated, records, label, max_trim_tokens: int = 0):
     """Verify build_training_arrays produces correct output."""
-    arrays = build_training_arrays(accumulated, records)
+    try:
+        arrays = build_training_arrays(accumulated, records, max_trim_tokens=max_trim_tokens)
+    except ValueError as e:
+        print(f"  ✗ build_training_arrays raised ValueError: {e}")
+        return False
     p = arrays["prompt_ids"]
     r = arrays["response_ids"]
     m = arrays["response_mask"]
@@ -130,12 +134,36 @@ def verify_training_arrays(accumulated, records, label):
     if model_tok == 0 and records:
         errors.append("no model tokens (all mask=0)")
 
+    # 7. Last-turn output must fully align with accumulated (no trim on last turn).
+    #    build_training_arrays already guards this; here we double-check for diagnostics.
+    if records:
+        last_lps = records[-1].get("output_logprobs") or []
+        last_output_ids = [int(pair[1]) for pair in last_lps]
+        if last_output_ids and accumulated:
+            # Compute the start position of the last turn's output in accumulated
+            # by replaying the cursor logic from build_training_arrays.
+            cursor = 0
+            for rec_i, rec_r in enumerate(records[:-1]):
+                cursor = rec_r["prompt_token_count"] + len(rec_r.get("output_logprobs") or [])
+            last_prompt_len = records[-1]["prompt_token_count"]
+            last_start = max(last_prompt_len, cursor)
+            tail_matches = all(
+                last_start + j < len(accumulated)
+                and accumulated[last_start + j] == tid
+                for j, tid in enumerate(last_output_ids)
+            )
+            if not tail_matches:
+                errors.append(
+                    f"last turn output_ids do not align with accumulated at offset {last_start} "
+                    f"(unexpected trim on last turn)"
+                )
+
     print(f"\n  [{label}] prompt={len(p)} response={len(r)} model_tok={model_tok} env_tok={env_tok} turns={nt}")
     if errors:
         for e in errors:
             print(f"  ✗ {e}")
         return False
-    print("  ✓ All 6 checks passed")
+    print("  ✓ All 7 checks passed")
     return True
 
 
@@ -203,8 +231,16 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
 
         # Retrieve TITO data from SMG
         data = get_session_data(base_url, client, sid)
-        acc = data.get("accumulated_token_ids", [])
-        recs = data.get("records", [])
+        max_trim_tokens = data.get("max_trim_tokens", 0)
+
+        # Support both single-trajectory (flat) and multi-trajectory formats.
+        if "trajectories" in data:
+            traj = data["trajectories"][0] if data["trajectories"] else {}
+            acc = traj.get("accumulated_token_ids", [])
+            recs = traj.get("records", [])
+        else:
+            acc = data.get("accumulated_token_ids", [])
+            recs = data.get("records", [])
 
         if not acc:
             print("  ✗ accumulated_token_ids is empty — TITO did not capture data")
@@ -213,15 +249,22 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
             print("  ✗ records is empty — TurnRecord not stored")
             return False
 
-        print(f"  TITO data: {len(acc)} accumulated tokens, {len(recs)} records")
+        print(f"  TITO data: {len(acc)} accumulated tokens, {len(recs)} records, max_trim_tokens={max_trim_tokens}")
         for i, rec in enumerate(recs):
             n_lps = len(rec.get("output_logprobs") or [])
             print(
                 f"    record[{i}]: prompt={rec['prompt_token_count']} "
                 f"output_lps={n_lps} finish={rec.get('finish_reason', '?')}"
             )
+            for m_entry in rec.get("mismatch_report", []):
+                mtype = m_entry.get("mismatch_type", "?")
+                if mtype != "assistant_text":
+                    print(f"  ✗ Turn {i} TITO mismatch [{mtype}] pos={m_entry.get('position')} {str(m_entry.get('detail', ''))[:80]}")
+                    ok = False
+                else:
+                    print(f"  ~ Turn {i} TITO mismatch [assistant_text] (expected, non-fatal)")
 
-        ok = verify_training_arrays(acc, recs, "single-turn-tito") and ok
+        ok = verify_training_arrays(acc, recs, "single-turn-tito", max_trim_tokens=max_trim_tokens) and ok
         return ok
     finally:
         delete_session(base_url, client, sid)
@@ -266,8 +309,15 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
 
         # Retrieve TITO data
         data = get_session_data(base_url, client, sid)
-        acc = data.get("accumulated_token_ids", [])
-        recs = data.get("records", [])
+        max_trim_tokens = data.get("max_trim_tokens", 0)
+
+        if "trajectories" in data:
+            traj = data["trajectories"][0] if data["trajectories"] else {}
+            acc = traj.get("accumulated_token_ids", [])
+            recs = traj.get("records", [])
+        else:
+            acc = data.get("accumulated_token_ids", [])
+            recs = data.get("records", [])
 
         if not acc:
             print("  ✗ accumulated_token_ids is empty — TITO not working")
@@ -276,15 +326,22 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
             print("  ✗ records is empty — TurnRecords not stored")
             return False
 
-        print(f"\n  TITO data: {len(acc)} accumulated tokens, {len(recs)} records")
+        print(f"\n  TITO data: {len(acc)} accumulated tokens, {len(recs)} records, max_trim_tokens={max_trim_tokens}")
         for i, rec in enumerate(recs):
             n_lps = len(rec.get("output_logprobs") or [])
             print(
                 f"    record[{i}]: prompt={rec['prompt_token_count']} "
                 f"output_lps={n_lps} finish={rec.get('finish_reason', '?')}"
             )
+            for m_entry in rec.get("mismatch_report", []):
+                mtype = m_entry.get("mismatch_type", "?")
+                if mtype != "assistant_text":
+                    print(f"  ✗ Turn {i} TITO mismatch [{mtype}] pos={m_entry.get('position')} {str(m_entry.get('detail', ''))[:80]}")
+                    ok = False
+                else:
+                    print(f"  ~ Turn {i} TITO mismatch [assistant_text] (expected, non-fatal)")
 
-        ok = verify_training_arrays(acc, recs, "multi-turn-tito") and ok
+        ok = verify_training_arrays(acc, recs, "multi-turn-tito", max_trim_tokens=max_trim_tokens) and ok
         return ok
     finally:
         delete_session(base_url, client, sid)

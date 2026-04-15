@@ -8,7 +8,7 @@ from verl import DataProto
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop import register
-from psrl.workers.reward.reward_loop.base import RewardLoopManagerBase
+from psrl.workers.reward.reward_loop.base import RewardManagerBase
 
 
 async def single_compute_score(
@@ -37,7 +37,7 @@ async def single_compute_score(
 
 
 @register("prime")
-class PrimeRewardLoopManager(RewardLoopManagerBase):
+class PrimeRewardManager(RewardManagerBase):
     """
     The Reward Manager used in https://github.com/PRIME-RL/PRIME
     """

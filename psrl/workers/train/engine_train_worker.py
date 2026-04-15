@@ -8,9 +8,9 @@ from typing import TYPE_CHECKING
 
 import ray
 import torch
-from mbridge.core.util import unwrap_model
 from omegaconf import DictConfig, OmegaConf, open_dict
 from transformers import AutoConfig
+from tensordict import TensorDict
 from verl import DataProto
 from verl.single_controller.base.decorator import (
     Dispatch,
@@ -31,6 +31,7 @@ from psrl.utils.converter import create_parameter_mapping
 if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
 
+from mbridge.core.util import unwrap_model
 try:
     from psrl.utils.converter.megatron_converter import convert_megatron_inplace  # noqa: E402
 except ImportError:
@@ -285,7 +286,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if not ps_buffers:
                 return
             device = get_device_id()
-            model = self.actor_module_fsdp
+            model = self.actor.engine.module
             # Apply each buffer by navigating the module tree with its dotted name.
             for full_name, cpu_tensor in ps_buffers.items():
                 *module_path_parts, buf_attr = full_name.split(".")
@@ -319,7 +320,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             reference_inv_freq = next(iter(inv_freq_tensors.values()))
             device = torch.cuda.current_device()
             restored = 0
-            for model_chunk in self.actor_module:
+            for model_chunk in self.actor.engine.module:
                 for module in model_chunk.modules():
                     if isinstance(module, RotaryEmbedding) and hasattr(module, "inv_freq"):
                         # Clear lru_cache: cached cos/sin point to freed/garbage GPU memory.
@@ -467,11 +468,15 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             skip_load_weight = init_mode == "empty"
+            strategy = self.config.actor.strategy
 
             if skip_load_weight:
                 OmegaConf.set_struct(self.config, True)
                 with open_dict(self.config):
-                    self.config.actor.engine.load_weight = False
+                    if strategy in {"fsdp", "fsdp2"}:
+                        self.config.actor.fsdp_config.load_weight = False
+                    elif strategy == "megatron":
+                        self.config.actor.megatron.load_weight = False
 
             try:
                 ActorRolloutRefWorker.init_model(self)
@@ -479,70 +484,14 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 if skip_load_weight:
                     OmegaConf.set_struct(self.config, True)
                     with open_dict(self.config):
-                        self.config.actor.engine.load_weight = True
+                        if strategy in {"fsdp", "fsdp2"}:
+                            self.config.actor.fsdp_config.load_weight = True
+                        elif strategy == "megatron":
+                            self.config.actor.megatron.load_weight = True
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)
-    def compute_log_prob(self, data: DataProto):
-        """Recompute log-probabilities on the training-side actor model.
-
-        When `is_lora=True` in data.meta_info the LoRA adapter is disabled so the
-        output represents the base (reference) policy log-prob.
-        """
-        with log_dual_events("Recompute log_prob", psrl_logger, event_type=EventType.OTHER):
-            assert self._is_actor
-
-            is_lora = data.meta_info.pop("is_lora", False)
-            data = data.to(get_device_id())
-            # Batch-size parameters are not injected here: the engine uses
-            # engine_config.infer_micro_batch_size_per_gpu / infer_max_token_len_per_gpu,
-            # which were configured from config.rollout at init_model time.
-
-            if is_lora:
-                # TrainingWorker.infer_batch reads this via tu.pop(data, "no_lora_adapter")
-                from tensordict import NonTensorData
-
-                data.batch["no_lora_adapter"] = NonTensorData(True)
-
-            # Router replay (Megatron/MoE): inject enable_routing_replay flag into data.
-            # The base class uses a decorator (@_with_routing_replay_flag) for this, but
-            # since we override compute_log_prob we must replicate the injection manually.
-            from verl.utils import tensordict_utils as tu
-
-            if not is_lora:
-                tu.assign_non_tensor_data(data.batch, "calculate_entropy", True)
-
-            if self.enable_routing_replay:
-                tu.assign_non_tensor_data(data.batch, "enable_routing_replay", True)
-
-            output_td = self.actor.infer_batch(data)
-            # output_td is None on non-MP-src ranks (pipeline-parallel non-last stages)
-            if output_td is None:
-                return None
-
-            # The engine forward returns log_probs (and optionally entropy) inside the
-            # model_output sub-dict, which _postprocess_output merges into the top-level
-            # TensorDict for infer_batch (unlike train_batch, which pops model_output).
-            log_probs = output_td.get("log_probs", None)
-            entropy = output_td.get("entropy", None)
-
-            tensors = {}
-            if not is_lora:
-                tensors["old_log_probs"] = log_probs
-                if entropy is not None:
-                    tensors["entropys"] = entropy
-            else:
-                tensors["ref_log_prob"] = log_probs
-
-            output = DataProto.from_dict(
-                tensors=tensors,
-                meta_info={"temperature": self.config.rollout.temperature},
-            )
-            return output.to("cpu")
-
-    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
-    @gpu_memory_logger_decorator(log_only_rank_0=False)
-    def update_actor(self, data: DataProto):
+    def update_actor(self, data: TensorDict) -> TensorDict:
         """Train the actor for one step, then push updated weights to the PS."""
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)

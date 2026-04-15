@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
+from verl.workers.config.model import HFModelConfig
 
-from .model import HFModelConfig
 from .rollout import PoolingConfig, RolloutConfig, SamplingConfig, ServerConfig
 
 __all__ = [

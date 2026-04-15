@@ -17,15 +17,16 @@ from psrl.utils.nixl.nixl_spec import NIXLSharding
 class BaseConverter(ABC):
     """Base class for state dict and sharding converter."""
 
-    def __init__(self, parameter_mapping: ParameterMapping):
+    def __init__(self, parameter_mapping: ParameterMapping | None):
         """
         Initialize the converter with model info from the given parameter mapping.
 
         Args:
-            parameter_mapping (ParameterMapping): Parameter mapping for the model.
-                model_info is extracted here and shared across all converter methods.
+            parameter_mapping (ParameterMapping | None): Parameter mapping for the model.
+                When None (e.g. for models implementing SupportsWeightLayoutSpec),
+                model_info is populated lazily by the subclass during conversion.
         """
-        self.model_info = parameter_mapping.get_model_info()
+        self.model_info = parameter_mapping.get_model_info() if parameter_mapping is not None else {}
 
     def maybe_reshape_qkv_to_3d(
         self,
@@ -34,18 +35,19 @@ class BaseConverter(ABC):
         sharding: NIXLSharding,
     ) -> tuple[Parameter, NIXLSharding]:
         """
-        Conditionally reshape a 2D Q/K/V weight to 3D group-interleaved layout and
-        update the sharding descriptor to match the new tensor shape.
+        Conditionally reshape a Q/K/V weight or bias to the 3D group-interleaved layout
+        and update the sharding descriptor to match the new tensor shape.
 
+        Handles both 2D weight tensors (rows, H) and 1D bias tensors (rows,).
         Returns unchanged (param, sharding) if self.model_info does not contain
-        num_heads, param_name is not a Q/K/V weight, or param is not 2-dimensional.
+        num_heads, param_name is not a Q/K/V weight/bias, or param is already ≥3D.
 
         Local head counts are derived from the sharding descriptor:
           - dim=0 sharding: num_heads_local = num_heads // ws (may be 0 for fine-grained FSDP)
           - dim=1 sharding: all heads present on this rank; use global counts
 
-        Reshape rule: (rows, H) -> (G_eff, rows // G_eff, H)
-        where G_eff = gcd(num_heads_local, num_kv_heads_local).
+        Reshape rule: (rows[, H]) -> (G_eff, rows // G_eff, H)
+        where G_eff = gcd(num_heads_local, num_kv_heads_local), H=1 for 1D bias.
 
         Sharding update — three cases based on ws and G_global = gcd(num_heads, num_kv_heads):
 
@@ -66,14 +68,14 @@ class BaseConverter(ABC):
 
         Args:
             param_name (str): Fully-qualified parameter name.
-            param (Parameter): The 2D parameter tensor.
+            param (Parameter): The 1D or 2D parameter tensor.
             sharding (NIXLSharding): Existing sharding descriptor for this param.
 
         Returns:
             tuple[Parameter, NIXLSharding]: Reshaped param and updated sharding.
         """
         num_heads = self.model_info.get("num_heads")
-        if num_heads is None or not is_qkv_weight(param_name) or param.ndim != 2:
+        if num_heads is None or not is_qkv_weight(param_name) or param.ndim > 2:
             return param, sharding
 
         num_kv_heads = self.model_info["num_kv_heads"]
@@ -82,7 +84,10 @@ class BaseConverter(ABC):
         shard_dim_2d = next(iter(sharding.shard_mesh.keys()))
         ws = next(iter(sharding.shard_mesh.values()))
         rank = sharding.shard_indices[0][0]
-        rows, H = param.shape
+        # 1D bias tensors (q_proj.bias etc.) have no hidden dim; treat H=1 to match
+        # the trailing size-1 dim produced by slice_qkv_proj_megatron's reshape(..., -1).
+        rows = param.shape[0]
+        H = param.shape[1] if param.ndim == 2 else 1
 
         # Derive local head counts from the sharding descriptor.
         if shard_dim_2d == 0:

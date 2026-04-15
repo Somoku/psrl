@@ -1,5 +1,6 @@
-from verl.workers.config import HFModelConfig, RolloutConfig
+from verl.workers.config import HFModelConfig
 
+from psrl.workers.config import RolloutConfig
 from psrl.workers.gen_dplb.vllm_async_server import GenInterface, PSRL_vLLMReplica
 
 

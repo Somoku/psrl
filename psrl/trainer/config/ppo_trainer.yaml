@@ -11,24 +11,24 @@ defaults:
   # PSRL Python code accesses `train_actor_rollout_ref` and `gen_actor_rollout_ref`,
   # which are defined below as alias bridges via OmegaConf interpolation.
 
-  # actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
-  - actor@actor_rollout_ref.actor: ${model_engine}_actor
+  # train_actor_rollout_ref.actor: trainer/config/actor/dp_actor.yaml
+  - actor@train_actor_rollout_ref.actor: ${model_engine}_actor
 
-  # Rollout model config for training.
-  - rollout@actor_rollout_ref.rollout: rollout
+  # Rollout model config for training. (PSRL-extended rollout.yaml under rollout/).
+  - rollout@train_actor_rollout_ref.rollout: psrl_rollout
 
-  # Rollout model config for generation.
-  - rollout@gen_actor_rollout_ref.rollout: rollout
+  # Rollout model config for generation. (same PSRL-extended rollout.yaml).
+  - rollout@gen_actor_rollout_ref.rollout: psrl_rollout
 
   # Model config.
-  - model@actor_rollout_ref.model: hf_model
+  - model@train_actor_rollout_ref.model: hf_model
 
   # data: trainer/config/data/data.yaml
   - data@data: data
 
   # Reference model config.
   # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
-  - ref@actor_rollout_ref.ref: ${model_engine}_ref
+  - ref@train_actor_rollout_ref.ref: ${model_engine}_ref
 
   # Critic model config.
   - critic@critic: ${model_engine}_critic
@@ -50,7 +50,7 @@ defaults:
 # ===== PSRL alias bridges (Python code zero-change) =====
 # train_actor_rollout_ref is a direct alias of actor_rollout_ref.
 # Any Hydra CLI override to actor_rollout_ref automatically propagates.
-train_actor_rollout_ref: ${actor_rollout_ref}
+actor_rollout_ref: ${train_actor_rollout_ref}
 
 # gen_actor_rollout_ref has its own overrides for the generation side.
 gen_actor_rollout_ref:
@@ -61,30 +61,8 @@ gen_actor_rollout_ref:
   # Timeout for operations executed against the process group
   nccl_timeout: 600
 
-  # Rollout model config.
-  rollout:
-
-    # (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
-    enable_weights_cpu_backup: False
-
-    # vLLM runner mode. Must be 'pooling' for reward / embedding models.
-    runner: generate
-
-    # vLLM task type forwarded to the engine.
-    # Common values: 'classify' (reward models), 'embed' (embedding models).
-    task: generate
-
-    # Pooling params for vLLM-based pooling reward models.
-    reward_kwargs:
-
-      # Whether to L2-normalise the output embedding vector.
-      normalize: False
-
-      # Whether to apply an activation function (e.g., sigmoid) to the logit output.
-      use_activation: False
-
   # Share model config from actor_rollout_ref
-  model: ${oc.select:actor_rollout_ref.model}
+  model: ${oc.select:train_actor_rollout_ref.model}
 
 # config for the algorithm
 algorithm:

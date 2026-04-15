@@ -192,7 +192,7 @@ class SandboxFusionTool(Tool):
                     return ToolOutput(
                         name=self.name,
                         output={
-                            "content": output_text,
+                            "text": output_text,
                             "result_status": result_status,
                         },
                         metadata=metadata,
@@ -203,7 +203,7 @@ class SandboxFusionTool(Tool):
                     return ToolOutput(
                         name=self.name,
                         output={
-                            "content": output_text,
+                            "text": output_text,
                             "result_status": result_status,
                             "score": score,
                         },

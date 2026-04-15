@@ -1,4 +1,4 @@
-"""CPU tests for PSRL_RewardModelManager interface."""
+"""CPU tests for RewardModelManager interface."""
 
 import importlib
 import pathlib as _p
@@ -58,25 +58,25 @@ def _load(rel):
 
 
 _manager_mod = _load("psrl/workers/reward/reward_model/manager.py")
-PSRL_RewardModelManager = _manager_mod.PSRL_RewardModelManager
+RewardModelManager = _manager_mod.RewardModelManager
 
 
 def test_manager_requires_gateway_url():
-    """PSRL_RewardModelManager constructor must accept gateway_url parameter."""
+    """RewardModelManager constructor must accept gateway_url parameter."""
     import inspect
 
-    sig = inspect.signature(PSRL_RewardModelManager.__init__)
-    assert "gateway_url" in sig.parameters, "PSRL_RewardModelManager.__init__ must have a 'gateway_url' parameter"
+    sig = inspect.signature(RewardModelManager.__init__)
+    assert "gateway_url" in sig.parameters, "RewardModelManager.__init__ must have a 'gateway_url' parameter"
     assert "status_queues" not in sig.parameters, (
-        "PSRL_RewardModelManager.__init__ must NOT have 'status_queues' (old API)"
+        "RewardModelManager.__init__ must NOT have 'status_queues' (old API)"
     )
 
 
 def test_manager_has_get_gateway_url():
-    """PSRL_RewardModelManager must expose get_gateway_url()."""
-    assert hasattr(PSRL_RewardModelManager, "get_gateway_url")
+    """RewardModelManager must expose get_gateway_url()."""
+    assert hasattr(RewardModelManager, "get_gateway_url")
 
 
 def test_manager_has_get_reward_model_tokenizer():
-    """PSRL_RewardModelManager must expose get_reward_model_tokenizer()."""
-    assert hasattr(PSRL_RewardModelManager, "get_reward_model_tokenizer")
+    """RewardModelManager must expose get_reward_model_tokenizer()."""
+    assert hasattr(RewardModelManager, "get_reward_model_tokenizer")

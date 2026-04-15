@@ -6,10 +6,11 @@ from typing import Any
 
 import ray
 from omegaconf import DictConfig
+from transformers import AutoProcessor, AutoTokenizer
 from verl import DataProto
 
 from psrl.environments.base import ConversationType, Environment, EnvStepOutput
-from psrl.tools.base import ToolGroup, initialize_tools_from_config
+from psrl.tools.base import ToolGroup, ToolResponse, initialize_tools_from_config
 
 ToolAction = list[dict] | dict
 
@@ -59,6 +60,9 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
         max_turns: int,
+        tokenizer: AutoTokenizer,
+        processor: AutoProcessor | None = None,
+        dataset_cls = None,
     ):
         """
         Initialize the ToolEnvironment.
@@ -67,12 +71,60 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             config: Configuration object containing training settings
             reward_manager: Ray actor handle for computing rewards
             max_turns: Maximum number of turns allowed in an episode
-            **kwargs: Additional keyword arguments
+            tokenizer: Tokenizer for converting between text and tokens
+            processor: Optional multimodal processor (e.g. Qwen2VLProcessor).
+            dataset_cls: Optional dataset class for loading data.
         """
-        super().__init__(config, reward_manager)
+        super().__init__(config, reward_manager, tokenizer, processor, dataset_cls)
 
         self.max_turns = max_turns
         self.num_turn = 0
+        self.tools_kwargs = {}
+
+    async def process_vision_info(
+        self,
+        messages: list[dict],
+    ) -> tuple[list | None, list | None]:
+        """Extract images and videos from messages.
+
+        Delegates to ``dataset_cls.process_vision_info`` (the same path used by
+        ``AgentLoopBase.process_vision_info``), mirroring verl's design where a
+        single canonical extraction function is shared across the whole stack.
+
+        When no processor is configured (text-only model) both return values are None.
+
+        Args:
+            messages: Chat messages that may contain image/video content parts.
+
+        Returns:
+            (images, videos):
+                images - list of PIL.Image.Image, or None if none found.
+                videos - list of (video_tensor, metadata) tuples, or None.
+        """
+        if self.processor is None:
+            return None, None
+
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            psrl_logger.warning(
+                "AgentData.process_vision_info: processor %s has no image_processor attribute; "
+                "skipping vision extraction.",
+                type(self.processor).__name__,
+            )
+            return None, None
+
+        if self.dataset_cls is None:
+            raise RuntimeError(
+                "AgentData.process_vision_info: dataset_cls is required when processor is set. "
+                "Pass dataset_cls= when constructing AgentData."
+            )
+
+        images, videos = await self.dataset_cls.process_vision_info(
+            messages,
+            image_patch_size=image_processor.patch_size,
+            config=self.config.data,
+        )
+        return (images if images else None), (videos if videos else None)
 
     async def reset(self, task: DataProto, **kwargs) -> tuple[ConversationType, dict]:
         """Reset the environment to an initial state.
@@ -101,19 +153,27 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             "For ReTool recipe, task must contain 'raw_prompt' in non_tensor_batch"
         )
         initial_observation = task.non_tensor_batch["raw_prompt"].tolist()[0]
+        self.tools_kwargs = task.non_tensor_batch.get("tools_kwargs", [{}])[0]
+        images, videos = await self.process_vision_info(initial_observation)
+        if images is not None or videos is not None:
+            info["multi_modal_data"] = {"images": images, "videos": videos}
 
         return initial_observation, info
 
-    async def step(self, action: ToolAction, tools_kwargs: dict | None = None) -> EnvStepOutput:
+    async def step(self, action: ToolAction) -> EnvStepOutput:
         """Execute a step in the environment by calling tools.
 
         Takes a tool action (one or more tool calls) from the agent, executes
         the requested tools asynchronously, and returns the results as observations.
 
+        Each tool result is a ``ToolResponse`` with ``text``, ``image``, and
+        ``video`` fields.  Multimodal responses produce structured content lists
+        (``[{"type": "image"}, ..., {"type": "text", "text": ...}]``); text-only
+        responses produce a plain string.  Video responses are not yet supported
+        and raise ``NotImplementedError``.
+
         Args:
             action: Tool action - either a single tool call dict or list of tool calls
-            tools_kwargs: Optional per-sample kwargs forwarded to each tool call
-                (e.g. sandbox credentials).  Keyed by tool name.
 
         Returns:
             EnvStepOutput: Dictionary containing:
@@ -130,54 +190,83 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         if isinstance(action, dict):
             action = [action]
 
-        reward = 0.0
+        tool_rewards = []
 
-        # Empty action indicates agent wants to stop
         if len(action) == 0:
-            return EnvStepOutput(
-                observation=[],
-                reward=reward,
-                done=True,
-                info={},
-            )
+            return EnvStepOutput(observation=[], reward=tool_rewards, done=True, info={})
 
         self.num_turn += 1
-
-        # Check if maximum turns exceeded
         if self.num_turn > self.max_turns:
-            return EnvStepOutput(
-                observation=[],
-                reward=reward,
-                done=False,
-                info={},
-            )
+            return EnvStepOutput(observation=[], reward=tool_rewards, done=False, info={})
 
-        tools_kwargs = tools_kwargs or {}
-
-        # Execute tool calls with an explicit concurrency cap to control latency spikes.
         sem = asyncio.Semaphore(self.max_parallel_calls)
 
         async def _guarded_call(tc: dict):
             async with sem:
-                return await self._call_tool(tc, tools_kwargs)
+                return await self._call_tool(tc, self.tools_kwargs)
 
-        tool_outputs = await asyncio.gather(*[_guarded_call(tc) for tc in action])
+        results: list[tuple[ToolResponse, float | None]] = await asyncio.gather(
+            *[_guarded_call(tc) for tc in action]
+        )
 
-        # Collect observations and rewards from tool executions
-        next_observation = []
-        for tool_message, tool_reward in tool_outputs:
-            next_observation.append(tool_message)
-            if tool_reward:
-                reward += tool_reward
+        next_observation: list[dict] = []
+        new_images_this_turn: list[Any] = []
+
+        for tool_response, tool_reward in results:
+            if tool_response.image or tool_response.video:
+                # Multi-modal content with structured format
+                if not getattr(self.processor, "image_processor", None):
+                    raise ValueError(
+                        "Multimedia data can only be processed by `processor`, but the processor is None. "
+                        "This error is often caused if you are using a LLM model but your tool returns multimodal "
+                        "data. Plase use a vlm as the base model."
+                    )
+                content = []
+                if tool_response.image:
+                    content.append({"type": "image"})
+                if tool_response.video:
+                    content.append({"type": "video"})
+                if tool_response.text:
+                    content.append({"type": "text", "text": tool_response.text})
+                message = {"role": "tool", "content": content}
+            else:
+                # Text-only content
+                message = {"role": "tool", "content": tool_response.text or ""}
+
+            next_observation.append(message)
+
+            if tool_response.image:
+                # Add new image data
+                if isinstance(tool_response.image, list):
+                    # Ensure all elements in the list are valid image objects
+                    for img in tool_response.image:
+                        if img is not None:  # Add a check to ensure the image is not None
+                            new_images_this_turn.append(img)  # Using local variable
+                else:
+                    if tool_response.image is not None:
+                        new_images_this_turn.append(tool_response.image)
+
+            if tool_response.video:
+                raise NotImplementedError("Video responses are not yet supported in ToolEnvironment.")
+
+            if tool_reward is not None:
+                tool_rewards.append(tool_reward)
 
         return EnvStepOutput(
             observation=next_observation,
-            reward=reward,
+            reward=tool_rewards,
             done=False,
-            info={},
+            info={
+                "multi_modal_data": {
+                    "images": new_images_this_turn if new_images_this_turn else None,
+                    "videos": None, # Video handling not implemented
+                }
+            }
         )
 
-    async def _call_tool(self, tool_call: dict, tools_kwargs: dict | None = None) -> dict[str, str]:
+    async def _call_tool(
+        self, tool_call: dict, tools_kwargs: dict | None = None
+    ) -> tuple[ToolResponse, float | None]:
         """Call a single tool and format the response.
 
         Executes the specified tool with the provided arguments, handles errors,
@@ -201,44 +290,44 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             - Truncation side controlled by tool_response_truncate_side config
         """
         try:
-            # Extract tool name and arguments from tool call
             tool_name = tool_call["function"]["name"]
             tool_args = json.loads(tool_call["function"]["arguments"])
-
-            # Merge per-sample extra kwargs for this tool (if any).
+            tools_kwargs = tools_kwargs or self.tools_kwargs
             if tools_kwargs:
                 extra = tools_kwargs.get(tool_name, {})
                 if extra:
                     tool_args = {**extra, **tool_args}
 
-            # Retrieve and execute the tool
             tool = self.tools.get_tool(tool_name)
             assert tool is not None, f"Tool {tool_name} not found in ToolGroup."
-            tool_output = await tool(**tool_args)
-            tool_response_text = tool_output.output["content"]
-            tool_reward = tool_output.output.get("score", None)
-            tool_metadata = tool_output.output.get("metadata", None)
+            tool_response = await tool(**tool_args)
+            tool_reward = tool_response.output.get("score", None)
         except Exception as e:
             psrl_logger.warning(f"Error when executing tool: {e}")
-            return (
-                {"role": "tool", "content": f"Error when executing tool: {e}"},
-                0.0,
-            )
+            return ToolResponse(text=f"Error when executing tool: {e}"), 0.0
 
-        # Truncate tool response if it exceeds maximum length
+        # Truncate text response when needed.
+        tool_response_text = tool_response.output.get("text", None)
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
                 tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
             elif self.tool_response_truncate_side == "right":
                 tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
             else:
-                # Center truncation
-                length = self.max_tool_response_length // 2
-                tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
+                half = self.max_tool_response_length // 2
+                tool_response_text = tool_response_text[:half] + "...(truncated)..." + tool_response_text[-half:]
 
-        tool_message = {"role": "tool", "content": tool_response_text, "metadata": tool_metadata}
-        psrl_logger.debug(f"Tool {tool_name} called with args {tool_args}, response: {tool_response_text}")
-        return tool_message, tool_reward
+        # Create ToolResponse from tool execution result
+        tool_response_kwargs = {"text": tool_response_text}
+        # Add multimedia data if present
+        for attr_name in ["image", "video"]:
+            if attr_name in tool_response.output:
+                attr_value = tool_response.output.get(attr_name)
+                if attr_value is not None:
+                    tool_response_kwargs[attr_name] = attr_value
+
+        psrl_logger.debug(f"Tool {tool_name} called with args {tool_args}, response: {tool_response_kwargs}")
+        return ToolResponse(**tool_response_kwargs), tool_reward
 
     async def close(self) -> None:
         """Cleans up resources used by the environment.

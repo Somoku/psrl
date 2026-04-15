@@ -10,7 +10,6 @@ psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@ray.remote
 class RewardModelCoordinator(RolloutCoordinator):
     """
     Coordinator for reward-model replicas.

@@ -6,7 +6,7 @@ export PSRL_LOGGING_PATH=${PSRL_PATH}/tests/nixl/log
 export PSRL_LOGGING_LEVEL=INFO
 cd ${PSRL_PATH}/tests/nixl
 
-CASE=1
+CASE=0
 
 # NOTE(lhy): HSDP/FSDP precision is not aligned, because we use FSDP1 in the unit test.
 
@@ -36,7 +36,7 @@ if [ $CASE -eq 1 ]; then
         test.megatron.context_parallel_size=1 \
         test.gen.tensor_parallel_size=4 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-32B \
+        model.path=/jizhicfs/lhy/models/Qwen2.5-32B \
         2>&1 | tee test_nixl_e2e.log
 fi
 

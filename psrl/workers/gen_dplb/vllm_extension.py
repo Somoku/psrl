@@ -122,7 +122,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         param_mapping = (
             None
             if isinstance(vllm_model, SupportsWeightLayoutSpec)
-            else create_parameter_mapping(type(vllm_model), copy_to_local(model_config["path"]))
+            else create_parameter_mapping(type(vllm_model), model_config)
         )
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
             vllm_model,
@@ -262,3 +262,10 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         # Restore the actual max model length
         self.vllm_config.model_config.max_model_len = actual_max_model_len
         return estimated_max_model_len
+
+    def cuda_synchronize(self):
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            raise ValueError(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}") from e
+        return None

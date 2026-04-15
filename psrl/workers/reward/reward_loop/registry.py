@@ -12,7 +12,7 @@ from verl.workers.config.reward import RewardManagerConfig
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.gen_reward_function import get_gen_reward_function_cls
 from psrl.workers.reward.reward_loop.base import RawRewardFn, RewardManagerBase
-from psrl.workers.reward.reward_model import PSRL_RewardModelManager
+from psrl.workers.reward.reward_model import RewardModelManager
 
 __all__ = ["register", "get_reward_manager_cls", "load_reward_manager"]
 
@@ -94,7 +94,7 @@ def load_reward_manager(
     tokenizer: Any,
     reward_manager_cfg: RewardManagerConfig,
     reward_fn_config: DictConfig,
-    reward_model_manager: PSRL_RewardModelManager | None = None,
+    reward_model_manager: RewardModelManager | None = None,
     **reward_kwargs: Any,
 ) -> RewardManagerBase:
     """Load the reward loop manager based on the configuration.
@@ -111,7 +111,7 @@ def load_reward_manager(
         **reward_kwargs: `(Any)`
             Additional keyword arguments for the reward loop manager.
     Returns:
-        `(RewardLoopManagerBase)`: The reward loop manager instance.
+        `(RewardManagerBase)`: The reward loop manager instance.
     """
     reward_manager_cls: type[RewardManagerBase]
     if reward_manager_cfg.source == "register":

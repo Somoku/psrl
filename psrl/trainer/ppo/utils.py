@@ -13,8 +13,24 @@ from verl.single_controller.ray import RayResourcePool
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
-from verl.trainer.ppo.ray_trainer import compute_response_mask
+# from verl.trainer.ppo.ray_trainer import compute_response_mask
 
+def compute_response_mask(data: DataProto):
+    """Compute the attention mask for the response part of the sequence.
+
+    This function extracts the portion of the attention mask that corresponds to the model's response,
+    which is used for masking computations that should only apply to response tokens.
+
+    Args:
+        data (DataProto): The data containing batched model outputs and inputs.
+
+    Returns:
+        torch.Tensor: The attention mask for the response tokens.
+    """
+    responses = data.batch["responses"]
+    response_length = responses.size(1)
+    attention_mask = data.batch["attention_mask"]
+    return attention_mask[:, -response_length:]
 
 class PSRL_Role(Enum):
     Actor = enum.auto()

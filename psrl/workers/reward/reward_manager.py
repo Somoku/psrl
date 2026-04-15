@@ -24,7 +24,7 @@ from psrl.utils.logger import (
 from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.reward.reward_loop import load_reward_manager
-from psrl.workers.reward.reward_model import PSRL_RewardModelManager
+from psrl.workers.reward.reward_model import RewardModelManager
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -60,7 +60,7 @@ class RewardLoopManager(CommandExtension):
         tokenizer,
         processor,
         reward_model_configs: list[DictConfig],
-        reward_model_to_manager: dict[str, PSRL_RewardModelManager],
+        reward_model_to_manager: dict[str, RewardModelManager],
         ps_manager_handle=None,
     ):
         """Initialize the reward manager for processing rollout data and computing rewards.
@@ -187,13 +187,54 @@ class RewardLoopManager(CommandExtension):
         """
         reward_spec_keys, reward_managers, coefs = [], [], []
         for reward_model_dict in reward_model_dicts:
+            # reward_fn can be either a string name (from dataset defaults) or a
+            # list-of-config-dicts (from system config). Normalise to string.
+            raw_reward_fn = reward_model_dict.get("reward_fn", "default")
+            if isinstance(raw_reward_fn, list) and len(raw_reward_fn) > 0:
+                reward_fn_name = raw_reward_fn[0].get("name", "default") if isinstance(raw_reward_fn[0], dict) else str(raw_reward_fn[0])
+            elif isinstance(raw_reward_fn, dict):
+                reward_fn_name = raw_reward_fn.get("name", "default")
+            else:
+                reward_fn_name = str(raw_reward_fn)
+
+            # reward_model_name: treat string "null" the same as Python None
+            raw_model_name = reward_model_dict.get("reward_model_name", None)
+            if raw_model_name == "null":
+                raw_model_name = None
+
             reward_spec = RewardSpec(
                 reward_manager_type=reward_model_dict.get("reward_loop_type", "naive"),
-                reward_fn_name=reward_model_dict.get("reward_fn", "default"),
-                reward_model_name=reward_model_dict.get("reward_model_name", None),
+                reward_fn_name=reward_fn_name,
+                reward_model_name=raw_model_name,
             )
+            manager = self.reward_spec_to_manager.get(reward_spec, None)
+
+            # Fallback: if not found by exact match, try progressively looser matching.
+            # This handles mismatches between dataset-default reward_model_dicts
+            # (e.g. reward_loop_type="naive", reward_fn="default") and the actual
+            # system-configured reward spec.
+            if manager is None:
+                # 1st fallback: match by reward_loop_type only
+                candidates = [
+                    (spec, mgr) for spec, mgr in self.reward_spec_to_manager.items()
+                    if spec.reward_manager_type == reward_spec.reward_manager_type
+                ]
+                if len(candidates) == 0:
+                    # 2nd fallback: if only one manager registered globally, use it
+                    all_managers = list(self.reward_spec_to_manager.items())
+                    if len(all_managers) == 1:
+                        candidates = all_managers
+                    elif len(all_managers) > 1:
+                        psrl_logger.warning(
+                            f"No reward spec match for {reward_spec} among {[s for s, _ in all_managers]}. "
+                            f"Using the first registered manager as fallback."
+                        )
+                        candidates = [all_managers[0]]
+                if candidates:
+                    reward_spec, manager = candidates[0]
+
             reward_spec_keys.append(reward_spec.key())
-            reward_managers.append(self.reward_spec_to_manager.get(reward_spec, None))
+            reward_managers.append(manager)
             coefs.append(reward_model_dict.get("reward_coef", 1.0))
         return reward_spec_keys, reward_managers, coefs
 
@@ -232,17 +273,62 @@ class RewardLoopManager(CommandExtension):
         # Wait for the background task to finish
         await asyncio.gather(self.command_loop_task)
 
+    def _compute_multi_modal_inputs(self, inputs: DataProto, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Compute multi-modal inputs with image and video.
+
+        Mirrors ``PSRL_AgentLoopManager._compute_multi_modal_inputs`` but omits
+        ``images_seqlens`` computation (not needed by reward functions).
+        """
+        multi_modal_inputs = {}
+        if self.processor is None:
+            return multi_modal_inputs
+        images = inputs.non_tensor_batch.get("multi_modal_data", {})[0].get("images", None)
+        videos = inputs.non_tensor_batch.get("multi_modal_data", {})[0].get("videos", None)
+        if videos is not None:
+            videos, video_metadatas = zip(*videos, strict=False)
+            videos, video_metadatas = list(videos), list(video_metadatas)
+        else:
+            video_metadatas = None
+        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        multi_modal_inputs = self.processor(
+            text=[current_text],
+            images=images,
+            videos=videos,
+            video_metadata=video_metadatas,
+            return_tensors="pt",
+            do_sample_frames=False,
+        )
+        multi_modal_inputs.pop("input_ids", None)
+        multi_modal_inputs.pop("attention_mask", None)
+
+        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+        # because np.array() only keeps the keys for BatchFeature.
+        return dict(multi_modal_inputs.convert_to_tensors("pt"))
+
     def _pre_process(self, inputs: DataProto) -> DataProto:
         """Pre-process the generated outputs to create properly formatted tensors.
 
-        This method handles padding, attention masks, position IDs, and multi-modal inputs
-        to ensure compatibility with the training pipeline.
+        This method handles padding, attention masks, and multi-modal inputs to ensure
+        compatibility with the reward computation pipeline.
+
+        NOTE(linsh): This method is the reward-side counterpart of
+        ``PSRL_AgentLoopManager._post_process``.  The shared block (prompt/response
+        padding → input_ids / attention_mask assembly, multi-modal inputs) is kept in
+        sync with that method.  The following fields produced by ``_post_process`` are
+        intentionally **omitted** here because reward functions do not need them:
+
+        * ``response_mask``  — only used by the training loss mask.
+        * ``position_ids``   — only required by the actor/critic forward pass (FSDP workers).
+        * ``rollout_log_probs`` — optional PSRL feature consumed by the training pipeline.
+        * ``routed_experts``    — optional PSRL MoE routing replay, training-only.
+        * ``rm_scores``         — written back by ``_post_process`` in sync mode after
+                                  reward is already known; not an input to reward computation.
 
         Args:
             inputs (DataProto): Raw generation outputs.
 
         Returns:
-            DataProto: Formatted data ready for training.
+            DataProto: Formatted data ready for reward computation.
         """
         # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
         # prompts: left pad
@@ -258,10 +344,13 @@ class RewardLoopManager(CommandExtension):
             level=logging.DEBUG,
         )
 
+        batch_size = len(inputs)
+
+        # ── BEGIN shared block with PSRL_AgentLoopManager._post_process ──────────
+
         # prompts
         self.tokenizer.padding_side = "left"
         if "raw_prompt_ids" not in inputs.non_tensor_batch:
-            batch_size = len(inputs)
             raw_prompt_ids = np.array(
                 [
                     _pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i])
@@ -288,7 +377,7 @@ class RewardLoopManager(CommandExtension):
         raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
         assert raw_response_ids is not None, "raw_response_ids must be provided in the input batch"
         self.tokenizer.padding_side = "right"
-        outputs = self.tokenizer.pad(
+        response_output = self.tokenizer.pad(
             [{"input_ids": raw_response_id} for raw_response_id in raw_response_ids],
             padding="max_length",
             max_length=self.config.gen_actor_rollout_ref.rollout.response_length,
@@ -296,27 +385,20 @@ class RewardLoopManager(CommandExtension):
             return_attention_mask=True,
         )
         response_ids, response_attention_mask = (
-            outputs["input_ids"],
-            outputs["attention_mask"],
+            response_output["input_ids"],
+            response_output["attention_mask"],
         )
 
         attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
         input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-        # Handle multi-modal inputs and position_ids calculation
-        # Only support Qwen2VLImageProcessor for multi-modal processing currently
-        # TODO(verl): support other multi-modal inputs
-        multi_modal_inputs = None
-        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)
-            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-            multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
-            multi_modal_inputs.pop("input_ids", None)
-            multi_modal_inputs.pop("attention_mask", None)
+        
+        # multi-modal inputs (per-sample, mirrors _post_process per-sample loop)
+        multi_modal_inputs_list = [
+            self._compute_multi_modal_inputs(inputs[i : i + 1], input_ids[i : i + 1])
+            for i in range(batch_size)
+        ]
 
-            # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-            # because np.array() only keeps the keys for BatchFeature.
-            multi_modal_inputs = dict(multi_modal_inputs)
-
+        # ── END shared block with PSRL_AgentLoopManager._post_process ────────────
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
@@ -324,14 +406,14 @@ class RewardLoopManager(CommandExtension):
                 "input_ids": input_ids,  # [bsz, prompt_length + response_length]
                 "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
             },
-            batch_size=len(input_ids),
+            batch_size=batch_size,
         )
 
         inputs.non_tensor_batch.pop("raw_prompt_ids", None)
         inputs.non_tensor_batch.pop("raw_response_ids", None)
         non_tensor_batch = inputs.non_tensor_batch
-        if multi_modal_inputs is not None:
-            non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
+        if any(mmi for mmi in multi_modal_inputs_list):
+            non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=inputs.meta_info)
 
@@ -420,6 +502,9 @@ class RewardLoopManager(CommandExtension):
                         PSRL_RequestStatus.REWARD_COMPLETED,
                         is_validate=is_validate,
                     )
+                    # update_request_status returns bool when single request, list[bool] when multiple
+                    if isinstance(update_status_success, bool):
+                        update_status_success = [update_status_success]
                     assert all(not status for status in update_status_success), (
                         "Update status should not be successful for aborted requests."
                     )
@@ -443,6 +528,7 @@ class RewardLoopManager(CommandExtension):
         """
         for request_id, reward in request_id_to_reward.items():
             reward["reward_extra_info"]["data_source"] = self.request_id_to_data_source.pop(request_id)
+            reward["reward_extra_info"]["original_reward_score"] = reward["reward_score"]
         if self.reward_normalization != "batch" and self.reward_normalization != "group":
             return request_id_to_reward
 
@@ -515,7 +601,9 @@ class RewardLoopManager(CommandExtension):
                 PSRL_RequestStatus.REWARD_RUNNING,
                 is_validate=is_validate,
             )
-            if not update_status_success[0]:
+            # update_request_status returns bool when single request, list[bool] when multiple
+            first_success = update_status_success[0] if isinstance(update_status_success, list) else update_status_success
+            if not first_success:
                 return None
 
             if rollout_n > 1:
@@ -570,6 +658,9 @@ class RewardLoopManager(CommandExtension):
                             PSRL_RequestStatus.REWARD_COMPLETED,
                             is_validate=is_validate,
                         )
+                        # update_request_status returns bool when single request, list[bool] when multiple
+                        if isinstance(update_status_success, bool):
+                            update_status_success = [update_status_success]
                         complete_request_idxs = [i for i, success in enumerate(update_status_success) if success]
                         if complete_request_idxs:
                             results[request_id] = result

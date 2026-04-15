@@ -3,9 +3,13 @@ import logging
 import os
 
 import ray
+import torch
+import numpy as np
 from omegaconf import DictConfig
-from transformers import AutoTokenizer
+from PIL import Image
+from transformers import AutoProcessor, AutoTokenizer
 from verl import DataProto
+from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 
 from psrl.environments.base import ConversationType, Environment
 from psrl.environments.tool_env import ToolAction
@@ -31,7 +35,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
     """
 
     @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
+    def init_class(cls, config: DictConfig, **kwargs):
         """Initialize class-level shared resources for all instances.
 
         This method sets up the tokenizer, maximum turns, and tool parser that
@@ -47,7 +51,6 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         cls._class_initialized = True
 
         # Initialize class-level attributes from config
-        cls.tokenizer = tokenizer
         cls.max_turns = config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
 
         # Initialize tool parser for extracting tool calls from model output
@@ -57,8 +60,9 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         self,
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
-        tokenizer: AutoTokenizer,
         env: Environment,
+        tokenizer: AutoTokenizer,
+        processor: AutoProcessor | None = None,
         **kwargs,
     ):
         """Initialize ToolAgentData instance.
@@ -66,70 +70,103 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         Args:
             config: Configuration object containing training settings
             reward_manager: Ray actor handle for computing rewards
+            env: Environment instance with ``get_tool_schemas()`` method
             tokenizer: Tokenizer for converting between text and tokens
-            tool_schemas: List of tool schema dictionaries for chat template
+            processor: Optional multimodal processor (e.g. Qwen2VLProcessor).
             **kwargs: Additional keyword arguments from configuration
         """
         assert hasattr(env, "get_tool_schemas"), "Environment must implement get_tool_schemas method."
 
-        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
-        super().__init__(config, reward_manager, tokenizer, env)
+        self.init_class(config=config, **kwargs)
+        super().__init__(config, reward_manager, env, tokenizer, processor, dataset_cls)
         self.tool_schemas = self.env.get_tool_schemas()
         self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
 
         # Pre-compute system prompt token ids for incremental turn stripping.
         # This mirrors AgentLoopBase._get_system_prompt_ids() but lives here so
         # AgentData subclasses don't need a reference to the loop.
-        self._system_prompt_ids: list[int] = tokenizer.apply_chat_template(
-            [{}],
-            add_generation_prompt=False,
-            tokenize=True,
+        self._system_prompt_ids: list[int] = initialize_system_prompt(
+            self.tokenizer,
             **self.apply_chat_template_kwargs,
         )
 
-    async def encode_observation(self, observation: ConversationType, *, is_init: bool) -> tuple[list[int], bool]:
+    async def encode_observation(
+        self,
+        observation: ConversationType,
+        images: list[Image.Image] | None = None,
+        videos: list[tuple[torch.Tensor, dict]] | None = None,
+        is_init: bool = False,
+    ) -> tuple[list[int], bool]:
         """Encode tool-env conversation messages into token ids (async).
 
-        For the first observation, we include tool schemas and treat the result as prompt.
-        For subsequent observations, we drop the system prompt prefix and treat the result
-        as user-side tokens (masked out for training).
+        For the first observation we include tool schemas and treat the result as
+        prompt ids.  For subsequent observations we re-encode incrementally,
+        stripping the system-prompt prefix, and treat the result as user-side
+        tokens (masked to 0 during training).
 
-        The tokenizer call is offloaded to the default executor so the async event
-        loop is never blocked.
+        When a multimodal *processor* is configured (VLM path), the initial
+        observation is processed via ``processor(text=..., images=..., ...)`` so
+        that vision tokens are embedded correctly.  Subsequent incremental turns
+        are still text-only (tool responses are text) and use the tokenizer path.
+
+        All blocking CPU work is offloaded to the default thread-pool executor.
+
+        Returns:
+            (token_ids, is_prompt) where is_prompt is True only for the initial
+            observation (which becomes part of the padded prompt tensor).
         """
-        import asyncio
+        from verl.utils.tokenizer import normalize_token_ids
 
         if not observation:
             return [], is_init
 
-        loop = asyncio.get_running_loop()
-
-        if is_init:
-            kwargs = dict(self.apply_chat_template_kwargs)
-
-            def _tokenize_init():
-                return self.tokenizer.apply_chat_template(
+        if self.processor is not None:
+            raw_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.processor,
                     observation,
-                    tools=self.tool_schemas,
+                    tools=self.tool_schemas if is_init else None,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                )
+            )
+            
+            # split the videos and according metadatas
+            if videos is not None:
+                videos, video_metadatas = zip(*videos, strict=False)
+                videos, video_metadatas = list(videos), list(video_metadatas)
+            else:
+                video_metadatas = None
+
+            model_inputs = self.processor(
+                text=[raw_prompt],
+                images=images,
+                videos=videos,
+                video_metadata=video_metadatas,
+                return_tensors="pt",
+                do_sample_frames=False,
+            )
+            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+        else:
+            tokenized_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.tokenizer,
+                    observation,
+                    tools=self.tool_schemas if is_init else None,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **kwargs,
-                )
-
-            token_ids: list[int] = await loop.run_in_executor(None, _tokenize_init)
-            return token_ids, True
-
-        # Incremental turn: re-encode without tools, then strip system-prompt prefix.
-        def _tokenize_incremental():
-            return self.tokenizer.apply_chat_template(
-                observation,
-                add_generation_prompt=True,
-                tokenize=True,
+                    **self.apply_chat_template_kwargs,
+                ),
             )
+            prompt_ids = normalize_token_ids(tokenized_prompt)
 
-        token_ids = await loop.run_in_executor(None, _tokenize_incremental)
-        token_ids = token_ids[len(self._system_prompt_ids) :]
-        return token_ids, False
+        if not is_init:
+            token_ids = prompt_ids[len(self._system_prompt_ids):]
+
+        return token_ids, is_init
 
     def format_chat_completions(self, observation: ConversationType, *, is_init: bool) -> ConversationType:
         """ToolEnvironment already uses ConversationType as observation, so return as-is."""
@@ -186,18 +223,10 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             parent_id=parent_id,
         )
 
-        # Store per-sample tools_kwargs in trajectory.extra_fields so that
-        # ToolEnvironment can access them during tool execution.
-        tools_kwargs_arr = request.non_tensor_batch.get("tools_kwargs", None)
-        if tools_kwargs_arr is not None:
-            self.trajectory.extra_fields["tools_kwargs"] = tools_kwargs_arr[0] or {}
-        else:
-            self.trajectory.extra_fields["tools_kwargs"] = {}
-
     async def update_from_env(
         self,
         observation: ConversationType,
-        reward: float | None,
+        reward: float | list[float] | None,
         done: bool,
         info: dict,
         **kwargs,
@@ -219,14 +248,37 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             bool: True if response length limit is reached, False otherwise
         """
         is_init = len(self.trajectory.steps) == 0
+
+        multi_modal_data = info.get("multi_modal_data", {})
+        images = multi_modal_data.get("images", None)
+        videos = multi_modal_data.get("videos", None)
+
+        if images:
+            if self.trajectory.image_data is None:
+                self.trajectory.image_data = []
+            elif not isinstance(self.trajectory.image_data, list):
+                self.trajectory.image_data = [self.trajectory.image_data]
+            for img in images:
+                self.trajectory.image_data.append(img)
+        if videos:
+            raise NotImplementedError("Video data handling is not yet implemented in ToolAgentData.")
+
         if len(self.trajectory.steps) < self.max_turns:
             # Create a new step explicitly (avoids implicit steps[-1] contract).
+            if isinstance(reward, float):
+                reward = [reward]
             step = self.start_step(observation=observation, reward=reward, done=done, info=info)
 
             # Fill normalized ConversationType for logging/debugging.
             step.chat_completions = self.format_chat_completions(observation, is_init=is_init)
 
-            token_ids, is_prompt = await self.encode_observation(observation, is_init=is_init)
+            # NOTE(linsh): currently we do not support gpt-oss style tool calls.
+            token_ids, is_prompt = await self.encode_observation(
+                observation,
+                images=images,
+                videos=videos,
+                is_init=is_init,
+            )
             if token_ids:
                 if is_prompt:
                     self.append_prompt_ids(token_ids)
@@ -234,8 +286,12 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
                     self.append_user_tokens(token_ids)
 
         # Accumulate non-None tool rewards from env steps for downstream use.
-        if not is_init and reward is not None:
-            self.trajectory.tool_rewards.append(float(reward))
+        if reward is not None:
+            # TODO(linsh): find a better approach to handle multiple tool rewards
+            # currently we just sum them up for trajectory-level reward computation,
+            # but we may want to keep them separate for more detailed credit assignment.
+            tool_reward = np.sum(reward) if isinstance(reward, list) else reward
+            self.trajectory.tool_rewards.append(tool_reward)
 
         # Check if response length limit is reached
         return self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length

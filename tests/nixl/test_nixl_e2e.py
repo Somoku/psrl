@@ -18,12 +18,6 @@ import pytest
 # Skip the entire module at collection time if required packages are unavailable.
 # pytest.importorskip raises Skipped before any further imports are attempted.
 pytest.importorskip("megatron", reason="test_nixl_e2e requires megatron")
-# NIXLInterface must be importable from psrl.utils.nixl (present in full nixl stack)
-try:
-    from psrl.utils.nixl import NIXLInterface  # noqa: F401 — existence check only
-except ImportError:
-    pytest.skip("psrl.utils.nixl.NIXLInterface not available", allow_module_level=True)
-
 import hydra
 import ray
 import torch
@@ -34,10 +28,9 @@ from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.nixl import (
-    GLOBAL_META_SERVER_NAME,
     NIXLClientType,
-    NIXLInterface,
     NIXLMetaServer,
     NIXLStorageClient,
 )
@@ -59,6 +52,7 @@ from verl.utils.device import get_device_name
 from verl.utils.megatron_utils import get_model
 from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.megatron_workers import set_random_seed
+from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
 
 NUM_GPU_PER_NODE = 8
 
@@ -156,7 +150,6 @@ class TrainClientActor:
         backend,
         torch_port,
         log_dir,
-        nixl_interface: NIXLInterface,
         ps_for_push_worker_handles,
         model_path,
         fsdp_hybrid_config=None,
@@ -194,8 +187,8 @@ class TrainClientActor:
             use_gpu=True,
             client_type=NIXLClientType.PUSH_SIDE,
             nixl_config=psrl_config.nixl,
-            nixl_interface=nixl_interface,
-            client_group_id=self._get_replica_id(),
+            replica_idx=0,
+            worker_index=rank,
             logging_path=log_dir,
         )
 
@@ -304,7 +297,7 @@ class TrainClientActor:
 
             model_config = AutoConfig.from_pretrained(model_path)
             parameter_mapping = create_parameter_mapping("FSDP", model_config)
-            state_dict, sharding = convert_fsdp_inplace(parameter_mapping, self.model)
+            state_dict, sharding = convert_fsdp_inplace(parameter_mapping, self.model, fsdp_strategy="fsdp")
         elif self.engine_type == "megatron":
             from transformers import AutoConfig
 
@@ -377,7 +370,6 @@ class GenClientActor:
         backend,
         torch_port,
         log_dir,
-        nixl_interface: NIXLInterface,
         model_path,
         gen_config,
     ):
@@ -423,8 +415,8 @@ class GenClientActor:
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=psrl_config.nixl,
-            nixl_interface=nixl_interface,
-            client_group_id=self._get_replica_id(),
+            replica_idx=self._get_replica_id(),
+            worker_index=self.rank,
             logging_path=log_dir,
         )
 
@@ -466,8 +458,16 @@ class GenClientActor:
         from transformers import AutoConfig
 
         model_config = AutoConfig.from_pretrained(model_path)
-        param_mapping = create_parameter_mapping(type(self.model), model_config)
-        state_dict, sharding = convert_vllm_inplace(param_mapping, self.model, tp_rank=self.tp_rank)
+        parameter_mapping = (
+            None
+            if isinstance(self.model, SupportsWeightLayoutSpec)
+            else create_parameter_mapping(type(self.model), model_config)
+        )
+        state_dict, sharding = convert_vllm_inplace(
+            self.model,
+            tp_rank=self.tp_rank,
+            parameter_mapping=parameter_mapping,
+        )
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -514,7 +514,7 @@ class GenClientActor:
         self.client.shutdown()
 
 
-def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, nixl_interface: NIXLInterface):
+def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path):
     model_config = OmegaConf.create({"path": model_path, "use_shm": False, "trust_remote_code": False})
     ray_nodes = ray.nodes()
     ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
@@ -538,7 +538,6 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path, n
         storage_plan,
         model_config,
         psrl_config,
-        nixl_interface,
     )
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
     return ps_wg
@@ -554,7 +553,7 @@ def test_nixl_e2e(cfg: DictConfig):
     )
     listen_ip = cfg.network.listen_ip
     print(f"meta server listen_ip: {listen_ip}")
-    server_name = GLOBAL_META_SERVER_NAME
+    server_name = NIXL_META_SERVER_NAME
     backend = cfg.network.backend
     torch_port_train = cfg.network.torch_port_train
     torch_port_gen = cfg.network.torch_port_gen
@@ -583,7 +582,6 @@ def test_nixl_e2e(cfg: DictConfig):
         }
     )
 
-    nixl_interface = NIXLInterface()
     global_store = GlobalStore.remote()
 
     start_time = time.time()
@@ -597,7 +595,7 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] server init done. time: {end_time - start_time}s")
 
     start_time = time.time()
-    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model.path, nixl_interface)
+    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model.path)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
     ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
@@ -633,7 +631,6 @@ def test_nixl_e2e(cfg: DictConfig):
             backend,
             torch_port_train,
             log_dir,
-            nixl_interface,
             ps_for_push_worker_handles,
             cfg.model.path,
             fsdp_hybrid_config,
@@ -656,7 +653,6 @@ def test_nixl_e2e(cfg: DictConfig):
             backend,
             torch_port_gen,
             log_dir,
-            nixl_interface,
             cfg.model.path,
             cfg.test.gen,
         )

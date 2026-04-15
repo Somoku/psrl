@@ -27,7 +27,6 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 STATUS_QUEUE_POLL_TIMEOUT_SECS = 0.2
 
 
-@ray.remote
 class RolloutCoordinator(CommandExtension):
     def __init__(
         self,
@@ -779,6 +778,10 @@ class RolloutCoordinator(CommandExtension):
             have_syncing_instance = False
             sync_instance_ids = []
             for instance_id in self.instance_ids:
+                # Ignore validate instances for weight synchronization
+                replica_id, _ = instance_id
+                if replica_id not in self.tag_to_replica_ids["rollout"]:
+                    continue
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)
                 if self.instance_to_model_version.get(
                     instance_id, 0
@@ -826,7 +829,7 @@ class RolloutCoordinator(CommandExtension):
             sync_instance_ids = []
             for instance_id, engine_stats in self.instance_to_engine_status.items():
                 # Ignore validate instances for weight synchronization
-                replica_id = instance_id[0]
+                replica_id, _ = instance_id
                 if replica_id not in self.tag_to_replica_ids["rollout"]:
                     continue
                 # Check whether engine status is stale (the instance is currently being synchronized with PS)

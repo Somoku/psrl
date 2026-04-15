@@ -54,8 +54,14 @@ class GenerateAgentLoop(AgentLoopBase):
 
         reward_input = request
         reward_result = await self.reward_manager.compute_score.remote(reward_input)
+        if reward_result is None:
+            # Request was aborted during reward computation (e.g. staleness check failed)
+            return None, TerminateReason.ABORTED
         if not self.config.reward.launch_reward_fn_async:
             output = self._post_process_and_merge_reward(reward_result, request)
+        else:
+            # Async reward: reward_result will be fetched later; return the request as output
+            output = request
         # psrl_logger.info(f"output of {request.non_tensor_batch['uid'][0]} = {output}")
 
         return output, TerminateReason.FINISHED

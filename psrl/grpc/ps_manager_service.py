@@ -225,7 +225,19 @@ class PSManagerGrpcServer:
         if self._server is not None:
             return int(self._port)
 
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=16),
+            options=[
+                # Allow client keepalive pings every 10s even without active calls.
+                # The SMG client sends HTTP/2 PING frames every 30s; the gRPC-core
+                # default of 300s would trigger GOAWAY after 2 strikes (60s).
+                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
+                ("grpc.keepalive_permit_without_calls", True),
+                # Disable GOAWAY on ping-rate violations — rely on the interval
+                # above for rate-limiting instead of killing the transport.
+                ("grpc.http2.max_ping_strikes", 0),
+            ],
+        )
         psrl_manager_pb2_grpc.add_PSManagerStateServicer_to_server(
             PSManagerStateServicer(self._ps_manager),
             server,

@@ -46,7 +46,13 @@ packages = ["psrl"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-psrl = ["trainer/config/*.yaml"]
+psrl = [
+    "trainer/config/*.yaml",
+    "trainer/config/**/*.yaml",
+]
+
+[project.entry-points."hydra.searchpath"]
+psrl = "psrl.trainer.config.hydra_plugins.psrl_searchpath:PSRLSearchPathPlugin"
 
 [tool.ruff]
 line-length = 119

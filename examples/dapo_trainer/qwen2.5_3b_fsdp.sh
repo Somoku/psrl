@@ -1,8 +1,8 @@
 #!/bin/bash
 set -xeuo pipefail
 
-staleness=${1:-2}
-project_name=psrl_example
+staleness=${1:-0}
+project_name=psrl_compare
 experiment_name=DAPO-Qwen2.5-3B-fsdp-staleness_${staleness}
 fix_weight=${2:-False}
 disable_attn=${3:-False}

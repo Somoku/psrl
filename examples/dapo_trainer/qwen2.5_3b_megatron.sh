@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 staleness=${1:-0}
-project_name=psrl_example
+project_name=psrl_compare
 experiment_name=DAPO-Qwen2.5-3B-megatron-staleness_${staleness}
 fix_weight=${2:-False}
 disable_attn=${3:-False}

@@ -21,7 +21,10 @@ _target_: psrl.workers.config.RolloutConfig
 name: vllm
 
 # Whether disable attention for profiling.
-disable_attn: False
+disable_attn: ${oc.select:psrl.profile.disable_attn,False}
+
+# max length of sequences
+max_num_seqs: ${oc.select:psrl.routing_strategy.max_concurrent_seqs_per_instance,1024}
 
 # vLLM runner type: 'generate' for autoregressive LLMs, 'pooling' for
 # embedding / reward / classification models.
@@ -29,6 +32,9 @@ runner: generate
 
 # vLLM task type forwarded to the engine (e.g., 'generate', 'classify', 'embed').
 task: generate
+
+# Number of rollouts to run per sample.
+n: ${oc.select:psrl.rollout_n}
 
 # Pooling params for vLLM-based pooling reward models.
 reward_kwargs:

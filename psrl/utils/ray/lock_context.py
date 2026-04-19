@@ -73,15 +73,15 @@ def add_busy_polling_lock(cls):
     cls.release = release
     return cls
 
-    
+
 def exclusive_push_model_context(ps_manager):
     """
     A context manager that ensures exclusive access during model push.
     Ensures no other push or pull operations are in progress when entering.
     """
     return _ExclusivePushModelContext(ps_manager)
-        
-        
+
+
 def shared_pull_model_context(ps_manager):
     """
     A context manager that ensures shared access during model pull.
@@ -243,7 +243,6 @@ class AsyncBusyPollingRayLock:
     async def __aexit__(self, exc_type, exc, tb):
         # release regardless of exception
         await self.release()
-        
 
 
 class _ExclusivePushModelContext:
@@ -271,9 +270,7 @@ class _ExclusivePushModelContext:
         # 2. No pull is in progress (_shared_pull_count == 0)
         while True:
             # Check if we can acquire the lock
-            can_acquire = ray.get(
-                self.ps_manager._try_acquire_exclusive_push_lock.remote()
-            )
+            can_acquire = ray.get(self.ps_manager._try_acquire_exclusive_push_lock.remote())
             if can_acquire:
                 return self
             # Lock is still held, wait for poll_interval before checking again
@@ -308,9 +305,7 @@ class _SharedPullModelContext:
         # We need to wait until no push is in progress (_exclusive_push_locked == False)
         while True:
             # Check if we can acquire the lock
-            can_acquire = ray.get(
-                self.ps_manager._try_acquire_shared_pull_lock.remote()
-            )
+            can_acquire = ray.get(self.ps_manager._try_acquire_shared_pull_lock.remote())
             if can_acquire:
                 return self
             # Lock is still held, wait for poll_interval before checking again

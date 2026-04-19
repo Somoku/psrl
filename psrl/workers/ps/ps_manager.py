@@ -1,5 +1,4 @@
 import logging
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -301,7 +300,9 @@ class PSManager(RequestStatusTracker):
         if buffer_id in ready_for_delete_buffer_ids:
             for bid in sorted(list(ready_for_delete_buffer_ids)):
                 if bid <= buffer_id:
-                    psrl_logger.info(f"Clearing ready for deletion buffer {bid} after model version {buffer_id} is pushed.")
+                    psrl_logger.info(
+                        f"Clearing ready for deletion buffer {bid} after model version {buffer_id} is pushed."
+                    )
                     self.staleness_inventory.delete_buffer(bid)
                 else:
                     break
@@ -504,10 +505,10 @@ class PSManager(RequestStatusTracker):
             buffer_ids.append(buffer_id)
 
         return buffer_ids, entry_ids
-    
+
     def abort_reserved_requests(self, buffer_id: int) -> tuple[int, list[int]]:
         """Abort the reserved requests for a specific buffer.
-        
+
         Args:
             buffer_id (int): The ID of the buffer that is waiting for consumption.
         Returns:
@@ -520,14 +521,14 @@ class PSManager(RequestStatusTracker):
             prompt_id = entry_info.prompt_id
             # NOTE(lhy): we should abort all requests of the prompt, not just the recorded ones
             abort_request_ids.extend([prompt_id * self.rollout_n + i for i in range(self.rollout_n)])
-            '''
+            """
             request_idxs = entry_info.request_idx
             if not isinstance(request_idxs, list):
                 request_idxs = [request_idxs]
             for request_idx in request_idxs:
                 request_id = prompt_id * self.rollout_n + request_idx
                 abort_request_ids.append(request_id)
-            '''
+            """
         self.abort_requests(abort_request_ids)
         return len(reserved_entry_ids), abort_request_ids
 
@@ -624,7 +625,7 @@ class PSManager(RequestStatusTracker):
     def _abort_after_buffer_ready(self, buffer_id: int) -> set[int]:
         """
         Check and interrupt rollout instances if necessary based on the ready buffer.
-        
+
         Args:
             buffer_id (int): The ID of the buffer that is ready.
         Returns:
@@ -708,13 +709,13 @@ class PSManager(RequestStatusTracker):
             f"abort {len(abort_request_ids)} requests. "
             f"After abortion, current ready buffers {self.staleness_inventory.ready_buffer_ids()}."
         )
-        
+
         return abort_request_ids
-        
+
     def handle_ready_buffer(self, buffer_id: int) -> set[int]:
         """
         Handle the ready buffer.
-        
+
         Args:
             buffer_id (int): The ID of the buffer that is ready.
         Returns:
@@ -723,7 +724,7 @@ class PSManager(RequestStatusTracker):
         self.rollout_coordinator.update_ready_buffer.remote(buffer_id)
         abort_request_ids = self._abort_after_buffer_ready(buffer_id)
         return abort_request_ids
-        
+
     def occupy_rollout_instance_request(
         self,
         prompt_id: int,
@@ -1019,9 +1020,7 @@ class PSManager(RequestStatusTracker):
         )
         return self.ps_nixl_gen_storage_client_names
 
-    def get_ps_nixl_train_storage_client_name_for_node(
-        self, node_id: str
-    ) -> str | None:
+    def get_ps_nixl_train_storage_client_name_for_node(self, node_id: str) -> str | None:
         """
         Return the NIXL train storage client name for the PS worker on the given node.
 
@@ -1053,7 +1052,7 @@ class PSManager(RequestStatusTracker):
         """
         Try to acquire the exclusive push lock.
         Returns True if acquired, False if already locked.
-        
+
         This method ensures that:
         - No push is in progress (_exclusive_push_locked == False)
         - No pull is in progress (_shared_pull_count == 0)
@@ -1072,7 +1071,7 @@ class PSManager(RequestStatusTracker):
         """
         Try to acquire the shared pull lock.
         Returns True if acquired, False if a push is in progress.
-        
+
         This method ensures that:
         - No push is in progress (_exclusive_push_locked == False)
         Multiple pull operations can run concurrently.

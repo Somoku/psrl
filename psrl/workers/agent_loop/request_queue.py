@@ -1,6 +1,6 @@
 import heapq
-from enum import Enum
 from collections.abc import Callable, Iterator
+from enum import Enum
 
 from sortedcontainers import SortedDict
 from verl import DataProto
@@ -82,8 +82,7 @@ def get_priority_by_version_and_token_num(
 
 
 def get_priority_by_version_and_id(request: DataProto, staleness: int) -> int:
-    """Get the priority value for a request based on version tag and ID.
-    """
+    """Get the priority value for a request based on version tag and ID."""
     version_priority = get_priority_by_version(request, staleness)
     id_priority = request.non_tensor_batch["uid"][0]
     return (version_priority, id_priority)

@@ -3,17 +3,14 @@ import os
 import pickle
 import time
 
-import torch
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
-from psrl.utils.logger import deprecated
 from psrl.utils.nixl.comm_plan import CommunicationPlanner, NIXLCommPlan
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
     NIXLSharding,
-    NIXLTensorInfo,
 )
 
 psrl_logger = logging.getLogger(__file__)
@@ -236,18 +233,14 @@ class NIXLMetaServer:
         relevant: set[str] = set(my_clients)  # always include own clients
 
         # Determine which types this agent's clients have.
-        my_types: set[NIXLClientType] = {
-            self.client_infos[c].type for c in my_clients if c in self.client_infos
-        }
+        my_types: set[NIXLClientType] = {self.client_infos[c].type for c in my_clients if c in self.client_infos}
 
         # Initiating side → counterpart type mapping.
         type_needs: dict[NIXLClientType, NIXLClientType] = {
             NIXLClientType.PUSH_SIDE: NIXLClientType.PS_FOR_PUSH,
             NIXLClientType.PULL_SIDE: NIXLClientType.PS_FOR_PULL,
         }
-        needed_types: set[NIXLClientType] = {
-            dst for src, dst in type_needs.items() if src in my_types
-        }
+        needed_types: set[NIXLClientType] = {dst for src, dst in type_needs.items() if src in my_types}
 
         for client_name, client_info in self.client_infos.items():
             if client_info.type in needed_types:
@@ -277,18 +270,18 @@ class NIXLMetaServer:
         assert self.comm_plan, "Communication plan not made yet."
 
         # Serialize each client info exactly once up front (avoid repeated serialization per agent)
-        all_serialized: dict[str, bytes] = {
-            name: info.serialize() for name, info in self.client_infos.items()
-        }
+        all_serialized: dict[str, bytes] = {name: info.serialize() for name, info in self.client_infos.items()}
         comm_plan_bytes: bytes | None = self.comm_plan.serialize() if self.comm_plan else None
 
         for agent_name in self.connected_clients:
             # Filter to only the client infos this agent actually needs
             relevant = self._get_relevant_client_names_for_agent(agent_name)
-            payload = pickle.dumps({
-                "client_infos": {n: all_serialized[n] for n in relevant if n in all_serialized},
-                "comm_plan": comm_plan_bytes,
-            })
+            payload = pickle.dumps(
+                {
+                    "client_infos": {n: all_serialized[n] for n in relevant if n in all_serialized},
+                    "comm_plan": comm_plan_bytes,
+                }
+            )
             self.agent.send_notif(agent_name, payload)
 
     def notify_all_client_temp_mappings(self):

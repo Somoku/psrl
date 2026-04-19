@@ -22,10 +22,10 @@ from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
-from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import gen_client_name, ps_agent_name
+from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
     NIXLClientType,
     NIXLInterface,
@@ -202,9 +202,7 @@ class vLLMWorkerExtension:
         )
         parameter_mapping = create_parameter_mapping(type(vllm_model), model_config)
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
-            parameter_mapping, 
-            vllm_model, 
-            tp_rank=self.get_instance_local_tp_rank()
+            parameter_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
         )
 
     def nixl_protocol(self, config: DictConfig, mode: str = "full"):

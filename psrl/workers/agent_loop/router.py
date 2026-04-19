@@ -258,7 +258,7 @@ class RolloutRouter:
         request_id = request.non_tensor_batch["uid"][0]
         is_validate = request.meta_info.get("validate", False)
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-        assert "version_tag" in request.non_tensor_batch and request.non_tensor_batch["version_tag"][0] != None, (
+        assert "version_tag" in request.non_tensor_batch and request.non_tensor_batch["version_tag"][0] is not None, (
             "Request must have 'version_tag' for routing and it must not be None"
         )
         needed_model_version = request.non_tensor_batch["version_tag"][0]
@@ -369,7 +369,9 @@ class RolloutRouter:
                 reserve_indicator = indicator_results[all_candidate_model_versions.index(version)]
                 candidate_indicator_list.append((reserve_indicator, version_indicator))
         else:
-            raise ValueError(f"Invalid candidate sort indicator: {self.config.psrl.routing_strategy.candidate_sort_indicator}")
+            raise ValueError(
+                f"Invalid candidate sort indicator: {self.config.psrl.routing_strategy.candidate_sort_indicator}"
+            )
         route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
 
         # 6. Strategy-based routing
@@ -618,7 +620,7 @@ class RolloutRouter:
                     # time_begin = time.time()
                     new_instance_id = await self._choose_new_rollout_instance(request)
                     # time_end = time.time()
-                    # psrl_logger.info(f"Choosing rollout instance for request {request_id} to {new_instance_id} in {time_end - time_begin} seconds")
+                    # psrl_logger.info(f"Choosing rollout instance for request {request_id} to {new_instance_id} in {time_end - time_begin} seconds") # noqa: E501
                     if new_instance_id is None:
                         # new_instance_id is None indicates that we cannot find a suitable rollout instance
                         # for the request due to the current engine status (e.g.,
@@ -693,7 +695,10 @@ class RolloutRouter:
             self._is_routing = False
             sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
             if route_num > 0:
-                psrl_logger.debug(f"Routing {route_num} requests in multi priority queue routing loop, time cost: {time.time() - begin_time} seconds")
+                psrl_logger.debug(
+                    f"Routing {route_num} requests in multi priority queue "
+                    f"routing loop, time cost: {time.time() - begin_time} seconds"
+                )
             await asyncio.sleep(sleep_time)
 
     def _profiling_accumulate_and_overwrite(
@@ -890,9 +895,7 @@ class RolloutRouter:
         is_validate = request.meta_info.get("validate", False)
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         request.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
-        assert "version_tag" in request.non_tensor_batch, (
-            "Request must have 'version_tag' for routing"
-        )
+        assert "version_tag" in request.non_tensor_batch, "Request must have 'version_tag' for routing"
         needed_model_version = request.non_tensor_batch["version_tag"][0]
         version_tag_error = (
             "The version tag should not be -1 (new request that is not "
@@ -1186,7 +1189,8 @@ class RolloutRouter:
                     if can_reserve_without_new_reserve_entry[i] == [True]
                 ]
 
-        # If there are requests that can still be routed to the instance before synchronization without new reserve entry
+        # If there are requests that can still be routed to
+        # the instance before synchronization without new reserve entry
         # we will not attempt to synchronize with PS
         if len(filtered_request_ids) > 0 and self.config.psrl.sync_and_mig_strategy.sync.check_req_before_sync:
             return False

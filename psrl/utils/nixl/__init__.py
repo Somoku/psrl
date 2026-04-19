@@ -1,3 +1,5 @@
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
+
 from .client import NIXLMultiStorageClients, NIXLStorageClient
 from .global_vars import (
     GLOBAL_PORT_SCANNER,
@@ -11,7 +13,6 @@ from .nixl_spec import (
     NIXLTensorInfo,
 )
 from .server import NIXLMetaServer
-from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 
 __all__ = [
     "NIXLSharding",

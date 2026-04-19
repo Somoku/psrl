@@ -2,15 +2,16 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
+
 import ray
 import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
-from dataclasses import dataclass
 
-from psrl.utils.logger import DualOutputHandler
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name
+from psrl.utils.logger import DualOutputHandler
 from psrl.utils.nixl import NIXLInterface
 
 psrl_logger = logging.getLogger(__file__)
@@ -154,10 +155,13 @@ class PSRL_BaseTrainWorker:
         # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                # NOTE(lhy): Now we use a dict to store the PS handle and the key and shards to transfer and merge them on the PS side.
+                # NOTE(lhy): Now we use a dict to store the PS handle and the key
+                # and shards to transfer and merge them on the PS side.
                 # This is more efficient than calling transfer_train_to_gen for each key and shard, which will cause
                 # a lot of remote calls and may cause the ray actor collapse.
-                ps_handle_to_precision_transfer_key_and_shards_list: dict[str, list[tuple[str, list[tuple[int, ...]]]]] = {}
+                ps_handle_to_precision_transfer_key_and_shards_list: dict[
+                    str, list[tuple[str, list[tuple[int, ...]]]]
+                ] = {}
                 psrl_logger.debug(f"Starting to push model to the PS via NIXL for version {next_ps_model_version}...")
                 for key in self.unified_state_dict:
                     wait_operations = []
@@ -215,10 +219,19 @@ class PSRL_BaseTrainWorker:
                         psrl_logger.debug(f"Wait completed for key {wait_key} to target {wait_target_client_name}")
                         if wait_target_client_name not in ps_handle_to_precision_transfer_key_and_shards_list:
                             ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name] = []
-                        ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name].append((wait_key, wait_shards_to_transfer))
+                        ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name].append(
+                            (wait_key, wait_shards_to_transfer)
+                        )
                 precision_transfer_futures = []
-                for target_client_name, precision_transfer_key_and_shards_list in ps_handle_to_precision_transfer_key_and_shards_list.items():
-                    precision_transfer_futures.append(self._cached_ps_worker_handles[target_client_name].transfer_train_to_gen_merged.remote(precision_transfer_key_and_shards_list))
+                for (
+                    target_client_name,
+                    precision_transfer_key_and_shards_list,
+                ) in ps_handle_to_precision_transfer_key_and_shards_list.items():
+                    precision_transfer_futures.append(
+                        self._cached_ps_worker_handles[target_client_name].transfer_train_to_gen_merged.remote(
+                            precision_transfer_key_and_shards_list
+                        )
+                    )
                 ray.get(precision_transfer_futures)
                 psrl_logger.debug("Starting to push model tag to the PS...")
                 # Ensure all workers have completed the NIXL push operations and precision transfers
@@ -434,9 +447,7 @@ class PSRL_BaseTrainWorker:
         ps_manager_handle = self.train_interface.ps_manager_handle
         my_node_id = self.get_node_id()
         # Prefer PS worker on the same node to avoid cross-node data transfer.
-        client_name = ray.get(
-            ps_manager_handle.get_ps_nixl_train_storage_client_name_for_node.remote(my_node_id)
-        )
+        client_name = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_name_for_node.remote(my_node_id))
         if client_name is None:
             # Fallback: pick the first available PS client.
             if self._cached_ps_nixl_train_storage_client_names is None:
@@ -465,9 +476,7 @@ class PSRL_BaseTrainWorker:
         if self._cached_non_persistent_buffers is not None:
             return self._cached_non_persistent_buffers
         ps_handle = self._get_any_ps_worker_handle()
-        self._cached_non_persistent_buffers = ray.get(
-            ps_handle.get_non_persistent_named_buffers.remote()
-        )
+        self._cached_non_persistent_buffers = ray.get(ps_handle.get_non_persistent_named_buffers.remote())
         psrl_logger.debug(
             f"[_get_non_persistent_buffers_from_ps] Fetched "
             f"{len(self._cached_non_persistent_buffers)} non-persistent buffer(s) from PS."

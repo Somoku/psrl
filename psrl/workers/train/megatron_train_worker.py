@@ -1,11 +1,11 @@
 import logging
 import os
-import ray
-import torch
 from contextlib import nullcontext
-from omegaconf import DictConfig, OmegaConf, open_dict
 from typing import TYPE_CHECKING
 
+import ray
+import torch
+from omegaconf import DictConfig, OmegaConf, open_dict
 from verl import DataProto
 from verl.single_controller.base.decorator import (
     Dispatch,
@@ -17,8 +17,10 @@ from verl.utils.fs import copy_to_local
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.megatron_workers import ActorRolloutRefWorker
 
+from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.common.utils import lazy_import_many_to_globals, lazy_import_to_globals
+from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.logger import (
     DualOutputHandler,
@@ -30,14 +32,12 @@ from psrl.utils.logger import (
     log_dual_events,
     log_tensor,
 )
-from psrl.utils.ray import exclusive_push_model_context
-from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.common.worker_naming import train_client_name
 from psrl.utils.nixl import (
     NIXLClientType,
     NIXLInterface,
     NIXLStorageClient,
 )
+from psrl.utils.ray import exclusive_push_model_context
 from psrl.workers.train import PSRL_BaseTrainWorker, TrainInterface
 
 # Make type checking happy
@@ -363,14 +363,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
         # Extract inv_freq tensors from PS buffers (HF naming).
         inv_freq_tensors = {
-            name: tensor
-            for name, tensor in ps_buffers.items()
-            if name.endswith(".inv_freq") or name == "inv_freq"
+            name: tensor for name, tensor in ps_buffers.items() if name.endswith(".inv_freq") or name == "inv_freq"
         }
         if not inv_freq_tensors:
-            psrl_logger.warning(
-                "[_restore_non_persistent_buffers_from_ps] No inv_freq found in PS buffers."
-            )
+            psrl_logger.warning("[_restore_non_persistent_buffers_from_ps] No inv_freq found in PS buffers.")
             return
 
         # Use the first available inv_freq (all layers share the same value for standard RoPE).
@@ -383,9 +379,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                     # Clear lru_cache: cached cos/sin point to freed/garbage GPU memory.
                     if hasattr(module.forward, "cache_clear"):
                         module.forward.cache_clear()
-                    module.inv_freq = reference_inv_freq.to(
-                        device=device, dtype=module.inv_freq.dtype
-                    )
+                    module.inv_freq = reference_inv_freq.to(device=device, dtype=module.inv_freq.dtype)
                     restored += 1
         psrl_logger.info(
             f"[_restore_non_persistent_buffers_from_ps] Restored inv_freq and cleared "
@@ -499,11 +493,11 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             assert self._is_actor
             if self._is_offload_param:
                 load_megatron_model_to_gpu(self.actor_module, load_grad=False)
-            
+
             data.meta_info["micro_batch_size"] = self.config.rollout.log_prob_micro_batch_size_per_gpu
             data.meta_info["max_token_len"] = self.config.rollout.log_prob_max_token_len_per_gpu
             data.meta_info["use_dynamic_bsz"] = self.config.rollout.log_prob_use_dynamic_bsz
-            
+
             for k, v in data.batch.items():
                 if k != "routed_experts":
                     data.batch[k] = v.to(get_device_id())
@@ -537,7 +531,11 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
         torch.cuda.synchronize()
-        context_manager = exclusive_push_model_context(self.train_interface.ps_manager_handle) if self.is_train_representative_rank else nullcontext()
+        context_manager = (
+            exclusive_push_model_context(self.train_interface.ps_manager_handle)
+            if self.is_train_representative_rank
+            else nullcontext()
+        )
         with context_manager:
             with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
                 PSRL_BaseTrainWorker.push_model(self)

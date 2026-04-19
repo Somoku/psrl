@@ -452,9 +452,7 @@ class DataProcessor:
                 for i in range(batch_size):
                     ray.get(
                         self.ps_manager_handle.add_request.remote(
-                            gen_batch.non_tensor_batch["uid"][
-                                i * self.rollout_n : (i + 1) * self.rollout_n
-                            ].tolist(),
+                            gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
                         )
                     )
                     ray.get(

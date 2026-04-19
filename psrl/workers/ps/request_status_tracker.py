@@ -320,7 +320,8 @@ class RequestStatusTracker:
         """
         Mark requests for abortion.
         If the request is in the COMPLETED status, simply delete it from the status tracker.
-        Otherwise, the request will not be aborted immediately, but will be aborted next time when the request is updated.
+        Otherwise, the request will not be aborted immediately,
+        but will be aborted next time when the request is updated.
 
         Args:
             request_ids (Union[List[int], int]): The unique identifiers of the requests to abort.

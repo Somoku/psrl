@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import warnings
 
 import numpy as np
 import ray
@@ -116,7 +115,7 @@ class RolloutCoordinator(CommandExtension):
         ] = {}  # The latest stale model version of each instance
         self.instance_to_model_version: dict[int, int] = {}  # Track the model version of each instance
         self.ps_model_version = 0  # Current model version in the parameter server
-        self.ready_buffers = set() # The set of ready buffers
+        self.ready_buffers = set()  # The set of ready buffers
 
         # Engine status tracking
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
@@ -240,13 +239,9 @@ class RolloutCoordinator(CommandExtension):
         futures = []
         for i in range(len(wg_list)):
             futures.append(wg_list[i].execute_rank_zero_async("estimate_max_model_len"))
-        max_model_lens = await self._await_futures_with_timeout(
-            futures, "init_route_strategy", tag, wg_indices
-        )
+        max_model_lens = await self._await_futures_with_timeout(futures, "init_route_strategy", tag, wg_indices)
         psrl_logger.info(f"Max model lens on {tag} instances: {max_model_lens}")
-        instance_to_max_model_len = {
-            wg_idx: max(max_model_lens[j]) for j, wg_idx in enumerate(wg_indices)
-        }
+        instance_to_max_model_len = {wg_idx: max(max_model_lens[j]) for j, wg_idx in enumerate(wg_indices)}
         # Use the max model len to budget the kv cache size for each instance
         await self.rollout_router.init_route_strategy.remote(instance_to_max_model_len=instance_to_max_model_len)
 
@@ -256,9 +251,7 @@ class RolloutCoordinator(CommandExtension):
         futures = []
         for i in range(self.gen_wg_size):
             futures.append(self.gen_wg_list[i].execute_rank_zero_async("init_nixl_client"))
-        await self._await_futures_with_timeout(
-            futures, "init_nixl_client", "all", self._get_wgs("all")[1]
-        )
+        await self._await_futures_with_timeout(futures, "init_nixl_client", "all", self._get_wgs("all")[1])
         psrl_logger.info(f"Initialized NIXL client on all {self.gen_wg_size} instances.")
         self._is_init_nixl_client.set()
 
@@ -283,9 +276,7 @@ class RolloutCoordinator(CommandExtension):
         futures = []
         for i in range(self.gen_wg_size):
             futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_protocol", full_tag_list[i]))
-        await self._await_futures_with_timeout(
-            futures, "nixl_protocol", "all", self._get_wgs("all")[1]
-        )
+        await self._await_futures_with_timeout(futures, "nixl_protocol", "all", self._get_wgs("all")[1])
 
     async def nixl_convert_params(self):
         """Convert the model parameters to unified format on rollout and validate instances."""
@@ -293,9 +284,7 @@ class RolloutCoordinator(CommandExtension):
         futures = []
         for i in range(self.gen_wg_size):
             futures.append(self.gen_wg_list[i].execute_rank_zero_async("nixl_convert_params"))
-        await self._await_futures_with_timeout(
-            futures, "nixl_convert_params", "all", self._get_wgs("all")[1]
-        )
+        await self._await_futures_with_timeout(futures, "nixl_convert_params", "all", self._get_wgs("all")[1])
 
     async def initial_pull_from_ps(self, tag: str = "rollout") -> None:
         """
@@ -473,9 +462,7 @@ class RolloutCoordinator(CommandExtension):
                     if instance_ids is not None:
                         for instance_id in instance_ids:
                             futures.append(
-                                self.gen_wg_list[instance_id].execute_rank_zero_async(
-                                    "interrupt_requests", None
-                                )
+                                self.gen_wg_list[instance_id].execute_rank_zero_async("interrupt_requests", None)
                             )
 
                     if not futures:
@@ -667,11 +654,11 @@ class RolloutCoordinator(CommandExtension):
                         continue
                 # Add the instance to the sync list
                 sync_instance_ids.append(instance_id)
-                '''
+                """
                 # NOTE(lhy): currently, we only synchronize with PS for one instance at a time
                 # But the model pulling time can be overlapped
                 break
-                '''
+                """
 
             if sync_instance_ids:
                 await self.sync_with_ps(sync_instance_ids)
@@ -695,7 +682,9 @@ class RolloutCoordinator(CommandExtension):
         """
         self.ps_model_version = version
         assert self.ps_model_version > 0, "PS model version must be greater than 0"
-        assert (self.ps_model_version - 1) in self.ready_buffers, "PS model version must be greater than the ready buffers"
+        assert (self.ps_model_version - 1) in self.ready_buffers, (
+            "PS model version must be greater than the ready buffers"
+        )
         self.ready_buffers.remove(self.ps_model_version - 1)
         psrl_logger.info(f"Updated PS model version to {version}")
 
@@ -713,15 +702,13 @@ class RolloutCoordinator(CommandExtension):
         psrl_logger.info(
             f"Updated rollout instance {rollout_instance_id} model version: {old_version} -> {version_tag}"
         )
-        
+
     def update_ready_buffer(self, ready_buffer: int):
         """
         Update the ready buffer.
         """
         self.ready_buffers.add(ready_buffer)
-        psrl_logger.info(
-            f"Updated ready buffers to: {self.ready_buffers}"
-        )
+        psrl_logger.info(f"Updated ready buffers to: {self.ready_buffers}")
 
     async def sync_with_ps(
         self,
@@ -828,11 +815,10 @@ class RolloutCoordinator(CommandExtension):
                     blocking=True,
                 )
                 if wait_interrupted_partial_requests_loop_back:
-                    await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(
-                        migrate_instance_ids
-                    )
+                    await self.rollout_router.wait_interrupted_partial_requests_loop_back.remote(migrate_instance_ids)
                     psrl_logger.info(
-                        f"All interrupted requests on the migrated instances {migrate_instance_ids} have been looped back"
+                        f"All interrupted requests on the migrated "
+                        f"instances {migrate_instance_ids} have been looped back"
                     )
                 await self.rollout_router.resume_routing.remote()
                 psrl_logger.info("Resumed routing after migration")

@@ -205,8 +205,8 @@ class MegatronConverter(BaseConverter):
 
 
 def convert_megatron_inplace(
-    parameter_mapping: ParameterMapping, 
-    model, 
+    parameter_mapping: ParameterMapping,
+    model,
     mpu: ParallelStates | None = None,
 ):
     """

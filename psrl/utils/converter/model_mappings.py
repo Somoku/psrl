@@ -74,9 +74,7 @@ def reshape_qkv_to_3d(
     num_groups_local = math.gcd(num_heads_local, num_kv_heads_local)
     rows = param.shape[0]
     hidden = param.shape[1] if param.ndim == 2 else 1
-    assert rows % num_groups_local == 0, (
-        f"rows={rows} is not divisible by num_groups_local={num_groups_local}."
-    )
+    assert rows % num_groups_local == 0, f"rows={rows} is not divisible by num_groups_local={num_groups_local}."
     new_shape = (num_groups_local, rows // num_groups_local, hidden)
     # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
     # fused split), so reshape produces a view, not a copy.

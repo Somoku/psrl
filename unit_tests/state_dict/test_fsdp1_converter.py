@@ -66,6 +66,7 @@ def example_with_real_model():
 
     # Convert to HuggingFace format
     from psrl.utils.converter import create_parameter_mapping
+
     parameter_mapping = create_parameter_mapping("FSDP", model.config)
     hf_state_dict, sharding = convert_fsdp_inplace(parameter_mapping, fsdp_model, fsdp_strategy="fsdp")
 

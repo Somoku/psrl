@@ -7,6 +7,7 @@ module should construct worker name strings directly.
 
 NIXL name string constants are imported from psrl.utils.common.nixl_names.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -42,9 +43,7 @@ class WorkerKey:
     def __post_init__(self) -> None:
         """Validate field invariants at construction time."""
         if self.role == "actor":
-            assert self.instance_id == 0, (
-                f"Actor workers must have instance_id=0, got: {self.instance_id!r}."
-            )
+            assert self.instance_id == 0, f"Actor workers must have instance_id=0, got: {self.instance_id!r}."
 
     def to_trainer_name(self) -> str:
         """
@@ -83,8 +82,7 @@ class WorkerKey:
             return f"{NIXL_TRAIN_CLIENT_PREFIX}_{self.rank}"
         else:
             raise AssertionError(
-                f"to_nixl_client_name: unhandled role {self.role!r}. "
-                "Expected 'rollout', 'actor', or 'validate'."
+                f"to_nixl_client_name: unhandled role {self.role!r}. Expected 'rollout', 'actor', or 'validate'."
             )
 
 

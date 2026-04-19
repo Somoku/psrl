@@ -1,17 +1,14 @@
 import logging
 import os
+from collections.abc import Callable
 
 import torch
-import torch.nn as nn
 from torch_memory_saver import torch_memory_saver
+from tqdm import tqdm
 from vllm.config.compilation import CUDAGraphMode
-from vllm.forward_context import set_forward_context
-from vllm.v1.attention.backends.utils import AttentionMetadataBuilder
-from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager, prepare_inputs_to_capture
-from vllm.v1.worker.gpu.dp_utils import make_num_tokens_across_dp
-from vllm.v1.worker.gpu.input_batch import InputBuffers
+from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
+from vllm.model_executor.offloader.base import get_offloader
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
@@ -19,68 +16,60 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.12.0")
+@min_vllm_version("0.18.1")
 class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
     """
     Replace `torch.cuda.graph()` with `torch_memory_saver.cuda_graph()`
 
-    Compatible with vLLM 0.12.0+
+    Compatible with vLLM 0.18.1+
     """
 
-    def capture_graph(
+    @torch.inference_mode()
+    def capture(
         self,
-        num_tokens: int,
-        model: nn.Module,
-        input_buffers: InputBuffers,
-        block_tables: BlockTables,
-        attn_metadata_builders: list[AttentionMetadataBuilder],
-        kv_cache_config: KVCacheConfig,
+        create_forward_fn: Callable[[BatchExecutionDescriptor], Callable[[CUDAGraphMode], None]],
+        progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> None:
-        num_reqs = min(num_tokens, self.max_num_reqs)
-        input_ids = input_buffers.input_ids[:num_tokens]
-        positions = input_buffers.positions[:num_tokens]
-        attn_metadata = prepare_inputs_to_capture(
-            num_reqs,
-            num_tokens,
-            input_buffers,
-            block_tables,
-            attn_metadata_builders,
-            self.max_model_len,
-            kv_cache_config,
-        )
-        num_tokens_across_dp = make_num_tokens_across_dp(self.dp_size, num_tokens)
+        """Capture CUDA graphs.
 
-        # Warm up.
-        with set_forward_context(
-            attn_metadata,
-            self.vllm_config,
-            num_tokens=num_tokens,
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            num_tokens_across_dp=num_tokens_across_dp,
-        ):
-            hidden_states = model(
-                input_ids=input_ids,
-                positions=positions,
-            )
-            if self.hidden_states is None:
-                self.hidden_states = torch.empty_like(hidden_states)
+        Args:
+            create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
+                returns a function that runs forward with a given CUDAGraphMode.
+        """
+        with graph_capture(device=self.device):
+            # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
+            # activations so FULL activations should fit in already allocated
+            # buffers in the graph pool.
+            for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
+                if mode not in self._capture_descs:
+                    continue
 
-        # Capture the graph.
-        assert num_tokens not in self.graphs
-        graph = torch.cuda.CUDAGraph()
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                num_tokens_across_dp=num_tokens_across_dp,
-            ),
-            torch_memory_saver.cuda_graph(graph, pool=self.pool, tag="graph"),
-        ):
-            hidden_states = model(
-                input_ids=input_ids,
-                positions=positions,
-            )
-            self.hidden_states[:num_tokens] = hidden_states
-        self.graphs[num_tokens] = graph
+                descs = self._capture_descs[mode]
+                if is_global_first_rank():
+                    descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
+                for desc in descs:
+                    # Prepare inputs and get forward function
+                    forward_fn = create_forward_fn(desc)
+
+                    # Warmup
+                    forward_fn(CUDAGraphMode.NONE)
+
+                    # Capture
+                    psrl_logger.debug("CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc)
+                    if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        forward_fn(CUDAGraphMode.PIECEWISE)
+                    else:
+                        assert desc not in self.graphs, f"Graph already captured for {desc}"
+                        graph = torch.cuda.CUDAGraph()
+                        # Sync offloader's copy stream before capture.
+                        # Ensure any pre-capture prefetches from offloader are complete.
+                        get_offloader().sync_prev_onload()
+                        with torch_memory_saver.cuda_graph(graph, self.pool, tag="graph"):
+                            forward_fn(CUDAGraphMode.NONE)
+                            # Join offloader's copy stream after forward to avoid
+                            # unjoined stream error. The last layer's start_prefetch
+                            # forks copy_stream, but wait_prefetch only happens in
+                            # the next forward pass.
+                            get_offloader().join_after_forward()
+                        self.graphs[desc] = graph
+        self._graphs_captured = True

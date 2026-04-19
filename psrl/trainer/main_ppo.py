@@ -82,9 +82,7 @@ def _reserve_excess_nodes(config) -> list:
     cluster_nnodes = len(alive_gpu_nodes)
 
     if cluster_nnodes <= total_nnodes:
-        psrl_logger.info(
-            f"Cluster has {cluster_nnodes} GPU nodes, job needs {total_nnodes}; no reservation needed."
-        )
+        psrl_logger.info(f"Cluster has {cluster_nnodes} GPU nodes, job needs {total_nnodes}; no reservation needed.")
         return []
 
     excess_nodes = alive_gpu_nodes[total_nnodes:]
@@ -98,9 +96,7 @@ def _reserve_excess_nodes(config) -> list:
         )
         for _ in range(n_gpus):
             actor = _GpuSlotReserver.options(
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=node_id, soft=False
-                )
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
             ).remote()
             reservers.append(actor)
 

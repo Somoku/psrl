@@ -19,18 +19,13 @@ import math
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import torch
-from torch.nn import Parameter
-
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.hf_converter import HFConverter, convert_hf_inplace
 from psrl.utils.converter.model_mappings import (
-    MappingType,
     ParameterMapping,
     create_parameter_mapping,
-    make_slice_parameter,
     model_registry,
     register_model,
     reshape_qkv_to_3d,
@@ -39,11 +34,12 @@ from psrl.utils.converter.model_mappings import (
 from psrl.utils.converter.modeling.fsdp_modeling import FSDPParameterMapping
 from psrl.utils.converter.modeling.hf_modeling import HFParameterMapping
 from psrl.utils.nixl.nixl_spec import NIXLSharding
-
+from torch.nn import Parameter
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_config(
     num_attention_heads: int = 32,
@@ -77,6 +73,7 @@ def _default_sharding() -> NIXLSharding:
 # ParameterMapping base class
 # ---------------------------------------------------------------------------
 
+
 class TestParameterMappingBase(unittest.TestCase):
     """Tests for ParameterMapping.__init__ and default get_model_info."""
 
@@ -87,8 +84,7 @@ class TestParameterMappingBase(unittest.TestCase):
 
     def test_get_model_info_standard(self):
         # num_heads=32, num_kv_heads=8, hidden=4096 → head_size = 4096 // 32 = 128
-        config = _make_config(num_attention_heads=32, num_key_value_heads=8,
-                               hidden_size=4096, intermediate_size=11008)
+        config = _make_config(num_attention_heads=32, num_key_value_heads=8, hidden_size=4096, intermediate_size=11008)
         info = HFParameterMapping(config).get_model_info()
         self.assertEqual(info["num_heads"], 32)
         self.assertEqual(info["num_kv_heads"], 8)
@@ -116,6 +112,7 @@ class TestParameterMappingBase(unittest.TestCase):
 # HFParameterMapping
 # ---------------------------------------------------------------------------
 
+
 class TestHFParameterMapping(unittest.TestCase):
     """Tests for the HFParameterMapping concrete class."""
 
@@ -131,8 +128,7 @@ class TestHFParameterMapping(unittest.TestCase):
         self.assertIsInstance(mapping, HFParameterMapping)
 
     def test_model_info_correct_via_create(self):
-        config = _make_config(num_attention_heads=16, num_key_value_heads=4,
-                               hidden_size=2048, intermediate_size=8192)
+        config = _make_config(num_attention_heads=16, num_key_value_heads=4, hidden_size=2048, intermediate_size=8192)
         mapping = create_parameter_mapping("HF", config)
         info = mapping.get_model_info()
         self.assertEqual(info["num_heads"], 16)
@@ -143,6 +139,7 @@ class TestHFParameterMapping(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # FSDPParameterMapping
 # ---------------------------------------------------------------------------
+
 
 class TestFSDPParameterMapping(unittest.TestCase):
     """Tests for the FSDPParameterMapping concrete class."""
@@ -159,8 +156,7 @@ class TestFSDPParameterMapping(unittest.TestCase):
 
     def test_model_info_same_as_hf_mapping(self):
         # FSDP and HF use the same default get_model_info — both must agree
-        config = _make_config(num_attention_heads=32, num_key_value_heads=8,
-                               hidden_size=4096, intermediate_size=11008)
+        config = _make_config(num_attention_heads=32, num_key_value_heads=8, hidden_size=4096, intermediate_size=11008)
         hf_info = HFParameterMapping(config).get_model_info()
         fsdp_info = FSDPParameterMapping(config).get_model_info()
         self.assertEqual(hf_info, fsdp_info)
@@ -173,6 +169,7 @@ class TestFSDPParameterMapping(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # ModelRegistry / create_parameter_mapping
 # ---------------------------------------------------------------------------
+
 
 class TestModelRegistry(unittest.TestCase):
     """Tests that ModelRegistry.create_mapping accepts a config, not a path."""
@@ -202,6 +199,7 @@ class TestModelRegistry(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # reshape_qkv_to_3d
 # ---------------------------------------------------------------------------
+
 
 class TestReshapeQKVTo3D(unittest.TestCase):
     """Tests for the reshape_qkv_to_3d helper in model_mappings.py."""
@@ -279,6 +277,7 @@ class TestReshapeQKVTo3D(unittest.TestCase):
 # slice_qkv_proj
 # ---------------------------------------------------------------------------
 
+
 class TestSliceQKVProj(unittest.TestCase):
     """Tests for slice_qkv_proj (returns 2D shards)."""
 
@@ -339,6 +338,7 @@ class TestSliceQKVProj(unittest.TestCase):
 # BaseConverter.maybe_reshape_qkv_to_3d
 # ---------------------------------------------------------------------------
 
+
 class _ConcreteConverter(BaseConverter):
     """Minimal concrete converter for testing maybe_reshape_qkv_to_3d."""
 
@@ -361,20 +361,19 @@ def _make_converter(num_heads=32, num_kv_heads=8, head_size=128) -> _ConcreteCon
 # BaseConverter.__init__ via super()
 # ---------------------------------------------------------------------------
 
+
 class TestBaseConverterInit(unittest.TestCase):
     """Tests that BaseConverter.__init__ populates model_info from parameter_mapping."""
 
     def test_model_info_populated_from_mapping(self):
-        config = _make_config(num_attention_heads=16, num_key_value_heads=4,
-                               hidden_size=2048, intermediate_size=8192)
+        config = _make_config(num_attention_heads=16, num_key_value_heads=4, hidden_size=2048, intermediate_size=8192)
         conv = _ConcreteConverter(HFParameterMapping(config))
         self.assertEqual(conv.model_info["num_heads"], 16)
         self.assertEqual(conv.model_info["num_kv_heads"], 4)
         self.assertEqual(conv.model_info["head_size"], 128)
 
     def test_fsdp_mapping_also_populates_model_info(self):
-        config = _make_config(num_attention_heads=32, num_key_value_heads=8,
-                               hidden_size=4096, intermediate_size=11008)
+        config = _make_config(num_attention_heads=32, num_key_value_heads=8, hidden_size=4096, intermediate_size=11008)
         conv = _ConcreteConverter(FSDPParameterMapping(config))
         self.assertEqual(conv.model_info["num_heads"], 32)
         self.assertEqual(conv.model_info["num_kv_heads"], 8)
@@ -440,9 +439,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((num_heads * head_size, H_shard))
         sharding = _sharding(shard_dim=1, ws=2, rank=1)
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         G = math.gcd(num_heads, num_kv_heads)
         self.assertEqual(out_p.shape, (G, num_heads // G * head_size, H_shard))
         self.assertEqual(out_s.shard_mesh, OrderedDict([(2, 2)]))
@@ -461,9 +458,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((rows, H))
         sharding = _sharding(shard_dim=0, ws=ws, rank=3)
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         # num_heads_local=4, num_kv_heads_local=1 → G_eff = gcd(4,1) = 1
         G_eff = math.gcd(num_heads // ws, num_kv_heads // ws)
         self.assertEqual(out_p.shape, (G_eff, rows // G_eff, H))
@@ -479,9 +474,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((rows, H))
         sharding = _sharding(shard_dim=0, ws=ws, rank=2)
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         G_eff = math.gcd(num_heads // ws, num_kv_heads // ws)  # gcd(8,2)=2
         self.assertEqual(out_p.shape, (G_eff, rows // G_eff, H))
         self.assertIs(out_s, sharding)
@@ -493,9 +486,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((num_heads * head_size, H))
         sharding = _default_sharding()
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         G = math.gcd(num_heads, num_kv_heads)  # 8
         self.assertEqual(out_p.shape, (G, num_heads // G * head_size, H))
         self.assertIs(out_s, sharding)
@@ -513,15 +504,12 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((rows, H))
         sharding = _sharding(shard_dim=0, ws=ws, rank=5)
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, out_s = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         G_global = math.gcd(num_heads, num_kv_heads)  # 8
         steps = ws // G_global  # 2
         self.assertEqual(out_p.shape, (1, rows, H))
         self.assertEqual(out_s.shard_mesh, OrderedDict([(0, G_global), (1, steps)]))
-        self.assertEqual(out_s.shard_indices, [(rank // steps, rank % steps)
-                                               for rank in [5]])
+        self.assertEqual(out_s.shard_indices, [(rank // steps, rank % steps) for rank in [5]])
 
     def test_case_c_shard_indices_rank0(self):
         num_heads, num_kv_heads, head_size = 32, 8, 128
@@ -534,9 +522,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
             param = _make_param((rows, H))
             sharding = _sharding(shard_dim=0, ws=ws, rank=rank)
             conv = _make_converter(num_heads, num_kv_heads, head_size)
-            _, out_s = conv.maybe_reshape_qkv_to_3d(
-                "model.layers.0.self_attn.q_proj.weight", param, sharding
-            )
+            _, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
             expected = [(rank // steps, rank % steps)]
             self.assertEqual(out_s.shard_indices, expected, f"rank={rank}")
 
@@ -549,9 +535,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         sharding = _sharding(shard_dim=0, ws=10, rank=1)
         conv = _make_converter(num_heads, num_kv_heads, head_size)
         with self.assertRaises(AssertionError):
-            conv.maybe_reshape_qkv_to_3d(
-                "model.layers.0.self_attn.q_proj.weight", param, sharding
-            )
+            conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
 
     # -----------------------------------------------------------------------
     # Storage sharing
@@ -563,9 +547,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((num_heads * head_size, H))
         sharding = _default_sharding()
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, _ = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, _ = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         self.assertEqual(
             out_p.data.untyped_storage().data_ptr(),
             param.data.untyped_storage().data_ptr(),
@@ -578,9 +560,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((rows, H))
         sharding = _sharding(shard_dim=0, ws=16, rank=0)
         conv = _make_converter(num_heads, num_kv_heads, head_size)
-        out_p, _ = conv.maybe_reshape_qkv_to_3d(
-            "model.layers.0.self_attn.q_proj.weight", param, sharding
-        )
+        out_p, _ = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
         self.assertEqual(
             out_p.data.untyped_storage().data_ptr(),
             param.data.untyped_storage().data_ptr(),
@@ -597,9 +577,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         for name in ("k_proj.weight", "v_proj.weight", "q_proj.bias"):
             param = _make_param((num_kv_heads * head_size, H))
             sharding = _default_sharding()
-            out_p, _ = conv.maybe_reshape_qkv_to_3d(
-                f"model.layers.0.self_attn.{name}", param, sharding
-            )
+            out_p, _ = conv.maybe_reshape_qkv_to_3d(f"model.layers.0.self_attn.{name}", param, sharding)
             self.assertEqual(out_p.ndim, 3, f"Expected 3D for {name}")
 
     # -----------------------------------------------------------------------
@@ -695,6 +673,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
 # HFConverter.convert_state_and_sharding_dict
 # ---------------------------------------------------------------------------
 
+
 def _make_minimal_hf_model(num_heads=32, num_kv_heads=8, head_size=128, hidden=4096):
     """Build a tiny fake HF-like model with a q_proj, k_proj, v_proj and a non-QKV param."""
 
@@ -732,8 +711,12 @@ class TestHFConverter(unittest.TestCase):
     """Tests for HFConverter (and convert_hf_inplace convenience wrapper)."""
 
     def _converter(self, num_heads=32, num_kv_heads=8, head_size=128, hidden=4096):
-        config = _make_config(num_attention_heads=num_heads, num_key_value_heads=num_kv_heads,
-                               hidden_size=hidden, intermediate_size=11008)
+        config = _make_config(
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+            hidden_size=hidden,
+            intermediate_size=11008,
+        )
         return HFConverter(HFParameterMapping(config))
 
     def test_all_keys_present(self):
@@ -753,9 +736,11 @@ class TestHFConverter(unittest.TestCase):
         model = _make_minimal_hf_model()
         conv = self._converter()
         state, _ = conv.convert_state_and_sharding_dict(model)
-        for key in ("model.layers.0.self_attn.q_proj.weight",
-                    "model.layers.0.self_attn.k_proj.weight",
-                    "model.layers.0.self_attn.v_proj.weight"):
+        for key in (
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ):
             self.assertEqual(state[key].ndim, 3, f"Expected 3D for {key}")
 
     def test_non_qkv_weight_is_2d(self):
@@ -810,8 +795,7 @@ class TestHFConverter(unittest.TestCase):
         self.assertEqual(q.ndim, 2)
 
     def test_convert_hf_inplace_wrapper(self):
-        config = _make_config(num_attention_heads=32, num_key_value_heads=8,
-                               hidden_size=4096, intermediate_size=11008)
+        config = _make_config(num_attention_heads=32, num_key_value_heads=8, hidden_size=4096, intermediate_size=11008)
         model = _make_minimal_hf_model()
         state, sharding = convert_hf_inplace(HFParameterMapping(config), model)
         self.assertIn("model.layers.0.self_attn.q_proj.weight", state)
@@ -837,6 +821,7 @@ class TestHFConverter(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Subclass get_model_info via super()
 # ---------------------------------------------------------------------------
+
 
 class TestSubclassGetModelInfo(unittest.TestCase):
     """Verify that MOE-style subclasses extending super().get_model_info() work."""
@@ -910,7 +895,6 @@ class TestLoadStateDictNdimMismatchSlicing(unittest.TestCase):
         src_2d = torch.randn(512, 2048)
         # Each PS worker registered a (1, 128, 2048) shard
         dst_sample = torch.empty(1, 128, 2048)
-        sharding = self._make_sharding(shard_mesh={0: 4}, shard_indices=[(0,)])
 
         for i in range(4):
             sharding_i = self._make_sharding(shard_mesh={0: 4}, shard_indices=[(i,)])
@@ -928,9 +912,7 @@ class TestLoadStateDictNdimMismatchSlicing(unittest.TestCase):
         """
         src_2d = torch.randn(512, 2048)
         dst_sample = torch.empty(1, 128, 2048)
-        sharding = self._make_sharding(
-            shard_mesh={0: 4}, shard_indices=[(0,), (1,), (2,), (3,)]
-        )
+        sharding = self._make_sharding(shard_mesh={0: 4}, shard_indices=[(0,), (1,), (2,), (3,)])
         shards = self._extract_shard_ndim_mismatch(src_2d, dst_sample, sharding)
         self.assertEqual(len(shards), 4)
         for i, shard in enumerate(shards):

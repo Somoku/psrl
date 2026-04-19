@@ -16,7 +16,7 @@ from omegaconf import DictConfig, ListConfig
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
 from verl import DataProto
-from vllm import LLM, SamplingParams
+from vllm import SamplingParams
 from vllm.config import CompilationConfig
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import PromptType, TokensPrompt
@@ -84,6 +84,7 @@ class PSRL_vLLMRollout:
         # The inner parallel workers are handled by vLLM + Ray.
         if model_parallel_size > 1:
             import os
+
             if os.environ.get("LOCAL_RANK") != "0":
                 self.inference_engine = None
                 return

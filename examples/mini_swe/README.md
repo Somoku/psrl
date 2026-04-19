@@ -1,6 +1,6 @@
 # mini-SWE-agent Training Recipe
 
-Train language models to solve software engineering tasks using reinforcement learning. This recipe integrates [mini-SWE-agent](https://github.com/SWE-agent/mini-SWE-agent) (v2) as a **Python library** with PSRL's GRPO trainer, enabling models to learn from interactive coding feedback in Docker-sandboxed environments.
+Train language models to solve software engineering tasks using reinforcement learning. This recipe integrates [mini-SWE-agent](https://github.com/SWE-agent/mini-SWE-agent) (v2) as a **Python library** with PSRL's trainer, enabling models to learn from interactive coding feedback in Docker-sandboxed environments.
 
 ## Overview
 
@@ -128,13 +128,37 @@ python prepare/prepare_data.py \
 
 ## Training
 
+A ready-to-run multi-node FSDP script is provided:
+
+```bash
+bash examples/mini_swe/fsdp_qwen_7b_dapo.sh
+```
+
+The script targets 4 nodes × 8 GPUs (2 nodes for rollout, 2 for training) with
+Qwen2.5-7B-Instruct. Edit the cluster-layout variables at the top to match your
+hardware.
+
+Key parameters set by the script (passed to `psrl.trainer.main_ppo`):
+
+```
+gen_actor_rollout_ref.rollout.multi_turn.enable=True
+gen_actor_rollout_ref.rollout.multi_turn.max_turns=30
+gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=<path>/mini_swe_agent_config.yaml
+gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env
+gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data
+custom_reward_function.path=<path>/examples/mini_swe/reward.py
+custom_reward_function.name=compute_score
+algorithm.adv_estimator=grpo
+```
+
+For a minimal single-node smoke test:
+
 ```bash
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
-python -m psrl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
-    data.train_files="['data/mini_swe_agent/train.parquet']" \
-    data.val_files="['data/mini_swe_agent/test.parquet']" \
+python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
+    data.train_files="['${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/train.parquet']" \
+    data.val_files="['${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/test.parquet']" \
     data.prompt_key=prompt \
     data.return_raw_chat=True \
     data.max_prompt_length=2048 \
@@ -147,6 +171,7 @@ python -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
     custom_reward_function.path=${PSRL_PATH}/examples/mini_swe/reward.py \
     custom_reward_function.name=compute_score \
+    algorithm.adv_estimator=grpo \
     trainer.total_epochs=10 \
     trainer.project_name=mini_swe_agent \
     trainer.experiment_name=mini_swe_grpo
@@ -164,18 +189,21 @@ MiniSWEAgentRuntimeConfig (dataclass defaults in config.py)
 
 ### Agent loop config (`config/mini_swe_agent_config.yaml`)
 
+`agent.system_template` and `agent.problem_template` are **required** — no hardcoded defaults exist. `build_runtime_config` raises `ValueError` if either is left empty after YAML merge.
+
 ```yaml
 - name: mini_swe_agent
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
   sandbox_config:
-    output:
-      enable: true
-      dir: ""
-    max_parallel_tasks_per_worker: 4
+    max_parallel_tasks_per_worker: 0   # 0 = unlimited
     environment:
       image: "python:3.11-slim"
       container_timeout: "2h"
-  agent: {}
+  agent:
+    system_template: |
+      <your system prompt here>
+    problem_template: |
+      <your per-problem prompt here — use {{ task }}, {{ cwd }}, {{ system }}, etc.>
 ```
 
 ### Key config fields
@@ -183,17 +211,18 @@ MiniSWEAgentRuntimeConfig (dataclass defaults in config.py)
 | Field | Category | Description |
 |-------|----------|-------------|
 | `rollout.multi_turn.enable` | Required | Must be `True` for mini-SWE-agent |
-| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode (also used as agent step_limit) |
-| `sandbox_config.output.enable` | Infrastructure | Whether to write per-problem `.txt` trajectory files (default: `true`) |
-| `sandbox_config.output.dir` | Infrastructure | Base output directory; trajectories are grouped by model version under `v{N}/` subdirectories (default: `psrl.logging_path/mini-SWE-agent`) |
+| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode (also passed as agent `step_limit`) |
+| `psrl.agentic_rl.trajectory_output.enable` | Infrastructure | Whether to write per-problem `.txt` trajectory files |
+| `psrl.agentic_rl.trajectory_output.dir` | Infrastructure | Base output directory; trajectories are grouped by model version under `v{N}/` sub-directories. Defaults to `<psrl.logging_path>/trajectories` |
 | `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node; `0` = unlimited |
 | `sandbox_config.environment.image` | Data-affine | Docker image for sandbox (default: `python:3.11-slim`) |
 | `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (default: `/testbed`) |
 | `sandbox_config.environment.container_timeout` | Infrastructure | Max container lifetime (default: `2h`) |
 | `sandbox_config.environment.env` | Infrastructure | Docker container env vars (default: disables pagers) |
 | `sandbox_config.environment.run_args` | Infrastructure | Extra `docker run` flags |
-| `agent.system_template` | Data-affine | System prompt template |
-| `agent.problem_template` | Data-affine | Per-problem prompt template (maps to mini-swe-agent's `instance_template`) |
+| `agent.system_template` | **Required** | System prompt template (no default) |
+| `agent.problem_template` | **Required** | Per-problem prompt template; maps to mini-swe-agent's `instance_template` kwarg (no default) |
+| `agent.cost_limit` | Optional | LiteLLM cost limit per episode (default: `0.0` = unlimited) |
 
 ## Architecture: How It Works
 
@@ -216,13 +245,14 @@ Inherited from `LitellmTextbasedModel` (no custom code needed):
 ### Thread bridging
 
 mini-swe-agent's `DefaultAgent.run()` is synchronous. PSRL's rollout is async. The bridge:
-- `DefaultAgent.run(task)` runs in a worker thread via `loop.run_in_executor()`.
+- `DefaultAgent.run(task)` runs in a **dedicated thread pool** (`_AGENT_THREAD_POOL`, max 32 threads, separate from the default asyncio executor to prevent deadlocks with `asyncio.to_thread`).
 - `DockerEnvironment` is created **in the worker thread** (its `__init__` starts a Docker container synchronously).
-- The async generation loop polls `request_queue` and feeds `response_queue`.
+- The async generation loop polls `request_queue` with a 0.1 s sleep and feeds `response_queue`.
+- `_PSRLModel.query()` blocks on `response_queue` with a 600 s timeout.
 
 ### Reward Function
 
-Computes a patch-based reward with bash-tool-use shaping for `mini_swe_agent` data sources. Tool usage detection targets mini-SWE-agent v2 bash patterns (`sed -i`, `cat <<`, `tee`, `patch`, etc.).
+Computes a patch-based reward with bash-tool-use shaping for `mini_swe_agent` and `mini_swe_agent_simple` data sources. Tool usage detection targets mini-SWE-agent v2 bash patterns (`sed -i`, `cat <<`, `tee`, `patch`, etc.).
 
 | Condition | Score |
 |-----------|-------|
@@ -230,12 +260,13 @@ Computes a patch-based reward with bash-tool-use shaping for `mini_swe_agent` da
 | Partial patch match | `0.10` -- `0.85` |
 | Patch on wrong files | `0.05` |
 | No patch, but edited correct file | `0.05` |
-| No patch, but ran tests | `0.03` |
-| No patch, but made edits | `0.02` |
-| No patch, but explored code | `0.01` |
+| No patch, but ran tests or python | `0.03` |
+| No patch, but made edits (wrong file) | `0.02` |
+| No patch, but explored correct file (cat/ls) | `0.02` |
+| No patch, but explored code (cat/ls, wrong file) | `0.01` |
 | Alignment failed / 0 turns / timeout | `0.0` |
-| Long and fruitless (>=10 turns) | `-0.05` |
-| Premature exit (<=2 turns) | `-0.1` |
+| Long and fruitless (>=10 turns, no editor) | `-0.05` |
+| Premature exit (<=2 turns, no tool use) | `-0.1` |
 
 ## Troubleshooting
 
@@ -276,6 +307,6 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kw
 
 ### Custom Prompt Templates
 
-Override templates in `mini_swe_agent_config.yaml` via `agent.system_template` / `agent.problem_template`. Templates use Jinja2 with variables: `{{ task }}`, `{{ system }}`, `{{ release }}`, `{{ version }}`, `{{ machine }}`.
+Override templates in `mini_swe_agent_config.yaml` via `agent.system_template` / `agent.problem_template`. Templates use Jinja2 with variables: `{{ task }}`, `{{ cwd }}`, `{{ system }}`, `{{ release }}`, `{{ version }}`, `{{ machine }}`.
 
 The model must output bash commands in `mswea_bash_command` fenced blocks (text-based model class).

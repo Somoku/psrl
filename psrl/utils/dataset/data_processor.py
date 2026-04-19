@@ -405,6 +405,8 @@ class DataProcessor:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "agent_name" in batch_dict.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("agent_name")
+                if "extra_info" in batch_dict.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("extra_info")
                 if self.rollout_n > 1:
                     non_tensor_batch_keys_to_pop.append("parent_id")
                 else:

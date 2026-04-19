@@ -192,7 +192,7 @@ class PSRL_GenWorker(Worker):
                 * self.psrl_config.rollout_n
                 // self.psrl_config.deployment.n_rollout_instances
             )
-        self.log_active_tasks_interval = self.avg_max_active_tasks_len // 8
+        self.log_active_tasks_interval = max(self.avg_max_active_tasks_len // 8, 1)
 
         self._lora_rank = self.config.model.get("lora_rank", 0)
         self._is_lora = self._lora_rank > 0

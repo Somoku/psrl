@@ -149,9 +149,6 @@ class PSRL_RayPPOTrainer:
         # Parameter server handle for other workers to access
         self.ps_manager_handle = None
 
-        # Async rollout mode for training worker
-        self.async_rollout_mode = False
-
         # Indicate whether current mode is rollout mode in actor
         self.is_rollout_mode_in_actor = (
             self.config.psrl.colocate_validate_and_train and self.config.trainer.val_before_train
@@ -515,9 +512,18 @@ class PSRL_RayPPOTrainer:
         """Stop the data processor."""
         if self.data_processor is not None:
             psrl_logger.debug("Stopping data processor...")
-            ray.get(self.data_processor.stop_busy_loop.remote())
-            self.data_processor = None
-            psrl_logger.debug("Data processor stopped successfully.")
+            try:
+                ray.get(self.data_processor.stop_busy_loop.remote(), timeout=60)
+                self.data_processor = None
+                psrl_logger.debug("Data processor stopped successfully.")
+            except ray.exceptions.GetTimeoutError:
+                psrl_logger.error("Timeout stopping data processor (60s), force killing.")
+                ray.kill(self.data_processor, no_restart=True)
+                self.data_processor = None
+            except Exception as e:
+                psrl_logger.error(f"Error stopping data processor: {e}", exc_info=True)
+                ray.kill(self.data_processor, no_restart=True)
+                self.data_processor = None
         else:
             psrl_logger.warning("Data processor is not initialized, skipping stop operation.")
 
@@ -543,14 +549,41 @@ class PSRL_RayPPOTrainer:
         ray.get(self.agent_loop_manager.start_busy_loop.remote())
 
     def stop_agent_loop_manager(self):
-        """Stop the agent loop manager."""
+        """Stop the agent loop manager.
+        
+        This method gracefully shuts down the agent loop manager and waits
+        for all its internal tasks to complete. A timeout is applied to prevent
+        indefinite hangs in case of deadlocks.
+        """
         if self.agent_loop_manager is not None:
             psrl_logger.debug("Stopping agent loop manager...")
-            ray.get(self.agent_loop_manager.stop_busy_loop.remote())
-            self.agent_loop_manager = None
-            psrl_logger.debug("Agent loop manager stopped successfully.")
+            try:
+                # Apply a 60-second timeout to prevent indefinite hangs
+                ray.get(self.agent_loop_manager.stop_busy_loop.remote(), timeout=60)
+                self.agent_loop_manager = None
+                psrl_logger.debug("Agent loop manager stopped successfully.")
+            except ray.exceptions.GetTimeoutError:
+                psrl_logger.error(
+                    "Timeout waiting for agent loop manager to stop (60s). "
+                    "This may indicate a deadlock or resource contention issue."
+                )
+                # Force cleanup by killing the actor
+                if self.agent_loop_manager is not None:
+                    ray.kill(self.agent_loop_manager, no_restart=True)
+                    self.agent_loop_manager = None
+                    psrl_logger.warning("Agent loop manager actor was forcefully killed.")
+            except Exception as e:
+                psrl_logger.error(f"Error stopping agent loop manager: {e}", exc_info=True)
+                # Attempt to kill the actor on any error
+                if self.agent_loop_manager is not None:
+                    try:
+                        ray.kill(self.agent_loop_manager, no_restart=True)
+                        self.agent_loop_manager = None
+                    except Exception as kill_error:
+                        psrl_logger.error(f"Failed to kill agent loop manager actor: {kill_error}")
         else:
             psrl_logger.warning("Agent loop manager is not initialized, skipping stop operation.")
+
 
     def init_rollout_router(self):
         """Initialize the rollout router for routing requests to rollout instances."""
@@ -635,9 +668,18 @@ class PSRL_RayPPOTrainer:
         """Stop the rollout coordinator."""
         if self.rollout_coordinator is not None:
             psrl_logger.debug("Stopping rollout coordinator...")
-            ray.get(self.rollout_coordinator.stop_busy_loop.remote())
-            self.rollout_coordinator = None
-            psrl_logger.debug("Rollout coordinator stopped successfully.")
+            try:
+                ray.get(self.rollout_coordinator.stop_busy_loop.remote(), timeout=60)
+                self.rollout_coordinator = None
+                psrl_logger.debug("Rollout coordinator stopped successfully.")
+            except ray.exceptions.GetTimeoutError:
+                psrl_logger.error("Timeout stopping rollout coordinator (60s), force killing.")
+                ray.kill(self.rollout_coordinator, no_restart=True)
+                self.rollout_coordinator = None
+            except Exception as e:
+                psrl_logger.error(f"Error stopping rollout coordinator: {e}", exc_info=True)
+                ray.kill(self.rollout_coordinator, no_restart=True)
+                self.rollout_coordinator = None
         else:
             psrl_logger.warning("Rollout coordinator is not initialized, skipping stop operation.")
 
@@ -677,9 +719,18 @@ class PSRL_RayPPOTrainer:
         """Stop the reward manager."""
         if self.reward_manager is not None:
             psrl_logger.debug("Stopping reward manager...")
-            ray.get(self.reward_manager.stop_busy_loop.remote())
-            self.reward_manager = None
-            psrl_logger.debug("Reward manager stopped successfully.")
+            try:
+                ray.get(self.reward_manager.stop_busy_loop.remote(), timeout=60)
+                self.reward_manager = None
+                psrl_logger.debug("Reward manager stopped successfully.")
+            except ray.exceptions.GetTimeoutError:
+                psrl_logger.error("Timeout stopping reward manager (60s), force killing.")
+                ray.kill(self.reward_manager, no_restart=True)
+                self.reward_manager = None
+            except Exception as e:
+                psrl_logger.error(f"Error stopping reward manager: {e}", exc_info=True)
+                ray.kill(self.reward_manager, no_restart=True)
+                self.reward_manager = None
         else:
             psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
 
@@ -782,10 +833,6 @@ class PSRL_RayPPOTrainer:
             non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
         )
 
-        # For agent loop, we need reward model keys to compute score.
-        if self.async_rollout_mode:
-            gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
-
         return gen_batch
 
     def _validate(self):
@@ -871,12 +918,13 @@ class PSRL_RayPPOTrainer:
                 non_tensor_batch_keys_to_pop.append("interaction_kwargs")
             if "agent_name" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("agent_name")
+            if "extra_info" in test_batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("extra_info")
             non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
-
             if val_rollout_n > 1:
                 uid_list = []
                 for i in range(batch_size):
@@ -1387,7 +1435,8 @@ class PSRL_RayPPOTrainer:
                 # NOTE(claude): dispatch preload immediately into each PS actor's serial queue; it will
                 # start as soon as that actor's init_model completes, overlapping with gen/val/train
                 # model initialization and NIXL protocol to hide disk I/O latency.
-                preload_futures = self.ps_wg.execute_all_async("preload_checkpoint_to_cpu")
+                if self._resolve_resume_checkpoint_paths() == None:
+                    preload_futures = self.ps_wg.execute_all_async("preload_checkpoint_to_cpu")
                 psrl_logger.info("PS model initialized successfully!")
             elif self.config.psrl.ps_mode == "nixl_gpu":
                 raise NotImplementedError("PS mode 'nixl_gpu' is not implemented yet")
@@ -1400,6 +1449,10 @@ class PSRL_RayPPOTrainer:
         psrl_logger.info("Initializing models in all rollout instances")
         # start rollout coordinator
         self.init_rollout_coordinator()
+        # set_rollout_coordinator must happen before push and pull from PS so that
+        # push_model (called inside the NIXL resume path) can notify the
+        # rollout coordinator of the new model version.
+        ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
         # for rollout indices, which init_nixl_client waits on.
         model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
@@ -1501,29 +1554,37 @@ class PSRL_RayPPOTrainer:
                 futures.extend(self.actor_wg.execute_all_async("nixl_protocol", actor_protocol_mode))
                 futures.append(self.rollout_coordinator.nixl_protocol.remote(rollout_full_tag))
                 ray.get(futures)
-
-            # Now that all NIXL buffers are allocated (meta tensors replaced),
-            # write the preloaded checkpoint tensors into the PS registered buffers.
-            with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
-                # Ensure prefetch finished (likely already done; blocks only if preload
-                # outlasted NIXL protocol, which would be unusual).
-                ray.get(preload_futures)
-                ray.get(self.ps_wg.execute_all_async("write_checkpoint_to_registered_tensors"))
-
+                
             # Bind the PS worker group to PSManager before initial pull, so that PSManager's
             # ps_nixl_agent_names are populated and gen workers can call get_ps_nixl_agent_names.
             psrl_logger.info("Binding PS worker group")
             ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
             psrl_logger.info("PS worker group bound successfully!")
 
-            # When broadcast_init is enabled, rank-0's checkpoint weights are broadcast to
-            # all other PS workers via NIXL GPU-Direct using a binary-tree topology, avoiding
-            # N independent disk reads. Skip this block on the existing path (enabled=False).
-            if self.config.psrl.broadcast_init.enabled:
-                with log_dual_events(
-                    "Broadcast init: PS rank-0 → all workers", psrl_logger, event_type=EventType.INIT
-                ):
-                    ray.get(self.ps_manager_handle._coordinate_broadcast_init.remote())
+            # NOTE(lhy): Two paths are supported:
+            # 1. New training: load checkpoint directly to PS (may broadcast init)
+            # 2. Resume training: load checkpoint into actor and push to PS
+            if self._resolve_resume_checkpoint_paths() == None:
+                # Now that all NIXL buffers are allocated (meta tensors replaced),
+                # write the preloaded checkpoint tensors into the PS registered buffers.
+                with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
+                    # Ensure prefetch finished (likely already done; blocks only if preload
+                    # outlasted NIXL protocol, which would be unusual).
+                    ray.get(preload_futures)
+                    ray.get(self.ps_wg.execute_all_async("write_checkpoint_to_registered_tensors"))
+                # When broadcast_init is enabled, rank-0's checkpoint weights are broadcast to
+                # all other PS workers via NIXL GPU-Direct using a binary-tree topology, avoiding
+                # N independent disk reads. Skip this block on the existing path (enabled=False).
+                if self.config.psrl.broadcast_init.enabled:
+                    with log_dual_events(
+                        "Broadcast init: PS rank-0 → all workers", psrl_logger, event_type=EventType.INIT
+                    ):
+                        ray.get(self.ps_manager_handle._coordinate_broadcast_init.remote())
+            else:
+                # If resuming from a checkpoint, load it into the actor and push to PS now,
+                # before initial_pull_from_ps, so gen/val workers get the resume weights on
+                # their first pull instead of the base HF checkpoint weights.
+                self._resume_load_and_push_to_ps()
 
             # Pull checkpoint weights from PS into gen and actor workers via NIXL.
             # NOTE(lhy): gen/val/actor workers are now empty-initialized and must pull from PS on startup.
@@ -1703,6 +1764,19 @@ class PSRL_RayPPOTrainer:
         ray.get(self.actor_wg.execute_all_async("pull_model"))
         psrl_logger.info(f"Step 7 done in {time.time() - _t:.2f}s.")
 
+        # If a checkpoint load was deferred (NIXL resume path), apply it now.
+        # Actor is awake with valid NIXL connections; overwrite the PS-pulled HF weights
+        # with the checkpoint weights.
+        deferred_path = getattr(self, "_deferred_actor_ckpt_path", None)
+        if deferred_path is not None:
+            psrl_logger.info(f"Resume (NIXL): loading deferred actor checkpoint from {deferred_path}...")
+            self.actor_wg.load_checkpoint(
+                deferred_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
+            self._deferred_actor_ckpt_path = None
+            psrl_logger.info("Resume (NIXL): deferred actor checkpoint loaded.")
+
         psrl_logger.info(f"Switched to trainer mode in {time.time() - _switch_start:.2f}s.")
         self.is_rollout_mode_in_actor = False
 
@@ -1848,6 +1922,106 @@ class PSRL_RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _resolve_resume_checkpoint_paths(self) -> tuple[str, str] | None:
+        """Resolve actor and critic checkpoint paths for resume, without side effects.
+
+        Returns:
+            (actor_path, critic_path) if a resume checkpoint exists, else None.
+            Does NOT set global_steps or load any weights.
+        """
+        if self.config.trainer.resume_mode == "disable":
+            return None
+
+        if self.config.trainer.default_hdfs_dir is not None:
+            raise NotImplementedError("load from hdfs is not implemented yet")
+
+        checkpoint_folder = self.config.trainer.default_local_dir
+        if not os.path.isabs(checkpoint_folder):
+            checkpoint_folder = os.path.join(os.getcwd(), checkpoint_folder)
+        global_step_folder = find_latest_ckpt_path(checkpoint_folder)
+
+        if self.config.trainer.resume_mode == "auto":
+            if global_step_folder is None:
+                return None
+        elif self.config.trainer.resume_mode == "resume_path":
+            assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
+            assert "global_step_" in self.config.trainer.resume_from_path, (
+                "resume ckpt must specify the global_steps"
+            )
+            global_step_folder = self.config.trainer.resume_from_path
+            if not os.path.isabs(global_step_folder):
+                global_step_folder = os.path.join(os.getcwd(), global_step_folder)
+
+        return (
+            os.path.join(global_step_folder, "actor"),
+            os.path.join(global_step_folder, "critic"),
+        )
+
+    def _resume_load_and_push_to_ps(self) -> None:
+        """Load actor resume checkpoint and push weights to PS before initial_pull_from_ps.
+
+        This must be called inside init_workers() after the NIXL protocol and PS buffer
+        initialisation (write_checkpoint_to_registered_tensors / broadcast_init) but
+        before initial_pull_from_ps, so that gen/val workers receive resume weights on
+        their very first pull.
+
+        Two cases:
+        - Path A (is_rollout_mode_in_actor=False): actor already has a live NIXL
+          connection and real GPU memory; load directly then push.
+        - Path B (is_rollout_mode_in_actor=True): actor is in meta-sleep with only
+          meta-tensor NIXL descriptors. We perform a mini wake → load → push → sleep
+          cycle. switch_to_trainer_mode() will do a proper wake later with a full
+          info-broadcast; the sleep here uses "full" mode (deregister NIXL) so
+          switch_to_trainer_mode re-registers with fresh addresses.
+
+        Sets self._actor_resume_loaded = True when a checkpoint was applied, which
+        causes _load_checkpoint() to skip the actor re-load.
+        """
+        is_nixl_mode = self.config.psrl.ps_mode in ["nixl_cpu", "nixl_gpu"]
+        if not is_nixl_mode:
+            return
+
+        resume_paths = self._resolve_resume_checkpoint_paths()
+        assert resume_paths is not None, "Resume checkpoint paths are not resolved"
+
+        actor_path, _ = resume_paths
+
+        if not self.is_rollout_mode_in_actor:
+            # Path A: actor NIXL is live; load checkpoint then push.
+            with log_dual_events(
+                "Resume (Path A): load actor ckpt + push to PS", psrl_logger, event_type=EventType.INIT
+            ):
+                psrl_logger.info(f"Resume (Path A): loading actor checkpoint from {actor_path}...")
+                self.actor_wg.load_checkpoint(
+                    actor_path,
+                    del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                )
+                psrl_logger.info("Resume (Path A): pushing resume weights to PS...")
+                ray.get(self.actor_wg.execute_all_async("push_model"))
+                psrl_logger.info("Resume (Path A): PS now holds resume checkpoint weights.")
+        else:
+            # Path B: actor is in meta-sleep; perform mini wake → load → push → sleep.
+            # nixl_push_model is a WRITE from actor to PS
+            # PS does not need to know actor's new addresses, so no info-broadcast step is required here.
+            with log_dual_events(
+                "Resume (Path B): mini wake-load-push-sleep cycle", psrl_logger, event_type=EventType.INIT
+            ):
+                psrl_logger.info("Resume (Path B): waking actor for checkpoint push...")
+                ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
+                psrl_logger.info(f"Resume (Path B): loading actor checkpoint from {actor_path}...")
+                self.actor_wg.load_checkpoint(
+                    actor_path,
+                    del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                )
+                psrl_logger.info("Resume (Path B): pushing resume weights to PS...")
+                ray.get(self.actor_wg.execute_all_async("push_model"))
+                # Sleep with "full" mode: release GPU memory AND deregister NIXL.
+                # switch_to_trainer_mode() will re-register with fresh addresses.
+                ray.get(self.actor_wg.execute_all_async("nixl_sleep", "full"))
+                psrl_logger.info("Resume (Path B): actor re-sleeping; PS holds resume weights.")
+
+        self._actor_resume_loaded = True
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -1886,11 +2060,32 @@ class PSRL_RayPPOTrainer:
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
-        # load actor (train only)
-        self.actor_wg.load_checkpoint(
-            actor_path,
-            del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
-        )
+
+        # Actor weights were already loaded and pushed to PS inside init_workers()
+        # (see _resume_load_and_push_to_ps).  Skip re-loading here to avoid
+        # overwriting the correct state with a redundant disk read.
+        if getattr(self, "_actor_resume_loaded", False):
+            psrl_logger.info(
+                "Resume: actor checkpoint was already loaded in init_workers(); skipping actor re-load."
+            )
+        else:
+            # In nixl_cpu/nixl_gpu + is_rollout_mode_in_actor: actor is in meta-sleep.
+            # load_checkpoint() would hit a CUDA invalid-argument error (TMS.pause() active).
+            # Defer actor loading until after switch_to_trainer_mode() wakes the actor and
+            # re-establishes NIXL connections; store the path for use there.
+            is_nixl_mode = self.config.psrl.ps_mode in ["nixl_cpu", "nixl_gpu"]
+            need_nixl_resume = is_nixl_mode and self.is_rollout_mode_in_actor
+            if need_nixl_resume:
+                psrl_logger.info(
+                    "Resume (NIXL): deferring actor checkpoint load until after switch_to_trainer_mode."
+                )
+                self._deferred_actor_ckpt_path = actor_path
+            else:
+                # load actor (train only)
+                self.actor_wg.load_checkpoint(
+                    actor_path,
+                    del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+                )
 
         # load critic
         if self.use_critic:
@@ -1898,8 +2093,6 @@ class PSRL_RayPPOTrainer:
                 critic_path,
                 del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
             )
-
-        # TODO(lhy): push the actor model state dict to the PS worker (though it is not necessary to do so)
 
         # load dataloader
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
@@ -1981,6 +2174,9 @@ class PSRL_RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        # Record starting step so buffer_id is always relative to this run's step 0.
+        # (buffer_id = global_steps - 1 - _start_global_steps, so first buffer is always 0)
+        self._start_global_steps = self.global_steps
 
         if self.global_steps >= self.total_training_steps:
             psrl_logger.warning(
@@ -1993,7 +2189,6 @@ class PSRL_RayPPOTrainer:
 
         futures = []
         futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
-        futures.append(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         for agent_loop_worker in self.agent_loop_workers:
             futures.append(agent_loop_worker.set_agent_loop_manager.remote(self.agent_loop_manager))
         ray.get(futures)
@@ -2070,7 +2265,7 @@ class PSRL_RayPPOTrainer:
                 # Wait for the training batch to be ready
                 with marked_timer("wait_for_gen", timing_raw, color="gray"):
                     if not self.config.psrl.colocate:
-                        buffer_id = self.global_steps - 1
+                        buffer_id = self.global_steps - 1 - self._start_global_steps
                         # will block until the training batch is ready
                         psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
                         with log_dual_events(
@@ -2114,6 +2309,8 @@ class PSRL_RayPPOTrainer:
                             non_tensor_batch_keys_to_pop.append("index")
                         if "agent_name" in batch.non_tensor_batch:
                             non_tensor_batch_keys_to_pop.append("agent_name")
+                        if "extra_info" in batch.non_tensor_batch:
+                            non_tensor_batch_keys_to_pop.append("extra_info")
                         gen_batch = batch.pop(
                             batch_keys=batch_keys_to_pop,
                             non_tensor_batch_keys=non_tensor_batch_keys_to_pop,

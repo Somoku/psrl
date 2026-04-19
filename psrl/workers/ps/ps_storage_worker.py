@@ -652,23 +652,27 @@ class PSStorageWorker:
             return
 
         train_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
-        checkpoint_keys = self._get_checkpoint_keys(
-            copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
-        )
+        # Use NIXL-registered keys (model.state_dict) rather than checkpoint keys so that
+        # tied-weight aliases (e.g. lm_head.weight when tie_word_embeddings=True) are also
+        # broadcast.  The alias buffer on the sender already holds the correct data because
+        # write_checkpoint_to_registered_tensors() filled it; using checkpoint keys would
+        # silently skip it and leave children with uninitialised alias buffers.
+        transfer_keys = list(train_client.local_client_info.tensor_infos.keys())
         psrl_logger.info(
             f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: "
-            f"sending {len(checkpoint_keys)} keys to children {children}."
+            f"sending {len(transfer_keys)} keys to children {children}."
         )
 
         for child_rank in children:
             child_agent = self._ps_agent_name_for_rank(child_rank)
             child_client = self._ps_train_client_name_for_rank(child_rank)
-            for key in checkpoint_keys:
+            for key in transfer_keys:
                 train_client.client_write(
                     target_agent=child_agent,
                     target_client=child_client,
                     key=key,
                     tag="ps_broadcast_init",
+                    use_comm_plan=False,
                 )
 
         # Poll until every NIXL transfer completes. torch.cuda.synchronize() only covers
@@ -676,7 +680,7 @@ class PSStorageWorker:
         # the round barrier (ray.get) would return while data is still in-flight.
         for child_rank in children:
             child_client = self._ps_train_client_name_for_rank(child_rank)
-            for key in checkpoint_keys:
+            for key in transfer_keys:
                 train_client.wait(key, "ps_broadcast_init", "WRITE", target_client=child_client)
         train_client.clear_intermediate_cached_data()
 
@@ -693,14 +697,18 @@ class PSStorageWorker:
         """
         if self.storage_plan.train_gen_model_share():
             return
-        checkpoint_keys = self._get_checkpoint_keys(
-            copy_to_local(self.model_config.path, use_shm=self.model_config.get("use_shm", False))
-        )
+        # Use the NIXL-registered key set (model.state_dict keys) rather than the
+        # checkpoint key set.  The two differ when tie_word_embeddings=True: the alias
+        # key (lm_head.weight) is registered in the NIXL buffer but absent from the
+        # checkpoint, so using _get_checkpoint_keys would silently leave the gen buffer
+        # for that key uninitialised on non-rank-0 workers.
+        push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        registered_keys = list(push_client.local_client_info.tensor_infos.keys())
         psrl_logger.info(
             f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: "
-            f"transferring {len(checkpoint_keys)} keys from train to gen buffer."
+            f"transferring {len(registered_keys)} keys from train to gen buffer."
         )
-        for key in checkpoint_keys:
+        for key in registered_keys:
             self.transfer_train_to_gen(key=key, sync=False)
         if self.use_gpu:
             torch.cuda.synchronize()

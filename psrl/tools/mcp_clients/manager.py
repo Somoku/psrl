@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from psrl.tools.mcp_clients.schema import MCPToolSchema
-from psrl.tools.mcp_clients.token_bucket import TokenBucket
+from psrl.utils.concurrency import TokenBucket
 
 psrl_logger = logging.getLogger(__name__)
 

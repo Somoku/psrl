@@ -6,7 +6,7 @@ from omegaconf import DictConfig
 from verl import DataProto
 
 from psrl.utils.common.http_utils import post
-from psrl.utils.common.utils import b64_dumps, b64_loads
+from psrl.utils.common.serialization import b64_dumps, b64_loads
 
 
 @dataclass(frozen=True)

@@ -14,7 +14,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.common.utils import lazy_import_to_globals
+from psrl.utils.common.dynamic_import import lazy_import_to_globals
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
@@ -1052,7 +1052,22 @@ class NIXLStorageClient:
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
     ) -> list[tuple[int, ...]]:
-        """Read from another client, supports shard alignment and communication plan."""
+        """Read from another client, supports shard alignment and communication plan.
+
+        Args:
+            target_agent: NIXL agent name of the remote worker to read from.
+            target_client: Client name on the remote agent that holds the tensor.
+            key: Parameter name identifying the tensor to transfer.
+            tag: Opaque string used to track the transfer handle (must be unique
+                per concurrent in-flight transfer for the same key).
+            comm_plan: Optional explicit communication plan overriding
+                ``self._comm_plan``.  When ``None`` the stored plan (if any) is
+                used; when supplied it takes precedence.
+            merge_and_cache_xfer: When ``True``, accumulate descriptors into an
+                internal cache for later bulk submission via
+                ``merge_and_finish_cached_xfer()`` instead of posting the
+                transfer immediately.
+        """
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
@@ -1218,9 +1233,29 @@ class NIXLStorageClient:
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
+        use_comm_plan: bool = True,
     ) -> list[tuple[int, ...]]:
-        """Write to another client, supports shard alignment and communication plan."""
-        plan = comm_plan or self._comm_plan
+        """Write to another client, supports shard alignment and communication plan.
+
+        Args:
+            target_agent: NIXL agent name of the remote worker to write to.
+            target_client: Client name on the remote agent that holds the tensor.
+            key: Parameter name identifying the tensor to transfer.
+            tag: Opaque string used to track the transfer handle (must be unique
+                per concurrent in-flight transfer for the same key).
+            comm_plan: Optional explicit communication plan overriding
+                ``self._comm_plan``.  When ``None`` the stored plan (if any) is
+                used; when supplied it takes precedence.
+            merge_and_cache_xfer: When ``True``, accumulate descriptors into an
+                internal cache for later bulk submission via
+                ``merge_and_finish_cached_xfer()`` instead of posting the
+                transfer immediately.
+            use_comm_plan: If ``False``, ignore both ``comm_plan`` and the stored
+                ``self._comm_plan`` and fall back to default shard-alignment.
+                Useful when writing to a target that is not covered by the
+                existing comm plan (e.g. PS-to-PS broadcast transfers).
+        """
+        plan = (comm_plan or self._comm_plan) if use_comm_plan else None
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
@@ -1969,10 +2004,11 @@ class NIXLMultiStorageClients:
         key: str,
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
+        use_comm_plan: bool = True,
     ):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
-        client.client_write(target_agent, target_client, key, tag, comm_plan)
+        client.client_write(target_agent, target_client, key, tag, comm_plan, use_comm_plan=use_comm_plan)
 
     def wait(
         self,

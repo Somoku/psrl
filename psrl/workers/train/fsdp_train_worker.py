@@ -23,7 +23,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.common.utils import lazy_import_to_globals
+from psrl.utils.common.dynamic_import import lazy_import_to_globals
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.logger import (

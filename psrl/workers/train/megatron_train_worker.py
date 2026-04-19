@@ -18,7 +18,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.common.utils import lazy_import_many_to_globals, lazy_import_to_globals
+from psrl.utils.common.dynamic_import import lazy_import_many_to_globals, lazy_import_to_globals
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.logger import (
     DualOutputHandler,

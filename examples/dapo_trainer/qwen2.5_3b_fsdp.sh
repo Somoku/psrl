@@ -14,6 +14,9 @@ HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
 
+CKPT_ROOT=${CKPT_ROOT:-$PWD}
+default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
+
 GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
@@ -160,8 +163,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
-    trainer.val_before_train=True \
+    trainer.default_local_dir="${default_local_dir}" \
+    trainer.val_before_train=False \
     trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=500 2>&1 | tee ${experiment_name}.log

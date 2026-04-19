@@ -1,5 +1,5 @@
 """
-mini-SWE-Agent AgentData for PSRL.
+mini-SWE-agent AgentData for PSRL.
 
 Handles tokenization of OpenAI-format messages, per-turn recording into
 PSRL's native `Step`/`Trajectory` structures, strict token-level
@@ -150,7 +150,7 @@ class MiniSWEAgentData(AgentData[dict, None]):
             **self.apply_chat_template_kwargs,
         )
 
-    def record_turn(
+    def update_from_external_turn(
         self,
         turn_index: int,
         messages: list[dict],
@@ -158,20 +158,23 @@ class MiniSWEAgentData(AgentData[dict, None]):
         response_ids: list[int],
         response_text: str,
         response_logprobs: list[float],
+        output: DataProto | None = None,
     ) -> None:
         """
-        Record one interaction turn into the trajectory.
+        Record one interaction turn from an external agent into the trajectory.
 
         Creates a new `Step` and stores per-turn metadata in `Step.info["turn_record"]`
-        for later trajectory reconstruction.
+        for later trajectory reconstruction. Also updates routing metadata
+        (`rollout_instance_id` / `version_tag`) from the generation output.
 
         Args:
-            turn_index: Zero-based turn index.
-            messages: Original OpenAI-format messages for this turn.
-            prompt_ids: Tokenized prompt IDs.
-            response_ids: Generated response token IDs.
-            response_text: Decoded response text.
-            response_logprobs: Per-token log probabilities.
+            turn_index (int): Zero-based turn index.
+            messages (list[dict]): Original OpenAI-format messages for this turn.
+            prompt_ids (list[int]): Tokenized prompt IDs.
+            response_ids (list[int]): Generated response token IDs.
+            response_text (str): Decoded response text.
+            response_logprobs (list[float]): Per-token log probabilities.
+            output (DataProto | None): Generation output for updating routing state.
         """
         normalized = normalize_openai_messages(messages)
 
@@ -193,6 +196,9 @@ class MiniSWEAgentData(AgentData[dict, None]):
             "response_logprobs": list(response_logprobs),
         }
 
+        if output is not None:
+            self.update_trajectory_state_from_output(output)
+
     def set_patch(self, patch: str | None) -> None:
         """
         Store the extracted patch for reward computation.
@@ -202,6 +208,8 @@ class MiniSWEAgentData(AgentData[dict, None]):
         """
         self.patch = patch
 
+    # TODO: a workaround solution for token misalignment.
+    # Will replace it with 
     async def reconstruct_and_validate(self) -> bool:
         """
         Strict replay validation of the recorded trajectory.
@@ -362,98 +370,73 @@ class MiniSWEAgentData(AgentData[dict, None]):
         """
         Finalize trajectory and prepare `DataProto` output for training.
 
-        Calls `reconstruct_and_validate()`. If reconstruction fails, sets reward=0.
-        Truncates to configured response_length. Computes reward via reward_manager.
+        Pre-processes the trajectory (reconstruct, handle alignment failure,
+        store mini-swe-specific reward fields), then delegates to
+        `super().finalize_output()` for truncation, non_tensor_batch building,
+        routing metadata, and reward computation.
 
         Args:
-            request: Original request DataProto containing metadata.
+            request (DataProto): Original request DataProto containing metadata.
 
         Returns:
             Finalized DataProto with reward.
         """
         alignment_ok = await self.reconstruct_and_validate()
-
         num_turns = len(self.trajectory.steps)
-        actual_num_turns = num_turns
 
         if not alignment_ok or not self.trajectory.response_ids:
-            # Alignment failed or no response: produce minimal valid output.
             pad_token_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
-            prompt_ids = self.trajectory.prompt_ids if self.trajectory.prompt_ids else [pad_token_id]
-            response_ids = [pad_token_id]
-            response_mask = [1]
-            response_logprobs = [0.0]
+            if not self.trajectory.prompt_ids:
+                self.trajectory.prompt_ids = [pad_token_id]
+            self.trajectory.response_ids = [pad_token_id]
+            self.trajectory.response_mask = [1]
+            self.trajectory.response_logprobs = [0.0]
             effective_num_turns = 0
         else:
-            max_response_length = self.config.gen_actor_rollout_ref.rollout.response_length
-            prompt_ids = self.trajectory.prompt_ids
-            response_ids = self.trajectory.response_ids[:max_response_length]
-            response_mask = self.trajectory.response_mask[:max_response_length]
-            response_logprobs = self.trajectory.response_logprobs[:max_response_length]
             effective_num_turns = num_turns
 
-        # Guarantee at least one mask=1 token.
-        if not any(m == 1 for m in response_mask):
-            pad_token_id = getattr(self.tokenizer, "pad_token_id", 0) or 0
-            response_ids.append(pad_token_id)
-            response_mask.append(1)
-            response_logprobs.append(0.0)
+        # Set turn counts so base's `__num_turns__` formula gives the correct value.
+        # Base formula: `assistant_turns + user_turns + 1`.
+        self.trajectory.assistant_turns = effective_num_turns
+        self.trajectory.user_turns = effective_num_turns
 
-        # Pad logprobs to match response length.
-        if len(response_logprobs) < len(response_ids):
-            response_logprobs.extend([0.0] * (len(response_ids) - len(response_logprobs)))
+        # Store mini-swe-specific fields under `agent_reward_info` (not directly
+        # in `extra_info`).  RewardManager merges this into `extra_info` after
+        # union, so the reward function sees all fields transparently.
+        swe_reward_info = {
+            "patch": self.patch,
+            "num_turns": effective_num_turns,
+            "actual_num_turns": num_turns,
+            "alignment_failed": not alignment_ok,
+            "alignment_failure_reason": self._alignment_failure_reason,
+        }
+        request.non_tensor_batch["agent_reward_info"] = np.array([swe_reward_info])
 
-        # Build output DataProto.
-        non_tensor_batch = request.non_tensor_batch.copy()
-        non_tensor_batch["raw_prompt_ids"] = np.array([prompt_ids])
-        non_tensor_batch["raw_response_ids"] = np.array([response_ids])
-        non_tensor_batch["response_mask"] = np.array([response_mask])
-        non_tensor_batch["rollout_log_probs"] = np.array([response_logprobs])
-        non_tensor_batch["__num_turns__"] = np.array([effective_num_turns * 2 + 1], dtype=np.int32)
+        psrl_logger.info(
+            f"[finalize_output] uid={request.non_tensor_batch.get('uid', ['?'])[0]}, "
+            f"agent_reward_info={swe_reward_info}, "
+            f"non_tensor_batch_keys={list(request.non_tensor_batch.keys())}"
+        )
 
-        # Store extra fields for reward computation.
-        extra_info_raw = non_tensor_batch.get("extra_info", [{}])[0]
-        if isinstance(extra_info_raw, dict):
-            extra_info_raw["patch"] = self.patch
-            extra_info_raw["num_turns"] = effective_num_turns
-            extra_info_raw["actual_num_turns"] = actual_num_turns
-            extra_info_raw["alignment_failed"] = not alignment_ok
-            extra_info_raw["alignment_failure_reason"] = self._alignment_failure_reason
+        # Delegate to base: truncation, non_tensor_batch, routing metadata, reward.
+        return await super().finalize_output(request)
 
-        data = DataProto(non_tensor_batch=non_tensor_batch, meta_info=request.meta_info)
-
-        # Compute reward via reward_manager.
-        reward_result = await self.reward_manager.compute_score.remote(data)
-        if not self.config.reward_model.launch_reward_fn_async:
-            data = self._post_process_and_merge_reward(reward_result, data)
-
-        return data
-
-    # --- Abstract methods not used in subprocess-proxy pattern ---
+    # --- White-box protocol stubs (not used in black-box pattern) ---
 
     def format_chat_completions(self, observation: dict, *, is_init: bool) -> ConversationType:
         """
-        Not used in the subprocess-proxy pattern.
+        Not used. This is a `@whitebox_protocol` method.
         """
-        raise NotImplementedError(
-            "MiniSWEAgentData uses encode_messages() and record_turn() instead "
-            "of the traditional env-step-driven methods."
-        )
+        raise NotImplementedError("MiniSWEAgentData implements the black-box protocol.")
 
     def encode_observation(self, observation: dict, *, is_init: bool) -> tuple[list[int], bool]:
         """
-        Not used in the subprocess-proxy pattern.
+        Not used. This is a `@whitebox_protocol` method.
         """
-        raise NotImplementedError(
-            "MiniSWEAgentData uses encode_messages() and record_turn() instead "
-            "of the traditional env-step-driven methods."
-        )
+        raise NotImplementedError("MiniSWEAgentData implements the black-box protocol.")
 
     def decode_action_from_token_ids(self, token_ids: list[int]) -> None:
         """
-        Not used in the subprocess-proxy pattern.
+        Not used. This is a `@whitebox_protocol` method.
         """
-        raise NotImplementedError(
-            "MiniSWEAgentData uses encode_messages() and record_turn() instead "
-            "of the traditional env-step-driven methods."
-        )
+        raise NotImplementedError("MiniSWEAgentData implements the black-box protocol.")

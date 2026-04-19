@@ -1,12 +1,12 @@
 """
-mini-SWE-Agent Dataset Generator.
+mini-SWE-agent Dataset Generator.
 
 Supports simple test cases (for quick validation), loaded from JSON files.
 
 Data format:
 - prompt: Minimal chat messages (satisfies framework's ``raw_prompt`` requirement).
           The real system/instance templates are applied at runtime by
-          mini-SWE-Agent via ``mini_swe_agent_config.yaml``.
+          mini-SWE-agent via ``mini_swe_agent_config.yaml``.
 - reward_model: Evaluation configuration.
 - extra_info: Contains problem_statement, expected_patch,
               and data-affine overrides (sandbox_overrides / agent_overrides).
@@ -115,7 +115,7 @@ def main() -> None:
     """
     CLI entry point for dataset generation.
     """
-    parser = argparse.ArgumentParser(description="mini-SWE-Agent Dataset Generator")
+    parser = argparse.ArgumentParser(description="mini-SWE-agent Dataset Generator")
     parser.add_argument("--mode", choices=["simple"], default="simple", help="Data generation mode")
     parser.add_argument("--train_size", type=int, default=100)
     parser.add_argument("--test_size", type=int, default=10)

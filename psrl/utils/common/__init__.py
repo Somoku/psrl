@@ -1,7 +1,8 @@
 from .http_utils import *
 from .memory_utils import *
 from .patch_utils import *
-from .utils import *
+from .serialization import *
+from .dynamic_import import *
 
 # NOTE(claude): nixl_names and worker_naming are intentionally not re-exported here.
 # Import them directly: from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME

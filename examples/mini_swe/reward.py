@@ -1,5 +1,5 @@
 """
-Mini-SWE-Agent Reward Function for PSRL.
+mini-SWE-agent Reward Function for PSRL.
 
 Reward structure (for mini_swe_agent data sources):
   1.0       — exact patch match
@@ -173,13 +173,11 @@ def compute_score(
     num_turns = 0
     alignment_failed = False
     alignment_failure_reason = ""
-    alignment_failure_details = ""
     if extra_info is not None:
         generated_patch = extra_info.get("patch", None)
         num_turns = int(extra_info.get("num_turns", 0) or 0)
         alignment_failed = bool(extra_info.get("alignment_failed", False))
         alignment_failure_reason = str(extra_info.get("alignment_failure_reason", "") or "")
-        alignment_failure_details = str(extra_info.get("alignment_failure_details", "") or "")
 
     if isinstance(ground_truth, dict):
         expected_patch = ground_truth.get("gold_patch") or ground_truth.get("ground_truth") or ""
@@ -188,14 +186,13 @@ def compute_score(
 
     # Timeout: agent loop never started (Docker/connection failure).
     if num_turns == 0:
-        psrl_logger.info("mini-SWE-agent reward: score=0.00 (0 turns / timeout).")
+        psrl_logger.debug("[mini-SWE-agent reward] score=0.00 (0 turns / timeout).")
         return 0.0
 
     if alignment_failed:
-        psrl_logger.info(
-            "mini-SWE-agent reward: score=0.00 (alignment failed), "
-            f"turns={num_turns}, reason={alignment_failure_reason or 'unknown'!r}, "
-            f"details={alignment_failure_details or 'n/a'!r}."
+        psrl_logger.debug(
+            "[mini-SWE-agent reward] score=0.00 (alignment failed), "
+            f"turns={num_turns}, reason={alignment_failure_reason or 'unknown'!r}."
         )
         return 0.0
 
@@ -205,8 +202,8 @@ def compute_score(
     # Patch was generated — use patch comparison.
     if generated_patch:
         score = compare_patches(generated_patch, expected_patch)
-        psrl_logger.info(
-            f"mini-SWE-agent reward: score={score:.2f}, patch_len={len(generated_patch)}, "
+        psrl_logger.debug(
+            f"[mini-SWE-agent reward] score={score:.2f}, patch_len={len(generated_patch)}, "
             f"turns={num_turns}, correct_file={hit_correct_file}, tools={tools}."
         )
         return score
@@ -231,8 +228,8 @@ def compute_score(
     if num_turns >= 10 and not tools["used_editor"] and score >= 0.0:
         score = -0.05
 
-    psrl_logger.info(
-        f"mini-SWE-agent reward: score={score:.2f} (no patch), turns={num_turns}, "
+    psrl_logger.debug(
+        f"[mini-SWE-agent reward] score={score:.2f} (no patch), turns={num_turns}, "
         f"correct_file={hit_correct_file}, tools={tools}."
     )
     return score

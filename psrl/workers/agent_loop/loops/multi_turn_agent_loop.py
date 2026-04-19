@@ -58,39 +58,21 @@ async def _null_async_context():
     yield
 
 
-def _finalize_profiling(
-    profiling_collector: TurnProfilingCollector | None,
-    request: DataProto,
-    result: DataProto | None,
-    config: DictConfig,
-) -> None:
+def _format_observation(observation: object) -> str:
     """
-    Finalize profiling data, write to JSONL, and strip profiling fields.
+    Format an environment observation for human-readable trajectory output.
 
-    Args:
-        profiling_collector (TurnProfilingCollector | None): The collector, or
-            None if profiling is disabled.
-        request (DataProto): The original request (for request_id).
-        result (DataProto | None): The finalized output (for cleanup).
-        config (DictConfig): Config for output path.
+    Handles `ConversationType` (list of role/content dicts) by rendering each
+    message as `[role]: content`.  Falls back to `str()` for any other type.
     """
-    if profiling_collector is None or result is None:
-        return
-
-    request_id = int(request.non_tensor_batch.get("uid", [0])[0])
-    profiling_data = profiling_collector.finalize(request_id)
-    if profiling_data is not None:
-        output_path = config.psrl.profile.trajectory.output_dir + "/trajectory_profiling.jsonl"
-        profiling_data.write_jsonl(output_path)
-
-    # Strip profiling fields from non_tensor_batch before returning to trainer.
-    for key in [
-        "profiling_generation_start_wall_ts",
-        "profiling_generation_end_wall_ts",
-        "profiling_prefill_records",
-        "profiling_decode_records",
-    ]:
-        result.non_tensor_batch.pop(key, None)
+    if isinstance(observation, list) and observation and isinstance(observation[0], dict):
+        parts = []
+        for msg in observation:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            parts.append(f"[{role}]: {content}")
+        return "\n\n".join(parts)
+    return str(observation)
 
 
 @register("multi_turn_agent")
@@ -127,11 +109,16 @@ class MultiTurnAgentLoop(AgentLoopBase):
         cls.env_step_timeout = config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
     @rollout_trace_op
-    async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
+    async def run(
+        self,
+        request: DataProto,
+        profiling_collector: TurnProfilingCollector | None = None,
+    ) -> tuple[DataProto | None, TerminateReason]:
         """Execute generation for a single request.
 
         Args:
             request (DataProto): Single input request.
+            profiling_collector: Per-trajectory profiling collector, or None if disabled.
 
         Returns:
             Tuple[DataProto, TerminateReason]: Generated response with metadata and termination reason.
@@ -141,9 +128,11 @@ class MultiTurnAgentLoop(AgentLoopBase):
         generate_times: list[float] = []
         env_step_times: list[float] = []
 
-        # Per-trajectory profiling
-        enable_profiling = self.config.psrl.profile.trajectory.enable
-        profiling_collector = TurnProfilingCollector() if enable_profiling else None
+        # Trajectory text accumulator and version/id state for output writing.
+        traj_text: list[str] = []
+        resolved_version: int | None = None
+        traj_id = str(request.non_tensor_batch["uid"][0])
+        turn_count = 0
 
         env_class = request.non_tensor_batch.get(
             "env_class", [self.config.gen_actor_rollout_ref.rollout.agent.env.name]
@@ -183,6 +172,9 @@ class MultiTurnAgentLoop(AgentLoopBase):
             seed=request.non_tensor_batch.get("seed", None),
         )
 
+        # Record the initial observation (problem statement) before any generation.
+        traj_text.append(f"=== Initial Observation ===\n{_format_observation(observation)}\n\n")
+
         self.agent_data.init_trajectory(request)
 
         overlong_terminate = await self.agent_data.update_from_env(observation, 0, False, info)
@@ -194,8 +186,11 @@ class MultiTurnAgentLoop(AgentLoopBase):
                 env_step_times,
             )
             finalized = await self.agent_data.finalize_output(request)
-            _finalize_profiling(profiling_collector, request, finalized, self.config)
-            return finalized, TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+            terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+            traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+            if resolved_version is not None:
+                self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+            return finalized, terminate_reason
 
         for _ in range(self.max_turns):
             # Currently we still use token-in-token-out generation,
@@ -222,12 +217,25 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     generate_times,
                     env_step_times,
                 )
-                _finalize_profiling(profiling_collector, request, None, self.config)
-                return None, TerminateReason.ABORTED
+                terminate_reason = TerminateReason.ABORTED
+                traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+                if resolved_version is not None:
+                    self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+                return None, terminate_reason
+
+            # Capture version tag from the first successful output.
+            if resolved_version is None:
+                resolved_version = int(output.non_tensor_batch["version_tag"][0])
 
             # Record profiling data for this turn.
             if profiling_collector is not None:
                 profiling_collector.on_turn_complete(output)
+
+            # Decode response text before update_from_model_token_ids, which
+            # pops "raw_response_ids" from output.non_tensor_batch via .pop().
+            turn_count += 1
+            response_ids = output.non_tensor_batch["raw_response_ids"][0]
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
 
             # TODO: we may implement `update_from_model_chat_completion` in the future.
             action, overlong_terminate = await self.agent_data.update_from_model_token_ids(output)
@@ -239,8 +247,14 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     env_step_times,
                 )
                 finalized = await self.agent_data.finalize_output(request)
-                _finalize_profiling(profiling_collector, request, finalized, self.config)
-                return finalized, TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                traj_text.append(
+                    f"=== Turn {turn_count} ===\n"
+                    f"--- assistant ---\n{response_text}\n\n"
+                )
+                traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+                self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+                return finalized, terminate_reason
 
             try:
                 with _append_timer(env_step_times):
@@ -256,8 +270,21 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     env_step_times,
                 )
                 finalized = await self.agent_data.finalize_output(request)
-                _finalize_profiling(profiling_collector, request, finalized, self.config)
-                return finalized, TerminateReason.ENV_TIMEOUT
+                terminate_reason = TerminateReason.ENV_TIMEOUT
+                traj_text.append(
+                    f"=== Turn {turn_count} ===\n"
+                    f"--- assistant ---\n{response_text}\n\n"
+                )
+                traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+                self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+                return finalized, terminate_reason
+
+            # Append turn (response + subsequent observation) to trajectory buffer.
+            traj_text.append(
+                f"=== Turn {turn_count} ===\n"
+                f"--- assistant ---\n{response_text}\n\n"
+                f"--- observation ---\n{_format_observation(observation)}\n\n"
+            )
 
             overlong_terminate = await self.agent_data.update_from_env(observation, reward, done, info)
 
@@ -268,8 +295,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     env_step_times,
                 )
                 finalized = await self.agent_data.finalize_output(request)
-                _finalize_profiling(profiling_collector, request, finalized, self.config)
-                return finalized, TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+                self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+                return finalized, terminate_reason
 
             if done:
                 _set_multi_turn_aggregates(
@@ -278,8 +307,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
                     env_step_times,
                 )
                 finalized = await self.agent_data.finalize_output(request)
-                _finalize_profiling(profiling_collector, request, finalized, self.config)
-                return finalized, TerminateReason.FINISHED
+                terminate_reason = TerminateReason.FINISHED
+                traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+                self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+                return finalized, terminate_reason
 
         _set_multi_turn_aggregates(
             multi_turn_metrics,
@@ -287,5 +318,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
             env_step_times,
         )
         finalized = await self.agent_data.finalize_output(request)
-        _finalize_profiling(profiling_collector, request, finalized, self.config)
-        return finalized, TerminateReason.MAX_TURNS_EXCEEDED
+        terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
+        traj_text.append(f"=== End: {terminate_reason.value} ===\n")
+        self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
+        return finalized, terminate_reason

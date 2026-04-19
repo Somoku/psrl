@@ -1,68 +1,154 @@
 """
-mini-SWE-Agent Loop -- External control multi-turn interaction mode.
+mini-SWE-agent Loop -- In-process library mode.
 
-Intercepts mini-SWE-agent model calls through `ModelProxy`, allowing PSRL to
-control generation and collect training trajectories.
+Uses mini-swe-agent v2 as a Python library instead of a subprocess. A custom
+`_PSRLModel` inherits `LitellmTextbasedModel` and overrides `query()` to
+bridge between mini-swe-agent's synchronous agent loop (running in a worker
+thread) and PSRL's async rollout engine (running in the event loop).
 
-Delegated responsibilities:
-- Config merge / dataclass: `examples.mini_swe.config`.
-- mini-SWE-agent CLI YAML generation: `examples.mini_swe.config.build_mini_sweagent_yaml`.
-- Subprocess lifecycle + Docker cleanup: `examples.mini_swe.subprocess_runner`.
-- Data conversion: `MiniSWEAgentData`.
-- Environment lifecycle: `MiniSWEEnvironment`.
+Communication uses a pair of `queue.Queue` objects:
+- `_PSRLModel.query()` puts messages into `request_queue`, blocks on `response_queue`.
+- The async generation loop consumes `request_queue`, calls vLLM, records the turn,
+  and puts the response text into `response_queue`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import hashlib
 import logging
 import os
-import shutil
-import tempfile
+import queue
 import time
-import uuid
 
-import numpy as np
-from examples.mini_swe.config import (
+# Suppress mini-swe-agent startup banner before importing minisweagent.
+os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+
+from examples.mini_swe.config import (  # noqa: E402
     MiniSWEAgentRuntimeConfig,
-    build_mini_sweagent_yaml,
     build_runtime_config,
 )
-from examples.mini_swe.model_proxy import ModelProxy
-from examples.mini_swe.subprocess_runner import cleanup_instance_containers, execute_mini_swe_agent
-from omegaconf import DictConfig, OmegaConf
-from verl import DataProto
+from litellm import ModelResponse  # noqa: E402
+from minisweagent.agents.default import DefaultAgent  # noqa: E402
+from minisweagent.environments.docker import DockerEnvironment  # noqa: E402
+from minisweagent.models.litellm_textbased_model import LitellmTextbasedModel  # noqa: E402
+from omegaconf import DictConfig, OmegaConf  # noqa: E402
+from verl import DataProto  # noqa: E402
 
-from psrl.environments.mini_swe_env import MiniSWEEnvironment
-from psrl.workers.agent_loop.agent_data.mini_swe_agent_data import (
+from psrl.environments.mini_swe_env import MiniSWEEnvironment  # noqa: E402
+from psrl.utils.common.docker_utils import cleanup_containers_by_label  # noqa: E402
+from psrl.utils.concurrency import SlotManager  # noqa: E402
+from psrl.utils.profiling.collector import TurnProfilingCollector  # noqa: E402
+from psrl.workers.agent_loop.agent_data.mini_swe_agent_data import (  # noqa: E402
     MiniSWEAgentData,
     normalize_openai_messages,
 )
-from psrl.workers.agent_loop.gateway_client import RolloutGatewayClient
-from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
-from psrl.workers.agent_loop.loops.utils import TerminateReason, register
-from psrl.workers.agent_loop.sticky_session import StickySession
+from psrl.workers.agent_loop.gateway_client import RolloutGatewayClient  # noqa: E402
+from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase  # noqa: E402
+from psrl.workers.agent_loop.loops.utils import TerminateReason, register  # noqa: E402
+from psrl.workers.agent_loop.sticky_session import StickySession  # noqa: E402
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 _MIN_GEN_TOKENS = 256
+_QUEUE_POLL_TIMEOUT = 2.0
+
+# Dedicated thread pool for running mini-swe-agent sync code.
+# Separating from the default pool prevents deadlocks when
+# `asyncio.to_thread` (used in the generation loop) competes with
+# `run_in_executor` (used for the agent thread).
+import concurrent.futures
+
+_AGENT_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="mini-swe-agent",
+)
+
+
+# ---------------------------------------------------------------------------
+# In-process model bridging mini-swe-agent -> PSRL rollout
+# ---------------------------------------------------------------------------
+
+
+class _PSRLModel(LitellmTextbasedModel):
+    """
+    Bridge between mini-swe-agent's synchronous `Model` protocol and PSRL's
+    async rollout engine.
+
+    Inherits `LitellmTextbasedModel` to reuse:
+    - `format_message()` (system/user message formatting).
+    - `format_observation_messages()` (observation template rendering).
+    - `_parse_actions()` (regex extraction of ``mswea_bash_command`` blocks).
+    - `get_template_vars()` / `serialize()` (template vars and trajectory serialization).
+    - `config` (`LitellmTextbasedModelConfig` with `observation_template`,
+      `format_error_template`, `action_regex`).
+
+    Only `query()` is overridden to route generation through PSRL instead of HTTP.
+    """
+
+    def __init__(
+        self,
+        request_queue: queue.Queue,
+        response_queue: queue.Queue,
+        **model_kwargs,
+    ):
+        """
+        Initialize the PSRL model bridge.
+
+        Args:
+            request_queue (queue.Queue): Messages from mini-swe-agent -> PSRL async side.
+            response_queue (queue.Queue): Generated text from PSRL async side -> mini-swe-agent.
+            **model_kwargs: Forwarded to `LitellmTextbasedModel` (must include `model_name`).
+        """
+        super().__init__(**model_kwargs)
+        self._req_q = request_queue
+        self._res_q = response_queue
+
+    def query(self, messages: list[dict], **kwargs) -> dict:
+        """
+        Override `LitellmModel.query()` to route through PSRL rollout via queues.
+
+        Called synchronously by `DefaultAgent` in a worker thread.
+        Blocks until the async generation loop puts a response.
+        """
+        psrl_logger.info(f"_PSRLModel.query() called with {len(messages)} messages, waiting for generation...")
+        self._req_q.put(messages)
+        text = self._res_q.get(timeout=600)
+        psrl_logger.info(f"_PSRLModel.query() received response: {len(text)} chars.")
+
+        response = ModelResponse(
+            choices=[{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            model="psrl-rollout",
+        )
+        actions = self._parse_actions(response)
+        message = response.choices[0].message.model_dump()
+        message["extra"] = {
+            "actions": actions,
+            "cost": 0.0,
+            "timestamp": time.time(),
+        }
+        return message
+
+
+# ---------------------------------------------------------------------------
+# Agent loop
+# ---------------------------------------------------------------------------
 
 
 @register("mini_swe_agent")
 class MiniSWEAgentLoop(AgentLoopBase):
     """
-    mini-SWE-Agent loop — external control multi-turn interaction mode.
+    mini-SWE-agent loop -- in-process library mode.
 
     Orchestrates the full episode lifecycle:
-    1. Environment setup (workspace, Docker config)
-    2. ModelProxy start (OpenAI-compatible HTTP server)
-    3. mini-SWE-agent subprocess launch
-    4. Interaction loop (intercept model calls, generate via PSRL rollout)
-    5. Patch extraction, trajectory reconstruction, reward computation
-    6. Cleanup (Docker containers, temp files, ModelProxy)
+    1. Environment setup (parse `DataProto`, build workspace).
+    2. Create `_PSRLModel` + `DockerEnvironment` + `DefaultAgent` (mini-swe-agent).
+    3. Run the agent in a worker thread; consume model requests in the async loop.
+    4. Record turns, extract patch, compute reward.
+    5. Cleanup (Docker containers, temp dirs).
     """
 
     @classmethod
@@ -77,13 +163,24 @@ class MiniSWEAgentLoop(AgentLoopBase):
         cls.prompt_length = config.gen_actor_rollout_ref.rollout.prompt_length
         cls.response_length = config.gen_actor_rollout_ref.rollout.response_length
 
-        # Build runtime config from kwargs (YAML-loaded fields).
         effective_kwargs = kwargs
         if "sandbox_config" not in kwargs:
             effective_kwargs = cls._reload_yaml_config(config, kwargs)
         cls.runtime_config: MiniSWEAgentRuntimeConfig = build_runtime_config(
             yaml_kwargs=effective_kwargs,
         )
+
+        multi_turn = config.gen_actor_rollout_ref.rollout.multi_turn
+        if not getattr(multi_turn, "enable", False):
+            raise ValueError(
+                "mini-SWE-agent requires rollout.multi_turn.enable=True. "
+                "Set gen_actor_rollout_ref.rollout.multi_turn.enable=True in your config."
+            )
+        if getattr(multi_turn, "max_turns", None) is None:
+            raise ValueError(
+                "mini-SWE-agent requires rollout.multi_turn.max_turns to be set. "
+                "Set gen_actor_rollout_ref.rollout.multi_turn.max_turns=<int> in your config."
+            )
 
     @staticmethod
     def _reload_yaml_config(config: DictConfig, kwargs: dict) -> dict:
@@ -107,78 +204,26 @@ class MiniSWEAgentLoop(AgentLoopBase):
             psrl_logger.warning(f"Failed to reload YAML config: {e}.")
         return kwargs
 
-    # --- Run slot management (cross-process concurrency control) ---
-
-    @classmethod
-    def _slot_lock_dir(cls, output_dir: str) -> str:
-        """
-        Return lock directory for cross-process run-slot coordination.
-        """
-        digest = hashlib.sha1(os.path.abspath(output_dir).encode("utf-8")).hexdigest()[:12]
-        return os.path.join(tempfile.gettempdir(), f"psrl_mini_swe_agent_slots_{digest}")
-
-    @classmethod
-    async def _acquire_run_slot(
-        cls,
-        max_parallel_tasks_per_worker: int,
-        output_dir: str,
-    ) -> tuple[int, int] | None:
-        """
-        Acquire one cross-process run slot via fcntl file lock.
-        """
-        if max_parallel_tasks_per_worker <= 0:
-            return None
-
-        lock_dir = cls._slot_lock_dir(output_dir)
-        os.makedirs(lock_dir, exist_ok=True)
-
-        while True:
-            for slot_idx in range(max_parallel_tasks_per_worker):
-                lock_path = os.path.join(lock_dir, f"slot_{slot_idx}.lock")
-                fd = os.open(
-                    lock_path,
-                    os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
-                    0o666,
-                )
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    os.ftruncate(fd, 0)
-                    os.write(fd, f"pid={os.getpid()}\n".encode())
-                    return fd, slot_idx
-                except BlockingIOError:
-                    os.close(fd)
-
-            await asyncio.sleep(0.2)
-
-    @staticmethod
-    def _release_run_slot(run_slot: tuple[int, int] | None) -> None:
-        """
-        Release a previously acquired run slot.
-        """
-        if run_slot is None:
-            return
-        fd, _ = run_slot
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
-
     # --- Main loop ---
 
-    async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
+    async def run(
+        self,
+        request: DataProto,
+        profiling_collector: TurnProfilingCollector | None = None,
+    ) -> tuple[DataProto | None, TerminateReason]:
         """
-        Run one mini-SWE-Agent episode and return the trajectory.
+        Run one mini-SWE-agent episode and return the trajectory.
 
         Args:
-            request: Single input DataProto request.
+            request (DataProto): Single input `DataProto` request.
+            profiling_collector: Per-trajectory profiling collector, or None if disabled.
 
         Returns:
             Tuple of (finalized DataProto, termination reason).
         """
         run_start_time = time.time()
-        agent_task: asyncio.Task | None = None
-        model_proxy: ModelProxy | None = None
         run_slot: tuple[int, int] | None = None
+        swe_problem_id = ""
 
         # Initialize environment and agent data.
         env = MiniSWEEnvironment(
@@ -186,6 +231,10 @@ class MiniSWEAgentLoop(AgentLoopBase):
             runtime_config=self.__class__.runtime_config,
         )
         observation, info = await env.reset(task=request)
+
+        swe_problem_id = observation["swe_problem_id"]
+        log_prefix = f"[mini-SWE-agent, id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
+        psrl_logger.info(f"{log_prefix} Initializing agent data...")
 
         agent_data = MiniSWEAgentData(
             self.config, self.reward_manager, self.tokenizer, env,
@@ -195,73 +244,138 @@ class MiniSWEAgentLoop(AgentLoopBase):
 
         runtime_config = observation["runtime_config"]
         sb = runtime_config.sandbox_config
-        pc = runtime_config.proxy_config
-        swe_problem_id = observation["swe_problem_id"]
+
+        psrl_logger.info(
+            f"{log_prefix} Agent data initialized. "
+            f"max_parallel={sb.max_parallel_tasks_per_worker}, "
+            f"traj_output={self.traj_writer.output_dir!r} (enable={self.traj_writer.enable})."
+        )
 
         try:
             # Acquire run slot if configured.
             if sb.max_parallel_tasks_per_worker > 0:
-                run_slot = await self._acquire_run_slot(
-                    sb.max_parallel_tasks_per_worker, sb.output_dir,
+                psrl_logger.info(
+                    f"{log_prefix} Waiting for run slot "
+                    f"(max_parallel={sb.max_parallel_tasks_per_worker})..."
+                )
+                run_slot = await SlotManager.acquire(
+                    sb.max_parallel_tasks_per_worker, self.traj_writer.output_dir,
+                    prefix="psrl_mini_swe_agent_slots",
                 )
                 psrl_logger.info(
-                    f"[{swe_problem_id}] Acquired run slot "
+                    f"{log_prefix} Acquired run slot "
                     f"(slot={run_slot[1] if run_slot else 'n/a'})."
                 )
+            else:
+                psrl_logger.info(f"{log_prefix} No slot limit, proceeding directly.")
 
-            # Start ModelProxy.
-            model_proxy = ModelProxy(port=pc.port)
-            await model_proxy.start_server(max_retries=pc.max_port_retries)
+            # Read max_turns from rollout.multi_turn (validated in init_class).
+            max_turns = int(self.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns)
+
+            # Build per-instance environment kwargs.
+            env_cfg = sb.environment
+            preexisting_repo_name = observation.get("preexisting_repo_name", "")
+            use_preexisting = observation.get("use_preexisting_repo", True)
+            effective_cwd = env_cfg.cwd
+            if use_preexisting and preexisting_repo_name:
+                effective_cwd = f"/{preexisting_repo_name}"
+
+            run_args = list(env_cfg.run_args)
+            run_args.extend(["--label", f"psrl.swe_problem_id={swe_problem_id}"])
+            if not use_preexisting and observation.get("repo_path"):
+                run_args.extend(["--volume", f"{observation['repo_path']}:/testbed"])
+
+            docker_env_kwargs = {
+                "image": env_cfg.image,
+                "cwd": effective_cwd,
+                "env": env_cfg.env if isinstance(env_cfg.env, dict) else {},
+                "run_args": run_args,
+                "container_timeout": env_cfg.container_timeout,
+            }
+
+            # Build agent config kwargs.
+            ag_cfg = runtime_config.agent
+            agent_kwargs = {
+                "system_template": ag_cfg.system_template,
+                "instance_template": ag_cfg.problem_template,
+                "step_limit": max_turns,
+                "cost_limit": ag_cfg.cost_limit,
+                "output_path": None,
+            }
+
+            # Create queues for sync/async bridging.
+            req_q: queue.Queue = queue.Queue()
+            res_q: queue.Queue = queue.Queue()
+
+            model = _PSRLModel(
+                req_q, res_q,
+                model_name="psrl/rollout",
+                cost_tracking="ignore_errors",
+            )
+
+            problem_statement = observation.get("problem_statement", "")
+
+            _problem_short = f"{problem_statement[:60]}..." if len(problem_statement) > 60 else problem_statement
             psrl_logger.info(
-                f"[{swe_problem_id}] ModelProxy started on port {model_proxy.port}."
+                f"{log_prefix} Starting episode: problem={_problem_short!r}, "
+                f"cwd={effective_cwd!r}, image={env_cfg.image!r}, "
+                f"max_turns={max_turns}."
             )
 
-            # Launch mini-SWE-Agent subprocess.
-            agent_task = asyncio.create_task(
-                self._launch_agent(
-                    observation=observation,
-                    runtime_config=runtime_config,
-                    model_proxy_port=model_proxy.port,
-                )
+            # Run the agent in a dedicated worker thread (not the default pool,
+            # which would deadlock with asyncio.to_thread used in _generation_loop).
+            loop = asyncio.get_running_loop()
+            psrl_logger.info(f"{log_prefix} Launching agent in worker thread...")
+            agent_future = loop.run_in_executor(
+                _AGENT_THREAD_POOL,
+                self._run_agent_sync,
+                model, docker_env_kwargs, agent_kwargs, problem_statement, swe_problem_id,
             )
 
-            # Interaction loop.
-            session_id = swe_problem_id if swe_problem_id else str(uuid.uuid4())
-            patch, num_turns = await self._interaction_loop(
-                agent_task=agent_task,
+            # Async generation loop: consume requests and generate via PSRL.
+            # trajectory_output_path is resolved lazily inside the loop from the first output's version_tag.
+            psrl_logger.info(f"{log_prefix} Entering generation loop...")
+            num_turns, patch, trajectory_output_path = await self._generation_loop(
+                agent_future=agent_future,
                 agent_data=agent_data,
                 request=request,
-                max_model_calls_per_instance=sb.max_model_calls_per_instance,
-                request_timeout=pc.timeout,
-                model_proxy=model_proxy,
-                session_id=session_id,
+                req_q=req_q,
+                res_q=res_q,
+                max_turns=max_turns,
+                swe_problem_id=swe_problem_id,
+                profiling_collector=profiling_collector,
             )
 
-            # Drain agent task.
-            if agent_task is not None and not agent_task.done():
-                drain_patch = await self._drain_agent_task(
-                    agent_task, num_turns >= sb.max_model_calls_per_instance,
-                )
-                if drain_patch and not patch:
-                    patch = drain_patch
-
-            # Extract patch from environment if not already obtained.
-            if not patch:
-                patch = await env.extract_patch()
+            # Wait for agent thread to finish.
+            try:
+                result = await asyncio.wait_for(agent_future, timeout=60.0)
+                thread_patch = result.get("submission", "") if isinstance(result, dict) else ""
+                if thread_patch and not patch:
+                    patch = thread_patch
+            except (asyncio.TimeoutError, Exception) as e:
+                psrl_logger.warning(f"{log_prefix} Agent thread did not finish cleanly: {e}.")
 
             agent_data.set_patch(patch)
 
             total_elapsed = time.time() - run_start_time
             psrl_logger.info(
-                f"[{swe_problem_id}] Episode completed: {num_turns} turns, "
+                f"{log_prefix} Episode completed: {num_turns} turns, "
                 f"patch={'yes' if patch else 'no'}, total={total_elapsed:.1f}s."
             )
 
-            # Finalize trajectory.
+            summary_text = ""
+            if patch:
+                summary_text += f"=== Submission ===\n{patch}\n\n"
+            summary_text += (
+                f"=== Summary ===\n"
+                f"turns: {num_turns}, patch: {'yes' if patch else 'no'}, "
+                f"elapsed: {total_elapsed:.1f}s\n"
+            )
+            self.traj_writer.append(trajectory_output_path, summary_text)
+
             finalized = await agent_data.finalize_output(request)
 
-            # Determine termination reason.
-            if num_turns >= sb.max_model_calls_per_instance:
+            if num_turns >= max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
             elif num_turns == 0:
                 terminate_reason = TerminateReason.UNKNOWN
@@ -271,40 +385,110 @@ class MiniSWEAgentLoop(AgentLoopBase):
             return finalized, terminate_reason
 
         finally:
-            if agent_task is not None and not agent_task.done():
-                agent_task.cancel()
-                try:
-                    await asyncio.wait_for(agent_task, timeout=10.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                    pass
-            if model_proxy is not None:
-                await model_proxy.stop_server()
+            # Safety-net Docker cleanup via labels.
+            if swe_problem_id:
+                await cleanup_containers_by_label("psrl.swe_problem_id", swe_problem_id)
             await env.close()
             if run_slot is not None:
-                self._release_run_slot(run_slot)
+                SlotManager.release(run_slot)
 
-    # --- Interaction loop ---
+    # --- Worker thread entry point ---
 
-    async def _interaction_loop(
+    @staticmethod
+    def _run_agent_sync(
+        model: _PSRLModel,
+        docker_env_kwargs: dict,
+        agent_kwargs: dict,
+        task: str,
+        swe_problem_id: str = "",
+    ) -> dict:
+        """
+        Run mini-swe-agent synchronously in a worker thread.
+
+        Creates `DockerEnvironment` and `DefaultAgent` in-thread (Docker
+        container starts immediately on construction), runs the agent, then
+        cleans up the container.
+        """
+        log_prefix = f"[mini-SWE-agent, id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
+        docker_env = None
+        try:
+            psrl_logger.info(
+                f"{log_prefix} Creating DockerEnvironment: image={docker_env_kwargs.get('image')!r}, "
+                f"cwd={docker_env_kwargs.get('cwd')!r}."
+            )
+            docker_env = DockerEnvironment(**docker_env_kwargs)
+            psrl_logger.info(
+                f"{log_prefix} DockerEnvironment created, container_id={docker_env.container_id!r}."
+            )
+
+            # Validate that the cwd exists inside the container.
+            # Run from "/" to avoid docker exec failing before our check command runs.
+            cwd = docker_env_kwargs.get("cwd", "")
+            if cwd:
+                check = docker_env.execute(
+                    {"command": f"test -d {cwd} && echo EXISTS || echo MISSING"},
+                    cwd="/",
+                )
+                if "MISSING" in check.get("output", ""):
+                    raise RuntimeError(
+                        f"{log_prefix} cwd {cwd!r} does not exist inside Docker container "
+                        f"{docker_env.container_id!r}. Check that the image was prepared "
+                        "with 'bake_simple_repos.sh' and the correct preexisting_repo_name."
+                    )
+                psrl_logger.info(f"{log_prefix} cwd={cwd!r} confirmed to exist inside container.")
+
+            psrl_logger.info(f"{log_prefix} Creating DefaultAgent with step_limit={agent_kwargs.get('step_limit')}.")
+            agent = DefaultAgent(model, docker_env, **agent_kwargs)
+
+            _task_short = f"{task[:60]}..." if len(task) > 60 else task
+            psrl_logger.info(f"{log_prefix} Running agent with task={_task_short!r}.")
+            result = agent.run(task)
+
+            submission = result.get("submission", "") if isinstance(result, dict) else ""
+            exit_status = result.get("exit_status", "") if isinstance(result, dict) else ""
+            psrl_logger.info(
+                f"{log_prefix} Agent finished: exit_status={exit_status!r}, "
+                f"submission_len={len(submission)}, n_calls={agent.n_calls}."
+            )
+            return result
+        except Exception as e:
+            psrl_logger.exception(f"{log_prefix} Agent thread failed: {e}.")
+            return {"exit_status": "error", "submission": ""}
+        finally:
+            if docker_env is not None:
+                psrl_logger.info(f"{log_prefix} Cleaning up DockerEnvironment...")
+                docker_env.cleanup()
+
+    # --- Async generation loop ---
+
+    async def _generation_loop(
         self,
-        agent_task: asyncio.Task,
+        agent_future: asyncio.Future,
         agent_data: MiniSWEAgentData,
         request: DataProto,
-        max_model_calls_per_instance: int,
-        request_timeout: float,
-        model_proxy: ModelProxy,
-        session_id: str,
-    ) -> tuple[str | None, int]:
+        req_q: queue.Queue,
+        res_q: queue.Queue,
+        max_turns: int,
+        swe_problem_id: str,
+        profiling_collector: TurnProfilingCollector | None = None,
+    ) -> tuple[int, str | None, str]:
         """
-        Run the main turn-by-turn interaction with mini-SWE-Agent via ModelProxy.
+        Consume model requests from `req_q`, generate via PSRL rollout,
+        record turns, and put responses into `res_q`.
+
+        The full trajectory is accumulated in a string buffer during the loop.
+        After the loop ends the real `version_tag` (assigned by the router on
+        the first generation call) is used to determine the versioned output
+        directory, and the buffer is written atomically to disk via
+        `self.traj_writer`.
 
         Returns:
-            Tuple of (patch_or_none, num_turns).
+            Tuple of (num_turns, patch_or_none, trajectory_path).
         """
         num_turns = 0
-        patch: str | None = None
+        trajectory_path = ""
+        resolved_version: int | None = None
 
-        # Compute token budget.
         rollout_cfg = self.config.gen_actor_rollout_ref.rollout
         cfg_prompt_len = int(getattr(rollout_cfg, "prompt_length", 0) or 0)
         cfg_response_len = int(getattr(rollout_cfg, "response_length", 4096) or 4096)
@@ -316,78 +500,54 @@ class MiniSWEAgentLoop(AgentLoopBase):
             else (max_model_len or vllm_budget)
         )
 
-        while True:
-            # Pre-check: agent already done?
-            if agent_task.done():
-                try:
-                    patch = await agent_task
-                except Exception as e:
-                    psrl_logger.exception(f"mini-SWE-Agent task failed: {e}.")
-                break
+        log_prefix = f"[mini-SWE-agent, id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
 
-            # Race: model request vs. agent completion.
-            request_coro = asyncio.create_task(model_proxy.get_request())
-            done, pending = await asyncio.wait(
-                {request_coro, agent_task},
-                timeout=request_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+        psrl_logger.info(
+            f"{log_prefix} Generation loop started: "
+            f"effective_limit={effective_limit}, max_turns={max_turns}."
+        )
 
-            if not done:
-                psrl_logger.error(
-                    f"Both request and agent tasks timed out after {request_timeout}s."
-                )
-                request_coro.cancel()
-                try:
-                    await request_coro
-                except (asyncio.CancelledError, Exception):
-                    pass
-                break
+        # Accumulate trajectory text throughout the loop; written to disk at the end.
+        traj_text: list[str] = [f"{log_prefix}\n\n"]
 
-            if agent_task in done:
-                if request_coro in pending:
-                    request_coro.cancel()
-                    try:
-                        await request_coro
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                try:
-                    patch = await agent_task
-                except Exception as e:
-                    psrl_logger.exception(f"mini-SWE-Agent task failed: {e}.")
-                break
-
-            # Process the model request.
+        while not agent_future.done():
             try:
-                model_request = request_coro.result()
-            except Exception as e:
-                psrl_logger.exception(f"Error getting model request: {e}.")
+                messages = req_q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.1)
                 continue
 
-            messages = normalize_openai_messages(model_request.messages)
-            prompt_ids = agent_data.encode_messages(messages, add_generation_prompt=True)
+            psrl_logger.info(
+                f"{log_prefix} Generation loop received request "
+                f"(turn {num_turns + 1}): {len(messages)} messages."
+            )
 
-            # Early-stop if prompt leaves insufficient generation room.
+            # Capture the observation before generating (messages[-1] is the latest
+            # user/tool message: problem statement on turn 1, Docker output thereafter).
+            observation = messages[-1].get("content", "") if messages else ""
+
+            normalized = normalize_openai_messages(messages)
+            prompt_ids = agent_data.encode_messages(normalized, add_generation_prompt=True)
+
+            # Token budget check.
             remaining = max(
                 (effective_limit - len(prompt_ids)) if effective_limit else cfg_response_len,
                 0,
             )
             if effective_limit and remaining < _MIN_GEN_TOKENS:
                 psrl_logger.warning(
-                    f"Turn {num_turns + 1}: remaining budget {remaining} < {_MIN_GEN_TOKENS} "
-                    f"(prompt_len={len(prompt_ids)}, limit={effective_limit}), stopping."
+                    f"{log_prefix} Turn {num_turns + 1}: remaining budget "
+                    f"{remaining} < {_MIN_GEN_TOKENS}, sending empty response."
                 )
-                await model_proxy.send_response(
-                    "", request=model_request, finish_reason="length",
-                )
+                res_q.put("")
                 break
 
-            # Build generation request.
-            gen_request = self._build_gen_request(request, prompt_ids)
-
-            # Generate via PSRL rollout (with sticky session for KV cache reuse).
+            # Build generation request (routing metadata managed by agent_data).
+            gen_request = agent_data.prepare_generation_request(request, prompt_ids=prompt_ids)
             request_id = request.non_tensor_batch["uid"][0]
             async with StickySession(self.rollout_router, request_id):
+                if profiling_collector is not None:
+                    profiling_collector.on_turn_submit()
                 if self.config.psrl.server_rollout.enable:
                     gateway_client = RolloutGatewayClient.from_config(self.config)
                     output = await gateway_client.generate_async(gen_request)
@@ -395,13 +555,15 @@ class MiniSWEAgentLoop(AgentLoopBase):
                     output = await self.rollout_router.generate_async.remote(gen_request)
 
             if output is None:
-                psrl_logger.warning(f"Turn {num_turns + 1}: rollout returned None, stopping.")
-                await model_proxy.send_response(
-                    "", request=model_request, finish_reason="stop",
+                psrl_logger.warning(
+                    f"{log_prefix} Turn {num_turns + 1}: rollout returned None."
                 )
+                res_q.put("")
                 break
 
-            # Extract training signals.
+            if profiling_collector is not None:
+                profiling_collector.on_turn_complete(output)
+
             response_ids = list(output.non_tensor_batch["raw_response_ids"][0])
             response_logprobs_raw = output.non_tensor_batch.get("rollout_log_probs", [None])[0]
             response_logprobs = (
@@ -410,141 +572,48 @@ class MiniSWEAgentLoop(AgentLoopBase):
             )
             response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
 
-            # Record turn.
-            agent_data.record_turn(
+            # Capture version_tag from the first real output (initial request carries -1).
+            if resolved_version is None:
+                resolved_version = int(output.non_tensor_batch["version_tag"][0])
+
+            # Record turn and update routing state (instance_id / version_tag).
+            agent_data.update_from_external_turn(
                 turn_index=num_turns,
-                messages=messages,
+                messages=normalized,
                 prompt_ids=prompt_ids,
                 response_ids=response_ids,
                 response_text=response_text,
                 response_logprobs=response_logprobs,
+                output=output,
             )
-
             num_turns += 1
 
-            # Send response back to mini-SWE-agent.
-            await model_proxy.send_response(response_text, request=model_request)
+            # Send response text to the worker thread.
+            res_q.put(response_text)
 
-            psrl_logger.info(f"Turn {num_turns}: {len(response_ids)} model tokens.")
+            # Append turn (observation captured before generate + response) to buffer.
+            traj_text.append(
+                f"=== Turn {num_turns} ===\n"
+                f"--- observation ---\n{observation}\n\n"
+                f"--- assistant ---\n{response_text}\n\n"
+            )
 
-            if num_turns >= max_model_calls_per_instance:
+            psrl_logger.info(
+                f"{log_prefix} Turn {num_turns}: {len(response_ids)} model tokens."
+            )
+
+            if num_turns >= max_turns:
                 psrl_logger.warning(
-                    f"Max model calls reached ({num_turns}/{max_model_calls_per_instance})."
+                    f"{log_prefix} Max turns reached "
+                    f"({num_turns}/{max_turns})."
                 )
                 break
 
-        return patch, num_turns
+        # Write the accumulated buffer via the shared TrajectoryWriter.
+        # Use uid as the file stem for uniqueness across rollout_n > 1 runs of the same problem.
+        trajectory_path = ""
+        if resolved_version is not None and num_turns > 0:
+            traj_id = str(request.non_tensor_batch["uid"][0])
+            trajectory_path = self.traj_writer.write(resolved_version, traj_id, "".join(traj_text))
 
-    # --- Agent launch ---
-
-    async def _launch_agent(
-        self,
-        observation: dict,
-        runtime_config: MiniSWEAgentRuntimeConfig,
-        model_proxy_port: int,
-    ) -> str | None:
-        """
-        Generate config, run mini-SWE-Agent subprocess, return patch.
-        """
-        swe_problem_id = observation["swe_problem_id"]
-        output_dir = observation["output_dir"]
-        repo_path = observation.get("repo_path") or ""
-        use_preexisting_repo = observation.get("use_preexisting_repo", True)
-        preexisting_repo_name = observation.get("preexisting_repo_name", "")
-
-        exec_dir = tempfile.mkdtemp(prefix=f"mini_swe_exec_{swe_problem_id}_")
-        output_json_path = os.path.join(output_dir, f"{swe_problem_id}.traj.json")
-
-        # Build YAML config for mini-SWE-Agent CLI.
-        rollout_cfg = self.config.gen_actor_rollout_ref.rollout
-        max_input_tokens = int(getattr(rollout_cfg, "max_model_len", 0) or 0)
-
-        repo_type = "preexisting" if use_preexisting_repo else "local"
-
-        yaml_str = build_mini_sweagent_yaml(
-            runtime_config,
-            swe_problem_id=swe_problem_id,
-            repo_path=repo_path,
-            model_proxy_port=model_proxy_port,
-            max_input_tokens=max_input_tokens,
-            repo_type=repo_type,
-            preexisting_repo_name=preexisting_repo_name,
-        )
-        config_file = tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=f"_mini_swe_config_{swe_problem_id}.yaml",
-            delete=False,
-            encoding="utf-8",
-        )
-        config_file.write(yaml_str)
-        config_file.close()
-        config_path = config_file.name
-
-        problem_statement = observation.get("problem_statement", "")
-
-        try:
-            patch = await execute_mini_swe_agent(
-                config_path=config_path,
-                problem_statement=problem_statement,
-                swe_problem_id=swe_problem_id,
-                output_dir=output_dir,
-                output_json_path=output_json_path,
-                repo_path=repo_path,
-                exec_dir=exec_dir,
-                swe_agent_timeout=runtime_config.sandbox_config.swe_agent_timeout,
-                proxy_port=model_proxy_port,
-            )
-            return patch
-        except Exception as e:
-            psrl_logger.exception(
-                f"[{swe_problem_id}] mini-SWE-Agent execution failed: {e}."
-            )
-            return None
-        finally:
-            await cleanup_instance_containers(swe_problem_id)
-            try:
-                os.unlink(config_path)
-            except OSError:
-                pass
-            shutil.rmtree(exec_dir, ignore_errors=True)
-
-    # --- Helpers ---
-
-    def _build_gen_request(self, request: DataProto, prompt_ids: list[int]) -> DataProto:
-        """
-        Build a generation request ``DataProto`` from prompt token IDs.
-        """
-        non_tensor_batch = request.non_tensor_batch.copy()
-        non_tensor_batch["raw_prompt_ids"] = np.array([prompt_ids])
-
-        return DataProto(
-            non_tensor_batch=non_tensor_batch,
-            meta_info=request.meta_info,
-        )
-
-    @staticmethod
-    async def _drain_agent_task(
-        agent_task: asyncio.Task,
-        max_model_calls_reached: bool,
-    ) -> str | None:
-        """
-        Wait for / cancel the mini-SWE-Agent background task.
-        """
-        if max_model_calls_reached:
-            try:
-                return await asyncio.wait_for(agent_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                psrl_logger.warning(
-                    "Cancelling mini-SWE-Agent task due to max_model_calls limit."
-                )
-                agent_task.cancel()
-                try:
-                    return await asyncio.wait_for(agent_task, timeout=15.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    return None
-        else:
-            try:
-                return await asyncio.wait_for(agent_task, timeout=60.0)
-            except asyncio.TimeoutError:
-                psrl_logger.warning("Timeout waiting for agent task completion.")
-                return None
+        return num_turns, None, trajectory_path

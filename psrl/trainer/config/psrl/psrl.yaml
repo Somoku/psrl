@@ -28,15 +28,30 @@ agentic_rl:
   # Whether to enable sticky session in multi-turn agent loop.
   sticky_session: False
 
+  # Per-trajectory text output: writes <dir>/v{version}/{id}.txt for every trajectory.
+  # Applies to all agent loops (generate_only, multi_turn, mini_swe).
+  trajectory_output:
+
+    # Whether to enable per-trajectory .txt files.
+    enable: True
+
+    # Output base directory.  Default when empty: psrl.logging_path/trajectories.
+    dir: ""
+
+  # TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml
+
 server_rollout:
+
   # Whether to enable server rollout service.
   enable: False
 
   # Rollout gateway config.
   # This gateway is an HTTP entrypoint used by agent loops to call rollout service.
   gateway:
+
     # Bind address for the gateway process.
     router_ip: ${psrl.ps_manager_ip}
+
     router_port: 18080
 
   # Max concurrent connections per rollout server for the HTTP client.
@@ -56,7 +71,7 @@ profile:
   trajectory:
 
     # Whether to enable per-trajectory profiling
-    enable: True
+    enable: False
 
     # Output directory for profiling JSONL files
     output_dir: ${psrl.logging_path}/trajectory_profiling
@@ -185,7 +200,7 @@ routing_strategy:
   # Method for rollout routing
   # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget", "kv_cache_aware"
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
-  method: kv_cache_aware
+  method: request_num_balance
 
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500

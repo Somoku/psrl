@@ -834,7 +834,7 @@ class KVCacheAwareRouteStrategy(RouteStrategyBase):
         for candidate in sorted_candidates:
             if self.instance_request_counts[candidate] < self.max_concurrent_seqs:
                 self.instance_request_counts[candidate] += 1
-                self.logger.info(
+                self.logger.debug(
                     f"[KVCacheAware]: Routing uid="
                     f"{request.non_tensor_batch['uid'][0]!r} to instance "
                     f"{candidate} (cached_tokens={kv_scores.get(candidate, 0)}, "

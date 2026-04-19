@@ -189,7 +189,7 @@ class PSRL_BaseTrainWorker:
                             )
                             raise e
                         if len(shards_to_transfer) > 0:
-                            psrl_logger.info(
+                            psrl_logger.debug(
                                 f"Pushing key {key} shards {shards_to_transfer} to {target_client_name} "
                                 f"for version {next_ps_model_version} with {len(shards_to_transfer)} shards"
                             )
@@ -377,7 +377,7 @@ class PSRL_BaseTrainWorker:
                 #     target_agent_name, target_client_name, key, "train_pull", merge_and_cache_xfer=False
                 # )
                 if len(shards_to_transfer) > 0:
-                    psrl_logger.info(
+                    psrl_logger.debug(
                         f"Pulling key {key} shards {shards_to_transfer} from {target_client_name} "
                         f"for pull {self.pull_times} times"
                     )

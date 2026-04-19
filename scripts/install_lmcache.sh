@@ -24,4 +24,9 @@ python -m pip uninstall lmcache -y
 python -m pip install --no-cache-dir -e .
 popd
 
+echo "2. Apply patch for lmcache"
+pushd $PSRL_PATH/patch/lm_cache
+bash apply_patch.sh
+popd
+
 echo "Successfully installed LMCache"

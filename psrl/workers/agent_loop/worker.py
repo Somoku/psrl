@@ -17,6 +17,7 @@ from verl.utils.model import compute_position_id_with_mask
 from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
+from psrl.utils.profiling.collector import TurnProfilingCollector
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig, TerminateReason
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
@@ -136,14 +137,19 @@ class PSRL_AgentLoopWorker:
         self.busy_loop_task = self.running_loop.create_task(self._launch_agent_loop())
         self.busy_loop_task.add_done_callback(lambda f: f.result())  # To avoid silent error in async tasks
 
-    def stop_busy_loop(self):
+    async def stop_busy_loop(self):
         """Stop the busy loop and wait for the current task to complete."""
         if not self.busy_loop_task or self.busy_loop_task.done():
             return
 
         self.stop_busy_loop_task = True
         # Wait for the background task to finish
-        self.running_loop.run_until_complete(self.busy_loop_task)
+        # Note: This is now async-safe and won't deadlock when called from Ray actors
+        try:
+            await asyncio.wait_for(self.busy_loop_task, timeout=10.0)
+        except asyncio.TimeoutError:
+            psrl_logger.warning("Timeout waiting for busy loop task to complete")
+            self.busy_loop_task.cancel()
 
     async def _launch_agent_loop(self):
         """Main loop that processes agent programs from the pending queue."""
@@ -236,6 +242,8 @@ class PSRL_AgentLoopWorker:
                 tokenizer=self.tokenizer,
             )
 
+            enable_profiling = self.config.psrl.profile.trajectory.enable
+
             with log_dual_events(
                 f"Agent loop with requests {requests.non_tensor_batch['uid']}",
                 psrl_logger,
@@ -244,11 +252,14 @@ class PSRL_AgentLoopWorker:
             ):
                 retry_limit = self.config.gen_actor_rollout_ref.rollout.agent.retry_limit
                 for retry_attempt in range(1, retry_limit + 1):
+                    # Create a fresh collector per attempt so retries don't accumulate
+                    # turns from failed attempts into the final profiling data.
+                    profiling_collector = TurnProfilingCollector() if enable_profiling else None
                     raise_on_error = (
                         retry_attempt == retry_limit
                     ) and self.config.gen_actor_rollout_ref.rollout.agent.raise_on_error
                     output, terminate_reason = await agent_loop.run_with_termination_handling(
-                        requests, raise_on_error=raise_on_error
+                        requests, raise_on_error=raise_on_error, profiling_collector=profiling_collector
                     )
 
                     if terminate_reason not in (
@@ -290,6 +301,12 @@ class PSRL_AgentLoopWorker:
             # Put the output into the result queue
             if output is not None:
                 assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
+                if profiling_collector is not None:
+                    request_id = int(requests.non_tensor_batch["uid"][0])
+                    profiling_data = profiling_collector.finalize(request_id)
+                    if profiling_data is not None:
+                        output_path = self.config.psrl.profile.trajectory.output_dir + "/trajectory_profiling.jsonl"
+                        profiling_data.write_jsonl(output_path)
                 request_ids = requests.non_tensor_batch["uid"]
                 is_validate = requests.meta_info.get("validate", False)
                 with log_dual_events(

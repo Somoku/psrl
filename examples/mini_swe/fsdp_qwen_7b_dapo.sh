@@ -2,51 +2,70 @@
 set -xeuo pipefail
 
 staleness=${1:-2}
-project_name=psrl_example
-experiment_name=KV_aware_DAPO-Qwen2.5-7B-AIME-fsdp2-retool-staleness_${staleness}
+project_name=psrl_mini_swe
+experiment_name=GRPO-Qwen2.5-7B-mini_swe-fsdp2-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
-# very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
-MODEL_PATH=${PSRL_WORKSPACE}/models/multiturn-sft-qwen-2.5-7b-instruct
-TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
-# aime_2024=${PSRL_WORKSPACE}/data/dapo/aime-2024-raw.parquet
-aime_2025=${PSRL_WORKSPACE}/data/dapo/aime-2025.parquet
+
+# --- Pre-flight checks ---
+echo "=== Pre-flight checks ==="
+python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent: OK')"
+docker run --rm python:3.11-slim bash -c "echo 'Docker: OK'" 2>/dev/null || echo "WARNING: Docker check failed"
+ray status 2>/dev/null | head -5 || echo "WARNING: ray status failed"
+echo "=== Pre-flight done ==="
+
+# --- Model ---
+# NOTE(lhy): Modify max_position_embeddings in config.json to 32768 after downloading.
+MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-7B-Instruct
+
+# --- Data ---
+# Generate with: python examples/mini_swe/prepare/prepare_data.py --train_size 64 --test_size 16
+TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/train.parquet
+TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/test.parquet
+
+if [[ ! -f "$TRAIN_FILE" ]]; then
+    echo "ERROR: Training data not found at $TRAIN_FILE"
+    echo "Run: python ${PSRL_PATH}/examples/mini_swe/prepare/prepare_data.py --train_size 64 --test_size 16 --output_dir ${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent"
+    exit 1
+fi
 
 train_files="['$TRAIN_FILE']"
-# test_files="['$aime_2025', '$aime_2024']"
-test_files="['$aime_2025']"
+test_files="['$TEST_FILE']"
 
 CKPT_ROOT=${CKPT_ROOT:-$PWD}
 default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
-tool_config_path=${PSRL_PATH}/examples/retool/sandbox_fusion_tool_config.yaml
+# --- Agent loop config ---
+agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/mini_swe_agent_config.yaml
 
-GEN_TP=1 # TP in the generation side
-GEN_PP=1 # PP in the generation side
+# --- Cluster layout ---
+GEN_TP=1
+GEN_PP=1
 
-VAL_TP=1 # TP in the training side for validation
-VAL_PP=1 # PP in the training side for validation
+VAL_TP=1
+VAL_PP=1
 
-TRAIN_SP=2 # SP in the training side
-TRAIN_FSDP=8 # FSDP in the training side
+TRAIN_SP=2
+TRAIN_FSDP=8
 
 NNODES=4
 NGPUS_PER_NODE=8
 
-GEN_NNODES=2 # Number of nodes for generation
-GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
-GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
-GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
+GEN_NNODES=2
+GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
+GEN_INSTANCES=$(( (GEN_NNODES * GEN_NGPUS_PER_NODE) / (GEN_TP * GEN_PP) ))
+GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( GEN_TP * GEN_PP ))
 
-TRAIN_NNODES=2 # Number of nodes for training
+TRAIN_NNODES=2
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
-VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
-VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
+VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / (VAL_TP * VAL_PP) ))
+VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( VAL_TP * VAL_PP ))
 
+# --- Algorithm ---
 adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
@@ -54,39 +73,38 @@ use_kl_loss=False
 kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
-max_turns=64
+
+# --- Sequence lengths ---
+# mini-SWE-agent episodes are multi-turn: system + user + (assistant + observation) * N.
+max_turns=30
 max_prompt_length=2048
 max_response_length=16384
+
+# --- Training hyperparameters ---
 actor_lr=1e-6
 enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 10))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=64
-n_resp_per_prompt=8
-n_resp_per_prompt_val=8
-train_prompt_mini_bsz=64
+train_prompt_bsz=16
+n_resp_per_prompt=4
+n_resp_per_prompt_val=4
+train_prompt_mini_bsz=16
 
-# Algorithm
+# --- Sampling ---
 temperature=1.0
 top_p=1.0
-top_k=-1 # 0 for HF rollout, -1 for vLLM rollout
+top_k=-1
 val_top_p=1.0
 
-# TIS
+# --- TIS ---
 rollout_is=token
 rollout_is_threshold=2.0
 
-# Performance Related Parameter
+# --- Performance ---
 use_dynamic_bsz=True
 packing_length=$(( (max_prompt_length + max_response_length) * 1 ))
-# NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
-# May support this in the future
 offload=False
-
-# Rollout Trace Configuration (precision may be affected)
-# gen_actor_rollout_ref.rollout.trace.backend=weave
-# gen_actor_rollout_ref.rollout.trace.token2text=True
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -94,7 +112,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_PATH}/examples/retool/fsdp_psrl_log/${experiment_name} \
+    psrl.logging_path=${PSRL_PATH}/examples/mini_swe/fsdp_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -119,10 +137,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.top_k=${top_k} \
     gen_actor_rollout_ref.rollout.multi_turn.enable=True \
     gen_actor_rollout_ref.rollout.multi_turn.max_turns=$max_turns \
-    gen_actor_rollout_ref.rollout.multi_turn.tool_config_path=$tool_config_path \
-    gen_actor_rollout_ref.rollout.multi_turn.format=hermes \
-    gen_actor_rollout_ref.rollout.agent.env.name=tool_env \
-    gen_actor_rollout_ref.rollout.agent.data.name=tool_agent_data \
+    gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
+    gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env \
+    gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \
@@ -177,9 +194,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     data.train_batch_size=${train_prompt_bsz} \
     data.return_raw_chat=True \
     data.filter_overlong_prompts=True \
-    data.custom_cls.path=${PSRL_PATH}/examples/retool/retool.py \
-    data.custom_cls.name=CustomRLHFDataset \
-    custom_reward_function.path=${PSRL_PATH}/examples/retool/retool.py \
+    custom_reward_function.path=${PSRL_PATH}/examples/mini_swe/reward.py \
     custom_reward_function.name=compute_score \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
@@ -188,9 +203,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.default_local_dir="${default_local_dir}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=10 \
     trainer.test_freq=5 \
-    trainer.save_freq=1000 \
-    trainer.total_epochs=10 \
-    trainer.total_training_steps=50 2>&1 | tee ${experiment_name}.log
+    trainer.save_freq=500 \
+    trainer.total_epochs=100 \
+    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

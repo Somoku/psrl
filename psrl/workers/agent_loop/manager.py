@@ -184,7 +184,11 @@ class PSRL_AgentLoopManager:
         futures = []
         for worker in self.agent_loop_workers:
             futures.append(worker.start_busy_loop.remote())
-        await asyncio.gather(*futures)
+        
+        # Ray futures must be resolved with ray.get() in an executor to avoid blocking the event loop
+        if futures:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: ray.get(futures))
 
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
@@ -197,28 +201,45 @@ class PSRL_AgentLoopManager:
 
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""
-        if (
-            (not self.train_dispatch_task or self.train_dispatch_task.done())
-            and (not self.val_dispatch_task or self.val_dispatch_task.done())
-            and (not self.collect_task or self.collect_task.done())
-        ):
+        # Check if any tasks are still running
+        tasks_running = []
+        if self.train_dispatch_task and not self.train_dispatch_task.done():
+            tasks_running.append(self.train_dispatch_task)
+        if self.val_dispatch_task and not self.val_dispatch_task.done():
+            tasks_running.append(self.val_dispatch_task)
+        if self.collect_task and not self.collect_task.done():
+            tasks_running.append(self.collect_task)
+        
+        if not tasks_running and not self.agent_loop_workers:
             return
 
+        # Signal tasks to stop
         self.stop_train_dispatch_task = True
         self.stop_val_dispatch_task = True
         self.stop_collect_task = True
-        # Wait for the background task to finish
-        await asyncio.gather(
-            self.train_dispatch_task,
-            self.val_dispatch_task,
-            self.collect_task,
-        )
+        
+        # Wait for the asyncio tasks to finish
+        if tasks_running:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks_running), timeout=30.0)
+            except asyncio.TimeoutError:
+                psrl_logger.warning(
+                    "Timeout (30s) waiting for dispatch/collect tasks to stop, cancelling them."
+                )
+                for task in tasks_running:
+                    task.cancel()
+                await asyncio.gather(*tasks_running, return_exceptions=True)
 
         # Stop the busy loop of agent loop workers
+        # NOTE: These are Ray remote futures, not asyncio futures
         futures = []
         for worker in self.agent_loop_workers:
             futures.append(worker.stop_busy_loop.remote())
-        await asyncio.gather(*futures)
+        
+        # Use ray.get() for Ray futures instead of asyncio.gather()
+        if futures:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: ray.get(futures))
 
     async def put_data(self, data: DataProto, is_validate: bool = False):
         """Put data into the manager's data queue."""
@@ -438,6 +459,14 @@ class PSRL_AgentLoopManager:
 
         inputs.non_tensor_batch.pop("raw_prompt_ids", None)
         inputs.non_tensor_batch.pop("raw_response_ids", None)
+        # Strip per-step profiling fields; shape varies per sample and would break DataProto.concat.
+        for _profiling_key in (
+            "profiling_generation_start_wall_ts",
+            "profiling_generation_end_wall_ts",
+            "profiling_prefill_records",
+            "profiling_decode_records",
+        ):
+            inputs.non_tensor_batch.pop(_profiling_key, None)
         non_tensor_batch = inputs.non_tensor_batch
         if multi_modal_inputs is not None:
             non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
@@ -814,7 +843,9 @@ class PSRL_AgentLoopManager:
                 level=logging.DEBUG,
                 event_type=EventType.OTHER,
             ):
-                results = await asyncio.gather(*occupy_futures)
+                # Ray futures must be resolved with ray.get() instead of asyncio.gather
+                loop = asyncio.get_event_loop()
+                results = await loop.run_in_executor(None, lambda: ray.get(occupy_futures))
 
             # 3. Handle the occupied results to accumulate data
             for result in results:

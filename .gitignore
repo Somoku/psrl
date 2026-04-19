@@ -136,6 +136,7 @@ ENV/
 # local logs
 logs
 log
+fsdp_psrl_log
 outputs
 
 

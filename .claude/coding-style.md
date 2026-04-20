@@ -298,6 +298,8 @@ self.worker_rank = worker_rank
 ```
 
 - Blank line above when starting a new logical section.
+- **No dashes inside comment text.** Use plain prose instead (e.g., `# worker-side` → `# worker side`).
+- **One space after a period**, not two. Never write `. ` + extra space mid-sentence.
 
 ### 5.2 Inline Comments
 

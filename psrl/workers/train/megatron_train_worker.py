@@ -19,8 +19,8 @@ from verl.workers.megatron_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.common.utils import lazy_import_many_to_globals, lazy_import_to_globals
 from psrl.utils.common.worker_naming import train_client_name
+from psrl.utils.common.dynamic_import import lazy_import_many_to_globals, lazy_import_to_globals
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.logger import (
     DualOutputHandler,

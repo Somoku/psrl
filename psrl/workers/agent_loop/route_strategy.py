@@ -770,10 +770,124 @@ class ThroughputOptimalWithBudgetRouteStrategy(ThroughputOptimalRouteStrategy):
         else:
             response_token_num = 0
         return prompt_token_num + response_token_num
-    
+
     def pop_request(self, request: DataProto, instance_id: int):
         RouteStrategyBase.pop_request(self, request, instance_id)
         self.instance_to_request_num[instance_id] -= 1
         self.instance_to_running_request_num[instance_id] -= 1
         self.instance_to_token_num[instance_id] -= self._get_actual_request_token_num(request)
     """
+
+
+@register_route_strategy("kv_cache_aware")
+class KVCacheAwareRouteStrategy(RouteStrategyBase):
+    """Routes requests to the instance with the most cached prefix (GPU + LMCache).
+
+    Primary sort key: `kv_hit_scores[i]` (descending) — from
+    `route_kwargs["kv_hit_scores"]`, pre-computed by the router via
+    `kv_get_cache_info` RPC.
+    Tiebreak: `instance_request_counts[i]` (ascending, least-loaded).
+    Hard cap: instances at `max_concurrent_seqs_per_instance` are skipped.
+    """
+
+    def __init__(self, n_instances: int, strategy_kwargs: dict = None):
+        super().__init__(n_instances, strategy_kwargs)
+        assert "max_concurrent_seqs_per_instance" in strategy_kwargs, (
+            "The max_concurrent_seqs_per_instance key is required for KVCacheAwareRouteStrategy."
+        )
+        self.max_concurrent_seqs: int = strategy_kwargs["max_concurrent_seqs_per_instance"]
+        self.instance_request_counts: dict[int, int] = {i: 0 for i in range(n_instances)}
+        self.logger.info("Initialized KVCacheAwareRouteStrategy.")
+
+    def route(
+        self,
+        request: DataProto,
+        candidates: list[int] | None = None,
+        route_kwargs: dict | None = None,
+    ) -> int | None:
+        """
+        Route a request to the candidate with the highest KV hit score.
+
+        Args:
+            request (DataProto): The request to route.
+            candidates (list[int] | None): Candidate instance indices.
+            route_kwargs (dict | None): Must contain `kv_hit_scores`
+                (dict[int, int]) mapping instance id to cached token count.
+
+        Returns:
+            int | None: Selected instance index, or None if all candidates are
+                at capacity.
+        """
+        if candidates is None:
+            candidates = list(range(self.n_instances))
+        if not candidates:
+            return None
+        assert route_kwargs is not None and "kv_hit_scores" in route_kwargs, (
+            "The kv_hit_scores key is required in route_kwargs for KVCacheAwareRouteStrategy."
+        )
+        kv_scores: dict[int, int] = route_kwargs["kv_hit_scores"]
+        # Sort by (kv_score DESC, request_count ASC).
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda i: (-kv_scores.get(i, 0), self.instance_request_counts[i]),
+        )
+        for candidate in sorted_candidates:
+            if self.instance_request_counts[candidate] < self.max_concurrent_seqs:
+                self.instance_request_counts[candidate] += 1
+                self.logger.debug(
+                    f"[KVCacheAware]: Routing uid="
+                    f"{request.non_tensor_batch['uid'][0]!r} to instance "
+                    f"{candidate} (cached_tokens={kv_scores.get(candidate, 0)}, "
+                    f"load={self.instance_request_counts[candidate]})."
+                )
+                return candidate
+        return None
+
+    def update_instance_to_engine_status(
+        self, instance_to_engine_status: dict[int, "EngineStats"]
+    ) -> None:
+        """
+        Sync `instance_request_counts` from the latest engine snapshots.
+
+        Args:
+            instance_to_engine_status (dict[int, EngineStats]): Latest engine
+                status per instance, as provided by the rollout coordinator.
+        """
+        super().update_instance_to_engine_status(instance_to_engine_status)
+        for i, engine_stats in instance_to_engine_status.items():
+            self.instance_request_counts[i] = (
+                engine_stats.get_waiting_and_running_queue_size()
+            )
+
+    def push_request(self, request: DataProto, instance_id: int) -> None:
+        """
+        No-op: request count is updated at route time, not push time.
+
+        Args:
+            request (DataProto): The pushed request.
+            instance_id (int): Target instance index.
+        """
+        super().push_request(request, instance_id)
+
+    def pop_request(self, request: DataProto, instance_id: int) -> None:
+        """
+        Decrement request count when a request leaves the instance.
+
+        Args:
+            request (DataProto): The completed request.
+            instance_id (int): Instance from which the request was popped.
+        """
+        super().pop_request(request, instance_id)
+        self.instance_request_counts[instance_id] -= 1
+    
+    def is_staled(self, instance_id: int, engine_status: EngineStats) -> bool:
+        if super().is_staled(instance_id, engine_status):
+            return True
+        if engine_status.get_waiting_and_running_queue_size() != self.instance_request_counts[instance_id]:
+            self.logger.debug(
+                f"Instance {instance_id} collected engine status is stale, "
+                f"waiting and running queue size {engine_status.get_waiting_and_running_queue_size()} "
+                f"is not equal to the recorded request count {self.instance_request_counts[instance_id]}"
+            )
+            return True
+        return False

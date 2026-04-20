@@ -4,6 +4,7 @@ import os
 import numpy as np
 from verl import DataProto
 
+from psrl.utils.profiling.collector import TurnProfilingCollector
 from psrl.workers.agent_loop.gateway_client import RolloutGatewayClient
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
@@ -16,11 +17,16 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class BatchGenerateAgentLoop(AgentLoopBase):
     """Agent loop that performs batch generation for multiple requests simultaneously."""
 
-    async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
+    async def run(
+        self,
+        request: DataProto,
+        profiling_collector: TurnProfilingCollector | None = None,
+    ) -> tuple[DataProto | None, TerminateReason]:
         """Execute batch generation for the given requests.
 
         Args:
             request (DataProto): Batch of input requests.
+            profiling_collector: Unused; accepted for interface consistency.
 
         Returns:
             Tuple[DataProto, TerminateReason]:

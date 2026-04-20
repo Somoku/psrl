@@ -10,6 +10,7 @@ from tensordict import TensorDict
 from verl import DataProto
 from vllm.sampling_params import RequestOutputKind
 
+from psrl.utils.kv_cache.types import TrajectoryCacheInfo
 from psrl.utils.logger import DualOutputHandler, EventType, deprecated, log_dual_events
 from psrl.utils.ray import AsyncBusyPollingRayLock
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
@@ -27,6 +28,15 @@ from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _to_token_list(tokens) -> list:
+    """Convert tokens to a Python list, handling both numpy arrays, tensors, and plain lists."""
+    if isinstance(tokens, list):
+        return tokens
+    if hasattr(tokens, "tolist"):
+        return tokens.tolist()
+    return list(tokens)
 
 
 @ray.remote(concurrency_groups={"control": 1})
@@ -104,6 +114,11 @@ class RolloutRouter:
         # Track the instance id for each incomplete request (i.e., request that is not completed yet):
         # {request_id: instance_id}
         self.incomplete_request_to_instance = {}
+        # Trajectory-level instance mapping — survives individual turn completion.
+        # Upserted on every routing decision; cleared by `kv_unregister`.
+        self.complete_request_to_instance: dict[int, int] = {}
+        # Trajectory-level token mapping — auto-maintained by generate_async / _route_single_request.
+        self.request_to_tokens: dict[int, list[int]] = {}
         self.request_futures = {}  # Track request futures: {request_id: Future}
         # Track the version after synchronization for each instance: {instance_id: ps_model_version}
         self.instance_to_version_after_sync = {i: 0 for i in range(self.rollout_wg_size)}
@@ -116,6 +131,53 @@ class RolloutRouter:
         self.log_prefix = "RolloutRouter"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info("Initialized RolloutRouter")
+
+    async def _inject_kv_hit_scores(
+        self,
+        request_id: int,
+        candidates: list[int],
+        route_kwargs: dict,
+    ) -> None:
+        """Query KV cache hit scores for all candidates and store in `route_kwargs`.
+
+        Only runs when `self.config.psrl.routing_strategy.method` is
+        `"kv_cache_aware"`.  Each candidate is queried concurrently via
+        `execute_rank_zero_async("kv_get_cache_info", tokens)`.  Instances that
+        time out or raise are assigned score 0 (graceful degradation).
+
+        Mutates `route_kwargs` in-place by adding the key `"kv_hit_scores"`.
+        """
+        if self.config.psrl.routing_strategy.method != "kv_cache_aware":
+            return
+        assert request_id in self.request_to_tokens, (
+            f"[KV] uid={request_id} not found in request_to_tokens. "
+            "Expected START registration in generate_async before routing."
+        )
+        tokens: list[int] = self.request_to_tokens[request_id]
+        timeout: float = self.config.psrl.routing_strategy.kv_query_timeout_ms / 1000
+        raw_results = await asyncio.gather(
+            *[
+                asyncio.wait_for(
+                    self.rollout_wg_list[i].execute_rank_zero_async(
+                        "kv_get_cache_info", tokens
+                    ),
+                    timeout=timeout,
+                )
+                for i in candidates
+            ],
+            return_exceptions=True,
+        )
+        kv_hit_scores: dict[int, int] = {}
+        for i, result in zip(candidates, raw_results):
+            if isinstance(result, Exception):
+                psrl_logger.warning(
+                    f"[KV]: Cache info RPC failed for instance {i!r}: {result!r}."
+                )
+                kv_hit_scores[i] = 0
+            else:
+                info = TrajectoryCacheInfo(**result)
+                kv_hit_scores[i] = max(info.gpu_cached_tokens, info.lmcache_cached_tokens)
+        route_kwargs["kv_hit_scores"] = kv_hit_scores
 
     def init_route_strategy(self, **kwargs):
         """Initialize the route strategy for the router.
@@ -374,10 +436,13 @@ class RolloutRouter:
             )
         route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
 
-        # 6. Strategy-based routing
+        # 6. KV hit score query (only active when method == "kv_cache_aware").
+        await self._inject_kv_hit_scores(request_id, candidates, route_kwargs)
+
+        # 7. Strategy-based routing.
         chosen_rollout_instance = self.route_strategy.route(request, candidates=candidates, route_kwargs=route_kwargs)
 
-        # 7. If not None, the request is routed to the chosen rollout instance
+        # 8. If not None, the request is routed to the chosen rollout instance.
         if chosen_rollout_instance is not None:
             # Allocate the version tag and reserve the request for the chosen
             # rollout instance if the request is not routed before
@@ -473,13 +538,24 @@ class RolloutRouter:
             all_log_prob_list.append(log_prob_list)
 
         # Consolidate batch results
+        assert all(isinstance(ids, (list, tuple)) for ids in response_ids_list), (
+            f"response_ids_list elements must be lists, got types: "
+            f"{[type(ids) for ids in response_ids_list]}"
+        )
         if "raw_response_ids" in non_tensor_batch:
             raw_response_ids = non_tensor_batch.pop("raw_response_ids")
+            assert isinstance(raw_response_ids, np.ndarray), (
+                f"raw_response_ids should be np.ndarray, got {type(raw_response_ids)}"
+            )
             raw_response_ids = np.fromiter(raw_response_ids.tolist(), dtype=object)
         else:
             raw_response_ids = np.fromiter(([] for _ in range(batch_size)), dtype=object)
 
         raw_response_ids = raw_response_ids + np.fromiter(response_ids_list, dtype=object)
+        assert isinstance(raw_response_ids, np.ndarray) and raw_response_ids.dtype == object, (
+            f"raw_response_ids after concat should be np.ndarray(dtype=object), "
+            f"got type={type(raw_response_ids)}, dtype={getattr(raw_response_ids, 'dtype', None)}"
+        )
         non_tensor_batch["raw_response_ids"] = raw_response_ids
 
         if "response_unpadded_len" in non_tensor_batch:
@@ -534,6 +610,10 @@ class RolloutRouter:
             psrl_logger.info("Started routing loop")
 
         request_id = request.non_tensor_batch["uid"][0]
+        # Register current token sequence for KV-aware routing (START of turn).
+        raw_prompt_ids = request.non_tensor_batch.get("raw_prompt_ids")
+        self.request_to_tokens[request_id] = _to_token_list(raw_prompt_ids[0])
+        
         is_validate = request.meta_info.get("validate", False)
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
             [request_id],
@@ -575,6 +655,31 @@ class RolloutRouter:
         self.request_futures[request_id].set_result(result)
         self.incomplete_request_to_instance.pop(request_id, None)
         self.sticky_session_requests.pop(request_id, None)
+
+    def _resolve_uid(self, uid: int) -> tuple[int | None, list[int] | None]:
+        """
+        Resolve the instance_id and token sequence for a trajectory uid.
+
+        Checks `incomplete_request_to_instance` first (turn in-flight), then
+        `complete_request_to_instance` (between turns).
+
+        Args:
+            uid (int): Trajectory unique identifier.
+
+        Returns:
+            tuple[int | None, list[int] | None]: `(instance_id, tokens)`, or
+                `(None, None)` if uid is not found in either registry.
+        """
+        # NOTE(claude): Cannot use `get(uid) or get(uid)` because instance_id=0
+        # is falsy in Python, which would incorrectly skip instance 0.
+        if uid in self.incomplete_request_to_instance:
+            instance_id = self.incomplete_request_to_instance[uid]
+        elif uid in self.complete_request_to_instance:
+            instance_id = self.complete_request_to_instance[uid]
+        else:
+            return None, None
+        tokens = self.request_to_tokens.get(uid)
+        return instance_id, tokens
 
     def is_routing(self) -> bool:
         """Check if the router is currently routing requests."""
@@ -633,6 +738,7 @@ class RolloutRouter:
                         self.requests_to_route.put(request)
                         break
                     self.incomplete_request_to_instance[request_id] = new_instance_id
+                    self.complete_request_to_instance[request_id] = new_instance_id
                     task_coro = self._route_single_request(request, new_instance_id)
                     task = asyncio.create_task(task_coro)
                     # To avoid silent error in async tasks
@@ -684,6 +790,7 @@ class RolloutRouter:
                             remain_requests.append(request)
                             break
                         self.incomplete_request_to_instance[request_id] = new_instance_id
+                        self.complete_request_to_instance[request_id] = new_instance_id
                         # Create a task to process this request
                         task_coro = self._route_single_request(request, new_instance_id)
                         task = asyncio.create_task(task_coro)
@@ -730,7 +837,7 @@ class RolloutRouter:
         # Get current call's records
         curr_prefill = ntb.get("profiling_prefill_records", [None])[0]
         curr_decode = ntb.get("profiling_decode_records", [None])[0]
-        if not curr_prefill:
+        if curr_prefill is None or len(curr_prefill) == 0:
             return
 
         # Determine trigger for the first record of this engine call.
@@ -762,7 +869,7 @@ class RolloutRouter:
         )[0]
         if accumulated_decode is None:
             accumulated_decode = []
-        if curr_decode:
+        if curr_decode is not None and len(curr_decode) > 0:
             accumulated_decode = list(accumulated_decode) + list(curr_decode)
 
         consolidated_output.non_tensor_batch["_profiling_accumulated_prefill_records"] = np.array(
@@ -827,7 +934,7 @@ class RolloutRouter:
 
         if accumulated_prefill is not None and len(accumulated_prefill) > 0:
             # This is a rerouted request — merge accumulated + current.
-            if curr_prefill:
+            if curr_prefill is not None and len(curr_prefill) > 0:
                 # Use the stored trigger from the last reroute.
                 last_reroute_trigger = str(
                     request.non_tensor_batch.get(
@@ -847,8 +954,8 @@ class RolloutRouter:
             else:
                 all_prefill = list(accumulated_prefill)
 
-            all_decode = list(accumulated_decode) if accumulated_decode else []
-            if curr_decode:
+            all_decode = list(accumulated_decode) if accumulated_decode is not None and len(accumulated_decode) > 0 else []
+            if curr_decode is not None and len(curr_decode) > 0:
                 all_decode = all_decode + list(curr_decode)
 
             # Use the first generation start ts from the first call.
@@ -864,7 +971,7 @@ class RolloutRouter:
                 )
         else:
             # First (and only) engine call — just overwrite RESUME to INITIAL.
-            if curr_prefill and len(curr_prefill) > 0:
+            if curr_prefill is not None and len(curr_prefill) > 0:
                 curr_prefill[0]["trigger"] = "initial"
 
         # Clean up internal accumulation fields.
@@ -955,6 +1062,7 @@ class RolloutRouter:
             # Remove request from inflight request ids for the instance
             self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
 
+            need_reroute = False
             # Check if request was interrupted and needs to be requeued
             if update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED_BY_SCHEDULER:
                 psrl_logger.debug(
@@ -969,7 +1077,7 @@ class RolloutRouter:
                 )
                 self.requests_to_route.put(consolidated_output)
                 # No result to set since the request is not completed
-                return
+                need_reroute = True
             elif update_status == PSRL_RequestStatus.ROLLOUT_INTERRUPTED:
                 psrl_logger.debug(
                     f"Request {request_id} on instance {new_instance_id} was interrupted "
@@ -983,7 +1091,7 @@ class RolloutRouter:
                 )
                 self.requests_to_route.put(consolidated_output)
                 # No result to set since the request is not completed
-                return
+                need_reroute = True
             elif update_status == PSRL_RequestStatus.ROLLOUT_COMPLETED:
                 response_len = consolidated_output.non_tensor_batch["response_unpadded_len"][0]
                 parent_prompt_id = request_id // rollout_n
@@ -1003,9 +1111,18 @@ class RolloutRouter:
             # Means the request is aborted
             # psrl_logger.info(f"Request {request_id} is aborted")
             result = None
+            
+        # Update token sequence with prompt + response for next turn's KV routing (END of turn).
+        if consolidated_output is not None:
+            raw_prompt_ids = consolidated_output.non_tensor_batch.get("raw_prompt_ids")
+            raw_response_ids = consolidated_output.non_tensor_batch.get("raw_response_ids")
+            prompt_tokens = _to_token_list(raw_prompt_ids[0])
+            response_tokens = _to_token_list(raw_response_ids[0])
+            self.request_to_tokens[request_id] = prompt_tokens + response_tokens
 
         # Set the result for the request
-        self._set_result(request_id, result)
+        if not need_reroute:
+            self._set_result(request_id, result)
 
     @ray.method(concurrency_group="control")
     async def check_should_migrate(self) -> list[int]:
@@ -1287,3 +1404,156 @@ class RolloutRouter:
                 break
             await asyncio.sleep(0)
         psrl_logger.info("The interrupted partial requests are looped back in the priority queue")
+
+    # --- Trajectory KV cache management methods ---
+
+    @ray.method(concurrency_group="control")
+    async def kv_unregister(self, uid: int) -> None:
+        """
+        Remove trajectory token and instance records when a trajectory ends.
+
+        Called by `AgentLoopWorker` when the trajectory is fully complete.
+
+        Args:
+            uid (int): Trajectory unique identifier.
+        """
+        self.complete_request_to_instance.pop(uid, None)
+        self.request_to_tokens.pop(uid, None)
+        psrl_logger.debug(f"[KV] Unregistered uid={uid}.")
+
+    @ray.method(concurrency_group="control")
+    async def kv_get_cache_info(self, uid: int) -> dict | None:
+        """
+        Query GPU prefix-cache and LMCache backend usage for a trajectory.
+
+        Args:
+            uid (int): Trajectory unique identifier.
+
+        Returns:
+            dict | None: `TrajectoryCacheInfo` as a dict, or None if uid not found.
+        """
+        instance_id, tokens = self._resolve_uid(uid)
+        assert instance_id is not None, f"kv_get_cache_info: uid={uid} not found in any registry."
+        assert tokens is not None, (
+            f"kv_get_cache_info: uid={uid} found on instance {instance_id} "
+            f"but has no registered tokens in request_to_tokens."
+        )
+        assert 0 <= instance_id < len(self.rollout_wg_list), (
+            f"kv_get_cache_info: instance_id={instance_id} out of range "
+            f"[0, {len(self.rollout_wg_list)})."
+        )
+        return await self.rollout_wg_list[instance_id].execute_rank_zero_async(
+            "kv_get_cache_info", tokens
+        )
+
+    @ray.method(concurrency_group="control")
+    async def kv_pin(self, uid: int, targets: list[str]) -> bool:
+        """
+        Pin the cached prefix blocks/chunks for a trajectory.
+
+        Args:
+            uid (int): Trajectory unique identifier.
+            targets (list[str]): Subset of `["gpu", "backend"]`.
+
+        Returns:
+            bool: True if all requested pins succeeded, False if uid not found.
+        """
+        instance_id, tokens = self._resolve_uid(uid)
+        assert instance_id is not None, f"kv_pin: uid={uid} not found in any registry."
+        assert tokens is not None, (
+            f"kv_pin: uid={uid} found on instance {instance_id} "
+            f"but has no registered tokens in request_to_tokens."
+        )
+        assert 0 <= instance_id < len(self.rollout_wg_list), (
+            f"kv_pin: instance_id={instance_id} out of range "
+            f"[0, {len(self.rollout_wg_list)})."
+        )
+        return await self.rollout_wg_list[instance_id].execute_rank_zero_async(
+            "kv_pin", tokens, targets
+        )
+
+    @ray.method(concurrency_group="control")
+    async def kv_unpin(self, uid: int, targets: list[str]) -> bool:
+        """
+        Unpin the cached prefix blocks/chunks for a trajectory.
+
+        Args:
+            uid (int): Trajectory unique identifier.
+            targets (list[str]): Subset of `["gpu", "backend"]`.
+
+        Returns:
+            bool: True if all unpins succeeded, False if uid not found.
+        """
+        instance_id, tokens = self._resolve_uid(uid)
+        assert instance_id is not None, f"kv_unpin: uid={uid} not found in any registry."
+        assert tokens is not None, (
+            f"kv_unpin: uid={uid} found on instance {instance_id} "
+            f"but has no registered tokens in request_to_tokens."
+        )
+        assert 0 <= instance_id < len(self.rollout_wg_list), (
+            f"kv_unpin: instance_id={instance_id} out of range "
+            f"[0, {len(self.rollout_wg_list)})."
+        )
+        return await self.rollout_wg_list[instance_id].execute_rank_zero_async(
+            "kv_unpin", tokens, targets
+        )
+
+    @ray.method(concurrency_group="control")
+    async def kv_clear_from_backend(self, uid: int) -> int:
+        """
+        Remove the cached prefix chunks for a trajectory from the LMCache backend.
+
+        Args:
+            uid (int): Trajectory unique identifier.
+
+        Returns:
+            int: Number of chunks removed, or 0 if uid not found.
+        """
+        instance_id, tokens = self._resolve_uid(uid)
+        assert instance_id is not None, f"kv_clear_from_backend: uid={uid} not found in any registry."
+        assert tokens is not None, (
+            f"kv_clear_from_backend: uid={uid} found on instance {instance_id} "
+            f"but has no registered tokens in request_to_tokens."
+        )
+        assert 0 <= instance_id < len(self.rollout_wg_list), (
+            f"kv_clear_from_backend: instance_id={instance_id} out of range "
+            f"[0, {len(self.rollout_wg_list)})."
+        )
+        return await self.rollout_wg_list[instance_id].execute_rank_zero_async(
+            "kv_clear_from_backend", tokens
+        )
+
+    @ray.method(concurrency_group="control")
+    async def kv_transfer(
+        self,
+        uid: int,
+        src: tuple[str, str],
+        dst: tuple[str, str],
+        copy: bool = False,
+    ) -> bool:
+        """
+        Transfer the cached prefix of a trajectory to another (instance, backend).
+
+        Args:
+            uid (int): Trajectory unique identifier.
+            src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)`.
+            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)`.
+            copy (bool): If True, keep data at source as well.
+
+        Returns:
+            bool: True if transfer was initiated, False if uid not found.
+        """
+        instance_id, tokens = self._resolve_uid(uid)
+        assert instance_id is not None, f"kv_transfer: uid={uid} not found in any registry."
+        assert tokens is not None, (
+            f"kv_transfer: uid={uid} found on instance {instance_id} "
+            f"but has no registered tokens in request_to_tokens."
+        )
+        assert 0 <= instance_id < len(self.rollout_wg_list), (
+            f"kv_transfer: instance_id={instance_id} out of range "
+            f"[0, {len(self.rollout_wg_list)})."
+        )
+        return await self.rollout_wg_list[instance_id].execute_rank_zero_async(
+            "kv_transfer", tokens, src, dst, copy
+        )
+

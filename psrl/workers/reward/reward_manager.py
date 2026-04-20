@@ -405,7 +405,25 @@ class RewardManager(CommandExtension):
                     continue
                 """
                 reward_input = reward_inputs[i : i + 1]
+                psrl_logger.debug(
+                    f"[RewardManager.union] sample_id={sample_id}, "
+                    f"reward_input keys={list(reward_input.non_tensor_batch.keys())}, "
+                    f"request_data keys={list(request_data.non_tensor_batch.keys())}, "
+                    f"overlap={set(reward_input.non_tensor_batch.keys()) & set(request_data.non_tensor_batch.keys())}"
+                )
                 reward_input = reward_input.union(request_data)
+
+                # Merge agent-loop-provided reward metadata into extra_info so
+                # that custom reward functions can access it transparently.
+                # Agent loops store this under a dedicated key to avoid mutating
+                # extra_info (which would break the union identity check).
+                agent_info = reward_input.non_tensor_batch.pop("agent_reward_info", None)
+                if agent_info is not None:
+                    ei = reward_input.non_tensor_batch.get("extra_info", None)
+                    if ei is not None and len(ei) > 0 and isinstance(ei[0], dict):
+                        info_val = agent_info[0] if hasattr(agent_info, '__getitem__') else agent_info
+                        if isinstance(info_val, dict):
+                            ei[0].update(info_val)
 
                 if self.config.reward_model.launch_reward_fn_async:
                     # Launch async reward computation

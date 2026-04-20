@@ -2,24 +2,24 @@
 # set -v
 
 # Save a Docker image as a tar (for docker load / docker_copy.sh).
-# Args or env: $1/DOCKER_IMAGE_DIR, $2/DOCKER_IMAGE_FILE (tar basename), $3/DOCKER_IMAGE_REF (e.g. python:3.11-slim).
-# Legacy env alias: DOCKER_IMAGE_NAME (same as DOCKER_IMAGE_FILE if DOCKER_IMAGE_FILE is unset).
 #
-# DOCKER_INSTALL_METHOD:
-#   docker (default) — docker pull + docker save (needs Docker daemon).
-#   skopeo            — registry -> tar in one step, no docker pull (needs skopeo).
-#   crane             — same idea (needs crane).
+# Required env vars:
+#   DOCKER_IMAGE_DIR   — output directory for the tar file
+#   DOCKER_IMAGE_FILE  — tar filename (basename, e.g. python_3.11-slim.tar)
+#   DOCKER_IMAGE_TAG   — image tag (e.g. python:3.11-slim)
+#
+# Optional env vars:
+#   DOCKER_INSTALL_METHOD — pull method: docker (default), skopeo, or crane
+#   DOCKERHUB_MIRROR      — registry mirror host (e.g. docker.m.daocloud.io)
+#   SKOPEO                — explicit path to skopeo binary
 #
 # Example:
-#   ./docker_install.sh /data/docker_images python_3.11-slim.tar python:3.11-slim
-#   DOCKER_INSTALL_METHOD=skopeo ./docker_install.sh /data img.tar python:3.11-slim
-# Then copy/load on nodes: ./docker_copy.sh "$DOCKER_NODE_IPS" "$DOCKER_NODE_NUM" /data/docker_images python_3.11-slim.tar
+#   DOCKER_IMAGE_DIR=/data/docker_images DOCKER_IMAGE_FILE=python_3.11-slim.tar \
+#     DOCKER_IMAGE_TAG=python:3.11-slim ./docker_install.sh
 #
-# Pulling via a Docker Hub mirror (when registry-1.docker.io is slow or blocked):
-#   DOCKERHUB_MIRROR=docker.m.daocloud.io ./docker_install.sh /data img.tar python:3.11-slim
-# Or pass a full ref (no DOCKERHUB_MIRROR needed):
-#   ./docker_install.sh /data img.tar docker.m.daocloud.io/library/python:3.11-slim
-# Registry mirrors for the daemon: /etc/docker/daemon.json "registry-mirrors", then restart docker.
+#   DOCKER_INSTALL_METHOD=skopeo DOCKERHUB_MIRROR=docker.m.daocloud.io \
+#     DOCKER_IMAGE_DIR=/data DOCKER_IMAGE_FILE=img.tar DOCKER_IMAGE_TAG=python:3.11-slim \
+#     ./docker_install.sh
 
 # If DOCKERHUB_MIRROR is set, rewrite short Docker Hub refs to pull from that host (skopeo/docker/crane).
 apply_dockerhub_mirror() {
@@ -42,23 +42,17 @@ apply_dockerhub_mirror() {
     fi
 }
 
-[ -n "$1" ] && DOCKER_IMAGE_DIR="$1"
-[ -n "$2" ] && DOCKER_IMAGE_FILE="$2"
-[ -n "$3" ] && DOCKER_IMAGE_REF="$3"
-
-DOCKER_IMAGE_FILE=${DOCKER_IMAGE_FILE:-${DOCKER_IMAGE_NAME:-}}
-
-if [ -z "$DOCKER_IMAGE_DIR" ] || [ -z "$DOCKER_IMAGE_FILE" ] || [ -z "$DOCKER_IMAGE_REF" ]; then
-    echo "Error: DOCKER_IMAGE_DIR, DOCKER_IMAGE_FILE (tar basename), and DOCKER_IMAGE_REF are required."
-    echo "Usage: $0 <dir> <tar_file> <image_ref>"
-    echo "Example: $0 /path/to/dir python_3.11-slim.tar python:3.11-slim"
-    echo "Env: DOCKER_IMAGE_DIR, DOCKER_IMAGE_FILE (or legacy DOCKER_IMAGE_NAME), DOCKER_IMAGE_REF"
+if [ -z "$DOCKER_IMAGE_DIR" ] || [ -z "$DOCKER_IMAGE_FILE" ] || [ -z "$DOCKER_IMAGE_TAG" ]; then
+    echo "[docker_install.sh] Required env vars not set."
+    echo "Usage:"
+    echo "  DOCKER_IMAGE_DIR=/path/to/dir DOCKER_IMAGE_FILE=my.tar DOCKER_IMAGE_TAG=python:3.11 \\"
+    echo "    ./docker_install.sh"
     exit 1
 fi
 
 OUT_PATH="$DOCKER_IMAGE_DIR/$DOCKER_IMAGE_FILE"
 DOCKER_INSTALL_METHOD=${DOCKER_INSTALL_METHOD:-docker}
-PULL_REF=$(apply_dockerhub_mirror "$DOCKER_IMAGE_REF")
+PULL_REF=$(apply_dockerhub_mirror "$DOCKER_IMAGE_TAG")
 
 mkdir -p "$DOCKER_IMAGE_DIR" || exit 1
 

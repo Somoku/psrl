@@ -21,7 +21,7 @@ pushd $TMS_PATH
 git checkout d64a6394d1e09c613fab90260054cecc2684586d
 rm -rf ./*.so ./build
 python -m pip uninstall torch_memory_saver -y
-python -m pip install --no-cache-dir -e .
+python -m pip install --no-cache-dir -e . --no-build-isolation -v
 popd
 
 echo "Successfully installed torch_memory_saver"

@@ -7,6 +7,8 @@ from omegaconf import DictConfig
 from transformers import AutoTokenizer
 from verl import DataProto
 
+from psrl.utils.profiling.collector import TurnProfilingCollector
+from psrl.utils.rollout.trajectory_writer import TrajectoryWriter
 from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
 
 
@@ -39,6 +41,7 @@ class AgentLoopBase(ABC):
         self.ps_manager_handle = ps_manager_handle
         self.tokenizer = tokenizer
         self.loop = asyncio.get_running_loop()
+        self.traj_writer = TrajectoryWriter.from_config(self.config)
 
     @classmethod
     def init_class(cls, config: DictConfig, **kwargs):
@@ -93,14 +96,19 @@ class AgentLoopBase(ABC):
         return outputs
 
     @abstractmethod
-    async def run(self, request: DataProto) -> DataProto:
+    async def run(
+        self,
+        request: DataProto,
+        profiling_collector: TurnProfilingCollector | None = None,
+    ) -> tuple[DataProto | None, TerminateReason]:
         """Execute the agent loop for the given request.
 
         Args:
             request (DataProto): Input request to process.
+            profiling_collector: Per-trajectory profiling collector, or None if disabled.
 
         Returns:
-            DataProto: Processed response data.
+            Tuple of (output DataProto or None, TerminateReason).
 
         Raises:
             NotImplementedError: Must be implemented by subclasses.
@@ -108,7 +116,10 @@ class AgentLoopBase(ABC):
         raise NotImplementedError
 
     async def run_with_termination_handling(
-        self, request: DataProto, raise_on_error: bool = True
+        self,
+        request: DataProto,
+        raise_on_error: bool = True,
+        profiling_collector: TurnProfilingCollector | None = None,
     ) -> tuple[DataProto | None, TerminateReason]:
         """Run the agent loop with termination event handling.
 
@@ -118,12 +129,14 @@ class AgentLoopBase(ABC):
         Args:
             request (DataProto): Input request to process.
             raise_on_error (bool): Whether to raise exceptions on errors.
+            profiling_collector: Per-trajectory profiling collector, or None if disabled.
 
         Returns:
             DataProto: Processed response data.
         """
+        uid = int(request.non_tensor_batch["uid"][0])
         try:
-            coro = self.run(request)
+            coro = self.run(request, profiling_collector)
             output, terminate_reason = await asyncio.wait_for(
                 coro, timeout=self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
             )
@@ -146,3 +159,5 @@ class AgentLoopBase(ABC):
                 )
                 return None, TerminateReason.ERROR
             raise e
+        finally:
+            await self.rollout_router.kv_unregister.remote(uid)

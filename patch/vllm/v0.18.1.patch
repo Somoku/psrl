@@ -50,9 +50,9 @@ index 7ff324f12..16f33c001 100644
  
          self.output_handler = asyncio.create_task(output_handler())
  
-+    async def abort_all(self, internal: bool = False) -> int:
++    async def abort_all(self) -> int:
 +        """Abort all requests in OutputProcessor and EngineCore."""
-+        all_request_ids = self.output_processor.abort_all(internal=internal)
++        all_request_ids = self.output_processor.abort_all()
 +        await self.engine_core.abort_requests_async(all_request_ids)
 +
 +        if self.log_requests:
@@ -70,9 +70,12 @@ index f9e965092..5501c8fb0 100644
              assert state.queue is not None
              state.queue.put(e)
  
-+    def abort_all(self, internal: bool = False) -> list[str]:
++    def abort_all(self) -> list[str]:
++        # request_states.keys() are *internal* IDs (randomized by assign_request_id),
++        # so we must pass internal=True; using internal=False would look them up in
++        # external_req_ids where they don't exist, silently aborting nothing.
 +        abort_request_ids = list(self.request_states.keys())
-+        self.abort_requests(abort_request_ids, internal=internal)
++        self.abort_requests(abort_request_ids, internal=True)
 +        return abort_request_ids
 +
      def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:

@@ -134,11 +134,12 @@ ENV/
 
 
 # local logs
-logs
-log
-outputs
+**/logs/
+**/log/
+**/fsdp_psrl_log/
+**/outputs/
 
 
-models/
-data/
-docs/
+**/models/
+**/data/
+**/docs/

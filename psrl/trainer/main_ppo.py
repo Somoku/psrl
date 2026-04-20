@@ -148,6 +148,7 @@ def run_ppo(config) -> None:
     else:
         runner = TaskRunner.remote()
     ray.get(runner.run.remote(config))
+    ray.shutdown()
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis

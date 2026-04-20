@@ -24,16 +24,16 @@ default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
 tool_config_path=${PSRL_PATH}/examples/retool/sandbox_fusion_tool_config.yaml
 
-GEN_TP=2 # TP in the generation side
+GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
-VAL_TP=2 # TP in the training side for validation
+VAL_TP=1 # TP in the training side for validation
 VAL_PP=1 # PP in the training side for validation
 
-TRAIN_SP=4 # SP in the training side
+TRAIN_SP=2 # SP in the training side
 TRAIN_FSDP=8 # FSDP in the training side
 
-NNODES=6
+NNODES=4
 NGPUS_PER_NODE=8
 
 GEN_NNODES=2 # Number of nodes for generation
@@ -41,7 +41,7 @@ GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=4 # Number of nodes for training
+TRAIN_NNODES=2 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
@@ -62,10 +62,10 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 10))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=128
+train_prompt_bsz=64
 n_resp_per_prompt=8
 n_resp_per_prompt_val=8
-train_prompt_mini_bsz=128
+train_prompt_mini_bsz=64
 
 # Algorithm
 temperature=1.0
@@ -91,7 +91,7 @@ offload=False
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
-    psrl.staleness=0 \
+    psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.ps_mode=nixl_cpu \
     psrl.logging_path=${PSRL_PATH}/examples/retool/fsdp_psrl_log/${experiment_name} \
@@ -109,7 +109,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     \
     gen_actor_rollout_ref.model.path="$MODEL_PATH" \
     +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -188,9 +188,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.default_local_dir="${default_local_dir}" \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.log_val_generations=10 \
-    trainer.test_freq=100 \
+    trainer.test_freq=5 \
     trainer.save_freq=1000 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=20 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

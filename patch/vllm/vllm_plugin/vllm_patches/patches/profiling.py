@@ -98,10 +98,19 @@ def _patch_scheduler_update_request_with_output() -> None:
     """
     Wrap `Scheduler._update_request_with_output` to record profiling events.
 
-    - `FIRST_TOKEN` is recorded *before* the original call when
-      `num_output_tokens == 0`, capturing the exact moment prefill ends.
-    - `LAST_TOKEN` is recorded *after* the original call when `stopped`
-      is True, providing a monotonic decode-end timestamp.
+    - `FIRST_TOKEN` is recorded *before* the original call when this is the
+      first output token of the *current scheduling cycle*. The cycle baseline
+      is tracked via `request._psrl_cycle_output_token_baseline`, which is set
+      to the current `num_output_tokens` each time a request is preempted and
+      re-queued (see `RolloutScheduler._preempt_request`). For brand-new
+      requests the attribute is absent, so the baseline defaults to 0.
+      This correctly handles internal preemption where `_output_token_ids` is
+      not cleared and `num_output_tokens` is non-zero from a prior decode
+      segment.
+    - `LAST_TOKEN` is recorded *after* the original call when `stopped` is
+      True **and** `new_token_ids_out` is non-empty, providing a monotonic
+      decode-end timestamp. Guarding on `new_token_ids_out` prevents a spurious
+      `LAST_TOKEN` when a request is aborted mid-prefill with no output tokens.
 
     Both events are only recorded when `self.log_stats` is enabled.
     """
@@ -117,17 +126,23 @@ def _patch_scheduler_update_request_with_output() -> None:
     _original = Scheduler._update_request_with_output
 
     def _patched(self, request, new_token_ids):
-        # Record `FIRST_TOKEN` before the original call so `num_output_tokens`
-        # is still 0 (the original appends tokens, incrementing the counter).
-        if new_token_ids and self.log_stats and request.num_output_tokens == 0:
-            request.record_event(EngineCoreEventType.FIRST_TOKEN)
+        if new_token_ids and self.log_stats:
+            # Fire FIRST_TOKEN when output tokens first exceed the per-cycle
+            # baseline. For new requests the baseline is absent → defaults to 0.
+            # For resumed requests the baseline was set in _preempt_request to
+            # `num_output_tokens` at the moment of preemption, so FIRST_TOKEN
+            # fires on the first new token of the current scheduling cycle.
+            baseline = getattr(request, "_psrl_cycle_output_token_baseline", 0)
+            if request.num_output_tokens == baseline:
+                request.record_event(EngineCoreEventType.FIRST_TOKEN)
 
         result = _original(self, request, new_token_ids)
 
-        # Record `LAST_TOKEN` after the original call so we know the final
-        # stop decision has been made.
-        _, stopped = result
-        if stopped and self.log_stats:
+        # Record LAST_TOKEN only when there are actual output tokens — an abort
+        # with no tokens (e.g. preempt before any decode) must not emit
+        # LAST_TOKEN, as there is no valid FIRST_TOKEN to pair it with.
+        new_token_ids_out, stopped = result
+        if stopped and new_token_ids_out and self.log_stats:
             request.record_event(EngineCoreEventType.LAST_TOKEN)
 
         return result

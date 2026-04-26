@@ -136,10 +136,9 @@ ENV/
 # local logs
 **/logs/
 **/log/
-**/fsdp_psrl_log/
+**/*log*/
 **/outputs/
-
-
 **/models/
 **/data/
 **/docs/
+**/output/

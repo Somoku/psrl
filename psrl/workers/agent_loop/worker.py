@@ -286,10 +286,36 @@ class PSRL_AgentLoopWorker:
                     TerminateReason.UNKNOWN,
                     TerminateReason.ABORTED,
                 ):
+                    # Emit a structured warning so stuck-group investigations can
+                    # correlate the dropped uids with rollout instances and
+                    # termination reasons across worker/manager logs.
+                    dropped_uids = requests.non_tensor_batch["uid"].tolist()
+                    parent_ids = (
+                        requests.non_tensor_batch["parent_id"].tolist()
+                        if "parent_id" in requests.non_tensor_batch
+                        else [None] * len(dropped_uids)
+                    )
+                    last_rollout_instance_ids = (
+                        requests.non_tensor_batch["rollout_instance_id"].tolist()
+                        if "rollout_instance_id" in requests.non_tensor_batch
+                        else [None] * len(dropped_uids)
+                    )
+                    last_version_tags = (
+                        requests.non_tensor_batch["version_tag"].tolist()
+                        if "version_tag" in requests.non_tensor_batch
+                        else [None] * len(dropped_uids)
+                    )
                     psrl_logger.warning(
-                        f"Agent loop for requests {requests.non_tensor_batch['uid']} "
-                        f"terminated with reason {terminate_reason.value} "
-                        f"after {retry_limit} attempts."
+                        "Dropping rollout output after %d attempts "
+                        "(terminate_reason=%s, is_validate=%s): "
+                        "uids=%s parent_ids=%s rollout_instance_ids=%s version_tags=%s",
+                        retry_limit,
+                        terminate_reason.value,
+                        requests.meta_info.get("validate", False),
+                        dropped_uids,
+                        parent_ids,
+                        last_rollout_instance_ids,
+                        last_version_tags,
                     )
                     output = None
                 else:

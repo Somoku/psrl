@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-2}
 project_name=psrl_mini_swe
-experiment_name=GRPO-Qwen2.5-7B-mini_swe-fsdp2-staleness_${staleness}
+experiment_name=GRPO-Qwen2.5-14B-mini_swe-fsdp2-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -19,7 +19,7 @@ echo "=== Pre-flight done ==="
 
 # --- Model ---
 # NOTE(lhy): Modify max_position_embeddings in config.json to 32768 after downloading.
-MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-7B-Instruct
+MODEL_PATH=${PSRL_WORKSPACE}/models/DeepSeek-R1-Distill-Qwen-14B
 
 # --- Data ---
 # Generate with: python examples/mini_swe/prepare/prepare_simple_data.py --train_size 64 --test_size 16
@@ -87,8 +87,8 @@ overlong_buffer_len=$((1024 * 10))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=16
-n_resp_per_prompt=4
-n_resp_per_prompt_val=4
+n_resp_per_prompt=8
+n_resp_per_prompt_val=8
 train_prompt_mini_bsz=16
 
 # --- Sampling ---
@@ -104,7 +104,7 @@ rollout_is_threshold=2.0
 # --- Performance ---
 use_dynamic_bsz=True
 packing_length=$(( (max_prompt_length + max_response_length) * 1 ))
-offload=False
+offload=True
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
@@ -208,4 +208,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=5 \
     trainer.save_freq=500 \
     trainer.total_epochs=100 \
-    trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=50 2>&1 | tee ${experiment_name}.log

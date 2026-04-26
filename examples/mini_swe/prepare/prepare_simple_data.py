@@ -6,7 +6,7 @@ Supports simple test cases (for quick validation), loaded from JSON files.
 Data format:
 - prompt: Minimal chat messages (satisfies framework's ``raw_prompt`` requirement).
           The real system/instance templates are applied at runtime by
-          mini-SWE-agent via ``mini_swe_agent_config.yaml``.
+          mini-SWE-agent via ``simple_agent_config.yaml``.
 - reward_model: Evaluation configuration.
 - extra_info: Contains problem_statement, expected_patch,
               and data-affine overrides (sandbox_overrides / agent_overrides).

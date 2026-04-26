@@ -62,7 +62,7 @@ class MiniSWEEnvironment(Environment[dict, None]):
         """
         super().__init__(config, reward_manager)
         self._base_runtime_config = runtime_config
-        self._swe_problem_id: str = ""
+        self._swe_task_id: str = ""
         self._runtime_config: MiniSWEAgentRuntimeConfig | None = None
 
     async def reset(self, task: DataProto, **kwargs) -> tuple[dict, dict]:
@@ -106,19 +106,23 @@ class MiniSWEEnvironment(Environment[dict, None]):
                     problem_statement = raw_prompt
 
         repo_path = extra_info.get("repo_path", None)
-        problem_swe_id = str(extra_info.get("instance_id", "") or "")
+        swe_problem_id = str(extra_info.get("swe_problem_id", "") or "")
         sandbox_overrides = extra_info.get("sandbox_overrides", {}) or {}
 
         # Build runtime config from pre-built base or defaults.
         base_config = self._base_runtime_config or build_runtime_config({})
         self._runtime_config = apply_data_overrides(base_config, extra_info)
 
-        # Generate unique swe_problem_id.
-        self._swe_problem_id = (
-            problem_swe_id
-            if problem_swe_id
-            else f"{uuid.uuid4().hex[:12]}-{int(time.time())}"
-        )
+        # Generate a fresh UUID for this rollout episode.
+        # swe_task_id is always new per episode so that concurrent rollouts on
+        # the same swe_problem_id (n_resp_per_prompt > 1) each get a distinct
+        # Docker label and cannot accidentally clean up each other's containers.
+        task_uuid = f"{uuid.uuid4().hex[:12]}-{int(time.time())}"
+        self._swe_task_id = task_uuid
+        if swe_problem_id:
+            # Append the problem ID for easier log tracing, but keep the UUID
+            # as the uniqueness guarantee.
+            self._swe_task_id = f"{task_uuid}-{swe_problem_id[:24]}"
 
         sb = self._runtime_config.sandbox_config
 
@@ -130,16 +134,22 @@ class MiniSWEEnvironment(Environment[dict, None]):
 
         observation = {
             "problem_statement": problem_statement,
-            "swe_problem_id": self._swe_problem_id,
+            "swe_task_id": self._swe_task_id,
             "runtime_config": self._runtime_config,
             "repo_path": repo_path,
             "use_preexisting_repo": use_preexisting_repo,
             "preexisting_repo_name": preexisting_repo_name,
+            # Grader fields: forwarded to the agent loop for post-rollout
+            # fresh-container evaluation.  Empty string means no grading.
+            "swe_grader": str(extra_info.get("swe_grader", "") or ""),
+            "swe_problem": extra_info.get("swe_problem", {}),
+            "swe_problem_image": str(extra_info.get("swe_problem_image", "") or ""),
+            "swe_restore_tests": bool(extra_info.get("swe_restore_tests", False)),
         }
 
         _problem_short = f"{problem_statement[:80]}..." if len(problem_statement) > 80 else problem_statement
         psrl_logger.info(
-            f"[mini-SWE-agent, id={self._swe_problem_id}] MiniSWEEnvironment reset: "
+            f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment reset: "
             f"problem={_problem_short!r}, "
             f"repo={preexisting_repo_name!r}, preexisting={use_preexisting_repo}."
         )
@@ -163,10 +173,10 @@ class MiniSWEEnvironment(Environment[dict, None]):
         `DockerEnvironment.cleanup()`. This method provides a fallback
         via label-based container cleanup in case the primary path fails.
         """
-        if self._swe_problem_id:
-            await cleanup_containers_by_label("psrl.swe_problem_id", self._swe_problem_id)
+        if self._swe_task_id:
+            await cleanup_containers_by_label("psrl.swe_task_id", self._swe_task_id)
 
-        psrl_logger.info(f"[mini-SWE-agent, id={self._swe_problem_id}] MiniSWEEnvironment closed.")
+        psrl_logger.info(f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment closed.")
 
     @property
     def state(self) -> dict:
@@ -174,6 +184,6 @@ class MiniSWEEnvironment(Environment[dict, None]):
         Return current environment state for debugging.
         """
         return {
-            "swe_problem_id": self._swe_problem_id,
+            "swe_task_id": self._swe_task_id,
             "runtime_config": self._runtime_config,
         }

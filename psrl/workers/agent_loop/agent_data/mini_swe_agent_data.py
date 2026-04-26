@@ -104,6 +104,7 @@ class MiniSWEAgentData(AgentData[dict, None]):
         self.patch = None
         self.problem_statement = ""
         self._alignment_failure_reason = ""
+        self._grader_result: dict = {}
 
     def init_trajectory(self, request: DataProto) -> None:
         """
@@ -207,6 +208,20 @@ class MiniSWEAgentData(AgentData[dict, None]):
             patch: Generated patch string, or None.
         """
         self.patch = patch
+
+    def set_grader_result(self, result: dict) -> None:
+        """
+        Store the post-rollout grading result from `swebench_grader.grade_fresh_container`.
+
+        The result dict is forwarded into `agent_reward_info` during
+        `finalize_output` so that `compute_score` can read it from
+        `extra_info.grader_result`.  The `resolved` and related fields are
+        also stored at the top level for easy wandb metric emission.
+
+        Args:
+            result (dict): Grading result from `grade_fresh_container`.
+        """
+        self._grader_result: dict = result
 
     # TODO: a workaround solution for token misalignment.
     # Will replace it with 
@@ -409,6 +424,12 @@ class MiniSWEAgentData(AgentData[dict, None]):
             "actual_num_turns": num_turns,
             "alignment_failed": not alignment_ok,
             "alignment_failure_reason": self._alignment_failure_reason,
+            # Grader result (populated by agent loop after fresh-container eval,
+            # empty dict for toy / simple-test data sources).
+            "grader_result": self._grader_result,
+            # Emit acc (resolve_rate, 0/1) alongside the shaped score metric
+            # so wandb shows both train/score and train/acc (OpenClaw-RL L886).
+            "acc": float(bool(self._grader_result.get("resolved", False))),
         }
         request.non_tensor_batch["agent_reward_info"] = np.array([swe_reward_info])
 

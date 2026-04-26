@@ -1,7 +1,7 @@
 """
 mini-SWE-agent Reward Function for PSRL.
 
-Reward structure (for mini_swe_agent data sources):
+Reward structure for mini_swe_agent data sources (toy / simple-test):
   1.0       — exact patch match
   0.10-0.85 — partial patch match (file overlap + line similarity)
   0.05      — patch generated but wrong files / no patch but edited correct file
@@ -11,6 +11,16 @@ Reward structure (for mini_swe_agent data sources):
   0.0       — no patch and no meaningful tool usage / 0 turns (timeout)
  -0.05      — long and fruitless (>=10 turns, no patch, no editor)
  -0.1       — premature submit without any tool usage (1-2 turns)
+
+Reward structure for swebench_verified / swe_smith_py data sources:
+  +1.0  — all FAIL_TO_PASS pass AND all PASS_TO_PASS still pass (resolved)
+   0.0  — patch policy violated (modifies test / config files) [OpenClaw L990]
+  -1.0  — patch submitted but not resolved [OpenClaw L1093-1095]
+   0.0  — no patch submitted (not penalised; policy-violation reward)
+
+The `acc` field (0/1 float, set in agent_data.finalize_output) is emitted
+alongside `score` on wandb to track resolve_rate separately from the shaped
+training signal.
 """
 
 import logging
@@ -161,10 +171,61 @@ def compute_score(
     ground_truth: Any,
     extra_info: dict[str, Any] | None = None,
     **kwargs,
-) -> float:
+) -> float | dict[str, Any]:
     """
     Custom reward function for mini-SWE-agent with tool-use shaping.
+
+    Returns:
+        float: For toy data sources (``mini_swe_agent_simple``, ``mini_swe_agent``),
+            returns a plain float reward in the range [-0.1, 1.0].
+        dict[str, Any]: For SWE-bench data sources (``swebench_verified``,
+            ``swe_smith_py``), returns ``{"score": float, "acc": float}`` so that
+            `DAPORewardLoopManager` emits both the shaped training signal and the
+            0/1 resolve_rate metric to wandb separately.
     """
+    # --- SWE-bench Verified / SWE-smith-py: test-execution reward ---
+    if data_source in ("swebench_verified", "swe_smith_py"):
+        if extra_info is None:
+            extra_info = {}
+        grader_result: dict[str, Any] = extra_info.get("grader_result", {}) or {}
+
+        # Treat num_turns == 0 as ABORTED (same as the simple branch).
+        num_turns = int(extra_info.get("num_turns", 0) or 0)
+        if num_turns == 0:
+            psrl_logger.debug("[swe reward] score=0.0, acc=0.0 (0 turns / aborted).")
+            return {"score": 0.0, "acc": 0.0}
+
+        policy_violated = bool(grader_result.get("policy_violated", False))
+        resolved = bool(grader_result.get("resolved", False))
+
+        # Outcome-reward convention aligned with OpenClaw-RL (L1093-1095):
+        # {-1, +1} with policy violations treated as 0 (not -1, OpenClaw L990).
+        if policy_violated:
+            reasons = grader_result.get("policy_reasons", [])
+            psrl_logger.debug(
+                f"[swe reward] score=0.0, acc=0.0 (policy violated), reasons={reasons!r}."
+            )
+            return {"score": 0.0, "acc": 0.0}
+
+        if resolved:
+            psrl_logger.debug("[swe reward] score=+1.0, acc=1.0 (resolved).")
+            return {"score": 1.0, "acc": 1.0}
+
+        # Not resolved and no grader result (grader was not invoked, e.g. no patch).
+        if not grader_result:
+            psrl_logger.debug(
+                "[swe reward] score=-1.0, acc=0.0 (no grader result, patch not evaluated)."
+            )
+            return {"score": -1.0, "acc": 0.0}
+
+        psrl_logger.debug(
+            f"[swe reward] score=-1.0, acc=0.0 (not resolved), "
+            f"apply_ok={grader_result.get('apply_ok')}, "
+            f"f2p={grader_result.get('f2p_pass')}/{grader_result.get('f2p_total')}."
+        )
+        return {"score": -1.0, "acc": 0.0}
+
+    # --- Toy / simple-test data sources: patch-overlap shaping ---
     if data_source not in ("mini_swe_agent_simple", "mini_swe_agent"):
         # Fallback for unknown data sources: return 0.0.
         return 0.0

@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import time
+from dataclasses import dataclass
 
 # Suppress mini-swe-agent startup banner before importing minisweagent.
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
@@ -30,6 +31,7 @@ from examples.mini_swe.config import (  # noqa: E402
 from litellm import ModelResponse  # noqa: E402
 from minisweagent.agents.default import DefaultAgent  # noqa: E402
 from minisweagent.environments.docker import DockerEnvironment  # noqa: E402
+from minisweagent.exceptions import InterruptAgentFlow  # noqa: E402
 from minisweagent.models.litellm_textbased_model import LitellmTextbasedModel  # noqa: E402
 from omegaconf import DictConfig, OmegaConf  # noqa: E402
 from verl import DataProto  # noqa: E402
@@ -63,10 +65,33 @@ _AGENT_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=32, thread_name_prefix="mini-swe-agent",
 )
 
+# Dedicated thread pool for post-rollout fresh-container grading.
+# Kept separate from _AGENT_THREAD_POOL to prevent grading jobs from
+# starving rollout threads (and vice versa).
+_GRADER_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="swebench-grader",
+)
+
 
 # ---------------------------------------------------------------------------
 # In-process model bridging mini-swe-agent -> PSRL rollout
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TerminateSignal:
+    """
+    Sentinel put into `res_q` by the generation loop when PSRL decides to abort
+    the current episode (e.g. prompt budget exhausted, rollout returned None).
+
+    `_PSRLModel.query()` detects this and raises `InterruptAgentFlow` with a
+    ``role="exit"`` message so `DefaultAgent.run()` terminates immediately,
+    instead of treating an empty string as a model response and looping until
+    `step_limit` via `FormatError` retries.
+    """
+
+    exit_status: str
+    content: str = ""
 
 
 class _PSRLModel(LitellmTextbasedModel):
@@ -112,7 +137,29 @@ class _PSRLModel(LitellmTextbasedModel):
         """
         psrl_logger.info(f"_PSRLModel.query() called with {len(messages)} messages, waiting for generation...")
         self._req_q.put(messages)
-        text = self._res_q.get(timeout=600)
+        item = self._res_q.get(timeout=600)
+
+        # PSRL-initiated abort: exit the agent on the same turn by raising
+        # InterruptAgentFlow with a role="exit" message. `DefaultAgent.run()`
+        # catches it, extends messages, sees the exit role and breaks.
+        if isinstance(item, _TerminateSignal):
+            psrl_logger.info(
+                f"_PSRLModel.query() received terminate signal: exit_status={item.exit_status!r}."
+            )
+            raise InterruptAgentFlow(
+                {
+                    "role": "exit",
+                    "content": item.content or item.exit_status,
+                    "extra": {
+                        "exit_status": item.exit_status,
+                        "submission": "",
+                        "cost": 0.0,
+                        "timestamp": time.time(),
+                    },
+                }
+            )
+
+        text = item
         psrl_logger.info(f"_PSRLModel.query() received response: {len(text)} chars.")
 
         response = ModelResponse(
@@ -223,7 +270,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
         """
         run_start_time = time.time()
         run_slot: tuple[int, int] | None = None
-        swe_problem_id = ""
+        swe_task_id = ""
 
         # Initialize environment and agent data.
         env = MiniSWEEnvironment(
@@ -232,8 +279,8 @@ class MiniSWEAgentLoop(AgentLoopBase):
         )
         observation, info = await env.reset(task=request)
 
-        swe_problem_id = observation["swe_problem_id"]
-        log_prefix = f"[mini-SWE-agent, id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
+        swe_task_id = observation["swe_task_id"]
+        log_prefix = f"[mini-SWE-agent, task_id={swe_task_id}]" if swe_task_id else "[mini-SWE-agent]"
         psrl_logger.info(f"{log_prefix} Initializing agent data...")
 
         agent_data = MiniSWEAgentData(
@@ -281,7 +328,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
                 effective_cwd = f"/{preexisting_repo_name}"
 
             run_args = list(env_cfg.run_args)
-            run_args.extend(["--label", f"psrl.swe_problem_id={swe_problem_id}"])
+            run_args.extend(["--label", f"psrl.swe_task_id={swe_task_id}"])
             if not use_preexisting and observation.get("repo_path"):
                 run_args.extend(["--volume", f"{observation['repo_path']}:/testbed"])
 
@@ -307,10 +354,14 @@ class MiniSWEAgentLoop(AgentLoopBase):
             req_q: queue.Queue = queue.Queue()
             res_q: queue.Queue = queue.Queue()
 
+            m_cfg = runtime_config.model
             model = _PSRLModel(
                 req_q, res_q,
                 model_name="psrl/rollout",
                 cost_tracking="ignore_errors",
+                action_regex=m_cfg.action_regex,
+                observation_template=m_cfg.observation_template,
+                format_error_template=m_cfg.format_error_template,
             )
 
             problem_statement = observation.get("problem_statement", "")
@@ -329,7 +380,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
             agent_future = loop.run_in_executor(
                 _AGENT_THREAD_POOL,
                 self._run_agent_sync,
-                model, docker_env_kwargs, agent_kwargs, problem_statement, swe_problem_id,
+                model, docker_env_kwargs, agent_kwargs, problem_statement, swe_task_id,
             )
 
             # Async generation loop: consume requests and generate via PSRL.
@@ -342,20 +393,69 @@ class MiniSWEAgentLoop(AgentLoopBase):
                 req_q=req_q,
                 res_q=res_q,
                 max_turns=max_turns,
-                swe_problem_id=swe_problem_id,
+                swe_problem_id=swe_task_id,
                 profiling_collector=profiling_collector,
             )
 
             # Wait for agent thread to finish.
+            thread_exit_status = ""
             try:
                 result = await asyncio.wait_for(agent_future, timeout=60.0)
                 thread_patch = result.get("submission", "") if isinstance(result, dict) else ""
+                thread_exit_status = result.get("exit_status", "") if isinstance(result, dict) else ""
                 if thread_patch and not patch:
                     patch = thread_patch
             except (asyncio.TimeoutError, Exception) as e:
                 psrl_logger.warning(f"{log_prefix} Agent thread did not finish cleanly: {e}.")
 
             agent_data.set_patch(patch)
+
+            # --- Post-rollout grading (SWE-bench / SWE-smith instances) ---
+            # Spawn a fresh container from the same image to grade the patch.
+            # This is intentionally done after set_patch() and before
+            # finalize_output() so that set_grader_result() can attach the
+            # result to agent_reward_info before the reward function is called.
+            grader_kind_str = str(observation.get("swe_grader", "") or "")
+            if patch and grader_kind_str == "swebench_fresh_container":
+                swe_problem = observation.get("swe_problem", {})
+                swe_image = str(observation.get("swe_problem_image", "") or "")
+                swe_restore_tests = bool(observation.get("swe_restore_tests", False))
+                grader_kind = "smith" if swe_restore_tests else "verified"
+
+                if swe_image and swe_problem:
+                    from examples.mini_swe.swebench_grader import grade_fresh_container
+
+                    loop = asyncio.get_running_loop()
+                    psrl_logger.info(
+                        f"{log_prefix} Starting fresh-container grading: "
+                        f"grader_kind={grader_kind!r}, image={swe_image!r}."
+                    )
+                    try:
+                        grader_result = await loop.run_in_executor(
+                            _GRADER_THREAD_POOL,
+                            grade_fresh_container,
+                            swe_problem,
+                            patch,
+                            grader_kind,
+                            swe_image,
+                            900,
+                            swe_task_id,
+                            runtime_config.sandbox_config.environment.grader_memory,
+                        )
+                        agent_data.set_grader_result(grader_result)
+                        psrl_logger.info(
+                            f"{log_prefix} Grading done: resolved={grader_result.get('resolved')}, "
+                            f"elapsed={grader_result.get('elapsed_s')}s."
+                        )
+                    except Exception as grading_exc:
+                        psrl_logger.error(
+                            f"{log_prefix} Grading raised an unexpected error: {grading_exc}."
+                        )
+                else:
+                    psrl_logger.warning(
+                        f"{log_prefix} swe_grader={grader_kind_str!r} but swe_problem_image or "
+                        f"swe_problem missing, skipping grading."
+                    )
 
             total_elapsed = time.time() - run_start_time
             psrl_logger.info(
@@ -375,7 +475,14 @@ class MiniSWEAgentLoop(AgentLoopBase):
 
             finalized = await agent_data.finalize_output(request)
 
-            if num_turns >= max_turns:
+            # PSRL-initiated aborts take priority over max_turns/finished so
+            # that the termination reason reflects what actually stopped the
+            # episode (see `_TerminateSignal` in the generation loop).
+            if thread_exit_status == "PromptBudgetExhausted":
+                terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+            elif thread_exit_status == "RolloutReturnedNone":
+                terminate_reason = TerminateReason.ERROR
+            elif num_turns >= max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
             elif num_turns == 0:
                 terminate_reason = TerminateReason.UNKNOWN
@@ -386,8 +493,8 @@ class MiniSWEAgentLoop(AgentLoopBase):
 
         finally:
             # Safety-net Docker cleanup via labels.
-            if swe_problem_id:
-                await cleanup_containers_by_label("psrl.swe_problem_id", swe_problem_id)
+            if swe_task_id:
+                await cleanup_containers_by_label("psrl.swe_task_id", swe_task_id)
             await env.close()
             if run_slot is not None:
                 SlotManager.release(run_slot)
@@ -400,7 +507,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
         docker_env_kwargs: dict,
         agent_kwargs: dict,
         task: str,
-        swe_problem_id: str = "",
+        swe_task_id: str = "",
     ) -> dict:
         """
         Run mini-swe-agent synchronously in a worker thread.
@@ -409,7 +516,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
         container starts immediately on construction), runs the agent, then
         cleans up the container.
         """
-        log_prefix = f"[mini-SWE-agent, id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
+        log_prefix = f"[mini-SWE-agent, task_id={swe_task_id}]" if swe_task_id else "[mini-SWE-agent]"
         docker_env = None
         try:
             psrl_logger.info(
@@ -500,7 +607,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
             else (max_model_len or vllm_budget)
         )
 
-        log_prefix = f"[mini-SWE-agent, id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
+        log_prefix = f"[mini-SWE-agent, task_id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
 
         psrl_logger.info(
             f"{log_prefix} Generation loop started: "
@@ -529,7 +636,8 @@ class MiniSWEAgentLoop(AgentLoopBase):
             normalized = normalize_openai_messages(messages)
             prompt_ids = agent_data.encode_messages(normalized, add_generation_prompt=True)
 
-            # Token budget check.
+            # Token budget check: terminate the agent thread immediately instead
+            # of letting it loop on empty responses until step_limit.
             remaining = max(
                 (effective_limit - len(prompt_ids)) if effective_limit else cfg_response_len,
                 0,
@@ -537,9 +645,9 @@ class MiniSWEAgentLoop(AgentLoopBase):
             if effective_limit and remaining < _MIN_GEN_TOKENS:
                 psrl_logger.warning(
                     f"{log_prefix} Turn {num_turns + 1}: remaining budget "
-                    f"{remaining} < {_MIN_GEN_TOKENS}, sending empty response."
+                    f"{remaining} < {_MIN_GEN_TOKENS}, terminating agent."
                 )
-                res_q.put("")
+                res_q.put(_TerminateSignal("PromptBudgetExhausted"))
                 break
 
             # Build generation request (routing metadata managed by agent_data).
@@ -556,9 +664,9 @@ class MiniSWEAgentLoop(AgentLoopBase):
 
             if output is None:
                 psrl_logger.warning(
-                    f"{log_prefix} Turn {num_turns + 1}: rollout returned None."
+                    f"{log_prefix} Turn {num_turns + 1}: rollout returned None, terminating agent."
                 )
-                res_q.put("")
+                res_q.put(_TerminateSignal("RolloutReturnedNone"))
                 break
 
             if profiling_collector is not None:
@@ -603,6 +711,9 @@ class MiniSWEAgentLoop(AgentLoopBase):
             )
 
             if num_turns >= max_turns:
+                # DefaultAgent.query() checks step_limit at the start of the
+                # next turn and raises LimitsExceeded before pushing to req_q,
+                # so no terminate signal is needed here.
                 psrl_logger.warning(
                     f"{log_prefix} Max turns reached "
                     f"({num_turns}/{max_turns})."

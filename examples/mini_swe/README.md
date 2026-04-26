@@ -1,16 +1,34 @@
 # mini-SWE-agent Training Recipe
 
-Train language models to solve software engineering tasks using reinforcement learning. This recipe integrates [mini-SWE-agent](https://github.com/SWE-agent/mini-SWE-agent) (v2) as a **Python library** with PSRL's trainer, enabling models to learn from interactive coding feedback in Docker-sandboxed environments.
+Train language models to solve software engineering tasks using reinforcement
+learning. This recipe integrates [mini-SWE-agent](https://github.com/SWE-agent/mini-SWE-agent)
+(v2) with PSRL's trainer, enabling models to learn from
+interactive coding feedback in Docker-sandboxed environments.
+
+Two training paths are supported:
+
+| Path | Dataset | Reward | Use case |
+|------|---------|--------|----------|
+| **Toy** | Synthetic bugs in `python:3.11-slim` | Patch-text overlap | Smoke tests, fast iteration |
+| **SWE-smith-py** | Real GitHub bugs (50k SWE problems, per-repo images) | F2P / P2P test execution | Full RL training |
+
+---
 
 ## Overview
 
 The training loop works as follows:
 
-1. **Data**: Each training sample contains a problem statement and a reference patch.
-2. **Rollout**: For each sample, mini-SWE-agent's `DefaultAgent` runs **in-process** (in a worker thread). It manages a Docker container and has the model interact with the codebase by running bash commands.
-3. **Model Bridge**: A custom `_PSRLModel` (inheriting `LitellmTextbasedModel`) intercepts every `query()` call and routes generation through PSRL's vLLM rollout engine via thread-safe queues -- no HTTP proxy, no subprocess.
-4. **Reward**: After the agent finishes, its generated patch is compared against the reference patch to produce a reward signal.
-5. **Training**: PSRL applies GRPO policy gradient updates using the collected trajectories and rewards.
+1. **Data**: Each training sample contains a problem statement and grading metadata.
+2. **Rollout**: For each sample, mini-SWE-agent's `DefaultAgent` runs **in-process**
+   (in a worker thread). It manages a Docker container and has the model interact
+   with the codebase by running bash commands.
+3. **Model Bridge**: A custom `_PSRLModel` (inheriting `LitellmTextbasedModel`)
+   intercepts every `query()` call and routes generation through PSRL's vLLM
+   rollout engine via thread-safe queues — no HTTP proxy, no subprocess.
+4. **Grading** (SWE-smith path): After the agent submits a patch, a fresh Docker
+   container runs the SWE problem's FAIL_TO_PASS and PASS_TO_PASS tests.
+5. **Reward**: Score is computed from the grading result (or patch-text overlap for
+   the toy path) and used for GRPO policy gradient updates.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -29,50 +47,76 @@ The training loop works as follows:
 ┌──────────┐   ┌──────────────┐   ┌────────────────────┐
 │  Docker  │   │ _PSRLModel   │   │ DefaultAgent.run() │
 │container │   │ .query()     │◄──│ (worker thread)    │
-│ (sandbox)│   │ (queue bridge)│   └────────────────────┘
+│(rollout) │   │(queue bridge)│   └────────────────────┘
 └──────────┘   └──────┬───────┘
                       │
                ┌──────┴───────┐
                │ vLLM generate│
-               │ (on-policy)  │
                └──────┬───────┘
+                      │
+               ┌──────┴────────────────┐
+               │ grade_fresh_container │  ← SWE-smith path only
+               │ (fresh Docker, pytest)│
+               └──────┬────────────────┘
                       │
                ┌──────┴───────┐
                │ compute_score│
-               │ (patch diff) │
                └──────────────┘
 ```
+
+---
 
 ## Directory Structure
 
 ```
 examples/mini_swe/
 ├── README.md                             # This file
-├── config.py                             # Runtime config dataclasses (env, agent, sandbox)
-├── reward.py                             # Patch-based reward function (compute_score)
+├── config.py                             # Runtime config dataclasses
+├── reward.py                             # Reward function (patch-overlap + test-execution)
+├── swebench_grader.py                    # Fresh-container grader for SWE-smith / Verified (shared by training + eval)
+├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset
+├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (real RL)
 ├── config/
-│   └── mini_swe_agent_config.yaml        # Agent loop config template
+│   ├── simple_agent_config.yaml        # Agent config for toy path
+│   └── swebench_agent_config.yaml        # Agent config for SWE-bench/smith path
+├── eval/                                 # Standalone evaluation + vLLM serving (see eval/README.md)
+│   ├── README.md                         # Guide for gold-patch sanity, multi-node eval, serving your own checkpoint
+│   ├── eval_swebench.py                  # Single-node eval entry point
+│   ├── eval_swebench_multinode.py        # Hash-sharded cross-host eval launcher
+│   ├── serve_vllm.sh                     # Single-node vLLM OpenAI-compatible server (TP/PP/DP)
+│   └── serve_vllm_multinode.sh           # Cross-host DP fan-out + litellm proxy config generator
 └── prepare/
-    ├── prepare_data.py                   # Dataset generator (simple synthetic tasks)
-    ├── bake_simple_repos.sh              # Bake repos into Docker image
-    ├── simple_cases_train.json           # Training cases (40 synthetic bug-fix tasks)
-    └── simple_cases_val.json             # Validation cases (12 synthetic bug-fix tasks)
+    ├── README.md                         # Data preparation guide (this is where to start)
+    ├── prepare_simple_data.py            # Toy dataset generator
+    ├── simple_cases_train.json           # Synthetic training bug-fix tasks
+    ├── simple_cases_val.json             # Synthetic validation bug-fix tasks
+    ├── prepare_swebench.py               # HF → parquet converter (smith / verified / lite)
+    ├── swebench_subsets.py               # Repo-balanced sampling helpers
+    └── docker_scripts/                   # Docker image pre-fetch / fan-out helpers
+        ├── bake_simple_repos.sh          # Bakes toy repos into a Docker image (Path A)
+        ├── prefetch_images.sh            # Pull per-SWE-problem images (skopeo + multi-mirror + tar cache)
+        ├── prefetch_example.sh           # Reference invocation chaining prefetch + load_all_nodes
+        ├── probe_mirrors.sh              # Check which public Docker Hub mirrors serve a given image
+        └── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
 
 # Core integration modules inside psrl/
-psrl/workers/agent_loop/loops/mini_swe_agent_loop.py   # MiniSWEAgentLoop + _PSRLModel
-psrl/workers/agent_loop/agent_data/mini_swe_agent_data.py  # MiniSWEAgentData
-psrl/environments/mini_swe_env.py                      # MiniSWEEnvironment
+psrl/workers/agent_loop/loops/mini_swe_agent_loop.py      # MiniSWEAgentLoop + _PSRLModel
+psrl/workers/agent_loop/agent_data/mini_swe_agent_data.py # MiniSWEAgentData
+psrl/environments/mini_swe_env.py                         # MiniSWEEnvironment
 ```
+
+---
 
 ## Prerequisites
 
 ### Hardware
 
-- NVIDIA GPUs (tested on RTX 3090 24GB, A100, H100; 8x GPUs per node recommended)
-- Sufficient disk space for model checkpoints (~50 GB per checkpoint)
-- Docker installed and accessible on all worker nodes
+- NVIDIA GPUs (tested on A100, H100; 8× GPUs per node recommended)
+- Sufficient disk space for checkpoints (~50 GB each)
+- Docker on every worker node
+- For SWE-smith-py: additional ~500 GB–1 TB per node for Docker image cache
 
-### Software Dependencies
+### Software
 
 ```bash
 # 1. Create conda environment and install PSRL (from repo root)
@@ -87,208 +131,338 @@ bash scripts/install_lmcache.sh
 
 python -m pip install -e .
 
-# 2. Install mini-SWE-agent (used as a Python library, not just CLI)
+# 2. mini-SWE-agent (used as a library)
 python -m pip install mini-swe-agent
-python -c "from minisweagent.agents.default import DefaultAgent; print('OK')"
 
-# 3. Pull the Docker sandbox image
-docker pull python:3.11-slim
+# 3. Extra deps for SWE-smith-py / SWE-bench grading (skip for toy path)
+python -m pip install swebench==4.1.0 swesmith
 
-# 4. Prepare model weights
-ls /path/to/models/Qwen/Qwen3-4B-Instruct/config.json
+# 4. Verify
+python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent OK')"
+python -c "import swebench; print('swebench', swebench.__version__)"
+python -c "from swesmith.profiles import registry; print('swesmith profiles:', len(registry.data))"
+docker run --rm python:3.11-slim bash -c "echo Docker OK"
 ```
 
-### Pre-flight Check
-
-```bash
-nvidia-smi -L | wc -l                                   # expect: >= 1
-python -c "from minisweagent.agents.default import DefaultAgent"  # no error
-docker run --rm python:3.11-slim bash -c "echo ok"       # expect: ok
-```
+---
 
 ## Data Preparation
 
-### Step 1: Bake repos into Docker image
+All dataset preparation (toy and SWE-smith-py) is documented in
+[`prepare/README.md`](prepare/README.md). That file covers:
 
-```bash
-bash prepare/bake_simple_repos.sh python:3.11-slim
-```
+- **Path A** — baking toy repos into Docker and generating parquets
+- **Path B** — converting SWE-smith-py and SWE-bench Verified from HuggingFace,
+  generating balanced subsets, and pre-fetching per-SWE-problem Docker images on
+  every cluster node
 
-> **Note**: The bake script contains commented-out proxy settings. Uncomment and edit if your network requires a proxy.
+Read that file before running training for the first time.
 
-### Step 2: Generate parquet datasets
-
-```bash
-python prepare/prepare_data.py \
-    --mode simple \
-    --train_size 64 \
-    --test_size 16 \
-    --output_dir data/mini_swe_agent
-```
+---
 
 ## Training
 
-A ready-to-run multi-node FSDP script is provided:
+### Toy dataset
 
 ```bash
 bash examples/mini_swe/fsdp_qwen_7b_dapo.sh
 ```
 
-The script targets 4 nodes × 8 GPUs (2 nodes for rollout, 2 for training) with
-Qwen2.5-7B-Instruct. Edit the cluster-layout variables at the top to match your
-hardware.
+Requires `data/mini_swe_agent/train.parquet` to exist (see `prepare/README.md`
+Path A).
 
-Key parameters set by the script (passed to `psrl.trainer.main_ppo`):
+### SWE-smith-py (real RL)
 
-```
-gen_actor_rollout_ref.rollout.multi_turn.enable=True
-gen_actor_rollout_ref.rollout.multi_turn.max_turns=30
-gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=<path>/mini_swe_agent_config.yaml
-gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env
-gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data
-custom_reward_function.path=<path>/examples/mini_swe/reward.py
-custom_reward_function.name=compute_score
-algorithm.adv_estimator=grpo
-```
-
-For a minimal single-node smoke test:
+#### Step 1: Install grading dependencies
 
 ```bash
-PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
-
-python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
-    data.train_files="['${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/train.parquet']" \
-    data.val_files="['${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/test.parquet']" \
-    data.prompt_key=prompt \
-    data.return_raw_chat=True \
-    data.max_prompt_length=2048 \
-    data.max_response_length=16384 \
-    gen_actor_rollout_ref.model.path=/path/to/model \
-    gen_actor_rollout_ref.rollout.multi_turn.enable=True \
-    gen_actor_rollout_ref.rollout.multi_turn.max_turns=30 \
-    gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/mini_swe_agent_config.yaml \
-    gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env \
-    gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
-    custom_reward_function.path=${PSRL_PATH}/examples/mini_swe/reward.py \
-    custom_reward_function.name=compute_score \
-    algorithm.adv_estimator=grpo \
-    trainer.total_epochs=10 \
-    trainer.project_name=mini_swe_agent \
-    trainer.experiment_name=mini_swe_grpo
+python -m pip install swebench==4.1.0 swesmith
 ```
+
+#### Step 2: Prepare data and pre-fetch images
+
+Follow `prepare/README.md` Path B. The expected layout when done:
+
+```
+examples/mini_swe/data/
+  swe_smith_py_1k/train.parquet          # 1 000 training SWE problems
+  verified_subset_80/train.parquet       # 80 validation SWE problems (test_freq)
+```
+
+#### Step 3: Pre-flight check
+
+```bash
+python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent OK')"
+python -c "import swebench; print('swebench', swebench.__version__)"
+python -c "from swesmith.profiles import registry; print('swesmith profiles:', len(registry.data))"
+python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; print('grader OK')"
+ray status | head -5
+```
+
+#### Step 4: Launch training
+
+```bash
+bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh
+```
+
+The script takes an optional positional argument for the PSRL staleness value
+(default: `2`):
+
+```bash
+bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh 3
+```
+
+#### Step 5: Monitor in wandb
+
+| Metric | Meaning |
+|--------|---------|
+| `train/score` | Shaped outcome reward: `+1.0` resolved, `-1.0` failed, `0.0` policy violation |
+| `train/acc` | Binary resolve rate (0 or 1 per sample) — the primary progress indicator |
+
+---
+
+### Script parameter reference (`fsdp_qwen_7b_swe_smith.sh`)
+
+#### Cluster layout
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NNODES` | `4` | Total nodes in the job |
+| `NGPUS_PER_NODE` | `8` | GPUs per node |
+| `GEN_NNODES` | `2` | Nodes dedicated to vLLM rollout |
+| `TRAIN_NNODES` | `2` | Nodes dedicated to FSDP training |
+| `GEN_TP` | `1` | Tensor-model parallelism for rollout vLLM |
+| `GEN_PP` | `1` | Pipeline parallelism for rollout vLLM |
+| `TRAIN_SP` | `2` | Ulysses sequence parallelism during training |
+| `TRAIN_FSDP` | `8` | FSDP shard group size (number of GPUs per FSDP shard) |
+
+`GEN_INSTANCES` and `VAL_INSTANCES` are derived automatically from the above.
+
+#### Algorithm
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `adv_estimator` | `grpo` | Advantage estimator. `grpo` groups rollouts by prompt and normalises within the group. |
+| `clip_ratio_low` | `0.2` | Lower clip bound for the PPO probability ratio (DAPO asymmetric clipping) |
+| `clip_ratio_high` | `0.28` | Upper clip bound |
+| `use_kl_in_reward` | `False` | Whether to add a KL-penalty term to the reward |
+| `kl_coef` | `0.0` | KL coefficient when `use_kl_in_reward=True` |
+| `use_kl_loss` | `False` | Whether to add a KL-divergence term to the policy loss |
+| `kl_loss_coef` | `0.0` | Weight of the KL loss term |
+
+#### Sequence lengths
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `max_turns` | `30` | Maximum agent turns (bash commands) per episode. Also passed as `step_limit` to `DefaultAgent`. |
+| `max_prompt_length` | `2048` | Maximum number of tokens in the initial prompt fed to vLLM |
+| `max_response_length` | `16384` | Maximum tokens generated per turn (applies to each individual assistant response) |
+
+#### Training hyperparameters
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `actor_lr` | `1e-6` | Actor learning rate |
+| `train_prompt_bsz` | `16` | Number of unique prompts per training step (each produces `n_resp_per_prompt` rollouts) |
+| `n_resp_per_prompt` | `4` | Rollouts per prompt during generation. GRPO normalises reward within this group. |
+| `n_resp_per_prompt_val` | `4` | Rollouts per prompt during validation |
+| `train_prompt_mini_bsz` | `16` | Mini-batch size for PPO gradient steps |
+| `loss_agg_mode` | `token-mean` | Loss aggregation: `token-mean` divides by total tokens, `seq-mean` divides by number of sequences |
+| `overlong_buffer_len` | `10240` | Buffer of tokens beyond `max_response_length` before penalty kicks in |
+| `overlong_penalty_factor` | `1.0` | Penalty per token in the overlong buffer (linear ramp from 0 to this value) |
+
+#### Sampling
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `temperature` | `1.0` | Sampling temperature for rollout generation |
+| `top_p` | `1.0` | Nucleus sampling threshold |
+| `top_k` | `-1` | Top-k sampling (`-1` = disabled) |
+| `val_top_p` | `1.0` | `top_p` used during validation rollouts |
+
+#### Token Importance Sampling (TIS)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `rollout_is` | `token` | Importance-sampling granularity: `token` weights by per-token probability ratio; `sequence` weights by sequence-level ratio |
+| `rollout_is_threshold` | `2.0` | Rollouts whose IS weight exceeds this threshold are clipped / dropped. Prevents stale rollouts from dominating updates. |
+
+The PSRL `staleness` parameter (first positional arg to the script, default `2`)
+controls how many training steps a rollout may remain in the replay buffer before
+being discarded. Lower values are more on-policy; higher values increase throughput.
+
+#### Performance
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `use_dynamic_bsz` | `True` | Pack sequences into fixed-length chunks to avoid wasted padding |
+| `packing_length` | `max_prompt_length + max_response_length` | Target chunk size for dynamic batching |
+| `offload` | `False` | CPU offload for optimizer state. Saves GPU memory at the cost of throughput. |
+
+---
+
+## Evaluation and Serving
+
+Standalone SWE-bench / SWE-smith evaluation and vLLM-based model serving live
+under [`eval/`](eval/README.md). That guide covers gold-patch sanity checks,
+single-node and multi-node eval, how to serve your own checkpoint (single
+host with TP / PP / DP, or cross-host via a litellm proxy), the output-artefact
+layout, and how PSRL's in-training validation differs from the standalone tool.
+
+---
 
 ## Configuration
 
 ### Config hierarchy
 
 ```
-MiniSWEAgentRuntimeConfig (dataclass defaults in config.py)
-  └── mini_swe_agent_config.yaml (deployment overrides)
-       └── extra_info per instance (runtime overrides via sandbox_overrides / agent_overrides)
+MiniSWEAgentRuntimeConfig   (dataclass defaults in config.py)
+  └── swebench_agent_config.yaml  or  simple_agent_config.yaml
+       └── extra_info per SWE problem  (sandbox_overrides / agent_overrides)
 ```
 
-### Agent loop config (`config/mini_swe_agent_config.yaml`)
+### Choosing the right config YAML
 
-`agent.system_template` and `agent.problem_template` are **required** — no hardcoded defaults exist. `build_runtime_config` raises `ValueError` if either is left empty after YAML merge.
+| YAML | Use with |
+|------|---------|
+| `config/simple_agent_config.yaml` | Toy path — single `python:3.11-slim` image, preexisting repos |
+| `config/swebench_agent_config.yaml` | SWE-smith-py / Verified — per-SWE-problem images, `cwd=/testbed` |
 
-```yaml
-- name: mini_swe_agent
-  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
-  sandbox_config:
-    max_parallel_tasks_per_worker: 0   # 0 = unlimited
-    environment:
-      image: "python:3.11-slim"
-      container_timeout: "2h"
-  agent:
-    system_template: |
-      <your system prompt here>
-    problem_template: |
-      <your per-problem prompt here — use {{ task }}, {{ cwd }}, {{ system }}, etc.>
-```
+The `environment.image` field in `swebench_agent_config.yaml` is intentionally set
+to a sentinel value (`swebench-sentinel-override-per-instance`). The real image is
+injected at rollout time from `extra_info.sandbox_overrides.environment.image`,
+which is written by `prepare_swebench.py`.
 
 ### Key config fields
 
 | Field | Category | Description |
 |-------|----------|-------------|
 | `rollout.multi_turn.enable` | Required | Must be `True` for mini-SWE-agent |
-| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode (also passed as agent `step_limit`) |
-| `psrl.agentic_rl.trajectory_output.enable` | Infrastructure | Whether to write per-problem `.txt` trajectory files |
-| `psrl.agentic_rl.trajectory_output.dir` | Infrastructure | Base output directory; trajectories are grouped by model version under `v{N}/` sub-directories. Defaults to `<psrl.logging_path>/trajectories` |
-| `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node; `0` = unlimited |
-| `sandbox_config.environment.image` | Data-affine | Docker image for sandbox (default: `python:3.11-slim`) |
-| `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (default: `/testbed`) |
+| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode |
+| `sandbox_config.environment.image` | Data-affine | Docker image (overridden per-SWE-problem for SWE-smith path) |
+| `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (`/testbed` for SWE-bench images) |
 | `sandbox_config.environment.container_timeout` | Infrastructure | Max container lifetime (default: `2h`) |
-| `sandbox_config.environment.env` | Infrastructure | Docker container env vars (default: disables pagers) |
-| `sandbox_config.environment.run_args` | Infrastructure | Extra `docker run` flags |
-| `agent.system_template` | **Required** | System prompt template (no default) |
-| `agent.problem_template` | **Required** | Per-problem prompt template; maps to mini-swe-agent's `instance_template` kwarg (no default) |
-| `agent.cost_limit` | Optional | LiteLLM cost limit per episode (default: `0.0` = unlimited) |
+| `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node (`0` = unlimited) |
+| `agent.system_template` | **Required** | System prompt (no default) |
+| `agent.problem_template` | **Required** | Per-SWE-problem prompt template; maps to `instance_template` in mini-swe-agent (no default) |
+| `agent.cost_limit` | Optional | LiteLLM cost limit per episode (`0.0` = unlimited) |
+
+---
 
 ## Architecture: How It Works
 
 ### _PSRLModel (in-process model bridge)
 
-`_PSRLModel` inherits `LitellmTextbasedModel` from mini-swe-agent and overrides only `query()`. When mini-swe-agent's `DefaultAgent` calls `model.query(messages)`:
+`_PSRLModel` inherits `LitellmTextbasedModel` and overrides only `query()`.
+When mini-swe-agent's `DefaultAgent` calls `model.query(messages)`:
 
 1. `_PSRLModel.query()` puts messages into a `request_queue` (thread-safe).
-2. The async generation loop (in the event loop thread) picks up the request.
+2. The async generation loop picks up the request.
 3. PSRL's vLLM generates a response; the turn is recorded in `MiniSWEAgentData`.
 4. The response text is put into `response_queue`.
 5. `_PSRLModel.query()` returns the response to `DefaultAgent`.
 
-Inherited from `LitellmTextbasedModel` (no custom code needed):
-- `format_observation_messages()` -- renders Docker command output as observation messages.
-- `_parse_actions()` -- extracts bash commands from `mswea_bash_command` fenced blocks.
-- `format_message()` -- formats system/user messages.
-- `get_template_vars()` / `serialize()` -- template variables and trajectory serialization.
+Inherited from `LitellmTextbasedModel`:
+- `format_observation_messages()` — renders Docker command output as observations.
+- `_parse_actions()` — extracts bash commands from `mswea_bash_command` blocks.
+- `format_message()` — formats system/user messages.
 
 ### Thread bridging
 
-mini-swe-agent's `DefaultAgent.run()` is synchronous. PSRL's rollout is async. The bridge:
-- `DefaultAgent.run(task)` runs in a **dedicated thread pool** (`_AGENT_THREAD_POOL`, max 32 threads, separate from the default asyncio executor to prevent deadlocks with `asyncio.to_thread`).
-- `DockerEnvironment` is created **in the worker thread** (its `__init__` starts a Docker container synchronously).
-- The async generation loop polls `request_queue` with a 0.1 s sleep and feeds `response_queue`.
+mini-swe-agent's `DefaultAgent.run()` is synchronous; PSRL's rollout is async.
+
+- `DefaultAgent.run(task)` runs in `_AGENT_THREAD_POOL` (32 threads, separate from
+  the default asyncio executor to avoid deadlocks with `asyncio.to_thread`).
+- `DockerEnvironment` is created in the worker thread (container starts on `__init__`).
+- The async loop polls `request_queue` and feeds `response_queue`.
 - `_PSRLModel.query()` blocks on `response_queue` with a 600 s timeout.
 
-### Reward Function
+After the rollout completes, for SWE-smith/Verified SWE problems, a second
+container is started from the same image via `_GRADER_THREAD_POOL` (separate
+16-thread pool) to run `grade_fresh_container` before the rollout container is
+cleaned up.
 
-Computes a patch-based reward with bash-tool-use shaping for `mini_swe_agent` and `mini_swe_agent_simple` data sources. Tool usage detection targets mini-SWE-agent v2 bash patterns (`sed -i`, `cat <<`, `tee`, `patch`, etc.).
+---
+
+## Reward Function
+
+### Toy path (`data_source = mini_swe_agent_simple` or `mini_swe_agent`)
 
 | Condition | Score |
 |-----------|-------|
 | Exact patch match | `1.0` |
-| Partial patch match | `0.10` -- `0.85` |
+| Partial patch match (file + line overlap) | `0.10 – 0.85` |
 | Patch on wrong files | `0.05` |
-| No patch, but edited correct file | `0.05` |
-| No patch, but ran tests or python | `0.03` |
-| No patch, but made edits (wrong file) | `0.02` |
-| No patch, but explored correct file (cat/ls) | `0.02` |
-| No patch, but explored code (cat/ls, wrong file) | `0.01` |
+| No patch, edited correct file | `0.05` |
+| No patch, ran tests or Python | `0.03` |
+| No patch, made edits (wrong file) | `0.02` |
+| No patch, explored correct file | `0.02` |
+| No patch, explored code | `0.01` |
 | Alignment failed / 0 turns / timeout | `0.0` |
-| Long and fruitless (>=10 turns, no editor) | `-0.05` |
-| Premature exit (<=2 turns, no tool use) | `-0.1` |
+| Long and fruitless (≥10 turns, no edits) | `-0.05` |
+| Premature exit (≤2 turns, no tools) | `-0.1` |
+
+### SWE-smith / Verified path (`data_source = swe_smith_py` or `swebench_verified`)
+
+Reward is based on whether the submitted patch resolves the SWE problem (all
+FAIL_TO_PASS tests pass and all PASS_TO_PASS tests still pass):
+
+| Condition | `score` (→ loss) | `acc` (→ wandb) |
+|-----------|-----------------|-----------------|
+| All F2P pass, no P2P regressions | `+1.0` | `1.0` |
+| Patch modified test or config files | `0.0` (policy violation — not penalised) | `0.0` |
+| Not resolved (patch failed, tests failed) | `-1.0` | `0.0` |
+| No patch submitted / 0 turns (aborted) | `0.0` | `0.0` |
+
+The `{-1, 0, +1}` convention follows OpenClaw-RL. The `score` field drives the
+policy gradient loss; the `acc` field is a separate metric for tracking resolve
+rate. Both are visible in wandb as `train/score` and `train/acc`.
+
+**Patch policy rules** (configurable via environment variables):
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `SWE_STRICT_NO_TEST_PATCH` | `1` | Reject patches that modify FAIL_TO_PASS / PASS_TO_PASS test files |
+| `SWE_STRICT_NO_CONFIG_PATCH` | `1` | Reject patches that modify `pyproject.toml`, `setup.py`, etc. |
+| `SWE_TEST_PATCH_POLICY_SCOPE` | `eval_tests_only` | `all_tests` to also reject changes to non-eval test files |
+
+---
 
 ## Troubleshooting
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| `ImportError: minisweagent` | mini-swe-agent not installed | `pip install mini-swe-agent` |
 | `docker: Cannot connect` | Docker not running | `sudo systemctl start docker` |
-| No patch found | Agent didn't submit before turn limit | Increase `rollout.multi_turn.max_turns` |
-| OOM during rollout | Too many concurrent containers | Reduce `max_parallel_tasks_per_worker` |
-| Alignment failed every episode | Context truncation | Use `max_model_len` instead of message-level truncation |
+| Rollout container fails immediately | Image not pulled | Run `prepare/docker_scripts/prefetch_images.sh` on this node first (or `load_all_nodes.sh` across the cluster) |
+| `swebench-sentinel-override-per-instance` in error (sentinel was not replaced per SWE problem) | Wrong config YAML for toy path | Use `simple_agent_config.yaml` for toy, `swebench_agent_config.yaml` for SWE-smith |
+| Grader always returns `resolved=False` | Image pull failing silently | Check `grading.json` in the eval output dir for error messages |
+| No patch found | Agent hit turn limit without submitting | Increase `max_turns` |
+| OOM during rollout | Too many concurrent containers | Reduce `max_parallel_tasks_per_worker` or lower `train_prompt_bsz` |
+| `alignment_failed` every episode | Context truncation | Reduce `max_prompt_length` or increase `max_model_len` |
 
-### Emergency Cleanup
+### Emergency cleanup
+
+Stop all rollout and grader containers left behind by an aborted run:
 
 ```bash
-docker ps -q --filter "label=psrl.swe_problem_id" | xargs -r docker stop
+# Rollout containers
+docker ps -q --filter "label=psrl.swe_task_id" | xargs -r docker stop
+
+# Grader containers
+docker ps -q --filter "label=psrl.grader_task_id" | xargs -r docker stop
+
+# Ray cluster
 ray stop --force
+
+# Training process
 pkill -9 -f main_ppo
 ```
 
+---
+
 ## Extending
 
-### Custom Docker Image
+### Custom Docker Image (toy path)
 
 ```dockerfile
 FROM python:3.11-slim
@@ -296,17 +470,25 @@ RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 RUN python -m pip install pytest numpy
 ```
 
-Set `sandbox_config.environment.image` in the YAML config.
+Set `sandbox_config.environment.image` in the agent config YAML.
 
 ### Custom Reward Functions
 
 ```python
-def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs) -> float:
-    """Returns a float reward (typically in [-0.1, 1.0])."""
+def compute_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: Any,
+    extra_info: dict | None = None,
+    **kwargs,
+) -> float | dict:
+    """Return a float or {"score": float, "acc": float}."""
 ```
+
+Pass `custom_reward_function.path` and `custom_reward_function.name` to `main_ppo`.
 
 ### Custom Prompt Templates
 
-Override templates in `mini_swe_agent_config.yaml` via `agent.system_template` / `agent.problem_template`. Templates use Jinja2 with variables: `{{ task }}`, `{{ cwd }}`, `{{ system }}`, `{{ release }}`, `{{ version }}`, `{{ machine }}`.
-
-The model must output bash commands in `mswea_bash_command` fenced blocks (text-based model class).
+Override `agent.system_template` and `agent.problem_template` in the config YAML.
+Templates use Jinja2; available variables: `{{ task }}`, `{{ cwd }}`,
+`{{ system }}`, `{{ release }}`, `{{ version }}`, `{{ machine }}`.

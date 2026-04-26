@@ -71,7 +71,7 @@ profile:
   trajectory:
 
     # Whether to enable per-trajectory profiling
-    enable: False
+    enable: True
 
     # Output directory for profiling JSONL files
     output_dir: ${psrl.logging_path}/trajectory_profiling
@@ -402,7 +402,7 @@ tms:
 lmcache:
 
   # Whether to enable LMCache KV offloading in vLLM.
-  enable: False
+  enable: True
 
   # Backend for offloaded KV: "cpu", "disk", or "remote" (TODO: remote).
   backend: cpu

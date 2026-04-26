@@ -1,0 +1,124 @@
+- name: mini_swe_agent
+  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
+  sandbox_config:
+    max_parallel_tasks_per_worker: 0  # No limit on parallel tasks per worker.
+    environment:
+      # NOTE(lhy): image is intentionally left as a sentinel here.
+      # Each SWE problem overrides it via extra_info.sandbox_overrides.environment.image,
+      # which is merged in by apply_data_overrides at rollout time.
+      image: "swebench-sentinel-override-per-instance"
+      cwd: "/testbed"
+      container_timeout: "2h"
+      # Memory limit for the fresh grading container (separate from the
+      # rollout container). Heavy repos (scikit-learn, xarray, matplotlib)
+      # run `pip install -e .` during grading and can temporarily need
+      # 15-25 GB. Set higher than the rollout container to avoid OOM kills.
+      grader_memory: "30g"
+  agent:
+    # System prompt from the official mini-swe-agent swebench_backticks.yaml.
+    # The format instruction in system_template is CRITICAL: without it the model
+    # produces plain text on the first turn, triggering format-error loops
+    # (each loop wastes a turn and a step_limit slot).
+    system_template: |
+      You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.
+      Your response must contain exactly ONE bash code block with ONE command (or commands connected with && or ||).
+
+      Include a THOUGHT section before your command where you explain your reasoning process.
+      Format your response as shown in <format_example>.
+
+      <format_example>
+      THOUGHT: Your reasoning and analysis here
+
+      ```mswea_bash_command
+      your_command_here
+      ```
+      </format_example>
+
+      Failure to follow these rules will cause your response to be rejected.
+    problem_template: |
+      <pr_description>
+      Consider the following PR description:
+      {{ task }}
+      </pr_description>
+
+      <instructions>
+      # Task Instructions
+
+      ## Overview
+
+      You're a software engineer interacting continuously with a computer by submitting commands.
+      You'll be helping implement necessary changes to meet requirements in the PR description.
+      Your task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.
+
+      <IMPORTANT>This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.</IMPORTANT>
+
+      For each response:
+
+      1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
+      2. Provide exactly ONE bash command to execute
+
+      ## Important Boundaries
+
+      - MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)
+      - DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)
+
+      ## Recommended Workflow
+
+      1. Analyze the codebase by finding and reading relevant files
+      2. Create a script to reproduce the issue
+      3. Edit the source code to resolve the issue
+      4. Verify your fix works by running your script again
+      5. Test edge cases to ensure your fix is robust
+
+      ## Format Requirements
+
+      Each response should include:
+      1. A **THOUGHT** section where you explain your reasoning and plan
+      2. A single bash code block with your command
+
+      Format:
+      ```mswea_bash_command
+      your_command_here
+      ```
+
+      **CRITICAL:**
+      - Your response MUST include EXACTLY ONE ```mswea_bash_command block
+      - Combine multiple commands with && or ||
+      - Directory changes are NOT persistent between responses
+
+      ## Submission
+
+      When you've completed your work, submit your changes as a git patch.
+      Follow these steps IN ORDER, with SEPARATE commands:
+
+      Step 1: Create the patch file (list only source files you modified):
+      ```mswea_bash_command
+      cd /testbed && git diff -- path/to/file1.py path/to/file2.py > /tmp/patch.txt
+      ```
+
+      Step 2: Verify your patch:
+      ```mswea_bash_command
+      cat /tmp/patch.txt
+      ```
+
+      Step 3: Submit (EXACT command required):
+      ```mswea_bash_command
+      echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && cat /tmp/patch.txt
+      ```
+
+      <CRITICAL>
+      - Creating/viewing the patch and submitting MUST be separate commands.
+      - You CANNOT continue working on this task after submitting.
+      - The patch must only contain changes to source files you modified.
+        Do NOT include test files, helper scripts, or config files.
+      </CRITICAL>
+      </instructions>
+  model:
+    # Action format used during training and eval.
+    # Both training (_PSRLModel) and standalone eval (eval_swebench.py) read
+    # from this section, so editing one place changes both.
+    # To switch to plain ```bash blocks (e.g. for compatibility with other
+    # models), change action_regex and update the system_template accordingly.
+    action_regex: "```mswea_bash_command\\s*\\n(.*?)\\n```"
+    observation_template: "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
+    format_error_template: "Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions."

@@ -1,9 +1,37 @@
 #!/usr/bin/env bash
+# fsdp_qwen_7b_swe_smith.sh — RL training on SWE-smith-py with SWE-bench Verified validation.
+#
+# Usage:
+#   bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh [STALENESS]
+#
+# Data preparation (run once):
+#   # 1 000 SWE-smith-py training SWE problems (repo-balanced, ~10 per repo)
+#   python -m examples.mini_swe.prepare.prepare_swebench \
+#       --dataset smith --split train \
+#       --total 1000 --per-repo-k 10 \
+#       --output-dir ${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k
+#
+#   # 80-problem SWE-bench Verified validation subset (repo-balanced)
+#   python -m examples.mini_swe.prepare.prepare_swebench \
+#       --dataset verified --split test \
+#       --total 80 --repo-balanced \
+#       --output-dir ${PSRL_PATH}/examples/mini_swe/data/verified_subset_80
+#
+#   # Pre-fetch Docker images (pull once to shared FS, then fan-out to every node)
+#   bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
+#       --parquet ${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet \
+#       --image-dir /jizhicfs/lhy/docker_images/swe
+#   bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
+#       --parquet ${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet \
+#       --image-dir /jizhicfs/lhy/docker_images/swe
+#   bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
+#       --hosts /jizhicfs/lhy/hosts/32GPUs \
+#       --image-dir /jizhicfs/lhy/docker_images/swe
 set -xeuo pipefail
 
 staleness=${1:-2}
-project_name=psrl_mini_swe
-experiment_name=GRPO-Qwen2.5-7B-mini_swe-fsdp2-staleness_${staleness}
+project_name=psrl_swe_smith
+experiment_name=GRPO-Qwen2.5-7B-swe_smith-fsdp2-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -13,7 +41,9 @@ PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dir
 # --- Pre-flight checks ---
 echo "=== Pre-flight checks ==="
 python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent: OK')"
-docker run --rm python:3.11-slim bash -c "echo 'Docker: OK'" 2>/dev/null || echo "WARNING: Docker check failed"
+python -c "import swebench; print('swebench', swebench.__version__, ': OK')"
+python -c "from swesmith.profiles import registry; print('swesmith registry:', len(registry.data), 'profiles: OK')"
+python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; print('swebench_grader: OK')"
 ray status 2>/dev/null | head -5 || echo "WARNING: ray status failed"
 echo "=== Pre-flight done ==="
 
@@ -22,13 +52,20 @@ echo "=== Pre-flight done ==="
 MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-7B-Instruct
 
 # --- Data ---
-# Generate with: python examples/mini_swe/prepare/prepare_simple_data.py --train_size 64 --test_size 16
-TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/train.parquet
-TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent/test.parquet
+# Train: SWE-smith-py 1 000-problem repo-balanced subset.
+# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet
+TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: Training data not found at $TRAIN_FILE"
-    echo "Run: python ${PSRL_PATH}/examples/mini_swe/prepare/prepare_simple_data.py --train_size 64 --test_size 16 --output_dir ${PSRL_PATH}/examples/mini_swe/data/mini_swe_agent"
+    echo "Run the data preparation commands at the top of this script."
+    exit 1
+fi
+
+if [[ ! -f "$TEST_FILE" ]]; then
+    echo "ERROR: Validation data not found at $TEST_FILE"
+    echo "Run the data preparation commands at the top of this script."
     exit 1
 fi
 
@@ -38,10 +75,10 @@ test_files="['$TEST_FILE']"
 CKPT_ROOT=${CKPT_ROOT:-$PWD}
 default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
-# --- Agent loop config ---
-agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/simple_agent_config.yaml
+# --- Agent loop config (swebench-tuned: cwd=/testbed, swebench-style submit) ---
+agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_agent_config.yaml
 
-# --- Cluster layout ---
+# --- Cluster layout (4 nodes x 8 GPUs, same as dapo script) ---
 GEN_TP=1
 GEN_PP=1
 
@@ -65,7 +102,7 @@ TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / (VAL_TP * VAL_PP) ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( VAL_TP * VAL_PP ))
 
-# --- Algorithm ---
+# --- Algorithm (GRPO / DAPO) ---
 adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
@@ -75,7 +112,10 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths ---
-# mini-SWE-agent episodes are multi-turn: system + user + (assistant + observation) * N.
+# SWE-bench episodes are multi-turn; swebench images typically use up to 250 turns
+# in upstream mini-SWE-agent.  We cap at 30 to match the toy script budget.
+# NOTE: GEN_INSTANCES / VAL_INSTANCES below refer to parallel rollout-engine
+# instances, not SWE problems.
 max_turns=30
 max_prompt_length=2048
 max_response_length=16384
@@ -206,6 +246,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.val_before_train=False \
     trainer.log_val_generations=10 \
     trainer.test_freq=5 \
-    trainer.save_freq=500 \
+    trainer.save_freq=50 \
     trainer.total_epochs=100 \
     trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

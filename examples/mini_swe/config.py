@@ -55,6 +55,12 @@ class MiniEnvironmentConfig:
         ]
     )
     container_timeout: str = "2h"
+    # Memory limit for the fresh grading container (separate from the rollout
+    # container above).  Heavy repos (scikit-learn, xarray, matplotlib) run
+    # `pip install -e .` inside the grading container, which can temporarily
+    # require 15–25 GB.  Set higher than the rollout container to avoid
+    # cgroup OOM kills during grading.
+    grader_memory: str = "30g"
 
 
 @dataclass
@@ -76,7 +82,7 @@ class MiniAgentConfig:
     `AgentConfig` (no defaults in upstream). `problem_template` maps to
     mini-swe-agent's `instance_template` kwarg.
 
-    Both templates should be provided via mini_swe_agent_config.yaml; the
+    Both templates should be provided via simple_agent_config.yaml; the
     empty-string defaults here are intentional -- `build_runtime_config` will
     raise if they remain unset after YAML merge.
     """
@@ -87,6 +93,37 @@ class MiniAgentConfig:
 
 
 @dataclass
+class MiniModelConfig:
+    """
+    Model format settings forwarded to `LitellmTextbasedModel` during training
+    (via `_PSRLModel`) and to `get_model()` during standalone eval.
+
+    Defaults match `LitellmTextbasedModelConfig` class-level defaults so that
+    omitting this section from a YAML config is fully backwards-compatible.
+
+    Fields:
+        action_regex: Regex applied to the model's text output to extract the
+            shell command.  Change this to switch action formats, e.g.
+            ``"```bash\\\\s*\\\\n(.*?)\\\\n```"`` for a plain bash block.
+        observation_template: Jinja2 template that formats Docker command output
+            into the next user message.  Training and eval must use the same
+            template or the model sees unfamiliar observation formatting.
+        format_error_template: Message sent back to the model when
+            ``action_regex`` finds 0 or >1 matches.
+    """
+
+    action_regex: str = r"```mswea_bash_command\s*\n(.*?)\n```"
+    observation_template: str = (
+        "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"
+        "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
+    )
+    format_error_template: str = (
+        "Please always provide EXACTLY ONE action in triple backticks, "
+        "found {{actions|length}} actions."
+    )
+
+
+@dataclass
 class MiniSWEAgentRuntimeConfig:
     """
     Top-level config for the mini-SWE-agent PSRL integration.
@@ -94,6 +131,7 @@ class MiniSWEAgentRuntimeConfig:
 
     sandbox_config: MiniSandboxConfig = field(default_factory=MiniSandboxConfig)
     agent: MiniAgentConfig = field(default_factory=MiniAgentConfig)
+    model: MiniModelConfig = field(default_factory=MiniModelConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +178,14 @@ def build_runtime_config(yaml_kwargs: dict[str, Any]) -> MiniSWEAgentRuntimeConf
     if not cfg.agent.system_template or not cfg.agent.problem_template:
         raise ValueError(
             "agent.system_template and agent.problem_template must be provided "
-            "in mini_swe_agent_config.yaml (they have no hardcoded defaults)."
+            "in simple_agent_config.yaml (they have no hardcoded defaults)."
         )
 
     return cfg
 
 
 # ---------------------------------------------------------------------------
-# Per-instance overrides
+# Per-SWE-problem overrides
 # ---------------------------------------------------------------------------
 
 _SANDBOX_FIELDS = frozenset(MiniSandboxConfig.__dataclass_fields__)
@@ -159,7 +197,7 @@ def apply_data_overrides(
     extra_info: dict[str, Any],
 ) -> MiniSWEAgentRuntimeConfig:
     """
-    Per-instance copy of `base` with data-affine overrides. `base` is not mutated.
+    Per-SWE-problem copy of `base` with data-affine overrides. `base` is not mutated.
     """
     sandbox_ov = _ensure_dict(extra_info.get("sandbox_overrides", {}))
     agent_ov = _ensure_dict(extra_info.get("agent_overrides", {}))

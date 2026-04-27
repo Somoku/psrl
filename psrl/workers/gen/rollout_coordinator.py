@@ -19,7 +19,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RolloutCoordinator(CommandExtension):
-    DEFAULT_AWAIT_TIMEOUT_S = 500
+    DEFAULT_AWAIT_TIMEOUT_S = 1200
 
     def __init__(
         self,

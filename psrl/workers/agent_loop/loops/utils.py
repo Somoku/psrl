@@ -45,6 +45,21 @@ class TerminateReason(Enum):
     UNKNOWN = "unknown"
     ERROR = "error"
 
+    def needs_manager_retry(self) -> bool:
+        """Return True iff this termination reason represents a transient error
+        that wasted a buffer slot and should trigger manager-level recovery.
+
+        Transient errors (ERROR / UNKNOWN) mean the agent crashed or produced
+        zero turns: the slot contributed nothing and must be replaced.
+
+        Intentional terminations do NOT need recovery:
+        - ABORTED: killed by staleness / redundant / proactive-filter; the PS
+          manager already accounts for the slot.
+        - All others (FINISHED, MAX_TURNS_EXCEEDED, etc.): have a valid
+          trajectory and are handled by the normal occupation flow.
+        """
+        return self in (TerminateReason.ERROR, TerminateReason.UNKNOWN)
+
 
 class AgentLoopMetrics(BaseModel):
     """Agent loop performance metrics."""

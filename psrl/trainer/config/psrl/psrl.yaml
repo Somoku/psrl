@@ -38,6 +38,15 @@ agentic_rl:
     # Output base directory.  Default when empty: psrl.logging_path/trajectories.
     dir: ""
 
+  # Error handling for transient rollout failures (TerminateReason.needs_manager_retry()).
+  # True  (default): on training failure, worker notifies manager to dispatch a
+  #                  replacement request so the buffer slot is eventually filled;
+  #                  on validation failure, manager shrinks val_buffer_size by 1
+  #                  so the waiter is unblocked (result has fewer rows).
+  # False           : raise RuntimeError immediately, crashing the worker so the
+  #                   failure is visible rather than silently stalling training.
+  manager_retry_on_error: True
+
   # TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml
 
 server_rollout:

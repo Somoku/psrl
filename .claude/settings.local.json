@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//**)",
+      "Bash(python3:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:lmcache.github.io)",
+      "WebFetch(domain:docs.vllm.ai)"
+    ],
+    "deny": [
+      "Bash(git reset --hard:*)"
+    ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  }
+}

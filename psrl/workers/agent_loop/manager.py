@@ -606,6 +606,44 @@ class PSRL_AgentLoopManager:
         else:
             psrl_logger.warning("Busy loop of the agent loop manager has stopped, the retry operation will be skipped")
 
+    async def retry_on_error(self):
+        """Called by a worker when a training rollout slot is lost to ERROR/UNKNOWN.
+
+        Pulls one fresh prompt from train_data_queue (if available) and dispatches
+        it so the buffer slot vacated by the failed rollout is eventually filled.
+        If the queue is empty, logs a warning; the proactive_filter or staleness
+        mechanisms handle any remaining gap.
+        """
+        if self.stop_train_dispatch_task:
+            psrl_logger.warning("retry_on_error: dispatch task stopped, skipping replacement.")
+            return
+        if self.train_data_queue.empty():
+            psrl_logger.warning("retry_on_error: train_data_queue is empty, no replacement available.")
+            return
+        psrl_logger.info("retry_on_error: dispatching one replacement request.")
+        await self._retry_data()  # data=None → get from queue, reset version_tag=-1
+
+    async def notify_val_slot_dropped(self):
+        """Called by a worker when a validation rollout slot is lost to ERROR/UNKNOWN.
+
+        Decrements val_buffer_size by 1 so the validation buffer can still reach
+        its (adjusted) target and wake the wait_for_validation_batch waiter, even
+        though one slot's result is missing.  The next occupy_requests() call will
+        detect that accumulated size == new val_buffer_size and fire handle_ready_buffer.
+        """
+        if self.val_buffer_size is None or self.val_buffer_size <= 0:
+            psrl_logger.warning(
+                "notify_val_slot_dropped: val_buffer_size=%s, cannot decrement.",
+                self.val_buffer_size,
+            )
+            return
+        self.val_buffer_size -= 1
+        psrl_logger.warning(
+            "notify_val_slot_dropped: val_buffer_size decremented to %d "
+            "(one validation slot lost to ERROR/UNKNOWN).",
+            self.val_buffer_size,
+        )
+
     def _get_expected_ps_version(self):
         """
         Get the expected PS version tag based on the current staleness and request counter.

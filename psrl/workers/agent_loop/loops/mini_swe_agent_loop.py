@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import queue
+import re
 import time
 from dataclasses import dataclass
 
@@ -54,6 +55,24 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 _MIN_GEN_TOKENS = 256
 _QUEUE_POLL_TIMEOUT = 2.0
+
+# Fallback wall-clock budget for one episode when container_timeout cannot be parsed.
+_DEFAULT_EPISODE_TIMEOUT_SECS = 7200  # 2 h
+
+
+def _parse_timeout_secs(container_timeout: str) -> float:
+    """
+    Parse a human-readable duration string (e.g. ``"2h"``, ``"90m"``, ``"3600s"``,
+    ``"3600"``) into seconds.  Falls back to ``_DEFAULT_EPISODE_TIMEOUT_SECS`` on
+    any parse error so the loop always has a finite upper bound.
+    """
+    s = str(container_timeout).strip().lower()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([hms]?)", s)
+    if not m:
+        return _DEFAULT_EPISODE_TIMEOUT_SECS
+    value, unit = float(m.group(1)), m.group(2)
+    multipliers = {"h": 3600.0, "m": 60.0, "s": 1.0, "": 1.0}
+    return value * multipliers[unit]
 
 # Dedicated thread pool for running mini-swe-agent sync code.
 # Separating from the default pool prevents deadlocks when
@@ -394,6 +413,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
                 res_q=res_q,
                 max_turns=max_turns,
                 swe_problem_id=swe_task_id,
+                container_timeout=env_cfg.container_timeout,
                 profiling_collector=profiling_collector,
             )
 
@@ -480,7 +500,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
             # episode (see `_TerminateSignal` in the generation loop).
             if thread_exit_status == "PromptBudgetExhausted":
                 terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-            elif thread_exit_status == "RolloutReturnedNone":
+            elif thread_exit_status in ("RolloutReturnedNone", "EpisodeTimeout"):
                 terminate_reason = TerminateReason.ERROR
             elif num_turns >= max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
@@ -577,6 +597,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
         res_q: queue.Queue,
         max_turns: int,
         swe_problem_id: str,
+        container_timeout: str = "2h",
         profiling_collector: TurnProfilingCollector | None = None,
     ) -> tuple[int, str | None, str]:
         """
@@ -609,15 +630,37 @@ class MiniSWEAgentLoop(AgentLoopBase):
 
         log_prefix = f"[mini-SWE-agent, task_id={swe_problem_id}]" if swe_problem_id else "[mini-SWE-agent]"
 
+        # Wall-clock budget: parsed from container_timeout with a 20 % safety
+        # margin so PSRL always times out before the Docker daemon kills the
+        # container.  This is the last line of defence against a trajectory
+        # that hangs forever (e.g. a `pip install` that never returns, an
+        # infinite loop that doesn't consume CPU, etc.).
+        episode_timeout_secs = _parse_timeout_secs(container_timeout) * 0.8
+        episode_start = time.time()
+
         psrl_logger.info(
             f"{log_prefix} Generation loop started: "
-            f"effective_limit={effective_limit}, max_turns={max_turns}."
+            f"effective_limit={effective_limit}, max_turns={max_turns}, "
+            f"episode_timeout={episode_timeout_secs:.0f}s."
         )
 
         # Accumulate trajectory text throughout the loop; written to disk at the end.
         traj_text: list[str] = [f"{log_prefix}\n\n"]
 
         while not agent_future.done():
+            # Hard wall-clock cutoff — fires if the agent thread hangs without
+            # ever putting a new message into req_q (e.g. a Docker command that
+            # blocks forever).  We signal the agent thread via res_q so it can
+            # clean up its DockerEnvironment before the outer finally-block runs.
+            elapsed = time.time() - episode_start
+            if elapsed > episode_timeout_secs:
+                psrl_logger.warning(
+                    f"{log_prefix} Episode wall-clock timeout "
+                    f"({elapsed:.0f}s > {episode_timeout_secs:.0f}s), terminating agent."
+                )
+                res_q.put(_TerminateSignal("EpisodeTimeout"))
+                break
+
             try:
                 messages = req_q.get_nowait()
             except queue.Empty:

@@ -253,6 +253,21 @@ def convert_dataset(
         swe_problems = filter_by_spec(swe_problems, subset_spec)
         psrl_logger.info(f"After spec filter: {len(swe_problems)} SWE problems.")
 
+    # Drop instances whose problem_statement is empty — these have no task
+    # description for the agent and produce uninformative rollouts.
+    n_before = len(swe_problems)
+    swe_problems = [p for p in swe_problems if p.get("problem_statement", "")]
+    n_dropped = n_before - len(swe_problems)
+    if n_dropped:
+        psrl_logger.info(
+            f"Dropped {n_dropped} instances with empty problem_statement "
+            f"({len(swe_problems)} remaining)."
+        )
+        print(
+            f"[prepare_swebench] Dropped {n_dropped} / {n_before} instances "
+            f"with empty problem_statement."
+        )
+
     # Sampling.
     if total is not None and repo_balanced:
         swe_problems = repo_balanced_sample(

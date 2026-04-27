@@ -1,32 +1,3 @@
-#!/usr/bin/env bash
-# fsdp_qwen_7b_swe_smith.sh — RL training on SWE-smith-py with SWE-bench Verified validation.
-#
-# Usage:
-#   bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh [STALENESS]
-#
-# Data preparation (run once):
-#   # 1 000 SWE-smith-py training SWE problems (repo-balanced, ~10 per repo)
-#   python -m examples.mini_swe.prepare.prepare_swebench \
-#       --dataset smith --split train \
-#       --total 1000 --per-repo-k 10 \
-#       --output-dir ${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k
-#
-#   # 80-problem SWE-bench Verified validation subset (repo-balanced)
-#   python -m examples.mini_swe.prepare.prepare_swebench \
-#       --dataset verified --split test \
-#       --total 80 --repo-balanced \
-#       --output-dir ${PSRL_PATH}/examples/mini_swe/data/verified_subset_80
-#
-#   # Pre-fetch Docker images (pull once to shared FS, then fan-out to every node)
-#   bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
-#       --parquet ${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet \
-#       --image-dir /jizhicfs/lhy/docker_images/swe
-#   bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
-#       --parquet ${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet \
-#       --image-dir /jizhicfs/lhy/docker_images/swe
-#   bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
-#       --hosts /jizhicfs/lhy/hosts/32GPUs \
-#       --image-dir /jizhicfs/lhy/docker_images/swe
 set -xeuo pipefail
 
 staleness=${1:-2}
@@ -116,7 +87,7 @@ clip_ratio_high=0.28
 # in upstream mini-SWE-agent.  We cap at 30 to match the toy script budget.
 # NOTE: GEN_INSTANCES / VAL_INSTANCES below refer to parallel rollout-engine
 # instances, not SWE problems.
-max_turns=30
+max_turns=100
 max_prompt_length=2048
 max_response_length=16384
 
@@ -126,10 +97,10 @@ enable_overlong_buffer=True
 overlong_buffer_len=$((1024 * 10))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=16
+train_prompt_bsz=32
 n_resp_per_prompt=4
 n_resp_per_prompt_val=4
-train_prompt_mini_bsz=16
+train_prompt_mini_bsz=32
 
 # --- Sampling ---
 temperature=1.0
@@ -144,7 +115,7 @@ rollout_is_threshold=2.0
 # --- Performance ---
 use_dynamic_bsz=True
 packing_length=$(( (max_prompt_length + max_response_length) * 1 ))
-offload=False
+offload=True
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \

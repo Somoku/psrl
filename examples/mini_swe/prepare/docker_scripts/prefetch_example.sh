@@ -10,13 +10,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREPARE_DIR="$(dirname "$SCRIPT_DIR")"
 
 bash "$SCRIPT_DIR/prefetch_images.sh" \
-    --parquet "$PREPARE_DIR/../data/verified_subset_80/train.parquet" \
+    --parquet "$PREPARE_DIR/../data/swe_smith_py_1k/train.parquet" \
     --workers 4 \
-    --image-dir /jizhicfs/lhy/docker_images/swe_eval \
+    --image-dir /jizhicfs/lhy/docker_images/swe_train \
     --mirrors docker.1ms.run,docker.1panel.live,proxy.vvvv.ee,lispy.org,registry.cyou \
     --no-direct-fallback \
     --retries 10
 
 bash "$SCRIPT_DIR/load_all_nodes.sh" \
     --hosts /jizhicfs/lhy/hosts/32GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe_eval
+    --image-dir /jizhicfs/lhy/docker_images/swe_train

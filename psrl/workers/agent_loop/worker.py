@@ -23,7 +23,7 @@ from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
-psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 @ray.remote
@@ -318,6 +318,40 @@ class PSRL_AgentLoopWorker:
                         last_version_tags,
                     )
                     output = None
+
+                # Notify manager to recover the lost buffer slot.
+                # Uses TerminateReason.needs_manager_retry() as the single
+                # classification point — no hardcoded enum lists here.
+                if terminate_reason.needs_manager_retry():
+                    is_validate = requests.meta_info.get("validate", False)
+                    if self.config.psrl.agentic_rl.get("manager_retry_on_error", True):
+                        if is_validate:
+                            # Val: cannot substitute a different prompt — shrink the
+                            # val_buffer_size target so the waiter can still unblock.
+                            psrl_logger.warning(
+                                "Val slot lost for uid=%s (terminate_reason=%s), "
+                                "notifying manager to shrink val buffer size.",
+                                requests.non_tensor_batch["uid"].tolist(),
+                                terminate_reason.value,
+                            )
+                            await self.agent_loop_manager.notify_val_slot_dropped.remote()
+                        else:
+                            # Train: pull a fresh prompt from the data queue to fill
+                            # the vacated slot and keep the buffer progressing.
+                            psrl_logger.warning(
+                                "Train slot lost for uid=%s (terminate_reason=%s), "
+                                "notifying manager to dispatch a replacement request.",
+                                requests.non_tensor_batch["uid"].tolist(),
+                                terminate_reason.value,
+                            )
+                            await self.agent_loop_manager.retry_on_error.remote()
+                    else:
+                        raise RuntimeError(
+                            f"Agent loop for uid={requests.non_tensor_batch['uid'].tolist()} "
+                            f"failed with terminate_reason={terminate_reason.value} "
+                            f"after {retry_limit} attempt(s). "
+                            "Set psrl.agentic_rl.manager_retry_on_error=True to recover silently."
+                        )
                 else:
                     psrl_logger.debug(
                         f"Agent loop for requests {requests.non_tensor_batch['uid']} "

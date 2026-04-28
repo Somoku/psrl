@@ -94,7 +94,7 @@ class PriorityRequestQueue:
         """Put a request into the priority queue.
 
         Args:
-            request (DataProto): The request to enqueue.
+            request (TokenInput): The request to enqueue.
         """
         if self._request_sort_indicator == RequestSortIndicator.SHORT_LENGTH:
             priority = get_priority_by_version_and_token_num(request, True)
@@ -320,7 +320,7 @@ class MultiPriorityRequestQueue:
             queue_id (int): The ID of the queue to iterate.
 
         Yields:
-            DataProto: Requests in priority order.
+            TokenInput: Requests in priority order.
 
         Raises:
             KeyError: If the queue doesn't exist.

@@ -7,11 +7,15 @@ from dataclasses import dataclass
 import numpy as np
 import ray
 import torch
+import transfer_queue as tq
 from torchdata.stateful_dataloader import StatefulDataLoader
-from verl import DataProto
+from transfer_queue import KVBatchMeta
+
+from verl.utils.dataset.rl_dataset import collate_fn
+from verl.utils import tensordict_utils as tu
 
 from psrl.utils.dataset.utils import create_multi_rl_datasets, create_rl_dataset, create_rl_sampler
-from psrl.utils.logger import DualOutputHandler, log_data_protocol
+from psrl.utils.logger import DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -37,7 +41,6 @@ class DataProcessor:
         tokenizer,
         processor,
         ps_manager_handle,
-        collate_fn=None,
     ):
         """
         Initialize the DataProcessor, responsible for processing data batches.
@@ -52,6 +55,9 @@ class DataProcessor:
         """
 
         self.config = config
+
+        # TransferQueue bootstrap.
+        tq.init()
 
         # Dataset and dataloader attributes
         self.tokenizer = tokenizer
@@ -70,13 +76,6 @@ class DataProcessor:
         self.global_steps = 0
         self._train_sample_idx = 0
         self._val_sample_idx = 0
-
-        if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
-
-            self.collate_fn = default_collate_fn
-        else:
-            self.collate_fn = collate_fn
 
         # Communication handles
         self.ps_manager_handle = ps_manager_handle
@@ -254,7 +253,7 @@ class DataProcessor:
                 batch_size=batch_size,
                 num_workers=num_workers,
                 drop_last=True,
-                collate_fn=self.collate_fn,
+                collate_fn=collate_fn,
                 sampler=sampler,
             )
             for dataset, batch_size, sampler in zip(self.train_datasets, batch_sizes, self.train_samplers)
@@ -291,7 +290,7 @@ class DataProcessor:
                 num_workers=num_workers,
                 shuffle=self.config.data.get("validation_shuffle", True),
                 drop_last=False,
-                collate_fn=self.collate_fn,
+                collate_fn=collate_fn,
             )
             for dataset, batch_size in zip(self.val_datasets, val_batch_sizes)
         ]
@@ -477,27 +476,108 @@ class DataProcessor:
             self._val_sample_idx += 1
         return sample_ids
 
-    def get_single_controller_batch(self, dataset_type: DatasetType):
+    def get_train_sample_ids(self, batch_size: int) -> list:
+        """
+        Generate sample IDs for training data with cyclic wrapping.
+
+        This method generates unique sample IDs for training data that cycle within
+        [0, MAX_TRAIN_ID) to avoid overflow. The IDs are used to track samples across
+        the training pipeline and must not conflict with validation sample IDs.
+
+        Args:
+            batch_size (int): The number of sample IDs to generate.
+
+        Returns:
+            list: A list of sample IDs for the training batch.
+        """
+        sample_ids = []
+        for i in range(batch_size):
+            sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
+            sample_ids.append(sample_id)
+        self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
+        return sample_ids
+
+    def get_single_controller_batch(
+        self,
+        dataset_type: DatasetType,
+        group_repeat: bool = True,
+        return_meta: bool = True,
+    ) -> dict | KVBatchMeta:
         """
         Get a single batch from the dataset for single controller training.
 
         Args:
             dataset_type (DatasetType): The type of dataset to get the batch from (train, val, test).
+            group_repeat (bool): Whether to repeat the batch for each group.
+            return_meta (bool): Whether to return KVBatchMeta and put the batch into TransferQueue.
 
         Returns:
-            DataProto: A single batch from the dataset.
+            dict | KVBatchMeta: A single batch dict from the dataset.
+
+        NOTE(linsh): If group_repeat is True, the batch will be repeated `rollout_n` times for each group
+        and put into the TransferQueue, and a KVBatchMeta will be returned for the repeated batch.
 
         Raises:
             StopIteration: If there are no more batches in the dataset.
         """
         if dataset_type == DatasetType.train:
-            batch = self.get_train_next()
+            batch_dict = self.get_train_next()
+            rollout_n = self.rollout_n
         elif dataset_type == DatasetType.val:
-            batch = self.get_val_next()
+            batch_dict = self.get_val_next()
+            rollout_n = self.val_rollout_n
         else:
             raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
-        return batch
+        if not return_meta:
+            return batch_dict
+
+        batch_size = len(batch_dict[list(batch_dict.keys())[0]])
+        if dataset_type == DatasetType.train:
+            sample_ids = self.get_train_sample_ids(batch_size)
+        else:
+            sample_ids = self.get_val_sample_ids(batch_size)
+
+        batch = tu.get_tensordict(batch_dict)
+        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tu.assign_non_tensor_data(batch, "validate", dataset_type == DatasetType.val)
+        tu.assign_non_tensor_stack(
+            batch,
+            "parent_id" if rollout_n > 1 else "uid",
+            sample_ids,
+        )
+        if group_repeat and rollout_n > 1:
+            request_ids: list[int] = []
+            for i in range(batch_size):
+                for j in range(rollout_n):
+                    request_ids.append(sample_ids[i] * rollout_n + j)
+            batch = batch.repeat_interleave(repeats=rollout_n)
+            tu.assign_non_tensor_stack(batch, "uid", request_ids)
+            keys = [str(uid) for uid in request_ids]
+            tags = [
+                {"uid": request_id}
+                for request_id in request_ids
+            ]
+        else:
+            keys = [str(uid) for uid in sample_ids]
+            tags = [
+                {"uid": sample_id}
+                for sample_id in sample_ids
+            ]
+
+        if rollout_n > 1:
+            for i in range(batch_size):
+                for j in range(rollout_n):
+                    tags[i * rollout_n + j]["parent_id"] = sample_ids[i]
+
+        batch_meta = tq.kv_batch_put(
+            keys=keys,
+            partition_id="train" if dataset_type == DatasetType.train else "val",
+            fields=batch,
+            tags=tags,
+        )
+
+        return batch_meta
 
     # ------- Streaming Data Processing Methods -------
     def start_busy_loop(self):
@@ -518,40 +598,6 @@ class DataProcessor:
             self.stop_data_process = True
             self.data_process_thread.join()
             self.data_process_thread = None
-
-    def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        # Keys that must be preserved so the reward manager and agent loop can consume them.
-        # - data_source, reward_model, extra_info, uid: always required by reward manager.
-        # - reward_model_dicts: new RLHFDataset field replacing the old reward_fn_key / reward_model_dict.
-        # - tools_kwargs: per-sample tool execution kwargs (new RLHFDataset field).
-        # - interaction_kwargs: per-sample interaction kwargs (new RLHFDataset field).
-        reward_keys = (
-            set(
-                {
-                    "data_source",
-                    "reward_model",
-                    "extra_info",
-                    "uid",
-                    "reward_model_dicts",
-                    "tools_kwargs",
-                    "interaction_kwargs",
-                }
-            )
-            & batch.non_tensor_batch.keys()
-        )
-
-        # pop those keys for generation
-        batch_keys_to_pop = []
-        non_tensor_batch_keys_to_pop = set(batch.non_tensor_batch.keys()) - reward_keys
-        gen_batch = batch.pop(
-            batch_keys=batch_keys_to_pop,
-            non_tensor_batch_keys=list(non_tensor_batch_keys_to_pop),
-        )
-
-        # For agent loop, we need reward model keys to compute score.
-        gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
-
-        return gen_batch
 
     @staticmethod
     def _concat_and_shuffle_batch_dicts(batch_dicts: list[dict]) -> dict:
@@ -648,9 +694,6 @@ class DataProcessor:
 
         The data queue will hold the processed batches, which can be consumed by the rollout server.
         """
-        assert self.reward_manager_handle is not None, (
-            "Reward manager handle is not set. Call `reward_manager_handle()` first."
-        )
         self.train_dataloader_iters = [iter(dataloader) for dataloader in self.train_dataloaders]
         total_epochs = self.config.trainer.total_epochs
 
@@ -661,69 +704,19 @@ class DataProcessor:
                 # `fit(...)` in `verl/trainer/ppo/ray_trainer.py`, you can find it by searching for
                 # `batch: DataProto = DataProto.from_single_dict(batch_dict)` in that file.
 
-                batch_dicts = [next(dataloader_iter) for dataloader_iter in self.train_dataloader_iters]
-                batch_dict = self._concat_and_shuffle_batch_dicts(batch_dicts)
-                batch_size = len(batch_dict[list(batch_dict.keys())[0]])
+                batch_meta: KVBatchMeta = self.get_single_controller_batch(DatasetType.train)
+                batch_size = len(batch_meta) // self.rollout_n
 
-                # Generate training sample IDs with cyclic wrapping to avoid overflow
-                sample_ids = []
-                for i in range(batch_size):
-                    sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
-                    sample_ids.append(sample_id)
-                self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
-
-                # For Group Sampling, we use `parent_id` to indicate the shared prompt.
-                if self.rollout_n > 1:
-                    batch_dict["parent_id"] = np.array(sample_ids)
-                else:
-                    batch_dict["uid"] = np.array(sample_ids)
-
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
-
-                # TODO(linsh): check whether get_gen_batch is needed
-                gen_batch = self._get_gen_batch(batch)
-                # gen_batch.meta_info["global_steps"] = self.global_steps
-
-                # Store the other batch fields in the request buffer of the reward manager
-                # They will be merged with the reward data.
-                log_data_protocol(
-                    batch,
-                    psrl_logger,
-                    self.log_prefix + " before adding request data to ps manager",
-                    level=logging.DEBUG,
+                # Register with PSManager and dispatch group-by-group to the
+                # agent-loop manager. Only KVBatchMeta crosses Ray.
+                psrl_logger.debug(
+                    f"Generating {batch_size} prompts x rollout_n={self.rollout_n} children"
                 )
-                ray.get(
-                    self.reward_manager_handle.add_requests.remote(
-                        {sample_ids[i]: batch[i : i + 1] for i in range(batch_size)}
-                    )
-                )
-
-                # We manually repeat prompts in the generation batch for Group Sampling.
-                # Requests in the batch are unique during generation and synchronized through parent tracker.
-                psrl_logger.debug(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
-                if self.rollout_n > 1:
-                    gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
-                    uid_list = []
-                    for i in range(batch_size):
-                        for j in range(self.rollout_n):
-                            child_id = sample_ids[i] * self.rollout_n + j
-                            uid_list.append(child_id)
-                    gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
-
-                # Record the request status in the request status manager and put the batch into the data queue.
-                # Put group-level requests to data queue
-                for i in range(batch_size):
-                    ray.get(
-                        self.ps_manager_handle.add_request.remote(
-                            gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
-                        )
-                    )
-                    ray.get(
-                        self.agent_loop_manager_handle.put_data.remote(
-                            gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n]
-                        )
-                    )
+                prompt_batch_metas = batch_meta.chunk(batch_size)
+                for prompt_batch_meta in prompt_batch_metas:
+                    request_ids = [tag["uid"] for tag in prompt_batch_meta.tags]
+                    ray.get(self.ps_manager_handle.add_request.remote(request_ids))
+                    ray.get(self.agent_loop_manager_handle.put_data.remote(prompt_batch_meta))
 
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:

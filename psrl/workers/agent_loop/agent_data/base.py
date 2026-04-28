@@ -4,11 +4,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
+import torch
 import numpy as np
 import ray
 from omegaconf import DictConfig
+from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
-from verl import DataProto
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
 from psrl.environments.base import ConversationType, Environment
@@ -456,24 +459,22 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.trajectory.curr_rollout_instance_id = output.rollout_instance_id
         self.get_current_step().info["rollout_instance_id"] = output.rollout_instance_id
 
-    def prepare_generation_request(self, request: DataProto) -> DataProto:
+    def prepare_generation_request(self, request: dict) -> dict:
         """Prepare the generation request based on the current agent data state.
 
         Args:
-            request (DataProto): Original input request.
+            request (dict): Original input request.
 
         Returns:
-            DataProto: Modified request for generation.
+            dict: Modified request for generation.
         """
         assert len(request) == 1, "prepare_generation_request only supports single request."
-        assert "input_ids" in request.batch, "Request must contain 'input_ids' in batch."
 
-        # TODO(linsh): we may merge them into `raw_prompt_ids` in the future.
-        request.non_tensor_batch["raw_prompt_ids"] = np.array([self.trajectory.prompt_ids])
-        request.non_tensor_batch["raw_response_ids"] = np.array([self.trajectory.response_ids])
+        request["raw_prompt_ids"] = np.array([self.trajectory.prompt_ids])
+        request["raw_response_ids"] = np.array([self.trajectory.response_ids])
         if self.trajectory.curr_rollout_instance_id is not None:
-            request.non_tensor_batch["rollout_instance_id"] = np.array([self.trajectory.curr_rollout_instance_id])
-
+            request["rollout_instance_id"] = np.array([self.trajectory.curr_rollout_instance_id])
+        
         # Propagate accumulated multi-modal data so generate_sequence() can
         # forward it to the inference backend on every turn.
         if self.trajectory.image_data is not None or self.trajectory.video_data is not None:
@@ -482,7 +483,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 mm["images"] = self.trajectory.image_data
             if self.trajectory.video_data is not None:
                 mm["videos"] = self.trajectory.video_data
-            request.non_tensor_batch["multi_modal_data"] = np.array([mm], dtype=object)
+            request["multi_modal_data"] = np.array([mm], dtype=object)
 
         return request
 
@@ -532,19 +533,8 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 G = step.reward + self.gamma * G
                 step.reward = G  # Replace the reward with MC return
 
-    async def finalize_output(self, request: DataProto) -> DataProto:
-        """Finalize the trajectory and prepare output for training.
-
-        This method truncates sequences to the maximum response length, computes
-        final rewards, and packages the trajectory data into a format suitable
-        for training.
-
-        Args:
-            request: Original request DataProto containing metadata.
-
-        Returns:
-            DataProto: Finalized output with rewards and trajectory information.
-        """
+    async def finalize_output(self) -> TokenOutput | None:
+        """Finalize the trajectory and prepare output for reward computation."""
         self.trajectory.response_ids = self.trajectory.response_ids[
             : self.config.gen_actor_rollout_ref.rollout.response_length
         ]
@@ -554,38 +544,38 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.trajectory.response_logprobs = self.trajectory.response_logprobs[
             : self.config.gen_actor_rollout_ref.rollout.response_length
         ]
-
-        non_tensor_batch = request.non_tensor_batch
-        non_tensor_batch["raw_prompt_ids"] = np.array([self.trajectory.prompt_ids])
-        non_tensor_batch["raw_response_ids"] = np.array([self.trajectory.response_ids])
-        non_tensor_batch["response_mask"] = np.array([self.trajectory.response_mask])
-        non_tensor_batch["rollout_instance_id"] = np.array([self.trajectory.curr_rollout_instance_id])
-        non_tensor_batch["__num_turns__"] = np.array(
-            [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
-        )
-        if len(self.trajectory.response_logprobs) > 0:
-            non_tensor_batch["rollout_log_probs"] = np.array([self.trajectory.response_logprobs])
-        if len(self.trajectory.routed_experts) > 0:
-            non_tensor_batch["routed_experts"] = np.array([self.trajectory.routed_experts])
-
-        # Propagate per-turn reward signals for downstream reward shaping.
-        non_tensor_batch["turn_scores"] = np.array([self.trajectory.turn_scores], dtype=object)
-        non_tensor_batch["tool_rewards"] = np.array([self.trajectory.tool_rewards], dtype=object)
-
-        # Propagate multi-modal data accumulated across turns so downstream
-        # training workers can compute position IDs and pixel inputs correctly.
+        
+        multi_modal_data = None
         if self.trajectory.image_data is not None or self.trajectory.video_data is not None:
-            mm: dict = {}
+            multi_modal_data = {}
             if self.trajectory.image_data is not None:
-                mm["images"] = self.trajectory.image_data
+                multi_modal_data["images"] = self.trajectory.image_data
             if self.trajectory.video_data is not None:
-                mm["videos"] = self.trajectory.video_data
-            non_tensor_batch["multi_modal_data"] = np.array([mm], dtype=object)
-
-        data = DataProto(non_tensor_batch=non_tensor_batch, meta_info=request.meta_info)
-
-        output: DataProto = data
-
+                multi_modal_data["videos"] = self.trajectory.video_data
+        
+        output: TokenOutput = TokenOutput(
+            prompt_ids=self.trajectory.prompt_ids,
+            response_ids=self.trajectory.response_ids,
+            response_mask=self.trajectory.response_mask,
+            response_log_probs=(
+                self.trajectory.response_logprobs
+                if len(self.trajectory.response_logprobs) > 0
+                else None
+            ),
+            routed_experts=(
+                self.trajectory.routed_experts
+                if len(self.trajectory.routed_experts) > 0
+                else None
+            ),
+            multi_modal_data=multi_modal_data,
+            num_turns=self.trajectory.assistant_turns + self.trajectory.user_turns + 1,
+            rollout_instance_id=self.trajectory.curr_rollout_instance_id,
+            extra_fields={
+                "tool_rewards": self.trajectory.tool_rewards,
+                "turn_scores": self.trajectory.turn_scores,
+            }
+        )
+        
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
             assert not self.config.reward.launch_reward_fn_async, (
                 "Asynchronous reward computation is not supported in 'step' traj_reward_mode."
@@ -593,57 +583,28 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             self.trajectory.reward = np.sum([self.compute_step_reward(step) for step in self.trajectory.steps])
             if len(self.trajectory.steps) > 1:
                 self.adjust_step_rewards(self.trajectory)
-            reward_result = {non_tensor_batch["uid"][0]: {"reward_score": self.trajectory.reward}}
-            output = self._post_process_and_merge_reward(reward_result, output)
+            output.reward_score = self.trajectory.reward
         elif self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "traj":
-            reward_result = await self.reward_manager.compute_score.remote(output)
+            data = tu.get_tensordict({
+                "prompts": torch.tensor(output.prompt_ids, dtype=torch.int64).unsqueeze(0),
+                "responses": torch.tensor(output.response_ids, dtype=torch.int64).unsqueeze(0),
+                "multi_modal_data": np.array([output.multi_modal_data], dtype=object),
+                "num_turns": np.array([output.num_turns]),
+                "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+            })
+            reward_result = await self.reward_manager.compute_score.remote(data)
             if not self.config.reward.launch_reward_fn_async:
-                output = self._post_process_and_merge_reward(reward_result, output)
+                if not reward_result:
+                    return None
+                output.reward_score = reward_result["reward_score"]
+                output.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
+                output.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
         else:
             raise ValueError(
                 f"Unknown traj_reward_mode: {self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode}"
             )
 
         return output
-
-    def _post_process_and_merge_reward(self, reward_result: dict[int, dict], outputs: DataProto) -> DataProto:
-        """Merge the computed reward results back into the output DataProto.
-
-        This method updates the output data with the reward scores and any additional
-        information returned by the reward model.
-
-        Args:
-            reward_result (Dict[int, dict]): Computed reward results indexed by data item.
-            outputs (DataProto): Original output data to be updated.
-
-        Returns:
-            DataProto: Updated output data with reward information.
-        """
-        if outputs.meta_info.get("validate", False):
-            return outputs  # Skip merging for validation data
-
-        filtered_request_ids = list(reward_result.keys())
-        filtered_request_idxs = [
-            idx for idx, uid in enumerate(outputs.non_tensor_batch["uid"].tolist()) if uid in filtered_request_ids
-        ]
-        outputs = outputs.select_idxs(filtered_request_idxs)
-        request_ids = outputs.non_tensor_batch["uid"].tolist()
-
-        rewards = []
-        reward_extra_infos = []
-        reward_metrics_list = []
-        for request_id in request_ids:
-            assert request_id in reward_result, f"Missing reward result for request ID: {request_id}"
-            result = reward_result[request_id]
-            rewards.append(result["reward_score"])
-            extra_info = result.get("reward_extra_info", {})
-            reward_extra_infos.append(extra_info)
-            reward_metrics = result.get("reward_metrics", {})
-            reward_metrics_list.append(reward_metrics)
-        outputs.non_tensor_batch["reward_scores"] = np.array(rewards)
-        outputs.non_tensor_batch["reward_extra_infos"] = np.array(reward_extra_infos, dtype=object)
-        outputs.non_tensor_batch["reward_metrics"] = np.array(reward_metrics_list, dtype=object)
-        return outputs
 
     @classmethod
     def get_agent_data(cls, name: str, *args, **kwargs) -> "AgentData":

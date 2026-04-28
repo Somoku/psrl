@@ -52,10 +52,10 @@ def sticky_session(rollout_router_handle, request):
 
     Args:
         rollout_router_handle: Ray actor handle to RolloutRouter.
-        request: DataProto containing request with 'uid' in non_tensor_batch.
+        request: dict containing request with 'uid' in non_tensor_batch.
 
     Returns:
         StickySession: Context manager for sticky session.
     """
-    request_id = request.non_tensor_batch["uid"][0]
+    request_id = request["uid"]
     return StickySession(rollout_router_handle, request_id)

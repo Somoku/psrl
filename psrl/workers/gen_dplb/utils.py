@@ -1,4 +1,6 @@
-from dataclasses import dataclass
+import torch
+
+from dataclasses import dataclass, field
 from typing import Any
 
 # (worker_id, data_parallel_rank)
@@ -8,7 +10,6 @@ INVALID_ROLLOUT_INSTANCE_ID: RolloutInstanceId = ("", -1)
 # Default configuration constants
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_CONNECTIONS = 2000
-
 
 @dataclass
 class TokenInput:
@@ -29,12 +30,15 @@ class TokenInput:
     is_validate: bool = False
     """whether this request is for validation purpose"""
 
-
 @dataclass
 class TokenOutput:
-    token_ids: list[int]
+    prompt_ids: list[int]
+    """input token ids"""
+    response_ids: list[int]
     """response token ids"""
-    log_probs: list[float] | None = None
+    response_mask: list[int]
+    """Response mask, 1 for LLM generated token, 0 for tool response token."""
+    response_log_probs: list[float] | None = None
     """logprobs of response token ids"""
     routed_experts: Any | None = None
     """routed experts of response token ids"""
@@ -44,6 +48,8 @@ class TokenOutput:
     """pooling output tensor for pooling/reward models (torch.Tensor or None)"""
     multi_modal_data: dict | None = None
     """the multi-modal data for this generation, e.g., image/video features or metadata"""
+    reward_score: float | None = None
+    """Reward score for the trajectory."""
     stop_reason: str | None = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: int | None = None
@@ -52,7 +58,52 @@ class TokenOutput:
     """whether the generation is interrupted"""
     interrupted_by_scheduler: bool = False
     """whether the generation is interrupted by scheduler (preempted)"""
+    num_turns: int | None = None
+    """number of turns for multi-turn generation"""
     update_status: Any | None = None
     """status of the request"""
     rollout_instance_id: RolloutInstanceId | None = None
     """the rollout instance id used for this generation"""
+    extra_fields: dict[str, Any] = field(default_factory=dict)
+    """Extra fields for dynamic addition."""
+
+    def as_dict(self) -> dict[str, Any]:
+        """Convert the TokenOutput dataclass to a dictionary."""
+        output = {
+            "prompt_ids": self.prompt_ids,
+            "response_ids": self.response_ids,
+            "response_mask": self.response_mask,
+            "response_log_probs": self.response_log_probs,
+            "routed_experts": self.routed_experts,
+            "pooling_output": self.pooling_output,
+            "multi_modal_data": self.multi_modal_data,
+            "reward_score": self.reward_score,
+            "stop_reason": self.stop_reason,
+            "num_preempted": self.num_preempted,
+            "interrupted": self.interrupted,
+            "interrupted_by_scheduler": self.interrupted_by_scheduler,
+            "num_turns": self.num_turns,
+            "update_status": self.update_status,
+            "rollout_instance_id": self.rollout_instance_id,
+            **self.extra_fields,  # Include any extra fields in the dictionary
+        }
+
+        output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
+        output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
+        output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+
+        response_logprobs = output.pop("response_log_probs", None)
+        if response_logprobs is not None:
+            output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
+
+        routed_experts = output.pop("routed_experts", None)
+        if routed_experts is not None:
+            output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.int64)
+
+        reward_score = output.get("reward_score", None)
+        if reward_score is not None:
+            rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
+            rm_scores[-1] = reward_score
+            output["rm_scores"] = rm_scores
+
+        return output

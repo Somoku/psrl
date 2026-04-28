@@ -8,7 +8,7 @@ import numpy as np
 from omegaconf import DictConfig
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
-from verl import DataProto
+from verl.utils import tensordict_utils as tu
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 
 from psrl.environments.base import ConversationType, Environment
@@ -199,24 +199,20 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         """
         self.trajectory = Trajectory()
 
-    def init_trajectory(self, request: DataProto) -> None:
+    def init_trajectory(self, request: dict) -> None:
         """Initialize a new trajectory from the input request.
 
         Extracts request_id, parent_id, and per-sample tools_kwargs from the
         request and creates a new Trajectory instance.
 
         Args:
-            request: DataProto containing the initial task and metadata.
+            request: dict containing the initial task and metadata.
 
         Raises:
             AssertionError: If the request contains more than one item.
         """
-        assert len(request) == 1, "We only support single request initialization."
-
-        request_id = request.non_tensor_batch.get("uid", 0)[0]
-        parent_id = request.non_tensor_batch.get("parent_id", None)
-        if parent_id is not None:
-            parent_id = parent_id[0]
+        request_id = request.get("uid", 0)
+        parent_id = request.get("parent_id", None)
 
         self.trajectory = Trajectory(
             request_id=request_id,
@@ -318,9 +314,12 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         self.update_trajectory_state_from_output(output)
 
-        response_ids = output.token_ids
-        rollout_logprobs = output.log_probs
-        routed_experts = output.routed_experts.tolist()
+        response_ids = output.response_ids
+        rollout_logprobs = output.response_log_probs
+        if output.routed_experts is not None:
+            routed_experts = output.routed_experts.tolist()
+        else:
+            routed_experts = None
 
         # Update trajectory state with model-generated tokens
         self.append_assistant_tokens(
@@ -347,11 +346,15 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         # Compute step reward if using step-level reward mode
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
-            raise NotImplementedError
-            # output.non_tensor_batch["__num_turns__"] = np.array(
-            #     [self.trajectory.assistant_turns + self.trajectory.user_turns + 1], dtype=np.int32
-            # )
-            # self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(output)
+            output.num_turns = self.trajectory.assistant_turns + self.trajectory.user_turns + 1
+            data = tu.get_tensordict({
+                "prompts": torch.tensor(output.prompt_ids, dtype=torch.int64).unsqueeze(0),
+                "responses": torch.tensor(output.response_ids, dtype=torch.int64).unsqueeze(0),
+                "multi_modal_data": np.array([output.multi_modal_data], dtype=object),
+                "num_turns": np.array([output.num_turns]),
+                "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+            })
+            self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(data)["reward_score"]
 
         # Check if response length limit is reached
         if self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:

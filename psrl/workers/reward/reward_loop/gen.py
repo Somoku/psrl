@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from verl import DataProto
+from verl.utils import tensordict_utils as tu
 
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler
@@ -223,7 +224,7 @@ class GenRewardManager(RewardManagerBase):
 
     # ── Main entry point ───────────────────────────────────────────────────
 
-    async def run_single(self, data: DataProto) -> dict:
+    async def run_single(self, data: TensorDict) -> dict:
         """
         Process a single data item through the reward model.
 
@@ -232,27 +233,27 @@ class GenRewardManager(RewardManagerBase):
         """
         assert len(data) == 1, "Only single data items supported in run_single"
         data_item = data[0]
-        request_uid = self._format_request_uid(data_item.non_tensor_batch.get("uid"))
+        request_uid = self._format_request_uid(tu.get(data_item, "uid"))
 
         # Decode prompt and agent response
-        prompt_ids = data_item.batch["prompts"]
+        prompt_ids = data_item["prompts"]
         prompt_str = await self.loop.run_in_executor(
             None,
             lambda: self.tokenizer.decode(prompt_ids, skip_special_tokens=True),
         )
-        response_ids = data_item.batch["responses"]
+        response_ids = data_item["responses"]
         response_length = response_ids.shape[-1]
-        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
+        valid_response_length = data_item["attention_mask"][-response_length:].sum()
         valid_response_ids = response_ids[:valid_response_length]
         response_str = await self.loop.run_in_executor(
             None,
             lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True),
         )
 
-        data_source = data_item.non_tensor_batch.get("data_source", "unknown")
-        reward_model_info = data_item.non_tensor_batch.get("reward_model")
+        data_source = tu.get(data_item, "data_source", "unknown")
+        reward_model_info = tu.get(data_item, "reward_model")
         ground_truth = reward_model_info.get("ground_truth", "") if isinstance(reward_model_info, dict) else ""
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
+        extra_info = tu.get(data_item, "extra_info", {})
 
         # Build RM prompt and tokenize
         rm_prompt = self.reward_function.prompt_constructor(prompt_str=prompt_str, response_str=response_str)

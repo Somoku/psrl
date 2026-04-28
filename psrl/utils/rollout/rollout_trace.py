@@ -271,9 +271,6 @@ def rollout_trace_op(func):
                         response_text = self.tokenizer.decode(processed_item["raw_response_ids"])
                         processed_item["response_text"] = response_text
 
-                    if "__num_turns__" in processed_item.keys():
-                        processed_item["num_turns"] = int(processed_item["__num_turns__"])
-
                     return processed_item
                 return item
 

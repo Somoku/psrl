@@ -3,6 +3,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import ray
+import transfer_queue as tq
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor import DTensor
@@ -68,6 +69,8 @@ class PSManager(RequestStatusTracker):
                 rollout_n, staleness buffer entries, staleness limit, etc.
         """
         RequestStatusTracker.__init__(self, psrl_config)
+        
+        tq.init()
 
         if self.psrl_config.redundant_rollout.enable:
             self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n

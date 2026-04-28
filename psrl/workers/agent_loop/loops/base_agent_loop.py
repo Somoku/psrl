@@ -9,8 +9,11 @@ import numpy as np
 import ray
 import torch
 from PIL import Image
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
+from tensordict import  NonTensorData, NonTensorStack
 from transformers import AutoProcessor, AutoTokenizer
-from verl import DataProto
+from verl.utils import tensordict_utils as tu
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.tokenizer import normalize_token_ids
@@ -75,6 +78,7 @@ class AgentLoopBase(ABC):
         self.loop = asyncio.get_running_loop()
         self.response_length = self.rollout_config.response_length
         self.prompt_length = self.rollout_config.prompt_length
+        self.output_in_tq = False
 
     async def process_vision_info(
         self,
@@ -189,9 +193,35 @@ class AgentLoopBase(ABC):
 
         return prompt_ids
 
-    async def generate_sequence(self, request: DataProto, is_sticky_session: bool = False) -> DataProto:
+    async def compute_reward_score(self, data: TokenOutput) -> TokenOutput | None:
+        """Compute reward score for the generated response and merge it into the output.
+
+        This function sends the generated response to the reward manager and waits for the computed reward score. If the reward computation is successful, it merges the reward score into the output data structure. If the request is aborted during reward computation (e.g., due to staleness check failure), it returns None to indicate that the request should be aborted.
+
+        Args:
+            data (TokenOutput): The output data structure containing the generated response and associated metadata.
+        Returns:
+            TokenOutput | None: The updated output data structure with the computed reward score, or None if the request was aborted during reward computation.
+        """
+        reward_requests = tu.get_tensordict({
+            "prompts": torch.tensor(data.prompt_ids, dtype=torch.int64).unsqueeze(0),
+            "responses": torch.tensor(data.response_ids, dtype=torch.int64).unsqueeze(0),
+            "multi_modal_data": np.array([data.multi_modal_data], dtype=object),
+            "num_turns": np.array([data.num_turns]),
+            "tool_extra_fields": np.array([data.extra_fields], dtype=object),
+        })
+        reward_result = await self.reward_manager.compute_score.remote(reward_requests)
+
+        if not self.config.reward.launch_reward_fn_async:
+            data.reward_score = reward_result["reward_score"]
+            data.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
+            data.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
+
+        return data
+
+    async def generate_sequence(self, request: dict, is_sticky_session: bool = False) -> "TokenOutput":
         # psrl_logger.info(f"Inside {request.non_tensor_batch['uid'][0]=}")
-        request_input = await self.pre_process_inputs(request)
+        request_input: TokenInput = await self.pre_process_inputs(request)
         # psrl_logger.info(f"After process: {request_input.request_id=}")
         sampling_params = self._get_sampling_params(request_input)
         if self.config.psrl.rollout_gateway.enable:
@@ -372,8 +402,10 @@ class AgentLoopBase(ABC):
 
         psrl_logger.info(f"{request_input.request_id=} generated output with {len(token_ids)} tokens")  # noqa: E501
         return TokenOutput(
-            token_ids=token_ids,
-            log_probs=log_probs,
+            prompt_ids=request_input.input_ids,
+            response_ids=token_ids,
+            response_mask=[1] * len(token_ids),
+            response_log_probs=log_probs,
             routed_experts=routed_experts,
             multi_modal_data=request_input.multi_modal_data,
             stop_reason=finish_reason,
@@ -506,8 +538,10 @@ class AgentLoopBase(ABC):
         )
 
         return TokenOutput(
-            token_ids=token_ids,
-            log_probs=log_probs,
+            prompt_ids=request_input.input_ids,
+            response_ids=token_ids,
+            response_mask=[1] * len(token_ids),
+            response_log_probs=log_probs,
             routed_experts=None,
             multi_modal_data=mm_data,
             stop_reason=finish_reason,
@@ -516,35 +550,25 @@ class AgentLoopBase(ABC):
             rollout_instance_id=rollout_instance_id,
         )
 
-    async def pre_process_inputs(self, request: DataProto) -> TokenInput:
-        non_tensor_batch = request.non_tensor_batch
-        version_tag = non_tensor_batch["version_tag"][0]
-        is_validate = request.meta_info.get("validate", False)
-
-        if "parent_id" in non_tensor_batch:
-            req_prompt_id = non_tensor_batch["parent_id"][0]
-        else:
-            req_prompt_id = non_tensor_batch["uid"][0]
-
-        if "rollout_instance_id" in non_tensor_batch:
-            rollout_instance_id = non_tensor_batch["rollout_instance_id"][0]
-        else:
-            rollout_instance_id = None
-
+    async def pre_process_inputs(self, request: dict) -> TokenInput:
+        version_tag = request["version_tag"]
+        is_validate = request.get("validate", False)
+        prompt_id = request.get("parent_id", request["uid"])
+        rollout_instance_id = request.get("rollout_instance_id", None)
+        
         multi_modal_data = None
-        if "raw_prompt_ids" not in non_tensor_batch:
-            if request.batch is not None and "input_ids" in request.batch and request.batch["input_ids"] is not None:
-                # Legacy path: DataProto carries padded input_ids tensor.
-                input_ids = request.batch["input_ids"][0]
+        if "raw_prompt_ids" not in request:
+            if request.get("input_ids", None) is not None:
+                input_ids = request["input_ids"]
                 raw_prompt_ids = _pre_process_inputs(self.tokenizer.pad_token_id, input_ids)
-            elif "raw_prompt" in non_tensor_batch:
-                messages = list(non_tensor_batch["raw_prompt"][0])
+            elif "raw_prompt" in request:
+                messages = list(request["raw_prompt"])
 
                 # 1. extract images and videos from messages
                 images, videos = await self.process_vision_info(messages)
+                multi_modal_data = None
                 if images is not None or videos is not None:
                     multi_modal_data = {"images": images, "videos": videos}
-                    non_tensor_batch["multi_modal_data"] = np.array([multi_modal_data])
 
                 # 2. apply chat template and tokenize
                 raw_prompt_ids = await self.apply_chat_template(
@@ -552,36 +576,31 @@ class AgentLoopBase(ABC):
                     images=images,
                     videos=videos,
                 )
-                non_tensor_batch["raw_prompt_ids"] = np.array([raw_prompt_ids])
+                request["raw_prompt_ids"] = np.array([raw_prompt_ids])
             else:
                 raise ValueError(
                     "Request must contain 'raw_prompt_ids', 'raw_prompt', or 'input_ids' "
                     "to build generation input. Got keys: "
-                    f"batch={list(request.batch.keys()) if request.batch else []}, "
-                    f"non_tensor_batch={list(non_tensor_batch.keys())}"
+                    f"{request.keys()}"
                 )
         else:
-            raw_prompt_ids = non_tensor_batch["raw_prompt_ids"][0]
+            raw_prompt_ids = request["raw_prompt_ids"]
             if isinstance(raw_prompt_ids, np.ndarray):
                 raw_prompt_ids = raw_prompt_ids.tolist()
 
         # Recover multi-modal data stored by prepare_generation_request().
-        mm_raw = non_tensor_batch.get("multi_modal_data", None)
-        multi_modal_data = mm_raw[0] if mm_raw is not None else None
+        multi_modal_data = request.get("multi_modal_data", None)
 
-        if "raw_response_ids" in non_tensor_batch:
-            raw_response_ids = non_tensor_batch["raw_response_ids"][0]
-        else:
-            raw_response_ids = []
-
+        raw_response_ids = request.get("raw_response_ids", [])
         if isinstance(raw_response_ids, np.ndarray):
             raw_response_ids = raw_response_ids.tolist()
+
         raw_prompt_ids.extend(raw_response_ids)
 
         return TokenInput(
             input_ids=raw_prompt_ids,
-            request_id=int(non_tensor_batch["uid"][0]),
-            prompt_id=req_prompt_id,
+            request_id=request["uid"],
+            prompt_id=prompt_id,
             rollout_instance_id=rollout_instance_id,
             version_tag=version_tag,
             cu_response_len=len(raw_response_ids),
@@ -791,78 +810,87 @@ class AgentLoopBase(ABC):
 
         return None, None, None
 
-    def _post_process_and_merge_reward(self, reward_result: dict[int, dict], outputs: DataProto) -> DataProto:
-        """Merge the computed reward results back into the output DataProto.
-
-        This method updates the output data with the reward scores and any additional
-        information returned by the reward model.
-
-        Args:
-            reward_result (Dict[int, dict]): Computed reward results indexed by data item.
-            outputs (DataProto): Original output data to be updated.
-
-        Returns:
-            DataProto: Updated output data with reward information.
-        """
-        if outputs.meta_info.get("validate", False):
-            return outputs  # Skip merging for validation data
-
-        filtered_request_ids = list(reward_result.keys())
-        filtered_request_idxs = [
-            idx for idx, uid in enumerate(outputs.non_tensor_batch["uid"].tolist()) if uid in filtered_request_ids
-        ]
-        outputs = outputs.select_idxs(filtered_request_idxs)
-        request_ids = outputs.non_tensor_batch["uid"].tolist()
-
-        rewards = []
-        reward_extra_infos = []
-        for request_id in request_ids:
-            assert request_id in reward_result, f"Missing reward result for request ID: {request_id}"
-            result = reward_result[request_id]
-            rewards.append(result["reward_score"])
-            extra_info = result.get("reward_extra_info", {})
-            reward_extra_infos.append(extra_info)
-        outputs.non_tensor_batch["reward_scores"] = np.array(rewards)
-        outputs.non_tensor_batch["reward_extra_infos"] = np.array(reward_extra_infos, dtype=object)
-        return outputs
-
     @abstractmethod
-    async def run(self, request: DataProto) -> DataProto:
+    async def run(self, request: dict) -> tuple[TokenOutput | None, TerminateReason]:
         """Execute the agent loop for the given request.
 
         Args:
-            request (DataProto): Input request to process.
+            request (dict): Input request to process.
 
         Returns:
-            DataProto: Processed response data.
+            Tuple[TokenOutput | None, TerminateReason]:
+                A tuple containing the output data (if any) and the termination reason.
 
         Raises:
             NotImplementedError: Must be implemented by subclasses.
         """
         raise NotImplementedError
 
+    def get_generate_fields(self) -> list[str]:
+        """Determine which fields to select from the key-value store for generation.
+
+        Returns:
+            list[str] | None: List of field names to select from the key-value store,
+                              or None to fetch all fields.
+        """
+        fields = [
+            # metadata
+            "uid",
+            "parent_id",
+            "version_tag",
+            "validate",
+            "rollout_instance_id",
+            # prompt
+            "raw_prompt_ids",
+            "raw_prompt",
+            "input_ids",
+            "raw_response_ids",
+            # multi-modal data
+            "multi_modal_data",
+        ]
+        
+        return fields
+
     async def run_with_termination_handling(
-        self, request: DataProto, raise_on_error: bool = True
-    ) -> tuple[DataProto | None, TerminateReason]:
+        self, request: KVBatchMeta, raise_on_error: bool = True
+    ) -> tuple[TokenOutput | None, TerminateReason]:
         """Run the agent loop with termination event handling.
 
         This method wraps the run method to catch termination events and handle them appropriately.
         It enables timeouts and error handling based on the provided configuration.
 
         Args:
-            request (DataProto): Input request to process.
+            request (KVBatchMeta): Input request to process.
             raise_on_error (bool): Whether to raise exceptions on errors.
 
         Returns:
-            DataProto: Processed response data.
+            Tuple[TokenOutput | None, TerminateReason]:
+                A tuple containing the output data (if any) and the termination reason.
         """
         try:
-            coro = self.run(request)
+            fields = self.get_generate_fields()
+            if fields:
+                data = await tq.async_kv_batch_get(keys=request.keys, partition_id=request.partition_id, select_fields=fields)
+            else:
+                data = await tq.async_kv_batch_get_by_meta(request)
+            
+            prompt = {}
+            for k, v in data.items():
+                if isinstance(v, torch.Tensor):
+                    prompt[k] = v[0]
+                elif isinstance(v, NonTensorStack):
+                    prompt[k] = v[0].data
+                elif isinstance(v, NonTensorData):
+                    prompt[k] = v.data
+                else:
+                    psrl_logger.exception(f"Unsupported type {type(v)} for key {k}")
+
+            coro = self.run(prompt)
             # output, terminate_reason = await asyncio.wait_for(
             #     coro, timeout=self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
             # )
             output, terminate_reason = await coro
-            if output is not None and isinstance(output, DataProto):
+            if output is not None and isinstance(output, TokenOutput):
                 return output, terminate_reason
             elif output is None and terminate_reason in (
                 TerminateReason.ABORTED,
@@ -878,7 +906,7 @@ class AgentLoopBase(ABC):
             elif not raise_on_error:
                 return None, TerminateReason.UNKNOWN
             else:
-                raise RuntimeError("Agent loop run did not return a valid DataProto output.")
+                raise RuntimeError("Agent loop run did not return a valid TokenOutput output.")
         except asyncio.TimeoutError:
             psrl_logger.error(
                 "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",  # noqa: E501

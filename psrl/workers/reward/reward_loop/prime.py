@@ -4,7 +4,8 @@ from concurrent.futures import ProcessPoolExecutor
 from functools import partial
 
 import psutil
-from verl import DataProto
+from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
 from psrl.utils.reward_score import default_compute_score_async
 from psrl.workers.reward.reward_loop import register
@@ -62,11 +63,11 @@ class PrimeRewardManager(RewardManagerBase):
 
         self.already_print_data_sources = {}
 
-    async def run_single(self, data: DataProto) -> dict:
+    async def run_single(self, data: TensorDict) -> dict:
         """Process a single data item and return reward score.
 
         Args:
-            data: DataProto containing a single data item
+            data: TensorDict containing a single data item
 
         Returns:
             dict: Dictionary containing 'reward_score' and 'reward_extra_info'
@@ -74,16 +75,16 @@ class PrimeRewardManager(RewardManagerBase):
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
 
-        response_ids = data_item.batch["responses"]
+        response_ids = data_item["responses"]
         response_length = response_ids.shape[-1]
-        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
+        valid_response_length = data_item["attention_mask"][-response_length:].sum()
         valid_response_ids = response_ids[:valid_response_length]
 
-        data_source = data_item.non_tensor_batch.get(self.reward_fn_key, data_item.non_tensor_batch.get("data_source"))
-        ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
-        num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
-        rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
+        data_source = tu.get(data_item, "data_source")
+        ground_truth = tu.get(data_item, "reward_model")["ground_truth"]
+        extra_info = tu.get(data_item, "extra_info", {})
+        num_turns = tu.get(data_item, "num_turns", None)
+        rollout_reward_scores = tu.get(data_item, "reward_scores", {})
         extra_info["num_turns"] = num_turns
         extra_info["rollout_reward_scores"] = rollout_reward_scores
 

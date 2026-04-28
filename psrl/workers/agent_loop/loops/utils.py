@@ -1,3 +1,4 @@
+import torch
 from enum import Enum
 
 from omegaconf import DictConfig

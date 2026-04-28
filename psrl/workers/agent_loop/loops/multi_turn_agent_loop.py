@@ -4,11 +4,11 @@ import os
 
 import ray
 from transformers import AutoProcessor, AutoTokenizer
-from verl import DataProto
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from psrl.environments.base import Environment
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
+from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
@@ -56,22 +56,23 @@ class MultiTurnAgentLoop(AgentLoopBase):
         self.max_turns = trainer_config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
         self.env_step_timeout = trainer_config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
+    def get_generate_fields(self) -> list[str]:
+        fields = super().get_generate_fields()
+        fields.extend(["env_class", "data_class", "seed"])
+        return fields
+
     @rollout_trace_op
-    async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
+    async def run(self, request: dict) -> tuple[TokenOutput | None, TerminateReason]:
         """Execute generation for a single request.
 
         Args:
-            request (DataProto): Single input request.
+            request (dict): Single input request.
 
         Returns:
-            Tuple[DataProto, TerminateReason]: Generated response with metadata and termination reason.
+            Tuple[TokenOutput, TerminateReason]: Generated response with metadata and termination reason.
         """
-        env_class = request.non_tensor_batch.get(
-            "env_class", self.config.gen_actor_rollout_ref.rollout.agent.env.name
-        )[0]
-        data_class = request.non_tensor_batch.get(
-            "data_class", self.config.gen_actor_rollout_ref.rollout.agent.data.name
-        )[0]
+        env_class = request.get("env_class", self.config.gen_actor_rollout_ref.rollout.agent.env.name)
+        data_class = request.get("data_class", self.config.gen_actor_rollout_ref.rollout.agent.data.name)
 
         self.env = Environment.get_environment(
             env_class,
@@ -92,7 +93,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
 
         observation, info = await self.env.reset(
             task=request,
-            seed=request.non_tensor_batch.get("seed", None),
+            seed=request.get("seed", None),
         )
 
         self.agent_data.init_trajectory(request)
@@ -103,7 +104,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
         overlong_terminate = await self.agent_data.update_from_env(observation, 0, False, info)
 
         if overlong_terminate:
-            return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+            return await self.agent_data.finalize_output(), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
         for _ in range(self.max_turns):
             # Currently we still use token-in-token-out generation,
@@ -123,7 +124,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
             action, overlong_terminate = await self.agent_data.update_from_model_token_ids(output)
 
             if overlong_terminate:
-                return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                return await self.agent_data.finalize_output(), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             try:
                 env_step_output = await asyncio.wait_for(
@@ -135,14 +136,14 @@ class MultiTurnAgentLoop(AgentLoopBase):
                 done = env_step_output["done"]
                 info = env_step_output["info"]
             except asyncio.TimeoutError:
-                return await self.agent_data.finalize_output(request), TerminateReason.ENV_TIMEOUT
+                return await self.agent_data.finalize_output(), TerminateReason.ENV_TIMEOUT
 
             overlong_terminate = await self.agent_data.update_from_env(observation, reward, done, info)
 
             if overlong_terminate:
-                return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                return await self.agent_data.finalize_output(), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             if done:
-                return await self.agent_data.finalize_output(request), TerminateReason.FINISHED
+                return await self.agent_data.finalize_output(), TerminateReason.FINISHED
 
-        return await self.agent_data.finalize_output(request), TerminateReason.MAX_TURNS_EXCEEDED
+        return await self.agent_data.finalize_output(), TerminateReason.MAX_TURNS_EXCEEDED

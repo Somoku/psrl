@@ -7,6 +7,7 @@ import hydra
 import numpy as np
 import ray
 import torch
+import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
@@ -16,10 +17,6 @@ from verl.utils.device import auto_set_device, is_cuda_available
 
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.config import validate_config
-from psrl.utils.post_processor import (
-    load_buffer_post_processor,
-    load_group_post_processor,
-)
 from psrl.workers.gen_dplb.vllm_rollout import PSRL_ServerAdapter
 
 psrl_logger = logging.getLogger(__file__)
@@ -45,8 +42,18 @@ def seed_everything(seed: int):
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     auto_set_device(config)
+    
+    config.transfer_queue.enable = True
+
+    # validate config
+    validate_config(
+        config=config,
+        use_reference_policy=need_reference_policy(config),
+        use_critic=need_critic(config),
+    )
+
     # AGENT(VERL): Skip migrate legacy reward impl
-    run_ppo(config)
+    run_ppo(config, task_runner_class=TaskRunner)
 
 
 @ray.remote(num_gpus=1, num_cpus=0)
@@ -197,28 +204,20 @@ class TaskRunner:
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker (backend selected via config.actor.strategy)."""
-        from verl.single_controller.ray import RayWorkerGroup
-        from verl.workers.engine_workers import ActorRolloutRefWorker
-
         from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
-
-        # AGENT(VERL): skip legacy worker impl
-        actor_rollout_cls = ActorRolloutRefWorker
-        ray_worker_group_cls = RayWorkerGroup
 
         self.role_worker_mapping[PSRL_Role.Actor] = ray.remote(PSRL_TrainWorker)
         self.role_worker_mapping[PSRL_Role.Rollout] = ray.remote(PSRL_ServerAdapter)
         if config.psrl.colocate_validate_and_train:
             self.role_worker_mapping[PSRL_Role.Validate] = ray.remote(PSRL_ServerAdapter)
         self.mapping[PSRL_Role.Actor] = ["train_pool"]
-        return actor_rollout_cls, ray_worker_group_cls
 
     def add_critic_worker(self, config):
         """Add critic worker using the engine-based PSRL_TrainWorker."""
         from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
-
-        self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(PSRL_TrainWorker)
-        self.mapping[PSRL_Role.Critic] = ["train_pool"]
+        if need_critic(config):
+            self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(PSRL_TrainWorker)
+            self.mapping[PSRL_Role.Critic] = ["train_pool"]
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
@@ -392,7 +391,9 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
+        tq.init(config.transfer_queue)
+
+        self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
         # AGENT(VERL): PSRL use reward model worker.
@@ -403,51 +404,17 @@ class TaskRunner:
         # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
         self.add_dummy_worker(config)
 
-        # validate config
-        validate_config(
-            config=config,
-            use_reference_policy=need_reference_policy(config),
-            use_critic=need_critic(config),
-        )
-
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.train_actor_rollout_ref.model.path,
-            use_shm=config.train_actor_rollout_ref.model.get("use_shm", False),
-        )
-
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
-
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
         # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
-        from verl.utils.dataset.rl_dataset import collate_fn
-
         from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
-
-        # Load post-processor from configuration
-        group_post_process_fn = load_group_post_processor(config)
-        buffer_post_process_fn = load_buffer_post_processor(config)
 
         # Initialize the PPO trainer.
         trainer = PSRL_RayPPOTrainer(
             config=config,
-            tokenizer=tokenizer,
-            processor=processor,
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            collate_fn=collate_fn,
-            group_post_process_fn=group_post_process_fn,
-            buffer_post_process_fn=buffer_post_process_fn,
         )
         # Initialize the workers of the trainer.
         trainer.init_workers()

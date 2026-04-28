@@ -2,9 +2,11 @@ import enum
 import json
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 import numpy as np
 import ray
+import torch
 from omegaconf import DictConfig
 from verl import DataProto
 from verl.single_controller.base import Worker
@@ -227,6 +229,76 @@ def PSRL_compute_advantage(
         data.batch["returns"] = returns
     return data
 
+def compute_advantage_for_multi_trajectories(
+    data: DataProto,
+    batch_keys: list[str],
+    adv_estimator,
+    gamma: float = 1.0,
+    lam: float = 1.0,
+    num_repeat: int = 1,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Any = None,
+) -> DataProto:
+    """Compute GRPO advantages from each session's final output. For non-GRPO
+    estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
+
+    For GRPO, only the final output in each ``{uid}_{session_id}`` group participates
+    in advantage computation, and the result is broadcast to the other outputs in
+    the same session. Sessions whose AgentLoop returns ``None`` simply do not appear
+    in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
+    original ``compute_advantage()`` unchanged.
+    """
+    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+        return PSRL_compute_advantage(
+            data,
+            adv_estimator=adv_estimator,
+            gamma=gamma,
+            lam=lam,
+            num_repeat=num_repeat,
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
+        )
+
+    # final session of each agent loop: {uid}_{session_id} => (index, row_index)
+    final_sessions: dict[str, tuple[int, int]] = {}
+    row_session_keys = []
+    for i, key in enumerate(batch_keys):
+        fields = key.rsplit("_", 1)
+        assert len(fields) == 2, f"Unexpected key format: {key}"
+        uid, index = fields[0], int(fields[1])
+        session_key = uid
+        row_session_keys.append(session_key)
+        if session_key not in final_sessions or final_sessions[session_key][0] < index:
+            final_sessions[session_key] = (index, i)
+
+    # final session indices in batch data
+    final_indices = []
+    session_key_to_local_index = {}
+    for session_key, (_, row_index) in final_sessions.items():
+        final_indices.append(row_index)
+        session_key_to_local_index[session_key] = len(final_indices) - 1
+    row_to_local_index = [session_key_to_local_index[session_key] for session_key in row_session_keys]
+
+    # select final sessions from batch data for group relative advantage computation
+    final_data = PSRL_compute_advantage(
+        data.select_idxs(final_indices),
+        adv_estimator=adv_estimator,
+        gamma=gamma,
+        lam=lam,
+        num_repeat=num_repeat,
+        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        config=config,
+    )
+    first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
+    final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
+
+    # scatter final scores to all rows in batch data
+    scores = final_scores[row_to_local_index]
+    scores = scores.unsqueeze(-1) * data.batch["response_mask"]
+
+    data.batch["advantages"] = scores
+    data.batch["returns"] = scores
+    return data
 
 def _stats_to_timestamps(stats) -> dict | None:
     if stats is None:

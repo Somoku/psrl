@@ -11,7 +11,6 @@ import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from transformers import AutoConfig
 from tensordict import TensorDict
-from verl import DataProto
 from verl.single_controller.base.decorator import (
     Dispatch,
     make_nd_compute_dataproto_dispatch_fn,

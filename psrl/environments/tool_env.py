@@ -7,7 +7,6 @@ from typing import Any
 import ray
 from omegaconf import DictConfig
 from transformers import AutoProcessor, AutoTokenizer
-from verl import DataProto
 
 from psrl.environments.base import ConversationType, Environment, EnvStepOutput
 from psrl.tools.base import ToolGroup, ToolResponse, initialize_tools_from_config
@@ -126,14 +125,14 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         )
         return (images if images else None), (videos if videos else None)
 
-    async def reset(self, task: DataProto, **kwargs) -> tuple[ConversationType, dict]:
+    async def reset(self, task: dict, **kwargs) -> tuple[ConversationType, dict]:
         """Reset the environment to an initial state.
 
-        Extracts the initial task prompt from the input DataProto and prepares
+        Extracts the initial task prompt from the input dict and prepares
         the environment for a new episode.
 
         Args:
-            task: DataProto containing the initial task/prompt
+            task: dict containing the initial task/prompt
             **kwargs: Additional keyword arguments
 
         Returns:
@@ -149,11 +148,11 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         self.task = task
         assert len(task) == 1, "We only support single initial prompt in ToolEnvironment."
-        assert "raw_prompt" in task.non_tensor_batch, (
+        assert "raw_prompt" in task, (
             "For ReTool recipe, task must contain 'raw_prompt' in non_tensor_batch"
         )
-        initial_observation = task.non_tensor_batch["raw_prompt"].tolist()[0]
-        self.tools_kwargs = task.non_tensor_batch.get("tools_kwargs", [{}])[0]
+        initial_observation = task["raw_prompt"].tolist()[0]
+        self.tools_kwargs = task.get("tools_kwargs", [{}])[0]
         images, videos = await self.process_vision_info(initial_observation)
         if images is not None or videos is not None:
             info["multi_modal_data"] = {"images": images, "videos": videos}
@@ -352,7 +351,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             dict: Dictionary containing:
                 - num_turn: Current turn number
                 - max_turns: Maximum allowed turns
-                - task: Current task DataProto
+                - task: Current task dict
         """
         return {
             "num_turn": self.num_turn,

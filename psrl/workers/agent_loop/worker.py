@@ -3,23 +3,26 @@ import logging
 import os
 from collections import deque
 
+import torch
 import hydra
 import numpy as np
 import ray
-import torch
+import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
-from verl import DataProto
+from transfer_queue import KVBatchMeta
 from verl.trainer.distillation import is_distillation_enabled
+from verl.utils import tensordict_utils as tu
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import get_dataset_class
-from verl.utils.model import compute_position_id_with_mask
 from verl.workers.config.model import HFModelConfig
 
 from psrl.utils.common.http_utils import init_http_client
-from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -47,6 +50,10 @@ class PSRL_AgentLoopWorker:
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+
+        # TransferQueue bootstrap (connects to controller/storage spun up by the driver).
+        tq.init()
+
         self.distillation_config = config.get("distillation", None)
         self.distillation_enabled = is_distillation_enabled(self.distillation_config)
         if self.distillation_enabled:
@@ -121,18 +128,20 @@ class PSRL_AgentLoopWorker:
         """
         self.reward_manager = reward_manager
 
-    def add_agent_program(self, data: DataProto):
+    def add_agent_program(self, batch: KVBatchMeta | None):
         """Add a new agent program to the pending queue for processing.
 
         Args:
-            data (DataProto or None): Data to process, or None to signal termination.
+            batch (KVBatchMeta or None): Data to process, or None to signal termination.
         """
-        if isinstance(data, DataProto):
-            self.pending_program_queue.append(data)
-        elif data is None:
+        if batch is None:
             self.pending_program_queue.append(None)
+        elif isinstance(batch, KVBatchMeta):
+            self.pending_program_queue.append(batch)
         else:
-            raise TypeError(f"Unsupported data type: {type(data)}. Expected DataProto or None.")
+            raise TypeError(
+                f"Unsupported data type: {type(batch)}. Expected KVBatchMeta or None."
+            )
 
     def start_busy_loop(self):
         """Start the busy loop to continuously process agent programs from the queue."""
@@ -179,31 +188,34 @@ class PSRL_AgentLoopWorker:
 
         return task_done_callback
 
-    async def generate_trajectory(self, request: DataProto) -> DataProto:
+    async def generate_trajectory(self, batch: KVBatchMeta):
         """Generate trajectories using the specified agent type based on configuration.
 
         This method only create the task (agent_loop) and add the task to the agent_programs set.
         But the task is not await here so different agent_loop can be run in parallel.
 
         Args:
-            request (DataProto): Input request containing prompts and metadata.
-
-        Returns:
-            DataProto: Generated trajectories and associated data.
+            batch (KVBatchMeta): Input batch metadata containing prompts and metadata.
         """
         # by default, we assume it's a generation-only agent
         default_agent_name = "generate_only_agent"
-        assert len(request) == 1, "Only support single request for generation"
-        agent_name = request.non_tensor_batch.pop("agent_name", [default_agent_name])[0]
+        assert len(batch) == 1, "Only support single request for generation"
 
-        task = asyncio.create_task(self._run_agent_loop(agent_name, request))
+        fields = ["agent_name"]
+        data = await tq.async_kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        version_tag = [tag.get("version_tag", -1) for tag in batch.tags]
+        tu.assign_non_tensor_stack(data, "version_tag", version_tag)
+        await tq.async_kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("version_tag"))
+        agent_name = data.get("agent_name", [default_agent_name])[0]
+
+        task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
         self.agent_programs.add(task)
 
     async def _run_agent_loop(
         self,
         agent_name: str,
-        requests: DataProto,
+        batch: KVBatchMeta,
     ):
         """Execute the specified agent loop on the given requests.
 
@@ -212,21 +224,26 @@ class PSRL_AgentLoopWorker:
 
         Args:
             agent_name (str): Name of the agent loop to run.
-            requests (DataProto): Input requests to process.
+            batch (KVBatchMeta): Input batch metadata containing prompts and metadata.
         """
-        if "parent_id" in requests.non_tensor_batch:
-            prompt_index = requests.non_tensor_batch["parent_id"].tolist()[0]
-            request_index = requests.non_tensor_batch["uid"].tolist()[0]
+        assert len(batch) == 1, "Only support single request for generation"
+
+        fields = ["uid", "parent_id", "global_steps", "validate"]
+        data = await tq.async_kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        request_ids = tu.get(data, "uid")
+        if "parent_id" in data:
+            prompt_index = tu.get(data, "parent_id")[0]
+            request_index = tu.get(data, "uid")[0]
         else:
-            prompt_index = requests.non_tensor_batch["uid"].tolist()[0]
-            request_index = requests.non_tensor_batch["uid"].tolist()[0]
+            prompt_index = tu.get(data, "uid")[0]
+            request_index = tu.get(data, "uid")[0]
 
         with rollout_trace_attr(
             prompt_index=prompt_index,
             request_index=request_index,
-            step=requests.meta_info.get("global_steps", -1),
+            step=tu.get(data, "global_steps", default=-1),
             name=agent_name,
-            validate=requests.meta_info.get("validate", False),
+            validate=tu.get(data, "validate", default=False),
         ):
             assert agent_name in AGENT_LOOP_REGISTRY, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
@@ -246,7 +263,7 @@ class PSRL_AgentLoopWorker:
             )
 
             with log_dual_events(
-                f"Agent loop with requests {requests.non_tensor_batch['uid']}",
+                f"Agent loop with requests {tu.get(data, 'uid')}",
                 psrl_logger,
                 level=logging.DEBUG,
                 event_type=EventType.GEN,
@@ -257,7 +274,7 @@ class PSRL_AgentLoopWorker:
                         retry_attempt == retry_limit
                     ) and self.config.gen_actor_rollout_ref.rollout.agent.raise_on_error
                     output, terminate_reason = await agent_loop.run_with_termination_handling(
-                        requests, raise_on_error=raise_on_error
+                        batch, raise_on_error=raise_on_error
                     )
 
                     if terminate_reason not in (
@@ -271,7 +288,7 @@ class PSRL_AgentLoopWorker:
                     # Retry if applicable
                     if retry_attempt < retry_limit:
                         psrl_logger.warning(
-                            f"Agent loop for requests {requests.non_tensor_batch['uid']} "
+                            f"Agent loop for requests {tu.get(data, 'uid')} "
                             f"terminated with reason {terminate_reason.value} on "
                             f"attempt {retry_attempt}/{retry_limit}, retrying..."
                         )
@@ -285,22 +302,21 @@ class PSRL_AgentLoopWorker:
                     TerminateReason.ABORTED,
                 ):
                     psrl_logger.warning(
-                        f"Agent loop for requests {requests.non_tensor_batch['uid']} "
+                        f"Agent loop for requests {tu.get(data, 'uid')} "
                         f"terminated with reason {terminate_reason.value} "
                         f"after {retry_limit} attempts."
                     )
                     output = None
                 else:
                     psrl_logger.debug(
-                        f"Agent loop for requests {requests.non_tensor_batch['uid']} "
+                        f"Agent loop for requests {tu.get(data, 'uid')} "
                         f"terminated with reason {terminate_reason.value}."
                     )
 
-            # Put the output into the result queue
+            # Put the output into the TransferQueue and notify PSManager
+            # + AgentLoopManager via metadata-only RPCs.
             if output is not None:
-                assert isinstance(output, DataProto), f"Output must be a DataProto for now (got {type(output)})"
-                request_ids = requests.non_tensor_batch["uid"]
-                is_validate = requests.meta_info.get("validate", False)
+                is_validate = tu.get(data, "validate", default=False)
                 with log_dual_events(
                     "Update request status",
                     psrl_logger,
@@ -308,166 +324,130 @@ class PSRL_AgentLoopWorker:
                     event_type=EventType.OTHER,
                 ):
                     update_status_success = await self.ps_manager_handle.update_request_status.remote(
-                        request_ids.tolist(),
+                        request_ids,
                         PSRL_RequestStatus.COMPLETED,
                         is_validate=is_validate,
                     )
 
-                with log_dual_events(
-                    f"Put requests {request_ids} into result queue",
-                    psrl_logger,
-                    level=logging.DEBUG,
-                    event_type=EventType.OTHER,
-                ):
-                    if update_status_success:
-                        # NOTE(lhy): The DataProto will be huge and slow to transfer when putting into
-                        # the result queue, so we process the data inside the reward manager
-                        # output = self._post_process(output)
-                        await self.agent_loop_manager.put_result.remote(output)
+                if update_status_success:
+                    with log_dual_events(
+                        f"Put requests {request_ids} into TransferQueue",
+                        psrl_logger,
+                        level=logging.DEBUG,
+                        event_type=EventType.OTHER,
+                    ):
+                        await self.postprocess_output(output, batch)
             elif terminate_reason != TerminateReason.ABORTED:
                 # Generation failed (e.g. HTTP error, timeout) without PSManager being notified.
                 # The SMG already reserved a staleness-inventory entry for this request.
                 # Abort it now so the RESERVED entry is freed and the buffer can make progress.
-                request_ids = requests.non_tensor_batch["uid"]
                 psrl_logger.warning(
-                    f"Generation failed for requests {request_ids.tolist()} "
+                    f"Generation failed for requests {request_ids} "
                     f"(terminate_reason={terminate_reason.value}), aborting in PSManager."
                 )
-                try:
-                    await self.ps_manager_handle.abort_requests.remote(
-                        request_ids.tolist(),
-                    )
-                except Exception as e:  # noqa: BLE001
-                    psrl_logger.warning(
-                        f"Failed to abort requests {request_ids.tolist()} in PSManager: {e}"
-                    )
+                await self.ps_manager_handle.abort_requests.remote(request_ids)
 
-    # NOTE(lhy): This method is moved to the reward manager
-    def _post_process(self, inputs: DataProto) -> DataProto:
-        """Post-process the generated outputs to create properly formatted tensors.
+    async def postprocess_output(self, output: TokenOutput, batch: KVBatchMeta):
+        fields = []
+        prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+        responses = torch.tensor(output.response_ids, dtype=torch.int64)
+        input_ids = torch.cat([prompts, responses], dim=0)
+        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        position_ids = self._compute_position_ids(
+            input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+        ).squeeze(0)
+        
+        field = output.as_dict()
+        # do not store raw image/video
+        field.pop("multi_modal_data", None)
+        field["loss_mask"] = field["response_mask"]
+        field["input_ids"] = input_ids
+        field["position_ids"] = position_ids
+        field["multi_modal_inputs"] = multi_modal_inputs
+        prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+        field["seq_len"] = prompt_len + response_len
+        field["prompt_len"] = prompt_len
+        field["response_len"] = response_len
+        fields.append(field)
+        await tq.async_kv_batch_put(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            fields=list_of_dict_to_tensordict(fields),
+        )
+        
+        await self.agent_loop_manager.occupy_requests.remote(
+            request_id=batch.tags[0]["uid"],
+            prompt_id=batch.tags[0].get("parent_id", batch.tags[0]["uid"]),
+            rollout_instance_id=output.rollout_instance_id,
+            version_tag=batch.tags[0]["version_tag"],
+            is_validate=batch.partition_id == "val",
+        )
 
-        This method handles padding, attention masks, position IDs, and multi-modal inputs
-        to ensure compatibility with the training pipeline.
+    def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
+        """Compute multi-modal inputs with image and video."""
+        multi_modal_inputs = {}
+        if self.processor is None:
+            return multi_modal_inputs
+        if output.multi_modal_data is None:
+            return multi_modal_inputs
 
-        Args:
-            inputs (DataProto): Raw generation outputs.
-
-        Returns:
-            DataProto: Formatted data ready for training.
-        """
-        # NOTE: consistent with batch version of generate_sequences in vllm_rollout_spmd.py
-        # prompts: left pad
-        # responses: right pad
-        # input_ids: prompt + response
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-
-        # prompts
-        self.tokenizer.padding_side = "left"
-        if "raw_prompt_ids" not in inputs.non_tensor_batch:
-            batch_size = len(inputs)
-            raw_prompt_ids = np.array(
-                [
-                    _pre_process_inputs(self.tokenizer.pad_token_id, inputs.batch["input_ids"][i])
-                    for i in range(batch_size)
-                ],
-                dtype=object,
-            )
+        images = output.multi_modal_data.get("images")
+        videos = output.multi_modal_data.get("videos")
+        # split the videos and according metadatas
+        if videos is not None:
+            videos, video_metadatas = zip(*videos, strict=False)
+            videos, video_metadatas = list(videos), list(video_metadatas)
         else:
-            raw_prompt_ids = inputs.non_tensor_batch["raw_prompt_ids"]
-
-        prompt_output = self.tokenizer.pad(
-            [{"input_ids": raw_prompt_id} for raw_prompt_id in raw_prompt_ids],
-            padding="max_length",
-            max_length=self.config.gen_actor_rollout_ref.rollout.prompt_length,
+            video_metadatas = None
+        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        multi_modal_inputs = self.processor(
+            text=[current_text],
+            images=images,
+            videos=videos,
+            video_metadata=video_metadatas,
             return_tensors="pt",
-            return_attention_mask=True,
+            do_sample_frames=False,
         )
-        prompt_ids, prompt_attention_mask = (
-            prompt_output["input_ids"],
-            prompt_output["attention_mask"],
+        multi_modal_inputs.pop("input_ids", None)
+        multi_modal_inputs.pop("attention_mask", None)
+
+        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
+        # because np.array() only keeps the keys for BatchFeature.
+        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
+        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+        if image_grid_thw is not None:
+            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
+            multi_modal_inputs["images_seqlens"] = images_seqlens
+        return multi_modal_inputs
+
+    def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
+        """Compute position ids for multi-modal inputs."""
+        if self.processor is None:
+            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
+
+        multi_modal_kwargs = {
+            "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
+            "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
+        }
+        # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
+        if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
+            mm_token_type_ids = torch.zeros_like(input_ids)
+            mm_token_type_ids[0][input_ids[0] == self.processor.image_token_id] = 1
+            mm_token_type_ids[0][input_ids[0] == self.processor.video_token_id] = 2
+            multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
+
+        # Model's get_rope_index has been dynamically bind to the processor.
+        vision_position_ids, _ = self.processor.get_rope_index(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **multi_modal_kwargs,
         )
+        vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
 
-        # responses
-        raw_response_ids = inputs.non_tensor_batch.pop("raw_response_ids", None)
-        assert raw_response_ids is not None, "raw_response_ids must be provided in the input batch"
-        self.tokenizer.padding_side = "right"
-        outputs = self.tokenizer.pad(
-            [{"input_ids": raw_response_id} for raw_response_id in raw_response_ids],
-            padding="max_length",
-            max_length=self.config.gen_actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        response_ids, response_attention_mask = (
-            outputs["input_ids"],
-            outputs["attention_mask"],
-        )
-
-        # response_mask
-        response_masks = inputs.non_tensor_batch.pop("response_mask", None)
-        assert response_masks is not None, "response_masks must be provided in the input batch"
-        outputs = self.tokenizer.pad(
-            [{"input_ids": response_mask} for response_mask in response_masks],
-            padding="max_length",
-            max_length=self.config.gen_actor_rollout_ref.rollout.response_length,
-            return_tensors="pt",
-            return_attention_mask=False,
-        )
-        response_mask = outputs["input_ids"]
-
-        assert response_ids.shape == response_mask.shape, (
-            f"mismatch in response_ids and response_mask shape: {response_ids.shape} vs {response_mask.shape}"
-        )
-
-        response_mask = response_mask * response_attention_mask
-        attention_mask = torch.cat([prompt_attention_mask, response_attention_mask], dim=1)
-        input_ids = torch.cat([prompt_ids, response_ids], dim=1)
-        # Handle multi-modal inputs and position_ids calculation
-        # Only support Qwen2VLImageProcessor for multi-modal processing currently
-        # TODO(verl): support other multi-modal inputs
-        multi_modal_inputs = None
-        if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
-            from verl.models.transformers.qwen2_vl import get_rope_index
-
-            images = inputs.non_tensor_batch["multi_modal_data"].get("image", None)
-            current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-            multi_modal_inputs = self.processor(text=[current_text], images=images, return_tensors="pt")
-            multi_modal_inputs.pop("input_ids", None)
-            multi_modal_inputs.pop("attention_mask", None)
-
-            # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-            # because np.array() only keeps the keys for BatchFeature.
-            multi_modal_inputs = dict(multi_modal_inputs)
-
-            image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-            video_grid_thw = multi_modal_inputs.get("video_grid_thw")
-            second_per_grid_ts = multi_modal_inputs.get("second_per_grid_ts")
-
-            position_ids = get_rope_index(
-                self.processor,
-                input_ids=input_ids.squeeze(0),
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                attention_mask=attention_mask.squeeze(0),
-            ).unsqueeze(0)  # (1, 3, seq_len)
-        else:
-            position_ids = compute_position_id_with_mask(attention_mask)  # (1, seq_len)
-
-        batch = TensorDict(
-            {
-                "prompts": prompt_ids,  # [bsz, prompt_length]
-                "responses": response_ids,  # [bsz, response_length]
-                "response_mask": response_mask,  # [bsz, response_length]
-                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
-                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
-                "position_ids": position_ids,  # [bsz, prompt_length + response_length]
-            },
-            batch_size=len(input_ids),
-        )
-        non_tensor_batch = inputs.non_tensor_batch
-        if multi_modal_inputs is not None:
-            non_tensor_batch["multi_modal_inputs"] = multi_modal_inputs
-
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=inputs.meta_info)
+        valid_mask = attention_mask[0].bool()
+        text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+        text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+        text_position_ids = text_position_ids.unsqueeze(0)
+        position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+        return position_ids

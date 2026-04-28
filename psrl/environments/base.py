@@ -4,7 +4,6 @@ from typing import Any, Generic, SupportsFloat, TypedDict, TypeVar
 import ray
 from omegaconf import DictConfig
 from transformers import AutoProcessor, AutoTokenizer
-from verl import DataProto
 
 ConversationType = list[dict[str, str]]
 
@@ -78,14 +77,14 @@ class Environment(ABC, Generic[ObsType, ActType]):
         cls._class_initialized = True
 
     @abstractmethod
-    async def reset(self, task: DataProto, **kwargs) -> tuple[ObsType, dict]:
+    async def reset(self, task: dict, **kwargs) -> tuple[ObsType, dict]:
         """Resets the environment to an initial state and returns the initial observation.
 
         This method should initialize the environment for a new episode based on the
         given task, resetting any internal state and returning the first observation.
 
         Args:
-            task: DataProto containing the initial task/prompt
+            task: dict containing the initial task/prompt
             **kwargs: Additional keyword arguments
 
         Returns:

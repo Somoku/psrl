@@ -9,7 +9,10 @@ import numpy as np
 import ray
 import requests
 import torch
+import transfer_queue as tq
+from transfer_queue import KVBatchMeta
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tqdm import tqdm
 from verl import DataProto
@@ -24,6 +27,9 @@ from verl.trainer.ppo.metric_utils import (
     compute_timing_metrics,
     compute_variance_proxy_metrics,
 )
+from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+from verl.utils.fs import copy_to_local
+from verl.utils import hf_processor, hf_tokenizer
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, apply_kl_penalty, compute_response_mask
 from verl.trainer.ppo.utils import WorkerType
 from verl.utils import tensordict_utils as tu
@@ -39,8 +45,9 @@ from verl.utils.seqlen_balancing import (
 )
 from verl.utils.torch_dtypes import PrecisionType
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.debug.metrics import calculate_debug_metrics
 from verl.workers.config import DistillationConfig, EngineConfig
-from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+from verl.workers.utils.padding import response_from_nested, response_to_nested
 from verl.trainer.ppo.utils import (
     need_critic,
     need_reference_policy,
@@ -48,22 +55,23 @@ from verl.trainer.ppo.utils import (
 )
 
 from psrl.trainer.ppo.utils import (
-    PSRL_compute_advantage,
     PSRL_Role,
     ResourcePoolManager,
-    extract_gen_rm_token_num,
-    record_rollout_rm_metrics,
+    compute_advantage_for_multi_trajectories,
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
-from psrl.utils.dataset import DataProcessor, DatasetType
+from psrl.utils.dataset import DataProcessor
 from psrl.utils.elastic_rm.cluster_topology import ClusterTopology
 from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
-    log_data_protocol,
     log_dual_events,
+)
+from psrl.utils.post_processor import (
+    load_buffer_post_processor,
+    load_group_post_processor,
 )
 from psrl.utils.server.command import Command, CommandType
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
@@ -94,15 +102,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def __init__(
         self,
         config,
-        tokenizer,
         role_worker_mapping: dict[PSRL_Role, WorkerType],
         resource_pool_manager: ResourcePoolManager,
-        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
-        processor=None,
-        collate_fn=None,
-        group_post_process_fn=None,
-        buffer_post_process_fn=None,
-        device_name=None,
     ):
         """
         Initialize distributed PPO trainer with Ray backend.
@@ -110,21 +111,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         Args:
             config: Configuration object containing training parameters.
-            tokenizer: Tokenizer used for encoding and decoding text.
             role_worker_mapping (dict[PSRL_Role, WorkerType]): Mapping from roles to worker classes.
             resource_pool_manager (ResourcePoolManager): Manager for Ray resources.
-            ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
-            processor: Optional data processor, used for multimodal data.
-            reward_fn: Function to compute rewards for the training data.
-            val_reward_fn: Function to compute rewards for the validation data.
-            collate_fn: Optional function to collate data into batches.
-            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
         """
 
         # AGENT(VERL): PSRL use `config.train_actor_rollout_ref` instead of `config.actor_rollout_ref` in verl.
 
-        self.tokenizer = tokenizer
-        self.processor = processor
         self.config = config
 
         # AGENT(VERL): skip `hybrid_engine` in PSRL
@@ -137,8 +129,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # AGENT(VERL): skip `use_rm` in PSRL.
 
         self.use_critic = need_critic(self.config)
-        self.ray_worker_group_cls = ray_worker_group_cls  # NOTE(lhy): ray_worker_group_cls is used only in train side
-        self.device_name = device_name if device_name else self.config.trainer.device
+        self.device_name = self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -162,9 +153,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # ---- PSRL specific initialization ----
 
-        self.collate_fn = collate_fn
-        self.group_post_process_fn = group_post_process_fn
-        self.buffer_post_process_fn = buffer_post_process_fn
+        # Load post-processor from configuration
+        self.group_post_process_fn = load_group_post_processor(config)
+        self.buffer_post_process_fn = load_buffer_post_processor(config)
 
         # CPU workers for Streaming Rollout
         self.data_processor = None
@@ -252,12 +243,26 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # so that the total_training_steps can be obtained and the optimizer config
         # (related to weight decay, lr schedule, etc.) can be set
         # otherwise, it will cause error when running Megatron backend
+        self._init_tokenizer()
         self._init_data_processor()
 
         # Build logger
         self.log_prefix = "MainRayTrainer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info("Initialized major ray trainer (single controller).")
+
+    def _init_tokenizer(self):
+        # Download the checkpoint from HDFS to the local machine.
+        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
+        local_path = copy_to_local(
+            self.config.train_actor_rollout_ref.model.path,
+            use_shm=self.config.train_actor_rollout_ref.model.get("use_shm", False),
+        )
+
+        trust_remote_code = self.config.data.get("trust_remote_code", False)
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # Used for multimodal LLM, could be None
+        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
     def _initialize_queue_buffers(self):
         if self.config.psrl.redundant_rollout.enable:
@@ -327,7 +332,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # Initialize the data processor
         self.data_processor = DataProcessor.remote(
-            self.config, self.tokenizer, self.processor, self.ps_manager_handle, collate_fn=self.collate_fn
+            self.config, self.tokenizer, self.processor, self.ps_manager_handle
         )
 
         # Get total training steps from the data processor where dataloaders are built
@@ -711,16 +716,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Reward manager is not initialized, skipping stop operation.")
 
-    def _log_rollout_data(
-        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
-    ):
-        """Log rollout data to disk.
-        Args:
-            batch (DataProto): The batch containing rollout data
-            reward_extra_infos_dict (dict): Additional reward information to log
-            timing_raw (dict): Timing information for profiling
-            rollout_data_dir (str): Directory path to save the rollout data
-        """
+    def _log_rollout_data(self, batch: KVBatchMeta, timing_raw: dict, rollout_data_dir: str):
+        """Fetch rollout data from TransferQueue and dump sorted by uid."""
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             # AGENT(VERL): add PSRL specific `log_dual_events` here.
             with log_dual_events(
@@ -728,26 +725,33 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 psrl_logger,
                 event_type=EventType.OTHER,
             ):
-                inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                sample_gts = [
-                    item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch
-                ]
+                fields = ["uid", "prompts", "responses", "rm_scores", "reward_model", "reward_extra_info"]
+                data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+                data["prompts"] = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+                data["responses"] = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
 
-                reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-                if "request_id" in batch.non_tensor_batch:
-                    reward_extra_infos_dict.setdefault(
-                        "request_id",
-                        batch.non_tensor_batch["request_id"].tolist(),
-                    )
+                inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
+                outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
+                scores = data["rm_scores"].sum(-1).cpu().tolist()
+            
+                reward_model = data.pop("reward_model", None)
+                if reward_model is not None:
+                    gts = [item.get("ground_truth", None) for item in reward_model.tolist()]
+                else:
+                    gts = [None] * len(data)
+                
+                # extract reward infos
+                reward_extra_infos_dict = {
+                    "reward_extra_info": data["reward_extra_info"],
+                    "uid": [int(key) for key in batch.keys],
+                }
 
                 self._dump_generations(
                     inputs=inputs,
                     outputs=outputs,
-                    gts=sample_gts,
+                    gts=gts,
                     scores=scores,
-                    reward_extra_infos_dict=reward_extra_infos_to_dump,
+                    reward_extra_infos_dict=reward_extra_infos_dict,
                     dump_path=rollout_data_dir,
                 )
 
@@ -760,7 +764,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         with log_dual_events("Switch to rollout mode", psrl_logger, event_type=EventType.SWITCH):
             self.switch_to_rollout_mode()
 
-        data_source_lst = []
+        data_sources = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
         # Lists to collect samples for the table
@@ -777,102 +781,85 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         val_batch_num = ray.get(self.data_processor.get_val_batch_num.remote())
         assert self.reward_manager is not None, "Reward manager must be initialized before validation."
 
-        for i in range(val_batch_num):
-            test_data = ray.get(self.data_processor.get_single_controller_batch.remote(DatasetType.val))
-            test_batch = DataProto.from_single_dict(test_data)
-            batch_size = len(test_batch.batch)
+        for _ in range(val_batch_num):
+            # 1. Load prompts and stage them into TQ. Only KVBatchMeta + batch_size cross Ray.
+            test_batch: KVBatchMeta = ray.get(
+                self.data_processor.get_single_controller_batch.remote(DatasetType.val)
+            )
+            batch_size = len(test_batch) // val_rollout_n
 
             # AGENT(VERL): PSRL set the capacity of staleness inventory and val buffer per batch,
             # using the current batch size rather than the total across all validation datasets.
             # This ensures that each validation buffer completes when its own dataset is done,
             # instead of waiting for entries from all datasets combined (which would hang).
-            futures = []
-            futures.append(self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(batch_size))
-            futures.append(self.agent_loop_manager.set_val_buffer_size.remote(batch_size))
-            ray.get(futures)
+            ray.get(
+                [
+                    self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(batch_size),
+                    self.agent_loop_manager.set_val_buffer_size.remote(batch_size),
+                ]
+            )
 
-            sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
-            test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=val_rollout_n, interleave=True)
-
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
-            test_gen_batch = self._get_gen_batch(test_batch)
-            # AGENT(VERL): PSRL add `uid` for each sample to distinguish different samples.
-            if val_rollout_n > 1:
-                uid_list = []
-                for i in range(batch_size):
-                    for j in range(val_rollout_n):
-                        child_id = sample_ids[i] * val_rollout_n + j
-                        uid_list.append(child_id)
-                test_gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": self.config.train_actor_rollout_ref.rollout.val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-            psrl_logger.info(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
+            # 2. Dispatch to rollout workers.
             # AGENT(VERL): PSRL use its own generate function for validation.
-            val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_gen_batch))
+            val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_batch))
             psrl_logger.info(f"Wait for validate buffer id {val_buffer_id}")
             with log_dual_events(f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT):
-                test_output_gen_batch = ray.get(
+                test_batch: KVBatchMeta = ray.get(
                     self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
                 )
 
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
-            test_batch.meta_info["global_steps"] = self.global_steps
+            # 3. Score the batch via TQ-native compute_score_for_validation.
+            ray.get(self.reward_manager.wait_for_reward_of_requests.remote(test_batch))
+            fields = [
+                "uid",
+                "parent_id",
+                "prompts",
+                "responses",
+                "rm_scores",
+                "reward_extra_info",
+                "num_turns",
+                "reward_model",
+                "data_source",
+            ]
+            data = tq.kv_batch_get(keys=test_batch.keys, partition_id=test_batch.partition_id, select_fields=fields)
 
-            # evaluate using reward_function
-            request_id_to_reward = ray.get(self.reward_manager.compute_score_for_validation.remote(test_batch))
-            request_ids = test_batch.non_tensor_batch["uid"].tolist()
-            scores = []
-            reward_extra_infos_dict_list = []
-            acc_list = []
-            for request_id in request_ids:
-                reward_score = request_id_to_reward[request_id]["reward_score"]
+            scores = data["rm_scores"].sum(dim=1).tolist()
+            sample_scores.extend(scores)
+            reward_extra_infos_dict["reward"].extend(scores)
+            reward_extra_infos = tu.get(data, "reward_extra_info", [{}] * len(test_batch))
+            for reward_extra_info in reward_extra_infos:
                 # reward_extra_info is now {loop_key: per_loop_info_dict, ...}.
                 # Merge all per-loop dicts into a single flat dict so downstream
                 # code can access keys like "acc" regardless of which loop produced them.
-                per_loop_infos = request_id_to_reward[request_id].get("reward_extra_info", {})
                 extra_info = {}
-                for per_loop_info in per_loop_infos.values():
+                for per_loop_info in reward_extra_info.values():
                     extra_info.update(per_loop_info)
                 acc = extra_info.get("acc", 0.0)
-                scores.append(reward_score)
-                reward_extra_infos_dict_list.append(extra_info)
-                acc_list.append(acc)
-            sample_scores.extend(scores)
-            reward_extra_infos_dict["reward"].extend(scores)
-            reward_extra_infos_dict["reward_extra_info"].extend(reward_extra_infos_dict_list)
-            reward_extra_infos_dict["acc"].extend(acc_list)
+                reward_extra_infos_dict["reward_extra_info"].append(extra_info)
+                reward_extra_infos_dict["acc"].append(acc)
 
             # Store generated outputs
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
             sample_outputs.extend(output_texts)
 
             # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO(verl): Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
             sample_inputs.extend(input_texts)
-            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
 
-            # collect num_turns of each prompt
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+            sample_parent_ids.extend(tu.get(data, "parent_id" if val_rollout_n > 1 else "uid"))
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * len(request_ids)))
+            ground_truths = [
+                item.get("ground_truth", None)
+                for item in (tu.get(data, "reward_model") or [{}] * len(test_batch))
+            ]
+            sample_gts.extend(ground_truths)
+            sample_turns.extend(data.pop("num_turns").tolist())
+
+            data_source = tu.get(data, "data_source") or ["unknown"] * len(test_batch)
+            data_sources.extend(data_source)
+
+            # 5. Release TQ storage for this val batch.
+            tq.kv_clear(keys=test_batch.keys, partition_id=test_batch.partition_id)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -894,12 +881,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if merged:
             print("_merge_validation_results validate result will be merged")
             return {
-                "data_sources": data_source_lst,
+                "data_sources": data_sources,
                 "sample_parent_ids": sample_parent_ids,
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
-        data_sources = np.concatenate(data_source_lst, axis=0)
 
         with log_dual_events("Switch to trainer mode", psrl_logger, event_type=EventType.SWITCH):
             self.switch_to_trainer_mode()
@@ -1288,11 +1274,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # to create a fused worker group and low-level APIs can also be used
             if len(class_dict) == 1:
                 role = next(iter(class_dict.keys()))
-                ray_worker_group_cls = (
-                    RayWorkerGroup if "rollout" in role or "validate" in role else self.ray_worker_group_cls
-                )
                 return {
-                    role: ray_worker_group_cls(
+                    role: RayWorkerGroup(
                         resource_pool=resource_pool,
                         ray_cls_with_init=class_dict[role],
                         **wg_kwargs,
@@ -1301,7 +1284,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # colocate
             else:
                 worker_dict_cls = create_colocated_worker_cls_fused(class_dict=class_dict)
-                wg_dict = self.ray_worker_group_cls(
+                wg_dict = RayWorkerGroup(
                     resource_pool=resource_pool,
                     ray_cls_with_init=worker_dict_cls,
                     **wg_kwargs,
@@ -2109,11 +2092,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
-        attention_mask = batch.batch["attention_mask"]
-        batch_size = attention_mask.shape[0]
-        global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1)  # (train_batch_size,) tensor
+        batch_size = len(batch)
+        fields = ["seq_len"]
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        global_seqlen_lst = torch.tensor(tu.get(data, "seq_len"), dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
         workload_lst_list = workload_lst.tolist()  # list version for partitioning functions
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
@@ -2123,10 +2107,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
         # AGENT(VERL): PSRL use `parent_id` to group samples from the same episode,
         # while VERL use `uid` for the same purpose.
-        if getattr(self, "use_prefix_grouper", False) and "parent_id" in batch.non_tensor_batch:
+        if getattr(self, "use_prefix_grouper", False) and "parent_id" in batch.tags[0]:
             from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
-            uid_list = list(batch.non_tensor_batch["parent_id"])
+            uid_list = [tag["parent_id"] for tag in batch.tags]
             seqlen_list = global_seqlen_lst.tolist()
 
             # Count number of uid groups
@@ -2178,226 +2162,311 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
         metrics.update(global_balance_stats)
 
-    def _compute_values(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
-        tu.assign_non_tensor(batch_td, compute_loss=False)
-        output = self.critic_wg.infer_batch(batch_td)
-        output = output.get()
-        values = tu.get(output, "values")
-        values = no_padding_2_padding(values, batch_td)
-        values = tu.get_tensordict({"values": values.float()})
-        values = DataProto.from_tensordict(values)
-        return values
+    def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Compute the values of the batch."""
+        # 1. compute value
+        output = self.critic_wg.infer_batch(batch)
+        assert len(output) == len(batch)
+        
+        # 2. write value back to TransferQueue
+        t_start = time.time()
+        data = tq.kv_batch_get(
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
+        )
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_values time to get data: {t_end - t_start:.2f}")
+        data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
+        t_start = time.time()
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_values time to put data: {t_end - t_start:.2f}")
 
-    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
-        # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
+        return batch
+
+    def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Compute the advantage of the batch."""
+        fields = ["uid", "parent_id", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        t_start = time.time()
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        response_mask = data["response_mask"]
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_advantage time to get data: {t_end - t_start:.2f}")
+
+        # Extract non-tensor uid/parent_id BEFORE calling to_padded_tensor() to avoid
+        # dtype conversion issues (they are stored as NonTensorData/NonTensorStack in TQ).
+        uids = tu.get_non_tensor_data(data, "uid")
+        parent_ids = tu.get_non_tensor_data(data, "parent_id")
+        # Remove non-tensor fields so to_padded_tensor() only processes tensor fields.
+        tensor_fields = ["response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        data_tensor_only = data.select(*[f for f in tensor_fields if f in data.keys()])
+        data = DataProto(batch=data_tensor_only.to_padded_tensor())
+        data.batch["token_level_scores"] = data.batch["rm_scores"]
+        data.non_tensor_batch["uid"] = np.array(uids, dtype=object)
+        data.non_tensor_batch["parent_id"] = np.array(parent_ids, dtype=object)
+
+        # 1. apply kl penalty to rewards
+        if self.config.algorithm.use_kl_in_reward:
+            data, kl_metrics = apply_kl_penalty(
+                data,
+                kl_ctrl=self.kl_ctrl_in_reward,
+                kl_penalty=self.config.algorithm.kl_penalty,
+            )
+            metrics.update(kl_metrics)
+        else:
+            data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+
+        # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
+        # Only runs in decoupled mode (computes once per batch using stable π_old)
+        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        rollout_correction = (
+            rollout_corr_config is not None
+            and "rollout_log_probs" in data.batch
+            and not bypass_recomputing_logprobs
+        )
+        if rollout_correction:
+            data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
+            metrics.update(is_metrics)
+
+        # 3. compute advantages
+        data = compute_advantage_for_multi_trajectories(
+            data,
+            batch_keys=batch.keys,
+            adv_estimator=self.config.algorithm.adv_estimator,
+            gamma=self.config.algorithm.gamma,
+            lam=self.config.algorithm.lam,
+            num_repeat=self.config.gen_actor_rollout_ref.rollout.n,
+            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+            config=self.config.algorithm,
+        )
+
+        # 4. write nested advantages and returns back to TransferQueue
+        fields = ["advantages", "returns"]
+        if self.config.algorithm.use_kl_in_reward:
+            fields.append("token_level_rewards")
+        if rollout_correction:
+            fields.append("response_mask")
+            if "rollout_is_weights" in data.batch:
+                fields.append("rollout_is_weights")
+
+        output = {}
+        for field in fields:
+            output[field] = response_to_nested(data.batch[field], response_mask)
+        output = TensorDict(output, batch_size=len(batch))
+        t_start = time.time()
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_advantage time to put data: {t_end - t_start:.2f}")
+
+        return batch
+
+    def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Compute the reference log prob of the batch."""
+        # 1. compute log probs
         metadata = {"calculate_entropy": False, "compute_loss": False}
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
-        tu.assign_non_tensor(batch_td, **metadata)
+        batch.extra_info.update(metadata)
         if self.ref_in_actor:
-            output = self.actor_wg.compute_log_prob(batch_td)
+            output = self.actor_wg.compute_log_prob(batch)
         else:
-            output = self.ref_policy_wg.compute_ref_log_prob(batch_td)
-        # gather output
-        log_probs = tu.get(output, "log_probs")
-        # step 4. No padding to padding
-        log_probs = no_padding_2_padding(log_probs, batch_td)
-        # step 5: rebuild a tensordict and convert to dataproto
-        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
-        ref_log_prob = DataProto.from_tensordict(ref_log_prob)
-        return ref_log_prob
+            output = self.ref_policy_wg.compute_ref_log_prob(batch)
+        assert len(output) == len(batch)
 
-    def _compute_old_log_prob(self, batch: DataProto):
-        # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-        # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
-        tu.assign_non_tensor(batch_td, calculate_entropy=True, compute_loss=False)
-        output = self.actor_wg.compute_log_prob(batch_td)
-        # gather output
-        entropy = tu.get(output, "entropy")
-        log_probs = tu.get(output, "log_probs")
-        routed_experts = tu.get(output, "routed_experts")
+        # 2. write ref_log_prob and entropy back to TransferQueue
+        t_start = time.time()
+        data = tq.kv_batch_get(
+            keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
+        )
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_ref_log_prob time to get data: {t_end - t_start:.2f}")
+        data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+        t_start = time.time()
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_ref_log_prob time to put data: {t_end - t_start:.2f}")
+        
+        return batch
 
-        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-        # step 4. No padding to padding
-        entropy = no_padding_2_padding(entropy, batch_td)
-        log_probs = no_padding_2_padding(log_probs, batch_td)
-        # step 5: rebuild a tensordict and convert to dataproto
-        if routed_experts is not None:
-            old_log_prob = tu.get_tensordict(
-                {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
+    def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Compute the old log prob of the batch."""
+        # Operating Mode Selection:
+        # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+        # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+        #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+            data = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["rollout_log_probs"]
             )
-        else:
-            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
-        old_log_prob = DataProto.from_tensordict(old_log_prob)
-        return old_log_prob, old_log_prob_mfu
+            data["old_log_probs"] = data.pop("rollout_log_probs")
+            tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
+            
+            policy_loss_config = self.config.train_actor_rollout_ref.actor.policy_loss
+            with open_dict(policy_loss_config):
+                # Pass rollout_correction config to actor for loss computation and metrics
+                policy_loss_config["rollout_correction"] = rollout_corr_config
+                # Always use bypass_mode loss function which handles both loss_types
+                policy_loss_config["loss_mode"] = "bypass_mode"
+            return batch
 
-    def _update_actor(self, batch: DataProto) -> DataProto:
-        rollout_config = self.config.gen_actor_rollout_ref.rollout
-        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        # TODO: Make "temperature" single source of truth from generation.
-        batch.meta_info["temperature"] = rollout_config.temperature
-        # update actor
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to no-padding
-        batch_td = left_right_2_no_padding(batch_td)
+        # 1. compute log probs
+        # add meta info
+        batch.extra_info.update({"calculate_entropy": True, "compute_loss": False})
+        output: KVBatchMeta = self.actor_wg.compute_log_prob(batch)
+        assert len(output) == len(batch)
+
+        fields = ["entropy", "log_probs", "response_mask", "responses", "rollout_log_probs", "metrics"]
+        t_start = time.time()
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_old_log_prob time to get data: {t_end - t_start:.2f}")
+
+        # 2. write old_log_probs and entropy back to TransferQueue
+        data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        # old_log_prob_mfu = tu.get(data, "metrics")["mfu"]
+        t_start = time.time()
+        tq.kv_batch_put(
+            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
+        )
+        t_end = time.time()
+        psrl_logger.debug(f"_compute_old_log_prob time to put data: {t_end - t_start:.2f}")
+
+        data = DataProto(batch=data.to_padded_tensor())
+
+        # 3. calculate actor entroy metrics
+        actor_config = self.config.train_actor_rollout_ref.actor
+        entropy_agg = agg_loss(
+            loss_mat=data.batch["entropy"],
+            loss_mask=data.batch["response_mask"],
+            loss_agg_mode=actor_config.loss_agg_mode,
+            loss_scale_factor=actor_config.loss_scale_factor,
+        )
+        old_log_prob_metrics = {
+            "actor/entropy": entropy_agg.detach().item(),
+            # "perf/mfu/actor_infer": old_log_prob_mfu, # TODO(linsh): no global_token_num for mfu
+        }
+        metrics.update(old_log_prob_metrics)
+
+        # 4. calculate rollout vs actor logprobs diff
+        if "rollout_log_probs" in data.batch:
+            metrics.update(calculate_debug_metrics(data))
+
+        return batch
+
+    def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Update the actor network."""
+        ppo_mini_batch_size = self.config.train_actor_rollout_ref.actor.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
         calculate_entropy = self.config.train_actor_rollout_ref.actor.entropy_coeff != 0.0
-        distillation_use_topk = (
+        distillation_use_topk =(
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
-        ppo_mini_batch_size = self.config.train_actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
-        ppo_epochs = self.config.train_actor_rollout_ref.actor.ppo_epochs
-        seed = self.config.train_actor_rollout_ref.actor.data_loader_seed
-        shuffle = self.config.train_actor_rollout_ref.actor.shuffle
-        tu.assign_non_tensor(
-            batch_td,
-            calculate_entropy=calculate_entropy,
-            distillation_use_topk=distillation_use_topk,
-            global_batch_size=ppo_mini_batch_size,
-            mini_batch_size=ppo_mini_batch_size,
-            epochs=ppo_epochs,
-            seed=seed,
-            dataloader_kwargs={"shuffle": shuffle},
-            compute_loss=True,
-        )
-        actor_output = self.actor_wg.update_actor(batch_td)
-        actor_output = tu.get(actor_output, "metrics")
-        actor_output = rename_dict(actor_output, "actor/")
-        # modify key name
-        actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
-        actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
+        extra_info = {
+            "calculate_entropy": calculate_entropy,
+            "global_batch_size": ppo_mini_batch_size,
+            "mini_batch_size": ppo_mini_batch_size,
+            "epochs": self.config.train_actor_rollout_ref.actor.ppo_epochs,
+            "seed": self.config.train_actor_rollout_ref.actor.data_loader_seed,
+            "dataloader_kwargs": {"shuffle": self.config.train_actor_rollout_ref.actor.shuffle},
+            "shuffle": self.config.train_actor_rollout_ref.actor.shuffle,
+            "multi_turn": self.config.gen_actor_rollout_ref.rollout.multi_turn.enable,
+            "distillation_use_topk": distillation_use_topk,
+            "compute_loss": True,
+        }
+        batch.extra_info.update(extra_info)
 
-        return actor_output
+        output: TensorDict = self.actor_wg.update_actor(batch)
+        output = rename_dict(output["metrics"], "actor/")
+        output["perf/mfu/actor"] = output.pop("actor/mfu")
+        actor_metrics = reduce_metrics(output)
+        metrics.update(actor_metrics)
 
-    def _update_critic(self, batch: DataProto) -> DataProto:
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to no-padding
-        batch_td = left_right_2_no_padding(batch_td)
+        return batch
+
+    def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Update the critic network."""
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
-        ppo_epochs = self.config.critic.ppo_epochs
-        seed = self.config.critic.data_loader_seed
-        shuffle = self.config.critic.shuffle
-        tu.assign_non_tensor(
-            batch_td,
-            global_batch_size=ppo_mini_batch_size,
-            mini_batch_size=ppo_mini_batch_size,
-            epochs=ppo_epochs,
-            seed=seed,
-            dataloader_kwargs={"shuffle": shuffle},
-        )
+        extra_info = {
+            "global_batch_size": ppo_mini_batch_size,
+            "mini_batch_size": ppo_mini_batch_size,
+            "epochs": self.config.critic.ppo_epochs,
+            "seed": self.config.critic.data_loader_seed,
+            "dataloader_kwargs": {"shuffle": self.config.critic.shuffle},
+        }
+        batch.extra_info.update(extra_info)
 
-        output = self.critic_wg.train_mini_batch(batch_td)
-        output = output.get()
-        output = tu.get(output, "metrics")
-        output = rename_dict(output, "critic/")
-        # modify key name
+        output = self.critic_wg.train_mini_batch(batch)
+        output: TensorDict = output.get()
+        output = rename_dict(output["metrics"], "critic/")
         output["perf/mfu/critic"] = output.pop("critic/mfu")
-        critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
-        return critic_output
+        critic_metrics = reduce_metrics(output) # 从 DataProto.from_single_dict 替换为 reduce_metrics
+        metrics.update(critic_metrics)
 
-    def _process_reward_results(
-        self,
-        batch: DataProto,
-        request_id_to_reward: dict[int, dict],
-        request_ids: list[int],
-    ) -> tuple[torch.Tensor, dict]:
-        """Convert a per-request reward dict into tensors and update *batch* in-place.
+        return batch
 
-        Both the async path (results fetched from ``reward_manager``) and the sync
-        path (results rebuilt from ``non_tensor_batch``) produce a
-        ``request_id_to_reward`` mapping with the same schema::
+    def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps):
+        # 1. collect necessary fields from TransferQueue for computing metrics
+        fields = [
+            "prompts",
+            "responses",
+            "response_mask",
+            "values",
+            "advantages",
+            "returns",
+            "rm_scores",
+            "token_level_rewards",
+            "num_turns",
+        ]
+        # GDPO per-component reward metrics
+        gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
+        if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+            fields.extend(gdpo_reward_keys)
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        prompt_length = data["prompts"].offsets().diff()
+        response_length = data["responses"].offsets().diff()
+        global_token_num = (prompt_length + response_length).tolist()
+        data = data.to_padded_tensor()
+        data["token_level_scores"] = data["rm_scores"]
+        if "token_level_rewards" not in data:
+            data["token_level_rewards"] = data["rm_scores"]
+        data["prompt_length"] = prompt_length.float()
+        data["response_length"] = response_length.float()
+        batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
 
+        # 2. compute metrics
+        metrics.update({"training/global_step": global_steps})
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+        n_gpus = self.resource_pool_manager.get_n_gpus()
+        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+        gradient_norm = metrics.get("actor/grad_norm", None)
+        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+
+        # 3. other auxiliary metrics
+        num_turns = np.array(data.pop("num_turns").tolist())
+        metrics.update(
             {
-                request_id: {
-                    "reward_score": float,
-                    "reward_extra_info": {
-                        "data_source": str,           # always present
-                        "original_reward_score": float,  # present when normalization is on
-                        <loop_key>: <per-loop info>,  # nested loop-specific fields
-                        ...
-                    },
-                    "reward_metrics": {...},
-                }
+                "training/num_turns/mean": num_turns.mean(),
+                "training/num_turns/max": num_turns.max(),
+                "training/num_turns/min": num_turns.min(),
             }
-
-        This method:
-        1. Builds ``reward_tensor`` (shape ``[bsz, response_length]``) with the
-           scalar reward placed at the last valid token position.
-        2. Flattens the ``reward_extra_info`` dicts across samples:
-           - Scalar top-level fields (``data_source``, ``original_reward_score``)
-             are collected into plain numpy arrays.
-           - Nested loop-key fields are kept as object arrays (one dict per sample).
-           - A ``reward_extra_info`` key containing the full per-sample dict is also kept.
-        3. Updates ``batch.non_tensor_batch`` with all flattened fields.
-        4. Accumulates generative-RM token counts into ``batch.meta_info["global_token_num"]``.
-
-        Returns:
-            ``(reward_tensor, reward_extra_infos_dict)`` where ``reward_tensor`` is the
-            ``[bsz, response_length]`` float tensor and ``reward_extra_infos_dict`` is the
-            flattened ``defaultdict(list)`` that has already been written to
-            ``batch.non_tensor_batch``.
-        """
-        scores: list[float] = []
-        reward_extra_infos_dict_list: list[dict] = []
-        rm_generated_token_nums: list[int] = []
-
-        for request_id in request_ids:
-            result = request_id_to_reward[request_id]
-            scores.append(result["reward_score"])
-            extra_info = result.get("reward_extra_info", {})
-            reward_extra_infos_dict_list.append(extra_info)
-            rm_generated_token_nums.append(extract_gen_rm_token_num(extra_info))
-
-        # Build sparse reward tensor: place scalar score at the last valid token position.
-        prompt_length = batch.batch["prompts"].size(1)
-        response_length = batch.batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
-        reward_tensor = torch.zeros_like(batch.batch["response_mask"], dtype=torch.float32)
-        reward_tensor[
-            torch.arange(reward_tensor.size(0)),
-            response_length,
-        ] = torch.tensor(scores, dtype=torch.float32)
-
-        # Flatten extra_info across samples.  Every key gets one entry per sample:
-        # - scalar top-level fields (data_source, original_reward_score) become 1-D arrays;
-        # - nested loop-key dicts become object arrays (one dict per sample).
-        # Both are handled identically by .append(); the distinction is purely semantic.
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-        for extra_info in reward_extra_infos_dict_list:
-            reward_extra_infos_dict["reward_extra_info"].append(extra_info)
-            for key, value in extra_info.items():
-                reward_extra_infos_dict[key].append(value)
-        batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
-        # Accumulate generative-RM generated tokens into the global token budget.
-        global_token_num = batch.meta_info.get("global_token_num")
-        if isinstance(global_token_num, list) and len(global_token_num) == len(rm_generated_token_nums):
-            batch.meta_info["global_token_num"] = [
-                int(t) + int(r) for t, r in zip(global_token_num, rm_generated_token_nums)
-            ]
-        else:
-            psrl_logger.warning(
-                "Skip merging reward model token count to global_token_num due to shape mismatch: "
-                "global_token_num=%s rm_generated_token_nums=%s",
-                type(global_token_num),
-                len(rm_generated_token_nums),
-            )
-
-        return reward_tensor, reward_extra_infos_dict
+        )
+        
+        # 4. GDPO per-component reward metrics
+        if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
+            for key in gdpo_reward_keys:
+                vals = np.array(data.pop(key).tolist(), dtype=np.float32)
+                metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
+                metrics[f"gdpo/{key}/std"] = float(np.std(vals))
+                metrics[f"gdpo/{key}/max"] = float(np.max(vals))
+                metrics[f"gdpo/{key}/min"] = float(np.min(vals))
 
     def fit(self):
         """
@@ -2534,50 +2603,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             psrl_logger,
                             event_type=EventType.WAIT,
                         ):
-                            batch = ray.get(self.agent_loop_manager.wait_for_training_batch.remote(buffer_id))
+                            batch: KVBatchMeta = ray.get(self.agent_loop_manager.wait_for_training_batch.remote(buffer_id))
                         with log_dual_events("Switch to trainer mode", psrl_logger, event_type=EventType.SWITCH):
                             self.switch_to_trainer_mode()
                     else:
-                        # NOTE(linsh): this code snippet is not actively maintained.
-                        from verl.trainer.ppo.reward import compute_reward
-
-                        batch = ray.get(self.agent_loop_manager.get_data.remote())
-                        if batch is None:
-                            psrl_logger.info(
-                                "No more data from agent loop manager, ending training at step %d",
-                                self.global_steps,
-                            )
-                            break
-                        batch_keys_to_pop = [
-                            "input_ids",
-                            "attention_mask",
-                            "position_ids",
-                        ]
-                        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                        if "multi_modal_data" in batch.non_tensor_batch:
-                            non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                        if "raw_prompt" in batch.non_tensor_batch:
-                            non_tensor_batch_keys_to_pop.append("raw_prompt")
-                        if "tools_kwargs" in batch.non_tensor_batch:
-                            non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                        if "interaction_kwargs" in batch.non_tensor_batch:
-                            non_tensor_batch_keys_to_pop.append("interaction_kwargs")
-                        if "index" in batch.non_tensor_batch:
-                            non_tensor_batch_keys_to_pop.append("index")
-                        if "agent_name" in batch.non_tensor_batch:
-                            non_tensor_batch_keys_to_pop.append("agent_name")
-                        gen_batch = batch.pop(
-                            batch_keys=batch_keys_to_pop,
-                            non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                        # NOTE(linsh): this code snippet is not actively maintained and is
+                        # incompatible with the TransferQueue-based data flow.  The colocate
+                        # path still expects a DataProto (`.pop(batch_keys=...)`, `.union()`),
+                        # but `batch` is now a KVBatchMeta.  Raise explicitly rather than
+                        # crash with an obscure AttributeError.
+                        raise NotImplementedError(
+                            "The colocate training path (psrl.colocate=True) is not supported "
+                            "with the TransferQueue-based data flow.  Set psrl.colocate=False "
+                            "or re-implement this branch using KVBatchMeta / TQ APIs."
                         )
-                        gen_batch.meta_info["need_pull_model"] = self.global_steps != 1
-                        # Verl original colocate method
-                        output_batch = self.actor_wg.generate_sequences(gen_batch)
-                        batch = batch.union(output_batch)
-                        reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                        batch.batch["reward"] = reward_tensor
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -2585,13 +2624,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                if self._should_compute_teacher_colocate(batch):
-                    with marked_timer("teacher", timing_raw, color="cyan"):
-                        batch_teacher = self._compute_teacher_colocate(batch)
-                        batch = batch.union(batch_teacher)
 
-                if "response_mask" not in batch.batch.keys():
-                    batch.batch["response_mask"] = compute_response_mask(batch)
                 # Balance the number of valid tokens across DP ranks.
                 # NOTE: This usually changes the order of data in the `batch`,
                 # which won't affect the advantage calculation (since it's based on uid),
@@ -2600,69 +2633,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self._balance_batch(batch, metrics=metrics)
 
                 # compute global_valid tokens
-                batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
-                batch.meta_info["global_steps"] = self.global_steps
-                # get images_seqlens
-                images_seqlens_all = []
-                for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                    if "image_grid_thw" not in multi_modal_input.keys():
-                        continue
-                    images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
-                batch.meta_info["images_seqlens"] = images_seqlens_all
-
-                # Operating Mode Selection:
-                # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-                # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-                #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
-                rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                    from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
-
-                    apply_bypass_mode(
-                        batch=batch,
-                        rollout_corr_config=rollout_corr_config,
-                        policy_loss_config=self.config.train_actor_rollout_ref.actor.policy_loss,
-                    )
-                else:
-                    # recompute log_probs in the training side
-                    with marked_timer("old_log_prob", timing_raw, color="orange"):
-                        with log_dual_events(
-                            "Recompute log_prob on training side",
-                            psrl_logger,
-                            event_type=EventType.OTHER,
-                        ):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            entropys = old_log_prob.batch["entropys"]
-                            response_masks = batch.batch["response_mask"]
-                            actor_config = self.config.train_actor_rollout_ref.actor
-                            entropy_agg = agg_loss(
-                                loss_mat=entropys,
-                                loss_mask=response_masks,
-                                loss_agg_mode=actor_config.loss_agg_mode,
-                                loss_scale_factor=actor_config.loss_scale_factor,
-                            )
-                            old_log_prob_metrics = {
-                                "actor/entropy": entropy_agg.detach().item(),
-                                "perf/mfu/actor_infer": old_log_prob_mfu,
-                            }
-                            metrics.update(old_log_prob_metrics)
-                            old_log_prob.batch.pop("entropys")
-                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
-                                raise ValueError(
-                                    "Detected conflicting router replay configuration: "
-                                    "router_replay.mode='R2' and enable_rollout_routing_replay=True "
-                                    "cannot be enabled simultaneously. "
-                                    "The enable_rollout_routing_replay option is only used in R3 mode; "
-                                    "it should not be set when using R2 mode."
-                                )
-                            batch = batch.union(old_log_prob)
-                            if "rollout_log_probs" in batch.batch.keys():
-                                # TODO: we may want to add diff of probs too.
-                                from verl.utils.debug.metrics import calculate_debug_metrics
-
-                                metrics.update(calculate_debug_metrics(batch))
+                batch.extra_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
+                batch.extra_info["global_steps"] = self.global_steps
+                # compute old_log_prob
+                with marked_timer("old_log_prob", timing_raw, color="orange"):
+                    with log_dual_events(
+                        "Recompute log_prob on training side",
+                        psrl_logger,
+                        event_type=EventType.OTHER,
+                    ):
+                        batch = self._compute_old_log_prob(batch, metrics=metrics)
 
                 if self.use_reference_policy:
                     # compute reference log_prob
@@ -2672,8 +2652,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             psrl_logger,
                             event_type=EventType.OTHER,
                         ):
-                            ref_log_prob = self._compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                            batch = self._compute_ref_log_prob(batch, metrics=metrics)
 
                 # compute values
                 if self.use_critic:
@@ -2683,14 +2662,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             psrl_logger,
                             event_type=EventType.OTHER,
                         ):
-                            values = self._compute_values(batch)
-                            batch = batch.union(values)
+                            batch = self._compute_values(batch, metrics=metrics)
 
-                # AGENT(VERL): PSRL specific reward computation logic.
-                # Obtain a unified ``request_id_to_reward`` dict regardless of whether
-                # reward was computed asynchronously or synchronously, then delegate all
-                # post-processing to ``_process_reward_results``.
-                request_ids = batch.non_tensor_batch["uid"].tolist()
                 if self.config.reward.launch_reward_fn_async:
                     # Overlap reward computation with log_prob computation in trainer.
                     with marked_timer("async_reward_get", timing_raw, color="yellow"):
@@ -2699,110 +2672,32 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             psrl_logger,
                             event_type=EventType.OTHER,
                         ):
-                            assert self.reward_manager is not None, "Reward manager is not initialized"
-                            psrl_logger.debug("Waiting for reward of request_ids: %s", request_ids)
-                            request_id_to_reward = ray.get(
-                                self.reward_manager.wait_for_reward_of_requests.remote(request_ids)
-                            )
+                            batch = ray.get(self.reward_manager.wait_for_reward_of_requests.remote(batch))
                 else:
-                    # Sync path: reward results were stored in non_tensor_batch by the agent loop.
-                    # Reconstruct the canonical request_id_to_reward dict from those arrays.
-                    scores = batch.non_tensor_batch.pop("reward_scores")
-                    reward_extra_infos_arr = batch.non_tensor_batch.pop("reward_extra_infos", None)
-                    request_id_to_reward = {}
-                    for i, request_id in enumerate(request_ids):
-                        request_id_to_reward[request_id] = {
-                            "reward_score": float(scores[i]),
-                            "reward_extra_info": reward_extra_infos_arr[i] if reward_extra_infos_arr is not None else {},
-                        }
-
-                with log_dual_events(
-                    "Post process reward model score",
-                    psrl_logger,
-                    event_type=EventType.OTHER,
-                ):
-                    reward_tensor, reward_extra_infos_dict = self._process_reward_results(
-                        batch, request_id_to_reward, request_ids
-                    )
-
-                batch.batch["token_level_scores"] = reward_tensor
-
-                metrics_logging_path = self.config.psrl.get("logging_path", None)
-                metrics_output_path = (
-                    os.path.join(metrics_logging_path, "rollout_rm_metrics.jsonl")
-                    if metrics_logging_path is not None
-                    else None
-                )
-                record_rollout_rm_metrics(batch, output_path=metrics_output_path)
+                    with log_dual_events(
+                        "Normalize reward",
+                        psrl_logger,
+                        event_type=EventType.OTHER,
+                    ):
+                        batch = ray.get(self.reward_manager.normalize_reward.remote(batch))
 
                 with marked_timer("adv", timing_raw, color="brown"):
                     with log_dual_events("Compute advantage", psrl_logger, event_type=EventType.OTHER):
+                        batch = self._compute_advantage(batch, metrics=metrics)
                         # AGENT(VERL): reward combine is moved.
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch,
-                                kl_ctrl=self.kl_ctrl_in_reward,
-                                kl_penalty=self.config.algorithm.kl_penalty,
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
-                        if (
-                            rollout_corr_config is not None
-                            and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
-                        ):
-                            from verl.trainer.ppo.rollout_corr_helper import (
-                                compute_rollout_correction_and_add_to_batch,
-                            )
-
-                            # Compute IS weights, apply rejection sampling, compute metrics
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics.update(is_metrics)
-
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
-                        # AGENT(VERL): PSRL specific debug logging.
-                        log_data_protocol(
-                            batch,
-                            psrl_logger,
-                            self.log_prefix + " before compute advantage",
-                            level=logging.DEBUG,
-                        )
-                        batch = PSRL_compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.gen_actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
 
                 # update critic
                 if self.use_critic:
                     with marked_timer("update_critic", timing_raw, color="pink"):
                         with log_dual_events("Update critic", psrl_logger, event_type=EventType.TRAIN):
-                            critic_output = self._update_critic(batch)
-                    critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                    metrics.update(critic_output_metrics)
+                            batch = self._update_critic(batch, metrics=metrics)
 
                 # implement critic warmup
                 if self.config.trainer.critic_warmup <= self.global_steps:
                     # update actor
                     with marked_timer("update_actor", timing_raw, color="red"):
                         with log_dual_events("Update actor", psrl_logger, event_type=EventType.TRAIN):
-                            actor_output = self._update_actor(batch)
+                            batch = self._update_actor(batch, metrics=metrics)
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(
@@ -2829,13 +2724,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
                     # AGENT(VERL): Skip checkpoint manager in PSRL.
 
-                    actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                    metrics.update(actor_output_metrics)
-
                 # Log rollout generations if enabled
                 rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                 if rollout_data_dir:
-                    self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+                    self._log_rollout_data(batch, timing_raw, rollout_data_dir)
 
                 # validate
                 if self.config.trainer.test_freq > 0 and (
@@ -2865,32 +2757,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             steps_duration = timing_raw["step"]
             self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
-            # training metrics
-            metrics.update(
-                {
-                    "training/global_step": self.global_steps,
-                    # AGENT(VERL): no epoch metrics in PSRL.
-                }
-            )
-            # collect metrics
-            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-            # GDPO per-component reward metrics
-            gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
-            if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
-                for key in gdpo_reward_keys:
-                    if key in batch.non_tensor_batch:
-                        vals = np.asarray(batch.non_tensor_batch[key], dtype=np.float32)
-                        metrics[f"gdpo/{key}/mean"] = float(np.mean(vals))
-                        metrics[f"gdpo/{key}/std"] = float(np.std(vals))
-                        metrics[f"gdpo/{key}/max"] = float(np.max(vals))
-                        metrics[f"gdpo/{key}/min"] = float(np.min(vals))
-            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-            # TODO(verl): implement actual tflpo and theoretical tflpo
-            n_gpus = self.resource_pool_manager.get_n_gpus()
-            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-            # compute variance proxy metrics
-            gradient_norm = metrics.get("actor/grad_norm", None)
-            metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+            self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps)
+
+            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
             # AGENT(VERL): skip curriculum sampler processing here in PSRL.
 
@@ -2925,6 +2794,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ray.get(self.elastic_executor.stop_busy_loop.remote())
             self.elastic_executor = None
         self.stop_ps_manager()
+
+        if self.config.transfer_queue.enable:
+            tq.close()
 
         # AGENT(VERL): skip `on_batch_end` processing in PSRL.
 

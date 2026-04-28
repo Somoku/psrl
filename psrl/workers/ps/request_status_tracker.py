@@ -4,6 +4,7 @@ from enum import Enum
 from functools import wraps
 
 import ray
+import transfer_queue as tq
 from omegaconf import DictConfig
 
 from psrl.utils.logger import DualOutputHandler, deprecated, get_ps_logger
@@ -151,10 +152,12 @@ class RequestStatusTracker:
 
         request_update_success = [True for _ in range(len(request_id))]
 
+        abort_request_ids = []
         for i, req_id in enumerate(request_id):
             # Check if the request is marked for abortion
             if self._check_aborted_request(req_id, remove=True):
                 request_update_success[i] = False
+                # NOTE(linsh): data clean of these requests is handled in `_abort_requests`
                 continue
 
             # If the request is stale, we should not update its status
@@ -172,6 +175,7 @@ class RequestStatusTracker:
                         self._running_min_version,
                     )
                     request_update_success[i] = False
+                    abort_request_ids.append(str(req_id))
                     continue
             else:
                 raise KeyError(f"Request ID {req_id} not found in request info map.")
@@ -186,6 +190,10 @@ class RequestStatusTracker:
                 self._request_id_to_status[req_id] = new_status
             else:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
+
+        # Clear the aborted requests from transferqueue
+        if abort_request_ids:
+            tq.kv_clear(keys=abort_request_ids, partition_id="val" if is_validate else "train")
 
         return request_update_success[0] if len(request_update_success) == 1 else request_update_success
 
@@ -413,6 +421,12 @@ class RequestStatusTracker:
 
         if futures and blocking:
             ray.get(futures)
+
+        # Clear data from transfer queue for the aborted requests that are not in COMPLETED status
+        tq.kv_clear(
+            keys=[str(req_id) for req_id in (request_ids - abort_requests_for_completed)],
+            partition_id="train",
+        )
 
     def classify_requests_in_status(self, request_ids: list[int] | int) -> dict:
         """

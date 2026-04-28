@@ -98,7 +98,6 @@ class Entry:
 
     Args:
         category (EntryCategory): The category of the entry (EMPTY, RESERVED, OCCUPIED).
-        data (Optional[DataProto]): The data associated with the entry.
         entry_info (Optional[EntryInfo]): The metadata of the entry.
     """
 
@@ -1089,8 +1088,7 @@ class StalenessInventory:
         Move data to the first non-occupied entry in an appropriate buffer, occupying it.
 
         Args:
-            entry_info (EntryInfo): The entry metadata to occupy.
-            data (Optional[DataProto]): The data to occupy with. If None, will use data from data_pool.
+            prompt_id (int): The prompt ID to occupy.
         Returns:
             Tuple[Optional[int], Optional[int], Optional[int]]:
                 The buffer ID, entry ID, and occupy number after occupying,

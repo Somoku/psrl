@@ -4,8 +4,8 @@ from collections.abc import Callable
 from typing import Any
 
 from omegaconf import DictConfig
+from tensordict import TensorDict
 from transformers import AutoTokenizer
-from verl import DataProto
 from verl.utils.ray_utils import get_event_loop
 
 RawRewardFn = Callable[..., Any] | None
@@ -36,5 +36,5 @@ class RewardManagerBase(ABC):
         cls._class_initialized = True
 
     @abstractmethod
-    async def run_single(self, data: DataProto):
+    async def run_single(self, data: TensorDict):
         raise NotImplementedError

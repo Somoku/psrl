@@ -51,6 +51,48 @@ reward_kwargs:
 # (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
 enable_weights_cpu_backup: False
 
+# Multi-turn interaction config for tools or chat.
+multi_turn:
+
+  # Required when using psrl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: psrl.workers.config.MultiTurnConfig
+
+  # set to True for multi-turn tool interaction tasks; should set rollout.name to sglang as well
+  enable: False
+
+  # null for no limit (default max_length // 3)
+  max_turns: null
+
+  # null for no tool
+  tool_config_path: null
+
+  # max parallel call for tools in single turn
+  max_parallel_calls: 1
+
+  # max length of tool response
+  max_tool_response_length: 256
+
+  # truncate side of tool response: left, middle, right
+  tool_response_truncate_side: middle
+
+  # - When set to True, the model's default chat template is used for multi-turn rollout, which typically matches production behavior.
+  # - When set to False, the token ids recorded for training are used instead; unlike the default chat template, these always include the model's full output,
+  #   which may contain additional content such as reasoning content. This maintains the consistency between training and rollout, but it will lead to longer prompts.
+  use_inference_chat_template: False
+
+  # Tokenization is performed turn by turn and the resulting token ids are concatenated to form the full conversation.
+  # To ensure this matches the result of tokenizing the entire conversation at once, a sanity check is run at the end of each multi-turn rollout to compare the two sets of token ids.
+  # Some models are known to produce different tokenization results when tokenizing turn by turn vs. all at once. aThis behavior has already been validated for them.
+  # To reduce excessive warnings, you can turn off the sanity check for these models if you are using their default chat template:
+  # Qwen/QwQ-32B, Qwen/Qwen3-xxB
+  # - disable: disable tokenization sanity check
+  # - strict: enable strict tokenization sanity check (default)
+  # - ignore_strippable: ignore strippable tokens when checking tokenization sanity
+  tokenization_sanity_check_mode: strict
+
+  # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
+  format: hermes
+
 # [PSRL] Agent loop configuration (overrides veRL's AgentLoopConfig with PSRL variant).
 agent:
 

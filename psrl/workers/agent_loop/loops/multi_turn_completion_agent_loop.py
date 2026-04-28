@@ -15,7 +15,7 @@ from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
@@ -57,25 +57,26 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             data_config=data_config,
             **kwargs,
         )
-        self.max_turns = trainer_config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-        self.env_step_timeout = trainer_config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
+        self.session_router_url = kwargs["session_router_url"]
+        self.max_turns = trainer_config.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
+        self.env_step_timeout = trainer_config.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
     # ------------------------------------------------------------------
     # Session helpers
     # ------------------------------------------------------------------
 
-    async def _create_session(self) -> str:
+    async def create_session(self) -> str:
         """Create a TITO session and return its ID."""
-        base = self.gateway_addr.rstrip("/")
+        base = self.session_router_url.rstrip("/")
         resp = await post(f"{base}/sessions", payload={})
         session_id = resp["session_id"]
         psrl_logger.info("Created TITO session %s", session_id)
         return session_id
 
-    async def _delete_session(self, session_id: str) -> None:
+    async def delete_session(self, session_id: str) -> None:
         """Delete a TITO session (best-effort)."""
 
-        base = self.gateway_addr.rstrip("/")
+        base = self.session_router_url.rstrip("/")
         url = f"{base}/sessions/{session_id}"
         try:
             client = await _ensure_http_client()
@@ -84,9 +85,9 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         except Exception:
             psrl_logger.warning("Failed to delete TITO session %s", session_id, exc_info=True)
 
-    async def _get_session_data(self, session_id: str) -> dict:
+    async def get_session_data(self, session_id: str) -> dict:
         """Retrieve accumulated session data."""
-        base = self.gateway_addr.rstrip("/")
+        base = self.session_router_url.rstrip("/")
         return await get(f"{base}/sessions/{session_id}")
 
     def _get_chat_sampling_params(self, is_validate: bool = False) -> dict:
@@ -96,14 +97,10 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         awareness (the session server manages accumulated context).  Per-turn
         generation is bounded by ``rollout_config.response_length``.
         """
-        top_k = int(self.rollout_config.top_k)
-        if top_k < 0:
-            top_k = 0
-
-        params = dict(
+        sampling_params = dict(
             temperature=float(self.rollout_config.temperature),
             top_p=float(self.rollout_config.top_p),
-            top_k=top_k,
+            top_k=self.rollout_config.top_k,
             repetition_penalty=float(self.rollout_config.get("repetition_penalty", 1.0)),
             max_tokens=int(self.rollout_config.response_length),
         )
@@ -111,13 +108,11 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         if is_validate:
             val_config = self.config.train_actor_rollout_ref.rollout.val_kwargs
             val_top_k = int(val_config.top_k)
-            if val_top_k < 0:
-                val_top_k = 0
-            params["top_k"] = val_top_k
-            params["top_p"] = float(val_config.top_p)
-            params["temperature"] = float(val_config.temperature)
+            sampling_params["top_k"] = val_top_k
+            sampling_params["top_p"] = float(val_config.top_p)
+            sampling_params["temperature"] = float(val_config.temperature)
 
-        return params
+        return sampling_params
 
     async def _chat_completion(
         self,
@@ -125,21 +120,48 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         messages: list[dict],
         sampling_params: dict,
         tools: list[dict] | None = None,
+        chat_template_kwargs: dict | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> dict:
         """Send a chat-completion request scoped to *session_id*."""
-        base = self.gateway_addr.rstrip("/")
+        base = self.session_router_url.rstrip("/")
         url = f"{base}/sessions/{session_id}/v1/chat/completions"
 
-        payload: dict = {"model": self.model_config.path, "messages": messages}
+        payload: dict = {"model": self.model_config.path, "messages": messages, "logprobs": True, "top_logprobs": 0}
         if tools:
             payload["tools"] = tools
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
         payload.update(sampling_params)
 
-        return await post(url, payload=payload)
+        return await post(url, payload=payload, headers=extra_headers)
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+
+    def build_extra_headers(self, request: DataProto) -> dict[str, str]:
+        non_tensor_batch = request.non_tensor_batch                                                                                                                                  
+        is_validate = request.meta_info.get("validate", False)
+        request_id = int(non_tensor_batch["uid"][0])
+        version_tag = int(non_tensor_batch.get("version_tag", [0])[0])
+        if "parent_id" in non_tensor_batch:
+            prompt_id = non_tensor_batch["parent_id"][0]
+        else:
+            prompt_id = request_id
+
+        extra_headers = {
+            "x-request-id": str(request_id),
+            "x-prompt-id": str(prompt_id),
+            "x-version-tag": str(version_tag),
+            "x-is-validate": str(is_validate).lower(),
+        }
+        rollout_instance_id = non_tensor_batch.get("rollout_instance_id", [None])[0]
+        if rollout_instance_id is not None:
+            replica_id, dp_rank = rollout_instance_id
+            extra_headers["x-base-worker-id"] = str(replica_id)
+            extra_headers["x-target-dp-rank"] = str(dp_rank)
+        return extra_headers
 
     @rollout_trace_op
     async def run(self, request: DataProto) -> tuple[DataProto | None, TerminateReason]:
@@ -153,10 +175,11 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         """
         env_class = request.non_tensor_batch.get(
             "env_class", self.config.gen_actor_rollout_ref.rollout.agent.env.name
-        )[0]
+        )
         data_class = request.non_tensor_batch.get(
             "data_class", self.config.gen_actor_rollout_ref.rollout.agent.data.name
-        )[0]
+        )
+        extra_headers = self.build_extra_headers(request)
 
         self.env = Environment.get_environment(
             env_class,
@@ -175,45 +198,47 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         )
         self.agent_data.reset()
 
-        is_validate = request.meta_info.get("validate", False)
-        sampling_params = self._get_chat_sampling_params(is_validate)
+        observation, info = await self.env.reset(
+            task=request,
+            seed=request.non_tensor_batch.get("seed", None),
+        )
 
-        session_id: str | None = None
+        self.agent_data.init_trajectory(request)
+
+        session_id = await self.create_session()
+        psrl_logger.info(f"[complete] request {request.non_tensor_batch['uid']} create session {session_id}")
+
         try:
-            # --- Create TITO session ---
-            session_id = await self._create_session()
-
-            # --- Environment reset ---
-            observation, info = await self.env.reset(
-                task=request,
-                seed=request.non_tensor_batch.get("seed", None),
-            )
-
-            self.agent_data.init_trajectory(request)
+            is_validate = request.meta_info.get("validate", False)
+            sampling_params = self._get_chat_sampling_params(is_validate)
 
             overlong_terminate = await self.agent_data.update_from_env(observation, 0, False, info)
             if overlong_terminate:
-                return (
-                    await self.agent_data.finalize_output(request),
-                    TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
-                )
+                return await self.agent_data.finalize_output(request), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
-            # --- Turn loop ---
+            initial_prompt_ids = list(self.agent_data.trajectory.prompt_ids)
+
+            terminate_reason = TerminateReason.FINISHED
             for _ in range(self.max_turns):
                 # 1. Build messages/tools from agent data
                 messages, tools = self.agent_data.prepare_chat_completion_request()
 
                 # 2. Call chat completion API
-                response = await self._chat_completion(session_id, messages, sampling_params, tools)
+                response = await self._chat_completion(
+                    session_id,
+                    messages,
+                    sampling_params,
+                    tools,
+                    self.agent_data.apply_chat_template_kwargs,
+                    extra_headers,
+                )
 
                 # 3. Parse response and extract action
                 action, overlong_terminate = await self.agent_data.update_from_model_chat_completion(response)
 
                 if overlong_terminate:
-                    return (
-                        await self.agent_data.finalize_output(request),
-                        TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
-                    )
+                    terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                    break
 
                 # 4. Step the environment
                 try:
@@ -226,24 +251,24 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
                     done = env_step_output["done"]
                     info = env_step_output["info"]
                 except asyncio.TimeoutError:
-                    return (
-                        await self.agent_data.finalize_output(request),
-                        TerminateReason.ENV_TIMEOUT,
-                    )
+                    terminate_reason = TerminateReason.ENV_TIMEOUT
+                    break
 
                 overlong_terminate = await self.agent_data.update_from_env(observation, reward, done, info)
 
                 if overlong_terminate:
-                    return (
-                        await self.agent_data.finalize_output(request),
-                        TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
-                    )
-
-                if done:
+                    terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
                     break
 
+                if done:
+                    terminate_reason = TerminateReason.FINISHED
+                    break
+
+            if terminate_reason == TerminateReason.FINISHED and not done:
+                terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
+
             # --- Retrieve session data and build training arrays ---
-            session_data = await self._get_session_data(session_id)
+            session_data = await self.get_session_data(session_id)
             max_trim_tokens = session_data.get("max_trim_tokens", 0)
 
             if "trajectories" in session_data:
@@ -269,6 +294,9 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             # and are not fatal.
             for i, record in enumerate(records):
                 mismatch_report = record.get("mismatch_report", [])
+                prompt_token_count = record.get("prompt_token_count", 0)
+                finish_reason = record.get("finish_reason", "")
+                '''
                 for entry in mismatch_report:
                     mtype = entry.get("mismatch_type", "")
                     if mtype != "assistant_text":
@@ -279,9 +307,12 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
                         )
                         psrl_logger.error(msg)
                         raise RuntimeError(msg)
+                '''
 
             training_arrays = build_training_arrays(
-                accumulated_token_ids, records, max_trim_tokens=max_trim_tokens
+                accumulated_token_ids,
+                records,
+                max_trim_tokens=max_trim_tokens,
             )
 
             # Attach training arrays to trajectory for finalize_output
@@ -291,9 +322,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             trajectory.response_mask = training_arrays["response_mask"]
             trajectory.response_logprobs = training_arrays["logprobs"]
 
-            terminate_reason = TerminateReason.FINISHED if done else TerminateReason.MAX_TURNS_EXCEEDED
             return await self.agent_data.finalize_output(request), terminate_reason
 
         finally:
-            if session_id is not None:
-                await self._delete_session(session_id)
+            await self.delete_session(session_id)

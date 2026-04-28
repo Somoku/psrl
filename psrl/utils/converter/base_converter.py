@@ -35,23 +35,28 @@ class BaseConverter(ABC):
         sharding: NIXLSharding,
     ) -> tuple[Parameter, NIXLSharding]:
         """
-        Conditionally reshape a Q/K/V weight or bias to the 3D group-interleaved layout
-        and update the sharding descriptor to match the new tensor shape.
+        Conditionally reshape a Q/K/V weight or bias to 3D group-interleaved layout and
+        update the sharding descriptor to match the new tensor shape.
 
         Handles both 2D weight tensors (rows, H) and 1D bias tensors (rows,).
+        For 1D bias, the hidden dimension H is treated as 1.
+
         Returns unchanged (param, sharding) if self.model_info does not contain
-        num_heads, param_name is not a Q/K/V weight/bias, or param is already ≥3D.
+        num_heads, param_name is not a Q/K/V weight or bias, or param has more than
+        2 dimensions.
 
         Local head counts are derived from the sharding descriptor:
           - dim=0 sharding: num_heads_local = num_heads // ws (may be 0 for fine-grained FSDP)
           - dim=1 sharding: all heads present on this rank; use global counts
+            (only valid for 2D weight tensors; 1D bias tensors are never sharded along
+            the hidden dimension)
 
         Reshape rule: (rows[, H]) -> (G_eff, rows // G_eff, H)
-        where G_eff = gcd(num_heads_local, num_kv_heads_local), H=1 for 1D bias.
+        where G_eff = gcd(num_heads_local, num_kv_heads_local) and H=1 for 1D bias.
 
         Sharding update — three cases based on ws and G_global = gcd(num_heads, num_kv_heads):
 
-          Case A — shard_dim_2d == 1 (hidden dim sharded):
+          Case A — shard_dim_2d == 1 (hidden dim sharded, weights only):
             Hidden shifts from index 1 -> 2 after reshape.
             New sharding: shard_mesh={2: ws}, shard_indices=[(rank,)].
 
@@ -75,7 +80,7 @@ class BaseConverter(ABC):
             tuple[Parameter, NIXLSharding]: Reshaped param and updated sharding.
         """
         num_heads = self.model_info.get("num_heads")
-        if num_heads is None or not is_qkv_weight(param_name) or param.ndim > 2:
+        if num_heads is None or not is_qkv_weight(param_name) or param.ndim not in (1, 2):
             return param, sharding
 
         num_kv_heads = self.model_info["num_kv_heads"]
@@ -84,8 +89,7 @@ class BaseConverter(ABC):
         shard_dim_2d = next(iter(sharding.shard_mesh.keys()))
         ws = next(iter(sharding.shard_mesh.values()))
         rank = sharding.shard_indices[0][0]
-        # 1D bias tensors (q_proj.bias etc.) have no hidden dim; treat H=1 to match
-        # the trailing size-1 dim produced by slice_qkv_proj_megatron's reshape(..., -1).
+        # For 1D bias tensors, treat hidden dimension as 1.
         rows = param.shape[0]
         H = param.shape[1] if param.ndim == 2 else 1
 

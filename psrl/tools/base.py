@@ -27,6 +27,7 @@ class ToolResponse(BaseModel):
     when non-None — a ``@model_validator`` enforces this contract.
     """
 
+    id: str | None = None
     text: str | None = None
     image: list[Any] | None = None
     video: list[Any] | None = None

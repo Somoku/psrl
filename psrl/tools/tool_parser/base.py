@@ -10,14 +10,26 @@ class ToolParser(ABC):
         self.tokenizer = tokenizer
 
     @abstractmethod
-    def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[ToolCall]]:
+    def extract_tool_calls_from_token_ids(self, responses_ids: list[int]) -> tuple[str, list[ToolCall]]:
         """Extract tool calls from the responses.
 
         Args:
             responses_ids (List[int]): The ids of the responses.
 
         Returns:
-            List[ToolCall]: Extracted tool calls.
+            tuple[str, List[ToolCall]]: Extracted text and tool calls.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def extract_tool_calls_from_str(self, response_str: str) -> tuple[str, list[ToolCall]]:
+        """Extract tool calls from the response string.
+
+        Args:
+            response_str (str): The response string.
+
+        Returns:
+            tuple[str, List[ToolCall]]: Extracted text and tool calls.
         """
         raise NotImplementedError
 

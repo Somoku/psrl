@@ -221,6 +221,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
 
+        self._initialize_queue_buffers()
         if self.config.psrl.redundant_rollout.enable:
             self.max_concurrency = (
                 self.config.psrl.redundant_rollout.redundant_rollout_n
@@ -234,7 +235,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 * (self.config.psrl.staleness + 1)
             )
 
-        self._initialize_queue_buffers()
 
         self._init_ps_manager()
 
@@ -410,7 +410,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.ps_manager_grpc_port,
             )
             self.rollout_gateway_url = ray.get(self.rollout_router.launch_router.remote())
+            self.session_router_url = ray.get(self.rollout_router.launch_session_router.remote())
             psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}")
+            psrl_logger.info(f"Session router launched at {self.session_router_url}")
         else:
             self.rollout_router = RolloutRouter.options(max_concurrency=self.max_concurrency).remote(
                 self.config,
@@ -418,6 +420,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.tokenizer,
             )
             self.rollout_gateway_url = None
+            self.session_router_url = None
 
     def init_rollout_coordinator(self):
         assert self.rollout_router is not None, (
@@ -861,7 +864,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # 5. Release TQ storage for this val batch.
             tq.kv_clear(keys=test_batch.keys, partition_id=test_batch.partition_id)
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        # self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -1394,6 +1397,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self.config,
                     self.ps_manager_handle,
                     rollout_router,
+                    self.session_router_url,
                 )
             )
 

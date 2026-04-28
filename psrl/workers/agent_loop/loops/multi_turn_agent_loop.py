@@ -13,7 +13,7 @@ from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
@@ -53,8 +53,8 @@ class MultiTurnAgentLoop(AgentLoopBase):
             data_config=data_config,
             **kwargs,
         )
-        self.max_turns = trainer_config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-        self.env_step_timeout = trainer_config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
+        self.max_turns = trainer_config.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
+        self.env_step_timeout = trainer_config.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
     def get_generate_fields(self) -> list[str]:
         fields = super().get_generate_fields()

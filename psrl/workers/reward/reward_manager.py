@@ -140,11 +140,11 @@ class RewardLoopManager(CommandExtension):
             reward_manager_cfg = reward_model_config.reward_manager
             reward_manager_type = reward_model_config.reward_loop_type
             reward_fn_configs = reward_model_config.reward_fn
-            reward_model_name = reward_model_config.get("reward_model_name", None)
-            reward_loop_kwargs = reward_model_config.get("reward_loop_kwargs", {})
+            reward_model_name = reward_model_config.get("reward_model_name", "null")
+            reward_kwargs = reward_model_config.get("reward_kwargs", {})
 
             for reward_fn_config in reward_fn_configs:
-                reward_fn_name = reward_fn_config.get("name", None)
+                reward_fn_name = reward_fn_config.get("name", "null")
                 reward_spec = RewardSpec(
                     reward_manager_type=reward_manager_type,
                     reward_fn_name=reward_fn_name,
@@ -168,7 +168,7 @@ class RewardLoopManager(CommandExtension):
                     reward_manager_cfg=reward_manager_cfg,
                     reward_fn_config=reward_fn_config,
                     reward_model_manager=reward_model_manager,
-                    **reward_loop_kwargs,
+                    **reward_kwargs,
                 )
                 self.reward_spec_to_manager[reward_spec] = reward_manager
 

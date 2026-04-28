@@ -4,42 +4,42 @@
 launch_reward_fn_async: True
 
 # way to normalize the reward, choices: group, batch, none
-reward_normalization: group
+reward_normalization: none
 
 # list of reward models
 reward_models:
-  # - reward_manager:
-  #     _target_: verl.workers.config.reward_model.RewardManagerConfig
-  #     source: register
-  #     name: naive
-  #     module:
-  #       _target_: verl.trainer.config.config.ModuleConfig
-  #       path: null
-  #       name: custom_reward_manager
-  #   reward_loop_type: naive
-  #   reward_fn:
-  #     path: null
-  #     name: compute_score
-
   - reward_manager:
       _target_: verl.workers.config.reward_model.RewardManagerConfig
       source: register
-      name: dapo
+      name: naive
       module:
         _target_: verl.trainer.config.config.ModuleConfig
         path: null
         name: custom_reward_manager
-    reward_loop_type: dapo
+    reward_loop_type: naive
     reward_fn:
       - path: null
         name: compute_score
-    reward_kwargs:
-      max_resp_len: 5120
-      overlong_buffer_cfg:
-        enable: True
-        len: 3072
-        penalty_factor: 1.0
-        log: False
+
+  # - reward_manager:
+  #     _target_: verl.workers.config.reward_model.RewardManagerConfig
+  #     source: register
+  #     name: dapo
+  #     module:
+  #       _target_: verl.trainer.config.config.ModuleConfig
+  #       path: null
+  #       name: custom_reward_manager
+  #   reward_loop_type: dapo
+  #   reward_fn:
+  #     - path: null
+  #       name: compute_score
+  #   reward_kwargs:
+  #     max_resp_len: 5120
+  #     overlong_buffer_cfg:
+  #       enable: True
+  #       len: 3072
+  #       penalty_factor: 1.0
+  #       log: False
 
   # - reward_manager:
   #     _target_: verl.workers.config.reward_model.RewardManagerConfig

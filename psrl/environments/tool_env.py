@@ -13,7 +13,7 @@ from psrl.tools.base import ToolGroup, ToolResponse, initialize_tools_from_confi
 
 ToolAction = list[dict] | dict
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
@@ -227,10 +227,10 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                     content.append({"type": "video"})
                 if tool_response.text:
                     content.append({"type": "text", "text": tool_response.text})
-                message = {"role": "tool", "content": content}
+                message = {"role": "tool", "tool_call_id": tool_response.id, "content": content}
             else:
                 # Text-only content
-                message = {"role": "tool", "content": tool_response.text or ""}
+                message = {"role": "tool", "tool_call_id": tool_response.id, "content": tool_response.text or ""}
 
             next_observation.append(message)
 
@@ -303,7 +303,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             tool_reward = tool_response.output.get("score", None)
         except Exception as e:
             psrl_logger.warning(f"Error when executing tool: {e}")
-            return ToolResponse(text=f"Error when executing tool: {e}"), 0.0
+            return ToolResponse(id=tool_call["id"], text=f"Error when executing tool: {e}"), 0.0
 
         # Truncate text response when needed.
         tool_response_text = tool_response.output.get("text", None)
@@ -317,7 +317,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                 tool_response_text = tool_response_text[:half] + "...(truncated)..." + tool_response_text[-half:]
 
         # Create ToolResponse from tool execution result
-        tool_response_kwargs = {"text": tool_response_text}
+        tool_response_kwargs = {"text": tool_response_text, "id": tool_call["id"]}
         # Add multimedia data if present
         for attr_name in ["image", "video"]:
             if attr_name in tool_response.output:

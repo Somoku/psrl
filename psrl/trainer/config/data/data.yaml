@@ -20,6 +20,13 @@ use_multi_dataset: False
 #         reward_model_name: null
 #         reward_coef: 1.0
 
+reward_model_dicts:
+  - reward_fn_key: data_source
+    reward_loop_type: naive
+    reward_fn: default
+    reward_model_name: null
+    reward_coef: 1.0
+
 train_datas:
   - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/gsm8k_verl/train.parquet
     data_source_name: openai/gsm8k

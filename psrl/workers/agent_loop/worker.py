@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import traceback
 from collections import deque
 
 import torch
@@ -39,6 +40,7 @@ class PSRL_AgentLoopWorker:
         config: DictConfig,
         ps_manager_handle: ray.actor.ActorHandle,
         rollout_router: ray.actor.ActorHandle | str,
+        session_router_url: str,
     ):
         """Initialize agent loop worker.
 
@@ -46,6 +48,7 @@ class PSRL_AgentLoopWorker:
             config (DictConfig): Configuration containing model and rollout settings.
             ps_manager_handle (ray.actor.ActorHandle): Handle to the parameter server manager.
             rollout_router (ray.actor.ActorHandle | str): Handle to the rollout router actor.
+            session_router_url (str): URL of the session router.
         """
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
@@ -65,6 +68,7 @@ class PSRL_AgentLoopWorker:
         self.processor = self.model_config.processor
 
         self.rollout_router = rollout_router
+        self.session_router_url = session_router_url
         self.ps_manager_handle = ps_manager_handle
         self.agent_loop_manager = None
         self.reward_manager = None
@@ -110,7 +114,9 @@ class PSRL_AgentLoopWorker:
         # Build logger
         # TODO(lhy): support >1 workers
         self.log_prefix = "AgentLoopWorker"
-        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+        handler = DualOutputHandler(self.config.psrl.logging_path, self.log_prefix)
+        logging.getLogger("psrl").addHandler(handler)
+        psrl_logger.addHandler(handler)
 
     def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
         """Set the agent loop manager handle for communication.
@@ -182,7 +188,11 @@ class PSRL_AgentLoopWorker:
             try:
                 future.result()  # This will raise an exception if the task failed
             except Exception as e:
-                psrl_logger.error(f"Task {task} failed with exception: {e}")
+                tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                psrl_logger.error(
+                    f"Task {task} failed with exception: {e}\n"
+                    f"Traceback:\n{tb_str}"
+                )
             finally:
                 self.agent_programs.discard(task)
 
@@ -230,13 +240,35 @@ class PSRL_AgentLoopWorker:
 
         fields = ["uid", "parent_id", "global_steps", "validate"]
         data = await tq.async_kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-        request_ids = tu.get(data, "uid")
         if "parent_id" in data:
             prompt_index = tu.get(data, "parent_id")[0]
             request_index = tu.get(data, "uid")[0]
         else:
             prompt_index = tu.get(data, "uid")[0]
             request_index = tu.get(data, "uid")[0]
+
+        try:
+          await self._run_agent_loop_inner(agent_name, batch, data, prompt_index, request_index)
+        except Exception as e:
+            tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            psrl_logger.error(
+                f"Agent loop '{agent_name}' for request {request_index} "
+                f"(prompt {prompt_index}) raised an exception: {e}\n"
+                f"Full traceback:\n{tb_str}"
+            )
+            raise
+
+    async def _run_agent_loop_inner(
+        self,
+        agent_name: str,
+        batch: KVBatchMeta,
+        data: TensorDict,
+        prompt_index,
+        request_index,
+    ):
+        """Inner implementation of the agent loop execution."""
+
+        request_ids = tu.get(data, "uid")
 
         with rollout_trace_attr(
             prompt_index=prompt_index,
@@ -260,6 +292,7 @@ class PSRL_AgentLoopWorker:
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
+                session_router_url=self.session_router_url,
             )
 
             with log_dual_events(

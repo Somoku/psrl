@@ -29,6 +29,8 @@ class SessionRouter:
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._session_turn: dict[str, int] = {}
         self._session_closing: dict[str, bool] = {}
+        self._session_inflight: dict[str, int] = {}
+        self._session_drained: dict[str, asyncio.Event] = {}
         self._setup_routes()
 
     def _setup_routes(self):
@@ -47,6 +49,14 @@ class SessionRouter:
             self._session_locks[sid] = asyncio.Lock()
         return self._session_locks[sid]
 
+    def _get_or_create_drained_event(self, sid: str) -> asyncio.Event:
+        event = self._session_drained.get(sid)
+        if event is None:
+            event = asyncio.Event()
+            event.set()
+            self._session_drained[sid] = event
+        return event
+
     async def create_session(self):
         resp = await self.client.post(f"{self.smg_url}/v1/tito/sessions")
         data = resp.json()
@@ -55,6 +65,10 @@ class SessionRouter:
             self._session_locks[sid] = asyncio.Lock()
             self._session_turn[sid] = 0
             self._session_closing[sid] = False
+            self._session_inflight[sid] = 0
+            drained = asyncio.Event()
+            drained.set()
+            self._session_drained[sid] = drained
         return JSONResponse(status_code=resp.status_code, content=data)
 
     async def get_session(self, sid: str):
@@ -66,17 +80,21 @@ class SessionRouter:
         )
 
     async def delete_session(self, sid: str):
-        # Signal that the session is closing so in-flight Phase 1 checks will reject
-        # new requests without waiting for the lock.
-        self._session_closing[sid] = True
-
         lock = self._get_or_create_lock(sid)
+        async with lock:
+            self._session_closing[sid] = True
+            drained = self._get_or_create_drained_event(sid)
+
+        await drained.wait()
+
         async with lock:
             await self.client.delete(f"{self.smg_url}/v1/tito/sessions/{sid}")
             # Clean up all per-session state while holding the lock.
             self._session_locks.pop(sid, None)
             self._session_turn.pop(sid, None)
             self._session_closing.pop(sid, None)
+            self._session_inflight.pop(sid, None)
+            self._session_drained.pop(sid, None)
 
         return Response(status_code=204)
 
@@ -92,48 +110,58 @@ class SessionRouter:
                     media_type="application/json",
                 )
             expected_turn = self._session_turn.get(sid, 0)
+            self._session_inflight[sid] = self._session_inflight.get(sid, 0) + 1
+            self._get_or_create_drained_event(sid).clear()
 
-        # ── Phase 2: proxy to SMG (lock NOT held — avoids blocking other ops) ─
-        body = json.loads(await request.body())
-        body["logprobs"] = True
-        headers = self._extract_headers(request)
-        headers["x-smg-tito-session-id"] = sid
-        resp = await self.client.post(
-            f"{self.smg_url}/v1/chat/completions",
-            content=json.dumps(body),
-            headers=headers,
-        )
+        try:
+            # ── Phase 2: proxy to SMG (lock NOT held — avoids blocking other ops) ─
+            body = json.loads(await request.body())
+            body["logprobs"] = True
+            headers = self._extract_headers(request)
+            headers["x-smg-tito-session-id"] = sid
+            resp = await self.client.post(
+                f"{self.smg_url}/v1/chat/completions",
+                content=json.dumps(body),
+                headers=headers,
+            )
 
-        # ── Phase 3: lock, handle stale write, increment turn ─────────────────
-        async with lock:
-            if sid not in self._session_turn:
-                # Session was fully deleted while request was in-flight (delete_session
-                # popped all three dicts before this lock acquisition). Pass the response
-                # through without touching any state — no zombie entries created.
-                return Response(
-                    content=resp.content,
-                    status_code=resp.status_code,
-                    headers=dict(resp.headers),
-                )
-            current_turn = self._session_turn[sid]
-            if current_turn != expected_turn:
-                # Concurrent write detected: another request already incremented the
-                # counter. Pass the response through but do not double-increment.
-                logger.warning(
-                    "SessionRouter: stale write detected for sid=%s "
-                    "(expected_turn=%d, current=%d); skipping increment",
-                    sid,
-                    expected_turn,
-                    current_turn,
-                )
-            else:
-                self._session_turn[sid] = current_turn + 1
+            # ── Phase 3: lock, handle stale write, increment turn ─────────────────
+            async with lock:
+                if sid not in self._session_turn:
+                    # Session was fully deleted while request was in-flight. Pass the
+                    # response through without touching any state — no zombie entries created.
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        headers=dict(resp.headers),
+                    )
+                current_turn = self._session_turn[sid]
+                if current_turn != expected_turn:
+                    # Concurrent write detected: another request already incremented the
+                    # counter. Pass the response through but do not double-increment.
+                    logger.warning(
+                        "SessionRouter: stale write detected for sid=%s "
+                        "(expected_turn=%d, current=%d); skipping increment",
+                        sid,
+                        expected_turn,
+                        current_turn,
+                    )
+                else:
+                    self._session_turn[sid] = current_turn + 1
 
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers),
-        )
+            return Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers=dict(resp.headers),
+            )
+        finally:
+            async with lock:
+                inflight = self._session_inflight.get(sid, 0)
+                if inflight <= 1:
+                    self._session_inflight[sid] = 0
+                    self._get_or_create_drained_event(sid).set()
+                else:
+                    self._session_inflight[sid] = inflight - 1
 
     async def session_proxy(self, sid: str, path: str, request: Request):
         headers = self._extract_headers(request)

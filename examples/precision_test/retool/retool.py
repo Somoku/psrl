@@ -1,3 +1,6 @@
+import hashlib
+import logging
+import os
 import re
 from typing import Any
 
@@ -78,36 +81,83 @@ class CustomSandboxFusionTool(SandboxFusionTool):
 
 answer_format = """\nThe answer format must be: \\boxed{'The final answer goes here.'}"""
 
+logger = logging.getLogger(__name__)
+
 
 class CustomRLHFDataset(RLHFDataset):
     """Custom dataset class to process dapo/aime-2024, dapo/aime-2025 datasets."""
 
+    def _get_cache_file_path(self, parquet_file: str) -> str:
+        """Generate cache file path based on parquet file path."""
+        # Create a hash of the file path to ensure unique cache file names
+        file_hash = hashlib.md5(parquet_file.encode()).hexdigest()
+        cache_dir = os.path.join(self.cache_dir, "processed_datasets")
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"{file_hash}.parquet")
+        return cache_file
+
+    def _load_from_cache(self, cache_file: str) -> datasets.Dataset | None:
+        """Load dataset from cache file if it exists."""
+        if os.path.exists(cache_file):
+            try:
+                logger.info(f"Loading dataset from cache: {cache_file}")
+                dataframe = datasets.load_dataset("parquet", data_files=cache_file)["train"]
+                return dataframe
+            except Exception as e:
+                logger.warning(f"Failed to load cache file {cache_file}: {e}")
+                return None
+        return None
+
+    def _save_to_cache(self, dataframe: datasets.Dataset, cache_file: str):
+        """Save processed dataset to cache file."""
+        try:
+            logger.info(f"Saving dataset to cache: {cache_file}")
+            dataframe.to_parquet(cache_file)
+        except Exception as e:
+            logger.warning(f"Failed to save cache file {cache_file}: {e}")
+
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
-            # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
-            data_source = "/".join(parquet_file.split("/")[-2:]).split(".")[0]  # e.g., dapo/aime-2024
-            if data_source in ["dapo/aime-2024", "dapo/aime-2025"]:
-                dataframe = dataframe.map(
-                    self.map_fn, fn_kwargs={"data_source": data_source}, remove_columns=dataframe.column_names
-                )
+            # Generate cache file path
+            cache_file = self._get_cache_file_path(parquet_file)
+
+            # Try to load from cache first
+            dataframe = self._load_from_cache(cache_file)
+
+            if dataframe is None:
+                # Cache miss, need to process
+                logger.info(f"Cache miss for {parquet_file}, processing...")
+                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+                data_source = "/".join(parquet_file.split("/")[-2:]).split(".")[0]  # e.g., dapo/aime-2024
+                if data_source in ["dapo/aime-2024-raw", "dapo/aime-2024-retool", "dapo/aime-2025"]:
+                    dataframe = dataframe.map(
+                        self.map_fn, fn_kwargs={"data_source": data_source}, remove_columns=dataframe.column_names
+                    )
+                else:
+                    dataframe = dataframe.map(self.map_fn2, num_proc=16)
+
+                # Save to cache for future use
+                self._save_to_cache(dataframe, cache_file)
             else:
-                dataframe = dataframe.map(self.map_fn2, num_proc=16)
+                logger.info(f"Cache hit for {parquet_file}, skipping map operation")
+
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
         print(f"dataset len: {len(self.dataframe)}")
 
     def map_fn(self, row: dict, *, data_source: str = None):
-        if data_source == "dapo/aime-2024":
+        if data_source == "dapo/aime-2024-raw":
+            problem, answer = row["prompt"][0]["content"], row["reward_model"]["ground_truth"]
+        elif data_source == "dapo/aime-2024-retool":
             problem, answer = row["problem"], row["answer"]
         elif data_source == "dapo/aime-2025":
             problem, answer = row["problem"], row["answer"]
 
         prompt = problem + answer_format
         data = {
-            "data_source": data_source.split("/")[1].lower(),  # aime_2024, aime_2025
+            "data_source": data_source.split("/")[1].lower(),  # aime_2024_raw, aime_2024, aime_2025
             "prompt": [{"role": "user", "content": prompt}],
             "ability": "MATH",
             "reward_model": {"ground_truth": str(answer)},

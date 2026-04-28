@@ -548,6 +548,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def sleep(self, level: int, data_parallel_rank: int | None = None):
         await self.engine.sleep(level, data_parallel_rank=data_parallel_rank)
+        await self.engine.reset_encoder_cache()
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
             # Here we do an aggressive empty cache for TMS.

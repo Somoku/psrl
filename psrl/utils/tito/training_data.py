@@ -6,11 +6,18 @@ into prompt_ids, response_ids, response_mask, and logprobs arrays.
 
 from __future__ import annotations
 
+import logging
+import os
+
+psrl_logger = logging.getLogger(__name__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 
 def build_training_arrays(
     accumulated_token_ids: list[int],
     records: list[dict],
     max_trim_tokens: int = 0,
+    prompt_ids_override: list[int] | None = None,
 ) -> dict:
     """Convert TITO session data into training arrays.
 
@@ -26,6 +33,9 @@ def build_training_arrays(
             field (0 = DefaultAdapter; 1 = Qwen3/GLM4.7).  A ``ValueError`` is raised
             if the actual trim count exceeds this limit, which indicates a TITO merge
             bug rather than a normal boundary-token situation.
+        prompt_ids_override: Optional initial prompt token ids rendered by the Python/verl
+            path.  When provided, these ids are used as ``prompt_ids`` instead of slicing
+            TITO ``accumulated_token_ids`` by the first record's ``prompt_token_count``.
 
     Returns:
         Dict with keys: prompt_ids, response_ids, response_mask, logprobs, num_turns.
@@ -44,6 +54,7 @@ def build_training_arrays(
     all_logprobs: list[float] = []
 
     cursor = 0
+    total_acc_len = len(accumulated_token_ids)
     for i, record in enumerate(records):
         prompt_len = record["prompt_token_count"]
         raw_lps = record.get("output_logprobs") or []
@@ -55,12 +66,18 @@ def build_training_arrays(
             all_response_mask.extend([0] * len(env_ids))
             all_logprobs.extend([0.0] * len(env_ids))
 
+            psrl_logger.info(
+                "[TITO turn %d] env_ids: cursor=%d, prompt_len=%d, "
+                "env_count=%d, env_ids[:5]=%s",
+                i, cursor, prompt_len, len(env_ids), str(env_ids[:5]),
+            )
+
         # Assistant output tokens
         output_ids = [int(pair[1]) for pair in raw_lps]
         output_logprobs = [float(pair[0]) for pair in raw_lps]
 
         # Trailing trim for non-last turns: greedy match against accumulated.
-        # The last turn never trims — boundary tokens are part of the final output.
+        # The last turn never trims -- boundary tokens are part of the final output.
         is_last = i == len(records) - 1
         if not is_last and output_ids:
             matched = 0
@@ -71,6 +88,14 @@ def build_training_arrays(
                 else:
                     break
             trim_count = len(output_ids) - matched
+
+            psrl_logger.info(
+                "[TITO turn %d] trim analysis: is_last=%s, matched=%d, "
+                "trim_count=%d, allowed=%d, prompt_len=%d, "
+                "output_len=%d, total_acc_len=%d",
+                i, is_last, matched, trim_count, max_trim_tokens,
+                prompt_len, len(output_ids), total_acc_len,
+            )
 
             # Validate against the model-specific ceiling.
             # Last turn: no trimming ever allowed (allowed = 0).
@@ -89,7 +114,10 @@ def build_training_arrays(
             if trim_count > 0:
                 output_ids = output_ids[:matched]
                 output_logprobs = output_logprobs[:matched]
-
+                psrl_logger.info(
+                    "[TITO turn %d] trimmed %d tokens, remaining output_len=%d",
+                    i, trim_count, len(output_ids),
+                )
         all_response_ids.extend(output_ids)
         all_response_mask.extend([1] * len(output_ids))
         all_logprobs.extend(output_logprobs)
@@ -97,7 +125,14 @@ def build_training_arrays(
         cursor = prompt_len + len(output_ids)
 
     first_prompt_len = records[0]["prompt_token_count"]
-    prompt_ids = accumulated_token_ids[:first_prompt_len]
+    prompt_ids = list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
+
+    psrl_logger.info(
+        "[TITO build_training_arrays] prompt_len=%d tito_prompt_len=%d response_len=%d "
+        "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d",
+        len(prompt_ids), first_prompt_len, len(all_response_ids), sum(all_response_mask),
+        len(all_logprobs), len(records), total_acc_len,
+    )
 
     return {
         "prompt_ids": prompt_ids,

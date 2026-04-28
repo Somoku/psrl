@@ -22,13 +22,13 @@ from verl.base_config import BaseConfig
 from verl.workers.config.rollout import (
     CheckpointEngineConfig,
     CustomAsyncServerConfig,
-    MultiTurnConfig,
     PrometheusConfig,
     SamplingConfig,
     ServerConfig,
     TraceConfig,
 )
 from verl.workers.config.rollout import (
+    MultiTurnConfig as _VeRLMultiTurnConfig,
     RolloutConfig as _VeRLRolloutConfig,
     AgentLoopConfig as _VeRLAgentLoopConfig,
 )
@@ -55,6 +55,19 @@ class EnvironmentConfig(BaseConfig):
 class AgentDataConfig(BaseConfig):
     name: str | None = MISSING
 
+@dataclass
+class MultiTurnConfig(_VeRLMultiTurnConfig):
+    _mutable_fields = {"max_turns"}
+
+    enable: bool = False
+    max_turns: int | None = None
+    tool_config_path: str | None = None
+    max_parallel_calls: int = 1
+    max_tool_response_length: int = 256
+    tool_response_truncate_side: str = "middle"
+    use_inference_chat_template: bool = False
+    tokenization_sanity_check_mode: str = "strict"
+    format: str = "hermes"
 
 @dataclass
 class AgentLoopConfig(_VeRLAgentLoopConfig):
@@ -93,6 +106,9 @@ class RolloutConfig(_VeRLRolloutConfig):
 
     # (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
     enable_weights_cpu_backup: bool = False
+
+    # Multi-turn config
+    multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
 
     # Override veRL's AgentLoopConfig with PSRL's richer variant (env + data sub-configs).
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)

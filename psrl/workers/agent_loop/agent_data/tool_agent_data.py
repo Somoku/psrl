@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import uuid
 
 import ray
 import torch
@@ -17,9 +19,17 @@ from psrl.tools.tool_parser.base import ToolParser
 from psrl.workers.agent_loop.agent_data.base import AgentData, Trajectory
 from psrl.workers.gen_dplb.utils import TokenOutput
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+
+def sort_tool_schema_keys(value):
+    """Return a copy of a tool schema value with all dict keys sorted recursively."""
+    if isinstance(value, dict):
+        return {key: sort_tool_schema_keys(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [sort_tool_schema_keys(item) for item in value]
+    return copy.deepcopy(value)
 
 @AgentData.register("tool_agent_data")
 class ToolAgentData(AgentData[ConversationType, ToolAction]):
@@ -34,35 +44,11 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
     integrates with chat templates for proper formatting.
     """
 
-    @classmethod
-    def init_class(cls, config: DictConfig, **kwargs):
-        """Initialize class-level shared resources for all instances.
-
-        This method sets up the tokenizer, maximum turns, and tool parser that
-        will be shared across all ToolAgentData instances.
-
-        Args:
-            config: Configuration object containing training settings
-            tokenizer: Tokenizer for converting between text and tokens
-            **kwargs: Additional keyword arguments from configuration
-        """
-        if cls._class_initialized:
-            return
-        cls._class_initialized = True
-
-        # Initialize class-level attributes from config
-        cls.max_turns = config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-
-        # Initialize tool parser for extracting tool calls from model output
-        cls.tool_parser = ToolParser.get_tool_parser(config.gen_actor_rollout_ref.rollout.multi_turn.format, tokenizer)
-
     def __init__(
         self,
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
         env: Environment,
-        tokenizer: AutoTokenizer,
-        processor: AutoProcessor | None = None,
         **kwargs,
     ):
         """Initialize ToolAgentData instance.
@@ -77,10 +63,11 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         """
         assert hasattr(env, "get_tool_schemas"), "Environment must implement get_tool_schemas method."
 
-        self.init_class(config=config, **kwargs)
-        super().__init__(config, reward_manager, env, tokenizer, processor, dataset_cls)
-        self.tool_schemas = self.env.get_tool_schemas()
+        super().__init__(config, reward_manager, env)
+        self.tool_schemas = sort_tool_schema_keys(self.env.get_tool_schemas())
         self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
+        self.max_turns = self.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
+        self.tool_parser = ToolParser.get_tool_parser(self.config.gen_actor_rollout_ref.rollout.multi_turn.format, self.tokenizer)
 
         # Pre-compute system prompt token ids for incremental turn stripping.
         # This mirrors AgentLoopBase._get_system_prompt_ids() but lives here so
@@ -164,9 +151,9 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             prompt_ids = normalize_token_ids(tokenized_prompt)
 
         if not is_init:
-            token_ids = prompt_ids[len(self._system_prompt_ids):]
+            prompt_ids = prompt_ids[len(self._system_prompt_ids):]
 
-        return token_ids, is_init
+        return prompt_ids, is_init
 
     def format_chat_completions(self, observation: ConversationType, *, is_init: bool) -> ConversationType:
         """ToolEnvironment already uses ConversationType as observation, so return as-is."""
@@ -178,9 +165,31 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         Returns a list of OpenAI-function-call style dicts:
         [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
         """
-        _, tool_calls = self.tool_parser.extract_tool_calls(token_ids)
+        _, tool_calls = self.tool_parser.extract_tool_calls_from_token_ids(token_ids)
         tool_calls_dict = [
             {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": tool_call.to_dict(),
+            }
+            for tool_call in tool_calls
+        ]
+        # Ensure tool call arguments are JSON strings (required by chat template)
+        for i, call in enumerate(tool_calls_dict):
+            if isinstance(call.get("function", {}).get("arguments"), dict):
+                tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        return tool_calls_dict
+
+    def decode_action_from_response_str(self, response_str: str) -> ToolAction:
+        """Decode model generated response string into ToolAction.
+
+        Returns a list of OpenAI-function-call style dicts:
+        [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
+        """
+        _, tool_calls = self.tool_parser.extract_tool_calls_from_str(response_str)
+        tool_calls_dict = [
+            {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
                 "type": "function",
                 "function": tool_call.to_dict(),
             }
@@ -366,7 +375,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         messages = []
         for step in self.trajectory.steps:
             messages.extend(step.chat_completions)
-        tools = self.env.get_tool_schemas()
+        tools = self.tool_schemas
         return messages, tools
 
     def _parse_tool_calls(self, tool_calls: list[dict]):
@@ -387,16 +396,19 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         assistant_msg = choice["message"]
 
         # Update step
-        current_step = self.trajectory.steps[-1]
-        current_step.chat_completions.append(assistant_msg)
-        current_step.model_response = assistant_msg.get("content", "") or ""
+        self.trajectory.assistant_turns += 1
+        model_response = assistant_msg.get("content", "") or ""
 
-        # Parse tool calls into action
-        tool_calls = assistant_msg.get("tool_calls")
-        if tool_calls:
-            action = self._parse_tool_calls(tool_calls)
-        else:
-            action = assistant_msg.get("content", "")
+        try:
+            tool_calls_dict = self.decode_action_from_response_str(model_response)
+        except Exception as e:
+            psrl_logger.error("Failed to parse tool calls: %s", e)
+            tool_calls_dict = []
+
+        # Update current step with assistant response
+        self.add_step_chat_message(assistant_msg)
+        self.set_step_model_response(model_response)
+        self.set_step_action(tool_calls_dict)
 
         # Check length limit
         usage = output.get("usage", {})
@@ -406,5 +418,4 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             + self.config.gen_actor_rollout_ref.rollout.response_length
         )
 
-        current_step.action = action
-        return action, overlong
+        return tool_calls_dict, overlong

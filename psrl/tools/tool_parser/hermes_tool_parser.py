@@ -24,8 +24,11 @@ class HermesToolParser(ToolParser):
         self.tool_call_regex = regex.compile(r"<tool_call>(.*?)</tool_call>", regex.DOTALL)
 
     @rollout_trace_op
-    def extract_tool_calls(self, responses_ids: list[int]) -> tuple[str, list[ToolCall]]:
+    def extract_tool_calls_from_token_ids(self, responses_ids: list[int]) -> tuple[str, list[ToolCall]]:
         response_str = self.tokenizer.decode(responses_ids)
+        return self.extract_tool_calls_from_str(response_str)
+
+    def extract_tool_calls_from_str(self, response_str: str) -> tuple[str, list[ToolCall]]:
         if self.tool_call_start_token not in response_str or self.tool_call_end_token not in response_str:
             return response_str, []
 

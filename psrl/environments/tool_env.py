@@ -52,6 +52,14 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         # Initialize tools from configuration file
         tool_config_path = config.gen_actor_rollout_ref.rollout.multi_turn.tool_config_path
         tools = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+
+        # Per-sample tool selection: filter global tools by extra_info.tool_selection
+        extra_info = kwargs.get("extra_info", {}) or {}
+        tool_selection = extra_info.get("tool_selection")
+        if tool_selection:
+            selected = [tool for tool in tools if tool.name in tool_selection]
+            tools = selected
+        
         cls.tools = ToolGroup(tools=tools)
 
     def __init__(
@@ -62,6 +70,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         tokenizer: AutoTokenizer,
         processor: AutoProcessor | None = None,
         dataset_cls = None,
+        **kwargs,
     ):
         """
         Initialize the ToolEnvironment.
@@ -74,7 +83,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             processor: Optional multimodal processor (e.g. Qwen2VLProcessor).
             dataset_cls: Optional dataset class for loading data.
         """
-        super().__init__(config, reward_manager, tokenizer, processor, dataset_cls)
+        super().__init__(config, reward_manager, tokenizer, processor, dataset_cls, **kwargs)
 
         self.max_turns = max_turns
         self.num_turn = 0

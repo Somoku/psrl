@@ -62,7 +62,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
         return fields
 
     @rollout_trace_op
-    async def run(self, request: dict) -> tuple[TokenOutput | None, TerminateReason]:
+    async def run(self, request: dict, **kwargs) -> tuple[TokenOutput | None, TerminateReason]:
         """Execute generation for a single request.
 
         Args:
@@ -82,6 +82,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
             tokenizer=self.tokenizer,
             processor=self.processor,
             dataset_cls=self.dataset_cls,
+            **kwargs,
         )
         self.agent_data = AgentData.get_agent_data(
             data_class,
@@ -97,9 +98,6 @@ class MultiTurnAgentLoop(AgentLoopBase):
         )
 
         self.agent_data.init_trajectory(request)
-
-        # Extract per-sample tools_kwargs (populated by init_trajectory via extra_fields).
-        tools_kwargs: dict = self.agent_data.trajectory.extra_fields.get("tools_kwargs", {})
 
         overlong_terminate = await self.agent_data.update_from_env(observation, 0, False, info)
 

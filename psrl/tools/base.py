@@ -394,6 +394,18 @@ class ToolGroup(Tool):
         """
         return list(self.tools.keys())
 
+    def has_tool(self, name: str) -> bool:
+        """
+        Check if a tool with the given name exists in the group.
+
+        Args:
+            name: The name of the tool to check
+
+        Returns:
+            bool: True if the tool exists, False otherwise
+        """
+        return name in self.tools
+
 
 def initialize_tools_from_config(config_path: str) -> list[Tool]:
     """Initialize tools from a configuration file.

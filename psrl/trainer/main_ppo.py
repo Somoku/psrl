@@ -355,16 +355,6 @@ class TaskRunner:
         """Add reward model worker."""
         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_ServerAdapter)
 
-    def add_teacher_model_resource_pool(self, config):
-        """Add teacher model worker if enabled."""
-        if is_distillation_enabled(config.get("distillation")):
-            # we do not use teacher model workers, so we only register teacher model in resource pool
-            # without registering a teacher model worker in role-worker mapping
-            if config.distillation.teacher_model.enable_resource_pool:
-                self.mapping[PSRL_Role.TeacherModel] = "teacher_pool"
-            else:
-                self.mapping[PSRL_Role.TeacherModel] = "train_pool"
-
     def add_dummy_worker(self, config):
         from psrl.trainer.ppo.utils import PSRL_DummyWorker
 
@@ -398,8 +388,6 @@ class TaskRunner:
 
         # AGENT(VERL): PSRL use reward model worker.
         self.add_reward_model_worker(config)
-
-        self.add_teacher_model_resource_pool(config)
 
         # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
         self.add_dummy_worker(config)

@@ -535,15 +535,11 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
     async def finalize_output(self) -> TokenOutput | None:
         """Finalize the trajectory and prepare output for reward computation."""
-        self.trajectory.response_ids = self.trajectory.response_ids[
-            : self.config.gen_actor_rollout_ref.rollout.response_length
-        ]
-        self.trajectory.response_mask = self.trajectory.response_mask[
-            : self.config.gen_actor_rollout_ref.rollout.response_length
-        ]
-        self.trajectory.response_logprobs = self.trajectory.response_logprobs[
-            : self.config.gen_actor_rollout_ref.rollout.response_length
-        ]
+        response_length = self.config.gen_actor_rollout_ref.rollout.response_length
+
+        self.trajectory.response_ids = self.trajectory.response_ids[: response_length]
+        self.trajectory.response_mask = self.trajectory.response_mask[: response_length]
+        self.trajectory.response_logprobs = self.trajectory.response_logprobs[: response_length]
         
         multi_modal_data = None
         if self.trajectory.image_data is not None or self.trajectory.video_data is not None:
@@ -563,7 +559,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 else None
             ),
             routed_experts=(
-                self.trajectory.routed_experts
+                self.trajectory.routed_experts[: len(self.trajectory.prompt_ids) + response_length]
                 if len(self.trajectory.routed_experts) > 0
                 else None
             ),

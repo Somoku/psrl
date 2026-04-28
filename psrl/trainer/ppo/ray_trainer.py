@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import math
 import os
 import time
 from collections import defaultdict
@@ -19,6 +21,7 @@ from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.single_controller.ray.base import SubRayResourcePool, create_colocated_worker_cls_fused
 from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -735,7 +738,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
                 inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
                 outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
-                scores = data["rm_scores"].sum(-1).cpu().tolist()
+                scores = data["rm_scores"].sum(dim=1).tolist()
             
                 reward_model = data.pop("reward_model", None)
                 if reward_model is not None:
@@ -864,7 +867,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # 5. Release TQ storage for this val batch.
             tq.kv_clear(keys=test_batch.keys, partition_id=test_batch.partition_id)
 
-        # self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        reward_extra_infos_to_dump = {
+            k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in reward_extra_infos_dict.items()
+        }
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -874,7 +881,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=val_data_dir,
             )
 
@@ -894,6 +901,45 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.switch_to_trainer_mode()
 
         return self._val_metrics_update(data_sources, sample_parent_ids, reward_extra_infos_dict, sample_turns)
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+
+        n = len(inputs)
+        base_data = {
+            "input": inputs,
+            "output": outputs,
+            "gts": gts,
+            "score": scores,
+            "step": [self.global_steps] * n,
+        }
+
+        for k, v in reward_extra_infos_dict.items():
+            if len(v) == n:
+                base_data[k] = v
+
+        def json_encode_default(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        lines = []
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False, default=json_encode_default))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Dumped generations to {filename}")
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():
@@ -2096,17 +2142,38 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if self.use_critic:
                 self.critic_wg.stop_profile()
 
+    def _get_required_batch_multiple(self, dp_size: int) -> int:
+        """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
+        required_multiple = dp_size
+
+        # If enabled with critic training, the batch should align with critic PPO mini-batches.
+        if self.use_critic:
+            critic_global_mini_batch_size = self.config.critic.ppo_mini_batch_size
+            critic_global_mini_batch_size *= self.config.train_actor_rollout_ref.rollout.n
+            required_multiple = math.lcm(required_multiple, critic_global_mini_batch_size)
+
+        # If there is an actor update, the batch should align with actor PPO mini-batches too.
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            actor_global_mini_batch_size = self.config.train_actor_rollout_ref.actor.ppo_mini_batch_size
+            actor_global_mini_batch_size *= self.config.train_actor_rollout_ref.rollout.n
+            required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
+
+        # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
+        return required_multiple
+
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         batch_size = len(batch)
         fields = ["seq_len"]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-        global_seqlen_lst = torch.tensor(tu.get(data, "seq_len"), dtype=torch.int64)
-        workload_lst = calculate_workload(global_seqlen_lst)
-        workload_lst_list = workload_lst.tolist()  # list version for partitioning functions
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_wg, "actor")
+
+        batch_multiple = self._get_required_batch_multiple(dp_size)
+        batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+        global_seqlen_lst = torch.tensor(tu.get(data, "seq_len"), dtype=torch.int64)
+        workload_lst = calculate_workload(global_seqlen_lst)
 
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
         # AGENT(VERL): PSRL use `parent_id` to group samples from the same episode,
@@ -2138,23 +2205,23 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         elif keep_minibatch:
             # Decouple the DP balancing and mini-batching.
             minibatch_size = self.config.train_actor_rollout_ref.actor.get("ppo_mini_batch_size")
-            minibatch_num = len(workload_lst_list) // minibatch_size
+            minibatch_num = len(workload_lst) // minibatch_size
             global_partition_lst = [[] for _ in range(dp_size)]
             for i in range(minibatch_num):
                 rearrange_minibatch_lst = get_seqlen_balanced_partitions(
-                    workload_lst_list[i * minibatch_size : (i + 1) * minibatch_size],
+                    workload_lst[i * minibatch_size : (i + 1) * minibatch_size],
                     k_partitions=dp_size,
                     equal_size=True,
                 )
                 for j, part in enumerate(rearrange_minibatch_lst):
                     global_partition_lst[j].extend([x + minibatch_size * i for x in part])
         else:
-            global_partition_lst = get_seqlen_balanced_partitions(workload_lst_list, k_partitions=dp_size, equal_size=True)
+            global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
         # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
         # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
         if not getattr(self, "use_prefix_grouper", False):
             for idx, partition in enumerate(global_partition_lst):
-                partition.sort(key=lambda x: (workload_lst_list[x], x))
+                partition.sort(key=lambda x: (workload_lst[x], x))
                 ordered_partition = partition[::2] + partition[1::2][::-1]
                 global_partition_lst[idx] = ordered_partition
 
@@ -2165,6 +2232,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             seqlen_list=global_seqlen_lst.tolist(), partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+        return batch
 
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the values of the batch."""
@@ -2268,7 +2336,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the reference log prob of the batch."""
         # 1. compute log probs
-        metadata = {"calculate_entropy": False, "compute_loss": False}
+        metadata = {
+            "calculate_entropy": False,
+            "compute_loss": False,
+            "temperature": self.config.gen_actor_rollout_ref.rollout.temperature,
+        }
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
         batch.extra_info.update(metadata)
@@ -2318,11 +2390,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # 1. compute log probs
         # add meta info
-        batch.extra_info.update({"calculate_entropy": True, "compute_loss": False})
+        calculate_sum_pi_squared = self.config.train_actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
+        batch.extra_info.update(
+            {
+                "calculate_entropy": True,
+                "compute_loss": False,
+                "calculate_sum_pi_squared": calculate_sum_pi_squared,
+                "temperature": self.config.gen_actor_rollout_ref.rollout.temperature,
+            }
+        )
         output: KVBatchMeta = self.actor_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
-        fields = ["entropy", "log_probs", "response_mask", "responses", "rollout_log_probs", "metrics"]
+        fields = ["entropy", "log_probs", "sum_pi_squared", "response_mask", "responses", "rollout_log_probs", "metrics"]
         t_start = time.time()
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         t_end = time.time()
@@ -2331,10 +2411,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+        if calculate_sum_pi_squared:
+            data["sum_pi_squared"] = response_from_nested(data.pop("sum_pi_squared"), data["response_mask"])
         # old_log_prob_mfu = tu.get(data, "metrics")["mfu"]
         t_start = time.time()
+        fields = ["old_log_probs", "entropy"]
+        if calculate_sum_pi_squared:
+            fields.append("sum_pi_squared")
         tq.kv_batch_put(
-            keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs", "entropy")
+            keys=batch.keys, partition_id=batch.partition_id, fields=data.select(*fields)
         )
         t_end = time.time()
         psrl_logger.debug(f"_compute_old_log_prob time to put data: {t_end - t_start:.2f}")
@@ -2365,7 +2450,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         """Update the actor network."""
         ppo_mini_batch_size = self.config.train_actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
-        calculate_entropy = self.config.train_actor_rollout_ref.actor.entropy_coeff != 0.0
+        calculate_entropy = self.config.train_actor_rollout_ref.actor.calculate_entropy or (
+            self.config.train_actor_rollout_ref.actor.entropy_coeff != 0.0
+        )
         distillation_use_topk =(
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
@@ -2410,13 +2497,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         output: TensorDict = output.get()
         output = rename_dict(output["metrics"], "critic/")
         output["perf/mfu/critic"] = output.pop("critic/mfu")
-        critic_metrics = reduce_metrics(output) # 从 DataProto.from_single_dict 替换为 reduce_metrics
+        critic_metrics = reduce_metrics(output)
         metrics.update(critic_metrics)
 
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps):
         # 1. collect necessary fields from TransferQueue for computing metrics
+        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
             "prompts",
             "responses",
@@ -2433,6 +2521,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
             fields.extend(gdpo_reward_keys)
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -2443,18 +2532,20 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
         batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+        metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps})
-        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
-        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
-        num_turns = np.array(data.pop("num_turns").tolist())
+        if non_padding_mask.any():
+            num_turns = num_turns[non_padding_mask]
         metrics.update(
             {
                 "training/num_turns/mean": num_turns.mean(),
@@ -2634,7 +2725,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # which won't affect the advantage calculation (since it's based on uid),
                 # but might affect the loss calculation (due to the change of mini-batching).
                 if self.config.trainer.balance_batch:
-                    self._balance_batch(batch, metrics=metrics)
+                    batch = self._balance_batch(batch, metrics=metrics)
 
                 # compute global_valid tokens
                 batch.extra_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature

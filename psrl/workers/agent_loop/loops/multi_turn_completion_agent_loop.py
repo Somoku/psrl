@@ -7,7 +7,7 @@ from transformers import AutoProcessor, AutoTokenizer
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from psrl.environments.base import Environment
-from psrl.utils.common.http_utils import _ensure_http_client, get, post
+from psrl.utils.common.http_utils import delete, get, post
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.utils.tito.training_data import build_training_arrays
 from psrl.workers.gen_dplb.utils import TokenOutput
@@ -79,9 +79,8 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         base = self.session_router_url.rstrip("/")
         url = f"{base}/sessions/{session_id}"
         try:
-            client = await _ensure_http_client()
-            async with client.delete(url) as resp:
-                psrl_logger.info("Deleted TITO session %s (status=%s)", session_id, resp.status)
+            resp = await delete(url)
+            psrl_logger.info("Deleted TITO session %s (status=%s)", session_id, resp.status)
         except Exception:
             psrl_logger.warning("Failed to delete TITO session %s", session_id, exc_info=True)
 
@@ -140,7 +139,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
     # Main loop
     # ------------------------------------------------------------------
 
-    def build_extra_headers(self, request: dict) -> dict[str, str]:                                                                                                                            
+    def build_extra_headers(self, request: dict) -> dict[str, str]:
         is_validate = request.get("validate", False)
         request_id = request["uid"]
         version_tag = request.get("version_tag", 0)
@@ -210,6 +209,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
                 return await self.agent_data.finalize_output(), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             terminate_reason = TerminateReason.FINISHED
+            done = False
             for _ in range(self.max_turns):
                 # 1. Build messages/tools from agent data
                 messages, tools = self.agent_data.prepare_chat_completion_request()

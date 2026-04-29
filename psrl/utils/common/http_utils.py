@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import socket
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -73,24 +75,121 @@ _http_client: aiohttp.ClientSession | None = None
 # Maximum concurrency for the global HTTP client
 _client_concurrency: int = 256
 
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+}
+
+
+@dataclass(slots=True)
+class HttpResponse:
+    """Fully buffered HTTP response for proxy-style callers."""
+
+    status: int
+    body: bytes
+    headers: dict[str, str]
+
+    def json(self) -> Any:
+        return json.loads(self.body)
+
+
+def filter_http_headers(
+    headers: Mapping[str, str],
+    *,
+    excluded: set[str] | None = None,
+) -> dict[str, str]:
+    """Remove hop-by-hop headers before forwarding requests or responses."""
+    blocked = HOP_BY_HOP_HEADERS if excluded is None else HOP_BY_HOP_HEADERS | excluded
+    return {key: value for key, value in headers.items() if key.lower() not in blocked}
+
+
+def create_aiohttp_client(
+    *,
+    concurrency: int | None = None,
+    timeout: aiohttp.ClientTimeout | None = None,
+) -> aiohttp.ClientSession:
+    """Create an aiohttp client configured for long-running rollout requests."""
+    connector = aiohttp.TCPConnector(
+        limit=_client_concurrency if concurrency is None else concurrency,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    return aiohttp.ClientSession(
+        connector=connector,
+        timeout=aiohttp.ClientTimeout(total=None) if timeout is None else timeout,
+    )
+
 
 async def _ensure_http_client() -> aiohttp.ClientSession:
     global _http_client
     if _http_client is None or _http_client.closed:
-        connector = aiohttp.TCPConnector(
-            limit=_client_concurrency,
-            ttl_dns_cache=300,
-            enable_cleanup_closed=True,
-        )
-        # Respect configured request timeout when provided.
-        _http_client = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=None),
-        )
+        _http_client = create_aiohttp_client()
     return _http_client
 
 
-async def _post(client, url, payload, max_retries=5, headers: dict[str, str] | None = None):
+async def close_http_client() -> None:
+    """Close the global aiohttp client if it has been created."""
+    global _http_client
+    if _http_client is not None and not _http_client.closed:
+        await _http_client.close()
+    _http_client = None
+
+
+async def raw_request(
+    method: str,
+    url: str,
+    *,
+    content: bytes | None = None,
+    headers: Mapping[str, str] | None = None,
+    params: Mapping[str, str] | None = None,
+    client: aiohttp.ClientSession | None = None,
+    max_retries: int = 1,
+) -> HttpResponse:
+    """Send one HTTP request and return a fully buffered response.
+
+    This helper is intentionally status-code agnostic.  It is suitable for
+    proxy paths where 4xx/5xx responses should be forwarded instead of raised.
+    """
+    retry_count = 0
+    session = client or await _ensure_http_client()
+    while True:
+        try:
+            async with session.request(
+                method,
+                url,
+                data=content,
+                headers=headers,
+                params=params,
+            ) as response:
+                body = await response.read()
+                return HttpResponse(
+                    status=response.status,
+                    body=body,
+                    headers=filter_http_headers(response.headers),
+                )
+        except Exception as e:
+            retry_count += 1
+            if retry_count >= max_retries:
+                raise
+            psrl_logger.info(
+                "Error: %s, retrying... (attempt %s/%s, url=%s)",
+                e,
+                retry_count,
+                max_retries,
+                url,
+            )
+            await asyncio.sleep(1)
+
+
+async def _post(client, url, payload, max_retries=1, headers: dict[str, str] | None = None):
     """POST JSON payload with retries.
 
     Args:
@@ -142,7 +241,7 @@ async def _post(client, url, payload, max_retries=5, headers: dict[str, str] | N
     return output
 
 
-async def _get(client, url, params=None, max_retries=5, headers: dict[str, str] | None = None):
+async def _get(client, url, params=None, max_retries=1, headers: dict[str, str] | None = None):
     """GET JSON payload with retries."""
     retry_count = 0
     while retry_count < max_retries:
@@ -194,13 +293,18 @@ def init_http_client(server_concurrency: int, rollout_engine_num: int):
     _client_concurrency = server_concurrency * rollout_engine_num
 
 
-async def post(url, payload, max_retries=5, headers: dict[str, str] | None = None):
+async def post(url, payload, max_retries=1, headers: dict[str, str] | None = None):
     """POST JSON payload using the global HTTP client."""
     client = await _ensure_http_client()
     return await _post(client, url, payload, max_retries=max_retries, headers=headers)
 
 
-async def get(url, params: dict[str, Any] | None = None, max_retries=5, headers: dict[str, str] | None = None):
+async def get(url, params: dict[str, Any] | None = None, max_retries=1, headers: dict[str, str] | None = None):
     """GET JSON payload using the global HTTP client."""
     client = await _ensure_http_client()
     return await _get(client, url, params=params, max_retries=max_retries, headers=headers)
+
+
+async def delete(url, max_retries=1, headers: dict[str, str] | None = None) -> HttpResponse:
+    """DELETE a URL and return the fully buffered response."""
+    return await raw_request("DELETE", url, headers=headers, max_retries=max_retries)

@@ -1,183 +1,217 @@
-"""Lightweight session router proxy for TITO-aware chat completions.
-
-Responsibilities:
-1. Session lifecycle (create/get/delete) → proxied to SMG /v1/tito/sessions
-2. Inject x-smg-tito-session-id header on session-scoped requests
-3. Force logprobs=true on /v1/chat/completions (required for vLLM backend)
-4. Serialize concurrent chat completion requests per session using a split-lock
-   pattern (Phase 1: lock + check → Phase 2: HTTP proxy unlocked → Phase 3:
-   lock + increment turn counter).
-"""
-
 import asyncio
 import json
 import logging
+from dataclasses import dataclass, field
 
-import httpx
+import aiohttp
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
-logger = logging.getLogger(__name__)
+from psrl.utils.common.http_utils import (
+    HttpResponse,
+    create_aiohttp_client,
+    raw_request,
+)
 
+psrl_logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class SessionState:
+    """Local concurrency state for one TITO session."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    drained: asyncio.Event = field(default_factory=asyncio.Event)
+    closing: bool = False
+    inflight: int = 0
+    turn: int = 0
+
+    def __post_init__(self) -> None:
+        if self.inflight == 0:
+            self.drained.set()
+        else:
+            self.drained.clear()
 
 class SessionRouter:
-    def __init__(self, smg_url: str):
+    def __init__(
+        self,
+        smg_url: str,
+        client_concurrency: int = 1024,
+    ):
         self.smg_url = smg_url.rstrip("/")
         self.app = FastAPI()
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
-        # Per-session concurrency state
-        self._session_locks: dict[str, asyncio.Lock] = {}
-        self._session_turn: dict[str, int] = {}
-        self._session_closing: dict[str, bool] = {}
-        self._session_inflight: dict[str, int] = {}
-        self._session_drained: dict[str, asyncio.Event] = {}
-        self._setup_routes()
+        self.client: aiohttp.ClientSession | None = None
+        self.client_concurrency = client_concurrency
+        self.states: dict[str, SessionState] = {}
+        self.states_lock = asyncio.Lock()
+        self.setup_routes()
+        self.app.router.on_shutdown.append(self.aclose)
 
-    def _setup_routes(self):
+    def setup_routes(self):
         self.app.post("/sessions")(self.create_session)
         self.app.get("/sessions/{sid}")(self.get_session)
         self.app.delete("/sessions/{sid}")(self.delete_session)
         self.app.post("/sessions/{sid}/v1/chat/completions")(self.session_chat_completions)
-        # Catch-all for all other session-scoped paths (including GET for sub-paths)
         self.app.api_route(
             "/sessions/{sid}/{path:path}",
             methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
         )(self.session_proxy)
 
-    def _get_or_create_lock(self, sid: str) -> asyncio.Lock:
-        if sid not in self._session_locks:
-            self._session_locks[sid] = asyncio.Lock()
-        return self._session_locks[sid]
+    async def aclose(self):
+        """Close the router-owned aiohttp client."""
+        if self.client is not None and not self.client.closed:
+            await self.client.close()
 
-    def _get_or_create_drained_event(self, sid: str) -> asyncio.Event:
-        event = self._session_drained.get(sid)
-        if event is None:
-            event = asyncio.Event()
-            event.set()
-            self._session_drained[sid] = event
-        return event
+    async def create_session(self) -> Response:
+        result = await self._request_upstream("POST", "v1/tito/sessions")
+        if result.status < 400:
+            session_id = self.extract_session_id(result)
+            if session_id is not None:
+                await self._ensure_state(session_id)
+        return self.build_response(result)
 
-    async def create_session(self):
-        resp = await self.client.post(f"{self.smg_url}/v1/tito/sessions")
-        data = resp.json()
-        sid = data.get("session_id")
-        if sid:
-            self._session_locks[sid] = asyncio.Lock()
-            self._session_turn[sid] = 0
-            self._session_closing[sid] = False
-            self._session_inflight[sid] = 0
-            drained = asyncio.Event()
-            drained.set()
-            self._session_drained[sid] = drained
-        return JSONResponse(status_code=resp.status_code, content=data)
+    async def get_session(self, sid: str) -> Response:
+        result = await self._request_upstream("GET", f"v1/tito/sessions/{sid}")
+        return self.build_response(result)
 
-    async def get_session(self, sid: str):
-        resp = await self.client.get(f"{self.smg_url}/v1/tito/sessions/{sid}")
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers),
-        )
+    async def delete_session(self, sid: str) -> Response:
+        state = await self._ensure_state(sid)
+        async with state.lock:
+            state.closing = True
 
-    async def delete_session(self, sid: str):
-        lock = self._get_or_create_lock(sid)
-        async with lock:
-            self._session_closing[sid] = True
-            drained = self._get_or_create_drained_event(sid)
+        await state.drained.wait()
 
-        await drained.wait()
+        result = await self._request_upstream("DELETE", f"v1/tito/sessions/{sid}")
 
-        async with lock:
-            await self.client.delete(f"{self.smg_url}/v1/tito/sessions/{sid}")
-            # Clean up all per-session state while holding the lock.
-            self._session_locks.pop(sid, None)
-            self._session_turn.pop(sid, None)
-            self._session_closing.pop(sid, None)
-            self._session_inflight.pop(sid, None)
-            self._session_drained.pop(sid, None)
+        async with self.states_lock:
+            if self.states.get(sid) is state:
+                self.states.pop(sid, None)
+        return self.build_response(result)
 
-        return Response(status_code=204)
-
-    async def session_chat_completions(self, sid: str, request: Request):
-        lock = self._get_or_create_lock(sid)
-
-        # ── Phase 1: lock, check closing, capture expected_turn ──────────────
-        async with lock:
-            if self._session_closing.get(sid, False):
-                return Response(
-                    content=b'{"error":"session is closing"}',
-                    status_code=409,
-                    media_type="application/json",
-                )
-            expected_turn = self._session_turn.get(sid, 0)
-            self._session_inflight[sid] = self._session_inflight.get(sid, 0) + 1
-            self._get_or_create_drained_event(sid).clear()
+    async def session_chat_completions(self, sid: str, request: Request) -> Response:
+        state = await self._ensure_state(sid)
+        async with state.lock:
+            if state.closing:
+                return JSONResponse(status_code=409, content={"error": "session is closing"})
+            expected_turn = state.turn
+            state.inflight += 1
+            state.drained.clear()
 
         try:
-            # ── Phase 2: proxy to SMG (lock NOT held — avoids blocking other ops) ─
-            body = json.loads(await request.body())
-            body["logprobs"] = True
-            headers = self._extract_headers(request)
-            headers["x-smg-tito-session-id"] = sid
-            resp = await self.client.post(
-                f"{self.smg_url}/v1/chat/completions",
-                content=json.dumps(body),
+            headers = self.add_session_headers(request, sid)
+            result = await self._request_upstream(
+                "POST",
+                "v1/chat/completions",
+                content=await request.body(),
                 headers=headers,
             )
-
-            # ── Phase 3: lock, handle stale write, increment turn ─────────────────
-            async with lock:
-                if sid not in self._session_turn:
-                    # Session was fully deleted while request was in-flight. Pass the
-                    # response through without touching any state — no zombie entries created.
-                    return Response(
-                        content=resp.content,
-                        status_code=resp.status_code,
-                        headers=dict(resp.headers),
-                    )
-                current_turn = self._session_turn[sid]
-                if current_turn != expected_turn:
-                    # Concurrent write detected: another request already incremented the
-                    # counter. Pass the response through but do not double-increment.
-                    logger.warning(
-                        "SessionRouter: stale write detected for sid=%s "
-                        "(expected_turn=%d, current=%d); skipping increment",
-                        sid,
-                        expected_turn,
-                        current_turn,
-                    )
-                else:
-                    self._session_turn[sid] = current_turn + 1
-
-            return Response(
-                content=resp.content,
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
-            )
+            if result.status < 400:
+                async with state.lock:
+                    if state.turn != expected_turn:
+                        psrl_logger.warning(
+                            "SessionRouter stale write detected for sid=%s expected_turn=%s current_turn=%s.",
+                            sid,
+                            expected_turn,
+                            state.turn,
+                        )
+                        return
+                    state.turn += 1
+            return self.build_response(result)
         finally:
-            async with lock:
-                inflight = self._session_inflight.get(sid, 0)
-                if inflight <= 1:
-                    self._session_inflight[sid] = 0
-                    self._get_or_create_drained_event(sid).set()
-                else:
-                    self._session_inflight[sid] = inflight - 1
+            async with state.lock:
+                state.inflight = max(0, state.inflight - 1)
+                if state.inflight == 0:
+                    state.drained.set()
 
-    async def session_proxy(self, sid: str, path: str, request: Request):
-        headers = self._extract_headers(request)
-        headers["x-smg-tito-session-id"] = sid
-        resp = await self.client.request(
-            method=request.method,
-            url=f"{self.smg_url}/{path}",
+    async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
+        headers = self.add_session_headers(request, sid)
+        result = await self._request_upstream(
+            request.method,
+            path,
             content=await request.body(),
             headers=headers,
         )
+        return self.build_response(result)
+
+    async def _ensure_state(self, sid: str) -> SessionState:
+        async with self.states_lock:
+            state = self.states.get(sid)
+            if state is None:
+                state = SessionState()
+                self.states[sid] = state
+            return state
+
+    async def _request_upstream(
+        self,
+        method: str,
+        path: str,
+        *,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> HttpResponse:
+        url = f"{self.smg_url}/{path.lstrip('/')}"
+        try:
+            return await raw_request(
+                method,
+                url,
+                content=content,
+                headers=headers,
+                client=await self._ensure_client(),
+                max_retries=1,
+            )
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            psrl_logger.warning(
+                "SessionRouter upstream transport error for %s %s: %s.",
+                method,
+                path,
+                exc,
+            )
+            body = json.dumps(
+                {
+                    "error": f"backend transport error: {type(exc).__name__}: {exc}",
+                }
+            ).encode()
+            return HttpResponse(
+                status=502,
+                body=body,
+                headers={"content-type": "application/json"},
+            )
+
+    async def _ensure_client(self) -> aiohttp.ClientSession:
+        if self.client is None or self.client.closed:
+            self.client = create_aiohttp_client(concurrency=self.client_concurrency)
+        return self.client
+
+    @staticmethod
+    def build_response(result: HttpResponse) -> Response:
+        content_type = result.headers.get("content-type", "")
+        if not result.body or result.status in (204, 304):
+            return Response(
+                content=result.body,
+                status_code=result.status,
+                headers=result.headers,
+                media_type=content_type or None,
+            )
+        if content_type.startswith("application/json"):
+            return JSONResponse(
+                content=json.loads(result.body or b"{}"),
+                status_code=result.status,
+                headers=result.headers,
+            )
         return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers),
+            content=result.body,
+            status_code=result.status,
+            headers=result.headers,
+            media_type=content_type or None,
         )
 
     @staticmethod
-    def _extract_headers(request: Request) -> dict:
-        return {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    def extract_session_id(result: HttpResponse) -> str | None:
+        session_id = result.json().get("session_id")
+        return session_id if isinstance(session_id, str) else None
+
+    @staticmethod
+    def add_session_headers(request: Request, sid: str) -> dict[str, str]:
+        headers = request.headers
+        headers["x-smg-tito-session-id"] = sid
+        return headers

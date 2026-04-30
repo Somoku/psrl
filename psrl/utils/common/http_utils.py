@@ -189,7 +189,7 @@ async def raw_request(
             await asyncio.sleep(1)
 
 
-async def _post(client, url, payload, max_retries=1, headers: dict[str, str] | None = None):
+async def _post(client, url, payload, max_retries=5, headers: dict[str, str] | None = None):
     """POST JSON payload with retries.
 
     Args:
@@ -241,7 +241,7 @@ async def _post(client, url, payload, max_retries=1, headers: dict[str, str] | N
     return output
 
 
-async def _get(client, url, params=None, max_retries=1, headers: dict[str, str] | None = None):
+async def _get(client, url, params=None, max_retries=5, headers: dict[str, str] | None = None):
     """GET JSON payload with retries."""
     retry_count = 0
     while retry_count < max_retries:
@@ -293,13 +293,13 @@ def init_http_client(server_concurrency: int, rollout_engine_num: int):
     _client_concurrency = server_concurrency * rollout_engine_num
 
 
-async def post(url, payload, max_retries=1, headers: dict[str, str] | None = None):
+async def post(url, payload, max_retries=5, headers: dict[str, str] | None = None):
     """POST JSON payload using the global HTTP client."""
     client = await _ensure_http_client()
     return await _post(client, url, payload, max_retries=max_retries, headers=headers)
 
 
-async def get(url, params: dict[str, Any] | None = None, max_retries=1, headers: dict[str, str] | None = None):
+async def get(url, params: dict[str, Any] | None = None, max_retries=5, headers: dict[str, str] | None = None):
     """GET JSON payload using the global HTTP client."""
     client = await _ensure_http_client()
     return await _get(client, url, params=params, max_retries=max_retries, headers=headers)

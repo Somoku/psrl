@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from psrl.utils.common.http_utils import (
     HttpResponse,
     create_aiohttp_client,
+    filter_http_headers,
     raw_request,
 )
 
@@ -98,11 +99,13 @@ class SessionRouter:
             state.drained.clear()
 
         try:
+            body = json.loads(await request.body())
+            body["logprobs"] = True
             headers = self.add_session_headers(request, sid)
             result = await self._request_upstream(
                 "POST",
                 "v1/chat/completions",
-                content=await request.body(),
+                content=json.dumps(body).encode(),
                 headers=headers,
             )
             if result.status < 400:
@@ -114,8 +117,8 @@ class SessionRouter:
                             expected_turn,
                             state.turn,
                         )
-                        return
-                    state.turn += 1
+                    else:
+                        state.turn += 1
             return self.build_response(result)
         finally:
             async with state.lock:
@@ -212,6 +215,6 @@ class SessionRouter:
 
     @staticmethod
     def add_session_headers(request: Request, sid: str) -> dict[str, str]:
-        headers = request.headers
+        headers = filter_http_headers(request.headers)
         headers["x-smg-tito-session-id"] = sid
         return headers

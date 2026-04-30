@@ -1,6 +1,6 @@
-From 79e1874996550a2b5649f5c6f8e26189f25f4631 Mon Sep 17 00:00:00 2001
+From ff147f2a6bac8aa9e001311067ec6b46f96f6b1e Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Tue, 28 Apr 2026 17:46:53 +0800
+Date: Thu, 30 Apr 2026 19:31:33 +0800
 Subject: [PATCH] tms, metrics, ray resource num, data sampling
 
 ---
@@ -9,13 +9,12 @@ Subject: [PATCH] tms, metrics, ray resource num, data sampling
  verl/trainer/config/data/legacy_data.yaml     |   2 +-
  verl/trainer/config/engine/fsdp.yaml          |   2 +
  verl/trainer/config/engine/megatron.yaml      |   2 +
- verl/trainer/ppo/metric_utils.py              |  31 ++++-
- verl/utils/dataset/rl_dataset.py              |  28 ++++
+ verl/trainer/ppo/metric_utils.py              |  29 ++++
+ verl/utils/dataset/rl_dataset.py              |  27 ++++
  verl/workers/config/engine.py                 |   1 +
- verl/workers/engine/base.py                   |   5 +-
  verl/workers/engine/fsdp/transformer_impl.py  |  59 +++++----
  .../engine/megatron/transformer_impl.py       | 125 ++++++++++--------
- 11 files changed, 198 insertions(+), 101 deletions(-)
+ 10 files changed, 193 insertions(+), 98 deletions(-)
 
 diff --git a/verl/protocol.py b/verl/protocol.py
 index 4a1034b3..4dff2655 100644
@@ -146,7 +145,7 @@ index ec4883dd..fdf1e75e 100644
  override_ddp_config: {}
  
 diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
-index 946f7611..6112f446 100644
+index 946f7611..9a820ba7 100644
 --- a/verl/trainer/ppo/metric_utils.py
 +++ b/verl/trainer/ppo/metric_utils.py
 @@ -131,6 +131,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
@@ -192,24 +191,14 @@ index 946f7611..6112f446 100644
          # score
          "critic/score/mean": score_mean,
          "critic/score/max": score_max,
-@@ -637,7 +666,7 @@ def process_validation_metrics(
- 
-             for var_name, var_vals in var2vals.items():
-                 # skip empty or string values
--                if not var_vals or isinstance(var_vals[0], str):
-+                if not var_vals or isinstance(var_vals[0], str) or isinstance(var_vals[0], dict):
-                     continue
- 
-                 # compute mean and std
 diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
-index a0195347..151d4133 100644
+index c0889727..3a33bb98 100644
 --- a/verl/utils/dataset/rl_dataset.py
 +++ b/verl/utils/dataset/rl_dataset.py
-@@ -114,6 +114,15 @@ class RLHFDataset(Dataset):
-         self.truncation = config.get("truncation", "error")
+@@ -115,6 +115,15 @@ class RLHFDataset(Dataset):
          self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
          self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
-+        
+ 
 +        self.data_source_name = config.get("data_source_name", data_files[0])
 +        default_reward_model_dict = {
 +            "reward_loop_type": "naive",
@@ -218,10 +207,11 @@ index a0195347..151d4133 100644
 +            "reward_coef": 1.0,
 +        }
 +        self.reward_model_dicts = config.get("reward_model_dicts", [default_reward_model_dict])
- 
++
          self.tool_config_path = config.get("tool_config_path", None)
          self.tool_schemas = None
-@@ -290,6 +299,17 @@ class RLHFDataset(Dataset):
+         if self.tool_config_path:
+@@ -287,6 +296,17 @@ class RLHFDataset(Dataset):
          else:
              print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
  
@@ -239,11 +229,10 @@ index a0195347..151d4133 100644
      def __getstate__(self):
          if not self.serialize_dataset:
              state = self.__dict__.copy()
-@@ -383,6 +403,14 @@ class RLHFDataset(Dataset):
+@@ -378,6 +398,13 @@ class RLHFDataset(Dataset):
              logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict["data_source"])
          row_dict["index"] = index
          row_dict["tools_kwargs"] = tools_kwargs
-+
 +        # add reward loop type and reward fn
 +        row_dict["reward_model_dicts"] = self.reward_model_dicts
 +
@@ -255,7 +244,7 @@ index a0195347..151d4133 100644
  
      @classmethod
 diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
-index 9075c7fd..9b7342d8 100644
+index 13cc048f..e350aef9 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
 @@ -112,6 +112,7 @@ class EngineConfig(BaseConfig):
@@ -266,24 +255,8 @@ index 9075c7fd..9b7342d8 100644
  
      full_determinism: bool = False
      router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
-diff --git a/verl/workers/engine/base.py b/verl/workers/engine/base.py
-index 5e2e0d7d..a2c243ae 100644
---- a/verl/workers/engine/base.py
-+++ b/verl/workers/engine/base.py
-@@ -176,8 +176,9 @@ class BaseEngine:
-             optimizer: If True, move the optimizer states.
-             grad: If True, move the gradient buffer.
-         """
--        if not model:
--            assert not optimizer and not grad, "Model must be moved to device along with optimizer and grad"
-+        pass
-+        # if not model:
-+        #     assert not optimizer and not grad, "Model must be moved to device along with optimizer and grad"
- 
-     def save_checkpoint(
-         self,
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index f966814c..3f97f6ec 100644
+index 657d3e2e..a75f81aa 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
 @@ -75,6 +75,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -300,7 +273,7 @@ index f966814c..3f97f6ec 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -517,32 +524,36 @@ class FSDPEngine(BaseEngine):
+@@ -533,32 +540,36 @@ class FSDPEngine(BaseEngine):
      def _build_model_optimizer(self):
          from verl.utils.model import print_model_size
  

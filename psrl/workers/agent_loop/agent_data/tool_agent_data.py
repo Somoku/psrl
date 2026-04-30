@@ -9,14 +9,13 @@ import torch
 import numpy as np
 from omegaconf import DictConfig
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 
 from psrl.environments.base import ConversationType, Environment
 from psrl.environments.tool_env import ToolAction
 from psrl.tools.tool_parser.base import ToolParser
-from psrl.workers.agent_loop.agent_data.base import AgentData, Trajectory
+from psrl.workers.agent_loop.agent_data.base import AgentData, Trajectory, SessionData
 from psrl.workers.gen_dplb.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
@@ -206,7 +205,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         Clears the current trajectory and prepares for a new episode.
         """
-        self.trajectory = Trajectory()
+        self.session_data = SessionData()
 
     def init_trajectory(self, request: dict) -> None:
         """Initialize a new trajectory from the input request.
@@ -222,11 +221,14 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         """
         request_id = request.get("uid", 0)
         parent_id = request.get("parent_id", None)
+        validate = request.get("validate", False)
 
-        self.trajectory = Trajectory(
+        self.session_data = SessionData(
             request_id=request_id,
             parent_id=parent_id,
+            validate=validate,
         )
+        self.session_data.trajectories.append(Trajectory())
 
     async def update_from_env(
         self,
@@ -252,23 +254,23 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         Returns:
             bool: True if response length limit is reached, False otherwise
         """
-        is_init = len(self.trajectory.steps) == 0
+        is_init = len(self.session_data.trajectories[-1].steps) == 0
 
         multi_modal_data = info.get("multi_modal_data", {})
         images = multi_modal_data.get("images", None)
         videos = multi_modal_data.get("videos", None)
 
         if images:
-            if self.trajectory.image_data is None:
-                self.trajectory.image_data = []
-            elif not isinstance(self.trajectory.image_data, list):
-                self.trajectory.image_data = [self.trajectory.image_data]
+            if self.session_data.trajectories[-1].image_data is None:
+                self.session_data.trajectories[-1].image_data = []
+            elif not isinstance(self.session_data.trajectories[-1].image_data, list):
+                self.session_data.trajectories[-1].image_data = [self.session_data.trajectories[-1].image_data]
             for img in images:
-                self.trajectory.image_data.append(img)
+                self.session_data.trajectories[-1].image_data.append(img)
         if videos:
             raise NotImplementedError("Video data handling is not yet implemented in ToolAgentData.")
 
-        if len(self.trajectory.steps) < self.max_turns:
+        if len(self.session_data.trajectories[-1].steps) < self.max_turns:
             # Create a new step explicitly (avoids implicit steps[-1] contract).
             if isinstance(reward, float):
                 reward = [reward]
@@ -296,10 +298,10 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             # currently we just sum them up for trajectory-level reward computation,
             # but we may want to keep them separate for more detailed credit assignment.
             tool_reward = np.sum(reward) if isinstance(reward, list) else reward
-            self.trajectory.tool_rewards.append(tool_reward)
+            self.session_data.trajectories[-1].tool_rewards.append(tool_reward)
 
         # Check if response length limit is reached
-        return self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length
+        return self.session_data.trajectories[-1].response_length >= self.config.gen_actor_rollout_ref.rollout.response_length
 
     async def update_from_model_token_ids(self, output: TokenOutput, **kwargs) -> tuple[ToolAction, bool]:
         """Update agent data from model token ids output.
@@ -316,7 +318,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
                 dictionaries and done indicates if response limit is reached
         """
         # Ensure we have a step to attach model output to.
-        if len(self.trajectory.steps) == 0:
+        if len(self.session_data.trajectories[-1].steps) == 0:
             # This should not happen in MultiTurnAgentLoop, but keep a safe fallback
             # for custom loops or unexpected call orders.
             self.start_step(observation=[], reward=None, done=False, info={})
@@ -355,7 +357,8 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         # Compute step reward if using step-level reward mode
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
-            output.num_turns = self.trajectory.assistant_turns + self.trajectory.user_turns + 1
+            # TODO(linsh): check whether use global num_turns for step reward
+            output.num_turns = self.session_data.assistant_turns + self.session_data.user_turns + 1
             data = tu.get_tensordict({
                 "prompts": torch.tensor(output.prompt_ids, dtype=torch.int64).unsqueeze(0),
                 "responses": torch.tensor(output.response_ids, dtype=torch.int64).unsqueeze(0),
@@ -366,14 +369,14 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(data)["reward_score"]
 
         # Check if response length limit is reached
-        if self.trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:
+        if self.session_data.trajectories[-1].response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:
             return [], True
         return tool_calls_dict, False
 
     def prepare_chat_completion_request(self) -> tuple[list[dict], list[dict] | None]:
         """Build messages and tools from current trajectory state."""
         messages = []
-        for step in self.trajectory.steps:
+        for step in self.session_data.trajectories[-1].steps:
             messages.extend(step.chat_completions)
         tools = self.tool_schemas
         return messages, tools
@@ -396,7 +399,8 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         assistant_msg = choice["message"]
 
         # Update step
-        self.trajectory.assistant_turns += 1
+        self.session_data.assistant_turns += 1
+        self.session_data.trajectories[-1].assistant_turns += 1
         model_response = assistant_msg.get("content", "") or ""
 
         try:

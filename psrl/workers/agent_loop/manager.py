@@ -280,7 +280,7 @@ class PSRL_AgentLoopManager:
     async def _inner_dispatch_data(self, data: KVBatchMeta, is_validate: bool = False):
         """Update request status to RUNNING in PSManager, then fan out to workers."""
         # Rows are ordered as contiguous groups of `rollout_n` children per parent.
-        uids = [int(key) for key in data.keys]
+        uids = [tag["uid"] for tag in data.tags]
         versions = [tag["version_tag"] for tag in data.tags]
 
         # Update request status from PENDING to RUNNING
@@ -319,7 +319,7 @@ class PSRL_AgentLoopManager:
         if rollout_n > 1:
             prompt_ids = [tag["parent_id"] for tag in data.tags]
         else:
-            prompt_ids = [int(key) for key in data.keys]
+            prompt_ids = [tag["uid"] for tag in data.tags]
 
         # Round-robin dispatching
         for i, prompt_id in enumerate(prompt_ids):
@@ -341,8 +341,9 @@ class PSRL_AgentLoopManager:
         prompt_id: int,
         rollout_instance_id: RolloutInstanceId | tuple | list,
         version_tag: int,
+        n_trajectory: int = 1,
         is_validate: bool = False,
-    ):
+    ) -> bool:
         """Flat-arg RPC invoked by rollout workers once a request finishes.
 
         The rollout worker has already written the per-sample TensorDict to
@@ -350,6 +351,9 @@ class PSRL_AgentLoopManager:
         corresponding ``EntryInfo`` into the manager's trackers and triggers
         PSManager occupation, running group/buffer post-processing on
         KVBatchMeta slices (never on tensor payload).
+        
+        Returns:
+            bool: True if the request is occupied, False if the request is aborted.
         """
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
@@ -367,6 +371,7 @@ class PSRL_AgentLoopManager:
                     request_idx=request_id % rollout_n,
                     prompt_id=prompt_id,
                     model_version=version_tag,
+                    n_trajectory=n_trajectory,
                     is_validate=is_validate,
                 )
                 self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
@@ -466,7 +471,7 @@ class PSRL_AgentLoopManager:
 
             # 2. Occupy requests in the PS worker
             if not occupy_futures:
-                return
+                return False
             with log_dual_events(
                 "Occupy requests",
                 psrl_logger,
@@ -557,6 +562,7 @@ class PSRL_AgentLoopManager:
                     await self.handle_ready_buffer(buffer_id, is_validate)
                     accumulated_buffers.pop(buffer_id)
                     accumulated_buffer_size.pop(buffer_id)
+            return True
 
     def maybe_add_buffer(self, buffer_id: int, batch: KVBatchMeta, is_validate: bool = False) -> bool:
         """
@@ -593,21 +599,36 @@ class PSRL_AgentLoopManager:
         tags: list[dict] = []
         for entry_info in entry_infos:
             request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
+            n_trajectories = entry_info.n_trajectory if isinstance(entry_info.n_trajectory, list) else [entry_info.n_trajectory]
             model_versions = (
                 entry_info.model_version if isinstance(entry_info.model_version, list) else [entry_info.model_version]
             )
-            for j, request_idx in enumerate(request_idxs):
-                keys.append(str(entry_info.prompt_id * rollout_n + request_idx))
-                tags.append(
-                    {
+
+            for j, (request_idx, n_trajectory) in enumerate(zip(request_idxs, n_trajectories)):
+                if n_trajectory == 1:
+                    keys.append(f"{entry_info.prompt_id * rollout_n + request_idx}")
+                    tags.append({
                         "uid": entry_info.prompt_id * rollout_n + request_idx,
                         "parent_id": entry_info.prompt_id,
                         "version_tag": (
                             model_versions[j] if j < len(model_versions) else model_versions[-1]
                         ),
                         "rollout_instance_id": entry_info.rollout_instance_id,
-                    }
-                )
+                    })
+                else:
+                    keys.append(f"{entry_info.prompt_id * rollout_n + request_idx}_{n_trajectory}")
+                    tags.extend(
+                        [
+                            {
+                                "uid": entry_info.prompt_id * rollout_n + request_idx,
+                                "parent_id": entry_info.prompt_id,
+                                "version_tag": (
+                                    model_versions[j] if j < len(model_versions) else model_versions[-1]
+                                ),
+                                "rollout_instance_id": entry_info.rollout_instance_id,
+                            } for _ in range(n_trajectory)
+                        ]
+                    )
         return KVBatchMeta(keys=keys, tags=tags, partition_id=partition)
 
     async def _group_post_process(self, entry_infos: list[EntryInfo]) -> bool:
@@ -627,9 +648,14 @@ class PSRL_AgentLoopManager:
             "Group post-processing should not be applied to validation data."
         )
 
-        keys = [
-            str(entry_info.prompt_id * self.rollout_n + entry_info.request_idx) for entry_info in entry_infos
-        ]
+        keys = []
+        for entry_info in entry_infos:
+            if entry_info.n_trajectory == 1:
+                keys.append(f"{entry_info.prompt_id * self.rollout_n + entry_info.request_idx}")
+            else:
+                for i in range(entry_info.n_trajectory):
+                    keys.append(f"{entry_info.prompt_id * self.rollout_n + entry_info.request_idx}_{i}")
+        
         # TODO(linsh): optimize by only fetching necessary columns for post-processing instead of the full TD.
         meta = KVBatchMeta(
             keys=keys,
@@ -665,7 +691,7 @@ class PSRL_AgentLoopManager:
         """
         assert self.buffer_post_process_fn is not None, "Buffer post-processing function is not set."
 
-        original_keys = list(batch_meta.keys)
+        original_keys = batch_meta.keys
         # TODO(linsh): optimize by only fetching necessary columns for post-processing instead of the full TD.
         data = tq.kv_batch_get_by_meta(batch_meta)
         processed_data = self.buffer_post_process_fn(data)
@@ -695,7 +721,15 @@ class PSRL_AgentLoopManager:
         # Partial clear: recover kept keys from the processor's uid column and
         # rebuild EntryInfo inventory + a tighter KVBatchMeta.
         request_ids = tu.get_non_tensor_data(processed_data, "uid")
-        kept_keys = [str(request_id) for request_id in request_ids]
+        trajectory_indexs = tu.get_non_tensor_data(processed_data, "trajectory_index")
+        trajectory_nums = tu.get_non_tensor_data(processed_data, "trajectory_num")
+        
+        kept_keys = []
+        for request_id, trajectory_index, trajectory_num in zip(request_ids, trajectory_indexs, trajectory_nums):
+            if trajectory_num == 1:
+                kept_keys.append(f"{request_id}")
+            else:
+                kept_keys.append(f"{request_id}_{trajectory_index}")
         dropped_keys = [k for k in original_keys if k not in set(kept_keys)]
         if dropped_keys:
             tq.kv_clear(keys=dropped_keys, partition_id=batch_meta.partition_id)
@@ -713,23 +747,20 @@ class PSRL_AgentLoopManager:
             self.train_accumulated_buffers[buffer_id].setdefault(model_version, []).append(entry_info)
             self.train_accumulated_buffer_size[buffer_id] += 1
 
-        tags = [
-            {
-                "parent_id": entry_info.prompt_id,
-                "uid": entry_info.prompt_id * self.rollout_n + (
-                    entry_info.request_idx[0]
-                    if isinstance(entry_info.request_idx, list)
-                    else entry_info.request_idx
-                ),
-                "version_tag": (
-                    entry_info.model_version[0]
-                    if isinstance(entry_info.model_version, list)
-                    else entry_info.model_version
-                ),
-                "rollout_instance_id": entry_info.rollout_instance_id,
-            }
-            for entry_info in prompt_entry_infos
-        ]
+        tags = []
+        version_tags = tu.get_non_tensor_data(processed_data, "version_tag")
+        rollout_instance_ids = tu.get_non_tensor_data(processed_data, "rollout_instance_id")
+        for request_id, version_tag, rollout_instance_id in zip(request_ids, version_tags, rollout_instance_ids):
+            tags.append({
+                "uid": request_id,
+                "version_tag": version_tag,
+                "rollout_instance_id": rollout_instance_id,
+            })
+        if self.rollout_n > 1:
+            parent_ids = tu.get_non_tensor_data(processed_data, "parent_id")
+            for parent_id, tag in zip(parent_ids, tags):
+                tag["parent_id"] = parent_id
+
         new_meta = KVBatchMeta(
             keys=kept_keys,
             tags=tags,
@@ -758,8 +789,9 @@ class PSRL_AgentLoopManager:
             rollout_instance_ids = tu.get_non_tensor_data(data, "rollout_instance_id")
             request_ids = tu.get_non_tensor_data(data, "uid")
             model_versions = tu.get_non_tensor_data(data, "version_tag")
-            for parent_id, rollout_instance_id, request_id, model_version in zip(
-                parent_ids, rollout_instance_ids, request_ids, model_versions
+            trajectory_nums = tu.get_non_tensor_data(data, "trajectory_num")
+            for parent_id, rollout_instance_id, request_id, model_version, trajectory_num in zip(
+                parent_ids, rollout_instance_ids, request_ids, model_versions, trajectory_nums
             ):
                 if parent_id in entry_infos_map:
                     entry_info = entry_infos_map[parent_id]
@@ -777,12 +809,20 @@ class PSRL_AgentLoopManager:
                             entry_info.model_version,
                             model_version,
                         ]
+                    if isinstance(entry_info.n_trajectory, list):
+                        entry_info.n_trajectory.append(trajectory_num)
+                    else:
+                        entry_info.n_trajectory = [
+                            entry_info.n_trajectory,
+                            trajectory_num,
+                        ]
                 else:
                     entry_info = EntryInfo(
                         rollout_instance_id=rollout_instance_id,
                         request_idx=request_id % rollout_n,
                         prompt_id=parent_id,
                         model_version=model_version,
+                        n_trajectory=trajectory_num,
                         is_validate=is_validate,
                     )
                     entry_infos_map[parent_id] = entry_info
@@ -790,14 +830,16 @@ class PSRL_AgentLoopManager:
             request_ids = tu.get_non_tensor_data(data, "uid")
             model_versions = tu.get_non_tensor_data(data, "version_tag")
             rollout_instance_ids = tu.get_non_tensor_data(data, "rollout_instance_id")
-            for request_id, model_version, rollout_instance_id in zip(
-                request_ids, model_versions, rollout_instance_ids
+            trajectory_nums = tu.get_non_tensor_data(data, "trajectory_num")
+            for request_id, model_version, rollout_instance_id, trajectory_num in zip(
+                request_ids, model_versions, rollout_instance_ids, trajectory_nums
             ):
                 entry_info = EntryInfo(
                     rollout_instance_id=rollout_instance_id,
                     request_idx=0,
                     prompt_id=request_id,
                     model_version=model_version,
+                    n_trajectory=trajectory_num,
                     is_validate=is_validate,
                 )
                 entry_infos_map[request_id] = entry_info
@@ -1012,7 +1054,7 @@ class PSRL_AgentLoopManager:
         prompt_num = len(batch) // self.val_rollout_n
         prompt_batch_metas = batch.chunk(prompt_num)
         for prompt_batch_meta in prompt_batch_metas:
-            request_ids = [int(key) for key in prompt_batch_meta.keys]
+            request_ids = [tag["uid"] for tag in prompt_batch_meta.tags]
             await self.ps_manager_handle.add_request.remote(request_ids, is_validate=True)
             await self.put_data(prompt_batch_meta, is_validate=True)
         self._val_buffer_id += 1

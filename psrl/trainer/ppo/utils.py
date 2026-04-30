@@ -259,17 +259,20 @@ def compute_advantage_for_multi_trajectories(
             config=config,
         )
 
-    # final session of each agent loop: {uid}_{session_id} => (index, row_index)
+    # final session of each agent loop: uid => (index, row_index)
     final_sessions: dict[str, tuple[int, int]] = {}
     row_session_keys = []
     for i, key in enumerate(batch_keys):
         fields = key.rsplit("_", 1)
-        assert len(fields) == 2, f"Unexpected key format: {key}"
-        uid, index = fields[0], int(fields[1])
-        session_key = uid
+        if len(fields) == 2:
+            uid, index = fields[0], int(fields[1])
+            session_key = uid
+            if session_key not in final_sessions or final_sessions[session_key][0] < index:
+                final_sessions[session_key] = (index, i)
+        else:
+            session_key = key
+            final_sessions[session_key] = (0, i)
         row_session_keys.append(session_key)
-        if session_key not in final_sessions or final_sessions[session_key][0] < index:
-            final_sessions[session_key] = (index, i)
 
     # final session indices in batch data
     final_indices = []

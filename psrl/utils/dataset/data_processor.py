@@ -565,6 +565,7 @@ class DataProcessor:
                 for sample_id in sample_ids
             ]
 
+        # add `parent_id` tag
         if rollout_n > 1:
             for i in range(batch_size):
                 for j in range(rollout_n):

@@ -61,6 +61,11 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         self.max_turns = trainer_config.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
         self.env_step_timeout = trainer_config.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
+    def get_generate_fields(self) -> list[str]:
+        fields = super().get_generate_fields()
+        fields.extend(["env_class", "data_class", "seed"])
+        return fields
+
     # ------------------------------------------------------------------
     # Session helpers
     # ------------------------------------------------------------------
@@ -307,7 +312,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             )
 
             # Attach training arrays to trajectory for finalize_output
-            trajectory = self.agent_data.trajectory
+            trajectory = self.agent_data.session_data.trajectories[0]
             trajectory.prompt_ids = training_arrays["prompt_ids"]
             trajectory.response_ids = training_arrays["response_ids"]
             trajectory.response_mask = training_arrays["response_mask"]

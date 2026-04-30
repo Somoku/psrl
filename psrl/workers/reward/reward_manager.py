@@ -8,17 +8,19 @@ import numpy as np
 import ray
 import torch
 from omegaconf import DictConfig
+
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
 from tensordict import TensorDict
+
 from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils import tensordict_utils as tu
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+from verl.utils import tensordict_utils as tu
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 
-from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -97,8 +99,9 @@ class RewardLoopManager(CommandExtension):
         )
 
         # Reward model configuration
-        self.request_id_to_future = {}
-        self.request_id_to_reward = {}
+        self.request_id_to_n_trajectory = {}
+        self.request_key_to_future = {}
+        self.request_key_to_reward = {}
         self.request_id_to_data_source = {}
 
         # Reward normalization
@@ -422,12 +425,19 @@ class RewardLoopManager(CommandExtension):
                     # 1. Kill running reward computation futures
                     aborted_count = 0
                     for abort_request_id in abort_request_uids:
-                        future_data = self.request_id_to_future.pop(abort_request_id, None)
+                        n_trajectory = self.request_id_to_n_trajectory.pop(abort_request_id, 1)
+                        if n_trajectory > 1:
+                            reward_keys = [f"{abort_request_id}_{i}" for i in range(n_trajectory)]
+                        else:
+                            reward_keys = [str(abort_request_id)]
+
+                        future_data = self.request_key_to_future.pop(abort_request_id, None)
                         if future_data is not None:
                             _, reward_future = future_data
                             ray.kill(reward_future, no_restart=True)
                             aborted_count += 1
-                            self.request_id_to_reward[abort_request_id] = None  # Mark reward as None for aborted requests
+                            for key in reward_keys:
+                                self.request_key_to_reward[key] = None  # Mark reward as None for aborted requests
 
                     psrl_logger.debug(f"Aborted {aborted_count} running reward computations")
                     # 2. Remove from the request tracker (update_status)
@@ -463,10 +473,10 @@ class RewardLoopManager(CommandExtension):
         fields = ["uid", "reward_extra_info", "reward_score", "data_source"]
         data = tq.kv_batch_get(keys=reward_batch.keys, partition_id=reward_batch.partition_id, select_fields=fields)
 
-        uids = data["uid"]
-        reward_extra_infos = data["reward_extra_info"]
-        data_sources = data["data_source"]
-        reward_scores = data["reward_score"]
+        uids = tu.get(data, "uid")
+        reward_extra_infos = tu.get(data, "reward_extra_info")
+        data_sources = tu.get(data, "data_source")
+        reward_scores = tu.get(data, "reward_score")
 
         for reward_extra_info, data_source, reward_score in zip(reward_extra_infos, data_sources, reward_scores):
             reward_extra_info["data_source"] = data_source
@@ -474,30 +484,63 @@ class RewardLoopManager(CommandExtension):
 
         if self.reward_normalization != "batch" and self.reward_normalization != "group":
             data["reward_extra_info"] = reward_extra_infos
-            tq.kv_batch_put(keys=reward_batch.keys, partition_id=reward_batch.partition_id, fields=data.select("reward_extra_info"))
+            tq.kv_batch_put(
+                keys=reward_batch.keys,
+                partition_id=reward_batch.partition_id,
+                fields=data.select("reward_extra_info"),
+            )
             return reward_batch
 
+        # final trajectory of each uid: uid => (trajectory_index, row_index)
+        final_trajectories: dict[str, tuple[int, int]] = {}
+        row_session_keys = []
+        for i, key in enumerate(reward_batch.keys):
+            fields = key.rsplit("_", 1)
+            if len(fields) == 2:
+                uid_key, index = fields[0], int(fields[1])
+                if uid_key not in final_trajectories or final_trajectories[uid_key][0] < index:
+                    final_trajectories[uid_key] = (index, i)
+            else:
+                uid_key, index = key, 0
+                final_trajectories[uid_key] = (index, i)
+            row_session_keys.append(uid_key)
+
+        # final trajectory indices in batch data
+        final_indices = []
+        uid_key_to_local_index = {}
+        for uid, (_, row_index) in final_trajectories.items():
+            final_indices.append(row_index)
+            uid_key_to_local_index[uid] = len(final_indices) - 1
+        row_to_local_index = [uid_key_to_local_index[uid_key] for uid_key in row_session_keys]
+
+        # Group final-trajectory rewards by group_id.
         group_rewards_dicts = {}
-        for uid, reward_extra_info, reward_score in zip(uids, reward_extra_infos, reward_scores):
-            reward_extra_info["original_reward_score"] = reward_score
+        for local_index, row_index in enumerate(final_indices):
+            uid = uids[row_index]
             group_id = self.request_id_to_group[uid]
             if group_id not in group_rewards_dicts:
                 group_rewards_dicts[group_id] = {
-                    "uids": [],
+                    "local_indices": [],
                     "rewards": [],
                 }
-            group_rewards_dicts[group_id]["uids"].append(uid)
-            group_rewards_dicts[group_id]["rewards"].append(reward_score)
+            group_rewards_dicts[group_id]["local_indices"].append(local_index)
+            group_rewards_dicts[group_id]["rewards"].append(reward_scores[row_index])
             self.request_id_to_group.pop(uid, None)
 
+        # Normalize rewards for each group
+        final_reward_scores = [0.0] * len(final_indices)
         for group_id, group_rewards_dict in group_rewards_dicts.items():
-            uids = group_rewards_dict["uids"]
+            local_indices = group_rewards_dict["local_indices"]
             rewards = np.array(group_rewards_dict["rewards"])
             psrl_logger.info(f"Rewards for group {group_id}: {len(rewards)}")
             norm_rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-            for uid, norm_reward in zip(uids, norm_rewards):
-                reward_scores[uids.index(uid)] = float(norm_reward)
-        
+            for local_index, norm_reward in zip(local_indices, norm_rewards):
+                final_reward_scores[local_index] = float(norm_reward)
+
+        # Scatter normalized final rewards to all trajectories with the same uid.
+        normalized_reward_scores = [final_reward_scores[local_index] for local_index in row_to_local_index]
+        reward_scores = np.asarray(normalized_reward_scores, dtype=reward_scores.dtype)
+
         # Put updated reward scores and extra info back to the batch
         data["reward_extra_info"] = reward_extra_infos
         data["reward_score"] = reward_scores
@@ -509,26 +552,40 @@ class RewardLoopManager(CommandExtension):
             select_fields=["response_mask"],
         )["response_mask"]
         rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
-        for i, reward_score in enumerate(reward_scores):
-            rm_scores[i][-1] = reward_score
+        rm_scores[:, -1] = torch.as_tensor(reward_scores, dtype=rm_scores.dtype, device=rm_scores.device)
         data["rm_scores"] = rm_scores
 
-        tq.kv_batch_put(keys=reward_batch.keys, partition_id=reward_batch.partition_id, fields=data.select("reward_extra_info", "reward_score", "rm_scores"))
+        tq.kv_batch_put(
+            keys=reward_batch.keys,
+            partition_id=reward_batch.partition_id,
+            fields=data.select("reward_extra_info", "reward_score", "rm_scores"),
+        )
         return reward_batch
 
-    async def compute_score(self, reward_inputs: TensorDict) -> dict[str, Any]:
+    async def compute_score(self, reward_inputs: TensorDict) -> dict[str, Any] | None:
         """
         Compute the reward score for the given inputs.
 
         Args:
             reward_inputs (_post_process_and_merge_reward): Input data for reward computation.
         Returns:
-            dict: A dictionary containing the computed reward score and any additional information.
+            dict | None:
+                A dictionary containing the computed reward score and any additional information,
+                or None if the computation failed.
         """
         reward_inputs = self.pre_process(reward_inputs)
 
         is_validate = tu.get(reward_inputs, "validate", False)
         request_ids = tu.get(reward_inputs, "uid")
+        n_trajectories = tu.get(reward_inputs, "n_trajectory")
+        for request_id, n_trajectory in zip(request_ids, n_trajectories):
+            self.request_id_to_n_trajectory[request_id] = n_trajectory
+        request_keys = []
+        for request_id, n_trajectory in zip(request_ids, n_trajectories):
+            if n_trajectory > 1:
+                request_keys.extend([f"{request_id}_{i}" for i in range(n_trajectory)])
+            else:
+                request_keys.append(str(request_id))
 
         # Update the request status to REWARD_RUNNING
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
@@ -538,7 +595,8 @@ class RewardLoopManager(CommandExtension):
         )
         if not update_status_success:
             # Mark reward as None for requests that fail to update status
-            self.request_id_to_reward[request_ids[0]] = None
+            for request_key in request_keys:
+                self.request_key_to_reward[request_key] = None
             return None
 
         # Compute reward
@@ -626,7 +684,7 @@ class RewardLoopManager(CommandExtension):
         futures = [asyncio.create_task(reward_manager.run_single(reward_input)) for reward_manager in reward_managers]
         results = await asyncio.gather(*futures)
 
-        reward_score = sum(r["reward_score"] * c for r, c in zip(results, reward_coefs))
+        reward_score = np.sum([r["reward_score"] * c for r, c in zip(results, reward_coefs)])
         reward_extra_info_dict = {key: r["reward_extra_info"] for key, r in zip(reward_spec_keys, results)}
         reward_metrics_dict = {key: r.get("reward_metrics", {}) for key, r in zip(reward_spec_keys, results)}
 
@@ -650,7 +708,17 @@ class RewardLoopManager(CommandExtension):
 
         uid = tu.get(reward_input, "uid")[0]
         result = await self._compute_score(reward_input)
-        await self.set_reward_for_requests({uid: result})
+        n_trajectory = tu.get(reward_input, "n_trajectory", 1)
+        
+        # Broadcast to all trajectories
+        trajectory_to_results = {}
+        if n_trajectory > 1:
+            for i in range(n_trajectory):
+                trajectory_to_results[f"{uid}_{i}"] = result
+        else:
+            trajectory_to_results[str(uid)] = result
+        
+        await self.set_reward_for_requests(trajectory_to_results)
 
     async def wait_for_reward_of_requests(self, requests: KVBatchMeta) -> KVBatchMeta:
         """Wait for the reward results of the specified requests.
@@ -659,35 +727,35 @@ class RewardLoopManager(CommandExtension):
         are available, either from previously computed rewards or from ongoing
         reward computation tasks.
         """
-        request_ids = [int(key) for key in requests.keys]
+        request_keys = requests.keys
         is_validate = requests.partition_id == "val"
-
-        request_id_to_reward: dict[int, KVBatchMeta] = {}
+        
+        request_key_to_reward: dict[str, KVBatchMeta] = {}
         futures_to_wait = {}
 
         # Gather available rewards and futures for the requested IDs.
-        for request_id in request_ids:
-            if request_id in self.request_id_to_reward:
-                request_id_to_reward[request_id] = self.request_id_to_reward.pop(request_id)
-            elif request_id in self.request_id_to_future:
-                futures_to_wait[request_id] = self.request_id_to_future[request_id]
+        for request_key in request_keys:
+            if request_key in self.request_key_to_reward:
+                request_key_to_reward[request_key] = self.request_key_to_reward.pop(request_key)
+            elif request_key in self.request_key_to_future:
+                futures_to_wait[request_key] = self.request_key_to_future[request_key]
             else:
                 fut = asyncio.get_running_loop().create_future()
-                self.request_id_to_future[request_id] = fut
-                futures_to_wait[request_id] = fut
+                self.request_key_to_future[request_key] = fut
+                futures_to_wait[request_key] = fut
 
         if futures_to_wait:
             results = await asyncio.gather(*futures_to_wait.values())
-            for request_id, reward in zip(futures_to_wait.keys(), results):
-                request_id_to_reward[request_id] = reward
+            for request_key, reward in zip(futures_to_wait.keys(), results):
+                request_key_to_reward[request_key] = reward
 
         fields = []
-        for request_id in request_ids:
-            fields.append(request_id_to_reward[request_id])
-            self.request_id_to_future.pop(request_id, None)
+        for request_key in request_keys:
+            fields.append(request_key_to_reward[request_key])
+            self.request_key_to_future.pop(request_key, None)
 
         await tq.async_kv_batch_put(
-            keys=requests.keys,
+            keys=request_keys,
             partition_id="train" if not is_validate else "val",
             fields=list_of_dict_to_tensordict(fields),
         )
@@ -697,12 +765,12 @@ class RewardLoopManager(CommandExtension):
         else:
             return requests
 
-    async def set_reward_for_requests(self, request_id_to_reward: dict[int, dict[str, Any]]):
+    async def set_reward_for_requests(self, request_key_to_reward: dict[str, dict[str, Any]]):
         """Set the reward for the specified request IDs."""
-        for request_id, reward in request_id_to_reward.items():
-            if request_id in self.request_id_to_future:
-                fut = self.request_id_to_future[request_id]
+        for request_key, reward in request_key_to_reward.items():
+            if request_key in self.request_key_to_future:
+                fut = self.request_key_to_future[request_key]
                 if not fut.done():
                     fut.set_result(reward)
             else:
-                self.request_id_to_reward[request_id] = reward
+                self.request_key_to_reward[request_key] = reward

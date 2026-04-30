@@ -22,7 +22,6 @@ from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
 from psrl.workers.agent_loop.sticky_session import sticky_session
 
-# from psrl.utils.common.http_utils import post
 from psrl.workers.gen_dplb.utils import TokenInput, TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -31,10 +30,6 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class AgentLoopBase(ABC):
-    # Debug counter - print for first N requests to check input/output correctness
-    _debug_request_count: int = 0
-    _debug_max_requests: int = 3
-
     def __init__(
         self,
         trainer_config: DictConfigWrap,
@@ -128,9 +123,9 @@ class AgentLoopBase(ABC):
     async def apply_chat_template(
         self,
         messages: list[dict],
-        tools: list[dict] = None,
-        images: list[Image.Image] = None,
-        videos: list[tuple[torch.Tensor, dict]] = None,
+        tools: list[dict] | None = None,
+        images: list[Image.Image] | None = None,
+        videos: list[tuple[torch.Tensor, dict]] | None = None,
         remove_system_prompt: bool = False,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
@@ -193,7 +188,12 @@ class AgentLoopBase(ABC):
 
         return prompt_ids
 
-    async def compute_reward_score(self, data: TokenOutput) -> TokenOutput | None:
+    async def compute_reward_score(
+        self,
+        request_id: int,
+        outputs: TokenOutput | list[TokenOutput],
+        is_validate: bool = False,
+    ) -> TokenOutput | list[TokenOutput] | None:
         """Compute reward score for the generated response and merge it into the output.
 
         This function sends the generated response to the reward manager and waits for the computed reward score. If the reward computation is successful, it merges the reward score into the output data structure. If the request is aborted during reward computation (e.g., due to staleness check failure), it returns None to indicate that the request should be aborted.
@@ -203,26 +203,37 @@ class AgentLoopBase(ABC):
         Returns:
             TokenOutput | None: The updated output data structure with the computed reward score, or None if the request was aborted during reward computation.
         """
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        # NOTE(linsh): Only compute reward for the last trajectory.
+        final_output = outputs[-1]
         reward_requests = tu.get_tensordict({
-            "prompts": torch.tensor(data.prompt_ids, dtype=torch.int64).unsqueeze(0),
-            "responses": torch.tensor(data.response_ids, dtype=torch.int64).unsqueeze(0),
-            "multi_modal_data": np.array([data.multi_modal_data], dtype=object),
-            "num_turns": np.array([data.num_turns]),
-            "tool_extra_fields": np.array([data.extra_fields], dtype=object),
+            "prompts": torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0),
+            "responses": torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0),
+            "multi_modal_data": np.array([final_output.multi_modal_data], dtype=object),
+            "num_turns": np.array([final_output.num_turns]),
+            "tool_extra_fields": np.array([final_output.extra_fields], dtype=object),
+            "uid": np.array([request_id]),
+            "validate": is_validate,
+            "n_trajectory": np.array([len(outputs)]),
         })
         reward_result = await self.reward_manager.compute_score.remote(reward_requests)
 
         if not self.config.reward.launch_reward_fn_async:
-            data.reward_score = reward_result["reward_score"]
-            data.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
-            data.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
+            if not reward_result:
+                return None
+            # Broadcast to all trajectories
+            for output in outputs:
+                output.reward_score = reward_result["reward_score"]
+                output.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
+                output.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
 
-        return data
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
 
     async def generate_sequence(self, request: dict, is_sticky_session: bool = False) -> "TokenOutput":
-        # psrl_logger.info(f"Inside {request.non_tensor_batch['uid'][0]=}")
         request_input: TokenInput = await self.pre_process_inputs(request)
-        # psrl_logger.info(f"After process: {request_input.request_id=}")
         sampling_params = self._get_sampling_params(request_input)
         if self.config.psrl.rollout_gateway.enable:
             if not self.gateway_addr:
@@ -322,15 +333,6 @@ class AgentLoopBase(ABC):
             len(request_input.input_ids),
             payload["return_logprob"],
         )
-        AgentLoopBase._debug_request_count += 1
-        if AgentLoopBase._debug_request_count <= AgentLoopBase._debug_max_requests:
-            psrl_logger.info(
-                f"[PSRL-DEBUG] AgentLoop.generate_sequence req#{AgentLoopBase._debug_request_count} "
-                f"(id={request_input.request_id}): "
-                f"sampling_params sent to SMG = {payload_sampling_params}, "
-                f"input_ids len={len(request_input.input_ids)}, "
-                f"return_logprob={payload['return_logprob']}"
-            )
 
         # Call SMG /generate directly via aiohttp so we can read both the
         # response body (a JSON array) and the worker-instance headers in one pass.
@@ -375,15 +377,6 @@ class AgentLoopBase(ABC):
             log_probs[0] if log_probs else None,
             first.get("meta_info", {}).get("finish_reason"),
         )
-        if AgentLoopBase._debug_request_count <= AgentLoopBase._debug_max_requests:
-            psrl_logger.info(
-                f"[PSRL-DEBUG] AgentLoop.generate_sequence response "
-                f"(id={request_input.request_id}): "
-                f"num_output_tokens={len(token_ids)}, "
-                f"num_logprobs={len(log_probs) if log_probs is not None else 'None'}, "
-                f"first_logprob={log_probs[0] if log_probs else None}, "
-                f"finish_reason={first.get('meta_info', {}).get('finish_reason')}"
-            )
 
         # finish_reason: SMG returns {"type": "stop"} or {"type": "length", "length": N}
         finish_reason_raw = first.get("meta_info", {}).get("finish_reason", {})
@@ -811,14 +804,14 @@ class AgentLoopBase(ABC):
         return None, None, None
 
     @abstractmethod
-    async def run(self, request: dict) -> tuple[TokenOutput | None, TerminateReason]:
+    async def run(self, request: dict) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """Execute the agent loop for the given request.
 
         Args:
             request (dict): Input request to process.
 
         Returns:
-            Tuple[TokenOutput | None, TerminateReason]:
+            Tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
                 A tuple containing the output data (if any) and the termination reason.
 
         Raises:
@@ -853,7 +846,7 @@ class AgentLoopBase(ABC):
 
     async def run_with_termination_handling(
         self, request: KVBatchMeta, raise_on_error: bool = True
-    ) -> tuple[TokenOutput | None, TerminateReason]:
+    ) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """Run the agent loop with termination event handling.
 
         This method wraps the run method to catch termination events and handle them appropriately.
@@ -864,7 +857,7 @@ class AgentLoopBase(ABC):
             raise_on_error (bool): Whether to raise exceptions on errors.
 
         Returns:
-            Tuple[TokenOutput | None, TerminateReason]:
+            Tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
                 A tuple containing the output data (if any) and the termination reason.
         """
         try:
@@ -890,7 +883,7 @@ class AgentLoopBase(ABC):
             #     coro, timeout=self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
             # )
             output, terminate_reason = await coro
-            if output is not None and isinstance(output, TokenOutput):
+            if output is not None:
                 return output, terminate_reason
             elif output is None and terminate_reason in (
                 TerminateReason.ABORTED,

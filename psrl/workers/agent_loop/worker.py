@@ -6,11 +6,9 @@ from collections import deque
 
 import torch
 import hydra
-import numpy as np
 import ray
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf
-from tensordict import TensorDict
 from transfer_queue import KVBatchMeta
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils import tensordict_utils as tu
@@ -23,6 +21,7 @@ from verl.workers.config.model import HFModelConfig
 from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.utils.transferqueue_utils import kv_batch_meta_update_tags
 from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
@@ -247,8 +246,12 @@ class PSRL_AgentLoopWorker:
             prompt_index = tu.get(data, "uid")[0]
             request_index = tu.get(data, "uid")[0]
 
+        batch = kv_batch_meta_update_tags(batch, "uid", tu.get(data, "uid"))
+        batch.extra_info["validate"] = tu.get(data, "validate", default=False)[0]
+        batch.extra_info["global_steps"] = tu.get(data, "global_steps", default=-1)[0]
+
         try:
-          await self._run_agent_loop_inner(agent_name, batch, data, prompt_index, request_index)
+          await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
         except Exception as e:
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             psrl_logger.error(
@@ -262,20 +265,19 @@ class PSRL_AgentLoopWorker:
         self,
         agent_name: str,
         batch: KVBatchMeta,
-        data: TensorDict,
         prompt_index,
         request_index,
     ):
         """Inner implementation of the agent loop execution."""
 
-        request_ids = tu.get(data, "uid")
+        request_ids = [tag["uid"] for tag in batch.tags]
 
         with rollout_trace_attr(
             prompt_index=prompt_index,
             request_index=request_index,
-            step=tu.get(data, "global_steps", default=-1),
+            step=batch.extra_info.get("global_steps", -1),
             name=agent_name,
-            validate=tu.get(data, "validate", default=False),
+            validate=batch.extra_info.get("validate", False),
         ):
             assert agent_name in AGENT_LOOP_REGISTRY, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
@@ -296,7 +298,7 @@ class PSRL_AgentLoopWorker:
             )
 
             with log_dual_events(
-                f"Agent loop with requests {tu.get(data, 'uid')}",
+                f"Agent loop with requests {request_ids}",
                 psrl_logger,
                 level=logging.DEBUG,
                 event_type=EventType.GEN,
@@ -321,7 +323,7 @@ class PSRL_AgentLoopWorker:
                     # Retry if applicable
                     if retry_attempt < retry_limit:
                         psrl_logger.warning(
-                            f"Agent loop for requests {tu.get(data, 'uid')} "
+                            f"Agent loop for requests {request_ids} "
                             f"terminated with reason {terminate_reason.value} on "
                             f"attempt {retry_attempt}/{retry_limit}, retrying..."
                         )
@@ -335,21 +337,21 @@ class PSRL_AgentLoopWorker:
                     TerminateReason.ABORTED,
                 ):
                     psrl_logger.warning(
-                        f"Agent loop for requests {tu.get(data, 'uid')} "
+                        f"Agent loop for requests {request_ids} "
                         f"terminated with reason {terminate_reason.value} "
                         f"after {retry_limit} attempts."
                     )
                     output = None
                 else:
                     psrl_logger.debug(
-                        f"Agent loop for requests {tu.get(data, 'uid')} "
+                        f"Agent loop for requests {request_ids} "
                         f"terminated with reason {terminate_reason.value}."
                     )
 
             # Put the output into the TransferQueue and notify PSManager
             # + AgentLoopManager via metadata-only RPCs.
             if output is not None:
-                is_validate = tu.get(data, "validate", default=False)
+                is_validate = batch.extra_info.get("validate", False)
                 with log_dual_events(
                     "Update request status",
                     psrl_logger,
@@ -380,42 +382,69 @@ class PSRL_AgentLoopWorker:
                 )
                 await self.ps_manager_handle.abort_requests.remote(request_ids)
 
-    async def postprocess_output(self, output: TokenOutput, batch: KVBatchMeta):
-        fields = []
-        prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
-        responses = torch.tensor(output.response_ids, dtype=torch.int64)
-        input_ids = torch.cat([prompts, responses], dim=0)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
-        position_ids = self._compute_position_ids(
-            input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
-        ).squeeze(0)
-        
-        field = output.as_dict()
-        # do not store raw image/video
-        field.pop("multi_modal_data", None)
-        field["loss_mask"] = field["response_mask"]
-        field["input_ids"] = input_ids
-        field["position_ids"] = position_ids
-        field["multi_modal_inputs"] = multi_modal_inputs
-        prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
-        field["seq_len"] = prompt_len + response_len
-        field["prompt_len"] = prompt_len
-        field["response_len"] = response_len
-        fields.append(field)
-        await tq.async_kv_batch_put(
-            keys=batch.keys,
-            partition_id=batch.partition_id,
-            fields=list_of_dict_to_tensordict(fields),
-        )
-        
-        await self.agent_loop_manager.occupy_requests.remote(
+    async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: KVBatchMeta):
+        uid = batch.tags[0]["uid"]
+
+        outputs = output if isinstance(output, list) else [output]
+        keys, fields = [], []
+        for i, output in enumerate(outputs):
+            prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+            responses = torch.tensor(output.response_ids, dtype=torch.int64)
+            input_ids = torch.cat([prompts, responses], dim=0)
+            attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+            position_ids = self._compute_position_ids(
+                input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+            ).squeeze(0)
+            
+            if len(outputs) > 1:
+                keys.append(f"{uid}_{i}")
+            else:
+                keys.append(str(uid))
+
+            field = output.as_dict()
+            # do not store raw image/video
+            field.pop("multi_modal_data", None)
+            field["loss_mask"] = field["response_mask"]
+            field["input_ids"] = input_ids
+            field["position_ids"] = position_ids
+            field["multi_modal_inputs"] = multi_modal_inputs
+            prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+            field["seq_len"] = prompt_len + response_len
+            field["prompt_len"] = prompt_len
+            field["response_len"] = response_len
+            field["uid"] = [uid]
+            if "parent_id" in batch.tags[0]:
+                field["parent_id"] = [batch.tags[0]["parent_id"]]
+            field["trajectory_index"] = [i]
+            field["trajectory_num"] = [len(outputs)]
+            fields.append(field)
+
+        occupy_success = await self.agent_loop_manager.occupy_requests.remote(
             request_id=batch.tags[0]["uid"],
             prompt_id=batch.tags[0].get("parent_id", batch.tags[0]["uid"]),
             rollout_instance_id=output.rollout_instance_id,
             version_tag=batch.tags[0]["version_tag"],
+            n_trajectory=len(outputs),
             is_validate=batch.partition_id == "val",
         )
+
+        if occupy_success:
+            # TODO(linsh): optimize data transfer and memory usage by
+            # keeping input data with `key=str(uid)` and output data with `key=f"{uid}_{i}"`
+            # and then join the data in trainer
+            await tq.async_kv_batch_put(
+                keys=keys,
+                partition_id=batch.partition_id,
+                fields=list_of_dict_to_tensordict(fields),
+            )
+            
+            # Clear original input data
+            if len(outputs) > 1:
+                await tq.async_kv_clear(
+                    keys=batch.keys,
+                    partition_id=batch.partition_id,
+                )
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""

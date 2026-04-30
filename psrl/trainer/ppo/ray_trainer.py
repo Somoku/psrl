@@ -746,10 +746,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 else:
                     gts = [None] * len(data)
                 
+                uids = []
+                for key in batch.keys:
+                    parts = key.rsplit("_", 1)
+                    if len(parts) == 2:
+                        uid = parts[0]
+                    else:
+                        uid = key
+                    uids.append(int(uid))
+                
                 # extract reward infos
                 reward_extra_infos_dict = {
                     "reward_extra_info": data["reward_extra_info"],
-                    "uid": [int(key) for key in batch.keys],
+                    "uid": uids,
                 }
 
                 self._dump_generations(
@@ -808,14 +817,31 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # 2. Dispatch to rollout workers.
             # AGENT(VERL): PSRL use its own generate function for validation.
             val_buffer_id = ray.get(self.agent_loop_manager.generate_validate_sequences.remote(test_batch))
-            psrl_logger.info(f"Wait for validate buffer id {val_buffer_id}")
             with log_dual_events(f"Wait for validation batch {val_buffer_id}", psrl_logger, event_type=EventType.WAIT):
-                test_batch: KVBatchMeta = ray.get(
+                test_result: KVBatchMeta = ray.get(
                     self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
                 )
 
             # 3. Score the batch via TQ-native compute_score_for_validation.
-            ray.get(self.reward_manager.wait_for_reward_of_requests.remote(test_batch))
+            ray.get(self.reward_manager.wait_for_reward_of_requests.remote(test_result))
+            
+            # 4. collect necessary data for logging
+            # For multi-output agent loops, only use the final output per session for metrics.
+            # Keys have format {uid}_{index}; keep only the highest index per session.
+            final_indices = []
+            session_max: dict[str, tuple[int, int]] = {}  # session_key -> (max_index, position)
+            for pos, key in enumerate(test_result.keys):
+                parts = key.rsplit("_", 1)
+                if len(parts) == 2:
+                    uid, index = parts[0], int(parts[1])
+                    session_key = uid
+                    if session_key not in session_max or index > session_max[session_key][0]:
+                        session_max[session_key] = (index, pos)
+                else:
+                    session_max[key] = (0, pos)
+            final_indices = sorted(pos for _, pos in session_max.values())
+            final_keys = [test_result.keys[i] for i in final_indices]
+
             fields = [
                 "uid",
                 "parent_id",
@@ -827,12 +853,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "reward_model",
                 "data_source",
             ]
-            data = tq.kv_batch_get(keys=test_batch.keys, partition_id=test_batch.partition_id, select_fields=fields)
+            data = tq.kv_batch_get(keys=final_keys, partition_id=test_result.partition_id, select_fields=fields)
 
             scores = data["rm_scores"].sum(dim=1).tolist()
             sample_scores.extend(scores)
             reward_extra_infos_dict["reward"].extend(scores)
-            reward_extra_infos = tu.get(data, "reward_extra_info", [{}] * len(test_batch))
+            reward_extra_infos = tu.get(data, "reward_extra_info", [{}] * len(final_keys))
             for reward_extra_info in reward_extra_infos:
                 # reward_extra_info is now {loop_key: per_loop_info_dict, ...}.
                 # Merge all per-loop dicts into a single flat dict so downstream
@@ -856,16 +882,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             ground_truths = [
                 item.get("ground_truth", None)
-                for item in (tu.get(data, "reward_model") or [{}] * len(test_batch))
+                for item in (tu.get(data, "reward_model") or [{}] * len(final_keys))
             ]
             sample_gts.extend(ground_truths)
             sample_turns.extend(data.pop("num_turns").tolist())
 
-            data_source = tu.get(data, "data_source") or ["unknown"] * len(test_batch)
+            data_source = tu.get(data, "data_source") or ["unknown"] * len(final_keys)
             data_sources.extend(data_source)
 
             # 5. Release TQ storage for this val batch.
-            tq.kv_clear(keys=test_batch.keys, partition_id=test_batch.partition_id)
+            tq.kv_clear(keys=test_result.keys, partition_id=test_result.partition_id)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 

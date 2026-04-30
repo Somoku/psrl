@@ -58,6 +58,7 @@ class EntryInfo:
     # (i.e., higher than the final occupied buffer ID minus the staleness limit)
     request_idx: int | list[int]
     model_version: int | list[int]
+    n_trajectory: int | list[int]
     is_validate: bool = False
 
     def __hash__(self):

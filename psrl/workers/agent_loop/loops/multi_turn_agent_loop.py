@@ -62,14 +62,15 @@ class MultiTurnAgentLoop(AgentLoopBase):
         return fields
 
     @rollout_trace_op
-    async def run(self, request: dict, **kwargs) -> tuple[TokenOutput | None, TerminateReason]:
+    async def run(self, request: dict, **kwargs) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """Execute generation for a single request.
 
         Args:
             request (dict): Single input request.
 
         Returns:
-            Tuple[TokenOutput, TerminateReason]: Generated response with metadata and termination reason.
+            Tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
+                Generated response with metadata and termination reason.
         """
         env_class = request.get("env_class", self.config.gen_actor_rollout_ref.rollout.agent.env.name)
         data_class = request.get("data_class", self.config.gen_actor_rollout_ref.rollout.agent.data.name)

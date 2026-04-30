@@ -8,9 +8,6 @@ import torch
 import numpy as np
 import ray
 from omegaconf import DictConfig
-from tensordict import TensorDict
-from transformers import AutoProcessor, AutoTokenizer
-from verl.utils.model import compute_position_id_with_mask
 from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
@@ -98,21 +95,6 @@ class Step:
 
 @dataclass
 class Trajectory:
-    """
-    Represents a complete trajectory of agent interactions.
-
-    A trajectory contains multiple steps and tracks the cumulative state and rewards
-    throughout an episode. It includes both the conversation history and tokenized
-    representations for model training.
-    """
-
-    # Unique identifier for this trajectory
-    request_id: int = 0
-    # ID of parent trajectory (for group-based generation)
-    parent_id: int | None = None
-    # Current rollout instance ID
-    curr_rollout_instance_id: RolloutInstanceId | None = None
-
     # List of Step objects comprising this trajectory
     steps: list[Step] = field(default_factory=list)
     # Number of assistant (model) turns taken
@@ -123,8 +105,6 @@ class Trajectory:
     reward: float | None = None
     # Total length of generated responses in tokens
     response_length: int = 0
-    # Additional metadata or debug information
-    info: dict = field(default_factory=dict)
 
     # State variables
     prompt_ids: list[int] = field(default_factory=list)
@@ -144,10 +124,44 @@ class Trajectory:
     # video_data: list of (video_tensor, metadata) tuples.
     image_data: list[Any] | None = None
     video_data: list[Any] | None = None
-
+    
     # Arbitrary extra fields for dynamic addition (e.g. tools_kwargs, interaction_kwargs).
     extra_fields: dict = field(default_factory=dict)
 
+@dataclass
+class SessionData:
+    """
+    Represents a complete session of agent interactions.
+
+    A session contains multiple trajectories and tracks the cumulative state and rewards
+    throughout an episode. It includes both the conversation history and tokenized
+    representations for model training.
+    """
+
+    # Unique identifier for this session
+    request_id: int = 0
+    # ID of parent session (for group-based generation)
+    parent_id: int | None = None
+    # Current rollout instance ID
+    curr_rollout_instance_id: RolloutInstanceId | None = None
+    # val/train session data
+    validate: bool = False
+
+    # List of Step objects comprising this trajectory
+    steps: list[Step] = field(default_factory=list)
+    # Number of assistant (model) turns taken
+    assistant_turns: int = 0
+    # Number of user (environment) turns taken
+    user_turns: int = 0
+    # Total reward accumulated for this trajectory
+    reward: float | None = None
+    # Total length of generated responses in tokens
+    response_length: int = 0
+    # Additional metadata or debug information
+    info: dict = field(default_factory=dict)
+
+    # Trajectories inside a session
+    trajectories: list[Trajectory] = field(default_factory=list)
 
 ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
@@ -191,7 +205,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         self.env = env
         self.tokenizer = self.env.tokenizer
         self.processor = self.env.processor
-        self.trajectory = Trajectory()
+        self.session_data = SessionData()
         self.loop = get_event_loop()
 
         # Discount factor for reward discounting (default: 0.0)
@@ -211,6 +225,9 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         if cls._class_initialized:
             return
         cls._class_initialized = True
+
+    def create_trajectory(self):
+        self.session_data.trajectories.append(Trajectory())
 
     def start_step(self, observation: ObsType, reward: list[float] | None, done: bool, info: dict | None) -> Step:
         """Start (append) a new step to the trajectory.
@@ -236,7 +253,9 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             tool_reward=reward,
             done=done,
         )
-        self.trajectory.steps.append(step)
+        # TODO(linsh): check whether global steps are required
+        self.session_data.steps.append(step)
+        self.session_data.trajectories[-1].steps.append(step)
         return step
 
     @abstractmethod
@@ -264,16 +283,16 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         Raises a clearer error than an IndexError if subclasses call into
         step-dependent helpers before starting a step.
         """
-        if len(self.trajectory.steps) == 0:
+        if len(self.session_data.steps) == 0:
             raise RuntimeError(
                 "No step exists in trajectory yet. Ensure `update_from_env()` (or `start_step()`) "
                 "is called before `update_from_model_*()` methods."
             )
-        return self.trajectory.steps[-1]
+        return self.session_data.steps[-1]
 
     def append_prompt_ids(self, prompt_ids: list[int]) -> None:
         """Set prompt token ids for the trajectory."""
-        self.trajectory.prompt_ids = list(prompt_ids)
+        self.session_data.trajectories[-1].prompt_ids = list(prompt_ids)
 
     def append_user_tokens(self, token_ids: list[int]) -> None:
         """Append tokens that come from the environment/user side.
@@ -283,13 +302,18 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         """
         if not token_ids:
             return
-        self.trajectory.user_turns += 1
-        self.trajectory.response_ids += list(token_ids)
-        self.trajectory.response_mask += [0] * len(token_ids)
-        self.trajectory.response_length += len(token_ids)
-        if len(self.trajectory.response_logprobs) > 0:
+        # Session-level stats
+        self.session_data.user_turns += 1
+        self.session_data.response_length += len(token_ids)
+
+        # Trajectory-level stats
+        self.session_data.trajectories[-1].user_turns += 1
+        self.session_data.trajectories[-1].response_ids += list(token_ids)
+        self.session_data.trajectories[-1].response_mask += [0] * len(token_ids)
+        self.session_data.trajectories[-1].response_length += len(token_ids)
+        if len(self.session_data.trajectories[-1].response_logprobs) > 0:
             # Keep alignment if logprobs are being tracked.
-            self.trajectory.response_logprobs += [0.0] * len(token_ids)
+            self.session_data.trajectories[-1].response_logprobs += [0.0] * len(token_ids)
 
     def append_assistant_tokens(
         self,
@@ -305,14 +329,19 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         """
         if not token_ids:
             return
-        self.trajectory.assistant_turns += 1
-        self.trajectory.response_ids += list(token_ids)
-        self.trajectory.response_mask += [1] * len(token_ids)
-        self.trajectory.response_length += len(token_ids)
+        # Session-level stats
+        self.session_data.assistant_turns += 1
+        self.session_data.response_length += len(token_ids)
+        
+        # Trajectory-level stats
+        self.session_data.trajectories[-1].assistant_turns += 1
+        self.session_data.trajectories[-1].response_ids += list(token_ids)
+        self.session_data.trajectories[-1].response_mask += [1] * len(token_ids)
+        self.session_data.trajectories[-1].response_length += len(token_ids)
         if logprobs:
-            self.trajectory.response_logprobs += list(logprobs)
+            self.session_data.trajectories[-1].response_logprobs += list(logprobs)
         if routed_experts:
-            self.trajectory.routed_experts = routed_experts
+            self.session_data.trajectories[-1].routed_experts = routed_experts
 
     def set_step_action(self, action: ActType) -> None:
         """Set parsed action for the current step."""
@@ -456,7 +485,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
     def update_trajectory_state_from_output(self, output: TokenOutput, **kwargs):
         """Update trajectory state based on model output dataproto."""
-        self.trajectory.curr_rollout_instance_id = output.rollout_instance_id
+        self.session_data.curr_rollout_instance_id = output.rollout_instance_id
         self.get_current_step().info["rollout_instance_id"] = output.rollout_instance_id
 
     def prepare_generation_request(self, request: dict) -> dict:
@@ -470,19 +499,22 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         """
         assert len(request) == 1, "prepare_generation_request only supports single request."
 
-        request["raw_prompt_ids"] = np.array([self.trajectory.prompt_ids])
-        request["raw_response_ids"] = np.array([self.trajectory.response_ids])
-        if self.trajectory.curr_rollout_instance_id is not None:
-            request["rollout_instance_id"] = np.array([self.trajectory.curr_rollout_instance_id])
+        request["raw_prompt_ids"] = np.array([self.session_data.trajectories[-1].prompt_ids])
+        request["raw_response_ids"] = np.array([self.session_data.trajectories[-1].response_ids])
+        if self.session_data.curr_rollout_instance_id is not None:
+            request["rollout_instance_id"] = np.array([self.session_data.curr_rollout_instance_id])
         
         # Propagate accumulated multi-modal data so generate_sequence() can
         # forward it to the inference backend on every turn.
-        if self.trajectory.image_data is not None or self.trajectory.video_data is not None:
+        if (
+            self.session_data.trajectories[-1].image_data is not None
+            or self.session_data.trajectories[-1].video_data is not None
+        ):
             mm: dict = {}
-            if self.trajectory.image_data is not None:
-                mm["images"] = self.trajectory.image_data
-            if self.trajectory.video_data is not None:
-                mm["videos"] = self.trajectory.video_data
+            if self.session_data.trajectories[-1].image_data is not None:
+                mm["images"] = self.session_data.trajectories[-1].image_data
+            if self.session_data.trajectories[-1].video_data is not None:
+                mm["videos"] = self.session_data.trajectories[-1].video_data
             request["multi_modal_data"] = np.array([mm], dtype=object)
 
         return request
@@ -533,74 +565,88 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 G = step.reward + self.gamma * G
                 step.reward = G  # Replace the reward with MC return
 
-    async def finalize_output(self) -> TokenOutput | None:
+    async def finalize_output(self) -> TokenOutput | list[TokenOutput] | None:
         """Finalize the trajectory and prepare output for reward computation."""
         response_length = self.config.gen_actor_rollout_ref.rollout.response_length
 
-        self.trajectory.response_ids = self.trajectory.response_ids[: response_length]
-        self.trajectory.response_mask = self.trajectory.response_mask[: response_length]
-        self.trajectory.response_logprobs = self.trajectory.response_logprobs[: response_length]
-        
-        multi_modal_data = None
-        if self.trajectory.image_data is not None or self.trajectory.video_data is not None:
-            multi_modal_data = {}
-            if self.trajectory.image_data is not None:
-                multi_modal_data["images"] = self.trajectory.image_data
-            if self.trajectory.video_data is not None:
-                multi_modal_data["videos"] = self.trajectory.video_data
-        
-        output: TokenOutput = TokenOutput(
-            prompt_ids=self.trajectory.prompt_ids,
-            response_ids=self.trajectory.response_ids,
-            response_mask=self.trajectory.response_mask,
-            response_log_probs=(
-                self.trajectory.response_logprobs
-                if len(self.trajectory.response_logprobs) > 0
-                else None
-            ),
-            routed_experts=(
-                self.trajectory.routed_experts[: len(self.trajectory.prompt_ids) + response_length]
-                if len(self.trajectory.routed_experts) > 0
-                else None
-            ),
-            multi_modal_data=multi_modal_data,
-            num_turns=self.trajectory.assistant_turns + self.trajectory.user_turns + 1,
-            rollout_instance_id=self.trajectory.curr_rollout_instance_id,
-            extra_fields={
-                "tool_rewards": self.trajectory.tool_rewards,
-                "turn_scores": self.trajectory.turn_scores,
-            }
-        )
+        outputs = []
+        for trajectory in self.session_data.trajectories:
+            trajectory.response_ids = trajectory.response_ids[: response_length]
+            trajectory.response_mask = trajectory.response_mask[: response_length]
+            trajectory.response_logprobs = trajectory.response_logprobs[: response_length]
+            
+            multi_modal_data = None
+            if trajectory.image_data is not None or trajectory.video_data is not None:
+                multi_modal_data = {}
+                if trajectory.image_data is not None:
+                    multi_modal_data["images"] = trajectory.image_data
+                if trajectory.video_data is not None:
+                    multi_modal_data["videos"] = trajectory.video_data
+            
+            output: TokenOutput = TokenOutput(
+                prompt_ids=trajectory.prompt_ids,
+                response_ids=trajectory.response_ids,
+                response_mask=trajectory.response_mask,
+                response_log_probs=(
+                    trajectory.response_logprobs
+                    if len(trajectory.response_logprobs) > 0
+                    else None
+                ),
+                routed_experts=(
+                    trajectory.routed_experts[: len(trajectory.prompt_ids) + response_length]
+                    if len(trajectory.routed_experts) > 0
+                    else None
+                ),
+                multi_modal_data=multi_modal_data,
+                # TODO(linsh): check whether use global num_turns
+                num_turns=self.session_data.assistant_turns + self.session_data.user_turns + 1,
+                rollout_instance_id=self.session_data.curr_rollout_instance_id,
+                extra_fields={
+                    "tool_rewards": trajectory.tool_rewards,
+                    "turn_scores": trajectory.turn_scores,
+                }
+            )
+            outputs.append(output)
         
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
             assert not self.config.reward.launch_reward_fn_async, (
                 "Asynchronous reward computation is not supported in 'step' traj_reward_mode."
             )
-            self.trajectory.reward = np.sum([self.compute_step_reward(step) for step in self.trajectory.steps])
-            if len(self.trajectory.steps) > 1:
-                self.adjust_step_rewards(self.trajectory)
-            output.reward_score = self.trajectory.reward
+            for trajectory, output in zip(self.session_data.trajectories, outputs):
+                trajectory.reward = np.sum([self.compute_step_reward(step) for step in trajectory.steps])
+                if len(trajectory.steps) > 1:
+                    self.adjust_step_rewards(trajectory)
+                output.reward_score = trajectory.reward
         elif self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "traj":
+            # NOTE(linsh): Only compute reward for the last trajectory.
+            final_output = outputs[-1]
             data = tu.get_tensordict({
-                "prompts": torch.tensor(output.prompt_ids, dtype=torch.int64).unsqueeze(0),
-                "responses": torch.tensor(output.response_ids, dtype=torch.int64).unsqueeze(0),
-                "multi_modal_data": np.array([output.multi_modal_data], dtype=object),
-                "num_turns": np.array([output.num_turns]),
-                "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                "prompts": torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0),
+                "responses": torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0),
+                "multi_modal_data": np.array([final_output.multi_modal_data], dtype=object),
+                "num_turns": np.array([final_output.num_turns]),
+                "tool_extra_fields": np.array([final_output.extra_fields], dtype=object),
+                "uid": np.array([self.session_data.request_id]),
+                "validate": self.session_data.validate,
+                "n_trajectory": np.array([len(outputs)]),
             })
             reward_result = await self.reward_manager.compute_score.remote(data)
             if not self.config.reward.launch_reward_fn_async:
                 if not reward_result:
                     return None
-                output.reward_score = reward_result["reward_score"]
-                output.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
-                output.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
+                # Broadcast to all trajectories
+                for output in outputs:
+                    output.reward_score = reward_result["reward_score"]
+                    output.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
+                    output.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
         else:
             raise ValueError(
                 f"Unknown traj_reward_mode: {self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode}"
             )
 
-        return output
+        if len(outputs) == 1:
+            return outputs[0]
+        return outputs
 
     @classmethod
     def get_agent_data(cls, name: str, *args, **kwargs) -> "AgentData":

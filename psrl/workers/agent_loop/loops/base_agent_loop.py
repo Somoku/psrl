@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -18,6 +19,7 @@ from verl.utils.chat_template import apply_chat_template, initialize_system_prom
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.tokenizer import normalize_token_ids
 
+from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
 from psrl.workers.agent_loop.sticky_session import sticky_session
@@ -252,7 +254,6 @@ class AgentLoopBase(ABC):
                     "Implement a /v1/chat/completions video path when ready."
                 )
 
-            # TODO(linsh): currently not supported yet in smg caller side.
             if has_images:
                 return await self._generate_via_chat_completions(
                     request_input, sampling_params, is_sticky_session, mm_data
@@ -312,7 +313,7 @@ class AgentLoopBase(ABC):
             req_headers["x-target-dp-rank"] = str(dp_rank)
 
         if is_sticky_session:
-            req_headers["x-manual-target-worker"] = "true"
+            req_headers["x-is-sticky"] = "true"
 
         payload = {
             "model": self.model_config.path,
@@ -324,6 +325,21 @@ class AgentLoopBase(ABC):
             # TODO: implement it
             # "return_routed_experts": self.config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay,
         }
+
+        # Multimodal payload
+        images = request_input.multi_modal_data.get("images")
+        videos = request_input.multi_modal_data.get("videos")
+        if images:
+            payload["image_data"] = await serialize_image_inputs(images)
+        if videos:
+            payload["video_data"] = videos
+        if images or videos:
+            modalities = []
+            if images:
+                modalities.append("multi-images" if len(images) > 1 else "image")
+            if videos:
+                modalities.append("video")
+            payload["modalities"] = modalities
 
         psrl_logger.info(
             "[PSRL-DEBUG] request_id=%s: SMG /generate payload sampling_params=%s, "
@@ -346,8 +362,6 @@ class AgentLoopBase(ABC):
                 request_input.request_id,
             )
             return None
-
-        psrl_logger.info(f"{gen_responses=}")
 
         first = gen_responses[0]
 
@@ -417,35 +431,32 @@ class AgentLoopBase(ABC):
         """Call SMG /v1/chat/completions for multimodal requests.
 
         SMG's chat route runs a full Rust-side vision preprocessing pipeline
-        (image fetch → pixel preprocessing → mm_inputs proto) that the /generate
-        route does not yet implement.  Images are embedded in the messages as
-        ``image_url`` content parts using base64 data-URLs.
+        (image fetch -> pixel preprocessing -> mm_inputs proto). When original
+        chat messages are still available, PSRL forwards them after normalizing
+        image parts to OpenAI ``image_url`` content. When only token IDs and
+        Python image objects remain, PSRL falls back to a synthetic user message
+        with base64 data URLs.
 
         Token IDs are recovered by tokenizing the response text, because the
         OpenAI chat-completion response does not carry raw output_ids.  Logprobs
         are extracted from ``choices[0].logprobs.content`` when available.
         """
-        from psrl.utils.rollout.vision_utils import pil_images_to_base64
-
         images: list = mm_data["images"]
-        image_data_urls: list[str] = await pil_images_to_base64(images)
+        
+        if request_input.raw_prompt is not None:
+            messages = await self._normalize_messages(request_input.raw_prompt)
+        else:
+            image_data_urls = await serialize_image_inputs(mm_data.get("images", []))
+            prompt_text = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.decode(request_input.input_ids, skip_special_tokens=True),
+            )
 
-        # Rebuild the messages list from token IDs by decoding the full sequence.
-        # The prompt was already tokenized with vision tokens embedded, so we
-        # cannot trivially re-derive the original messages.  Instead we send the
-        # pre-tokenized prompt as a single user message with the images prepended
-        # as image_url content parts — SMG's chat pipeline will handle vision
-        # preprocessing independently on its side.
-        prompt_text = await self.loop.run_in_executor(
-            None,
-            lambda: self.tokenizer.decode(request_input.input_ids, skip_special_tokens=True),
-        )
-
-        content: list[dict] = [
-            {"type": "image_url", "image_url": {"url": url}} for url in image_data_urls
-        ]
-        content.append({"type": "text", "text": prompt_text})
-        messages = [{"role": "user", "content": content}]
+            content: list[dict] = [
+                {"type": "image_url", "image_url": {"url": url}} for url in image_data_urls
+            ]
+            content.append({"type": "text", "text": prompt_text})
+            messages = [{"role": "user", "content": content}]
 
         need_logprobs = sampling_params.get("logprobs") is not None
         max_tokens = sampling_params.get("max_new_tokens", sampling_params.get("max_tokens", 1024))
@@ -550,6 +561,7 @@ class AgentLoopBase(ABC):
         rollout_instance_id = request.get("rollout_instance_id", None)
         
         multi_modal_data = None
+        messages = None
         if "raw_prompt_ids" not in request:
             if request.get("input_ids", None) is not None:
                 input_ids = request["input_ids"]
@@ -580,9 +592,12 @@ class AgentLoopBase(ABC):
             raw_prompt_ids = request["raw_prompt_ids"]
             if isinstance(raw_prompt_ids, np.ndarray):
                 raw_prompt_ids = raw_prompt_ids.tolist()
+            if "raw_prompt" in request:
+                messages = list(request["raw_prompt"])
 
         # Recover multi-modal data stored by prepare_generation_request().
-        multi_modal_data = request.get("multi_modal_data", None)
+        if multi_modal_data is None:
+            multi_modal_data = request.get("multi_modal_data", None)
 
         raw_response_ids = request.get("raw_response_ids", [])
         if isinstance(raw_response_ids, np.ndarray):
@@ -598,8 +613,46 @@ class AgentLoopBase(ABC):
             version_tag=version_tag,
             cu_response_len=len(raw_response_ids),
             multi_modal_data=multi_modal_data,
+            raw_prompt=messages,
             is_validate=is_validate,
         )
+
+    async def _normalize_messages(self, messages: list[dict]) -> list[dict]:
+        # Extract image refs
+        image_refs = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                image_ref = extract_image_ref(part)
+                if image_ref is None:
+                    continue
+                image_refs.append(image_ref)
+
+        encoded_refs = await serialize_image_inputs(image_refs)
+        encoded_iter = iter(encoded_refs)
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or extract_image_ref(part) is None:
+                    continue
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict) and isinstance(image_url.get("detail"), str):
+                    detail = image_url["detail"]
+                else:
+                    detail = part.get("detail", None)
+
+                part.clear()
+                image_url = {"url": next(encoded_iter)}
+                if detail is not None:
+                    image_url["detail"] = detail
+                part.update({"type": "image_url", "image_url": image_url})
+        return messages
 
     def _get_sampling_params(self, request: TokenInput):
         is_validate = request.is_validate

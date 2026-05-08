@@ -13,6 +13,7 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     raw_request,
 )
+from psrl.workers.gen_dplb.smg_adapter import TITO_SESSIONS_PATH
 
 psrl_logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ class SessionRouter:
             await self.client.close()
 
     async def create_session(self) -> Response:
-        result = await self._request_upstream("POST", "v1/tito/sessions")
+        result = await self._request_upstream("POST", TITO_SESSIONS_PATH)
         if result.status < 400:
             session_id = self.extract_session_id(result)
             if session_id is not None:
@@ -72,7 +73,7 @@ class SessionRouter:
         return self.build_response(result)
 
     async def get_session(self, sid: str) -> Response:
-        result = await self._request_upstream("GET", f"v1/tito/sessions/{sid}")
+        result = await self._request_upstream("GET", f"{TITO_SESSIONS_PATH}/{sid}")
         return self.build_response(result)
 
     async def delete_session(self, sid: str) -> Response:
@@ -82,7 +83,7 @@ class SessionRouter:
 
         await state.drained.wait()
 
-        result = await self._request_upstream("DELETE", f"v1/tito/sessions/{sid}")
+        result = await self._request_upstream("DELETE", f"{TITO_SESSIONS_PATH}/{sid}")
 
         async with self.states_lock:
             if self.states.get(sid) is state:
@@ -217,4 +218,5 @@ class SessionRouter:
     def add_session_headers(request: Request, sid: str) -> dict[str, str]:
         headers = filter_http_headers(request.headers)
         headers["x-smg-tito-session-id"] = sid
+        headers.setdefault("x-smg-tito-trajectory-id", "0")
         return headers

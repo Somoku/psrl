@@ -1,6 +1,6 @@
 """Build RL training arrays from TITO session data.
 
-Converts accumulated_token_ids + per-turn records (from SMG GET /v1/tito/sessions)
+Converts accumulated_token_ids + per-turn records (from SMG GET /tito/sessions)
 into prompt_ids, response_ids, response_mask, and logprobs arrays.
 """
 

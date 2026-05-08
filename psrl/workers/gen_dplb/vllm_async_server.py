@@ -62,6 +62,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
+from psrl.workers.gen_dplb.smg_adapter import build_worker_registration_payload
 from psrl.workers.gen_dplb.stats_collector import DPLBStatCollector
 from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
 from psrl.workers.gen_dplb.zmq_queue import ZMQPushQueue
@@ -663,17 +664,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             timeout = aiohttp.ClientTimeout(total=self._timeout)
             self._gateway_client = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
-        payload = {
-            "url": f"grpc://{self._server_address}:{self._server_port}",
-            "worker_type": "regular",
-            "model_id": self.model_config.path,
-            "labels": {
-                # "dp_size": str(self.config.data_parallel_size),
-                # "tp_size": str(self.config.tensor_model_parallel_size),
-                # "pp_size": str(self.config.pipeline_model_parallel_size),
-                "max_model_len": str(max_model_len),
-            },
-        }
+        payload = build_worker_registration_payload(
+            url=f"grpc://{self._server_address}:{self._server_port}",
+            model_id=self.model_config.path,
+            max_model_len=max_model_len,
+            dp_size=self.config.data_parallel_size,
+            tp_size=self.config.tensor_model_parallel_size,
+            pp_size=self.config.pipeline_model_parallel_size,
+        )
 
         try:
             async with self._gateway_client.post(f"{gateway_url}/workers", json=payload) as resp:

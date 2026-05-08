@@ -82,6 +82,7 @@ from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.gen_dplb.rollout_coordinator import RolloutCoordinator
 from psrl.workers.gen_dplb.rollout_gateway import RolloutGateway
+from psrl.workers.gen_dplb.smg_adapter import build_pause_resume_payload
 from psrl.workers.gen_dplb.vllm_async_server import GenInterface, PSRL_vLLMReplica
 from psrl.workers.ps import (
     PSClassWithInitArgs,
@@ -478,15 +479,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert action in {"pause", "resume"}, f"Unsupported action: {action}"
         assert self.rollout_gateway_url is not None, "rollout_gateway_url is not initialized"
 
-        payload = []
-        for instance_id in instance_ids:
-            if isinstance(instance_id, tuple):
-                base_worker_id, dp_rank = instance_id
-                payload.append({"base_worker_id": base_worker_id, "dp_rank": dp_rank})
-            else:
-                base_worker_id = instance_id
-                payload.append({"base_worker_id": base_worker_id})
-
+        payload = build_pause_resume_payload(instance_ids)
         url = f"{self.rollout_gateway_url.rstrip('/')}/workers/{action}"
         psrl_logger.warning(
             f"[GATEWAY-CONTROL] Posting {action} to {url} with payload ({len(payload)} workers): {payload}"
@@ -1912,7 +1905,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info(f"Step 7 done in {time.time() - _t:.2f}s.")
 
         # Re-pause validate instances in the gateway AFTER all updates are done.
-        # The workers/version_tag update (Step 5-6) goes through UpdateWorkerPropertiesStep
+        # The workers/update_weight_version update (Step 5-6) goes through UpdateWorkerPropertiesStep
         # which replaces worker objects, resetting their paused state to False.
         # We must re-pause here to ensure validate workers don't receive rollout requests.
         if self.config.psrl.rollout_gateway.enable:

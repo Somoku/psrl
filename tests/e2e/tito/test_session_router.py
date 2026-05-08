@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 import httpx
@@ -15,17 +14,17 @@ mock_smg = FastAPI()
 captured: dict = {}
 
 
-@mock_smg.post("/v1/tito/sessions")
+@mock_smg.post("/tito/sessions")
 async def mock_create():
     return {"session_id": "test-sid-123"}
 
 
-@mock_smg.get("/v1/tito/sessions/{sid}")
+@mock_smg.get("/tito/sessions/{sid}")
 async def mock_get(sid: str):
     return {"session_id": sid, "accumulated_token_ids": [1, 2, 3], "records": []}
 
 
-@mock_smg.delete("/v1/tito/sessions/{sid}")
+@mock_smg.delete("/tito/sessions/{sid}")
 async def mock_delete(sid: str):
     return FastAPIResponse(status_code=204)
 
@@ -121,6 +120,7 @@ async def test_chat_completions_injects_session_header(client):
     payload = {"model": "m", "messages": []}
     await client.post("/sessions/sid-xyz/v1/chat/completions", json=payload)
     assert captured["chat_headers"]["x-smg-tito-session-id"] == "sid-xyz"
+    assert captured["chat_headers"]["x-smg-tito-trajectory-id"] == "0"
 
 
 @pytest.mark.asyncio
@@ -135,25 +135,22 @@ async def test_session_proxy_injects_header(client):
 async def test_turn_counter_increments_on_chat_completion(router, client):
     """Turn counter increments exactly once per successful chat completion."""
     payload = {"model": "m", "messages": []}
-    assert router._session_turn.get("sid-abc", 0) == 0
+    state = await router._ensure_state("sid-abc")
+    assert state.turn == 0
 
     await client.post("/sessions/sid-abc/v1/chat/completions", json=payload)
-    # Lock state is initialised on first _get_or_create_lock call — turn starts at 0
-    # and should be 1 after a single completion.
-    assert router._session_turn.get("sid-abc", 0) == 1
+    assert state.turn == 1
 
     await client.post("/sessions/sid-abc/v1/chat/completions", json=payload)
-    assert router._session_turn.get("sid-abc", 0) == 2
+    assert state.turn == 2
 
 
 @pytest.mark.asyncio
 async def test_delete_during_new_request_returns_409(router, client):
     """After session is closed, new chat completion requests get 409."""
-    # Manually set closing=True without going through delete_session
-    # (avoids the lock contention in the test itself)
-    router._session_closing["sid-close"] = True
-    router._session_locks["sid-close"] = asyncio.Lock()
-    router._session_turn["sid-close"] = 0
+    state = await router._ensure_state("sid-close")
+    async with state.lock:
+        state.closing = True
 
     payload = {"model": "m", "messages": []}
     resp = await client.post("/sessions/sid-close/v1/chat/completions", json=payload)

@@ -1,4 +1,3 @@
-import argparse
 import logging
 import multiprocessing
 import os
@@ -10,6 +9,7 @@ from omegaconf import DictConfig
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
 from psrl.workers.gen_dplb.rollout_gateway import _run_smg
+from psrl.workers.gen_dplb.smg_adapter import build_reward_router_args
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -42,57 +42,12 @@ class RewardModelGateway:
 
     def _init_router_args(self):
         """Build the CLI args namespace passed to smg RouterArgs."""
-        from smg.launch_router import RouterArgs
-
-        cli_args = argparse.Namespace(
-            # server
-            host=self.smg_ip,
-            port=self.smg_port,
-            dp_aware=False,
-            connection_mode="grpc",
-            # pd disaggregation
-            pd_disaggregation=False,
-            prefill=None,
-            decode=None,
-            # routing — round-robin, no cost model
-            policy="round_robin",
-            prefill_policy=None,
-            decode_policy=None,
-            disable_retries=True,
-            policy_balanced_concurrent_seqs_per_instance=1,
-            policy_max_concurrent_seqs_per_instance=1024,
-            policy_cost_model_path=None,
-            policy_max_num_waiting_reqs_after_preemption=1000,
-            policy_delta_throughput_threshold=0.5,
-            policy_max_prompt_length=32768,
-            policy_request_budget=1024,
-            # no PSRL staleness routing
-            enable_routing_loop=True,
-            enable_multi_priority_queue=False,
-            psrl_enable_group_sampling_on_multi_instances=False,
-            psrl_check_interval_ms=10,
-            psrl_ps_manager_ip=None,
-            psrl_ps_manager_grpc_port=None,
-            psrl_request_sort_indicator="short_length",
-            psrl_candidate_sort_indicator="version",
-            psrl_snapshot_staleness_threshold_in_ms=1000,
-            psrl_max_num_waiting_reqs_after_preemption=1000,
-            psrl_mig_enable=False,
-            # TITO / service discovery
-            enable_tito=False,
-            tito_max_entries_per_session=-1,
-            service_discovery=False,
-            # observability
+        return build_reward_router_args(
+            self.config,
+            self.smg_ip,
+            self.smg_port,
             prometheus_port=find_available_port(base_port=4100),
-            request_timeout_secs=2**64 - 1,
-            log_level="warn",
-            log_dir=self.config.psrl.logging_path,
-            api_key=None,
-            disable_health_check=True,
         )
-
-        router_args = RouterArgs.from_cli_args(cli_args, use_router_prefix=False)
-        return router_args
 
     def launch_router(self) -> str:
         """Start the smg subprocess and return the gateway HTTP URL."""

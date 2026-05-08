@@ -155,6 +155,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             "x-prompt-id": str(prompt_id),
             "x-version-tag": str(version_tag),
             "x-is-validate": str(is_validate).lower(),
+            "x-smg-tito-trajectory-id": str(request.get("trajectory_id", 0)),
         }
         rollout_instance_id = request.get("rollout_instance_id", None)
         if rollout_instance_id is not None:
@@ -266,17 +267,28 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             # --- Retrieve session data and build training arrays ---
             session_data = await self.get_session_data(session_id)
             max_trim_tokens = session_data.get("max_trim_tokens", 0)
+            trajectory_id = str(request.get("trajectory_id", 0))
 
             if "trajectories" in session_data:
-                # Multi-trajectory (retry/concurrent branches) — not expected in normal PSRL flow.
-                # Log a warning and use the first trajectory.
-                psrl_logger.warning(
-                    "TITO session %s has %d trajectories (retry/concurrent branches detected), "
-                    "using first trajectory for training",
-                    session_id,
-                    len(session_data["trajectories"]),
+                trajectories = session_data["trajectories"]
+                if not trajectories:
+                    raise RuntimeError(f"TITO session {session_id} returned no trajectories")
+                traj = next(
+                    (
+                        item
+                        for item in trajectories
+                        if str(item.get("trajectory_id", item.get("id", 0))) == trajectory_id
+                    ),
+                    None,
                 )
-                traj = session_data["trajectories"][0]
+                if traj is None:
+                    psrl_logger.warning(
+                        "TITO session %s has no trajectory_id=%s in %d trajectories; using first trajectory",
+                        session_id,
+                        trajectory_id,
+                        len(trajectories),
+                    )
+                    traj = trajectories[0]
                 accumulated_token_ids = traj.get("accumulated_token_ids", [])
                 records = traj.get("records", [])
             else:
@@ -288,22 +300,19 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             # These must abort training data construction to avoid silently corrupted samples.
             # ASSISTANT_TEXT mismatches are expected cross-turn token boundary differences
             # and are not fatal.
-            '''
             for i, record in enumerate(records):
                 mismatch_report = record.get("mismatch_report", [])
-                prompt_token_count = record.get("prompt_token_count", 0)
-                finish_reason = record.get("finish_reason", "")
                 for entry in mismatch_report:
                     mtype = entry.get("mismatch_type", "")
-                    if mtype != "assistant_text":
-                        msg = (
-                            f"TITO token ID mismatch at turn {i}: "
-                            f"type={mtype}, pos={entry.get('position')}, "
-                            f"detail={entry.get('detail')}"
-                        )
-                        psrl_logger.error(msg)
-                        raise RuntimeError(msg)
-            '''
+                    if mtype == "assistant_text":
+                        continue
+                    msg = (
+                        f"TITO token ID mismatch at turn {i}: "
+                        f"type={mtype}, pos={entry.get('position')}, "
+                        f"detail={entry.get('detail')}"
+                    )
+                    psrl_logger.error(msg)
+                    raise RuntimeError(msg)
 
             training_arrays = build_training_arrays(
                 accumulated_token_ids,

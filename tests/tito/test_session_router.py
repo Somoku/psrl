@@ -14,17 +14,17 @@ mock_smg = FastAPI()
 captured: dict = {}
 
 
-@mock_smg.post("/v1/tito/sessions")
+@mock_smg.post("/tito/sessions")
 async def mock_create():
     return {"session_id": "test-sid-123"}
 
 
-@mock_smg.get("/v1/tito/sessions/{sid}")
+@mock_smg.get("/tito/sessions/{sid}")
 async def mock_get(sid: str):
     return {"session_id": sid, "accumulated_token_ids": [1, 2, 3], "records": []}
 
 
-@mock_smg.delete("/v1/tito/sessions/{sid}")
+@mock_smg.delete("/tito/sessions/{sid}")
 async def mock_delete(sid: str):
     return FastAPIResponse(status_code=204)
 
@@ -120,6 +120,7 @@ async def test_chat_completions_injects_session_header(client):
     payload = {"model": "m", "messages": []}
     await client.post("/sessions/sid-xyz/v1/chat/completions", json=payload)
     assert captured["chat_headers"]["x-smg-tito-session-id"] == "sid-xyz"
+    assert captured["chat_headers"]["x-smg-tito-trajectory-id"] == "0"
 
 
 @pytest.mark.asyncio

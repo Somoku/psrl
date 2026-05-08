@@ -17,6 +17,14 @@ from psrl.utils.logger import (
 )
 from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.gen_dplb.stats_collector import EngineStats
+from psrl.workers.gen_dplb.smg_adapter import (
+    ROUTING_LOOP_STATUS_PATH,
+    WORKERS_STATS_PATH,
+    WORKERS_UPDATE_STATS_PATH,
+    WORKERS_UPDATE_WEIGHT_VERSION_PATH,
+    build_weight_version_updates,
+    build_worker_stats_update,
+)
 from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, RolloutInstanceId
 from psrl.workers.gen_dplb.zmq_queue import ZMQPullQueue
 
@@ -690,9 +698,14 @@ class RolloutCoordinator(CommandExtension):
         )
         t_rpc = time.monotonic()
         if self.use_rust_gateway:
-            # TODO: add `pending_request_num` to the `/routing_loop/status` endpoint in Rust gateway
-            pending = int(self._gateway_get_json("/routing_loop/status").get("pending_request_num", 0))
-            pass
+            status = await self._gateway_get_json(ROUTING_LOOP_STATUS_PATH)
+            pending_value = status.get("pending_request_num", status.get("queue_len"))
+            if pending_value is None:
+                worker_stats = await self._gateway_get_json(WORKERS_STATS_PATH)
+                stats = worker_stats if isinstance(worker_stats, list) else worker_stats.get("workers", [])
+                pending = sum(int(item.get("running_requests", 0)) for item in stats if isinstance(item, dict))
+            else:
+                pending = int(pending_value)
         else:
             pending = int(await self.rollout_router.get_pending_request_count.remote())
         log_elastic_rm_backlog_diag(
@@ -720,17 +733,8 @@ class RolloutCoordinator(CommandExtension):
                 updates = []
                 for instance_id, engine_status in self.instance_to_engine_status.items():
                     replica_id, dp_rank = instance_id
-                    updates.append(
-                        {
-                            "base_worker_id": replica_id,
-                            "dp_rank": dp_rank,
-                            "snapshot": {
-                                "timestamp": engine_status.snapshot.get("timestamp"),
-                                "scheduler_stats": engine_status.snapshot.get("scheduler_stats", {}),
-                            },
-                        }
-                    )
-                await self._gateway_post_json("/workers/stats", payload={"updates": updates})
+                    updates.append(build_worker_stats_update(replica_id, dp_rank, engine_status.snapshot))
+                await self._gateway_post_json(WORKERS_UPDATE_STATS_PATH, payload=updates)
             else:
                 await self.rollout_router.update_instance_status.remote(self.instance_to_engine_status)
         psrl_logger.info("Stopped syncing engine status to router.")
@@ -955,17 +959,8 @@ class RolloutCoordinator(CommandExtension):
             if self.use_rust_gateway:
                 for instance_id in instance_ids:
                     self.instance_to_version_after_sync[instance_id] = self.ps_model_version
-                updates = []
-                for instance_id in instance_ids:
-                    replica_id, dp_rank = instance_id
-                    updates.append(
-                        {
-                            "base_worker_id": replica_id,
-                            "dp_rank": dp_rank,
-                            "version_tag": self.ps_model_version,
-                        }
-                    )
-                await self._gateway_post_json("/workers/version_tag", payload={"updates": updates})
+                updates = build_weight_version_updates(instance_ids, self.ps_model_version)
+                await self._gateway_post_json(WORKERS_UPDATE_WEIGHT_VERSION_PATH, payload=updates)
                 psrl_logger.info(
                     f"Pushed version_after_sync to Rust gateway for "
                     f"{len(instance_ids)} instances to {self.ps_model_version}"

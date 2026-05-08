@@ -29,6 +29,8 @@ _MOCKED_MODULES = [
     "psrl.utils.logger",
     "psrl.utils.common",
     "psrl.utils.common.http_utils",
+    "smg",
+    "smg.launch_router",
 ]
 
 for _mod in _MOCKED_MODULES:
@@ -43,6 +45,10 @@ sys.modules["psrl.utils.common.http_utils"].find_available_port = lambda base_po
 
 # Provide DualOutputHandler stub
 sys.modules["psrl.utils.logger"].DualOutputHandler = MagicMock(return_value=MagicMock())
+
+# Return the argparse namespace from RouterArgs.from_cli_args so this CPU test can
+# inspect the values without importing the Rust extension.
+sys.modules["smg.launch_router"].RouterArgs.from_cli_args = lambda args, use_router_prefix=False: args
 
 _rm_pkg = _types.ModuleType("psrl.workers.reward.reward_model")
 _rm_pkg.RewardModelManager = MagicMock()
@@ -78,19 +84,17 @@ def test_gateway_init():
 
 
 def test_gateway_router_args_policy():
-    """_build_router_args_namespace sets policy to round_robin and disables PS manager."""
+    """_init_router_args sets policy to round_robin and disables PSRL routing."""
     cfg = _make_config()
     gw = RewardModelGateway.__new__(RewardModelGateway)
     gw.__init__(cfg, "TestRM")
     gw.smg_ip = "127.0.0.1"
     gw.smg_port = 8300
 
-    # _build_router_args_namespace uses only argparse.Namespace + find_available_port (mocked).
-    # No smg import at call time, so no ImportError can occur here.
-    args = gw._build_router_args_namespace()
+    args = gw._init_router_args()
     assert args.policy == "round_robin"
     assert args.enable_routing_loop is False
-    assert args.psrl_ps_manager_ip is None
+    assert args.worker_selection_strategy == "naive"
 
 
 def test_gateway_shutdown_noop_when_not_started():

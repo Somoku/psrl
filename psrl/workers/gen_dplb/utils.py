@@ -19,6 +19,8 @@ class TokenInput:
     """the unique request id"""
     prompt_id: int
     """the unique prompt id"""
+    raw_prompt: list[dict] | None = None
+    """original chat messages, preserved for SMG multimodal chat-completion calls"""
     rollout_instance_id: RolloutInstanceId | None = None
     """the rollout instance id assigned for this generation"""
     version_tag: int = -1

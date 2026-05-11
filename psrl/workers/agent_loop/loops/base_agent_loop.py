@@ -192,9 +192,8 @@ class AgentLoopBase(ABC):
 
     async def compute_reward_score(
         self,
-        request_id: int,
         outputs: TokenOutput | list[TokenOutput],
-        is_validate: bool = False,
+        **kwargs,
     ) -> TokenOutput | list[TokenOutput] | None:
         """Compute reward score for the generated response and merge it into the output.
 
@@ -209,17 +208,34 @@ class AgentLoopBase(ABC):
             outputs = [outputs]
         # NOTE(linsh): Only compute reward for the last trajectory.
         final_output = outputs[-1]
-        reward_requests = tu.get_tensordict({
+        tensor_dict = {
             "prompts": torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0),
             "responses": torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0),
             "multi_modal_data": np.array([final_output.multi_modal_data], dtype=object),
             "num_turns": np.array([final_output.num_turns]),
             "tool_extra_fields": np.array([final_output.extra_fields], dtype=object),
-            "uid": np.array([request_id]),
-            "validate": is_validate,
+            "uid": np.array([kwargs.get("uid")]),
             "n_trajectory": np.array([len(outputs)]),
-        })
-        reward_result = await self.reward_manager.compute_score.remote(reward_requests)
+            "data_source": np.array([kwargs.get("data_source", "unknown")]),
+        }
+        if kwargs.get("parent_id") is not None:
+            tensor_dict["parent_id"] = np.array([kwargs.get("parent_id")])
+        reward_requests = tu.get_tensordict(
+            tensor_dict=tensor_dict,
+            non_tensor_dict={
+                "validate": kwargs.get("validate", False),
+            },
+        )
+        reward_meta_infos = [{
+            "reward_model": kwargs.get("reward_model", {}),
+            "extra_info": kwargs.get("extra_info", {}),
+            "reward_model_dicts": kwargs.get("reward_model_dicts", None),
+        }]
+
+        reward_result = await self.reward_manager.compute_score.remote(
+            reward_requests,
+            reward_meta_infos=reward_meta_infos,
+        )
 
         if not self.config.reward.launch_reward_fn_async:
             if not reward_result:
@@ -581,7 +597,7 @@ class AgentLoopBase(ABC):
                     images=images,
                     videos=videos,
                 )
-                request["raw_prompt_ids"] = np.array([raw_prompt_ids])
+                request["raw_prompt_ids"] = np.array(raw_prompt_ids)
             else:
                 raise ValueError(
                     "Request must contain 'raw_prompt_ids', 'raw_prompt', or 'input_ids' "
@@ -880,7 +896,12 @@ class AgentLoopBase(ABC):
                               or None to fetch all fields.
         """
         fields = [
-            # metadata
+            # dataset metadata
+            "data_source",
+            "reward_model",
+            "extra_info",
+            "reward_model_dicts",
+            # request metadata
             "uid",
             "parent_id",
             "version_tag",

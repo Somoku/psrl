@@ -212,10 +212,13 @@ class PSRL_AgentLoopWorker:
 
         fields = ["agent_name"]
         data = await tq.async_kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-        version_tag = [tag.get("version_tag", -1) for tag in batch.tags]
-        tu.assign_non_tensor_stack(data, "version_tag", version_tag)
-        await tq.async_kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("version_tag"))
-        agent_name = data.get("agent_name", [default_agent_name])[0]
+        version_tag_fields = [{"version_tag": tag.get("version_tag", -1)} for tag in batch.tags]
+        await tq.async_kv_batch_put(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            fields=list_of_dict_to_tensordict(version_tag_fields),
+        )
+        agent_name = tu.get(data, "agent_name", [default_agent_name])[0]
 
         task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
@@ -247,8 +250,8 @@ class PSRL_AgentLoopWorker:
             request_index = tu.get(data, "uid")[0]
 
         batch = kv_batch_meta_update_tags(batch, "uid", tu.get(data, "uid"))
-        batch.extra_info["validate"] = tu.get(data, "validate", default=False)[0]
-        batch.extra_info["global_steps"] = tu.get(data, "global_steps", default=-1)[0]
+        batch.extra_info["validate"] = batch.partition_id == "val"
+        batch.extra_info["global_steps"] = tu.get(data, "global_steps")[0]
 
         try:
           await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
@@ -386,6 +389,14 @@ class PSRL_AgentLoopWorker:
         uid = batch.tags[0]["uid"]
 
         outputs = output if isinstance(output, list) else [output]
+        
+        # Update the number of trajectories of the request
+        await self.ps_manager_handle.update_request_n_trajectory.remote(
+            request_id=uid,
+            n_trajectory=len(outputs),
+            is_validate=batch.partition_id == "val",
+        )
+
         keys, fields = [], []
         for i, output in enumerate(outputs):
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
@@ -405,6 +416,7 @@ class PSRL_AgentLoopWorker:
             field = output.as_dict()
             # do not store raw image/video
             field.pop("multi_modal_data", None)
+            field = {k: v for k, v in field.items() if v is not None}
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
@@ -413,12 +425,29 @@ class PSRL_AgentLoopWorker:
             field["seq_len"] = prompt_len + response_len
             field["prompt_len"] = prompt_len
             field["response_len"] = response_len
-            field["uid"] = [uid]
+            field["uid"] = uid
             if "parent_id" in batch.tags[0]:
-                field["parent_id"] = [batch.tags[0]["parent_id"]]
-            field["trajectory_index"] = [i]
-            field["trajectory_num"] = [len(outputs)]
+                field["parent_id"] = batch.tags[0]["parent_id"]
+            field["trajectory_index"] = i
+            field["trajectory_num"] = len(outputs)
             fields.append(field)
+
+        # TODO(linsh): optimize data transfer and memory usage by
+        # keeping input data with `key=str(uid)` and output data with `key=f"{uid}_{i}"`
+        # and then join the data in trainer
+        await tq.async_kv_batch_put(
+            keys=keys,
+            partition_id=batch.partition_id,
+            fields=list_of_dict_to_tensordict(fields),
+        )
+
+        # Clear original input data for n_trajectory > 1 because of
+        # the difference between input/outputs keys
+        if len(outputs) > 1:
+            await tq.async_kv_clear(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+            )
 
         occupy_success = await self.agent_loop_manager.occupy_requests.remote(
             request_id=batch.tags[0]["uid"],
@@ -429,22 +458,14 @@ class PSRL_AgentLoopWorker:
             is_validate=batch.partition_id == "val",
         )
 
-        if occupy_success:
-            # TODO(linsh): optimize data transfer and memory usage by
-            # keeping input data with `key=str(uid)` and output data with `key=f"{uid}_{i}"`
-            # and then join the data in trainer
-            await tq.async_kv_batch_put(
+        if not occupy_success:
+            # occupy_requests rejected the request (e.g. already aborted by
+            # PSManager).  The per-trajectory keys we just wrote are now
+            # orphaned — clean them up so TQ does not accumulate stale data.
+            await tq.async_kv_clear(
                 keys=keys,
                 partition_id=batch.partition_id,
-                fields=list_of_dict_to_tensordict(fields),
             )
-            
-            # Clear original input data
-            if len(outputs) > 1:
-                await tq.async_kv_clear(
-                    keys=batch.keys,
-                    partition_id=batch.partition_id,
-                )
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""

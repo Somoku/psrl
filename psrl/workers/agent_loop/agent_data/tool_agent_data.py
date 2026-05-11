@@ -222,11 +222,19 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         request_id = request.get("uid", 0)
         parent_id = request.get("parent_id", None)
         validate = request.get("validate", False)
+        data_source = request.get("data_source", "unknown")
+        reward_model = request.get("reward_model", {})
+        extra_info = request.get("extra_info", {})
+        reward_model_dicts = request.get("reward_model_dicts", [])
 
         self.session_data = SessionData(
             request_id=request_id,
             parent_id=parent_id,
             validate=validate,
+            data_source=data_source,
+            reward_model=reward_model,
+            extra_info=extra_info,
+            reward_model_dicts=reward_model_dicts,
         )
         self.session_data.trajectories.append(Trajectory())
 
@@ -358,15 +366,36 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         # Compute step reward if using step-level reward mode
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
             # TODO(linsh): check whether use global num_turns for step reward
+            # NOTE(linsh): step reward is not verified and maybe buggy
             output.num_turns = self.session_data.assistant_turns + self.session_data.user_turns + 1
-            data = tu.get_tensordict({
+            tensor_dict = {
                 "prompts": torch.tensor(output.prompt_ids, dtype=torch.int64).unsqueeze(0),
                 "responses": torch.tensor(output.response_ids, dtype=torch.int64).unsqueeze(0),
                 "multi_modal_data": np.array([output.multi_modal_data], dtype=object),
                 "num_turns": np.array([output.num_turns]),
                 "tool_extra_fields": np.array([output.extra_fields], dtype=object),
-            })
-            self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(data)["reward_score"]
+                "uid": np.array([self.session_data.request_id]),
+                "n_trajectory": np.array([len(self.session_data.trajectories)]),
+                "data_source": np.array([self.session_data.data_source]),
+            }
+            if self.session_data.parent_id is not None:
+                tensor_dict["parent_id"] = np.array([self.session_data.parent_id])
+            data = tu.get_tensordict(
+                tensor_dict=tensor_dict,
+                non_tensor_dict={
+                    "validate": self.session_data.validate,
+                },
+            )
+            reward_meta_infos = [{
+                "reward_model": self.session_data.reward_model,
+                "extra_info": self.session_data.extra_info,
+                "reward_model_dicts": self.session_data.reward_model_dicts,
+            }]
+
+            self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(
+                data,
+                reward_meta_infos=reward_meta_infos,
+            )["reward_score"]
 
         # Check if response length limit is reached
         if self.session_data.trajectories[-1].response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:

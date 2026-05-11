@@ -551,8 +551,9 @@ class PSRL_AgentLoopManager:
                 for model_version in sorted(list(accumulated_buffers[buffer_id].keys())):
                     prompt_entry_infos.extend(accumulated_buffers[buffer_id][model_version])
 
-                if is_validate:
-                    prompt_entry_infos.sort(key=lambda ei: ei.prompt_id)
+                # NOTE(linsh): sort by prompt_id to ensure the order of prompt_entry_infos
+                # is the same as the order of prompt_ids in the buffer
+                prompt_entry_infos.sort(key=lambda ei: ei.prompt_id)
 
                 batch = self.entry_infos_to_kv_batch_meta(prompt_entry_infos, is_validate)
                 # Apply buffer post-processing if exists and add to data_buffers
@@ -590,7 +591,9 @@ class PSRL_AgentLoopManager:
         return add_buffer
 
     def entry_infos_to_kv_batch_meta(
-        self, entry_infos: list[EntryInfo], is_validate: bool
+        self,
+        entry_infos: list[EntryInfo],
+        is_validate: bool = False,
     ) -> KVBatchMeta:
         """Build a ``KVBatchMeta`` for the given EntryInfos."""
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
@@ -599,7 +602,8 @@ class PSRL_AgentLoopManager:
         tags: list[dict] = []
         for entry_info in entry_infos:
             request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
-            n_trajectories = entry_info.n_trajectory if isinstance(entry_info.n_trajectory, list) else [entry_info.n_trajectory]
+            n_trajectories = entry_info.n_trajectory if isinstance(entry_info.n_trajectory, list) else [entry_info.n_trajectory] * len(request_idxs)
+            request_idxs, n_trajectories = zip(*sorted(zip(request_idxs, n_trajectories), key=lambda x: x[0]))
             model_versions = (
                 entry_info.model_version if isinstance(entry_info.model_version, list) else [entry_info.model_version]
             )
@@ -785,11 +789,11 @@ class PSRL_AgentLoopManager:
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         entry_infos_map: dict[int, EntryInfo] = {}
         if rollout_n > 1:
-            parent_ids = tu.get_non_tensor_data(data, "parent_id")
-            rollout_instance_ids = tu.get_non_tensor_data(data, "rollout_instance_id")
-            request_ids = tu.get_non_tensor_data(data, "uid")
-            model_versions = tu.get_non_tensor_data(data, "version_tag")
-            trajectory_nums = tu.get_non_tensor_data(data, "trajectory_num")
+            parent_ids = tu.get(data, "parent_id")
+            rollout_instance_ids = tu.get(data, "rollout_instance_id")
+            request_ids = tu.get(data, "uid")
+            model_versions = tu.get(data, "version_tag")
+            trajectory_nums = tu.get(data, "trajectory_num")
             for parent_id, rollout_instance_id, request_id, model_version, trajectory_num in zip(
                 parent_ids, rollout_instance_ids, request_ids, model_versions, trajectory_nums
             ):
@@ -808,6 +812,13 @@ class PSRL_AgentLoopManager:
                         entry_info.model_version = [
                             entry_info.model_version,
                             model_version,
+                        ]
+                    if isinstance(entry_info.rollout_instance_id, list):
+                        entry_info.rollout_instance_id.append(rollout_instance_id)
+                    else:
+                        entry_info.rollout_instance_id = [
+                            entry_info.rollout_instance_id,
+                            rollout_instance_id,
                         ]
                     if isinstance(entry_info.n_trajectory, list):
                         entry_info.n_trajectory.append(trajectory_num)

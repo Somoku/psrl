@@ -29,6 +29,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    process_validation_metrics,
 )
 from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
 from verl.utils.fs import copy_to_local
@@ -64,7 +65,7 @@ from psrl.trainer.ppo.utils import (
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import WorkerKey, ps_agent_name, train_client_name
-from psrl.utils.dataset import DataProcessor
+from psrl.utils.dataset import DataProcessor, DatasetType
 from psrl.utils.elastic_rm.cluster_topology import ClusterTopology
 from psrl.utils.elastic_rm.elastic_executor import ElasticExecutor
 from psrl.utils.logger import (
@@ -740,7 +741,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     gts = [None] * len(data)
                 
                 uids = []
-                for key in batch.keys:
+                for key, tag in zip(batch.keys, batch.tags):
+                    if tag.get("is_padding", False):
+                        continue
                     parts = key.rsplit("_", 1)
                     if len(parts) == 2:
                         uid = parts[0]
@@ -762,6 +765,33 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     reward_extra_infos_dict=reward_extra_infos_dict,
                     dump_path=rollout_data_dir,
                 )
+
+    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
+        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
+        metric_dict = {}
+        for data_source, var2metric2val in data_src2var2metric2val.items():
+            core_var = "acc" if "acc" in var2metric2val else "reward"
+            for var_name, metric2val in var2metric2val.items():
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                for metric_name, metric_val in metric2val.items():
+                    if (
+                        (var_name == core_var)
+                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                        and (f"@{n_max}" in metric_name)
+                    ):
+                        metric_sec = "val-core"
+                    else:
+                        metric_sec = "val-aux"
+                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                    metric_dict[pfx] = metric_val
+
+        if len(sample_turns) > 0:
+            sample_turns = np.array(sample_turns)
+            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
+            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
+            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        return metric_dict
 
     def _validate(self, merged: bool = False):
         """Validate the model using the validation dataset.
@@ -2183,14 +2213,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
         batch_size = len(batch)
-        fields = ["seq_len"]
-        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
         dp_size = self._get_dp_size(self.actor_wg, "actor")
 
         batch_multiple = self._get_required_batch_multiple(dp_size)
         batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["seq_len"])
         global_seqlen_lst = torch.tensor(tu.get(data, "seq_len"), dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
@@ -2285,8 +2314,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # Extract non-tensor uid/parent_id BEFORE calling to_padded_tensor() to avoid
         # dtype conversion issues (they are stored as NonTensorData/NonTensorStack in TQ).
-        uids = tu.get_non_tensor_data(data, "uid")
-        parent_ids = tu.get_non_tensor_data(data, "parent_id")
+        uids = tu.get(data, "uid")
+        parent_ids = tu.get(data, "parent_id")
         # Remove non-tensor fields so to_padded_tensor() only processes tensor fields.
         tensor_fields = ["response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
         data_tensor_only = data.select(*[f for f in tensor_fields if f in data.keys()])
@@ -2550,7 +2579,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             data["token_level_rewards"] = data["rm_scores"]
         data["prompt_length"] = prompt_length.float()
         data["response_length"] = response_length.float()
-        batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+        batch = DataProto(
+            batch=data,
+            meta_info={
+                "global_token_num": global_token_num,
+                "max_prompt_length": self.config.data.max_prompt_length,
+                "max_response_length": self.config.data.max_response_length,
+            }
+        )
         metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
 
         # 2. compute metrics

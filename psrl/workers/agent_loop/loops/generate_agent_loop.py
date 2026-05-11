@@ -36,11 +36,17 @@ class GenerateAgentLoop(AgentLoopBase):
             output.routed_experts = output.routed_experts[: len(output.prompt_ids) + self.response_length]
         output.num_turns = 2
 
-        output = await self.compute_reward_score(
-            request["uid"],
-            output,
-            request.get("validate", False),
-        )
+        kwargs = {
+            "uid": request["uid"],
+            "parent_id": request.get("parent_id", None),
+            "validate": request.get("validate", False),
+            "data_source": request.get("data_source", "unknown"),
+            "reward_model": request.get("reward_model", {}),
+            "extra_info": request.get("extra_info", {}),
+            "reward_model_dicts": request.get("reward_model_dicts", []),
+        }
+
+        output = await self.compute_reward_score(output, **kwargs)
         if output is None:
             # Request was aborted during reward computation (e.g. staleness check failed)
             return None, TerminateReason.ABORTED

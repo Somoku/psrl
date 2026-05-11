@@ -1,6 +1,6 @@
-From ff147f2a6bac8aa9e001311067ec6b46f96f6b1e Mon Sep 17 00:00:00 2001
+From 996ef99c20d2232ebafb6b1f58adff7c7bf6d526 Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Thu, 30 Apr 2026 19:31:33 +0800
+Date: Sun, 10 May 2026 10:59:12 +0800
 Subject: [PATCH] tms, metrics, ray resource num, data sampling
 
 ---
@@ -9,12 +9,14 @@ Subject: [PATCH] tms, metrics, ray resource num, data sampling
  verl/trainer/config/data/legacy_data.yaml     |   2 +-
  verl/trainer/config/engine/fsdp.yaml          |   2 +
  verl/trainer/config/engine/megatron.yaml      |   2 +
- verl/trainer/ppo/metric_utils.py              |  29 ++++
+ verl/trainer/ppo/metric_utils.py              |  33 ++++-
+ verl/trainer/ppo/padding_utils.py             |  26 ++--
+ verl/trainer/ppo/rollout_corr_helper.py       |  34 +++--
  verl/utils/dataset/rl_dataset.py              |  27 ++++
  verl/workers/config/engine.py                 |   1 +
  verl/workers/engine/fsdp/transformer_impl.py  |  59 +++++----
  .../engine/megatron/transformer_impl.py       | 125 ++++++++++--------
- 10 files changed, 193 insertions(+), 98 deletions(-)
+ 12 files changed, 229 insertions(+), 126 deletions(-)
 
 diff --git a/verl/protocol.py b/verl/protocol.py
 index 4a1034b3..4dff2655 100644
@@ -145,10 +147,19 @@ index ec4883dd..fdf1e75e 100644
  override_ddp_config: {}
  
 diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
-index 946f7611..9a820ba7 100644
+index 946f7611..73ef56ac 100644
 --- a/verl/trainer/ppo/metric_utils.py
 +++ b/verl/trainer/ppo/metric_utils.py
-@@ -131,6 +131,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+@@ -115,6 +115,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+ 
+     advantages = batch.batch["advantages"]
+     returns = batch.batch["returns"]
++    max_prompt_length = batch.meta_info.get("max_prompt_length", batch.batch["prompts"].shape[-1])
++    max_response_length = batch.meta_info.get("max_response_length", batch.batch["responses"].shape[-1])
+ 
+     max_prompt_length = batch.batch["prompts"].shape[-1]
+     max_response_length = batch.batch["responses"].shape[-1]
+@@ -131,6 +133,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
      non_aborted_sequence_score = sequence_score[non_aborted_mask]
      non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
  
@@ -175,7 +186,7 @@ index 946f7611..9a820ba7 100644
      if non_aborted_sequence_score.numel() > 0:
          score_mean = torch.mean(non_aborted_sequence_score).detach().item()
          score_max = torch.max(non_aborted_sequence_score).detach().item()
-@@ -212,6 +232,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+@@ -212,6 +234,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
          critic_value_metrics = {}
  
      metrics = {
@@ -191,6 +202,131 @@ index 946f7611..9a820ba7 100644
          # score
          "critic/score/mean": score_mean,
          "critic/score/max": score_max,
+@@ -637,7 +668,7 @@ def process_validation_metrics(
+ 
+             for var_name, var_vals in var2vals.items():
+                 # skip empty or string values
+-                if not var_vals or isinstance(var_vals[0], str):
++                if not var_vals or isinstance(var_vals[0], (str, dict)):
+                     continue
+ 
+                 # compute mean and std
+diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
+index 436e17bc..011a0c76 100644
+--- a/verl/trainer/ppo/padding_utils.py
++++ b/verl/trainer/ppo/padding_utils.py
+@@ -71,6 +71,7 @@ def construct_minimal_padding_template(
+     source_td: dict,
+     source_tag: dict,
+     eos_token_id: int,
++    pad_uid: int,
+ ) -> tuple[dict, dict]:
+     """Construct a minimal text-only padding template of one prompt token and one response token.
+ 
+@@ -101,6 +102,7 @@ def construct_minimal_padding_template(
+ 
+     # Update the fields and remove redundant parts
+     template_sample.update(
++        uid=pad_uid,
+         prompts=prompts,
+         responses=prompts.clone(),
+         input_ids=input_ids,
+@@ -112,6 +114,8 @@ def construct_minimal_padding_template(
+         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
+         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+     )
++    if "parent_id" in template_sample:
++        template_sample["parent_id"] = pad_uid
+     if "multi_modal_inputs" in template_sample:
+         template_sample["multi_modal_inputs"] = {}
+     if routed_experts is not None:
+@@ -120,7 +124,7 @@ def construct_minimal_padding_template(
+         template_sample.pop("routed_experts", None)
+ 
+     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
+-    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
++    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2, parent_id=pad_uid)
+     return template_sample, template_tag
+ 
+ 
+@@ -154,26 +158,18 @@ def upsample_batch_to_divisible_size(
+     source_key = batch.keys[source_idx]
+     source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
+ 
+-    # Construct the minimal padding template of one prompt token and one response token
+-    template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id)
+-
+-    # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
+-    # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
+-    pad_uid = f"pad{uuid.uuid4().hex}"
+-    template_sample["uid"] = pad_uid
+-
+     # Construct the padding samples in a for-loop
+     pad_keys = []
+     pad_tags = []
+     pad_fields = []
+     pad_size = batch_multiple - remainder
+     for local_idx in range(pad_size):
+-        sample = copy.deepcopy(template_sample)
+-        # Use incremental local_idx as different session_ids
+-        pad_keys.append(f"{pad_uid}_{local_idx}_0")
+-        if "session_id" in sample:
+-            sample["session_id"] = local_idx
+-        pad_fields.append(sample)
++        pad_uid = -(local_idx + 1)
++        template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id, pad_uid)
++        pad_keys.append(f"{pad_uid}_0")
++        if "session_id" in template_sample:
++            template_sample["session_id"] = local_idx
++        pad_fields.append(template_sample)
+         pad_tags.append(copy.deepcopy(template_tag))
+ 
+     tq.kv_batch_put(
+diff --git a/verl/trainer/ppo/rollout_corr_helper.py b/verl/trainer/ppo/rollout_corr_helper.py
+index 0f4d558c..d893a50b 100644
+--- a/verl/trainer/ppo/rollout_corr_helper.py
++++ b/verl/trainer/ppo/rollout_corr_helper.py
+@@ -760,18 +760,28 @@ def compute_is_metrics(
+     if rollout_is_weights.dim() > 1:
+         seq_mean_weights: torch.Tensor = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)
+ 
+-        metrics["rollout_is_seq_mean"] = seq_mean_weights.mean().item()
+-        metrics["rollout_is_seq_std"] = seq_mean_weights.std().item() if seq_mean_weights.numel() > 1 else 0.0
+-        metrics["rollout_is_seq_max"] = seq_mean_weights.max().item()
+-        metrics["rollout_is_seq_min"] = seq_mean_weights.min().item()
+-
+-        # Sequence deviation from ideal weight (1.0)
+-        seq_deviation: torch.Tensor = (seq_mean_weights - 1.0).abs()
+-        metrics["rollout_is_seq_max_deviation"] = seq_deviation.max().item()
+-
+-        # Fraction of sequences with extreme weights
+-        metrics["rollout_is_seq_fraction_high"] = (seq_mean_weights > rollout_is_threshold).float().mean().item()
+-        metrics["rollout_is_seq_fraction_low"] = (seq_mean_weights < rollout_is_threshold_lower).float().mean().item()
++        seq_valid_mask_is: torch.Tensor = response_mask.sum(dim=-1) > 0
++        seq_mean_weights_valid: torch.Tensor = seq_mean_weights[seq_valid_mask_is]
++
++        if seq_mean_weights_valid.numel() > 0:
++            metrics["rollout_is_seq_mean"] = seq_mean_weights_valid.mean().item()
++            metrics["rollout_is_seq_std"] = (
++                seq_mean_weights_valid.std().item() if seq_mean_weights_valid.numel() > 1 else 0.0
++            )
++            metrics["rollout_is_seq_max"] = seq_mean_weights_valid.max().item()
++            metrics["rollout_is_seq_min"] = seq_mean_weights_valid.min().item()
++
++            # Sequence deviation from ideal weight (1.0)
++            seq_deviation: torch.Tensor = (seq_mean_weights_valid - 1.0).abs()
++            metrics["rollout_is_seq_max_deviation"] = seq_deviation.max().item()
++
++            # Fraction of sequences with extreme weights
++            metrics["rollout_is_seq_fraction_high"] = (
++                (seq_mean_weights_valid > rollout_is_threshold).float().mean().item()
++            )
++            metrics["rollout_is_seq_fraction_low"] = (
++                (seq_mean_weights_valid < rollout_is_threshold_lower).float().mean().item()
++            )
+ 
+     return metrics
+ 
 diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
 index c0889727..3a33bb98 100644
 --- a/verl/utils/dataset/rl_dataset.py

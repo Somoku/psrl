@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig
 
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
@@ -97,6 +97,7 @@ class RewardLoopManager(CommandExtension):
         assert self.rollout_n >= self.alg_rollout_n, (
             f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
         )
+        self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
 
         # Reward model configuration
         self.request_id_to_n_trajectory = {}
@@ -191,11 +192,16 @@ class RewardLoopManager(CommandExtension):
         reward_spec_keys, reward_managers, coefs = [], [], []
         for reward_model_dict in reward_model_dicts:
             # reward_fn can be either a string name (from dataset defaults) or a
-            # list-of-config-dicts (from system config). Normalise to string.
+            # list-of-config-dicts (from system config or OmegaConf ListConfig).
+            # Normalise to a plain string reward function name.
             raw_reward_fn = reward_model_dict.get("reward_fn", "default")
-            if isinstance(raw_reward_fn, list) and len(raw_reward_fn) > 0:
-                reward_fn_name = raw_reward_fn[0].get("name", "default") if isinstance(raw_reward_fn[0], dict) else str(raw_reward_fn[0])
-            elif isinstance(raw_reward_fn, dict):
+            if isinstance(raw_reward_fn, (list, ListConfig)) and len(raw_reward_fn) > 0:
+                reward_fn_name = (
+                    raw_reward_fn[0].get("name", "default")
+                    if isinstance(raw_reward_fn[0], (dict, DictConfig))
+                    else str(raw_reward_fn[0])
+                )
+            elif isinstance(raw_reward_fn, (dict, DictConfig)):
                 reward_fn_name = raw_reward_fn.get("name", "default")
             else:
                 reward_fn_name = str(raw_reward_fn)
@@ -340,8 +346,8 @@ class RewardLoopManager(CommandExtension):
         return position_ids
 
     def pre_process(self, inputs: TensorDict) -> TensorDict:
-        prompts = tu.get(inputs, "prompts")
-        responses = tu.get(inputs, "responses")
+        prompts = tu.get(inputs, "prompts").squeeze(0)    # [1, prompt_len] -> [prompt_len]
+        responses = tu.get(inputs, "responses").squeeze(0)  # [1, response_len] -> [response_len]
         # prompts and responses are 1D unpadded tensors stored per-sample in TQ.
         input_ids = torch.cat([prompts, responses], dim=0)
         attention_mask = torch.ones_like(input_ids, dtype=torch.int64) # No padding
@@ -349,7 +355,8 @@ class RewardLoopManager(CommandExtension):
         multi_modal_inputs = self._compute_multi_modal_inputs(inputs, input_ids.unsqueeze(0))
         position_ids = self._compute_position_ids(
             input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
-        ).squeeze(0)
+        )
+        inputs["attention_mask"] = attention_mask.unsqueeze(0)
         inputs["position_ids"] = position_ids
         return inputs
 
@@ -470,12 +477,13 @@ class RewardLoopManager(CommandExtension):
         Returns:
             KVBatchMeta: Normalized reward batch.
         """
-        fields = ["uid", "reward_extra_info", "reward_score", "data_source"]
+        fields = ["uid", "reward_score", "reward_extra_info"]
         data = tq.kv_batch_get(keys=reward_batch.keys, partition_id=reward_batch.partition_id, select_fields=fields)
 
         uids = tu.get(data, "uid")
         reward_extra_infos = tu.get(data, "reward_extra_info")
-        data_sources = tu.get(data, "data_source")
+        uid_to_data_source = {uid: self.request_id_to_data_source.pop(uid) for uid in set(uids)}
+        data_sources = [uid_to_data_source[uid] for uid in uids]
         reward_scores = tu.get(data, "reward_score")
 
         for reward_extra_info, data_source, reward_score in zip(reward_extra_infos, data_sources, reward_scores):
@@ -517,6 +525,8 @@ class RewardLoopManager(CommandExtension):
         group_rewards_dicts = {}
         for local_index, row_index in enumerate(final_indices):
             uid = uids[row_index]
+            if uid not in self.request_id_to_group:
+                continue
             group_id = self.request_id_to_group[uid]
             if group_id not in group_rewards_dicts:
                 group_rewards_dicts[group_id] = {
@@ -562,7 +572,11 @@ class RewardLoopManager(CommandExtension):
         )
         return reward_batch
 
-    async def compute_score(self, reward_inputs: TensorDict) -> dict[str, Any] | None:
+    async def compute_score(
+        self,
+        reward_inputs: TensorDict,
+        reward_meta_infos: list[dict],
+    ) -> dict[str, Any] | None:
         """
         Compute the reward score for the given inputs.
 
@@ -578,6 +592,7 @@ class RewardLoopManager(CommandExtension):
         is_validate = tu.get(reward_inputs, "validate", False)
         request_ids = tu.get(reward_inputs, "uid")
         n_trajectories = tu.get(reward_inputs, "n_trajectory")
+        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         for request_id, n_trajectory in zip(request_ids, n_trajectories):
             self.request_id_to_n_trajectory[request_id] = n_trajectory
         request_keys = []
@@ -609,7 +624,8 @@ class RewardLoopManager(CommandExtension):
         ):
             for i, request_id in enumerate(request_ids):
                 reward_input = reward_inputs[i : i + 1]
-                parent_id = tu.get(reward_input, "parent_id")[0]
+                reward_meta_info = reward_meta_infos[i]
+                prompt_id = tu.get(reward_input, "parent_id" if rollout_n > 1 else "uid")[0]
                 data_source = tu.get(reward_input, "data_source")[0]
 
                 # Reward normalization group assignment
@@ -617,7 +633,7 @@ class RewardLoopManager(CommandExtension):
                     group_id = data_source
                     self.request_id_to_group[request_id] = group_id
                 elif self.reward_normalization == "group":
-                    group_id = parent_id
+                    group_id = prompt_id
                     self.request_id_to_group[request_id] = group_id
                 self.request_id_to_data_source[request_id] = data_source
 
@@ -629,7 +645,7 @@ class RewardLoopManager(CommandExtension):
                         level=logging.DEBUG,
                         event_type=EventType.OTHER,
                     ):
-                        asyncio.create_task(self._async_reward_task(reward_input))
+                        asyncio.create_task(self._async_reward_task(reward_input, reward_meta_info))
                 else:
                     with log_dual_events(
                         "Compute reward model score",
@@ -638,7 +654,7 @@ class RewardLoopManager(CommandExtension):
                         event_type=EventType.OTHER,
                     ):
                         # TODO(zyf): need to support batchify reward computation for sync mode
-                        result = await self._compute_score(reward_input)
+                        result = await self._compute_score(reward_input, reward_meta_info)
                         # Update the request status to REWARD_COMPLETED
                         update_status_success = await self.ps_manager_handle.update_request_status.remote(
                             request_id,
@@ -650,7 +666,11 @@ class RewardLoopManager(CommandExtension):
 
         return result
 
-    async def _compute_score(self, reward_input: TensorDict) -> dict[str, Any]:
+    async def _compute_score(
+        self,
+        reward_input: TensorDict,
+        reward_meta_info: dict,
+    ) -> dict[str, Any]:
         """Run all reward loops for a single sample in parallel and aggregate the results.
 
         Resolves the reward loops from the input's ``reward_model_dicts``, executes them
@@ -670,15 +690,11 @@ class RewardLoopManager(CommandExtension):
         """
         assert len(reward_input) == 1, "Reward input for _compute_score should contain exactly one sample"
 
-        request_ids = tu.get(reward_input, "uid")
-        keys = [str(request_id) for request_id in request_ids]
-        partition_id = "val" if tu.get(reward_input, "validate", False) else "train"
-        fields = ["reward_model_dicts"]
+        # Merge reward extra info into reward_input
+        tu.assign_non_tensor_stack(reward_input, "reward_model", [reward_meta_info["reward_model"]])
+        tu.assign_non_tensor_stack(reward_input, "extra_info", [reward_meta_info["extra_info"]])
 
-        data = await tq.async_kv_batch_get(keys=keys, partition_id=partition_id, select_fields=fields)
-
-        reward_model_dicts = data["reward_model_dicts"]
-        reward_spec_keys, reward_managers, reward_coefs = self._resolve_reward_manager(reward_model_dicts)
+        reward_spec_keys, reward_managers, reward_coefs = self._resolve_reward_manager(reward_meta_info["reward_model_dicts"])
 
         # Return reward data instead of meta
         futures = [asyncio.create_task(reward_manager.run_single(reward_input)) for reward_manager in reward_managers]
@@ -697,7 +713,11 @@ class RewardLoopManager(CommandExtension):
 
         return result
 
-    async def _async_reward_task(self, reward_input: TensorDict):
+    async def _async_reward_task(
+        self,
+        reward_input: TensorDict,
+        reward_meta_info: dict,
+    ):
         """Fire-and-forget async task: compute reward and store the result for later retrieval.
 
         Derives all reward loop configuration from ``reward_input`` itself via
@@ -707,9 +727,10 @@ class RewardLoopManager(CommandExtension):
         assert len(reward_input) == 1, "Async reward task should be launched with a single-sample batch"
 
         uid = tu.get(reward_input, "uid")[0]
-        result = await self._compute_score(reward_input)
-        n_trajectory = tu.get(reward_input, "n_trajectory", 1)
-        
+        result = await self._compute_score(reward_input, reward_meta_info)
+        n_trajectory = tu.get(reward_input, "n_trajectory", [1])[0]
+        result["response_len"] = reward_input["responses"].shape[-1]
+
         # Broadcast to all trajectories
         trajectory_to_results = {}
         if n_trajectory > 1:
@@ -717,7 +738,7 @@ class RewardLoopManager(CommandExtension):
                 trajectory_to_results[f"{uid}_{i}"] = result
         else:
             trajectory_to_results[str(uid)] = result
-        
+
         await self.set_reward_for_requests(trajectory_to_results)
 
     async def wait_for_reward_of_requests(self, requests: KVBatchMeta) -> KVBatchMeta:
@@ -729,13 +750,24 @@ class RewardLoopManager(CommandExtension):
         """
         request_keys = requests.keys
         is_validate = requests.partition_id == "val"
-        
-        request_key_to_reward: dict[str, KVBatchMeta] = {}
+        partition_id = "val" if is_validate else "train"
+        # Padding from `_balance_batch` in `ray_trainer.py`
+        padding_keys: set[str] = {
+            key for key, tag in zip(requests.keys, requests.tags) if tag.get("is_padding", False)
+        }
+        request_key_to_reward: dict[str, dict] = {}
         futures_to_wait = {}
 
         # Gather available rewards and futures for the requested IDs.
         for request_key in request_keys:
-            if request_key in self.request_key_to_reward:
+            if request_key in padding_keys:
+                request_key_to_reward[request_key] = {
+                    "reward_score": 0.0,
+                    "reward_extra_info": {},
+                    "reward_metrics": {},
+                    "response_len": 1,
+                }
+            elif request_key in self.request_key_to_reward:
                 request_key_to_reward[request_key] = self.request_key_to_reward.pop(request_key)
             elif request_key in self.request_key_to_future:
                 futures_to_wait[request_key] = self.request_key_to_future[request_key]
@@ -754,9 +786,15 @@ class RewardLoopManager(CommandExtension):
             fields.append(request_key_to_reward[request_key])
             self.request_key_to_future.pop(request_key, None)
 
+        for f in fields:
+            response_len = f.pop("response_len", 1)
+            rm_score_tensor = torch.zeros(response_len, dtype=torch.float32)
+            rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
+            f["rm_scores"] = rm_score_tensor
+
         await tq.async_kv_batch_put(
             keys=request_keys,
-            partition_id="train" if not is_validate else "val",
+            partition_id=partition_id,
             fields=list_of_dict_to_tensordict(fields),
         )
 

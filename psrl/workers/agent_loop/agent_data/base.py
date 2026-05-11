@@ -147,6 +147,16 @@ class SessionData:
     # val/train session data
     validate: bool = False
 
+    # NOTE(linsh): the source of the following three fileds is dataset
+    # Data source of current session
+    data_source: str = "unknown"
+    # Reward model info (e.g., ground truth)
+    reward_model: dict = field(default_factory=dict)
+    # Extra info of input request
+    extra_info: dict = field(default_factory=dict)
+    # List of reward model dict
+    reward_model_dicts: list[dict] = field(default_factory=list)
+
     # List of Step objects comprising this trajectory
     steps: list[Step] = field(default_factory=list)
     # Number of assistant (model) turns taken
@@ -515,7 +525,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 mm["images"] = self.session_data.trajectories[-1].image_data
             if self.session_data.trajectories[-1].video_data is not None:
                 mm["videos"] = self.session_data.trajectories[-1].video_data
-            request["multi_modal_data"] = np.array([mm], dtype=object)
+            request["multi_modal_data"] = mm
 
         return request
 
@@ -620,17 +630,35 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         elif self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "traj":
             # NOTE(linsh): Only compute reward for the last trajectory.
             final_output = outputs[-1]
-            data = tu.get_tensordict({
+            tensor_dict = {
                 "prompts": torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0),
                 "responses": torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0),
                 "multi_modal_data": np.array([final_output.multi_modal_data], dtype=object),
                 "num_turns": np.array([final_output.num_turns]),
                 "tool_extra_fields": np.array([final_output.extra_fields], dtype=object),
                 "uid": np.array([self.session_data.request_id]),
-                "validate": self.session_data.validate,
                 "n_trajectory": np.array([len(outputs)]),
-            })
-            reward_result = await self.reward_manager.compute_score.remote(data)
+                "data_source": np.array([self.session_data.data_source]),
+            }
+            if self.session_data.parent_id is not None:
+                tensor_dict["parent_id"] = np.array([self.session_data.parent_id])
+
+            data = tu.get_tensordict(
+                tensor_dict=tensor_dict,
+                non_tensor_dict={
+                    "validate": self.session_data.validate,
+                },
+            )
+            reward_meta_infos = [{
+                "reward_model": self.session_data.reward_model,
+                "extra_info": self.session_data.extra_info,
+                "reward_model_dicts": self.session_data.reward_model_dicts,
+            }]
+
+            reward_result = await self.reward_manager.compute_score.remote(
+                data,
+                reward_meta_infos=reward_meta_infos,
+            )
             if not self.config.reward.launch_reward_fn_async:
                 if not reward_result:
                     return None

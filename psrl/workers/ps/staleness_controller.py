@@ -650,6 +650,18 @@ class StalenessInventory:
             elif isinstance(tracked_entry_info.rollout_instance_id, list):
                 tracked_entry_info.rollout_instance_id.append(entry_info.rollout_instance_id)
 
+            # Update trajectory num
+            if (
+                not isinstance(tracked_entry_info.n_trajectory, list)
+                and tracked_entry_info.n_trajectory != entry_info.n_trajectory
+            ):
+                tracked_entry_info.n_trajectory = [tracked_entry_info.n_trajectory] * (
+                    len(tracked_entry_info.request_idx) - 1
+                )
+                tracked_entry_info.n_trajectory.append(entry_info.n_trajectory)
+            elif isinstance(tracked_entry_info.n_trajectory, list):
+                tracked_entry_info.n_trajectory.append(entry_info.n_trajectory)
+
             self.buffers[buffer_id].entries[entry_id].entry_info = tracked_entry_info
             return buffer_id, entry_id
 
@@ -788,6 +800,49 @@ class StalenessInventory:
             f"[Entry Update]: request idx {request_idx} entry in "
             f"(buffer {buffer_id}, entry {entry_id}) is updated to {entry_info_to_update} "
             f"(instance id is updated to {new_instance_id})"
+        )
+
+    def update_request_n_trajectory(
+        self,
+        request_id: int,
+        new_n_trajectory: int,
+    ):
+        """
+        Update the number of trajectories for a specific request in the data tracker and buffer.
+
+        Args:
+            request_id (int): The global unique request ID to update.
+            n_trajectory (int): The new number of trajectories to set.
+        Raises:
+            AssertionError: If the request ID is not found or the new number of trajectories is invalid.
+        """
+        prompt_id = request_id // self.rollout_n
+        request_idx = request_id % self.rollout_n
+        if prompt_id not in self.data_tracker:
+            raise AssertionError(f"Prompt ID {prompt_id} not found in data tracker")
+
+        buffer_id, entry_id = self.data_tracker[prompt_id]
+        entry_info_to_update = self.buffers[buffer_id].entries[entry_id].entry_info
+
+        if isinstance(entry_info_to_update.n_trajectory, list):
+            request_idx_in_list = entry_info_to_update.request_idx.index(request_idx)
+            entry_info_to_update.n_trajectory[request_idx_in_list] = new_n_trajectory
+        elif entry_info_to_update.n_trajectory != new_n_trajectory:
+            if isinstance(entry_info_to_update.request_idx, list):
+                request_num = len(entry_info_to_update.request_idx)
+                request_idx_in_list = entry_info_to_update.request_idx.index(request_idx)
+                entry_info_to_update.n_trajectory = [entry_info_to_update.n_trajectory] * request_num
+                entry_info_to_update.n_trajectory[request_idx_in_list] = new_n_trajectory
+            else:
+                assert isinstance(entry_info_to_update.request_idx, np.int64), (
+                    "Request idx must be a list or an np.int64"
+                )
+                entry_info_to_update.n_trajectory = new_n_trajectory
+
+        psrl_logger.info(
+            f"[Entry Update]: request idx {request_idx} entry in "
+            f"(buffer {buffer_id}, entry {entry_id}) is updated to {entry_info_to_update} "
+            f"(n_trajectory is updated to {new_n_trajectory})"
         )
 
     def clear_buffer(

@@ -1,8 +1,8 @@
 set -xeuo pipefail
 
 staleness=${1:-1}
-project_name=psrl_swe_smith
-experiment_name=GRPO-SWE-agent-LM-7B-swe_smith-fsdp2-staleness_${staleness}
+project_name=psrl_swe_gym
+experiment_name=GRPO-SWE-agent-LM-7B-swe_gym-fsdp2-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -13,9 +13,34 @@ PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dir
 echo "=== Pre-flight checks ==="
 python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent: OK')"
 python -c "import swebench; print('swebench', swebench.__version__, ': OK')"
-python -c "from swesmith.profiles import registry; print('swesmith registry:', len(registry.data), 'profiles: OK')"
-python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; print('swebench_grader: OK')"
+python -c "from examples.mini_swe.swebench_grader import grade_fresh_container, _grade_gym; print('swebench_grader (gym): OK')"
+python -c "from swebench.harness.log_parsers.python import parse_log_pytest; print('parse_log_pytest: OK')"
 ray status 2>/dev/null | head -5 || echo "WARNING: ray status failed"
+
+# Pre-flight: spot-check Docker images from training data
+python -c "
+import pandas as pd, subprocess, json, sys
+train_file = '${PSRL_PATH}/examples/mini_swe/data/swe_gym_2438/train.parquet'
+try:
+    df = pd.read_parquet(train_file)
+except FileNotFoundError:
+    print(f'ERROR: Training data not found at {train_file}')
+    print('Run: python examples/mini_swe/data/prepare_swe_gym.py --source SWE-Gym/SWE-Gym --split train --output examples/mini_swe/data/swe_gym_2438')
+    sys.exit(1)
+sample = df.sample(min(3, len(df)))
+missing = 0
+for _, row in sample.iterrows():
+    ei = row['extra_info'] if isinstance(row['extra_info'], dict) else json.loads(row['extra_info'])
+    img = ei['swe_problem_image']
+    r = subprocess.run(['docker', 'image', 'inspect', img], capture_output=True, timeout=10)
+    if r.returncode != 0:
+        print(f'  WARNING: Image not found locally: {img}')
+        missing += 1
+if missing > 0:
+    print(f'  {missing} images missing. Pull them before training!')
+else:
+    print('Docker images spot-check: OK')
+"
 echo "=== Pre-flight done ==="
 
 # --- Model ---
@@ -23,20 +48,20 @@ echo "=== Pre-flight done ==="
 MODEL_PATH=${PSRL_WORKSPACE}/models/SWE-agent-LM-7B
 
 # --- Data ---
-# Train: SWE-smith-py 1 000-problem repo-balanced subset.
+# Train: SWE-Gym full 2438 instances (11 repos, difficulty suitable for 7B models).
 # Validation: SWE-bench Verified 80-problem repo-balanced subset.
-TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet
+TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_subset_100/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "ERROR: Training data not found at $TRAIN_FILE"
-    echo "Run the data preparation commands at the top of this script."
+    echo "Run: python examples/mini_swe/data/prepare_swe_gym.py --source SWE-Gym/SWE-Gym --split train --output examples/mini_swe/data/swe_gym_2438"
     exit 1
 fi
 
 if [[ ! -f "$TEST_FILE" ]]; then
     echo "ERROR: Validation data not found at $TEST_FILE"
-    echo "Run the data preparation commands at the top of this script."
+    echo "Run the data preparation commands for SWE-bench Verified."
     exit 1
 fi
 
@@ -74,10 +99,6 @@ VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / (VAL_TP * VAL_PP) ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( VAL_TP * VAL_PP ))
 
 # --- Algorithm (GRPO / DAPO) ---
-# Dynamic sampling filter: mirrors OpenClaw's check_reward_nonzero_std.
-# Drops rollout groups where all n=8 samples share the same reward (std=0),
-# preventing zero-gradient updates on batches where every rollout failed.
-# Uses psrl.group_post_process with algorithm.filter_groups.metric=score.
 enable_dynamic_sampling_filter=False
 adv_estimator=grpo
 use_kl_in_reward=False
@@ -88,12 +109,9 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths ---
-# SWE-bench episodes are multi-turn; swebench images typically use up to 250 turns
-# in upstream mini-SWE-agent.  We cap at 30 to match the eval script budget and
-# prevent degenerate loops from wasting compute.
-# NOTE: GEN_INSTANCES / VAL_INSTANCES below refer to parallel rollout-engine
-# instances, not SWE problems.
-max_turns=50
+# SWE-Gym tasks are real-world bugs from 11 repos. Cap at 30 turns
+# which is sufficient for most resolvable instances.
+max_turns=30
 max_prompt_length=2048
 max_response_length=30000
 
@@ -109,18 +127,15 @@ n_resp_per_prompt_val=8
 train_prompt_mini_bsz=32
 
 # --- Sampling ---
-# Use temperature=0.7, top_p=0.95 to match the model's fine-tuning distribution
-# (generation_config.json: T=0.7, top_p=0.8, top_k=20) while giving slightly
-# more diversity for GRPO exploration.
 temperature=0.7
 top_p=0.95
 top_k=-1
 val_top_p=0.7
 
 # --- Reward ---
-# Reward mode: binary | partial_credit | test_ratio | shaped
-# partial_credit gives intermediate rewards for patch submission, partial test fixes.
-reward_mode=binary
+# SWE-Gym has moderate difficulty (7B model can resolve some instances),
+# so partial_credit provides useful gradient signal beyond binary {+1,-1}.
+reward_mode=partial_credit
 
 # --- TIS ---
 rollout_is=token
@@ -243,6 +258,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.val_before_train=True \
     trainer.log_val_generations=5 \
     trainer.test_freq=5 \
-    trainer.save_freq=50 \
+    trainer.save_freq=200 \
     trainer.total_epochs=100 \
     trainer.total_training_steps=200 2>&1 | tee ${experiment_name}.log

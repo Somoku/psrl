@@ -12,6 +12,7 @@ loop internally via `DefaultAgent.run()`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ from omegaconf import DictConfig
 from verl import DataProto
 
 from psrl.environments.base import Environment, EnvStepOutput
-from psrl.utils.common.docker_utils import cleanup_containers_by_label
+from psrl.utils.common.docker_utils import force_remove_containers_by_label
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -79,7 +80,7 @@ class MiniSWEEnvironment(Environment[dict, None]):
 
         # Log available keys for debugging data pipeline issues.
         ntb_keys = list(task.non_tensor_batch.keys()) if task.non_tensor_batch else []
-        psrl_logger.info(f"MiniSWEEnvironment reset: non_tensor_batch keys={ntb_keys}.")
+        psrl_logger.debug(f"MiniSWEEnvironment reset: non_tensor_batch keys={ntb_keys}.")
 
         # Extract extra_info if available (may be absent when the data pipeline
         # does not copy it to gen_batch — the reward_manager holds the original).
@@ -93,6 +94,15 @@ class MiniSWEEnvironment(Environment[dict, None]):
             extra_info = extra_info_raw
         else:
             extra_info = {}
+
+        # DEBUG: Log extra_info grading fields to diagnose missing grader issue.
+        psrl_logger.warning(
+            f"MiniSWEEnvironment reset: extra_info type={type(extra_info_raw).__name__}, "
+            f"extra_info keys={list(extra_info.keys()) if isinstance(extra_info, dict) else 'N/A'}, "
+            f"swe_grader={extra_info.get('swe_grader', 'MISSING')!r}, "
+            f"has_swe_problem_image={bool(extra_info.get('swe_problem_image', ''))}, "
+            f"ntb_keys={ntb_keys}."
+        )
 
         # Fall back to raw_prompt for problem_statement if extra_info is empty.
         problem_statement = extra_info.get("problem_statement", "") or ""
@@ -132,6 +142,44 @@ class MiniSWEEnvironment(Environment[dict, None]):
         if not use_preexisting_repo and not repo_path:
             use_preexisting_repo = True
 
+        # Grader fields: forwarded to the agent loop for post-rollout
+        # fresh-container evaluation.  Empty string means no grading.
+        # Support both current field names (swe_grader, swe_problem, ...) and
+        # legacy field names (grader, instance, image_name) from old parquets.
+        swe_grader = str(
+            extra_info.get("swe_grader", "") or extra_info.get("grader", "") or ""
+        )
+        swe_problem = (
+            extra_info.get("swe_problem", None)
+            or extra_info.get("instance", None)
+            or {}
+        )
+        swe_problem_image = str(
+            extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or ""
+        )
+        swe_restore_tests = bool(
+            extra_info.get("swe_restore_tests", False)
+            or extra_info.get("needs_head_minus_one", False)
+        )
+
+        # Assert: after fallback, grading fields must be non-empty.
+        # If both old and new field names are missing, the parquet is broken.
+        assert swe_grader, (
+            f"extra_info has neither 'swe_grader' nor 'grader' field. "
+            f"Re-run prepare_swebench.py to regenerate the parquet. "
+            f"Available keys: {sorted(extra_info.keys())}."
+        )
+        assert swe_problem and isinstance(swe_problem, dict) and swe_problem.get("instance_id"), (
+            f"extra_info has neither 'swe_problem' nor 'instance' with valid data. "
+            f"Re-run prepare_swebench.py to regenerate the parquet. "
+            f"Available keys: {sorted(extra_info.keys())}."
+        )
+        assert swe_problem_image, (
+            f"extra_info has neither 'swe_problem_image' nor 'image_name' field. "
+            f"Re-run prepare_swebench.py to regenerate the parquet. "
+            f"Available keys: {sorted(extra_info.keys())}."
+        )
+
         observation = {
             "problem_statement": problem_statement,
             "swe_task_id": self._swe_task_id,
@@ -139,16 +187,14 @@ class MiniSWEEnvironment(Environment[dict, None]):
             "repo_path": repo_path,
             "use_preexisting_repo": use_preexisting_repo,
             "preexisting_repo_name": preexisting_repo_name,
-            # Grader fields: forwarded to the agent loop for post-rollout
-            # fresh-container evaluation.  Empty string means no grading.
-            "swe_grader": str(extra_info.get("swe_grader", "") or ""),
-            "swe_problem": extra_info.get("swe_problem", {}),
-            "swe_problem_image": str(extra_info.get("swe_problem_image", "") or ""),
-            "swe_restore_tests": bool(extra_info.get("swe_restore_tests", False)),
+            "swe_grader": swe_grader,
+            "swe_problem": swe_problem,
+            "swe_problem_image": swe_problem_image,
+            "swe_restore_tests": swe_restore_tests,
         }
 
         _problem_short = f"{problem_statement[:80]}..." if len(problem_statement) > 80 else problem_statement
-        psrl_logger.info(
+        psrl_logger.debug(
             f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment reset: "
             f"problem={_problem_short!r}, "
             f"repo={preexisting_repo_name!r}, preexisting={use_preexisting_repo}."
@@ -172,11 +218,21 @@ class MiniSWEEnvironment(Environment[dict, None]):
         Primary Docker cleanup is handled by mini-swe-agent's
         `DockerEnvironment.cleanup()`. This method provides a fallback
         via label-based container cleanup in case the primary path fails.
+
+        Uses ``docker rm -f`` (not ``docker stop``) because rollout sandboxes
+        are disposable and ``docker stop`` has been observed to silently
+        succeed without actually killing containers that have many runaway
+        in-container children or active ``docker exec`` sessions racing the
+        SIGTERM/SIGKILL window.
         """
         if self._swe_task_id:
-            await cleanup_containers_by_label("psrl.swe_task_id", self._swe_task_id)
+            await asyncio.to_thread(
+                force_remove_containers_by_label,
+                "psrl.swe_task_id",
+                self._swe_task_id,
+            )
 
-        psrl_logger.info(f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment closed.")
+        psrl_logger.debug(f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment closed.")
 
     @property
     def state(self) -> dict:

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Reference invocation: pull every image referenced by the 1k smith parquet
-# into a shared-FS tar cache, then fan `docker load` out to every node.
+# Pull every image referenced by the 1k smith parquet into a shared-FS tar
+# cache, then fan `docker load` out to every node.
 #
 # Run from this directory (examples/mini_swe/prepare/docker_scripts/):
-#   bash prefetch_example.sh
+#   bash swe_smith.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREPARE_DIR="$(dirname "$SCRIPT_DIR")"
 
+WORKERS=${SWE_PREFETCH_WORKERS:-4}
+
 bash "$SCRIPT_DIR/prefetch_images.sh" \
     --parquet "$PREPARE_DIR/../data/swe_smith_py_1k/train.parquet" \
-    --workers 4 \
+    --workers "$WORKERS" \
     --image-dir /jizhicfs/lhy/docker_images/swe_train \
     --method skopeo \
     --mirrors docker.1ms.run,docker.1panel.live,proxy.vvvv.ee,lispy.org,registry.cyou \

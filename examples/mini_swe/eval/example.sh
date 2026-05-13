@@ -18,15 +18,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-MODEL="/jizhicfs/lhy/models/Qwen3-30B-A3B"
-SERVED_MODEL_NAME="Qwen3-30B-A3B"
-HOSTS_FILE="/jizhicfs/lhy/hosts/32GPUs"
+MODEL="/jizhicfs/lhy/models/SWE-agent-LM-7B"
+SERVED_MODEL_NAME="SWE-agent-LM-7B"
+HOSTS_FILE="/jizhicfs/lhy/hosts/32GPUs_another"
 DATASET="examples/mini_swe/data/verified_subset_80/train.parquet"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
 SERVE_PORT=8000
-TP=4
-DP=2
+TP=2
+DP=4
 WORKERS_PER_NODE=8
 GRADER_TIMEOUT=1800
 SSH_TIMEOUT=7200
@@ -123,7 +123,8 @@ python -m examples.mini_swe.eval.eval_swebench_multinode \
     --dataset "$DATASET" \
     --output-dir "$EVAL_OUTDIR" \
     --model "$SERVED_MODEL_NAME" \
-    --model-class litellm_textbased \
+    --model-class "examples.mini_swe.eval.xml_fc_model.XmlFcModel" \
+    --config "examples/mini_swe/config/swebench_agent_config_full_sweagent.yaml" \
     --workers-per-node "$WORKERS_PER_NODE" \
     --grader-timeout "$GRADER_TIMEOUT" \
     --ssh-timeout "$SSH_TIMEOUT" \

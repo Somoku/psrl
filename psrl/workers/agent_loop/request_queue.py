@@ -45,10 +45,8 @@ def get_priority_by_version(request: DataProto, staleness: int) -> int:
             # It should have the lowest priority
             return float("inf")
         return request.non_tensor_batch["version_tag"][0]
-    elif "min_version_limit" in request.non_tensor_batch:
-        return request.non_tensor_batch["min_version_limit"][0] - staleness
     else:
-        raise AssertionError("Request must have either 'version_tag' or 'min_version_limit'")
+        raise AssertionError("Request must have 'version_tag'")
 
 
 def get_priority_by_version_and_token_num(

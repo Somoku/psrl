@@ -1,8 +1,9 @@
+#!/usr/bin/env bash
 set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_smith
-experiment_name=GRPO-SWE-agent-LM-7B-swe_smith-fsdp2-staleness_${staleness}
+experiment_name=GRPO-Qwen-4B-swe_smith-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -20,7 +21,9 @@ echo "=== Pre-flight done ==="
 
 # --- Model ---
 # NOTE(lhy): Modify max_position_embeddings in config.json to 32768 after downloading.
-MODEL_PATH=${PSRL_WORKSPACE}/models/SWE-agent-LM-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3-4B-Instruct-2507
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-4B-Instruct-2507
+python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path ${HF_MODEL_PATH} --output_path ${DIST_CKPT_PATH}
 
 # --- Data ---
 # Train: SWE-smith-py 1 000-problem repo-balanced subset.
@@ -46,18 +49,21 @@ test_files="['$TEST_FILE']"
 CKPT_ROOT=${CKPT_ROOT:-$PWD}
 default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
-# --- Agent loop config (full SWE-agent format for SWE-agent-LM-7B) ---
-agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_agent_config_full_sweagent.yaml
+# --- Agent loop config (swebench-tuned: cwd=/testbed, swebench-style submit) ---
+agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_agent_config.yaml
 
-# --- Cluster layout (4 nodes x 8 GPUs, same as dapo script) ---
-GEN_TP=2
+# --- Cluster layout (32 GPUs total: 16 for rollout, 16 for train) ---
+# Rollout: TP=2 (4B is small, TP=2 is sufficient for inference)
+# Train: TP=4, PP=1 (4B fits easily without pipeline parallelism; DP=4)
+# Val: TP=2 (matches rollout engine, 8 instances)
+GEN_TP=4
 GEN_PP=1
 
-VAL_TP=2
-VAL_PP=1
+VAL_TP=4
 
-TRAIN_SP=2
-TRAIN_FSDP=8
+TRAIN_TP=8
+TRAIN_PP=1
+TRAIN_CP=2
 
 NNODES=4
 NGPUS_PER_NODE=8
@@ -70,15 +76,14 @@ GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( GEN_TP * GEN_PP ))
 TRAIN_NNODES=2
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
-VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / (VAL_TP * VAL_PP) ))
-VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( VAL_TP * VAL_PP ))
+VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / VAL_TP ))
+VAL_NGPUS_PER_NODE_PER_INSTANCE=${VAL_TP}
 
 # --- Algorithm (GRPO / DAPO) ---
-# Dynamic sampling filter: mirrors OpenClaw's check_reward_nonzero_std.
-# Drops rollout groups where all n=8 samples share the same reward (std=0),
-# preventing zero-gradient updates on batches where every rollout failed.
-# Uses psrl.group_post_process with algorithm.filter_groups.metric=score.
-enable_dynamic_sampling_filter=False
+# Aligned with OpenClaw swe-rl 4B defaults:
+#   GRPO + DAPO asymmetric clip (0.2/0.28), KL effectively off, entropy=0.
+# Dynamic sampling filter: drops rollout groups with std=0 reward.
+enable_dynamic_sampling_filter=True
 adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
@@ -87,39 +92,32 @@ kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.28
 
-# --- Sequence lengths ---
-# SWE-bench episodes are multi-turn; swebench images typically use up to 250 turns
-# in upstream mini-SWE-agent.  We cap at 30 to match the eval script budget and
-# prevent degenerate loops from wasting compute.
-# NOTE: GEN_INSTANCES / VAL_INSTANCES below refer to parallel rollout-engine
-# instances, not SWE problems.
-max_turns=50
+# --- Sequence lengths (from OpenClaw 4B: response=4096, context=32768) ---
+max_turns=30
 max_prompt_length=2048
-max_response_length=30000
+max_response_length=32768
+packing_length=$((max_prompt_length + max_response_length))
 
-# --- Training hyperparameters ---
+# --- Training hyperparameters (from OpenClaw 4B) ---
+# Optimizer: lr=1e-6, weight_decay=0.01, adam_beta2=0.999
 actor_lr=1e-6
-enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 10))
+enable_overlong_buffer=False
+overlong_buffer_len=1024
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=64
-n_resp_per_prompt=8
-n_resp_per_prompt_val=8
-train_prompt_mini_bsz=32
+train_prompt_bsz=32
+n_resp_per_prompt=16
+n_resp_per_prompt_val=16
+train_prompt_mini_bsz=16
 
-# --- Sampling ---
-# Use temperature=0.7, top_p=0.95 to match the model's fine-tuning distribution
-# (generation_config.json: T=0.7, top_p=0.8, top_k=20) while giving slightly
-# more diversity for GRPO exploration.
-temperature=0.7
-top_p=0.95
+# --- Sampling (from OpenClaw 4B) ---
+temperature=1
+top_p=1
 top_k=-1
 val_top_p=0.7
 
 # --- Reward ---
 # Reward mode: binary | partial_credit | test_ratio | shaped
-# partial_credit gives intermediate rewards for patch submission, partial test fixes.
 reward_mode=binary
 
 # --- TIS ---
@@ -128,16 +126,16 @@ rollout_is_threshold=2.0
 
 # --- Performance ---
 use_dynamic_bsz=True
-packing_length=$(( (max_prompt_length + max_response_length) * 1 ))
 offload=True
 
-PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_trainer' \
+PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
     psrl.rollout_n=${n_resp_per_prompt} \
     psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.ps_mode=nixl_cpu \
-    psrl.logging_path=${PSRL_PATH}/examples/mini_swe/fsdp_psrl_log/${experiment_name} \
+    psrl.lmcache.enable=False \
+    psrl.logging_path=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
@@ -150,13 +148,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
     \
-    gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    +gen_actor_rollout_ref.model.custom_chat_template=${PSRL_PATH}/examples/mini_swe/config/qwen_no_think_strip.jinja \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
-    gen_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    gen_actor_rollout_ref.rollout.max_num_batched_tokens=${packing_length} \
     gen_actor_rollout_ref.rollout.temperature=${temperature} \
     gen_actor_rollout_ref.rollout.top_p=${top_p} \
     gen_actor_rollout_ref.rollout.top_k=${top_k} \
@@ -167,52 +165,47 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
     gen_actor_rollout_ref.rollout.agent.num_workers=${NNODES} \
     \
-    train_actor_rollout_ref.model.path="$MODEL_PATH" \
+    train_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
+    +train_actor_rollout_ref.model.custom_chat_template=${PSRL_PATH}/examples/mini_swe/config/qwen_no_think_strip.jinja \
+    train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
-    +train_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
-    train_actor_rollout_ref.model.enable_gradient_checkpointing=True \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${packing_length} \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
-    train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    train_actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
-    train_actor_rollout_ref.rollout.temperature=${temperature} \
-    train_actor_rollout_ref.rollout.top_p=${top_p} \
-    train_actor_rollout_ref.rollout.top_k=${top_k} \
+    train_actor_rollout_ref.rollout.max_num_batched_tokens=${packing_length} \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
     train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
-    train_actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    train_actor_rollout_ref.rollout.multi_turn.enable=True \
-    train_actor_rollout_ref.rollout.multi_turn.max_turns=$max_turns \
-    train_actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
-    train_actor_rollout_ref.rollout.agent.env.name=mini_swe_env \
-    train_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
-    train_actor_rollout_ref.rollout.agent.num_workers=${NNODES} \
+    train_actor_rollout_ref.rollout.val_kwargs.n=${n_resp_per_prompt_val} \
     train_actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
     train_actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
     train_actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
-    train_actor_rollout_ref.actor.optim.lr=$actor_lr \
+    train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
     train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
-    train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
+    train_actor_rollout_ref.actor.optim.weight_decay=0.01 \
+    train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${packing_length} \
-    +train_actor_rollout_ref.actor.use_rollout_log_probs=True \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
-    train_actor_rollout_ref.actor.strategy=fsdp2 \
-    train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
-    train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
-    train_actor_rollout_ref.actor.ulysses_sequence_parallel_size=${TRAIN_SP} \
-    train_actor_rollout_ref.actor.fsdp_config.fsdp_size=${TRAIN_FSDP} \
+    train_actor_rollout_ref.actor.megatron.param_offload=False \
+    train_actor_rollout_ref.actor.megatron.optimizer_offload=${offload} \
+    train_actor_rollout_ref.actor.megatron.grad_offload=${offload} \
+    train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
+    train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
+    train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
+    train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
+    train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
-    train_actor_rollout_ref.actor.grad_clip=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \
     algorithm.rollout_correction.rollout_is=${rollout_is} \
@@ -220,6 +213,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.group_post_process.enable=${enable_dynamic_sampling_filter} \
     psrl.group_post_process.name=dynamic_sampling_filter \
     algorithm.filter_groups.metric=score \
+    \
+    reward_model.reward_manager=dapo \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    +reward_model.reward_kwargs.overlong_buffer_cfg.log=False \
+    +reward_model.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="$train_files" \
     data.val_files="$test_files" \
@@ -240,7 +240,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.default_local_dir="${default_local_dir}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=5 \
     trainer.test_freq=5 \
     trainer.save_freq=50 \

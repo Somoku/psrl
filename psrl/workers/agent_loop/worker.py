@@ -1,6 +1,8 @@
 import asyncio
+import atexit
 import logging
 import os
+import uuid
 from collections import deque
 
 import hydra
@@ -14,12 +16,17 @@ from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
 
+from psrl.utils.common.chat_template import resolve_chat_template_value
+from psrl.utils.common.docker_utils import (
+    force_remove_containers_by_label,
+    spawn_actor_reaper,
+)
 from psrl.utils.common.http_utils import init_http_client
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.profiling.collector import TurnProfilingCollector
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
-from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig, TerminateReason
+from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DummyConfig
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -36,6 +43,7 @@ class PSRL_AgentLoopWorker:
         ps_manager_handle,
         rollout_router,
         rollout_wg_list,
+        worker_id: int = 0,
     ):
         """Initialize agent loop worker.
 
@@ -46,12 +54,56 @@ class PSRL_AgentLoopWorker:
             rollout_wg_list: List of rollout worker groups.
             rollout_queue: Queue for storing completed rollout results.
         """
+        # Per-actor identity used to label every Docker container this worker
+        # spawns (rollout containers in MiniSWEAgentLoop, grader containers in
+        # swebench_grader). The reaper sidecar below filters by this label to
+        # reclaim only this actor's containers when the actor process dies,
+        # which is robust under SIGKILL, OOM, Ray actor restart, and
+        # multiple-actors-per-node packing.
+        self._actor_id = (
+            f"w{worker_id}-{os.uname().nodename}-{os.getpid()}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
+        os.environ["PSRL_ACTOR_ID"] = self._actor_id
+        # Use the config parameter directly (self.config is set below) so the
+        # reaper log lands next to the AgentLoopWorker_N.log files.
+        _reaper_log_dir = getattr(getattr(config, "psrl", None), "logging_path", None)
+        self._reaper_proc = spawn_actor_reaper(
+            self._actor_id, log_dir=_reaper_log_dir,
+        )
+        # On graceful shutdown, _terminate_reaper synchronously reaps our
+        # actor's containers (belt) AND signals the bash sidecar to skip its
+        # post-mortem sweep (suspenders).
+        atexit.register(self._terminate_reaper)
+        psrl_logger.info(
+            f"PSRL_AgentLoopWorker {worker_id}: actor_id={self._actor_id!r}, "
+            f"reaper pid={self._reaper_proc.pid}, "
+            f"reaper log_dir={_reaper_log_dir!r}."
+        )
+
         self.config = config
         model_path = config.gen_actor_rollout_ref.model.path
         self.model_name = "/".join(model_path.split("/")[-2:])
         local_path = copy_to_local(config.gen_actor_rollout_ref.model.path)
         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=True)
         self.processor = hf_processor(local_path, trust_remote_code=True)
+
+        # Apply the same `custom_chat_template` override that `HFModelConfig` does
+        # on the model side, so that rollout-time prompt construction here uses
+        # the patched (non-stripping) template, keeping the PPO/GRPO ratio
+        # consistent between rollout and training.
+        custom_template_value = config.gen_actor_rollout_ref.model.get(
+            "custom_chat_template", None,
+        )
+        resolved_template = resolve_chat_template_value(custom_template_value)
+        if resolved_template is not None:
+            if self.processor is not None and getattr(self.processor, "chat_template", None) is not None:
+                self.processor.chat_template = resolved_template
+            self.tokenizer.chat_template = resolved_template
+            psrl_logger.info(
+                f"Applied custom chat template from {custom_template_value!r} "
+                f"to agent-loop tokenizer."
+            )
 
         self.rollout_router = rollout_router
         self.ps_manager_handle = ps_manager_handle
@@ -89,10 +141,36 @@ class PSRL_AgentLoopWorker:
                 rollout_engine_num=len(self.rollout_wg_list),
             )
 
-        # Build logger
-        # TODO(lhy): support >1 workers
-        self.log_prefix = "AgentLoopWorker"
-        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+        # Build logger (one file per worker so output from concurrent workers can be distinguished).  
+        # The handler is attached to the root logger so
+        # that all loggers in this Ray worker process (including agent_data,
+        # agent_loop, etc.) write to the same file.
+        self.log_prefix = f"AgentLoopWorker_{worker_id}"
+        dual_handler = DualOutputHandler(self.config.psrl.logging_path, self.log_prefix)
+        logging.getLogger().addHandler(dual_handler)
+
+    def _terminate_reaper(self) -> None:
+        """Belt-and-suspenders cleanup on graceful actor shutdown.
+
+        Belt: synchronously force-remove our actor's containers from the
+              actor process itself. Takes ~5-30 s for hundreds of containers,
+              well within Ray's SIGTERM grace period. This is the fast path
+              that wins the race against the bash sidecar.
+        Suspenders: also signal the bash sidecar to terminate so it does not
+                    run a redundant (and harmless) post-mortem sweep after we
+                    already cleaned up here.
+        """
+        try:
+            force_remove_containers_by_label("psrl.actor_id", self._actor_id)
+        except Exception as e:
+            psrl_logger.debug(f"Synchronous atexit reap failed: {e}.")
+        proc = getattr(self, "_reaper_proc", None)
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            proc.terminate()
+        except Exception as e:
+            psrl_logger.debug(f"Failed to terminate reaper sidecar: {e}.")
 
     def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
         """Set the agent loop manager handle for communication.
@@ -117,8 +195,10 @@ class PSRL_AgentLoopWorker:
             data (DataProto or None): Data to process, or None to signal termination.
         """
         if isinstance(data, DataProto):
-            # Prioritize retry requests
-            if "min_version_limit" in data.non_tensor_batch:
+            # Prioritize validation requests so they are not starved
+            # by a large backlog of training requests.
+            is_validate = data.meta_info.get("validate", False)
+            if is_validate in data.non_tensor_batch:
                 self.pending_program_queue.appendleft(data)
             else:
                 self.pending_program_queue.append(data)
@@ -262,12 +342,7 @@ class PSRL_AgentLoopWorker:
                         requests, raise_on_error=raise_on_error, profiling_collector=profiling_collector
                     )
 
-                    if terminate_reason not in (
-                        TerminateReason.TIMEOUT,
-                        TerminateReason.ENV_TIMEOUT,
-                        TerminateReason.ERROR,
-                        TerminateReason.UNKNOWN,
-                    ):
+                    if not terminate_reason.needs_worker_retry():
                         break
 
                     # Retry if applicable
@@ -279,13 +354,7 @@ class PSRL_AgentLoopWorker:
                         )
                         continue
 
-                if terminate_reason in (
-                    TerminateReason.TIMEOUT,
-                    TerminateReason.ENV_TIMEOUT,
-                    TerminateReason.ERROR,
-                    TerminateReason.UNKNOWN,
-                    TerminateReason.ABORTED,
-                ):
+                if terminate_reason.needs_worker_retry() or terminate_reason.is_aborted:
                     # Emit a structured warning so stuck-group investigations can
                     # correlate the dropped uids with rollout instances and
                     # termination reasons across worker/manager logs.
@@ -319,32 +388,33 @@ class PSRL_AgentLoopWorker:
                     )
                     output = None
 
-                # Notify manager to recover the lost buffer slot.
+                # Notify manager to recover the lost buffer slot at the group level.
                 # Uses TerminateReason.needs_manager_retry() as the single
                 # classification point — no hardcoded enum lists here.
                 if terminate_reason.needs_manager_retry():
                     is_validate = requests.meta_info.get("validate", False)
                     if self.config.psrl.agentic_rl.get("manager_retry_on_error", True):
-                        if is_validate:
-                            # Val: cannot substitute a different prompt — shrink the
-                            # val_buffer_size target so the waiter can still unblock.
-                            psrl_logger.warning(
-                                "Val slot lost for uid=%s (terminate_reason=%s), "
-                                "notifying manager to shrink val buffer size.",
-                                requests.non_tensor_batch["uid"].tolist(),
-                                terminate_reason.value,
-                            )
-                            await self.agent_loop_manager.notify_val_slot_dropped.remote()
-                        else:
-                            # Train: pull a fresh prompt from the data queue to fill
-                            # the vacated slot and keep the buffer progressing.
-                            psrl_logger.warning(
-                                "Train slot lost for uid=%s (terminate_reason=%s), "
-                                "notifying manager to dispatch a replacement request.",
-                                requests.non_tensor_batch["uid"].tolist(),
-                                terminate_reason.value,
-                            )
-                            await self.agent_loop_manager.retry_on_error.remote()
+                        failed_uid = int(requests.non_tensor_batch["uid"][0])
+                        # parent_id is the group key; fall back to failed_uid when absent
+                        # (rollout_n==1 or legacy data without parent_id).
+                        parent_id = (
+                            int(requests.non_tensor_batch["parent_id"][0])
+                            if "parent_id" in requests.non_tensor_batch
+                            else failed_uid
+                        )
+                        psrl_logger.warning(
+                            "Slot lost for uid=%s parent_id=%s (terminate_reason=%s, "
+                            "is_validate=%s), notifying manager to abort group and recover.",
+                            requests.non_tensor_batch["uid"].tolist(),
+                            parent_id,
+                            terminate_reason.value,
+                            is_validate,
+                        )
+                        await self.agent_loop_manager.notify_group_failed.remote(
+                            parent_id=parent_id,
+                            failed_uid=failed_uid,
+                            is_validate=is_validate,
+                        )
                     else:
                         raise RuntimeError(
                             f"Agent loop for uid={requests.non_tensor_batch['uid'].tolist()} "
@@ -394,6 +464,12 @@ class PSRL_AgentLoopWorker:
                         # the result queue, so we process the data inside the reward manager
                         # output = self._post_process(output)
                         await self.agent_loop_manager.put_result.remote(output)
+                    else:
+                        psrl_logger.warning(
+                            "update_request_status(COMPLETED) returned all-False for uid=%s "
+                            "(is_validate=%s), skipping put_result.",
+                            request_ids.tolist(), is_validate,
+                        )
 
     # NOTE(lhy): This method is moved to the reward manager
     def _post_process(self, inputs: DataProto) -> DataProto:

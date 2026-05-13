@@ -135,6 +135,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${packing_length} \
+    +train_actor_rollout_ref.actor.use_rollout_log_probs=True \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=False \
     train_actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \

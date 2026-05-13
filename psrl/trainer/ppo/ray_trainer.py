@@ -889,25 +889,29 @@ class PSRL_RayPPOTrainer:
         ray.get(futures)
 
         val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
+        val_id_key = "parent_id" if val_rollout_n > 1 else "uid"
         for test_batch in test_batch_list:
             batch_size = len(test_batch.batch)
 
             sample_ids = ray.get(self.data_processor.get_val_sample_ids.remote(batch_size))
-            test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"] = np.array(sample_ids)
+            test_batch.non_tensor_batch[val_id_key] = np.array(sample_ids)
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=val_rollout_n, interleave=True)
+
+            # Snapshot per-row val ids before pop so we can realign test_batch with
+            # the rollout output if some groups fail (notify_group_failed shrinks
+            # val_buffer_size in the manager and returns fewer rows than we sent).
+            saved_val_ids = np.array(test_batch.non_tensor_batch[val_id_key])
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
             # TODO(verl): Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_parent_ids.extend(test_batch.non_tensor_batch["parent_id" if val_rollout_n > 1 else "uid"])
+            local_sample_parent_ids = list(test_batch.non_tensor_batch[val_id_key])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
-            sample_gts.extend(ground_truths)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
@@ -923,7 +927,7 @@ class PSRL_RayPPOTrainer:
                 non_tensor_batch_keys_to_pop.append("agent_name")
             if "extra_info" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("extra_info")
-            non_tensor_batch_keys_to_pop.append("parent_id" if val_rollout_n > 1 else "uid")
+            non_tensor_batch_keys_to_pop.append(val_id_key)
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -952,6 +956,41 @@ class PSRL_RayPPOTrainer:
                     self.agent_loop_manager.wait_for_validation_batch.remote(val_buffer_id)
                 )
 
+            # Realign test_batch with test_output_gen_batch if the manager dropped
+            # any failed rollout groups (see notify_group_failed in agent_loop/manager.py).
+            output_len = len(test_output_gen_batch.batch)
+            test_len = len(test_batch.batch)
+            if output_len != test_len:
+                if val_id_key not in test_output_gen_batch.non_tensor_batch:
+                    raise RuntimeError(
+                        f"_validate: validation rollout returned {output_len} rows but expected {test_len}, "
+                        f"and missing '{val_id_key}' in output non_tensor_batch. Cannot realign."
+                    )
+                output_val_ids = np.asarray(test_output_gen_batch.non_tensor_batch[val_id_key])
+                kept_ids_set = set(output_val_ids.tolist())
+                keep_mask = np.array([vid in kept_ids_set for vid in saved_val_ids.tolist()], dtype=bool)
+                num_kept = int(keep_mask.sum())
+                num_dropped = int(test_len - num_kept)
+                num_failed_groups = num_dropped // max(val_rollout_n, 1)
+                psrl_logger.warning(
+                    f"_validate: dropped {num_dropped} rows from test_batch to align with returned val "
+                    f"buffer (val_buffer_id={val_buffer_id}, {num_failed_groups} group(s) failed and were "
+                    f"aborted). test_batch={test_len} -> {num_kept}, test_output_gen_batch={output_len}."
+                )
+                if num_kept != output_len:
+                    raise RuntimeError(
+                        f"_validate: alignment by '{val_id_key}' produced {num_kept} rows but "
+                        f"test_output_gen_batch has {output_len} rows."
+                    )
+                test_batch = test_batch.select_idxs(keep_mask)
+                input_texts = [t for t, k in zip(input_texts, keep_mask.tolist()) if k]
+                local_sample_parent_ids = [p for p, k in zip(local_sample_parent_ids, keep_mask.tolist()) if k]
+                ground_truths = [g for g, k in zip(ground_truths, keep_mask.tolist()) if k]
+
+            sample_inputs.extend(input_texts)
+            sample_parent_ids.extend(local_sample_parent_ids)
+            sample_gts.extend(ground_truths)
+
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
@@ -959,6 +998,21 @@ class PSRL_RayPPOTrainer:
 
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            # Merge agent_reward_info into extra_info so that compute_score
+            # can access grader_result.  The training path does this inside
+            # RewardManager.compute_score (line ~425), but validation bypasses
+            # the RM and calls val_reward_fn directly.  Replicate the same
+            # merge here to keep behaviour consistent.
+            if "agent_reward_info" in test_batch.non_tensor_batch:
+                agent_infos = test_batch.non_tensor_batch.pop("agent_reward_info")
+                extra_infos = test_batch.non_tensor_batch.get("extra_info", None)
+                if extra_infos is not None:
+                    for idx in range(len(agent_infos)):
+                        ai = agent_infos[idx] if hasattr(agent_infos, '__getitem__') else agent_infos
+                        ei = extra_infos[idx] if hasattr(extra_infos, '__getitem__') else extra_infos
+                        if isinstance(ai, dict) and isinstance(ei, dict):
+                            ei.update(ai)
 
             # evaluate using reward_function
             if self.val_reward_fn is None:
@@ -1339,19 +1393,30 @@ class PSRL_RayPPOTrainer:
         self.rollout_wg_list = [all_wg[f"rollout_{i}"] for i in range(self.n_rollout_instances)]
         self.validate_wg_list = [all_wg[f"validate_{i}"] for i in range(self.n_validate_instances)]
         self.init_rollout_router()
-        max_concurrency_per_worker = (
-            self.max_concurrency // self.config.gen_actor_rollout_ref.rollout.agent.num_workers
-        )
-        for i in range(self.config.gen_actor_rollout_ref.rollout.agent.num_workers):
+        num_agent_workers = self.config.gen_actor_rollout_ref.rollout.agent.num_workers
+        max_concurrency_per_worker = self.max_concurrency // num_agent_workers
+        # Distribute agent loop workers across cluster nodes round-robin so that
+        # Docker containers are spread across machines instead of piling up on one.
+        alive_node_ids = [n["NodeID"] for n in ray.nodes() if n["Alive"]]
+        for i in range(num_agent_workers):
+            node_id = alive_node_ids[i % len(alive_node_ids)]
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
-                    name=f"agent_loop_worker_{i}", max_concurrency=max_concurrency_per_worker
+                    name=f"agent_loop_worker_{i}",
+                    max_concurrency=max_concurrency_per_worker,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=node_id, soft=True
+                    ),
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
                     self.rollout_router,
                     self.rollout_wg_list + self.validate_wg_list,
+                    worker_id=i,
                 )
+            )
+            psrl_logger.info(
+                f"Agent loop worker {i} scheduled on node {node_id} (soft=True)."
             )
 
         psrl_logger.info("Initializing models and NIXL clients")
@@ -1511,6 +1576,10 @@ class PSRL_RayPPOTrainer:
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             ray.get(self.rollout_coordinator.init_route_strategy.remote("all"))
+            # Start the shared LMCache Controller and broadcast its URL to all instances,
+            # enabling cross-instance KV cache migration for partial rollout re-routes.
+            if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
+                ray.get(self.rollout_coordinator.init_lmcache_p2p.remote())
 
         else:
             # init validate wg -> offload -> init actor wg
@@ -1523,6 +1592,10 @@ class PSRL_RayPPOTrainer:
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
             ray.get(self.rollout_coordinator.init_route_strategy.remote("all"))
+            # Start the shared LMCache Controller and broadcast its URL to all instances,
+            # enabling cross-instance KV cache migration for partial rollout re-routes.
+            if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
+                ray.get(self.rollout_coordinator.init_lmcache_p2p.remote())
             # Pause validate instances in the router before sleeping them, so that the router
             # does not route rollout requests to validate instances that are in sleep state.
             # (fuse_rollout_with_validate=True makes all instances available by default)
@@ -2360,7 +2433,12 @@ class PSRL_RayPPOTrainer:
 
                 # compute global_valid tokens
                 batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-                batch.meta_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
+                # NOTE(fix): Use temperature=1.0 to match vLLM's raw_logprobs convention.
+                # vLLM computes logprobs from raw logits (before temperature scaling),
+                # so the training-side recomputation must also use temperature=1.0 for
+                # consistency. Temperature only affects sampling diversity, not the
+                # policy optimization objective.
+                batch.meta_info["temperature"] = 1.0
 
                 # Operating Mode Selection:
                 # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

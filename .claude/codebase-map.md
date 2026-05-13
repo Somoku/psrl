@@ -1,7 +1,7 @@
 # PSRL Codebase Map
 
 > **Purpose**: Fast-lookup reference for the entire PSRL project. Read this file first to orient yourself in any module.
-> **Last updated**: 2026-03-31 | **Total**: ~158 source files in `psrl/`, 31 tests, 8 examples, 7 scripts
+> **Last updated**: 2026-05-13 | **Total**: ~165 source files in `psrl/`, 31 tests, 12 examples, 7 scripts
 
 ---
 
@@ -108,12 +108,15 @@ psrl/
 │   │   ├── prometheus_utils.py   # Monitoring metrics
 │   │   ├── agent_data/           # Data structures for agent interactions
 │   │   │   ├── base.py           # BaseAgentData
+│   │   │   ├── conversation_agent_data.py # ConversationAgentData (chat-template base)
+│   │   │   ├── mini_swe_agent_data.py     # MiniSWEAgentData (patch + grading state)
 │   │   │   └── tool_agent_data.py# ToolAgentData (tool-use format)
 │   │   └── loops/                # Agent loop implementations
 │   │       ├── base_agent_loop.py       # BaseAgentLoop
 │   │       ├── generate_agent_loop.py   # Single-turn generation
 │   │       ├── batch_generate_agent_loop.py # Batched generation
 │   │       ├── multi_turn_agent_loop.py # Multi-turn with tool calls
+│   │       ├── mini_swe_agent_loop.py   # MiniSWEAgentLoop + _PSRLModel (SWE-bench RL)
 │   │       └── utils.py                 # Agent loop helpers
 │   │
 │   └── config/                   # Worker-level config dataclasses
@@ -136,10 +139,12 @@ psrl/
 │   │   └── token_bucket.py       # Rate limiting
 │   └── tool_parser/              # Parse tool calls from LLM output
 │       ├── base.py               # BaseToolParser
-│       └── hermes_tool_parser.py # Hermes format parser
+│       ├── hermes_tool_parser.py # Hermes format parser
+│       └── xml_fc_tool_parser.py # XML function-calling parser
 │
 ├── environments/                 # ★ Training environments
 │   ├── base.py                   # BaseEnvironment
+│   ├── mini_swe_env.py           # MiniSWEEnvironment (SWE-bench task parsing + config merging)
 │   └── tool_env.py               # ToolEnvironment (tool-use training env)
 │
 ├── utils/                        # ★ Shared utilities
@@ -259,6 +264,25 @@ unit_tests/              # 31 test files across 11 categories
 
 examples/
 ├── anaylsis/            # Cost model, plotting, regression analysis (7 files)
+├── mini_swe/            # ★ SWE-bench RL training recipe (see mini_swe/README.md)
+│   ├── config.py        # Runtime config dataclasses (MiniSWEAgentRuntimeConfig)
+│   ├── reward.py        # Reward function (patch-overlap + test-exec branching)
+│   ├── swebench_grader.py  # Fresh-container grader (SWE-smith / SWE-Gym / Verified)
+│   ├── fsdp_qwen_7b_swe_smith.sh   # FSDP training (SWE-smith)
+│   ├── fsdp_qwen_7b_swe_gym.sh     # FSDP training (SWE-Gym)
+│   ├── megatron_qwen_7b_swe_gym.sh  # Megatron training (SWE-Gym, 7B)
+│   ├── megatron_qwen_32b_swe_smith.sh # Megatron training (SWE-smith, 32B)
+│   ├── config/          # Agent YAML configs (simple, swebench, xml_fc variants)
+│   ├── eval/            # Standalone evaluation + vLLM serving
+│   │   ├── eval_swebench.py          # Single-node eval
+│   │   ├── eval_swebench_multinode.py # Hash-sharded cross-host eval
+│   │   ├── serve_vllm.sh             # Single-node vLLM server
+│   │   └── serve_vllm_multinode.sh   # Cross-host DP fan-out
+│   └── prepare/         # Data preparation + Docker management
+│       ├── prepare_swebench.py    # SWE-smith / Verified → parquet
+│       ├── prepare_swe_gym.py     # SWE-Gym / SWE-Gym-Subset → parquet
+│       ├── swebench_subsets.py    # Repo-balanced sampling helpers
+│       └── docker_scripts/        # Image prefetch, fan-out, mirror probing
 └── retool/retool.py     # Retool integration
 ```
 
@@ -330,6 +354,16 @@ python -m psrl.trainer.main_ppo \
 | `PSStorageWorker` | `workers/ps/ps_storage_worker.py` | Holds model shards on GPU |
 | `RewardManager` | `workers/reward/reward_manager.py` | Reward scoring pipeline |
 | `PSRL_AgentLoopManager` | `workers/agent_loop/manager.py` | Multi-turn tool-use orchestration |
+
+### mini-SWE Agent Layer
+
+| Class | File | Role |
+|-------|------|------|
+| `MiniSWEAgentLoop` | `workers/agent_loop/loops/mini_swe_agent_loop.py` | In-process SWE agent orchestration + sync/async bridge |
+| `_PSRLModel` | `workers/agent_loop/loops/mini_swe_agent_loop.py` | Queue-based bridge: mini-swe-agent sync → PSRL async rollout |
+| `MiniSWEAgentData` | `workers/agent_loop/agent_data/mini_swe_agent_data.py` | Trajectory building, patch extraction, grading state |
+| `ConversationAgentData` | `workers/agent_loop/agent_data/conversation_agent_data.py` | Chat-template base class (OpenAI format, token counting) |
+| `MiniSWEEnvironment` | `environments/mini_swe_env.py` | SWE task parsing, per-problem config override merging |
 
 ### Staleness System
 
@@ -436,6 +470,33 @@ AgentLoopWorker per request:
   ⑤ Append tool result to conversation
   ⑥ Repeat ②-⑤ until done or max_turns
   ⑦ Return full trajectory for reward scoring
+```
+
+### 6.6 mini-SWE Agent Flow (SWE-bench RL)
+
+```
+MiniSWEAgentLoop.run(request: DataProto)
+  → MiniSWEEnvironment.reset(task)
+    ├─ Parse extra_info (swe_problem, image, grader flags)
+    └─ apply_data_overrides(base_config, extra_info) → runtime_config
+
+  → Spawn worker thread: DefaultAgent.run(task) with DockerEnvironment
+    ├─ Docker container starts from per-problem image
+    ├─ Agent loop: observe → _PSRLModel.query() → parse action → execute in Docker
+    └─ _PSRLModel bridges sync calls to async PSRL rollout via queues
+
+  → Async _generation_loop (main coroutine)
+    ├─ Poll req_q → update trajectory → rollout_router.generate_async → res_q
+    ├─ Token budget / timeout / max_turns guards
+    └─ Terminates agent thread via _TerminateSignal if limits hit
+
+  → Post-rollout grading (SWE-smith / SWE-Gym only)
+    ├─ Determine grader_kind: smith (swe_restore_tests) / gym (eval_script) / verified
+    └─ grade_fresh_container() in _GRADER_THREAD_POOL
+       ├─ smith: git checkout HEAD~1 → apply patch → revert tests → swesmith harness
+       └─ gym: apply patch → run pre-computed eval_script → parse_log_pytest
+
+  → Finalize: agent_reward_info → compute_score(data_source) → DataProto with reward
 ```
 
 ---
@@ -587,6 +648,12 @@ agent_loop/manager.py
 | Modify Megatron training | `workers/train/megatron_train_worker.py` |
 | Change GPU resource allocation | `trainer/constants_ppo.py`, `ResourcePoolManager` in `ray_trainer.py` |
 | Add monitoring/metrics | `utils/logger/`, `utils/profiling/`, `utils/visualization/` |
+| Train on SWE-bench tasks | `examples/mini_swe/README.md`, launch scripts (`fsdp_qwen_7b_swe_*.sh`) |
+| Debug SWE agent rollouts | `workers/agent_loop/loops/mini_swe_agent_loop.py` |
+| Change SWE grading logic | `examples/mini_swe/swebench_grader.py` |
+| Add a new SWE dataset | `examples/mini_swe/prepare/` (write new `prepare_*.py` script) |
+| Prepare SWE Docker images | `examples/mini_swe/prepare/docker_scripts/` |
+| Change SWE reward shaping | `examples/mini_swe/reward.py` |
 | Run benchmarks | `psrl/bench/` |
 | Run tests | `unit_tests/` (pytest) |
 | Install from scratch | `scripts/install_basic.sh` → `install_nixl.sh` → `install_tms.sh` |

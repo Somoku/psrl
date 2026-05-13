@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -10,6 +11,8 @@ from verl import DataProto
 from psrl.utils.profiling.collector import TurnProfilingCollector
 from psrl.utils.rollout.trajectory_writer import TrajectoryWriter
 from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
+
+psrl_logger = logging.getLogger(__file__)
 
 
 class AgentLoopBase(ABC):
@@ -121,43 +124,62 @@ class AgentLoopBase(ABC):
         raise_on_error: bool = True,
         profiling_collector: TurnProfilingCollector | None = None,
     ) -> tuple[DataProto | None, TerminateReason]:
-        """Run the agent loop with termination event handling.
+        """Run ``self.run`` with whole-trajectory timeout + error classification.
 
-        This method wraps the run method to catch termination events and handle them appropriately.
-        It enables timeouts and error handling based on the provided configuration.
+        Translates the three failure modes that ``run`` itself doesn't classify
+        into ``TerminateReason`` values:
+
+        - ``asyncio.TimeoutError`` from ``asyncio.wait_for`` -> ``TRAJECTORY_TIMEOUT``
+        - Any other exception in ``run``                     -> ``ROLLOUT_ERROR``
+          (re-raised when ``raise_on_error=True``).
+        - ``run`` returned ``(None, reason)`` without ``ABORTED`` -> ``UNKNOWN``
+          (or ``RuntimeError`` when ``raise_on_error=True``).
+
+        Successful runs (``run`` returned a ``DataProto``) are passed through
+        with their loop-specific reason. ``ABORTED`` short-circuits with no
+        re-notification so the worker drops the slot cleanly.
 
         Args:
-            request (DataProto): Input request to process.
-            raise_on_error (bool): Whether to raise exceptions on errors.
-            profiling_collector: Per-trajectory profiling collector, or None if disabled.
+            request: Input request to process.
+            raise_on_error: If True, exceptions / contract violations bubble
+                up to the caller; if False, they're swallowed into a
+                ``ROLLOUT_ERROR`` / ``UNKNOWN`` termination.
+            profiling_collector: Per-trajectory profiling collector, or ``None``.
 
         Returns:
-            DataProto: Processed response data.
+            ``(output_or_None, TerminateReason)``.
         """
         uid = int(request.non_tensor_batch["uid"][0])
+        timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
         try:
-            coro = self.run(request, profiling_collector)
-            output, terminate_reason = await asyncio.wait_for(
-                coro, timeout=self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
-            )
-            if output is not None and isinstance(output, DataProto):
-                return output, terminate_reason
-            elif not raise_on_error:
-                return None, TerminateReason.UNKNOWN
-            else:
-                raise RuntimeError("Agent loop run did not return a valid DataProto output.")
-        except asyncio.TimeoutError:
-            return None, TerminateReason.TIMEOUT
-        except Exception as e:
-            if not raise_on_error:
-                import logging
-
-                psrl_logger = logging.getLogger(__file__)
-                psrl_logger.error(
-                    f"Exception in agent_loop.run for request {request.non_tensor_batch.get('uid', 'N/A')}",
-                    exc_info=True,
+            try:
+                output, reason = await asyncio.wait_for(
+                    self.run(request, profiling_collector), timeout=timeout,
                 )
-                return None, TerminateReason.ERROR
-            raise e
+            except asyncio.TimeoutError:
+                return None, TerminateReason.TRAJECTORY_TIMEOUT
+            except Exception:
+                if raise_on_error:
+                    raise
+                psrl_logger.error(
+                    f"Exception in agent_loop.run for uid={uid}", exc_info=True,
+                )
+                return None, TerminateReason.ROLLOUT_ERROR
+
+            # ``run`` returned normally; validate its contract.
+            if isinstance(output, DataProto):
+                return output, reason
+            if reason.is_aborted:
+                # Clean abort signalled by the agent loop (e.g. sibling
+                # trajectory already triggered notify_group_failed). Return
+                # directly so the worker drops the slot without re-notifying
+                # the manager.
+                return None, TerminateReason.ABORTED
+            if not raise_on_error:
+                return None, TerminateReason.UNKNOWN
+            raise RuntimeError(
+                f"Agent loop run did not return a valid DataProto output "
+                f"(uid={uid}, reason={reason.value})."
+            )
         finally:
             await self.rollout_router.kv_unregister.remote(uid)

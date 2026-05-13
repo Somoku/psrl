@@ -2,6 +2,12 @@
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
   sandbox_config:
     max_parallel_tasks_per_worker: 0  # Means no limit on the number of tasks running in parallel
+    # Per-turn rollout timeout (s). Must be < query_timeout so the generation
+    # loop always signals the agent before the agent's own queue wait fires.
+    rollout_turn_timeout: 480
+    # Last-resort timeout (s) for the agent thread's res_q.get() call.
+    # Set higher than rollout_turn_timeout so the generation loop acts first.
+    query_timeout: 600
     environment:
       image: "python:3.11-slim"
       container_timeout: "2h"

@@ -1,10 +1,13 @@
 import asyncio
 import logging
 import os
+import subprocess
+import time
 
 import numpy as np
 import ray
 
+from psrl.utils.common.http_utils import find_available_port, get_host_info
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -119,6 +122,9 @@ class RolloutCoordinator(CommandExtension):
 
         # Engine status tracking
         self.instance_to_engine_status: dict[int, EngineStats] = {}  # Track the latest engine stats of each instance
+
+        # LMCache P2P Controller subprocess handle (started by init_lmcache_p2p, if enabled).
+        self._lmcache_controller_proc: subprocess.Popen | None = None
 
         # Build logger
         self.log_prefix = "RolloutCoordinator"
@@ -450,9 +456,15 @@ class RolloutCoordinator(CommandExtension):
                             if not isinstance(uids, (list, set)):
                                 uids = [uids]
                             abort_requests = set(uids)  # Ensure uniqueness
-                            assert instance_id < len(self.rollout_wg_list), (
-                                f"Validate instance should not be interrupted, but got instance_id {instance_id} "
-                                f"which is out of rollout instance range [0, {len(self.rollout_wg_list)})."
+                            # NOTE: With fuse_rollout_with_validate=True, validation
+                            # requests may be routed to instance IDs >= len(rollout_wg_list).
+                            # When a validation agent fails (e.g. docker error), its sibling
+                            # requests must be aborted, which legitimately targets validation
+                            # instance IDs. Use gen_wg_list (which covers all instances) as
+                            # the valid range check.
+                            assert instance_id < len(self.gen_wg_list), (
+                                f"Instance ID {instance_id} is out of valid gen instance range "
+                                f"[0, {len(self.gen_wg_list)})."
                             )
                             futures.append(
                                 self.gen_wg_list[instance_id].execute_rank_zero_async(
@@ -822,3 +834,79 @@ class RolloutCoordinator(CommandExtension):
                     )
                 await self.rollout_router.resume_routing.remote()
                 psrl_logger.info("Resumed routing after migration")
+
+    # ------- FUNCTIONS FOR LMCACHE P2P -------
+
+    async def init_lmcache_p2p(self) -> None:
+        """
+        Start a single shared LMCache Controller and broadcast its URL to all GenWorkers.
+
+        This method starts the `lmcache_controller` subprocess once (on the node
+        where `RolloutCoordinator` runs, which is typically the head node / PS manager
+        node) and broadcasts its URL to every rollout and validate GenWorker instance.
+        Each GenWorker then calls `KVCacheManager.set_controller_url()` so that
+        subsequent `kv_transfer` calls can reach the shared Controller.
+
+        Must be called after `init_model` has completed on all instances, and
+        only when `psrl.lmcache.enable and psrl.lmcache.enable_p2p` are both True.
+        """
+        await self._wait_for_init_model("all", "init_lmcache_p2p")
+
+        controller_url = self._start_lmcache_controller()
+
+        wg_list, wg_indices = self._get_wgs("all")
+        futures = [
+            wg_list[i].execute_rank_zero_async("set_lmcache_controller_url", controller_url)
+            for i in range(len(wg_list))
+        ]
+        await self._await_futures_with_timeout(futures, "init_lmcache_p2p", "all", wg_indices)
+        psrl_logger.info(
+            f"LMCache P2P Controller at {controller_url!r} broadcast to all {len(wg_list)} instances."
+        )
+
+    def _start_lmcache_controller(self) -> str:
+        """
+        Start the `lmcache_controller` subprocess and poll until healthy.
+
+        Uses `find_available_port` to pick an unused port starting from
+        `psrl.lmcache.controller_base_port` and `get_host_info` to determine
+        the bind address.  Polls `GET /health` up to 30 times (1 s interval).
+
+        Returns:
+            str: Base URL of the Controller, e.g. `"http://10.0.0.1:9042"`.
+
+        Raises:
+            RuntimeError: If the Controller does not become healthy within 30 s.
+        """
+        import requests as _requests
+
+        _, host = get_host_info()
+        port = find_available_port(self.config.psrl.lmcache.controller_base_port)
+        cmd = [
+            "lmcache_controller",
+            "--host", host,
+            "--port", str(port),
+        ]
+        psrl_logger.info(f"[LMCache] Starting shared Controller: {' '.join(cmd)}.")
+        self._lmcache_controller_proc = subprocess.Popen(cmd)
+        controller_url = f"http://{host}:{port}"
+
+        health_url = f"{controller_url}/health"
+        for attempt in range(30):
+            try:
+                resp = _requests.get(health_url, timeout=1)
+                if resp.status_code == 200:
+                    psrl_logger.info(
+                        f"[LMCache] Controller healthy at {controller_url!r} "
+                        f"(attempt {attempt + 1})."
+                    )
+                    return controller_url
+            except Exception:
+                pass
+            time.sleep(1)
+
+        self._lmcache_controller_proc.kill()
+        self._lmcache_controller_proc = None
+        raise RuntimeError(
+            f"LMCache Controller did not become healthy at {health_url!r} within 30 s."
+        )

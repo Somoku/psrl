@@ -86,6 +86,30 @@ class VllmQwen2MoeParameterMapping(ParameterMapping):
         return info
 
 
+# Qwen3 (dense)
+vllm_qwen3_classes = []
+try:
+    from vllm.model_executor.models.qwen3 import Qwen3ForCausalLM, Qwen3Model
+
+    vllm_qwen3_classes = [Qwen3ForCausalLM, Qwen3Model]
+except ImportError as e:
+    warnings.warn(f"Could not import Qwen3 classes: {e}", stacklevel=2)
+
+
+@register_model(["VllmQwen3ForCausalLM", "VllmQwen3Model", "VllmQwen3ForSequenceClassification"] + vllm_qwen3_classes)
+class VllmQwen3ParameterMapping(ParameterMapping):
+    """Parameter mapping for Qwen3 (dense) model."""
+
+    def get_mappings(self):
+        return [
+            ("qkv_proj", "q_proj", MappingType.QKV_SPLIT, 0),
+            ("qkv_proj", "k_proj", MappingType.QKV_SPLIT, 1),
+            ("qkv_proj", "v_proj", MappingType.QKV_SPLIT, 2),
+            ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
+            ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
+        ]
+        
+
 # Qwen3Moe
 vllm_qwen3_moe_classes = []
 try:

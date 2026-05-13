@@ -338,11 +338,17 @@ class PSManager(RequestStatusTracker):
         else:
             is_single_request = False
 
+        if isinstance(is_validate, bool):
+            validate_per_request = [is_validate] * len(request_idx)
+        else:
+            validate_per_request = is_validate
+
         multi_results = []
-        for request_id in request_idx:
+        for i, request_id in enumerate(request_idx):
+            val_flag = validate_per_request[i]
             results = []
-            staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
-            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+            staleness_inventory = self.val_staleness_inventory if val_flag else self.staleness_inventory
+            rollout_n = self.val_rollout_n if val_flag else self.rollout_n
             for model_version in model_versions:
                 assert model_version != -1, "Model version should not be -1 when checking if a request can be reserved"
                 assert request_id not in self._abort_request_ids, (
@@ -356,7 +362,7 @@ class PSManager(RequestStatusTracker):
                     prompt_id=request_id // rollout_n,
                     request_idx=request_id % rollout_n,
                     model_version=model_version,
-                    is_validate=is_validate,
+                    is_validate=val_flag,
                 )
                 if without_new_reserve_entry:
                     results.append(
@@ -561,9 +567,21 @@ class PSManager(RequestStatusTracker):
         # Update the corresponding entries, and clear entries if necessary (handled at the end)
         clear_entries = []
         for prompt_id, abort_request_idxs in prompt_id_to_abort_request_idxs.items():
-            assert prompt_id in self.staleness_inventory.data_tracker, (
-                f"Prompt {prompt_id} must have existing mapping in data tracker."
-            )
+            if prompt_id not in self.staleness_inventory.data_tracker:
+                # The prompt was never reserved in the staleness inventory.
+                # This happens when a group fails before any response completed
+                # (e.g. all workers crash with rollout_instance_id=None, so
+                # occupy_rollout_instance_request was never called for this prompt).
+                # The request IDs remain in abort_request_ids and will be added to
+                # _abort_request_ids below, so any future update_request_status call
+                # for those UIDs will return False.  No inventory manipulation needed.
+                psrl_logger.warning(
+                    "abort_requests: prompt %d not in staleness data_tracker — "
+                    "group never completed, skipping inventory cleanup for uids %s.",
+                    prompt_id,
+                    [prompt_id * self.rollout_n + idx for idx in abort_request_idxs],
+                )
+                continue
             buffer_id, entry_id = self.staleness_inventory.data_tracker[prompt_id]
             entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
             all_requests_of_entry = entry_info.get_all_request_relative_ids()

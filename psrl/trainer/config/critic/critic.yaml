@@ -34,10 +34,10 @@ optim:
 model:
 
   # Path to pretrained model weights
-  path: ~/models/deepseek-llm-7b-chat
+  path: ${train_actor_rollout_ref.model.path}
 
   # Tokenizer path (defaults to actor's model path)
-  tokenizer_path: ${oc.select:train_actor_rollout_ref.model.path,"~/models/deepseek-llm-7b-chat"}
+  tokenizer_path: ${oc.select:train_actor_rollout_ref.model.path}
 
   # Hugging Face config override
   override_config: {}

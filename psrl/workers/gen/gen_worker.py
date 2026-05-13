@@ -518,6 +518,23 @@ class PSRL_GenWorker(Worker):
         assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
         return await self.kv_cache_manager.transfer(tokens, src, dst, copy)
 
+    def set_lmcache_controller_url(self, controller_url: str) -> None:
+        """
+        Receive the shared LMCache Controller URL broadcast from `RolloutCoordinator`.
+
+        Called by `RolloutCoordinator.init_lmcache_p2p()` after the single shared
+        Controller subprocess has started.  Forwards the URL to `KVCacheManager`
+        so that subsequent `kv_transfer` calls can reach it.
+
+        Args:
+            controller_url (str): Base URL of the shared Controller, e.g.
+                `"http://10.0.0.1:9042"`.
+        """
+        assert self.kv_cache_manager is not None, (
+            "KVCacheManager is not initialized. Call init_model() before set_lmcache_controller_url()."
+        )
+        self.kv_cache_manager.set_controller_url(controller_url)
+
     def get_node_id(self) -> str:
         """
         Get the node id of the rollout instance.
@@ -676,6 +693,8 @@ class PSRL_GenWorker(Worker):
 
         self.kv_cache_manager.attach_engine(rollout.inference_engine)
         psrl_logger.info("[KVCacheManager]: Engine attached after rollout initialization.")
+        # Set per-instance ID so LMCache P2P uses psrl_instance_{id} as the identifier.
+        self.kv_cache_manager.set_instance_id(self.get_instance_id())
 
         return rollout
 
@@ -875,6 +894,11 @@ class PSRL_GenWorker(Worker):
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Important: the prefix cache needs to be cleared after pulling the model
         await self.rollout.inference_engine.reset_prefix_cache()
+        # Clear the LMCache CPU backend so that stale KV entries from the previous
+        # model version cannot be reused by subsequent requests.
+        if self.kv_cache_manager.should_clear_on_weight_update:
+            await self._collective_rpc("lmcache_clear_all_from_backend", args=())
+            psrl_logger.debug("Cleared LMCache CPU backend after model weight update.")
 
     async def _async_interrupt_requests(self, request_ids=None):
         """Interrupt requests in the engine queue (waiting and running).

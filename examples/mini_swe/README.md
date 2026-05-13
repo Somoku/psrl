@@ -5,12 +5,13 @@ learning. This recipe integrates [mini-SWE-agent](https://github.com/SWE-agent/m
 (v2) with PSRL's trainer, enabling models to learn from
 interactive coding feedback in Docker-sandboxed environments.
 
-Two training paths are supported:
+Three training paths are supported:
 
 | Path | Dataset | Reward | Use case |
 |------|---------|--------|----------|
 | **Toy** | Synthetic bugs in `python:3.11-slim` | Patch-text overlap | Smoke tests, fast iteration |
 | **SWE-smith-py** | Real GitHub bugs (50k SWE problems, per-repo images) | F2P / P2P test execution | Full RL training |
+| **SWE-Gym** | Real GitHub bugs (2438 SWE problems, `xingyaoww` images) | F2P / P2P test execution (pre-computed eval_script) | Full RL training |
 
 ---
 
@@ -25,7 +26,7 @@ The training loop works as follows:
 3. **Model Bridge**: A custom `_PSRLModel` (inheriting `LitellmTextbasedModel`)
    intercepts every `query()` call and routes generation through PSRL's vLLM
    rollout engine via thread-safe queues — no HTTP proxy, no subprocess.
-4. **Grading** (SWE-smith path): After the agent submits a patch, a fresh Docker
+4. **Grading** (SWE-smith / SWE-Gym path): After the agent submits a patch, a fresh Docker
    container runs the SWE problem's FAIL_TO_PASS and PASS_TO_PASS tests.
 5. **Reward**: Score is computed from the grading result (or patch-text overlap for
    the toy path) and used for GRPO policy gradient updates.
@@ -55,7 +56,7 @@ The training loop works as follows:
                └──────┬───────┘
                       │
                ┌──────┴────────────────┐
-               │ grade_fresh_container │  ← SWE-smith path only
+               │ grade_fresh_container │  ← SWE-smith / SWE-Gym paths
                │ (fresh Docker, pytest)│
                └──────┬────────────────┘
                       │
@@ -73,12 +74,17 @@ examples/mini_swe/
 ├── README.md                             # This file
 ├── config.py                             # Runtime config dataclasses
 ├── reward.py                             # Reward function (patch-overlap + test-execution)
-├── swebench_grader.py                    # Fresh-container grader for SWE-smith / Verified (shared by training + eval)
+├── swebench_grader.py                    # Fresh-container grader for SWE-smith / SWE-Gym / Verified (shared by training + eval)
 ├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset
 ├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (real RL)
+├── fsdp_qwen_7b_swe_gym.sh               # Launch script — SWE-Gym (real RL, FSDP)
+├── megatron_qwen_7b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 7B)
+├── megatron_qwen_8b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 8B)
+├── megatron_qwen_32b_swe_smith.sh        # Launch script — SWE-smith (Megatron, 32B)
 ├── config/
-│   ├── simple_agent_config.yaml        # Agent config for toy path
-│   └── swebench_agent_config.yaml        # Agent config for SWE-bench/smith path
+│   ├── simple_agent_config.yaml          # Agent config for toy path
+│   ├── swebench_agent_config.yaml        # Agent config for SWE-smith / SWE-Gym / Verified
+│   └── swebench_agent_config_xml_fc.yaml # XML function-calling variant (newer models)
 ├── eval/                                 # Standalone evaluation + vLLM serving (see eval/README.md)
 │   ├── README.md                         # Guide for gold-patch sanity, multi-node eval, serving your own checkpoint
 │   ├── eval_swebench.py                  # Single-node eval entry point
@@ -86,16 +92,20 @@ examples/mini_swe/
 │   ├── serve_vllm.sh                     # Single-node vLLM OpenAI-compatible server (TP/PP/DP)
 │   └── serve_vllm_multinode.sh           # Cross-host DP fan-out + litellm proxy config generator
 └── prepare/
-    ├── README.md                         # Data preparation guide (this is where to start)
+    ├── README.md                         # Data preparation guide (Path A, B, and C)
     ├── prepare_simple_data.py            # Toy dataset generator
     ├── simple_cases_train.json           # Synthetic training bug-fix tasks
     ├── simple_cases_val.json             # Synthetic validation bug-fix tasks
     ├── prepare_swebench.py               # HF → parquet converter (smith / verified / lite)
+    ├── prepare_swe_gym.py                # HF → parquet converter (SWE-Gym / SWE-Gym-Subset)
     ├── swebench_subsets.py               # Repo-balanced sampling helpers
     └── docker_scripts/                   # Docker image pre-fetch / fan-out helpers
         ├── bake_simple_repos.sh          # Bakes toy repos into a Docker image (Path A)
         ├── prefetch_images.sh            # Pull per-SWE-problem images (skopeo + multi-mirror + tar cache)
         ├── prefetch_example.sh           # Reference invocation chaining prefetch + load_all_nodes
+        ├── swe_smith.sh                  # Convenience wrapper for SWE-smith images
+        ├── swe_gym.sh                    # Convenience wrapper for SWE-Gym images
+        ├── swe_gym_subset.sh             # Convenience wrapper for SWE-Gym-Subset images
         ├── probe_mirrors.sh              # Check which public Docker Hub mirrors serve a given image
         └── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
 
@@ -148,13 +158,16 @@ docker run --rm python:3.11-slim bash -c "echo Docker OK"
 
 ## Data Preparation
 
-All dataset preparation (toy and SWE-smith-py) is documented in
+All dataset preparation (toy, SWE-smith-py, and SWE-Gym) is documented in
 [`prepare/README.md`](prepare/README.md). That file covers:
 
 - **Path A** — baking toy repos into Docker and generating parquets
 - **Path B** — converting SWE-smith-py and SWE-bench Verified from HuggingFace,
   generating balanced subsets, and pre-fetching per-SWE-problem Docker images on
   every cluster node
+- **Path C** — converting SWE-Gym (2438 problems) or SWE-Gym-Subset (100
+  problems) from HuggingFace, with pre-computed eval scripts and `xingyaoww`
+  Docker images
 
 Read that file before running training for the first time.
 
@@ -218,6 +231,58 @@ bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh 3
 |--------|---------|
 | `train/score` | Shaped outcome reward: `+1.0` resolved, `-1.0` failed, `0.0` policy violation |
 | `train/acc` | Binary resolve rate (0 or 1 per sample) — the primary progress indicator |
+
+---
+
+### SWE-Gym (real RL)
+
+SWE-Gym provides 2438 real-world bugs with pre-computed eval scripts and Docker
+images from the `xingyaoww/sweb.eval.x86_64.*` registry. It shares the same
+agent config (`swebench_agent_config.yaml`) and grading infrastructure as
+SWE-smith, with two key differences: no `git checkout HEAD~1` is needed (standard
+repo layout), and eval scripts are pre-computed in the parquet rather than
+generated at grading time.
+
+#### Step 1: Install grading dependencies
+
+```bash
+python -m pip install swebench==4.1.0
+```
+
+(The SWE-Bench-Fork is only needed for _preparing_ the full dataset, not for
+training/grading. See `prepare/README.md` Path C.)
+
+#### Step 2: Prepare data and pre-fetch images
+
+Follow `prepare/README.md` Path C. The expected layout when done:
+
+```
+examples/mini_swe/data/
+  swe_gym_2438/train.parquet              # 2438 training SWE problems (full)
+  swe_gym_subset_100/train.parquet        # 100 training SWE problems (quick start)
+```
+
+#### Step 3: Pre-flight check
+
+```bash
+python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent OK')"
+python -c "import swebench; print('swebench', swebench.__version__)"
+python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; print('grader OK')"
+docker run --rm xingyaoww/sweb.eval.x86_64.getmoto_s_moto-7365:latest true && echo "SWE-Gym image OK"
+ray status | head -5
+```
+
+#### Step 4: Launch training
+
+```bash
+bash examples/mini_swe/fsdp_qwen_7b_swe_gym.sh
+```
+
+Or with Megatron parallelism:
+
+```bash
+bash examples/mini_swe/megatron_qwen_7b_swe_gym.sh
+```
 
 ---
 
@@ -326,7 +391,8 @@ MiniSWEAgentRuntimeConfig   (dataclass defaults in config.py)
 | YAML | Use with |
 |------|---------|
 | `config/simple_agent_config.yaml` | Toy path — single `python:3.11-slim` image, preexisting repos |
-| `config/swebench_agent_config.yaml` | SWE-smith-py / Verified — per-SWE-problem images, `cwd=/testbed` |
+| `config/swebench_agent_config.yaml` | SWE-smith-py / SWE-Gym / Verified — per-SWE-problem images, `cwd=/testbed` |
+| `config/swebench_agent_config_xml_fc.yaml` | Same as above but with XML function-calling format (for newer models) |
 
 The `environment.image` field in `swebench_agent_config.yaml` is intentionally set
 to a sentinel value (`swebench-sentinel-override-per-instance`). The real image is
@@ -377,7 +443,7 @@ mini-swe-agent's `DefaultAgent.run()` is synchronous; PSRL's rollout is async.
 - The async loop polls `request_queue` and feeds `response_queue`.
 - `_PSRLModel.query()` blocks on `response_queue` with a 600 s timeout.
 
-After the rollout completes, for SWE-smith/Verified SWE problems, a second
+After the rollout completes, for SWE-smith/SWE-Gym/Verified SWE problems, a second
 container is started from the same image via `_GRADER_THREAD_POOL` (separate
 16-thread pool) to run `grade_fresh_container` before the rollout container is
 cleaned up.
@@ -402,7 +468,7 @@ cleaned up.
 | Long and fruitless (≥10 turns, no edits) | `-0.05` |
 | Premature exit (≤2 turns, no tools) | `-0.1` |
 
-### SWE-smith / Verified path (`data_source = swe_smith_py` or `swebench_verified`)
+### SWE-smith / SWE-Gym / Verified path (`data_source = swe_smith_py`, `swe_gym`, or `swebench_verified`)
 
 Reward is based on whether the submitted patch resolves the SWE problem (all
 FAIL_TO_PASS tests pass and all PASS_TO_PASS tests still pass):
@@ -414,7 +480,7 @@ FAIL_TO_PASS tests pass and all PASS_TO_PASS tests still pass):
 | Not resolved (patch failed, tests failed) | `-1.0` | `0.0` |
 | No patch submitted / 0 turns (aborted) | `0.0` | `0.0` |
 
-The `{-1, 0, +1}` convention follows OpenClaw-RL. The `score` field drives the
+The `{-1, 0, +1}` convention. The `score` field drives the
 policy gradient loss; the `acc` field is a separate metric for tracking resolve
 rate. Both are visible in wandb as `train/score` and `train/acc`.
 
@@ -434,7 +500,9 @@ rate. Both are visible in wandb as `train/score` and `train/acc`.
 |---------|-------|-----|
 | `docker: Cannot connect` | Docker not running | `sudo systemctl start docker` |
 | Rollout container fails immediately | Image not pulled | Run `prepare/docker_scripts/prefetch_images.sh` on this node first (or `load_all_nodes.sh` across the cluster) |
-| `swebench-sentinel-override-per-instance` in error (sentinel was not replaced per SWE problem) | Wrong config YAML for toy path | Use `simple_agent_config.yaml` for toy, `swebench_agent_config.yaml` for SWE-smith |
+| `swebench-sentinel-override-per-instance` in error (sentinel was not replaced per SWE problem) | Wrong config YAML for toy path | Use `simple_agent_config.yaml` for toy, `swebench_agent_config.yaml` for SWE-smith/SWE-Gym |
+| `xingyaoww/sweb.eval.x86_64.*` image not found | SWE-Gym images not pre-fetched | Run `prepare/docker_scripts/swe_gym.sh` (or `swe_gym_subset.sh`) |
+| `eval_script missing` error in grader | SWE-Gym parquet missing eval_script | Re-run `prepare_swe_gym.py` (full dataset requires SWE-Bench-Fork 2.0.13) |
 | Grader always returns `resolved=False` | Image pull failing silently | Check `grading.json` in the eval output dir for error messages |
 | No patch found | Agent hit turn limit without submitting | Increase `max_turns` |
 | OOM during rollout | Too many concurrent containers | Reduce `max_parallel_tasks_per_worker` or lower `train_prompt_bsz` |

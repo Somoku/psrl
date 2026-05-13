@@ -832,7 +832,7 @@ class NIXLStorageClient:
 
         psrl_logger.debug(f"{self.client_name} deregistered all local tensors.")
 
-    def connect_to_server(self, timeout: float = 600.0):
+    def connect_to_server(self, timeout: float = 1200.0):
         """
         Connect to the storage/meta server.
         """
@@ -898,7 +898,7 @@ class NIXLStorageClient:
         self._unified_sharding_dict_fetched = True
         return self._unified_sharding_dict
 
-    def wait_for_server_info(self, timeout: float = 600.0):
+    def wait_for_server_info(self, timeout: float = 1200.0):
         """
         Wait for the server info to be fetched.
         """
@@ -947,7 +947,7 @@ class NIXLStorageClient:
             time.sleep(0.1)
         self._all_client_infos_fetched = True
 
-    def wait_for_server_temp_mappings(self, timeout: float = 600.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 1200.0):
         """Wait for the server temporary mappings to be fetched."""
         assert self._is_connected, "Not connected to server"
         start = time.time()
@@ -977,7 +977,7 @@ class NIXLStorageClient:
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float = 1200.0):
         """Wait for updated client infos from other clients.
 
         Args:
@@ -1565,7 +1565,7 @@ class NIXLStorageClient:
                                     f"Timeout waiting for merged transfer ({op_type}, {target_client}, {tag}) "
                                     f"from {self.client_name}"
                                 )
-                            time.sleep(0.0001)
+                            time.sleep(0.001)  # 1ms backoff to avoid CPU starvation at large scale
                         end = time.time()
                         psrl_logger.debug(
                             f"{self.client_name} finished client {op_type} transfer to {target_client} for tag {tag} "
@@ -1580,7 +1580,7 @@ class NIXLStorageClient:
         op_type: str,
         target_client: str | None = None,
         shard_idx: int | None = None,
-        timeout: float = 600.0,
+        timeout: float = 1800.0,
     ):
         """
         Wait for a transfer to be completed.
@@ -1649,7 +1649,7 @@ class NIXLStorageClient:
                         f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
                         f"from {self.client_name} to {target_client}"
                     )
-                # time.sleep(0.0001)
+                time.sleep(0.001)  # 1ms backoff to avoid CPU starvation on PS nodes at large scale
 
     def load_state_dict_into_registered_tensors(
         self,
@@ -1893,7 +1893,7 @@ class NIXLMultiStorageClients:
         for client in self.multi_clients:
             client.release_temp_memory()
 
-    def connect_to_server(self, timeout: float = 600.0):
+    def connect_to_server(self, timeout: float = 1200.0):
         assert not self._is_connected, "Already connected to server"
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
         self.agent.send_local_metadata(self.server_ip, self.server_port)
@@ -1931,7 +1931,7 @@ class NIXLMultiStorageClients:
             pickle.dumps({client.client_name: client._temp_desc_bytes_mapping for client in self.multi_clients}),
         )
 
-    def wait_for_server_sharding(self, timeout: float = 600.0):
+    def wait_for_server_sharding(self, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         start = time.time()
         if self._multi_unified_sharding_dicts_fetched:
@@ -1957,7 +1957,7 @@ class NIXLMultiStorageClients:
         self._multi_unified_sharding_dicts_fetched = True
         return {client.client_name: client._unified_sharding_dict for client in self.multi_clients}
 
-    def wait_for_server_info(self, timeout: float = 600.0):
+    def wait_for_server_info(self, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_info(timeout)
         if len(self.multi_clients) > 1:
@@ -1966,14 +1966,14 @@ class NIXLMultiStorageClients:
                 client._comm_plan = self.multi_clients[0]._comm_plan
                 client._all_client_infos_fetched = True
 
-    def wait_for_server_temp_mappings(self, timeout: float = 600.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_temp_mappings(timeout)
         if len(self.multi_clients) > 1:
             for client in self.multi_clients[1:]:
                 client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_update_infos(expected_agents, timeout)
         if len(self.multi_clients) > 1:
@@ -2019,7 +2019,7 @@ class NIXLMultiStorageClients:
         tag: str,
         op_type: str,
         target_client: str | None = None,
-        timeout: float = 600.0,
+        timeout: float = 1200.0,
     ):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)

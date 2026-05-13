@@ -9,6 +9,8 @@ from verl.utils.fs import copy_to_local
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import get_generation_config, update_model_config
 
+from psrl.utils.common.chat_template import resolve_chat_template_value
+
 __all__ = ["HFModelConfig"]
 
 
@@ -88,11 +90,14 @@ class HFModelConfig(BaseConfig):
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
             self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
 
-        if self.custom_chat_template is not None:
+        # Resolve `custom_chat_template`: accepts either an inline jinja string
+        # or a path to a `.jinja` file (the latter avoids hydra-CLI escaping pain).
+        resolved_template = resolve_chat_template_value(self.custom_chat_template)
+        if resolved_template is not None:
             if self.processor is not None:
-                self.processor.chat_template = self.custom_chat_template
+                self.processor.chat_template = resolved_template
             else:
-                self.tokenizer.chat_template = self.custom_chat_template
+                self.tokenizer.chat_template = resolved_template
 
         self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)
         self.generation_config = get_generation_config(

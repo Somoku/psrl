@@ -1,10 +1,8 @@
 import asyncio
 import logging
-import subprocess
-import time
 from collections import deque
 
-from psrl.utils.common.http_utils import find_available_port, get_host_info, post
+from psrl.utils.common.http_utils import post
 from psrl.utils.kv_cache.config import LMCacheConfig
 from psrl.utils.kv_cache.types import KVCacheBackend, KVCacheStatus, TrajectoryCacheInfo
 
@@ -39,7 +37,9 @@ class KVCacheManager:
         self._gpu_pinned_order: deque[list[int]] = deque()
 
         self._inference_engine = None
-        self._controller_proc: subprocess.Popen | None = None
+        # NOTE(lhy): Controller URL is no longer started locally per instance.
+        # It is started once by RolloutCoordinator and broadcast to all GenWorkers
+        # via set_controller_url(). Until that call, transfer() will assert-fail.
         self._controller_url: str | None = None
 
         self._log_init_status()
@@ -115,6 +115,42 @@ class KVCacheManager:
         """
         self._inference_engine = inference_engine
         psrl_logger.info("[LMCache] KVCacheManager: Engine attached.")
+
+    def set_instance_id(self, instance_id: int) -> None:
+        """
+        Set the per-instance LMCache identifier.
+
+        Must be called once by `PSRL_GenWorker` after construction, passing the
+        numeric instance id assigned to this worker group.  Sets
+        `lmcache_instance_id` to `"psrl_instance_{instance_id}"`, which the
+        LMCache Controller uses to identify KV transfer sources and destinations.
+
+        Args:
+            instance_id (int): Numeric identifier of this rollout instance.
+        """
+        self._config.lmcache_instance_id = f"psrl_instance_{instance_id}"
+        psrl_logger.info(
+            f"[LMCache] Instance ID set to {self._config.lmcache_instance_id!r}."
+        )
+
+    def set_controller_url(self, controller_url: str) -> None:
+        """
+        Set the shared LMCache Controller URL.
+
+        Called by `PSRL_GenWorker.set_lmcache_controller_url()` after
+        `RolloutCoordinator.init_lmcache_p2p()` broadcasts the URL of the
+        single shared Controller subprocess to all GenWorker instances.
+
+        Must be called before `transfer()` is used.
+
+        Args:
+            controller_url (str): Base URL of the shared Controller, e.g.
+                `"http://10.0.0.1:9042"`.
+        """
+        self._controller_url = controller_url
+        psrl_logger.info(
+            f"[LMCache] Controller URL set to {self._controller_url!r}."
+        )
 
     @property
     def is_attached(self) -> bool:
@@ -343,15 +379,16 @@ class KVCacheManager:
         Transfer the cached prefix of a trajectory to another (instance, backend).
 
         Uses the LMCache Controller HTTP API (`/move`). The Controller subprocess
-        is started on demand if not already running.  Both intra-machine (same host,
-        different GPU) and inter-machine (via NIXL RDMA or TCP) transfers are
-        supported through the same interface.
+        must have been started by `RolloutCoordinator.init_lmcache_p2p()` and its
+        URL must have been injected via `set_controller_url()`.  Both intra-machine
+        (same host, different GPU via UCX shared memory) and inter-machine (via NIXL
+        RDMA or TCP) transfers are supported through the same interface.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
-            src (tuple[str, str]): `(lmcache_instance_id, backend_location)` of
+            src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)` of
                 the source, e.g. `("psrl_instance_0", "LocalCPUBackend")`.
-            dst (tuple[str, str]): `(lmcache_instance_id, backend_location)` of
+            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)` of
                 the destination.
             copy (bool): If True, keep the data at `src` as well.
 
@@ -366,9 +403,9 @@ class KVCacheManager:
                 "Set LMCacheConfig.enable_p2p=True to enable cross-instance transfer."
             )
             return False
-
-        controller_url = await asyncio.get_event_loop().run_in_executor(
-            None, self._ensure_controller_running
+        assert self._controller_url is not None, (
+            "KVCacheManager controller URL is not set. "
+            "Call set_controller_url() after RolloutCoordinator.init_lmcache_p2p() completes."
         )
 
         payload = {
@@ -378,16 +415,14 @@ class KVCacheManager:
             "copy": copy,
         }
         try:
-            resp = await post(f"{controller_url}/move", payload)
+            resp = await post(f"{self._controller_url}/move", payload)
             psrl_logger.debug(f"[LMCache] Controller move ACK: {resp!r}.")
             return True
         except Exception as e:
             psrl_logger.error(f"[LMCache] Controller /move request failed: {e}.")
             return False
 
-    # --- GPU pin budget internals ---
-
-    async def _pin_gpu(self, tokens: list[int]) -> bool:
+    # --- GPU pin budget internals ---    async def _pin_gpu(self, tokens: list[int]) -> bool:
         """
         Pin GPU prefix-cache blocks for `tokens`, enforcing the budget.
 
@@ -470,63 +505,3 @@ class KVCacheManager:
         )
         return True
 
-    # --- Controller lifecycle ---
-
-    def _ensure_controller_running(self) -> str:
-        """
-        Start the LMCache controller subprocess if not already running.
-
-        Polls `GET /health` up to 30 times (1 s interval) before raising.
-
-        Returns:
-            str: Base URL of the controller, e.g. `"http://127.0.0.1:9042"`.
-
-        Raises:
-            RuntimeError: If the controller does not become healthy within 30 s.
-        """
-        if self._controller_proc is not None and self._controller_url is not None:
-            return self._controller_url
-
-        import requests as _requests
-
-        _, host = get_host_info()
-        port = find_available_port(self._config.controller_base_port)
-        cmd = [
-            "lmcache_controller",
-            "--host", host,
-            "--port", str(port),
-        ]
-        psrl_logger.info(f"[LMCache] Starting controller: {' '.join(cmd)}.")
-        self._controller_proc = subprocess.Popen(cmd)
-        self._controller_url = f"http://{host}:{port}"
-
-        # Poll until healthy.
-        health_url = f"{self._controller_url}/health"
-        for attempt in range(30):
-            try:
-                resp = _requests.get(health_url, timeout=1)
-                if resp.status_code == 200:
-                    psrl_logger.info(
-                        f"[LMCache] Controller healthy at {self._controller_url} "
-                        f"(attempt {attempt + 1})."
-                    )
-                    return self._controller_url
-            except Exception:
-                pass
-            time.sleep(1)
-
-        self._controller_proc.kill()
-        self._controller_proc = None
-        self._controller_url = None
-        raise RuntimeError(
-            f"LMCache controller did not become healthy at {health_url} "
-            "within 30 s."
-        )
-
-    def __del__(self) -> None:
-        if self._controller_proc is not None:
-            try:
-                self._controller_proc.terminate()
-                self._controller_proc.wait(timeout=5)
-            except Exception:
-                pass

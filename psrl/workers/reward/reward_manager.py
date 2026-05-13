@@ -380,6 +380,11 @@ class RewardManager(CommandExtension):
                 is_validate=is_validate,
             )
             if not update_status_success[0]:
+                psrl_logger.warning(
+                    "compute_score: update_request_status(REWARD_RUNNING) failed for uid=%s "
+                    "(aborted?), returning None.",
+                    request_ids.tolist(),
+                )
                 return None
 
             if rollout_n > 1:

@@ -140,6 +140,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=$agent_loop_config_path \
     gen_actor_rollout_ref.rollout.agent.env.name=mini_swe_env \
     gen_actor_rollout_ref.rollout.agent.data.name=mini_swe_agent_data \
+    gen_actor_rollout_ref.rollout.agent.num_workers=${NNODES} \
     \
     train_actor_rollout_ref.model.path="$MODEL_PATH" \
     train_actor_rollout_ref.model.use_remove_padding=True \
@@ -172,6 +173,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${packing_length} \
+    +train_actor_rollout_ref.actor.use_rollout_log_probs=True \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     train_actor_rollout_ref.actor.strategy=fsdp2 \
     train_actor_rollout_ref.actor.fsdp_config.param_offload=False \

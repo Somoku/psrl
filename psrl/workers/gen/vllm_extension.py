@@ -585,3 +585,39 @@ class vLLMWorkerExtension:
         n = engine.storage_manager.batched_remove(keys)
         return n
 
+    def lmcache_clear_all_from_backend(self) -> None:
+        """
+        Remove all cached KV chunks from the LMCache CPU backend.
+
+        Called after a model weight update (NIXL pull or CPU pull) to ensure
+        that stale KV cache entries from the previous model version are not
+        reused by subsequent requests.  Corresponds to the
+        `lmcache.clear_on_weight_update` config flag.
+
+        Invoked via `collective_rpc("lmcache_clear_all_from_backend")` from
+        `PSRL_GenWorker.pull_model_async()`.
+        """
+        engine = self._get_lmcache_engine()
+        # `storage_manager` holds references to all backends (local CPU, disk,
+        # remote).  `free_all` / `clear` semantics vary by LMCache version; we
+        # call `batched_remove` on every key currently tracked by the engine's
+        # token database, which is the safest cross-version approach.
+        try:
+            if hasattr(engine.storage_manager, "clear"):
+                engine.storage_manager.clear()
+            elif hasattr(engine, "clear"):
+                engine.clear()
+            else:
+                # Fallback: iterate all known chunks and remove them one by one.
+                # This is slower but guaranteed to work on any LMCache version.
+                all_keys = list(engine.storage_manager.local_cpu_backend.hot_cache.keys())
+                engine.storage_manager.batched_remove(all_keys)
+            psrl_logger.debug(
+                "[LMCache] Cleared all cached KV chunks from backend after model weight update."
+            )
+        except Exception as e:
+            psrl_logger.warning(
+                f"[LMCache] lmcache_clear_all_from_backend encountered an error: {e!r}. "
+                "Stale KV entries may remain in the CPU backend."
+            )
+

@@ -8,6 +8,7 @@ __all__ = [
     "HFParameterMapping",
     "VllmQwen2ParameterMapping",
     "VllmQwen2MoeParameterMapping",
+    "VllmQwen3ParameterMapping",
     "VllmQwen3MoeParameterMapping",
     "VllmMixtralParameterMapping",
     "VllmLlamaParameterMapping",

@@ -72,7 +72,7 @@ max_num_seqs: ${oc.select:psrl.routing_strategy.max_concurrent_seqs_per_instance
 enable_chunked_prefill: True
 
 # Prefix caching kv-cache blocks is a popular optimization in LLM inference to avoid redundant prompt computations.
-enable_prefix_caching: False
+enable_prefix_caching: True
 
 # The behavior of returned logprobs from rollout engine: raw_logprobs, processed_logprobs
 # raw_logprobs means the values before applying any logit processors, like bad words.

@@ -534,9 +534,10 @@ class StalenessInventory:
         """
         Check whether an entry can be reserved for a given model version without a new reserve entry.
         """
+        staleness = self.staleness if self.staleness is not None else 0
         if entry_info.prompt_id in self.data_tracker:
             buffer_id, _ = self.data_tracker[entry_info.prompt_id]
-            if model_version + self.staleness >= buffer_id:
+            if model_version + staleness >= buffer_id:
                 return True
         return False
 
@@ -550,23 +551,25 @@ class StalenessInventory:
         Returns:
             bool: Whether the entry can be reserved for the given model version
         """
+        # For validation inventory, staleness is None; treat as 0 (no staleness allowed)
+        staleness = self.staleness if self.staleness is not None else 0
         if entry_info.prompt_id in self.data_tracker:
             # Indicate it is already RESERVED (other requests in the same prompt group have been reserved)
             # We need to check if the model version can allow
             # the new request to be reserved at the same place as before
             buffer_id, _ = self.data_tracker[entry_info.prompt_id]
-            if model_version + self.staleness >= buffer_id:
+            if model_version + staleness >= buffer_id:
                 return True
             else:
                 return False
         # Ensure buffer IDs up to max_staleness_buffer_id exist
-        self.ensure_buffer_exists(model_version + self.staleness)
+        self.ensure_buffer_exists(model_version + staleness)
         # Get all PENDING buffers within the staleness limit
         pending_buffers = self.get_buffers_with_capacity()
         candidate_ids = [
             bid
             for bid in pending_buffers
-            if model_version <= bid <= model_version + self.staleness and bid not in self._ready_for_delete_buffer_ids
+            if model_version <= bid <= model_version + staleness and bid not in self._ready_for_delete_buffer_ids
         ]
         if not candidate_ids:
             # Cases where no PENDING buffers are available

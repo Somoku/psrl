@@ -130,6 +130,24 @@ class TurnProfilingCollector:
         self._turn_records.append(record)
         self._turn_index += 1
 
+    @property
+    def trajectory_start_ts(self) -> float:
+        """Timestamp when the first generation turn was submitted (0.0 if not yet set)."""
+        return self._trajectory_start_ts
+
+    def get_timing_breakdown(self) -> dict:
+        """
+        Return LLM-side timing summary for use in trajectory summary text.
+
+        Returns a dict with keys:
+            assistant_s: total wall-clock time across all model turns (router_wait + scheduler_wait + prefill + decode)
+            env_s: total environment execution time between turns
+        """
+        return {
+            "assistant_s": sum(r.total_duration_s for r in self._turn_records),
+            "env_s": sum(r.duration_s for r in self._env_records),
+        }
+
     def finalize(self, request_id: int) -> TrajectoryProfilingData | None:
         """
         Build and return TrajectoryProfilingData for the entire trajectory.

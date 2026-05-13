@@ -114,9 +114,11 @@ class RolloutRouter:
         # Track the instance id for each incomplete request (i.e., request that is not completed yet):
         # {request_id: instance_id}
         self.incomplete_request_to_instance = {}
-        # Trajectory-level instance mapping — survives individual turn completion.
-        # Upserted on every routing decision; cleared by `kv_unregister`.
-        self.complete_request_to_instance: dict[int, int] = {}
+        # Trajectory-level instance mapping — records the last instance each request
+        # was routed to.  Survives individual turn completion (unlike incomplete_request_to_instance
+        # which is cleared per-turn); used for KV cache migration and routing decisions
+        # between turns.  Cleared only when the full trajectory ends (kv_unregister).
+        self.request_to_last_routed_instance: dict[int, int] = {}
         # Trajectory-level token mapping — auto-maintained by generate_async / _route_single_request.
         self.request_to_tokens: dict[int, list[int]] = {}
         self.request_futures = {}  # Track request futures: {request_id: Future}
@@ -328,7 +330,15 @@ class RolloutRouter:
         # 1. Filter the rollout instances that are not paused and can tolerate the needed staleness of the request
         # This guarantees that the gen worker will have no ahead-of-time version tag when generating
         if self.config.psrl.fuse_rollout_with_validate:
-            available_instance_ids = set(range(self.rollout_wg_size))
+            if is_validate:
+                # Val requests can go to any instance (rollout + validate)
+                available_instance_ids = set(range(self.rollout_wg_size))
+            else:
+                # Train/rollout requests can only go to rollout instances, never to
+                # validate instances.  This prevents train partial-rollout requests
+                # from being stranded when validate instances are paused during
+                # switch_to_trainer_mode.
+                available_instance_ids = set(range(self.n_rollout_instances))
         else:
             # If not fusing rollout with validate, separate the instance IDs for rollout and validate
             available_instance_ids = set(
@@ -388,9 +398,12 @@ class RolloutRouter:
         # 4. Filter the rollout instances that can reserve the request for the current instance model version
         # This is only used when the needed model version is -1 (i.e. new request)
         if needed_model_version == -1:
-            all_candidate_model_versions = list(
-                set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
-            )
+            # Snapshot versions before await to avoid race with concurrent sync updates.
+            version_snapshot_for_filter = {
+                candidate: self.instance_to_version_after_sync[candidate]
+                for candidate in candidates
+            }
+            all_candidate_model_versions = list(set(version_snapshot_for_filter.values()))
             can_reserve_results = await self.ps_manager_handle.can_reserve_request.remote(
                 request_id, all_candidate_model_versions, is_validate=is_validate
             )
@@ -398,7 +411,7 @@ class RolloutRouter:
                 candidate
                 for candidate in candidates
                 if can_reserve_results[
-                    all_candidate_model_versions.index(self.instance_to_version_after_sync[candidate])
+                    all_candidate_model_versions.index(version_snapshot_for_filter[candidate])
                 ]
             ]
 
@@ -415,15 +428,20 @@ class RolloutRouter:
                     version_indicator = version
                 candidate_indicator_list.append(version_indicator)
         elif self.config.psrl.routing_strategy.candidate_sort_indicator == "reserve_capability":
-            # Use the (reserve_indicator, version) pair as the final indicator
-            all_candidate_model_versions = list(
-                set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
-            )
+            # Use the (reserve_indicator, version) pair as the final indicator.
+            # Snapshot the per-candidate versions BEFORE the await so that a
+            # concurrent update_currently_syncing_instances cannot invalidate the
+            # index lookup.
+            candidate_version_snapshot = {
+                candidate: self.instance_to_version_after_sync[candidate]
+                for candidate in candidates
+            }
+            all_candidate_model_versions = list(set(candidate_version_snapshot.values()))
             indicator_results = await self.ps_manager_handle.get_reserve_indicator.remote(
                 request_id, all_candidate_model_versions, is_validate=is_validate
             )
             for candidate in candidates:
-                version = self.instance_to_version_after_sync[candidate]
+                version = candidate_version_snapshot[candidate]
                 if needed_model_version == -1:
                     version_indicator = -version
                 else:
@@ -622,6 +640,7 @@ class RolloutRouter:
         )
         if not update_status_success[0]:
             # Means the request is aborted
+            psrl_logger.warning("generate_async: request %s aborted at ROLLOUT_ROUTING.", request_id)
             return None
 
         # Create a future to track this request's completion
@@ -641,6 +660,8 @@ class RolloutRouter:
             result = await result_future
         # Clean up the future
         self.request_futures.pop(request_id)
+        if result is None:
+            psrl_logger.warning("generate_async: request %s got None from GenWorker.", request_id)
         return result
 
     def _set_result(self, request_id: int, result: DataProto | None):
@@ -656,12 +677,26 @@ class RolloutRouter:
         self.incomplete_request_to_instance.pop(request_id, None)
         self.sticky_session_requests.pop(request_id, None)
 
+    def _set_exception(self, request_id: int, exc: BaseException):
+        """Propagate a generation exception to the awaiting `generate_async` caller.
+
+        Used when the underlying rollout raises (e.g. ``VLLMValidationError``):
+        the awaiting caller will see ``await result_future`` re-raise ``exc``
+        instead of receiving a sentinel value, so the agent loop can map it
+        to ``TerminateReason.ROLLOUT_ERROR`` and clean up.
+        """
+        assert request_id in self.request_futures, f"Request {request_id} should be in request futures"
+        assert not self.request_futures[request_id].done(), f"Request {request_id} should not be done"
+        self.request_futures[request_id].set_exception(exc)
+        self.incomplete_request_to_instance.pop(request_id, None)
+        self.sticky_session_requests.pop(request_id, None)
+
     def _resolve_uid(self, uid: int) -> tuple[int | None, list[int] | None]:
         """
         Resolve the instance_id and token sequence for a trajectory uid.
 
         Checks `incomplete_request_to_instance` first (turn in-flight), then
-        `complete_request_to_instance` (between turns).
+        `request_to_last_routed_instance` (between turns).
 
         Args:
             uid (int): Trajectory unique identifier.
@@ -674,8 +709,8 @@ class RolloutRouter:
         # is falsy in Python, which would incorrectly skip instance 0.
         if uid in self.incomplete_request_to_instance:
             instance_id = self.incomplete_request_to_instance[uid]
-        elif uid in self.complete_request_to_instance:
-            instance_id = self.complete_request_to_instance[uid]
+        elif uid in self.request_to_last_routed_instance:
+            instance_id = self.request_to_last_routed_instance[uid]
         else:
             return None, None
         tokens = self.request_to_tokens.get(uid)
@@ -738,7 +773,7 @@ class RolloutRouter:
                         self.requests_to_route.put(request)
                         break
                     self.incomplete_request_to_instance[request_id] = new_instance_id
-                    self.complete_request_to_instance[request_id] = new_instance_id
+                    self.request_to_last_routed_instance[request_id] = new_instance_id
                     task_coro = self._route_single_request(request, new_instance_id)
                     task = asyncio.create_task(task_coro)
                     # To avoid silent error in async tasks
@@ -790,7 +825,7 @@ class RolloutRouter:
                             remain_requests.append(request)
                             break
                         self.incomplete_request_to_instance[request_id] = new_instance_id
-                        self.complete_request_to_instance[request_id] = new_instance_id
+                        self.request_to_last_routed_instance[request_id] = new_instance_id
                         # Create a task to process this request
                         task_coro = self._route_single_request(request, new_instance_id)
                         task = asyncio.create_task(task_coro)
@@ -985,6 +1020,162 @@ class RolloutRouter:
             ntb.pop(key, None)
             request.non_tensor_batch.pop(key, None)
 
+    async def _maybe_migrate_kv(self, request: DataProto, new_instance_id: int) -> None:
+        """
+        Attempt to migrate accumulated KV cache from the previous instance to the new one.
+
+        When a request is re-routed to a different instance (typically due to partial
+        rollout interruption or load-balancing migration), this method transfers the
+        prefix KV cache from the old instance's LMCache CPU backend to the new
+        instance's CPU backend via the shared LMCache Controller (`/move`).  The new
+        instance's LMCache then automatically loads the CPU-cached KV into GPU when
+        the request is next scheduled, skipping re-prefill.
+
+        Flow:
+            1. Guard: return early if kv_migration is disabled, same instance, or no
+               previous instance recorded (fresh request + partial_rollout_only=True).
+            2. Query old instance for cached token count; skip if nothing cached.
+            3. Pin CPU cache on old instance to prevent LRU eviction during transfer.
+            4. Fire the Controller /move (A_CPU --NIXL/UCX--> B_CPU).
+            5. Unpin old instance CPU cache immediately after transfer, in a
+               `finally` block so the pin is always released on success or failure.
+
+        In "async" transfer_mode the transfer runs in the background while the
+        request is dispatched immediately; pair with `lmcache.enable_async_loading`
+        to overlap CPU-to-GPU retrieval with prefill computation on instance B.
+
+        Args:
+            request (DataProto): The request being routed (single-element batch).
+            new_instance_id (int): The instance the request will be dispatched to.
+        """
+        kv_migration_cfg = self.config.psrl.routing_strategy.get("kv_migration")
+        if kv_migration_cfg is None or not kv_migration_cfg.get("enable", False):
+            return
+
+        request_id = request.non_tensor_batch["uid"][0]
+
+        # Determine the old instance: prefer the rollout_instance_id already written
+        # into the request (set on first routing and updated on each re-route), then
+        # fall back to request_to_last_routed_instance (persists across turns).
+        if "rollout_instance_id" in request.non_tensor_batch:
+            old_instance_id = int(request.non_tensor_batch["rollout_instance_id"][0])
+        else:
+            old_instance_id = self.request_to_last_routed_instance.get(request_id)
+
+        partial_rollout_only: bool = kv_migration_cfg.get("partial_rollout_only", True)
+        if old_instance_id is None:
+            # No previous instance recorded yet (fresh request).
+            if partial_rollout_only:
+                return
+            # When partial_rollout_only=False, there is nothing to migrate for fresh
+            # requests anyway (no KV has been produced yet), so always return.
+            return
+
+        if old_instance_id == new_instance_id:
+            return  # Same instance: no migration needed.
+
+        tokens = self.request_to_tokens.get(request_id)
+        if not tokens:
+            return
+
+        # --- Step 1: Check whether old instance has anything cached. ---
+        try:
+            cache_info_raw = await asyncio.wait_for(
+                self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                    "kv_get_cache_info", tokens
+                ),
+                timeout=5.0,
+            )
+        except Exception as e:
+            psrl_logger.warning(
+                f"[KVMigration] Cache info query failed for uid={request_id!r} "
+                f"on instance {old_instance_id!r}: {e!r}. Skipping migration."
+            )
+            return
+
+        if cache_info_raw is None or cache_info_raw.get("lmcache_cached_tokens", 0) == 0:
+            psrl_logger.debug(
+                f"[KVMigration] No LMCache CPU data for uid={request_id!r} "
+                f"on instance {old_instance_id!r}. Skipping migration."
+            )
+            return
+
+        # --- Step 2: Pin src CPU to prevent LRU eviction during transfer. ---
+        try:
+            await asyncio.wait_for(
+                self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                    "kv_pin", tokens, ["backend"]
+                ),
+                timeout=5.0,
+            )
+        except Exception as e:
+            psrl_logger.warning(
+                f"[KVMigration] CPU pin failed for uid={request_id!r} "
+                f"on instance {old_instance_id!r}: {e!r}. Skipping migration."
+            )
+            return
+
+        src_id = f"psrl_instance_{old_instance_id}"
+        dst_id = f"psrl_instance_{new_instance_id}"
+        transfer_mode: str = kv_migration_cfg.get("transfer_mode", "async")
+        timeout_s: float = kv_migration_cfg.get("transfer_timeout_ms", 5000) / 1000
+
+        # --- Step 3: Transfer (pin → transfer → unpin in finally). ---
+        async def _transfer_and_unpin() -> None:
+            try:
+                success = await self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                    "kv_transfer",
+                    tokens,
+                    (src_id, "LocalCPUBackend"),
+                    (dst_id, "LocalCPUBackend"),
+                    False,  # copy=False → move semantics
+                )
+                if success:
+                    psrl_logger.debug(
+                        f"[KVMigration] Transfer succeeded for uid={request_id!r}: "
+                        f"instance {old_instance_id!r} -> {new_instance_id!r}."
+                    )
+                else:
+                    psrl_logger.warning(
+                        f"[KVMigration] Transfer returned False for uid={request_id!r}. "
+                        f"Instance {new_instance_id!r} will re-prefill."
+                    )
+            except Exception as e:
+                psrl_logger.warning(
+                    f"[KVMigration] Transfer failed for uid={request_id!r}: {e!r}. "
+                    f"Instance {new_instance_id!r} will re-prefill."
+                )
+            finally:
+                # Unpin immediately after transfer completes (or fails).
+                # /move success: B already has the data in its own CPU backend, A no longer needs the pin.
+                # /move failure: No migration occurred; release the pin so A's LRU can run freely.
+                try:
+                    await asyncio.wait_for(
+                        self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                            "kv_unpin", tokens, ["backend"]
+                        ),
+                        timeout=5.0,
+                    )
+                except Exception as e:
+                    psrl_logger.warning(
+                        f"[KVMigration] Post-transfer unpin failed for uid={request_id!r}: {e!r}."
+                    )
+
+        if transfer_mode == "sync":
+            try:
+                await asyncio.wait_for(_transfer_and_unpin(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                psrl_logger.warning(
+                    f"[KVMigration] Sync transfer timed out after {timeout_s}s "
+                    f"for uid={request_id!r}. Dispatch proceeds; instance {new_instance_id!r} "
+                    "will re-prefill."
+                )
+        else:
+            # async: fire-and-forget — dispatch immediately, transfer runs in background.
+            task = asyncio.create_task(_transfer_and_unpin())
+            # Surface any unhandled exception to the log rather than silencing it.
+            task.add_done_callback(lambda f: f.result() if not f.cancelled() else None)
+
     async def _route_single_request(self, request: DataProto, new_instance_id: int):
         """Route a single request to a rollout instance.
 
@@ -993,11 +1184,31 @@ class RolloutRouter:
             new_instance_id (int): The new rollout instance id that the request
                 will be routed to.
         """
-        # Update request non-tensor batch
-        # psrl_logger.info(
-        #     f"Routing single request {request.non_tensor_batch['uid'][0]} "
-        #     f"to rollout instance {new_instance_id}"
-        # )
+        request_id = request.non_tensor_batch["uid"][0]
+        try:
+            await self._route_single_request_impl(request, new_instance_id)
+        except BaseException as exc:
+            # Last-resort safety net: if anything inside the routing path raises
+            # an unhandled exception, the awaiting `result_future` would otherwise
+            # never resolve, and the caller would block until its own timeout
+            # (e.g. 600s in the agent loop). Surface the exception to the caller
+            # so it can clean up immediately instead of hanging.
+            psrl_logger.error(
+                f"_route_single_request crashed for request {request_id} on "
+                f"instance {new_instance_id}: {exc!r}. Propagating to caller.",
+                exc_info=True,
+            )
+            if (
+                request_id in self.request_futures
+                and not self.request_futures[request_id].done()
+            ):
+                self._set_exception(request_id, exc)
+            if not isinstance(exc, Exception):
+                # Re-raise CancelledError / KeyboardInterrupt / SystemExit etc.
+                raise
+
+    async def _route_single_request_impl(self, request: DataProto, new_instance_id: int):
+        """Implementation body of `_route_single_request`; see that method for docs."""
         request_id = request.non_tensor_batch["uid"][0]
         is_validate = request.meta_info.get("validate", False)
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
@@ -1051,11 +1262,30 @@ class RolloutRouter:
                 sampling_params["top_p"] = val_config.top_p
                 sampling_params["temperature"] = val_config.temperature
 
+            # Attempt KV cache migration from the previous instance to this one,
+            # so the new instance can skip re-prefill for the accumulated prefix.
+            await self._maybe_migrate_kv(request, new_instance_id)
+
             # Generate response
             # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")
-            consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async(
-                "generate_async", request, sampling_params
-            )
+            try:
+                consolidated_output, update_status = await self.rollout_wg_list[new_instance_id].execute_rank_zero_async(
+                    "generate_async", request, sampling_params
+                )
+            except Exception as gen_exc:
+                # Propagate the exception to the awaiting generate_async() so the
+                # agent loop maps it to TerminateReason.ROLLOUT_ERROR. We do NOT
+                # collapse it into _set_result(..., None) -- that channel now
+                # exclusively means "intentionally aborted".
+                psrl_logger.error(
+                    f"Generation failed for request {request_id} on instance {new_instance_id}: {gen_exc}. "
+                    "Propagating exception to the awaiting caller as ROLLOUT_ERROR."
+                )
+                self.route_strategy.pop_request(request, new_instance_id)
+                self.instance_to_inflight_request_ids[new_instance_id].remove(request_id)
+                if request_id in self.request_futures and not self.request_futures[request_id].done():
+                    self._set_exception(request_id, gen_exc)
+                return
 
             # Change engine status
             self.route_strategy.pop_request(request, new_instance_id)
@@ -1108,10 +1338,13 @@ class RolloutRouter:
                 # psrl_logger.info(f"Request {request_id} on instance {new_instance_id} is aborted")
                 result = None
         else:
-            # Means the request is aborted
+            # Means the request is aborted before reaching execute_rank_zero_async,
+            # so consolidated_output was never produced.
             # psrl_logger.info(f"Request {request_id} is aborted")
             result = None
-            
+            consolidated_output = None
+            need_reroute = False
+
         # Update token sequence with prompt + response for next turn's KV routing (END of turn).
         if consolidated_output is not None:
             raw_prompt_ids = consolidated_output.non_tensor_batch.get("raw_prompt_ids")
@@ -1160,19 +1393,24 @@ class RolloutRouter:
                     is_aborted = await self.ps_manager_handle.check_aborted_requests.remote(
                         filtered_request_ids, remove=False
                     )
-                    filtered_request_ids = [
-                        request_id for i, request_id in enumerate(filtered_request_ids) if not is_aborted[i]
+                    # Keep `is_validate` aligned with `filtered_request_ids` (same indices as `filtered_requests`).
+                    kept_indices = [i for i, aborted in enumerate(is_aborted) if not aborted]
+                    filtered_request_ids = [filtered_request_ids[i] for i in kept_indices]
+                    is_validate_list = [
+                        filtered_requests[i].meta_info.get("validate", False) for i in kept_indices
                     ]
-                    is_validate_list = [request.meta_info.get("validate", False) for request in filtered_requests]
-                    can_reserve = await self.ps_manager_handle.can_reserve_request.remote(
-                        filtered_request_ids,
-                        [instance_version],
-                        without_new_reserve_entry=False,
-                        is_validate=is_validate_list,
-                    )
-                    filtered_request_ids = [
-                        request_id for i, request_id in enumerate(filtered_request_ids) if can_reserve[i] == [True]
-                    ]
+                    if len(filtered_request_ids) > 0:
+                        can_reserve = await self.ps_manager_handle.can_reserve_request.remote(
+                            filtered_request_ids,
+                            [instance_version],
+                            without_new_reserve_entry=False,
+                            is_validate=is_validate_list,
+                        )
+                        filtered_request_ids = [
+                            request_id
+                            for i, request_id in enumerate(filtered_request_ids)
+                            if can_reserve[i] == [True]
+                        ]
                 if len(filtered_request_ids) == 0:
                     filtered_instance_ids.append(instance_id)
 
@@ -1417,7 +1655,7 @@ class RolloutRouter:
         Args:
             uid (int): Trajectory unique identifier.
         """
-        self.complete_request_to_instance.pop(uid, None)
+        self.request_to_last_routed_instance.pop(uid, None)
         self.request_to_tokens.pop(uid, None)
         psrl_logger.debug(f"[KV] Unregistered uid={uid}.")
 

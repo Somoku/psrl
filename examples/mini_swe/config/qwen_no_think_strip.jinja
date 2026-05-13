@@ -1,0 +1,24 @@
+{#-
+  Patched Qwen chat template that disables Qwen3's position-dependent
+  <think>...</think> stripping so the rollout-time prompt and the training
+  sequence agree on assistant content.
+
+  Usage:
+      +gen_actor_rollout_ref.model.custom_chat_template=
+          ${PSRL_PATH}/examples/mini_swe/config/qwen_no_think_strip.jinja
+
+  Notes:
+  - Drops Qwen2.5's auto-injected default system message; mini-SWE-agent
+    always supplies an explicit system message, so this is fine.
+  - Does not handle `tools` arg / `tool_calls` field / `tool` role;
+    mini-SWE-agent embeds tool output as plain `user` messages.
+-#}
+{%- for message in messages %}
+    {%- set content = message.content if message.content is string else '' %}
+    {%- if message.role == 'system' or message.role == 'user' or message.role == 'assistant' %}
+        {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' }}
+{%- endif %}

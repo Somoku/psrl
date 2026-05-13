@@ -38,7 +38,10 @@ agentic_rl:
     # Output base directory.  Default when empty: psrl.logging_path/trajectories.
     dir: ""
 
-  # Error handling for transient rollout failures (TerminateReason.needs_manager_retry()).
+  # Error handling for terminations where TerminateReason.needs_manager_retry()
+  # is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
+  # (unclassified failure / zero turns produced). Timeouts and aborts are
+  # handled by their own paths and do NOT route through this switch.
   # True  (default): on training failure, worker notifies manager to dispatch a
   #                  replacement request so the buffer slot is eventually filled;
   #                  on validation failure, manager shrinks val_buffer_size by 1
@@ -157,7 +160,7 @@ status_collection:
   dump_logging_to_file_level: all
 
   # Logging interval in milliseconds
-  dump_logging_to_file_interval_in_ms: 10
+  dump_logging_to_file_interval_in_ms: 500
 
   # Engine status sync interval in millisecond (each vllm engine -> rollout coordinator)
   # Here 10 means sync every 0.1 second
@@ -210,6 +213,33 @@ routing_strategy:
   # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget", "kv_cache_aware"
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
   method: request_num_balance
+
+  # KV cache migration: when re-routing a request to a different rollout instance,
+  # transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)
+  # so instance B can skip re-prefill. Requires lmcache.enable and lmcache.enable_p2p.
+  kv_migration:
+
+    # Master switch for KV cache migration.
+    enable: False
+
+    # Transfer timing mode.
+    # "sync"  -- await Controller /move completion before dispatching to B.
+    #            Guarantees a CPU cache hit on B; adds routing latency equal to
+    #            the transfer time.  Set transfer_timeout_ms accordingly.
+    # "async" -- fire-and-forget: dispatch to B immediately while transfer runs
+    #            in background.  Lower latency; pair with lmcache.enable_async_loading
+    #            so B can overlap retrieval with prefill computation.
+    transfer_mode: async
+
+    # Timeout in milliseconds for a single Controller /move call (sync mode only).
+    # On timeout the migration is abandoned and B falls back to re-prefill.
+    transfer_timeout_ms: 5000
+
+    # When True, only trigger migration for partial-rollout re-routes, i.e.,
+    # requests that have a previous rollout_instance_id (were already being
+    # generated somewhere).  Setting to False migrates on every cross-instance
+    # routing decision, which is expensive and rarely beneficial for fresh requests.
+    partial_rollout_only: True
 
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500
@@ -353,7 +383,7 @@ nixl:
 broadcast_init:
 
   # Set to true to use rank-0 broadcast initialization instead of each worker reading disk.
-  enabled: True
+  enabled: False
 
   # Broadcast algorithm. Supported: binary_tree. Reserved for future: ring.
   algorithm: binary_tree
@@ -383,7 +413,7 @@ buffer_post_process:
 # Whether to colocate validate and training workers
 colocate_validate_and_train: True
 
-# Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
+# Whether to dispatch requests to both rollout and validate instances
 fuse_rollout_with_validate: True
 
 # Whether to use torch_memory_saver (TMS) for GPU management
@@ -411,7 +441,7 @@ tms:
 lmcache:
 
   # Whether to enable LMCache KV offloading in vLLM.
-  enable: True
+  enable: False
 
   # Backend for offloaded KV: "cpu", "disk", or "remote" (TODO: remote).
   backend: cpu
@@ -463,3 +493,24 @@ lmcache:
 
   # Overlap KV cache retrieval with prefill computation to reduce TTFT.
   enable_async_loading: False
+
+  # --- P2P cross-instance KV transfer ---
+  # Required when routing_strategy.kv_migration.enable is True.
+
+  # Enable P2P cross-instance KV transfer via LMCache Controller.
+  # A shared Controller process is started by RolloutCoordinator and its URL is
+  # broadcast to all GenWorker instances at startup.
+  # Each instance is automatically assigned lmcache_instance_id = psrl_instance_{id}.
+  enable_p2p: False
+
+  # Transport channel for P2P transfer.
+  # "nixl" -- uses UCX (PSRL already has NIXL/UCX installed); automatically
+  #           selects shared-memory/IPC on same node and RDMA on multi-node.
+  #           Recommended for all deployment topologies.
+  # "tcp"  -- fallback when NIXL/UCX is unavailable.
+  p2p_transfer_channel: nixl
+
+  # Base port for the shared LMCache Controller subprocess.
+  # RolloutCoordinator picks the actual port starting from this value
+  # using find_available_port().
+  controller_base_port: 9000

@@ -72,6 +72,21 @@ class MiniSandboxConfig:
     max_parallel_tasks_per_worker: int = 0
     environment: MiniEnvironmentConfig = field(default_factory=MiniEnvironmentConfig)
 
+    # Per-turn rollout timeout (seconds).  The generation loop wraps each
+    # `generate_async` call in `asyncio.wait_for(timeout=rollout_turn_timeout)`.
+    # When this fires it sends `_TerminateSignal("RolloutError")` to the agent
+    # thread so the thread exits cleanly instead of blocking on `query_timeout`.
+    #
+    # Must be strictly less than `query_timeout` so the generation loop always
+    # classifies a silent routing failure before the agent thread does.
+    rollout_turn_timeout: int = 480
+
+    # Timeout (seconds) for the agent thread's blocking `res_q.get()` call.
+    # This is a last-resort safety net: in the fixed code the generation loop
+    # always notifies the agent before this fires.  Set it higher than
+    # `rollout_turn_timeout` to give the generation loop time to act first.
+    query_timeout: int = 600
+
 
 @dataclass
 class MiniAgentConfig:

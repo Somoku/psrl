@@ -177,11 +177,15 @@ def build_worker_stats_update(worker_id: str, dp_rank: int, snapshot: dict[str, 
         },
     }
 
-def _parse_timestamp(value: Any) -> str:
+def _parse_timestamp(value):
     if isinstance(value, str):
         try:
-            datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return value
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt.isoformat().replace("+00:00", "Z")
         except ValueError:
             pass
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

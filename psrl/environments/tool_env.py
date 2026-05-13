@@ -156,12 +156,11 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         self.num_turn = 0
 
         self.task = task
-        assert len(task) == 1, "We only support single initial prompt in ToolEnvironment."
         assert "raw_prompt" in task, (
             "For ReTool recipe, task must contain 'raw_prompt' in non_tensor_batch"
         )
-        initial_observation = task["raw_prompt"].tolist()[0]
-        self.tools_kwargs = task.get("tools_kwargs", [{}])[0]
+        initial_observation = task["raw_prompt"]
+        self.tools_kwargs = task.get("tools_kwargs", {})
         images, videos = await self.process_vision_info(initial_observation)
         if images is not None or videos is not None:
             info["multi_modal_data"] = {"images": images, "videos": videos}

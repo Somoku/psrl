@@ -458,7 +458,7 @@ class PSRL_AgentLoopWorker:
             is_validate=batch.partition_id == "val",
         )
 
-        if not occupy_success:
+        if not occupy_success and len(outputs) > 1:
             # occupy_requests rejected the request (e.g. already aborted by
             # PSManager).  The per-trajectory keys we just wrote are now
             # orphaned — clean them up so TQ does not accumulate stale data.

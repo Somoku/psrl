@@ -427,6 +427,7 @@ class PSManager(RequestStatusTracker):
                     prompt_id=request_id // rollout_n,
                     request_idx=request_id % rollout_n,
                     model_version=model_version,
+                    n_trajectory=1,
                     is_validate=is_validate,
                 )
                 if without_new_reserve_entry:
@@ -478,6 +479,7 @@ class PSManager(RequestStatusTracker):
                 prompt_id=request_id // rollout_n,
                 request_idx=request_id % rollout_n,
                 model_version=model_version,
+                n_trajectory=1,
                 is_validate=is_validate,
             )
             if staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
@@ -561,6 +563,7 @@ class PSManager(RequestStatusTracker):
                 prompt_id=request_id // rollout_n,
                 request_idx=request_id % rollout_n,
                 model_version=model_version,
+                n_trajectory=1,
                 is_validate=is_validate,
             )
 

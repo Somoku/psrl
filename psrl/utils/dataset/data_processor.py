@@ -539,8 +539,16 @@ class DataProcessor:
             sample_ids = self.get_val_sample_ids(batch_size)
 
         batch = tu.get_tensordict(batch_dict)
-        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
-        tu.assign_non_tensor_data(batch, "validate", dataset_type == DatasetType.val)
+        tu.assign_non_tensor_stack(
+            batch,
+            "global_steps",
+            [self.global_steps] * batch_size,
+        )
+        tu.assign_non_tensor_stack(
+            batch,
+            "validate",
+            [dataset_type == DatasetType.val] * batch_size,
+        )
         tu.assign_non_tensor_stack(
             batch,
             "parent_id" if rollout_n > 1 else "uid",

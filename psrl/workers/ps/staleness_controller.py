@@ -796,7 +796,7 @@ class StalenessInventory:
                 )
                 entry_info_to_update.rollout_instance_id = new_instance_id
 
-        psrl_logger.info(
+        psrl_logger.debug(
             f"[Entry Update]: request idx {request_idx} entry in "
             f"(buffer {buffer_id}, entry {entry_id}) is updated to {entry_info_to_update} "
             f"(instance id is updated to {new_instance_id})"
@@ -839,7 +839,7 @@ class StalenessInventory:
                 )
                 entry_info_to_update.n_trajectory = new_n_trajectory
 
-        psrl_logger.info(
+        psrl_logger.debug(
             f"[Entry Update]: request idx {request_idx} entry in "
             f"(buffer {buffer_id}, entry {entry_id}) is updated to {entry_info_to_update} "
             f"(n_trajectory is updated to {new_n_trajectory})"

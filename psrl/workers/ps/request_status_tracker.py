@@ -313,6 +313,7 @@ class RequestStatusTracker:
                 request_idx=req_id % rollout_n,
                 rollout_instance_id=rollout_instance_id[i],
                 model_version=model_version[i],
+                n_trajectory=1,
                 is_validate=is_validate[i],
             )
             self._request_id_to_status[req_id] = status[i]

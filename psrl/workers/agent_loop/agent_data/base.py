@@ -507,12 +507,10 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         Returns:
             dict: Modified request for generation.
         """
-        assert len(request) == 1, "prepare_generation_request only supports single request."
-
-        request["raw_prompt_ids"] = np.array([self.session_data.trajectories[-1].prompt_ids])
-        request["raw_response_ids"] = np.array([self.session_data.trajectories[-1].response_ids])
+        request["raw_prompt_ids"] = np.array(self.session_data.trajectories[-1].prompt_ids)
+        request["raw_response_ids"] = np.array(self.session_data.trajectories[-1].response_ids)
         if self.session_data.curr_rollout_instance_id is not None:
-            request["rollout_instance_id"] = np.array([self.session_data.curr_rollout_instance_id])
+            request["rollout_instance_id"] = self.session_data.curr_rollout_instance_id
         
         # Propagate accumulated multi-modal data so generate_sequence() can
         # forward it to the inference backend on every turn.
@@ -645,9 +643,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
             data = tu.get_tensordict(
                 tensor_dict=tensor_dict,
-                non_tensor_dict={
-                    "validate": self.session_data.validate,
-                },
+                non_tensor_dict={"validate": self.session_data.validate},
             )
             reward_meta_infos = [{
                 "reward_model": self.session_data.reward_model,

@@ -186,7 +186,7 @@ def run_ppo(config, task_runner_class=None) -> None:
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
 
-
+@ray.remote(num_cpus=1)
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
 

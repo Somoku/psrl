@@ -382,9 +382,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
                 tensor_dict["parent_id"] = np.array([self.session_data.parent_id])
             data = tu.get_tensordict(
                 tensor_dict=tensor_dict,
-                non_tensor_dict={
-                    "validate": self.session_data.validate,
-                },
+                non_tensor_dict={"validate": self.session_data.validate},
             )
             reward_meta_infos = [{
                 "reward_model": self.session_data.reward_model,

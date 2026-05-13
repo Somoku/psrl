@@ -218,13 +218,11 @@ class AgentLoopBase(ABC):
             "n_trajectory": np.array([len(outputs)]),
             "data_source": np.array([kwargs.get("data_source", "unknown")]),
         }
-        if kwargs.get("parent_id") is not None:
+        if kwargs.get("parent_id", None) is not None:
             tensor_dict["parent_id"] = np.array([kwargs.get("parent_id")])
         reward_requests = tu.get_tensordict(
             tensor_dict=tensor_dict,
-            non_tensor_dict={
-                "validate": kwargs.get("validate", False),
-            },
+            non_tensor_dict={"validate": kwargs.get("validate", False)},
         )
         reward_meta_infos = [{
             "reward_model": kwargs.get("reward_model", {}),
@@ -276,8 +274,6 @@ class AgentLoopBase(ABC):
                 )
 
             # ── Text-only: fast /generate path ──────────────────────────────
-            # psrl_logger.info(f"generate_sequence: {request_input=}")
-            psrl_logger.info(f"{request_input.request_id=} Sending generation request to gateway")
             return await self._generate_via_generate_endpoint(
                 request_input, sampling_params, is_sticky_session
             )
@@ -357,15 +353,6 @@ class AgentLoopBase(ABC):
                 modalities.append("video")
             payload["modalities"] = modalities
 
-        psrl_logger.info(
-            "[PSRL-DEBUG] request_id=%s: SMG /generate payload sampling_params=%s, "
-            "input_ids len=%d, return_logprob=%s",
-            request_input.request_id,
-            payload_sampling_params,
-            len(request_input.input_ids),
-            payload["return_logprob"],
-        )
-
         # Call SMG /generate directly via aiohttp so we can read both the
         # response body (a JSON array) and the worker-instance headers in one pass.
         gen_responses, base_worker_id, target_dp_rank = await self._post_generate(
@@ -397,17 +384,6 @@ class AgentLoopBase(ABC):
             if raw_logprobs is not None:
                 log_probs = [next((lp for lp in per_pos if lp is not None), 0.0) for per_pos in raw_logprobs]
 
-        psrl_logger.info(
-            "[PSRL-DEBUG] request_id=%s: SMG /generate response: "
-            "num_output_tokens=%d, has_logprobs=%s, "
-            "first_logprob=%s, finish_reason=%s",
-            request_input.request_id,
-            len(token_ids),
-            log_probs is not None,
-            log_probs[0] if log_probs else None,
-            first.get("meta_info", {}).get("finish_reason"),
-        )
-
         # finish_reason: SMG returns {"type": "stop"} or {"type": "length", "length": N}
         finish_reason_raw = first.get("meta_info", {}).get("finish_reason", {})
         if isinstance(finish_reason_raw, dict):
@@ -421,9 +397,6 @@ class AgentLoopBase(ABC):
         # routing replay is not supported via SMG /generate (no routed_experts field)
         routed_experts = None
 
-        # psrl_logger.info(f"Before return TokenOutput...")
-
-        psrl_logger.info(f"{request_input.request_id=} generated output with {len(token_ids)} tokens")  # noqa: E501
         return TokenOutput(
             prompt_ids=request_input.input_ids,
             response_ids=token_ids,
@@ -457,8 +430,6 @@ class AgentLoopBase(ABC):
         OpenAI chat-completion response does not carry raw output_ids.  Logprobs
         are extracted from ``choices[0].logprobs.content`` when available.
         """
-        images: list = mm_data["images"]
-        
         if request_input.raw_prompt is not None:
             messages = await self._normalize_messages(request_input.raw_prompt)
         else:
@@ -507,11 +478,6 @@ class AgentLoopBase(ABC):
             req_headers["x-manual-target-worker"] = "true"
 
         chat_url = f"{self.gateway_addr.rstrip('/')}/v1/chat/completions"
-        psrl_logger.info(
-            "[PSRL-DEBUG] request_id=%s: SMG /v1/chat/completions (multimodal, %d images)",
-            request_input.request_id,
-            len(images),
-        )
 
         chat_resp, base_worker_id, target_dp_rank = await self._post_chat(
             chat_url, chat_payload, req_headers
@@ -547,15 +513,6 @@ class AgentLoopBase(ABC):
                 content_lps = logprobs_field.get("content")
                 if content_lps:
                     log_probs = [entry["logprob"] for entry in content_lps]
-
-        psrl_logger.info(
-            "[PSRL-DEBUG] request_id=%s: chat/completions response: "
-            "num_output_tokens=%d, has_logprobs=%s, finish_reason=%s",
-            request_input.request_id,
-            len(token_ids),
-            log_probs is not None,
-            finish_reason,
-        )
 
         return TokenOutput(
             prompt_ids=request_input.input_ids,

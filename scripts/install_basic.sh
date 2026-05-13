@@ -56,7 +56,7 @@ fi
 
 echo "Building SMG from source..."
 pushd $THIRD_PARTY_PATH
-git clone https://github.com/Somoku/smg.git -b psrl_dev
+git clone https://github.com/Somoku/smg.git -b psrl-dev
 cd smg
 # Build release binary with PSRL policies
 cargo build --release

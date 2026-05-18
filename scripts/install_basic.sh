@@ -30,7 +30,7 @@ python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[stand
 
 echo "4. Install FlashAttention and FlashInfer"
 # Install flash-attn-2.8.1
-FLASH_ATTN_CUDA_ARCHS=128 \
+FLASH_ATTN_CUDA_ARCHS=90 \
 FLASH_ATTENTION_FORCE_BUILD="TRUE" \
 FLASH_ATTENTION_FORCE_CXX11_ABI="FALSE" \
 FLASH_ATTENTION_SKIP_CUDA_BUILD="FALSE" \
@@ -38,6 +38,8 @@ python -m uv pip install --no-cache-dir --no-build-isolation "flash-attn==2.8.1"
 
 # Install flashinfer-python
 python -m uv pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.5.3"
+
+python -m uv pip install flash-linear-attention==0.4.2
 
 echo "5. Install apex"
 mkdir -p apex_src
@@ -59,6 +61,9 @@ python use_existing_torch.py
 python -m uv pip install -r requirements/build.txt
 python -m uv pip install --no-build-isolation -e .
 popd
+
+# Reinstall transformers because vllm v0.18.1 uses transformers==4.57.3
+python -m uv pip install "transformers[hf_xet]==5.5.0"
 
 if [ -z "$VERL_PATH" ]; then
     pushd $THIRD_PARTY_PATH

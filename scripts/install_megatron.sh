@@ -58,6 +58,6 @@ echo "3. Install Megatron"
 python -m pip install megatron.core==0.16.0
 
 echo "4. Install mbridge"
-python -m pip install --no-cache-dir git+https://github.com/ISEEKYAN/mbridge
+python -m pip install --no-cache-dir git+https://github.com/ISEEKYAN/mbridge@90c4633a6cdcfe5d29723d7b145d32f6f5e73303
 
 echo "Successfully installed all packages for Megatron"

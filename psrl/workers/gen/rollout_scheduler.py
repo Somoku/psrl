@@ -102,4 +102,4 @@ class RolloutScheduler(Scheduler):
 
     def schedule(self) -> SchedulerOutput:
         self.need_to_abort_reqs: list[str] = list()
-        super().schedule()
+        return super().schedule()

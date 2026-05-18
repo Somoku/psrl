@@ -156,6 +156,8 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     \
     psrl.partial_rollout.enable=True \
     \
+    psrl.colocate_validate_and_train=False \
+    \
     reward_model.launch_reward_fn_async=True \
     \
     algorithm.use_kl_in_reward=False \

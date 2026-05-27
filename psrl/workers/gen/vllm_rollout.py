@@ -4,15 +4,15 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Sequence
-from pprint import pprint
-from typing import Any, cast
-
+import ray
 import numpy as np
 import torch
 import vllm
 import vllm.entrypoints.cli.serve
-from omegaconf import DictConfig, ListConfig
+from collections.abc import Sequence
+from pprint import pprint
+from typing import Any, cast
+from omegaconf import DictConfig, ListConfig, OmegaConf
 from ray.util.queue import Queue as RayQueue
 from tensordict import TensorDict
 from verl import DataProto
@@ -248,8 +248,39 @@ class PSRL_vLLMRollout:
         )
 
         # --- LMCache KV cache offloading integration ---
-        lmcache_cfg = LMCacheConfig(**psrl_config.get("lmcache", {}))
+        # Convert to plain dict to avoid OmegaConf struct-mode restrictions.
+        lmcache_raw = OmegaConf.to_container(
+            psrl_config.get("lmcache", OmegaConf.create()), resolve=True
+        ) or {}
+        # Inject controller_host and per-instance ID before env var generation.
+        if lmcache_raw.get("enable_p2p", False):
+            lmcache_raw.setdefault("controller_host", str(psrl_config.get("ps_manager_ip", "127.0.0.1")))
+            lmcache_raw["lmcache_instance_id"] = f"psrl_instance_{kwargs.get('instance_id', 0)}"
+        lmcache_cfg = LMCacheConfig(**lmcache_raw)
+        # Set runtime-only fields (not in YAML) — determined by deployment topology.
+        if lmcache_cfg.enable_p2p:
+            lmcache_cfg.num_kv_workers = config.get("tensor_model_parallel_size", 1)
+            from psrl.utils.common.http_utils import get_host_info
+            _, worker_ip = get_host_info()
+            lmcache_cfg.worker_host = worker_ip
+            # Allocate ports via the per-node PortScanner Ray actor (serialized,
+            # guarantees no two callers on the same node get the same port).
+            from psrl.utils.nixl.port_scanner import get_port_scanner
+            port_scanner = get_port_scanner(worker_ip)
+            num_ports_needed = lmcache_cfg.num_kv_workers * 3  # worker + p2p_init + p2p_lookup
+            ports = ray.get([
+                port_scanner.find_free_port.remote()
+                for _ in range(num_ports_needed)
+            ])
+            n = lmcache_cfg.num_kv_workers
+            lmcache_cfg.allocated_worker_ports = ports[0:n]
+            lmcache_cfg.allocated_p2p_init_ports = ports[n:2*n]
+            lmcache_cfg.allocated_p2p_lookup_ports = ports[2*n:3*n]
         self.kv_cache_manager = KVCacheManager(lmcache_cfg)
+        # Set per-instance ID BEFORE apply_env_vars so LMCACHE_LMCACHE_INSTANCE_ID
+        # is correct when the engine initializes and registers with the Controller.
+        instance_id = kwargs.get("instance_id", 0)
+        self.kv_cache_manager.set_instance_id(instance_id)
         # Set env vars BEFORE AsyncEngineArgs creation so that LMCache reads them.
         self.kv_cache_manager.apply_env_vars()
         # Merge LMCache engine kwargs (kv_offloading_backend, kv_offloading_size).
@@ -312,6 +343,13 @@ class PSRL_vLLMRollout:
             self.stat_collector.begin_record()
             self.stat_collector.init_output_queue(status_queue)
             self.stat_collector.init_scheduler_abort_queue(self.scheduler_abort_queue)
+            # Initialize the GPU prefix cache hash snapshot queue (in-process).
+            # StatCollector.record() pushes hash snapshots here; GenWorker's
+            # background task consumes them into KVCacheManager._gpu_cache_hash_set.
+            import queue as _queue
+
+            self.kv_cache_hash_queue: _queue.SimpleQueue = _queue.SimpleQueue()
+            self.stat_collector.init_kv_cache_hash_queue(self.kv_cache_hash_queue)
             self.stat_collector.record_model_version_update(0)
             stat_loggers = [self.stat_collector]
         psrl_logger.info(f"Initialize AsyncLLM for rollout instance {kwargs.get('instance_id', 0)}")

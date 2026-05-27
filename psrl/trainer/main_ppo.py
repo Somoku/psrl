@@ -409,7 +409,7 @@ class TaskRunner:
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
         # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
-        # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
+        # during initialization of nixl modules.
         from verl.utils.dataset.rl_dataset import collate_fn
 
         from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer

@@ -128,6 +128,18 @@ class RolloutRouter:
         self.currently_paused_instance_ids = set()
         # Track requests in sticky session: {request_id: bool}
         self.sticky_session_requests = {}
+        # Per-source-instance semaphore for KV transfer concurrency limiting.
+        # Prevents overloading a single instance's LMCacheWorker with too many
+        # concurrent transfer commands. Value of 8 allows reasonable parallelism.
+        self._kv_transfer_semaphores: dict[int, asyncio.Semaphore] = {}
+        # KV transfer statistics counters.
+        self._kv_transfer_stats = {
+            "succeeded": 0,
+            "no_cached_data": 0,       # snapshot shows 0 cached tokens
+            "transfer_returned_0": 0,  # engine.move() returned 0 (source evicted)
+            "transfer_exception": 0,   # ZMQ/network exception during transfer
+            "cache_info_error": 0,     # cache info query timed out or failed
+        }
 
         # Build logger
         self.log_prefix = "RolloutRouter"
@@ -144,8 +156,9 @@ class RolloutRouter:
 
         Only runs when `self.config.psrl.routing_strategy.method` is
         `"kv_cache_aware"`.  Each candidate is queried concurrently via
-        `execute_rank_zero_async("kv_get_cache_info", tokens)`.  Instances that
-        time out or raise are assigned score 0 (graceful degradation).
+        `execute_rank_zero_async("kv_get_cache_info", tokens)`.  The underlying
+        `KVCacheManager.get_cache_info` uses a push-based hash snapshot for GPU
+        cache (no EngineCore blocking) and Worker-side RPC for LMCache backend.
 
         Mutates `route_kwargs` in-place by adding the key `"kv_hit_scores"`.
         """
@@ -353,25 +366,33 @@ class RolloutRouter:
             if i in available_instance_ids and version >= needed_model_version
         ]
         psrl_logger.debug(
-            f"Routing candidates of request {request_id} is {candidates}, where "
-            f"available instance: {available_instance_ids}, "
+            f"Routing candidates of request {request_id} are {candidates}, where "
+            f"available instances: {available_instance_ids}, "
             f"instance_to_version: {self.instance_to_version_after_sync}"
         )
 
-        # 2. If forbidden global migration and the request is a partial rollout request,
-        # only consider the specific instance for routing
+        # 2. If global migration is disabled and the request is a partial rollout request,
+        # only consider its original instance for routing
         if "rollout_instance_id" in request.non_tensor_batch and not self.config.psrl.sync_and_mig_strategy.mig.enable:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             assert old_instance_id in candidates, f"Old rollout instance {old_instance_id} is not in the candidates"
             candidates = [old_instance_id]
+            psrl_logger.debug(
+                f"Routing candidates of request {request_id} are restricted to {candidates} "
+                f"because cross-instance migration is disabled"
+            )
 
         # 2.5. If request is in sticky session, keep the existing instance
         if self.sticky_session_requests.get(request_id, False) and "rollout_instance_id" in request.non_tensor_batch:
             old_instance_id = request.non_tensor_batch["rollout_instance_id"][0]
             assert old_instance_id in candidates, f"Sticky session instance {old_instance_id} is not in the candidates"
             candidates = [old_instance_id]
+            psrl_logger.debug(
+                f"Routing candidates of request {request_id} are restricted to {candidates} "
+                f"because the request is in a sticky session"
+            )
 
-        # 3. If forbidden group sampling on multiple instances, only consider the
+        # 3. If group sampling across multiple instances is disabled, only consider the
         # instance that other requests in the same group are already routed to
         enable_multi_instance_group = self.config.psrl.routing_strategy.enable_group_sampling_on_multi_instances
         if not enable_multi_instance_group:
@@ -394,6 +415,10 @@ class RolloutRouter:
                     f"needed model version: {needed_model_version}"
                 )
                 candidates = [group_instance]
+                psrl_logger.debug(
+                    f"Routing candidates of request {request_id} are restricted to {candidates} "
+                    f"because group sampling must stay on a single instance"
+                )
 
         # 4. Filter the rollout instances that can reserve the request for the current instance model version
         # This is only used when the needed model version is -1 (i.e. new request)
@@ -414,6 +439,10 @@ class RolloutRouter:
                     all_candidate_model_versions.index(version_snapshot_for_filter[candidate])
                 ]
             ]
+            psrl_logger.debug(
+                f"Routing candidates of request {request_id} are restricted to {candidates} "
+                f"after filtering by instance reservation capacity"
+            )
 
         # 5. Provide the indicator list to sort candidates for the route strategy
         candidate_indicator_list = []
@@ -458,6 +487,12 @@ class RolloutRouter:
         await self._inject_kv_hit_scores(request_id, candidates, route_kwargs)
 
         # 7. Strategy-based routing.
+        if "rollout_instance_id" in request.non_tensor_batch:
+            psrl_logger.debug(
+                f"[KVTransfer-debug] Pre-route: uid={request_id}, "
+                f"rollout_instance_id={request.non_tensor_batch['rollout_instance_id'][0]}, "
+                f"candidates={candidates}, strategy={self.config.psrl.routing_strategy.method}."
+            )
         chosen_rollout_instance = self.route_strategy.route(request, candidates=candidates, route_kwargs=route_kwargs)
 
         # 8. If not None, the request is routed to the chosen rollout instance.
@@ -772,9 +807,10 @@ class RolloutRouter:
                         #    updated after one request is added/completed.
                         self.requests_to_route.put(request)
                         break
+                    prev_instance_id = self.request_to_last_routed_instance.get(request_id)
                     self.incomplete_request_to_instance[request_id] = new_instance_id
                     self.request_to_last_routed_instance[request_id] = new_instance_id
-                    task_coro = self._route_single_request(request, new_instance_id)
+                    task_coro = self._route_single_request(request, new_instance_id, prev_instance_id)
                     task = asyncio.create_task(task_coro)
                     # To avoid silent error in async tasks
                     task.add_done_callback(lambda f: f.result())
@@ -1020,9 +1056,9 @@ class RolloutRouter:
             ntb.pop(key, None)
             request.non_tensor_batch.pop(key, None)
 
-    async def _maybe_migrate_kv(self, request: DataProto, new_instance_id: int) -> None:
+    async def _maybe_transfer_kv(self, request: DataProto, old_instance_id: int | None, new_instance_id: int) -> None:
         """
-        Attempt to migrate accumulated KV cache from the previous instance to the new one.
+        Attempt to transfer accumulated KV cache from the previous instance to the new one.
 
         When a request is re-routed to a different instance (typically due to partial
         rollout interruption or load-balancing migration), this method transfers the
@@ -1031,124 +1067,117 @@ class RolloutRouter:
         instance's LMCache then automatically loads the CPU-cached KV into GPU when
         the request is next scheduled, skipping re-prefill.
 
-        Flow:
-            1. Guard: return early if kv_migration is disabled, same instance, or no
-               previous instance recorded (fresh request + partial_rollout_only=True).
-            2. Query old instance for cached token count; skip if nothing cached.
-            3. Pin CPU cache on old instance to prevent LRU eviction during transfer.
-            4. Fire the Controller /move (A_CPU --NIXL/UCX--> B_CPU).
-            5. Unpin old instance CPU cache immediately after transfer, in a
-               `finally` block so the pin is always released on success or failure.
-
-        In "async" transfer_mode the transfer runs in the background while the
-        request is dispatched immediately; pair with `lmcache.enable_async_loading`
-        to overlap CPU-to-GPU retrieval with prefill computation on instance B.
-
         Args:
             request (DataProto): The request being routed (single-element batch).
+            old_instance_id (int | None): The instance the request was previously on,
+                or None if this is a fresh request.
             new_instance_id (int): The instance the request will be dispatched to.
         """
-        kv_migration_cfg = self.config.psrl.routing_strategy.get("kv_migration")
-        if kv_migration_cfg is None or not kv_migration_cfg.get("enable", False):
+        kv_transfer_cfg = self.config.psrl.routing_strategy.get("kv_transfer", None)
+        if kv_transfer_cfg is None or not kv_transfer_cfg.get("enable", False):
+            if not hasattr(self, "_kv_transfer_disabled_logged"):
+                psrl_logger.warning(
+                    f"[KVTransfer] Config check failed: kv_transfer_cfg={kv_transfer_cfg!r}."
+                )
+                self._kv_transfer_disabled_logged = True
             return
 
         request_id = request.non_tensor_batch["uid"][0]
 
-        # Determine the old instance: prefer the rollout_instance_id already written
-        # into the request (set on first routing and updated on each re-route), then
-        # fall back to request_to_last_routed_instance (persists across turns).
-        if "rollout_instance_id" in request.non_tensor_batch:
-            old_instance_id = int(request.non_tensor_batch["rollout_instance_id"][0])
-        else:
-            old_instance_id = self.request_to_last_routed_instance.get(request_id)
-
-        partial_rollout_only: bool = kv_migration_cfg.get("partial_rollout_only", True)
         if old_instance_id is None:
-            # No previous instance recorded yet (fresh request).
-            if partial_rollout_only:
-                return
-            # When partial_rollout_only=False, there is nothing to migrate for fresh
-            # requests anyway (no KV has been produced yet), so always return.
             return
-
         if old_instance_id == new_instance_id:
-            return  # Same instance: no migration needed.
-
+            return  # Same instance: no transfer needed.
         tokens = self.request_to_tokens.get(request_id)
         if not tokens:
             return
 
-        # --- Step 1: Check whether old instance has anything cached. ---
+        # --- Step 1: Check whether old instance has anything cached in LMCache CPU backend. ---
         try:
             cache_info_raw = await asyncio.wait_for(
                 self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
                     "kv_get_cache_info", tokens
                 ),
-                timeout=5.0,
+                timeout=1.0,
             )
         except Exception as e:
-            psrl_logger.warning(
-                f"[KVMigration] Cache info query failed for uid={request_id!r} "
-                f"on instance {old_instance_id!r}: {e!r}. Skipping migration."
-            )
+            self._kv_transfer_stats["cache_info_error"] += 1
             return
 
         if cache_info_raw is None or cache_info_raw.get("lmcache_cached_tokens", 0) == 0:
-            psrl_logger.debug(
-                f"[KVMigration] No LMCache CPU data for uid={request_id!r} "
-                f"on instance {old_instance_id!r}. Skipping migration."
-            )
-            return
-
-        # --- Step 2: Pin src CPU to prevent LRU eviction during transfer. ---
-        try:
-            await asyncio.wait_for(
-                self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
-                    "kv_pin", tokens, ["backend"]
-                ),
-                timeout=5.0,
-            )
-        except Exception as e:
-            psrl_logger.warning(
-                f"[KVMigration] CPU pin failed for uid={request_id!r} "
-                f"on instance {old_instance_id!r}: {e!r}. Skipping migration."
-            )
+            self._kv_transfer_stats["no_cached_data"] += 1
             return
 
         src_id = f"psrl_instance_{old_instance_id}"
         dst_id = f"psrl_instance_{new_instance_id}"
-        transfer_mode: str = kv_migration_cfg.get("transfer_mode", "async")
-        timeout_s: float = kv_migration_cfg.get("transfer_timeout_ms", 5000) / 1000
+        transfer_mode: str = kv_transfer_cfg.get("transfer_mode", "async")
+        timeout_s: float = kv_transfer_cfg.get("transfer_timeout_ms", 5000) / 1000
 
-        # --- Step 3: Transfer (pin → transfer → unpin in finally). ---
-        async def _transfer_and_unpin() -> None:
+        _VALID_TRANSFER_MODES = {"async", "sync", "pin_sync"}
+        if transfer_mode not in _VALID_TRANSFER_MODES:
+            psrl_logger.error(
+                f"[KVTransfer] Invalid transfer_mode={transfer_mode!r}. "
+                f"Valid: {sorted(_VALID_TRANSFER_MODES)}. Falling back to 'async'."
+            )
+            transfer_mode = "async"
+
+        # --- Step 3: Transfer. ---
+        # Use direct ZMQ path (bypasses Controller) with per-source semaphore.
+        _sem = self._kv_transfer_semaphores.setdefault(
+            old_instance_id, asyncio.Semaphore(8)
+        )
+
+        async def _do_transfer() -> None:
+            async with _sem:
+                try:
+                    success = await self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                        "kv_transfer_direct",
+                        tokens,
+                        (src_id, "LocalCPUBackend"),
+                        (dst_id, "LocalCPUBackend"),
+                        True,  # copy=True → keep source data, let LRU evict naturally
+                    )
+                    if success:
+                        self._kv_transfer_stats["succeeded"] += 1
+                        s = self._kv_transfer_stats
+                        psrl_logger.info(
+                            f"[KVTransfer] Transfer succeeded for uid={request_id!r}: "
+                            f"instance {old_instance_id!r} -> {new_instance_id!r}. "
+                            f"[stats: ok={s['succeeded']}, no_data={s['no_cached_data']}, "
+                            f"src_miss={s['transfer_returned_0']}, "
+                            f"exc={s['transfer_exception']}, "
+                            f"info_err={s['cache_info_error']}]"
+                        )
+                    else:
+                        self._kv_transfer_stats["transfer_returned_0"] += 1
+                except Exception:
+                    self._kv_transfer_stats["transfer_exception"] += 1
+
+        if transfer_mode == "pin_sync":
+            # Pin-sync mode: pin → transfer → unpin. Strongest guarantee —
+            # pin prevents LRU eviction while we await the transfer.
             try:
-                success = await self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
-                    "kv_transfer",
-                    tokens,
-                    (src_id, "LocalCPUBackend"),
-                    (dst_id, "LocalCPUBackend"),
-                    False,  # copy=False → move semantics
+                await asyncio.wait_for(
+                    self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                        "kv_pin", tokens, ["backend"]
+                    ),
+                    timeout=5.0,
                 )
-                if success:
-                    psrl_logger.debug(
-                        f"[KVMigration] Transfer succeeded for uid={request_id!r}: "
-                        f"instance {old_instance_id!r} -> {new_instance_id!r}."
-                    )
-                else:
-                    psrl_logger.warning(
-                        f"[KVMigration] Transfer returned False for uid={request_id!r}. "
-                        f"Instance {new_instance_id!r} will re-prefill."
-                    )
             except Exception as e:
                 psrl_logger.warning(
-                    f"[KVMigration] Transfer failed for uid={request_id!r}: {e!r}. "
-                    f"Instance {new_instance_id!r} will re-prefill."
+                    f"[KVTransfer] CPU pin failed for uid={request_id!r} "
+                    f"on instance {old_instance_id!r}: {e!r}. Skipping transfer."
+                )
+                return
+            try:
+                await asyncio.wait_for(_do_transfer(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                psrl_logger.warning(
+                    f"[KVTransfer] Pin-sync transfer timed out after {timeout_s}s "
+                    f"for uid={request_id!r}. Dispatch proceeds; instance {new_instance_id!r} "
+                    "will re-prefill."
                 )
             finally:
-                # Unpin immediately after transfer completes (or fails).
-                # /move success: B already has the data in its own CPU backend, A no longer needs the pin.
-                # /move failure: No migration occurred; release the pin so A's LRU can run freely.
                 try:
                     await asyncio.wait_for(
                         self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
@@ -1158,35 +1187,42 @@ class RolloutRouter:
                     )
                 except Exception as e:
                     psrl_logger.warning(
-                        f"[KVMigration] Post-transfer unpin failed for uid={request_id!r}: {e!r}."
+                        f"[KVTransfer] Post-transfer unpin failed for uid={request_id!r}: {e!r}."
                     )
 
-        if transfer_mode == "sync":
+        elif transfer_mode == "sync":
+            # Sync mode (no pin): await transfer completion, allow failure.
+            # No pinning overhead, no CPU backend memory pressure risk.
+            # If LRU evicts during transfer, dst simply re-prefills.
             try:
-                await asyncio.wait_for(_transfer_and_unpin(), timeout=timeout_s)
+                await asyncio.wait_for(_do_transfer(), timeout=timeout_s)
             except asyncio.TimeoutError:
                 psrl_logger.warning(
-                    f"[KVMigration] Sync transfer timed out after {timeout_s}s "
+                    f"[KVTransfer] Sync transfer timed out after {timeout_s}s "
                     f"for uid={request_id!r}. Dispatch proceeds; instance {new_instance_id!r} "
                     "will re-prefill."
                 )
+
         else:
-            # async: fire-and-forget — dispatch immediately, transfer runs in background.
-            task = asyncio.create_task(_transfer_and_unpin())
-            # Surface any unhandled exception to the log rather than silencing it.
+            # Async mode (default): fire-and-forget transfer, NO pin/unpin.
+            # Lowest routing latency. If LRU evicts before transfer completes,
+            # dst simply re-prefills.
+            task = asyncio.create_task(_do_transfer())
             task.add_done_callback(lambda f: f.result() if not f.cancelled() else None)
 
-    async def _route_single_request(self, request: DataProto, new_instance_id: int):
+    async def _route_single_request(self, request: DataProto, new_instance_id: int, prev_instance_id: int | None = None):
         """Route a single request to a rollout instance.
 
         Args:
             request (DataProto): The request to process.
             new_instance_id (int): The new rollout instance id that the request
                 will be routed to.
+            prev_instance_id (int | None): The instance the request was previously
+                routed to (before this routing decision). Used for KV migration.
         """
         request_id = request.non_tensor_batch["uid"][0]
         try:
-            await self._route_single_request_impl(request, new_instance_id)
+            await self._route_single_request_impl(request, new_instance_id, prev_instance_id)
         except BaseException as exc:
             # Last-resort safety net: if anything inside the routing path raises
             # an unhandled exception, the awaiting `result_future` would otherwise
@@ -1207,11 +1243,16 @@ class RolloutRouter:
                 # Re-raise CancelledError / KeyboardInterrupt / SystemExit etc.
                 raise
 
-    async def _route_single_request_impl(self, request: DataProto, new_instance_id: int):
+    async def _route_single_request_impl(self, request: DataProto, new_instance_id: int, prev_instance_id: int | None = None):
         """Implementation body of `_route_single_request`; see that method for docs."""
         request_id = request.non_tensor_batch["uid"][0]
         is_validate = request.meta_info.get("validate", False)
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        # Use prev_instance_id passed from the routing loop (captured before overwriting maps).
+        # Also check rollout_instance_id in request as fallback (set during partial rollout requeue).
+        old_instance_id = prev_instance_id
+        if old_instance_id is None and "rollout_instance_id" in request.non_tensor_batch:
+            old_instance_id = int(request.non_tensor_batch["rollout_instance_id"][0])
         request.non_tensor_batch["rollout_instance_id"] = np.array([new_instance_id], dtype=int)
         assert "version_tag" in request.non_tensor_batch, "Request must have 'version_tag' for routing"
         needed_model_version = request.non_tensor_batch["version_tag"][0]
@@ -1264,7 +1305,7 @@ class RolloutRouter:
 
             # Attempt KV cache migration from the previous instance to this one,
             # so the new instance can skip re-prefill for the accumulated prefix.
-            await self._maybe_migrate_kv(request, new_instance_id)
+            await self._maybe_transfer_kv(request, old_instance_id, new_instance_id)
 
             # Generate response
             # psrl_logger.info(f"Generating response for request {request_id} on instance {new_instance_id}")

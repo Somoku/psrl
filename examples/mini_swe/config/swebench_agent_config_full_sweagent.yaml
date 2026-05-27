@@ -13,12 +13,12 @@
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
   sandbox_config:
     max_parallel_tasks_per_worker: 0
-    rollout_turn_timeout: 2400
-    query_timeout: 3600
+    rollout_turn_timeout: 1800
+    query_timeout: 2400
     environment:
       image: "swebench-sentinel-override-per-instance"
       cwd: "/testbed"
-      container_timeout: "2h"
+      container_timeout: "45m"
       grader_memory: "30g"
   agent:
     # System template: verbatim copy from swesmith_infer.yaml (the SFT training config).

@@ -109,7 +109,7 @@ diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
 index 45f002e01..0df2835d7 100644
 --- a/vllm/v1/metrics/stats.py
 +++ b/vllm/v1/metrics/stats.py
-@@ -170,6 +170,10 @@ class KVCacheEvictionEvent:
+@@ -170,6 +170,12 @@ class KVCacheEvictionEvent:
  @dataclass
  class SchedulerStats:
      """Stats associated with the scheduler."""
@@ -117,9 +117,12 @@ index 45f002e01..0df2835d7 100644
 +    need_to_abort_reqs: list[str] = field(default_factory=list)
 +    req_id_to_prompt_token_num: dict[str, int] | None = None
 +    req_id_to_response_token_num: dict[str, int] | None = None
- 
++    # NOTE(lhy): GPU prefix cache hash snapshot for push-based KV cache info.
++    # Populated by RolloutScheduler.make_stats(), consumed by StatCollector.record().
++    gpu_prefix_cache_snapshot: dict | None = None
+
      num_running_reqs: int = 0
      num_waiting_reqs: int = 0
--- 
+--
 2.43.0
 

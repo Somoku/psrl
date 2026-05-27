@@ -42,10 +42,10 @@ python plot.py /jizhicfs/lhy/verl/lhy_exp/ablation_new \
 --processor instance_request_num_indexed_by_time
 '''
 
-python plot.py /jizhicfs/lhy/psrl_agent/examples/dapo_trainer/logs/DAPO-Llama3-70B-megatron-staleness_2 \
+python plot.py /jizhicfs/lhy/psrl_agent/examples/mini_swe/megatron_psrl_log/GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_1 \
 --substring StatCollector \
 --xlabel "time(s)" \
 --ylabel "instance request num" \
---out ablation_ours.png \
+--out new_ablation_ours.png \
 --mode subplot \
 --processor instance_request_num_indexed_by_time

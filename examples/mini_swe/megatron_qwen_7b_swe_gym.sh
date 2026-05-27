@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 staleness=${1:-1}
-project_name=psrl_swe_gym
+project_name=psrl_swe_gym_test
 experiment_name=GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -131,8 +131,8 @@ n_resp_per_prompt_val=8
 train_prompt_mini_bsz=32
 
 # --- Sampling ---
-temperature=1.0
-top_p=1.0
+temperature=1.4
+top_p=0.95
 top_k=-1
 val_top_p=0.7
 
@@ -155,7 +155,18 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness=${staleness} \
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.ps_mode=nixl_cpu \
-    psrl.lmcache.enable=False \
+    psrl.lmcache.enable=True \
+    psrl.lmcache.enable_p2p=True \
+    psrl.lmcache.p2p_transfer_channel=nixl \
+    psrl.lmcache.save_decode_cache=True \
+    psrl.lmcache.enable_async_loading=True \
+    psrl.routing_strategy.kv_transfer.enable=True \
+    psrl.routing_strategy.kv_transfer.transfer_mode=async \
+    psrl.sync_and_mig_strategy.mig.enable=True \
+    psrl.sync_and_mig_strategy.mig.indicator=request_num \
+    psrl.sync_and_mig_strategy.mig.threshold=1000 \
+    psrl.sync_and_mig_strategy.mig.stop_indicator=request_num \
+    psrl.sync_and_mig_strategy.mig.stop_threshold=1000 \
     psrl.logging_path=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -267,7 +278,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
     trainer.default_local_dir="${default_local_dir}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.log_val_generations=5 \
     trainer.test_freq=5 \
     trainer.save_freq=50 \

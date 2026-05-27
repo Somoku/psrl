@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 
 from omegaconf import DictConfig
 from verl import DataProto
@@ -13,7 +13,7 @@ from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
-from psrl.workers.agent_loop.sticky_session import sticky_session
+from psrl.workers.agent_loop.sticky_session import maybe_sticky_session
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -51,11 +51,6 @@ def _set_multi_turn_aggregates(
             multi_turn_metrics[f"multi_turn/{name}_all_turns"] = 0
             multi_turn_metrics[f"multi_turn/max_{name}_all_turns"] = 0
             multi_turn_metrics[f"multi_turn/min_{name}_all_turns"] = 0
-
-
-@asynccontextmanager
-async def _null_async_context():
-    yield
 
 
 def _format_observation(observation: object) -> str:
@@ -198,13 +193,11 @@ class MultiTurnAgentLoop(AgentLoopBase):
 
             # TODO: check unnecessary fields in output data_proto and
             # check redundant padding in single-request case
-            use_sticky_session = self.config.psrl.agentic_rl.sticky_session
-            session_ctx = (
-                sticky_session(self.rollout_router, request)
-                if use_sticky_session
-                else _null_async_context()
-            )
-            async with session_ctx:
+            async with maybe_sticky_session(
+                self.rollout_router,
+                request.non_tensor_batch["uid"][0],
+                self.config.psrl.agentic_rl.sticky_session,
+            ):
                 with _append_timer(generate_times):
                     gen_request = self.agent_data.prepare_generation_request(request)
                     if profiling_collector is not None:

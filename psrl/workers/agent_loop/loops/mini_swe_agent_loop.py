@@ -48,7 +48,7 @@ from psrl.workers.agent_loop.agent_data.mini_swe_agent_data import MiniSWEAgentD
 from psrl.workers.agent_loop.gateway_client import RolloutGatewayClient  # noqa: E402
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase  # noqa: E402
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register  # noqa: E402
-from psrl.workers.agent_loop.sticky_session import StickySession  # noqa: E402
+from psrl.workers.agent_loop.sticky_session import maybe_sticky_session  # noqa: E402
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -508,10 +508,18 @@ class MiniSWEAgentLoop(AgentLoopBase):
             if not use_preexisting and observation.get("repo_path"):
                 run_args.extend(["--volume", f"{observation['repo_path']}:/testbed"])
 
+            # Forward proxy env vars so pip/apt inside agent containers can
+            # reach external package indexes through the corporate proxy.
+            _PROXY_ENV_KEYS = [
+                "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                "no_proxy", "NO_PROXY",
+            ]
+
             docker_env_kwargs = {
                 "image": env_cfg.image,
                 "cwd": effective_cwd,
                 "env": env_cfg.env if isinstance(env_cfg.env, dict) else {},
+                "forward_env": _PROXY_ENV_KEYS,
                 "run_args": run_args,
                 "container_timeout": env_cfg.container_timeout,
             }
@@ -646,6 +654,24 @@ class MiniSWEAgentLoop(AgentLoopBase):
                         psrl_logger.error(
                             f"{log_prefix} Grading raised an unexpected error: {grading_exc}."
                         )
+                        # FIX: Set a failure result instead of leaving it empty
+                        f2p = swe_problem.get("FAIL_TO_PASS", [])
+                        p2p = swe_problem.get("PASS_TO_PASS", [])
+                        agent_data.set_grader_result({
+                            "policy_violated": False,
+                            "policy_reasons": [],
+                            "resolved": False,
+                            "apply_ok": False,
+                            "f2p_pass": 0,
+                            "f2p_total": len(f2p),
+                            "p2p_pass": 0,
+                            "p2p_total": len(p2p),
+                            "timeout": False,
+                            "error": str(grading_exc),
+                            "elapsed_s": grading_s,
+                            "output_tail": "",
+                            "resolved_by": "grader_exception",
+                        })
                 else:
                     psrl_logger.warning(
                         f"{log_prefix} swe_grader={grader_kind_str!r} but swe_problem_image or "
@@ -930,7 +956,11 @@ class MiniSWEAgentLoop(AgentLoopBase):
             gen_request = agent_data.prepare_generation_request(request)
             request_id = request.non_tensor_batch["uid"][0]
             try:
-                async with StickySession(self.rollout_router, request_id):
+                async with maybe_sticky_session(
+                    self.rollout_router,
+                    request_id,
+                    self.config.psrl.agentic_rl.sticky_session,
+                ):
                     if profiling_collector is not None:
                         profiling_collector.on_turn_submit()
                     if self.config.psrl.server_rollout.enable:

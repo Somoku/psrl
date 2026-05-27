@@ -705,6 +705,13 @@ def grade_fresh_container(
     if _actor_id:
         run_args += ["--label", f"psrl.actor_id={_actor_id}"]
 
+    # Forward corporate proxy environment variables to the grading container
+    # so that pip/apt inside the eval script can reach external package indexes.
+    _PROXY_ENV_KEYS = [
+        "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+        "no_proxy", "NO_PROXY",
+    ]
+
     docker_env: DockerEnvironment | None = None
     apply_ok = False
     eval_output = ""
@@ -720,6 +727,7 @@ def grade_fresh_container(
             image=image_name,
             cwd="/testbed",
             run_args=run_args,
+            forward_env=_PROXY_ENV_KEYS,
             container_timeout=_DEFAULT_CONTAINER_TIMEOUT,
         )
         psrl_logger.info(

@@ -25,7 +25,9 @@ logging_path: ~/psrl_logs
 # Agentic RL feature toggles.
 agentic_rl:
 
-  # Whether to enable sticky session in multi-turn agent loop.
+  # Whether to enable sticky session in agent loops.
+  # When True, all generation calls within a single trajectory are pinned to
+  # the same rollout instance (improves prefix-cache hit rate).
   sticky_session: False
 
   # Per-trajectory text output: writes <dir>/v{version}/{id}.txt for every trajectory.
@@ -214,32 +216,28 @@ routing_strategy:
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
   method: request_num_balance
 
-  # KV cache migration: when re-routing a request to a different rollout instance,
+  # KV cache transfer: when re-routing a request to a different rollout instance,
   # transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)
   # so instance B can skip re-prefill. Requires lmcache.enable and lmcache.enable_p2p.
-  kv_migration:
+  kv_transfer:
 
-    # Master switch for KV cache migration.
+    # Master switch for KV cache transfer.
     enable: False
 
     # Transfer timing mode.
-    # "sync"  -- await Controller /move completion before dispatching to B.
-    #            Guarantees a CPU cache hit on B; adds routing latency equal to
-    #            the transfer time.  Set transfer_timeout_ms accordingly.
-    # "async" -- fire-and-forget: dispatch to B immediately while transfer runs
-    #            in background.  Lower latency; pair with lmcache.enable_async_loading
-    #            so B can overlap retrieval with prefill computation.
+    # "async"    -- (default) fire-and-forget: dispatch to B immediately while
+    #              transfer runs in background.  Lowest routing latency.
+    # "sync"     -- await transfer completion, NO pin.  If LRU evicts during
+    #              transfer, it fails gracefully and B re-prefills.  Moderate
+    #              latency, no CPU backend memory pressure from pinning.
+    # "pin_sync" -- pin → await transfer → unpin.  Strongest guarantee: prevents
+    #              LRU eviction during transfer.  Highest latency; risks CPU
+    #              backend pressure under high concurrency.
     transfer_mode: async
 
-    # Timeout in milliseconds for a single Controller /move call (sync mode only).
-    # On timeout the migration is abandoned and B falls back to re-prefill.
+    # Timeout in milliseconds for "sync" and "pin_sync" modes.
+    # On timeout the transfer is abandoned and B falls back to re-prefill.
     transfer_timeout_ms: 5000
-
-    # When True, only trigger migration for partial-rollout re-routes, i.e.,
-    # requests that have a previous rollout_instance_id (were already being
-    # generated somewhere).  Setting to False migrates on every cross-instance
-    # routing decision, which is expensive and rarely beneficial for fresh requests.
-    partial_rollout_only: True
 
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500
@@ -379,6 +377,17 @@ nixl:
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
 
+# Checkpoint strategy config
+checkpoint:
+
+  # Use DCP (verl's default dist_checkpointing) for save/load.
+  # When False (default), uses PSRL's UCX-safe per-rank torch.save to avoid
+  # NIXL background thread (enable_prog_thread) corruption during save.
+  # When True: DCP is used with NCCL no-fork patch (applied automatically);
+  # NIXL prog_thread is automatically disabled (enable_prog_thread=False)
+  # to prevent UCX heap corruption from DCP's all_gather_object metadata gather.
+  use_dcp_save: True
+
 # Broadcast initialization: rank-0 PS worker reads checkpoint, distributes to others via NIXL.
 broadcast_init:
 
@@ -483,8 +492,9 @@ lmcache:
   # --- Cache behaviour ---
 
   # Also cache KV from decode steps (increases memory, helps multi-turn reuse).
-  save_decode_cache: False
+  save_decode_cache: True
 
+  # NOTE(lhy): Buggy, do not use. 
   # Persist a chunk even when not fully filled (helps short prompts < chunk_size).
   save_unfull_chunk: False
 
@@ -492,10 +502,10 @@ lmcache:
   cache_policy: LRU
 
   # Overlap KV cache retrieval with prefill computation to reduce TTFT.
-  enable_async_loading: False
+  enable_async_loading: True
 
   # --- P2P cross-instance KV transfer ---
-  # Required when routing_strategy.kv_migration.enable is True.
+  # Required when routing_strategy.kv_transfer.enable is True.
 
   # Enable P2P cross-instance KV transfer via LMCache Controller.
   # A shared Controller process is started by RolloutCoordinator and its URL is
@@ -510,7 +520,22 @@ lmcache:
   # "tcp"  -- fallback when NIXL/UCX is unavailable.
   p2p_transfer_channel: nixl
 
-  # Base port for the shared LMCache Controller subprocess.
+  # Base port for the shared LMCache Controller's HTTP API (FastAPI/uvicorn).
+  # PSRL calls this port for /move, /lookup etc. REST endpoints.
   # RolloutCoordinator picks the actual port starting from this value
   # using find_available_port().
   controller_base_port: 9000
+
+  # Host where the LMCache Controller runs. Defaults to psrl.ps_manager_ip.
+  # Both PSRL (HTTP) and LMCache workers (ZMQ) connect to this host.
+  controller_host: ${psrl.ps_manager_ip}
+
+  # ZMQ PULL port: Controller listens here for LMCache worker registrations
+  # and heartbeats. Each vLLM instance's LMCache worker connects to this port
+  # on startup to register itself with the Controller.
+  controller_pull_port: 8300
+
+  # ZMQ REPLY port: Controller sends task instructions (move, clear, etc.)
+  # to LMCache workers through this port. Workers connect here to receive
+  # commands dispatched by the Controller after a /move HTTP request.
+  controller_reply_port: 8400

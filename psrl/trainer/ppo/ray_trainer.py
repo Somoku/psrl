@@ -55,7 +55,6 @@ from psrl.utils.logger import (
     log_dual_events,
 )
 from psrl.utils.nixl import (
-    GLOBAL_PORT_SCANNER,
     NIXLInterface,
 )
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
@@ -187,6 +186,19 @@ class PSRL_RayPPOTrainer:
         self.log_prefix = "MainRayTrainer"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
         psrl_logger.info("Initialized major ray trainer (single controller).")
+
+        # Cache IP-to-Ray-node-ID mapping for scheduling actors to specific nodes.
+        self.ip_to_node_id: dict[str, str] = {
+            node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()
+        }
+
+        # Create per-node PortScanner actors for NIXL/LMCache port allocation.
+        # Each scanner is pinned to its node via NodeAffinitySchedulingStrategy,
+        # so port checks always reflect the correct node's state.
+        # Non-detached: auto-cleaned by Ray if the driver exits (Ctrl+C / crash).
+        from psrl.utils.nixl.port_scanner import create_port_scanners
+
+        self.port_scanner_handles = create_port_scanners(self.ip_to_node_id)
 
         self._initialize_queue_buffers()
 
@@ -447,6 +459,36 @@ class PSRL_RayPPOTrainer:
                 and self.config.train_actor_rollout_ref.actor.fsdp_config.optimizer_offload
             ), "Optimizer offload must be enabled when TMS is not enabled for training workers"
 
+        # Check LMCache and KV transfer configuration
+        lmcache_cfg = self.config.psrl.get("lmcache", {})
+        kv_transfer_cfg = self.config.psrl.routing_strategy.get("kv_transfer", {})
+
+        if kv_transfer_cfg.get("enable", False):
+            assert lmcache_cfg.get("enable", False), (
+                "psrl.lmcache.enable must be True when psrl.routing_strategy.kv_transfer.enable is True."
+            )
+            assert lmcache_cfg.get("enable_p2p", False), (
+                "psrl.lmcache.enable_p2p must be True when psrl.routing_strategy.kv_transfer.enable is True."
+            )
+            assert self.config.psrl.partial_rollout.enable, (
+                "psrl.partial_rollout.enable must be True when psrl.routing_strategy.kv_transfer.enable is True."
+            )
+
+        if lmcache_cfg.get("enable_p2p", False):
+            assert lmcache_cfg.get("enable", False), (
+                "psrl.lmcache.enable must be True when psrl.lmcache.enable_p2p is True."
+            )
+            assert self.config.psrl.ps_mode in ("nixl_cpu", "nixl_gpu"), (
+                "psrl.ps_mode must be nixl_cpu or nixl_gpu when psrl.lmcache.enable_p2p is True "
+                "(NIXL infrastructure is required for P2P transfer)."
+            )
+
+        if lmcache_cfg.get("enable", False):
+            assert self.config.gen_actor_rollout_ref.rollout.enable_prefix_caching, (
+                "gen_actor_rollout_ref.rollout.enable_prefix_caching must be True "
+                "when psrl.lmcache.enable is True (LMCache requires prefix caching)."
+            )
+
         psrl_logger.info("[validate_config] All configuration checks passed successfully!")
 
     def _init_ps_manager(self):
@@ -460,7 +502,7 @@ class PSRL_RayPPOTrainer:
         except Exception as e:
             psrl_logger.warning(f"Could not set val_rollout_n in config. Structure missing? Error: {e}")
 
-        ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
+        ip_to_node_id = self.ip_to_node_id
         assert self.config.psrl.ps_manager_ip in ip_to_node_id, (
             f"PSManager IP {self.config.psrl.ps_manager_ip} not found in ray nodes"
         )
@@ -602,7 +644,7 @@ class PSRL_RayPPOTrainer:
         if not self.config.psrl.server_rollout.enable or self.rollout_gateway is not None:
             return
 
-        ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
+        ip_to_node_id = self.ip_to_node_id
         assert self.rollout_router is not None, "Rollout router must be initialized before starting gateway."
 
         self.rollout_gateway = (
@@ -653,13 +695,19 @@ class PSRL_RayPPOTrainer:
         assert self.rollout_router is not None, (
             "Rollout router must be initialized before initializing rollout coordinator."
         )
-        self.rollout_coordinator = RolloutCoordinator.remote(
-            self.config,
-            self.rollout_router,
-            self.rollout_wg_list,
-            self.validate_wg_list,
-            self.agent_loop_workers,
-            self.status_queues,
+        self.rollout_coordinator = (
+            RolloutCoordinator.options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=self.ip_to_node_id[self.config.psrl.ps_manager_ip], soft=False
+                )
+            ).remote(
+                self.config,
+                self.rollout_router,
+                self.rollout_wg_list,
+                self.validate_wg_list,
+                self.agent_loop_workers,
+                self.status_queues,
+            )
         )
 
     def start_rollout_coordinator(self):
@@ -695,7 +743,7 @@ class PSRL_RayPPOTrainer:
             "Rollout server must be initialized before starting reward computation."
         )
 
-        ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
+        ip_to_node_id = self.ip_to_node_id
         self.reward_manager = (
             ray.remote(RewardManager)
             .options(
@@ -1130,7 +1178,7 @@ class PSRL_RayPPOTrainer:
         )
 
         # create nixl interface
-        nixl_interface = NIXLInterface(port_scanner=GLOBAL_PORT_SCANNER)
+        nixl_interface = NIXLInterface()
 
         # create rollout instances
         for i in range(self.n_rollout_instances):
@@ -1528,6 +1576,10 @@ class PSRL_RayPPOTrainer:
         # push_model (called inside the NIXL resume path) can notify the
         # rollout coordinator of the new model version.
         ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
+        # Start the LMCache Controller BEFORE init_model() so that LMCache workers
+        # inside EngineCore can register immediately when they start.
+        if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
+            ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
         # NOTE(lhy): must use rollout coordinator to init model so it sets _is_init_model_events
         # for rollout indices, which init_nixl_client waits on.
         model_init_futures.append(self.rollout_coordinator.init_model.remote("rollout", "empty"))
@@ -2778,5 +2830,9 @@ class PSRL_RayPPOTrainer:
         self.stop_rollout_coordinator()
         self.stop_data_processor()
         self.stop_rollout_gateway()
+
+        # Kill all PortScanner actors to free resources.
+        for handle in self.port_scanner_handles.values():
+            ray.kill(handle)
 
         psrl_logger.info("Training completed successfully!")

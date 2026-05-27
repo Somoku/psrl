@@ -123,13 +123,16 @@ class TerminateReason(Enum):
         its own retry budget by the time this is checked).
 
         - ``is_error``: yes -- the slot contributed nothing.
+        - ``TRAJECTORY_TIMEOUT``: yes -- with typical retry_limit=1 the
+          worker exhausts its budget immediately without a real retry.
+          The group will remain incomplete forever unless the manager
+          dispatches a replacement.
         - ``is_aborted``: no -- the PS manager already accounted for the slot.
-        - ``is_timeout``: no -- ``ENV_TIMEOUT`` produces a partial trajectory
-          and ``TRAJECTORY_TIMEOUT`` is rare enough to leave to the
-          worker-retry budget. Manager recovery here would risk double counting.
+        - ``ENV_TIMEOUT``: no -- produces a partial trajectory that is still
+          emitted (handled by the normal occupation flow).
         - ``is_successful``: no -- handled by the normal occupation flow.
         """
-        return self.is_error
+        return self.is_error or self is TerminateReason.TRAJECTORY_TIMEOUT
 
 
 class AgentLoopMetrics(BaseModel):

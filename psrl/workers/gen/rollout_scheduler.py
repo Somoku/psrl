@@ -37,14 +37,85 @@ class RolloutScheduler(Scheduler):
         connector_stats_payload = kv_connector_stats.data if kv_connector_stats else None
         req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
         req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
+        # Snapshot the GPU prefix cache hash table for push-based KV cache info.
+        # This is sent to the main process via SchedulerStats IPC, then consumed
+        # by StatCollector.record() and pushed to GenWorker's KVCacheManager.
+        block_pool = self.kv_cache_manager.block_pool
+        gpu_prefix_cache_snapshot = {
+            "hash_set": set(block_pool.cached_block_hash_to_block._cache.keys()),
+            "block_size": block_pool.hash_block_size,
+            "total_blocks": block_pool.num_gpu_blocks,
+        }
+        # Snapshot the LMCache backend chunk hash set for push-based cache info.
+        # For TP=1 (UniProcExecutor), the Worker and EngineCore share the same
+        # process, so get_kv_transfer_group() returns the active LMCache connector.
+        lmcache_backend_snapshot = None
+        try:
+            from vllm.distributed.kv_transfer import has_kv_transfer_group, get_kv_transfer_group
+            if has_kv_transfer_group():
+                connector = get_kv_transfer_group()
+                if hasattr(connector, "_lmcache_engine") and connector._lmcache_engine is not None:
+                    lmcache_engine = connector._lmcache_engine.lmcache_engine
+                    if lmcache_engine is not None:
+                        backend = lmcache_engine.storage_manager.local_cpu_backend
+                        hot_cache = backend.hot_cache
+                        chunk_size = getattr(lmcache_engine.token_database, "chunk_size", 256)
+                        # Snapshot: set of chunk_hash integers from all cached keys.
+                        # Must hold cpu_lock to avoid OrderedDict mutation during iteration.
+                        chunk_hash_set = set()
+                        with backend.cpu_lock:
+                            for key in hot_cache.keys():
+                                chunk_hash_set.add(key.chunk_hash)
+                        # Metadata for local query.
+                        allocator = backend.memory_allocator
+                        total_bytes = int(getattr(allocator, "total_size", 0))
+                        try:
+                            chunk_bytes = backend.get_full_chunk_size_bytes()
+                        except Exception:
+                            chunk_bytes = 0
+                        lmcache_backend_snapshot = {
+                            "chunk_hash_set": chunk_hash_set,
+                            "chunk_size": chunk_size,
+                            "total_bytes": total_bytes,
+                            "chunk_bytes": chunk_bytes,
+                        }
+                        # Include NONE_HASH and hash_algo for GenWorker local computation.
+                        # NOTE: hash_fn (function object) is NOT serializable through
+                        # zmq/msgspec, so we pass the algorithm name and none_hash value.
+                        from lmcache.v1.token_database import NONE_HASH as _LM_NONE_HASH
+                        lmcache_backend_snapshot["none_hash"] = _LM_NONE_HASH
+                        # Pass the hash algorithm name so GenWorker loads the SAME function.
+                        # LMCache uses config.pre_caching_hash_algorithm (default: "builtin"),
+                        # which may differ from vLLM's prefix_caching_hash_algo (default: "sha256").
+                        lmcache_backend_snapshot["hash_algo"] = getattr(
+                            lmcache_engine.token_database, "_hash_algo_name",
+                            getattr(lmcache_engine.token_database.config, "pre_caching_hash_algorithm", "builtin")
+                            if lmcache_engine.token_database.config is not None else "builtin"
+                        )
+                        # Hash consistency probe: GenWorker uses this to verify cross-process
+                        # hash() determinism. If mismatch → PYTHONHASHSEED not set properly.
+                        _hash_fn = lmcache_engine.token_database.hash_func
+                        lmcache_backend_snapshot["hash_probe"] = _hash_fn(
+                            (_LM_NONE_HASH, (0, 1, 2, 3), ())
+                        )
+        except Exception as exc:
+            # Non-fatal: if snapshot fails, router falls back to collective_rpc.
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "LMCache backend snapshot failed: %r", exc, exc_info=True
+            )
         # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
         # 1. `need_to_abort_reqs` field. This is a set of request IDs that need to be aborted.
         # 2. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
         # 3. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
+        # 4. `gpu_prefix_cache_snapshot` field. Push-based GPU prefix cache hash snapshot.
+        # 5. `lmcache_backend_snapshot` field. Push-based LMCache backend chunk hash snapshot.
         return SchedulerStats(
             need_to_abort_reqs=self.need_to_abort_reqs,
             req_id_to_prompt_token_num=req_id_to_prompt_token_num,
             req_id_to_response_token_num=req_id_to_response_token_num,
+            gpu_prefix_cache_snapshot=gpu_prefix_cache_snapshot,
+            lmcache_backend_snapshot=lmcache_backend_snapshot,
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
@@ -63,33 +134,23 @@ class RolloutScheduler(Scheduler):
     # is live and mutable.  They are intentionally NOT routed through `collective_rpc`
     # (which dispatches to Worker processes) because `block_pool` state must only be
     # mutated from a single process.  `KVCacheManager` in the PSRL coordinator calls
-    # these via `engine_core.call_utility_async("psrl_get_gpu_cache_info", tokens)`.
+    # these via `engine_core.call_utility_async("psrl_pin_gpu/psrl_unpin_gpu", tokens)`.
+    #
+    # NOTE(lhy): GPU prefix cache *read* queries (hit counts for routing) no longer
+    # go through call_utility_async — they use the push-based hash snapshot in
+    # KVCacheManager.get_gpu_cache_info_local(). Only pin/unpin (which mutate
+    # block_pool ref_cnt) still require EngineCore RPC.
 
     def _psrl_get_caching_hash_fn(self):
         """
         Return the token-hashing function used by the block pool.
 
-        Prefers `get_caching_hash_fn` from the LMCache integration utils when
-        available; falls back to SHA-256 for environments without the full vLLM
-        LMCache stack (e.g., unit tests).
-
-        Returns:
-            callable: A function that takes token data and returns a hash digest.
+        Reads prefix_caching_hash_algo from self.vllm_config (available on the Scheduler).
         """
-        try:
-            from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_integration.utils import (
-                get_caching_hash_fn,
-            )
-            return get_caching_hash_fn()
-        except ImportError:
-            import hashlib
-            return lambda data: hashlib.sha256(str(data).encode()).digest()
-        except Exception as e:
-            import hashlib
-            psrl_logger.warning(
-                f"[LMCache] Failed to load get_caching_hash_fn, falling back to SHA-256: {e!r}."
-            )
-            return lambda data: hashlib.sha256(str(data).encode()).digest()
+        from vllm.utils.hashing import get_hash_fn_by_name
+
+        hash_algo = self.vllm_config.cache_config.prefix_caching_hash_algo
+        return get_hash_fn_by_name(hash_algo)
 
     def _psrl_iter_gpu_prefix_blocks(self, tokens: list[int]):
         """
@@ -125,36 +186,6 @@ class RolloutScheduler(Scheduler):
             if block is None:
                 return  # prefix break
             yield block
-
-    def psrl_get_gpu_cache_info(self, tokens: list[int]) -> dict:
-        """
-        Return GPU prefix-cache statistics for `tokens`.
-
-        Called via `EngineCore.call_utility_async` from `KVCacheManager`.
-        Only covers the GPU side; the LMCache backend side is queried separately
-        on the Worker via `collective_rpc`.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            dict: Dict with keys `gpu_cached_blocks`, `gpu_cached_tokens`,
-                `gpu_total_blocks`, `gpu_usage_pct`.
-        """
-        assert tokens, "tokens must be a non-empty list."
-        block_pool = self.kv_cache_manager.block_pool
-        gpu_blocks = list(self._psrl_iter_gpu_prefix_blocks(tokens))
-        gpu_cached_blocks = len(gpu_blocks)
-        block_size = block_pool.hash_block_size
-        gpu_cached_tokens = gpu_cached_blocks * block_size
-        gpu_total_blocks = block_pool.num_gpu_blocks
-        gpu_usage_pct = gpu_cached_blocks / gpu_total_blocks if gpu_total_blocks > 0 else 0.0
-        return {
-            "gpu_cached_blocks": gpu_cached_blocks,
-            "gpu_cached_tokens": gpu_cached_tokens,
-            "gpu_total_blocks": gpu_total_blocks,
-            "gpu_usage_pct": gpu_usage_pct,
-        }
 
     def psrl_pin_gpu(self, tokens: list[int]) -> int:
         """

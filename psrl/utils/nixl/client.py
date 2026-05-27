@@ -71,6 +71,7 @@ class NIXLStorageClient:
         binded_agent: nixl_agent | None = None,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
+        enable_prog_thread: bool = True,
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -95,12 +96,12 @@ class NIXLStorageClient:
 
         # Initialize NIXL agent
         if binded_agent is None:
-            self.client_port = (
-                0
-                if self.nixl_interface.port_scanner is None
-                else ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
-            )
-            self.agent = nixl_agent(self.client_name, nixl_agent_config(True, True, self.client_port))
+            from psrl.utils.nixl.port_scanner import get_port_scanner
+
+            worker_ip = get_worker_info()[0]
+            port_scanner = get_port_scanner(worker_ip)
+            self.client_port = ray.get(port_scanner.find_free_port.remote())
+            self.agent = nixl_agent(self.client_name, nixl_agent_config(enable_prog_thread, True, self.client_port))
         else:
             self.agent = binded_agent
 
@@ -1856,11 +1857,11 @@ class NIXLMultiStorageClients:
         self.nixl_interface = nixl_interface if nixl_interface is not None else NIXLInterface()
 
         # Initialize NIXL agent
-        self.client_port = (
-            0
-            if self.nixl_interface.port_scanner is None
-            else ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
-        )
+        from psrl.utils.nixl.port_scanner import get_port_scanner
+
+        worker_ip = get_worker_info()[0]
+        port_scanner = get_port_scanner(worker_ip)
+        self.client_port = ray.get(port_scanner.find_free_port.remote())
         self.agent = nixl_agent(self.agent_name, nixl_agent_config(True, True, self.client_port))
 
         # Initialize multi clients

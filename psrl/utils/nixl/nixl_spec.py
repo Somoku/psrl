@@ -563,8 +563,8 @@ class NIXLClientInfo:
 
 @dataclass
 class NIXLInterface:
-    port_scanner: ray.actor.ActorHandle | None = None
     # CommunicationPlanner instance,
     # but import CommunicationPlanner here
     # will cause circular import
     # comm_planner: Optional[Any] = None
+    pass

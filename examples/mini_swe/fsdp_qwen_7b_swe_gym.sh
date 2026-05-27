@@ -118,7 +118,7 @@ max_response_length=30000
 # --- Training hyperparameters ---
 actor_lr=1e-6
 enable_overlong_buffer=True
-overlong_buffer_len=$((1024 * 10))
+overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
 train_prompt_bsz=64

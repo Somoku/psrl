@@ -131,7 +131,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.optim.lr=1e-6 \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=2 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${packing_length} \
@@ -169,4 +169,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=5 \
     trainer.save_freq=200 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=500 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=3 2>&1 | tee ${experiment_name}.log

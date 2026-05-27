@@ -97,6 +97,20 @@ class StatCollector(StatLoggerBase):
         self.last_dump_to_file_time = None
         self.last_push_to_queue_time = None
 
+        # Cumulative prefill/decode time tracking.
+        self._cumulative_prefill_time: float = 0.0
+        self._cumulative_decode_time: float = 0.0
+        self._cumulative_prefill_tokens: int = 0  # total prompt tokens (including cache hit)
+        self._cumulative_prefill_computed_tokens: int = 0  # actual computed (cache miss)
+        self._cumulative_decode_tokens: int = 0
+        self._last_time_split_log_time: float | None = None
+        self._time_split_logger = logging.getLogger(f"psrl.time_split.I{instance_id}")
+        self._time_split_logger.propagate = False
+        self._time_split_logger.setLevel(logging.INFO)
+        self._time_split_logger.addHandler(
+            FileOnlyHandler(self.psrl_config.logging_path, f"TimeSplit_I{instance_id}")
+        )
+
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             self.log_prefix = f"StatCollector_I{self.instance_id}"
@@ -129,6 +143,20 @@ class StatCollector(StatLoggerBase):
             output_queue: Ray queue for sending status updates to coordinator
         """
         self.output_queue = output_queue
+
+    def init_kv_cache_hash_queue(self, kv_cache_hash_queue) -> None:
+        """
+        Initialize the queue for pushing GPU prefix cache hash snapshots to GenWorker.
+
+        The StatCollector pushes hash snapshots (received via SchedulerStats IPC from
+        the EngineCore process) to this queue. The GenWorker consumes the queue and
+        stores the hash set in its `KVCacheManager`, enabling fast local prefix-cache
+        hit computation without blocking on EngineCore RPC.
+
+        Args:
+            kv_cache_hash_queue: In-process queue for sending hash snapshots to GenWorker.
+        """
+        self.kv_cache_hash_queue = kv_cache_hash_queue
 
     def init_scheduler_abort_queue(self, scheduler_abort_queue):
         """
@@ -236,6 +264,51 @@ class StatCollector(StatLoggerBase):
             )
             snapshot["iteration_stats"] = iteration_stats_entry
 
+            # Accumulate prefill/decode wall time for this step.
+            # `elapsed_time_since_last_record` is the wall time of this step
+            # (time since previous record() call). Skip abnormally large values
+            # (e.g. the very first record after engine init).
+            step_elapsed = snapshot["elapsed_time_since_last_record"]
+            num_pt = iteration_stats_entry["num_prompt_tokens"]
+            num_gt = iteration_stats_entry["num_generation_tokens"]
+            # Actual computed prefill tokens (excluding cache hit).
+            prompt_stats = getattr(iteration_stats, "prompt_token_stats", None)
+            num_pt_computed = getattr(prompt_stats, "computed", 0) if prompt_stats else 0
+
+            # Accumulate token counts unconditionally.
+            self._cumulative_prefill_tokens += num_pt
+            self._cumulative_prefill_computed_tokens += num_pt_computed
+            self._cumulative_decode_tokens += num_gt
+
+            # Accumulate time only for sane step durations.
+            if 0 < step_elapsed < 5.0:
+                if num_pt > 0 and num_gt == 0:
+                    self._cumulative_prefill_time += step_elapsed
+                elif num_pt == 0 and num_gt > 0:
+                    self._cumulative_decode_time += step_elapsed
+                elif num_pt > 0 and num_gt > 0:
+                    # Mixed step: attribute proportionally by token count.
+                    total_tokens = num_pt + num_gt
+                    self._cumulative_prefill_time += step_elapsed * (num_pt / total_tokens)
+                    self._cumulative_decode_time += step_elapsed * (num_gt / total_tokens)
+
+            # Log cumulative prefill/decode time every 60s.
+            if self._last_time_split_log_time is None:
+                self._last_time_split_log_time = curr_time
+            if curr_time - self._last_time_split_log_time >= 60.0:
+                total_tracked = self._cumulative_prefill_time + self._cumulative_decode_time
+                self._time_split_logger.info(
+                    f"[I{self.instance_id}] "
+                    f"cumulative_prefill_s={self._cumulative_prefill_time:.2f}, "
+                    f"cumulative_decode_s={self._cumulative_decode_time:.2f}, "
+                    f"prefill_frac={self._cumulative_prefill_time / max(total_tracked, 1e-9):.4f}, "
+                    f"prefill_tokens={self._cumulative_prefill_tokens}, "
+                    f"prefill_computed_tokens={self._cumulative_prefill_computed_tokens}, "
+                    f"decode_tokens={self._cumulative_decode_tokens}, "
+                    f"wall_time_s={curr_time - self.start_time:.1f}"
+                )
+                self._last_time_split_log_time = curr_time
+
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             if (
                 curr_time - self.last_dump_to_file_time
@@ -276,6 +349,20 @@ class StatCollector(StatLoggerBase):
                     snapshot=snapshot,
                 )
             )
+            # Push GPU prefix cache hash snapshot to GenWorker's KVCacheManager.
+            # The snapshot is produced by RolloutScheduler.make_stats() in the EngineCore
+            # process and arrives here via SchedulerStats IPC.
+            if hasattr(self, "kv_cache_hash_queue"):
+                assert scheduler_stats.gpu_prefix_cache_snapshot is not None, (
+                    "gpu_prefix_cache_snapshot is None in SchedulerStats. "
+                    "RolloutScheduler.make_stats() should always populate this field."
+                )
+                snapshot_payload = scheduler_stats.gpu_prefix_cache_snapshot
+                # Piggyback LMCache backend snapshot onto the same queue payload.
+                if scheduler_stats.lmcache_backend_snapshot is not None:
+                    snapshot_payload = dict(snapshot_payload)  # shallow copy to avoid mutation
+                    snapshot_payload["lmcache"] = scheduler_stats.lmcache_backend_snapshot
+                self.kv_cache_hash_queue.put_nowait(snapshot_payload)
             self.last_push_to_queue_time = curr_time
 
         # Put abort requests to the abort queue if any

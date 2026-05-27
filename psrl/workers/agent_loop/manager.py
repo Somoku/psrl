@@ -637,100 +637,101 @@ class PSRL_AgentLoopManager:
         TerminateReason values where needs_manager_retry() is True (ROLLOUT_ERROR
         / UNKNOWN) reach this method in the first place.
         """
-        rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+        async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
 
-        # --- dedup guard ---
-        if parent_id in self._failed_group_ids:
-            psrl_logger.warning(
-                "notify_group_failed: group parent_id=%s already being handled "
-                "(is_validate=%s, failed_uid=%s), skipping duplicate.",
-                parent_id, is_validate, failed_uid,
-            )
-            return
-        self._failed_group_ids.add(parent_id)
-
-        psrl_logger.warning(
-            "notify_group_failed: group parent_id=%s failed "
-            "(is_validate=%s, failed_uid=%s, rollout_n=%d). "
-            "Aborting siblings and recovering.",
-            parent_id, is_validate, failed_uid, rollout_n,
-        )
-
-        # --- abort all sibling requests on the PS ---
-        all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
-        sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]
-        if sibling_uids:
-            psrl_logger.info(
-                "notify_group_failed: aborting %d sibling uids=%s for parent_id=%s.",
-                len(sibling_uids), sibling_uids, parent_id,
-            )
-            try:
-                await self.ps_manager_handle.abort_requests.remote(sibling_uids, blocking=False)
-            except Exception as e:
-                # If the PS call fails (e.g. prompt was never registered in
-                # the staleness inventory because all workers crashed before
-                # completing), log and continue — cleanup and retry must still run.
+            # --- dedup guard ---
+            if parent_id in self._failed_group_ids:
                 psrl_logger.warning(
-                    "notify_group_failed: abort_requests failed for sibling uids=%s "
-                    "(parent_id=%s): %s. Proceeding with local cleanup and retry.",
-                    sibling_uids, parent_id, e,
-                )
-                raise e
-
-        # --- clean up any partially accumulated tracker state for this group ---
-        self._purge_tracker_group(parent_id, rollout_n)
-
-        # --- val: shrink target by the full group size then check for ready buffers ---
-        if is_validate:
-            if self.val_buffer_size is None or self.val_buffer_size <= 0:
-                psrl_logger.warning(
-                    "notify_group_failed (val): val_buffer_size=%s, cannot decrement "
-                    "(parent_id=%s).",
-                    self.val_buffer_size, parent_id,
+                    "notify_group_failed: group parent_id=%s already being handled "
+                    "(is_validate=%s, failed_uid=%s), skipping duplicate.",
+                    parent_id, is_validate, failed_uid,
                 )
                 return
-            # val_buffer_size counts GROUPS (prompts), not individual responses —
-            # it is set to val_data_size which is computed before repeat(val_rollout_n).
-            # accumulated_buffer_size is also incremented by 1 per group.
-            # Therefore one failed group = 1 decrement, regardless of val_rollout_n.
-            decrement = 1
-            self.val_buffer_size -= decrement
+            self._failed_group_ids.add(parent_id)
+
             psrl_logger.warning(
-                "notify_group_failed (val): val_buffer_size decremented by %d to %d "
-                "(group parent_id=%s lost to ERROR/UNKNOWN).",
-                decrement, self.val_buffer_size, parent_id,
+                "notify_group_failed: group parent_id=%s failed "
+                "(is_validate=%s, failed_uid=%s, rollout_n=%d). "
+                "Aborting siblings and recovering.",
+                parent_id, is_validate, failed_uid, rollout_n,
             )
 
-            # Check whether any in-progress val buffer now satisfies the new target.
-            for buffer_id, accumulated_size in list(self.val_accumulated_buffer_size.items()):
-                if accumulated_size == self.val_buffer_size and buffer_id not in self.val_data_buffers:
-                    psrl_logger.info(
-                        "notify_group_failed (val): buffer_id=%d now meets "
-                        "adjusted val_buffer_size=%d, assembling and firing.",
-                        buffer_id, self.val_buffer_size,
+            # --- abort all sibling requests on the PS ---
+            all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
+            sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]
+            if sibling_uids:
+                psrl_logger.info(
+                    "notify_group_failed: aborting %d sibling uids=%s for parent_id=%s.",
+                    len(sibling_uids), sibling_uids, parent_id,
+                )
+                try:
+                    await self.ps_manager_handle.abort_requests.remote(sibling_uids, blocking=False)
+                except Exception as e:
+                    # If the PS call fails (e.g. prompt was never registered in
+                    # the staleness inventory because all workers crashed before
+                    # completing), log and continue — cleanup and retry must still run.
+                    psrl_logger.warning(
+                        "notify_group_failed: abort_requests failed for sibling uids=%s "
+                        "(parent_id=%s): %s. Proceeding with local cleanup and retry.",
+                        sibling_uids, parent_id, e,
                     )
-                    await self._flush_ready_buffer(buffer_id, is_validate=True)
-        else:
-            # --- train: dispatch a fresh group to fill the vacated slot ---
-            if self.stop_train_dispatch_task:
+                    raise e
+
+            # --- clean up any partially accumulated tracker state for this group ---
+            self._purge_tracker_group(parent_id, rollout_n)
+
+            # --- val: shrink target by the full group size then check for ready buffers ---
+            if is_validate:
+                if self.val_buffer_size is None or self.val_buffer_size <= 0:
+                    psrl_logger.warning(
+                        "notify_group_failed (val): val_buffer_size=%s, cannot decrement "
+                        "(parent_id=%s).",
+                        self.val_buffer_size, parent_id,
+                    )
+                    return
+                # val_buffer_size counts GROUPS (prompts), not individual responses —
+                # it is set to val_data_size which is computed before repeat(val_rollout_n).
+                # accumulated_buffer_size is also incremented by 1 per group.
+                # Therefore one failed group = 1 decrement, regardless of val_rollout_n.
+                decrement = 1
+                self.val_buffer_size -= decrement
                 psrl_logger.warning(
-                    "notify_group_failed (train): dispatch task stopped, "
-                    "skipping replacement for parent_id=%s.",
+                    "notify_group_failed (val): val_buffer_size decremented by %d to %d "
+                    "(group parent_id=%s lost to ERROR/UNKNOWN).",
+                    decrement, self.val_buffer_size, parent_id,
+                )
+
+                # Check whether any in-progress val buffer now satisfies the new target.
+                for buffer_id, accumulated_size in list(self.val_accumulated_buffer_size.items()):
+                    if accumulated_size == self.val_buffer_size and buffer_id not in self.val_data_buffers:
+                        psrl_logger.info(
+                            "notify_group_failed (val): buffer_id=%d now meets "
+                            "adjusted val_buffer_size=%d, assembling and firing.",
+                            buffer_id, self.val_buffer_size,
+                        )
+                        await self._flush_ready_buffer(buffer_id, is_validate=True)
+            else:
+                # --- train: dispatch a fresh group to fill the vacated slot ---
+                if self.stop_train_dispatch_task:
+                    psrl_logger.warning(
+                        "notify_group_failed (train): dispatch task stopped, "
+                        "skipping replacement for parent_id=%s.",
+                        parent_id,
+                    )
+                    return
+                if self.train_data_queue.empty():
+                    psrl_logger.warning(
+                        "notify_group_failed (train): train_data_queue is empty, "
+                        "no replacement available for parent_id=%s.",
+                        parent_id,
+                    )
+                    return
+                psrl_logger.info(
+                    "notify_group_failed (train): dispatching replacement group for parent_id=%s.",
                     parent_id,
                 )
-                return
-            if self.train_data_queue.empty():
-                psrl_logger.warning(
-                    "notify_group_failed (train): train_data_queue is empty, "
-                    "no replacement available for parent_id=%s.",
-                    parent_id,
-                )
-                return
-            psrl_logger.info(
-                "notify_group_failed (train): dispatching replacement group for parent_id=%s.",
-                parent_id,
-            )
-            await self._retry_data()
+                await self._retry_data()
 
     def _get_expected_ps_version(self):
         """
@@ -1539,7 +1540,8 @@ class PSRL_AgentLoopManager:
 
     async def wait_for_validation_batch(self, buffer_id: int) -> DataProto:
         """Await a validate batch for a specific buffer ID."""
-        await self.ps_manager_handle.ensure_validate_buffer_exists.remote()
+        async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+            await self.ps_manager_handle.ensure_validate_buffer_exists.remote()
 
         if buffer_id in self.val_data_buffers:
             # If the buffer is ready, return immediately

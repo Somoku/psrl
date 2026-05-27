@@ -27,7 +27,7 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.model import get_generation_config, update_model_config
 
 from psrl.utils.common.http_utils import find_available_port
-from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
+from psrl.utils.kv_cache import KVCacheManager
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -250,10 +250,10 @@ class PSRL_GenWorker(Worker):
         # belongs in third_party/LMCache/lmcache/observability.py (ignore
         # engine_id/role in the equality check), but touching third-party code
         # is avoided to keep diffs minimal.
-        _lmcache_raw = OmegaConf.to_container(
-            self.psrl_config.get("lmcache", OmegaConf.create()), resolve=True
-        )
-        self.kv_cache_manager = KVCacheManager(LMCacheConfig(**(_lmcache_raw or {})))
+        # NOTE(lhy): KVCacheManager is created inside PSRL_vLLMRollout (which
+        # handles apply_env_vars + get_engine_kwargs before engine init).
+        # GenWorker accesses it via self.kv_cache_manager after _build_rollout().
+        self.kv_cache_manager = None
 
         # Build logger
         # Only the representative rank will build the logger
@@ -516,7 +516,70 @@ class PSRL_GenWorker(Worker):
         assert tokens, "tokens must be a non-empty list."
         assert len(src) == 2, f"src must be a 2-tuple, got length {len(src)}."
         assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
-        return await self.kv_cache_manager.transfer(tokens, src, dst, copy)
+        result = await self.kv_cache_manager.transfer(tokens, src, dst, copy)
+        if not result:
+            err = getattr(self.kv_cache_manager, '_last_transfer_error', 'unknown')
+            psrl_logger.warning(
+                f"[KVTransfer] transfer() returned False: src={src}, dst={dst}, "
+                f"tokens_len={len(tokens)}, enable_p2p={self.kv_cache_manager._config.enable_p2p}, "
+                f"controller_url={getattr(self.kv_cache_manager, '_controller_url', 'NOT_SET')}, "
+                f"error={err}"
+            )
+        return result
+
+    async def kv_transfer_direct(
+        self,
+        tokens: list[int],
+        src: tuple[str, str],
+        dst: tuple[str, str],
+        copy: bool = False,
+    ) -> bool:
+        """
+        Transfer KV cache directly via ZMQ to local LMCacheWorker, bypassing Controller.
+
+        This is the scalable alternative to `kv_transfer()`. Instead of routing
+        through the centralized Controller HTTP endpoint, it sends MoveWorkerMsg
+        directly to the local LMCacheWorker's ZMQ socket.
+
+        Under burst scenarios with many concurrent transfers across different
+        instances, this eliminates the Controller as a single-point bottleneck.
+        Falls back to Controller path on failure.
+
+        Args:
+            tokens (list[int]): Full token sequence for the trajectory.
+            src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)`.
+            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)`.
+            copy (bool): If True, keep data at source as well.
+
+        Returns:
+            bool: True if the transfer succeeded.
+        """
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. "
+            "Call init_model() before calling kv_transfer_direct."
+        )
+        assert tokens, "tokens must be a non-empty list."
+        assert len(src) == 2, f"src must be a 2-tuple, got length {len(src)}."
+        assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
+        return await self.kv_cache_manager.transfer_direct(tokens, src, dst, copy)
+
+    def kv_set_peer_registry(
+        self, registry: dict[str, str], worker_zmq_url: str | None = None
+    ) -> None:
+        """
+        Set the peer registry for direct KV transfer bypass.
+
+        Called by `RolloutCoordinator._broadcast_peer_registry()` after P2P init.
+        Enables `kv_transfer_direct()` to bypass the centralized Controller.
+
+        Args:
+            registry (dict[str, str]): Maps lmcache_instance_id → peer_init_url.
+            worker_zmq_url (str | None): ZMQ URL of local LMCacheWorker REP socket.
+        """
+        assert self.kv_cache_manager is not None, (
+            "KVCacheManager not initialized. Call init_model() first."
+        )
+        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_url)
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
         """
@@ -526,6 +589,9 @@ class PSRL_GenWorker(Worker):
         Controller subprocess has started.  Forwards the URL to `KVCacheManager`
         so that subsequent `kv_transfer` calls can reach it.
 
+        Also initializes the process-local HTTP client (httpx) so that
+        `KVCacheManager.transfer()` can call `post()` to the Controller.
+
         Args:
             controller_url (str): Base URL of the shared Controller, e.g.
                 `"http://10.0.0.1:9042"`.
@@ -533,7 +599,88 @@ class PSRL_GenWorker(Worker):
         assert self.kv_cache_manager is not None, (
             "KVCacheManager is not initialized. Call init_model() before set_lmcache_controller_url()."
         )
+        from psrl.utils.common.http_utils import init_http_client
+
+        # Initialize HTTP client in this GenWorker process if not already done.
+        # server_concurrency=4 and rollout_engine_num=1 are sufficient for
+        # Controller /move requests (low concurrency, one controller per job).
+        init_http_client(server_concurrency=4, rollout_engine_num=1)
         self.kv_cache_manager.set_controller_url(controller_url)
+
+    async def _consume_kv_cache_hash_queue(self, kv_cache_hash_queue) -> None:
+        """
+        Background task: consume GPU prefix cache hash snapshots from the EngineCore.
+
+        Runs in the GenWorker event loop. The `StatCollector` (in the same process)
+        pushes a hash snapshot to the `kv_cache_hash_queue` every ~100ms. We drain
+        the queue and store the latest snapshot in `KVCacheManager`, overwriting any
+        previous snapshot. This allows `kv_get_gpu_cache_info_local` to compute
+        prefix-cache hits instantly without blocking on EngineCore.
+
+        Args:
+            kv_cache_hash_queue (queue.SimpleQueue): In-process queue from the
+                `PSRL_vLLMRollout` instance.
+        """
+        import queue as _queue
+
+        _lmcache_log_count = 0
+        _lmcache_hash_verified = False
+        while True:
+            try:
+                # Drain the queue and keep only the latest snapshot.
+                latest_snapshot = None
+                while True:
+                    try:
+                        latest_snapshot = kv_cache_hash_queue.get_nowait()
+                    except _queue.Empty:
+                        break
+                if latest_snapshot is not None:
+                    self.kv_cache_manager.update_gpu_cache_snapshot(latest_snapshot)
+                    # LMCache backend snapshot piggybacked on same payload.
+                    lmcache_snapshot = latest_snapshot.get("lmcache")
+                    if lmcache_snapshot is not None:
+                        self.kv_cache_manager.update_lmcache_backend_snapshot(lmcache_snapshot)
+                        _lmcache_log_count += 1
+                        # One-time hash consistency verification.
+                        if not _lmcache_hash_verified and "hash_probe" in lmcache_snapshot:
+                            _lmcache_hash_verified = True
+                            expected = lmcache_snapshot["hash_probe"]
+                            none_hash = lmcache_snapshot.get("none_hash", 0)
+                            local_fn = self.kv_cache_manager._get_lmcache_hash_fn()
+                            local_probe = local_fn((none_hash, (0, 1, 2, 3), ()))
+                            if local_probe != expected:
+                                psrl_logger.error(
+                                    "[KVCacheConsumer] HASH MISMATCH! "
+                                    f"EngineCore hash_probe={expected}, "
+                                    f"GenWorker hash_probe={local_probe}. "
+                                    "Python hash() is non-deterministic across processes. "
+                                    "Set PYTHONHASHSEED=0 in env BEFORE launching Ray/Python. "
+                                    "LMCache local cache-info will ALWAYS return 0 until fixed."
+                                )
+                            else:
+                                psrl_logger.info(
+                                    "[KVCacheConsumer] Hash consistency verified OK "
+                                    f"(algo={lmcache_snapshot.get('hash_algo', 'N/A')})."
+                                )
+                        if _lmcache_log_count <= 3 or _lmcache_log_count % 100 == 0:
+                            psrl_logger.info(
+                                f"[KVCacheConsumer] LMCache snapshot received "
+                                f"(#{_lmcache_log_count}): "
+                                f"chunk_hash_set size={len(lmcache_snapshot.get('chunk_hash_set', []))}, "
+                                f"hash_algo={lmcache_snapshot.get('hash_algo', 'N/A')}"
+                            )
+                    elif _lmcache_log_count == 0:
+                        # Log once if lmcache key is missing from payload.
+                        _lmcache_log_count = -1
+                        psrl_logger.warning(
+                            "[KVCacheConsumer] Snapshot received but no 'lmcache' key. "
+                            f"Keys: {list(latest_snapshot.keys())}"
+                        )
+                # Yield control to avoid busy-spinning.
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                psrl_logger.warning(f"Error consuming kv_cache_hash_queue: {e!r}.")
+                await asyncio.sleep(0.5)
 
     def get_node_id(self) -> str:
         """
@@ -691,10 +838,18 @@ class PSRL_GenWorker(Worker):
         # Don't keep the dummy data in memory
         await rollout.inference_engine.reset_mm_cache()
 
+        # Use the KVCacheManager created inside PSRL_vLLMRollout (which already
+        # applied env vars and engine kwargs before engine init).
+        self.kv_cache_manager = rollout.kv_cache_manager
         self.kv_cache_manager.attach_engine(rollout.inference_engine)
         psrl_logger.info("[KVCacheManager]: Engine attached after rollout initialization.")
         # Set per-instance ID so LMCache P2P uses psrl_instance_{id} as the identifier.
         self.kv_cache_manager.set_instance_id(self.get_instance_id())
+        # Start background consumer for GPU prefix cache hash snapshots.
+        if hasattr(rollout, "kv_cache_hash_queue"):
+            self._kv_cache_hash_consumer_task = asyncio.ensure_future(
+                self._consume_kv_cache_hash_queue(rollout.kv_cache_hash_queue)
+            )
 
         return rollout
 

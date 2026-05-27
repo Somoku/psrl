@@ -15,7 +15,6 @@ from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
     NIXL_META_SERVER_NAME,
-    GLOBAL_PORT_SCANNER,
     NIXLClientType,
     NIXLInterface,
     NIXLMetaServer,
@@ -603,11 +602,15 @@ def test_nixl_e2e(cfg: DictConfig):
         }
     )
 
-    nixl_interface = NIXLInterface(port_scanner=GLOBAL_PORT_SCANNER)
+    nixl_interface = NIXLInterface()
     global_store = GlobalStore.remote()
 
     start_time = time.time()
     ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
+
+    # Create per-node PortScanner actors (required by NIXLStorageClient).
+    from psrl.utils.nixl.port_scanner import create_port_scanners
+    create_port_scanners(ip_to_node_id)
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = MetaServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)

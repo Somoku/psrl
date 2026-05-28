@@ -11,7 +11,7 @@ from psrl.utils.common.http_utils import (
     HttpResponse,
     create_aiohttp_client,
     filter_http_headers,
-    raw_request,
+    request_raw,
 )
 from psrl.workers.gen_dplb.smg_adapter import TITO_SESSIONS_PATH
 
@@ -155,7 +155,7 @@ class SessionRouter:
     ) -> HttpResponse:
         url = f"{self.smg_url}/{path.lstrip('/')}"
         try:
-            return await raw_request(
+            return await request_raw(
                 method,
                 url,
                 content=content,

@@ -4,26 +4,26 @@ import os
 import traceback
 from collections import deque
 
-import torch
 import hydra
 import ray
+import torch
 import transfer_queue as tq
 from omegaconf import DictConfig, OmegaConf
-from transfer_queue import KVBatchMeta
+from tensordict import TensorDict
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils import tensordict_utils as tu
-from verl.utils.model import compute_position_id_with_mask
-from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import get_dataset_class
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.workers.config.model import HFModelConfig
 
-from psrl.utils.common.http_utils import init_http_client
+from psrl.utils.common.http_io_thread import init_http_io_thread
+from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
-from psrl.utils.transferqueue_utils import kv_batch_meta_update_tags
-from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
+from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)
@@ -40,6 +40,8 @@ class PSRL_AgentLoopWorker:
         ps_manager_handle: ray.actor.ActorHandle,
         rollout_router: ray.actor.ActorHandle | str,
         session_router_url: str,
+        worker_id: int = 0,
+        worker_num: int = 1,
     ):
         """Initialize agent loop worker.
 
@@ -48,13 +50,15 @@ class PSRL_AgentLoopWorker:
             ps_manager_handle (ray.actor.ActorHandle): Handle to the parameter server manager.
             rollout_router (ray.actor.ActorHandle | str): Handle to the rollout router actor.
             session_router_url (str): URL of the session router.
+            worker_id (int): Unique identifier for this worker instance.
+            worker_num (int): Total number of worker instances.
         """
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
 
         # TransferQueue bootstrap (connects to controller/storage spun up by the driver).
-        tq.init()
+        tq.init(self.config.transfer_queue)
 
         self.distillation_config = config.get("distillation", None)
         self.distillation_enabled = is_distillation_enabled(self.distillation_config)
@@ -76,15 +80,26 @@ class PSRL_AgentLoopWorker:
         n_validate_instances = (
             self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
+        server_max_concurrency = self.config.psrl.rollout_gateway.server_max_concurrency
 
         init_http_client(
-            server_concurrency=self.config.psrl.rollout_gateway.max_concurrency,
+            server_concurrency=server_max_concurrency,
             rollout_engine_num=n_rollout_instances + n_validate_instances,
+            producer_count=worker_num,
+            producer_index=worker_id,
+        )
+
+        # Dedicated HTTP I/O thread (event loop isolation).
+        init_http_io_thread(
+            server_concurrency=server_max_concurrency,
+            rollout_engine_num=n_rollout_instances + n_validate_instances,
+            producer_count=worker_num,
+            producer_index=worker_id,
         )
 
         self.agent_programs = set()
+        self.put_tasks = set()
         self.pending_program_queue = deque()
-
         self.running_loop = None
         self.busy_loop_task = None
         self.stop_busy_loop_task = False
@@ -111,8 +126,7 @@ class PSRL_AgentLoopWorker:
         )
 
         # Build logger
-        # TODO(lhy): support >1 workers
-        self.log_prefix = "AgentLoopWorker"
+        self.log_prefix = f"AgentLoopWorker_I{worker_id}"
         handler = DualOutputHandler(self.config.psrl.logging_path, self.log_prefix)
         logging.getLogger("psrl").addHandler(handler)
         psrl_logger.addHandler(handler)
@@ -133,20 +147,35 @@ class PSRL_AgentLoopWorker:
         """
         self.reward_manager = reward_manager
 
-    def add_agent_program(self, batch: KVBatchMeta | None):
+    def set_distributed_post_actors(
+        self,
+        actors: list[ray.actor.ActorHandle] | None,
+        enabled: bool,
+        producer_index: int = 0,
+    ):
+        """Install distributed HTTP POST actors for this worker process."""
+        configure_distributed_post(
+            actors,
+            enabled=enabled,
+            start_index=producer_index,
+        )
+
+    def add_agent_program(self, batch: TensorDict | None):
         """Add a new agent program to the pending queue for processing.
 
         Args:
-            batch (KVBatchMeta or None): Data to process, or None to signal termination.
+            batch (TensorDict or None): Data to process, or None to signal termination.
         """
         if batch is None:
             self.pending_program_queue.append(None)
-        elif isinstance(batch, KVBatchMeta):
-            self.pending_program_queue.append(batch)
-        else:
-            raise TypeError(
-                f"Unsupported data type: {type(batch)}. Expected KVBatchMeta or None."
-            )
+            return
+        
+        n = len(batch)
+        if n == 0:
+            return
+        requests = batch.chunk(n)
+        for request in requests:
+            self.pending_program_queue.append(request)
 
     def start_busy_loop(self):
         """Start the busy loop to continuously process agent programs from the queue."""
@@ -173,7 +202,6 @@ class PSRL_AgentLoopWorker:
         while not self.stop_busy_loop_task:
             if len(self.pending_program_queue) > 0:
                 program = self.pending_program_queue.popleft()
-                # psrl_logger.info(f"Processing program: {program.non_tensor_batch['uid'].tolist()[0]}")
                 if program is None:
                     self.stop_busy_loop_task = True
                     continue
@@ -197,29 +225,19 @@ class PSRL_AgentLoopWorker:
 
         return task_done_callback
 
-    async def generate_trajectory(self, batch: KVBatchMeta):
+    async def generate_trajectory(self, batch: TensorDict):
         """Generate trajectories using the specified agent type based on configuration.
 
         This method only create the task (agent_loop) and add the task to the agent_programs set.
         But the task is not await here so different agent_loop can be run in parallel.
 
         Args:
-            batch (KVBatchMeta): Input batch metadata containing prompts and metadata.
+            batch (TensorDict): Input batch metadata containing prompts and metadata.
         """
-        # by default, we assume it's a generation-only agent
-        default_agent_name = "generate_only_agent"
         assert len(batch) == 1, "Only support single request for generation"
 
-        fields = ["agent_name"]
-        data = await tq.async_kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-        version_tag_fields = [{"version_tag": tag.get("version_tag", -1)} for tag in batch.tags]
-        await tq.async_kv_batch_put(
-            keys=batch.keys,
-            partition_id=batch.partition_id,
-            fields=list_of_dict_to_tensordict(version_tag_fields),
-        )
-        agent_name = tu.get(data, "agent_name", [default_agent_name])[0]
-
+        default_agent_name = self.config.gen_actor_rollout_ref.rollout.default_agent_loop
+        agent_name = tu.get(batch, "agent_name", [default_agent_name])[0]
         task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
         self.agent_programs.add(task)
@@ -227,7 +245,7 @@ class PSRL_AgentLoopWorker:
     async def _run_agent_loop(
         self,
         agent_name: str,
-        batch: KVBatchMeta,
+        batch: TensorDict,
     ):
         """Execute the specified agent loop on the given requests.
 
@@ -236,25 +254,19 @@ class PSRL_AgentLoopWorker:
 
         Args:
             agent_name (str): Name of the agent loop to run.
-            batch (KVBatchMeta): Input batch metadata containing prompts and metadata.
+            batch (TensorDict): Input batch metadata containing prompts and metadata.
         """
         assert len(batch) == 1, "Only support single request for generation"
 
-        fields = ["uid", "parent_id", "global_steps", "validate"]
-        data = await tq.async_kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
-        if "parent_id" in data:
-            prompt_index = tu.get(data, "parent_id")[0]
-            request_index = tu.get(data, "uid")[0]
+        if "parent_id" in batch:
+            prompt_index = tu.get(batch, "parent_id")[0]
+            request_index = tu.get(batch, "uid")[0]
         else:
-            prompt_index = tu.get(data, "uid")[0]
-            request_index = tu.get(data, "uid")[0]
-
-        batch = kv_batch_meta_update_tags(batch, "uid", tu.get(data, "uid"))
-        batch.extra_info["validate"] = batch.partition_id == "val"
-        batch.extra_info["global_steps"] = tu.get(data, "global_steps")[0]
+            prompt_index = tu.get(batch, "uid")[0]
+            request_index = tu.get(batch, "uid")[0]
 
         try:
-          await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
+            await self._run_agent_loop_inner(agent_name, batch, prompt_index, request_index)
         except Exception as e:
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             psrl_logger.error(
@@ -267,20 +279,22 @@ class PSRL_AgentLoopWorker:
     async def _run_agent_loop_inner(
         self,
         agent_name: str,
-        batch: KVBatchMeta,
+        batch: TensorDict,
         prompt_index,
         request_index,
     ):
         """Inner implementation of the agent loop execution."""
+        request_ids = tu.get(batch, "uid")
 
-        request_ids = [tag["uid"] for tag in batch.tags]
+        global_steps = tu.get(batch, "global_steps", -1)
+        validate = tu.get(batch, "validate", False)
 
         with rollout_trace_attr(
             prompt_index=prompt_index,
             request_index=request_index,
-            step=batch.extra_info.get("global_steps", -1),
+            step=global_steps,
             name=agent_name,
-            validate=batch.extra_info.get("validate", False),
+            validate=validate,
         ):
             assert agent_name in AGENT_LOOP_REGISTRY, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
@@ -354,7 +368,7 @@ class PSRL_AgentLoopWorker:
             # Put the output into the TransferQueue and notify PSManager
             # + AgentLoopManager via metadata-only RPCs.
             if output is not None:
-                is_validate = batch.extra_info.get("validate", False)
+                is_validate = validate
                 with log_dual_events(
                     "Update request status",
                     psrl_logger,
@@ -385,35 +399,80 @@ class PSRL_AgentLoopWorker:
                 )
                 await self.ps_manager_handle.abort_requests.remote(request_ids)
 
-    async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: KVBatchMeta):
-        uid = batch.tags[0]["uid"]
+    async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: TensorDict):
+        """Process generation output: fire TQ write + notify manager (non-blocking occupy).
+
+        The worker fires the TQ write as an async task and sends metadata to the manager
+        for occupy processing. The worker only blocks on the TQ write completion.
+        """
+        uid = tu.get(batch, "uid")[0]
+        is_validate = tu.get(batch, "validate")[0]
+        version_tag = tu.get(batch, "version_tag")[0]
+        partition_id = "val" if tu.get(batch, "validate")[0] else "train"
+        prompt_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else tu.get(batch, "uid")[0]
 
         outputs = output if isinstance(output, list) else [output]
-        
-        # Update the number of trajectories of the request
-        await self.ps_manager_handle.update_request_n_trajectory.remote(
-            request_id=uid,
-            n_trajectory=len(outputs),
-            is_validate=batch.partition_id == "val",
+
+        keys, fields = self._build_output_fields(outputs, batch, uid, version_tag)
+
+        await tq.async_kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=list_of_dict_to_tensordict(fields),
+            tags=[{"status": "success"}] * len(keys),
         )
 
+        # Notify manager with metadata only (immediately, no await on TQ write)
+        await self.agent_loop_manager.put_result.remote(
+            {
+                "request_id": uid,
+                "prompt_id": prompt_id,
+                "rollout_instance_id": output.rollout_instance_id,
+                "version_tag": version_tag,
+                "n_trajectory": len(outputs),
+                "is_validate": is_validate,
+            }
+        )
+
+        # Clear original input data for n_trajectory > 1 because of
+        # the difference between input/outputs keys.
+        if len(outputs) > 1:
+            await tq.async_kv_clear(
+                keys=batch.keys,
+                partition_id=partition_id,
+            )
+
+    def _build_output_fields(
+        self,
+        outputs: list,
+        batch: TensorDict,
+        uid: int,
+        version_tag: int,
+    ) -> tuple[list[str], list[dict]]:
+        """Build output keys and field dicts with tensor operations.
+
+        Designed for ``run_in_executor`` so that CPU-bound torch operations
+        (tensor creation, concatenation, position-ID computation) do not block
+        the asyncio event loop.
+        """
         keys, fields = [], []
-        for i, output in enumerate(outputs):
-            prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
-            responses = torch.tensor(output.response_ids, dtype=torch.int64)
+        for i, out in enumerate(outputs):
+            prompts = torch.tensor(out.prompt_ids, dtype=torch.int64)
+            responses = torch.tensor(out.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
             attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
-            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+            multi_modal_inputs = self._compute_multi_modal_inputs(out, input_ids)
             position_ids = self._compute_position_ids(
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
-            
+
             if len(outputs) > 1:
                 keys.append(f"{uid}_{i}")
             else:
                 keys.append(str(uid))
 
-            field = output.as_dict()
+            field = batch[0].to_dict()
+            field.update(out.as_dict())
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             field = {k: v for k, v in field.items() if v is not None}
@@ -426,46 +485,13 @@ class PSRL_AgentLoopWorker:
             field["prompt_len"] = prompt_len
             field["response_len"] = response_len
             field["uid"] = uid
-            if "parent_id" in batch.tags[0]:
-                field["parent_id"] = batch.tags[0]["parent_id"]
+            field.setdefault("version_tag", version_tag)
+            if "parent_id" in batch:
+                field["parent_id"] = tu.get(batch, "parent_id")[0]
             field["trajectory_index"] = i
             field["trajectory_num"] = len(outputs)
             fields.append(field)
-
-        # TODO(linsh): optimize data transfer and memory usage by
-        # keeping input data with `key=str(uid)` and output data with `key=f"{uid}_{i}"`
-        # and then join the data in trainer
-        await tq.async_kv_batch_put(
-            keys=keys,
-            partition_id=batch.partition_id,
-            fields=list_of_dict_to_tensordict(fields),
-        )
-
-        # Clear original input data for n_trajectory > 1 because of
-        # the difference between input/outputs keys
-        if len(outputs) > 1:
-            await tq.async_kv_clear(
-                keys=batch.keys,
-                partition_id=batch.partition_id,
-            )
-
-        occupy_success = await self.agent_loop_manager.occupy_requests.remote(
-            request_id=batch.tags[0]["uid"],
-            prompt_id=batch.tags[0].get("parent_id", batch.tags[0]["uid"]),
-            rollout_instance_id=output.rollout_instance_id,
-            version_tag=batch.tags[0]["version_tag"],
-            n_trajectory=len(outputs),
-            is_validate=batch.partition_id == "val",
-        )
-
-        if not occupy_success and len(outputs) > 1:
-            # occupy_requests rejected the request (e.g. already aborted by
-            # PSManager).  The per-trajectory keys we just wrote are now
-            # orphaned — clean them up so TQ does not accumulate stale data.
-            await tq.async_kv_clear(
-                keys=keys,
-                partition_id=batch.partition_id,
-            )
+        return keys, fields
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""

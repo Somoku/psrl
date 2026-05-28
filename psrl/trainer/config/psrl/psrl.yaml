@@ -206,10 +206,10 @@ status_collection:
 
     # Whether to enable periodic per-replica JSONL stats dump.
     # When enabled, writes one file per (replica_id, dp_rank) to psrl.logging_path.
-    enable: False
+    enable: True
 
     # Snapshot interval in seconds
-    interval_in_s: 5.0
+    interval_in_s: 1.0
 
 # Memory logger config
 memory_logger:
@@ -253,7 +253,7 @@ routing_strategy:
   # Method for rollout routing
   # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
-  method: request_num_balance
+  method: round_robin
 
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500
@@ -439,5 +439,15 @@ rollout_gateway:
   # Whether to enable rollout gateway
   enable: True
 
-  # Max concurrency per instance
-  max_concurrency: 256
+  # Max HTTP generation concurrency per rollout server.
+  # The global HTTP budget is
+  # server_max_concurrency * number_of_active_rollout_servers.
+  server_max_concurrency: 256
+
+  # Whether AgentLoopWorkers should route POST requests through a Ray actor pool.
+  # The pool is created by AgentLoopManager and selected with round-robin.
+  use_distributed_post: False
+
+  # Number of HTTP POST actors to place on each alive Ray node when
+  # use_distributed_post is enabled.
+  post_actor_num_per_node: 8

@@ -12,7 +12,7 @@ from psrl.workers.reward.reward_loop.base import RewardManagerBase
 
 @register("gdpo")
 class GDPORewardManager(RewardManagerBase):
-    """GDPO Reward Manager."""
+    """Reward loop for GDPO."""
 
     def __init__(
         self,

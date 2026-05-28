@@ -153,3 +153,6 @@ agent:
 
   # Trajectory reward calculation mode: 'step' or 'traj'.
   traj_reward_mode: traj
+
+  # Default agent loop name
+  default_agent_loop: generate_only_agent

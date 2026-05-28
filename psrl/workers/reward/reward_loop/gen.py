@@ -251,7 +251,7 @@ class GenRewardManager(RewardManagerBase):
         )
 
         data_source = tu.get(data_item, "data_source", "unknown")
-        reward_model_info = tu.get(data_item, "reward_model")
+        reward_model_info = tu.get(data_item, "reward_model", {})
         ground_truth = reward_model_info.get("ground_truth", "") if isinstance(reward_model_info, dict) else ""
         extra_info = tu.get(data_item, "extra_info", {})
 

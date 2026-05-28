@@ -1,7 +1,7 @@
-From 996ef99c20d2232ebafb6b1f58adff7c7bf6d526 Mon Sep 17 00:00:00 2001
+From bea931b1a7f7843d66026f6a2d0e1ec1174ca030 Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Sun, 10 May 2026 10:59:12 +0800
-Subject: [PATCH] tms, metrics, ray resource num, data sampling
+Date: Wed, 27 May 2026 23:56:38 +0800
+Subject: [PATCH] tms, metrics, ray resource num, data sampling, multi-reward
 
 ---
  verl/protocol.py                              |  38 ++++--
@@ -9,14 +9,14 @@ Subject: [PATCH] tms, metrics, ray resource num, data sampling
  verl/trainer/config/data/legacy_data.yaml     |   2 +-
  verl/trainer/config/engine/fsdp.yaml          |   2 +
  verl/trainer/config/engine/megatron.yaml      |   2 +
- verl/trainer/ppo/metric_utils.py              |  33 ++++-
+ verl/trainer/ppo/metric_utils.py              |  39 +++++-
  verl/trainer/ppo/padding_utils.py             |  26 ++--
  verl/trainer/ppo/rollout_corr_helper.py       |  34 +++--
- verl/utils/dataset/rl_dataset.py              |  27 ++++
+ verl/utils/dataset/rl_dataset.py              |  31 +++++
  verl/workers/config/engine.py                 |   1 +
  verl/workers/engine/fsdp/transformer_impl.py  |  59 +++++----
  .../engine/megatron/transformer_impl.py       | 125 ++++++++++--------
- 12 files changed, 229 insertions(+), 126 deletions(-)
+ 12 files changed, 235 insertions(+), 130 deletions(-)
 
 diff --git a/verl/protocol.py b/verl/protocol.py
 index 4a1034b3..4dff2655 100644
@@ -147,19 +147,22 @@ index ec4883dd..fdf1e75e 100644
  override_ddp_config: {}
  
 diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
-index 946f7611..73ef56ac 100644
+index 946f7611..4e732fb4 100644
 --- a/verl/trainer/ppo/metric_utils.py
 +++ b/verl/trainer/ppo/metric_utils.py
-@@ -115,6 +115,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+@@ -115,9 +115,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
  
      advantages = batch.batch["advantages"]
      returns = batch.batch["returns"]
+-
+-    max_prompt_length = batch.batch["prompts"].shape[-1]
+-    max_response_length = batch.batch["responses"].shape[-1]
 +    max_prompt_length = batch.meta_info.get("max_prompt_length", batch.batch["prompts"].shape[-1])
 +    max_response_length = batch.meta_info.get("max_response_length", batch.batch["responses"].shape[-1])
  
-     max_prompt_length = batch.batch["prompts"].shape[-1]
-     max_response_length = batch.batch["responses"].shape[-1]
-@@ -131,6 +133,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+     response_mask = batch.batch["response_mask"].bool()
+ 
+@@ -131,6 +130,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
      non_aborted_sequence_score = sequence_score[non_aborted_mask]
      non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
  
@@ -186,7 +189,7 @@ index 946f7611..73ef56ac 100644
      if non_aborted_sequence_score.numel() > 0:
          score_mean = torch.mean(non_aborted_sequence_score).detach().item()
          score_max = torch.max(non_aborted_sequence_score).detach().item()
-@@ -212,6 +234,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+@@ -212,6 +231,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
          critic_value_metrics = {}
  
      metrics = {
@@ -202,12 +205,15 @@ index 946f7611..73ef56ac 100644
          # score
          "critic/score/mean": score_mean,
          "critic/score/max": score_max,
-@@ -637,7 +668,7 @@ def process_validation_metrics(
+@@ -636,8 +664,9 @@ def process_validation_metrics(
+             var_dict = uid_dict.setdefault(uid, {})
  
              for var_name, var_vals in var2vals.items():
-                 # skip empty or string values
+-                # skip empty or string values
 -                if not var_vals or isinstance(var_vals[0], str):
-+                if not var_vals or isinstance(var_vals[0], (str, dict)):
++                # skip empty, string, or non-numeric values (e.g. dicts from
++                # reward_extra_info that aggregate per-loop reward metadata)
++                if not var_vals or not isinstance(var_vals[0], (int, float)):
                      continue
  
                  # compute mean and std
@@ -328,10 +334,18 @@ index 0f4d558c..d893a50b 100644
      return metrics
  
 diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
-index c0889727..3a33bb98 100644
+index c0889727..286c9b62 100644
 --- a/verl/utils/dataset/rl_dataset.py
 +++ b/verl/utils/dataset/rl_dataset.py
-@@ -115,6 +115,15 @@ class RLHFDataset(Dataset):
+@@ -22,6 +22,7 @@ import traceback
+ from collections import defaultdict
+ from io import BytesIO
+ from typing import Optional
++from omegaconf import OmegaConf
+ 
+ import datasets
+ import numpy as np
+@@ -115,6 +116,18 @@ class RLHFDataset(Dataset):
          self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
          self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
  
@@ -342,12 +356,15 @@ index c0889727..3a33bb98 100644
 +            "reward_model_name": "null",
 +            "reward_coef": 1.0,
 +        }
-+        self.reward_model_dicts = config.get("reward_model_dicts", [default_reward_model_dict])
++        self.reward_model_dicts = OmegaConf.to_container(
++            config.get("reward_model_dicts", [default_reward_model_dict]),
++            resolve=True,
++        )
 +
          self.tool_config_path = config.get("tool_config_path", None)
          self.tool_schemas = None
          if self.tool_config_path:
-@@ -287,6 +296,17 @@ class RLHFDataset(Dataset):
+@@ -287,6 +300,17 @@ class RLHFDataset(Dataset):
          else:
              print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
  
@@ -365,7 +382,7 @@ index c0889727..3a33bb98 100644
      def __getstate__(self):
          if not self.serialize_dataset:
              state = self.__dict__.copy()
-@@ -378,6 +398,13 @@ class RLHFDataset(Dataset):
+@@ -378,6 +402,13 @@ class RLHFDataset(Dataset):
              logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict["data_source"])
          row_dict["index"] = index
          row_dict["tools_kwargs"] = tools_kwargs

@@ -89,6 +89,36 @@ class StatsRecorder:
             except OSError as e:
                 logger.warning(f"StatsRecorder: failed to write {filename}: {e}")
 
+    def record_smg_routing_status(self, routing_loop_status: dict, workers_stats) -> None:
+        """
+        Append one JSONL row with SMG routing-loop queue state.
+
+        The row is intentionally separate from per-instance engine stats because
+        it describes gateway-level routing pressure and SMG's current
+        prompt-group pinning view.
+        """
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            "queue_len": routing_loop_status.get("queue_len"),
+            "pending_request_num": routing_loop_status.get("pending_request_num"),
+            "running_request_num": routing_loop_status.get("running_request_num"),
+            "running_tasks": routing_loop_status.get("running_tasks"),
+            "paused": routing_loop_status.get("paused"),
+            "routing": routing_loop_status.get("routing"),
+            "queue_keys": routing_loop_status.get("queue_keys", []),
+            "partition_queue_lens": routing_loop_status.get("partition_queue_lens", {}),
+            "workers": workers_stats,
+            "routing_loop_status": routing_loop_status,
+        }
+
+        filename = self._get_smg_routing_status_filename()
+        try:
+            fh = self._get_or_open(filename)
+            fh.write(json.dumps(row) + "\n")
+            fh.flush()
+        except OSError as e:
+            logger.warning(f"StatsRecorder: failed to write {filename}: {e}")
+
     def close(self) -> None:
         """Flush and close all open file handles."""
         for filename, fh in self._file_handles.items():
@@ -106,6 +136,9 @@ class StatsRecorder:
     def _get_filename(self, replica_id: str, dp_rank: int) -> str:
         safe = _sanitize_replica_id(replica_id)
         return os.path.join(self._logging_path, f"stats_{safe}_dp{dp_rank}.jsonl")
+
+    def _get_smg_routing_status_filename(self) -> str:
+        return os.path.join(self._logging_path, "smg_routing_status.jsonl")
 
     def _get_or_open(self, filename: str):
         """Open filename in 'w' mode on first call per run, then 'a'."""

@@ -1,24 +1,65 @@
-From 4dfe25d0d8beb8270ec8543fe292819348425655 Mon Sep 17 00:00:00 2001
+From 89cb3eed3e344c3b3ece867a8379ce59c7a09fb5 Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Fri, 20 Mar 2026 10:51:15 +0800
+Date: Thu, 28 May 2026 13:18:12 +0800
 Subject: [PATCH] v0.18.0 patch
 
 ---
+ vllm/config/scheduler.py                      |  12 ++
  vllm/engine/protocol.py                       |  19 +-
- .../entrypoints/openai/completion/protocol.py |  21 ++
- vllm/entrypoints/openai/completion/serving.py |   8 +
- vllm/entrypoints/openai/engine/protocol.py    |  10 +
- vllm/entrypoints/openai/engine/serving.py     |  20 ++
- vllm/entrypoints/serve/disagg/protocol.py     |  19 +-
- vllm/entrypoints/serve/disagg/serving.py      |  16 +-
- vllm/model_executor/models/qwen2.py           |  13 +-
+ vllm/entrypoints/grpc_server.py               |  61 +++++-
+ vllm/entrypoints/serve/disagg/serving.py      |   4 +
+ vllm/model_executor/models/arctic.py          | 117 +++++------
+ .../models/bailing_moe_linear.py              |   7 +-
+ vllm/model_executor/models/deepseek_v2.py     |  49 +++--
+ vllm/model_executor/models/gemma.py           |  35 +++-
+ vllm/model_executor/models/gemma2.py          |  35 +++-
+ vllm/model_executor/models/gemma3.py          |  35 +++-
+ vllm/model_executor/models/interfaces.py      |  61 ++++++
+ vllm/model_executor/models/internlm2.py       |  25 ++-
+ vllm/model_executor/models/jamba.py           |  34 +++-
+ vllm/model_executor/models/kimi_k25.py        |   6 +
+ vllm/model_executor/models/llama.py           |  35 +++-
+ vllm/model_executor/models/mamba.py           |   8 +-
+ vllm/model_executor/models/mixtral.py         |  33 +++-
+ vllm/model_executor/models/olmoe.py           |  31 ++-
+ vllm/model_executor/models/phi.py             |  32 ++-
+ vllm/model_executor/models/qwen2.py           |  48 ++++-
+ vllm/model_executor/models/qwen2_moe.py       |  36 +++-
+ vllm/model_executor/models/qwen3.py           |   7 +-
+ vllm/model_executor/models/qwen3_5.py         |   9 +-
+ vllm/model_executor/models/qwen3_moe.py       |  36 +++-
+ vllm/multimodal/inputs.py                     |  30 +++
+ vllm/v1/core/sched/scheduler.py               |  13 ++
  vllm/v1/engine/async_llm.py                   |  48 ++---
  vllm/v1/engine/core_client.py                 | 182 +++++++++++++-----
  vllm/v1/engine/output_processor.py            |  17 ++
  vllm/v1/metrics/loggers.py                    |  13 +-
- vllm/v1/metrics/stats.py                      |   4 +
- 13 files changed, 299 insertions(+), 91 deletions(-)
+ vllm/v1/metrics/stats.py                      |   8 +
+ 31 files changed, 804 insertions(+), 282 deletions(-)
 
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index 9f6284c4b..5d3f6b1ed 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -146,6 +146,18 @@ class SchedulerConfig:
+     while a larger value (e.g., 10) reduces host overhead and may increase throughput
+     by batching multiple tokens before sending."""
+ 
++    preemption_notification_threshold: int | None = Field(default=None, ge=0)
++    """Number of waiting sequences above which a preempted request is forwarded
++    to an external gateway (via StatLoggers) for global re-scheduling rather than
++    being silently re-queued locally.
++
++    - ``None`` (default): feature disabled; zero runtime overhead.
++    - ``0``: notify whenever any request is waiting after a preemption.
++    - ``N``: notify when ``len(waiting) > N`` after a preemption.
++
++    This is a generic observability hook; it is not tied to any specific gateway.
++    """
++
+     @staticmethod
+     def default_factory(**kwargs):
+         """
 diff --git a/vllm/engine/protocol.py b/vllm/engine/protocol.py
 index 0b3b29cd6..c8a842047 100644
 --- a/vllm/engine/protocol.py
@@ -90,216 +131,117 @@ index 0b3b29cd6..c8a842047 100644
      ):
          """Perform a collective RPC call to the given path."""
          raise NotImplementedError
-diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
-index c785d2540..fb6a2eed1 100644
---- a/vllm/entrypoints/openai/completion/protocol.py
-+++ b/vllm/entrypoints/openai/completion/protocol.py
-@@ -18,6 +18,7 @@ from vllm.entrypoints.openai.engine.protocol import (
-     StreamOptions,
-     StructuralTagResponseFormat,
-     UsageInfo,
-+    RoutedExpertsPayload,
- )
- from vllm.exceptions import VLLMValidationError
- from vllm.logger import init_logger
-@@ -141,6 +142,15 @@ class CompletionRequest(OpenAIBaseModel):
-             "need to map generated text back to input tokens."
-         ),
-     )
-+    
-+    return_routed_experts: bool = Field(
-+        default=False,
-+        description=(
-+            "If true, include routed expert indices in the final (non-streaming) "
-+            "response only as a vLLM extension field `routed_experts`, encoded "
-+            "compactly using base64 bytes with shape metadata."
-+        ),
-+    )
- 
-     cache_salt: str | None = Field(
-         default=None,
-@@ -415,6 +425,16 @@ class CompletionRequest(OpenAIBaseModel):
- 
-         return data
- 
-+    @model_validator(mode="before")
-+    @classmethod
-+    def validate_return_routed_experts(cls, data):
-+        if data.get("return_routed_experts") and data.get("stream"):
-+            raise VLLMValidationError(
-+                "`return_routed_experts` is only available when `stream=False`.",
-+                parameter="return_routed_experts",
-+            )
-+        return data
-+
-     @model_validator(mode="before")
-     @classmethod
-     def validate_prompt_and_prompt_embeds(cls, data):
-@@ -468,6 +488,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
-     token_ids: list[int] | None = None  # For response
-     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
-     prompt_token_ids: list[int] | None = None  # For prompt
-+    routed_experts: RoutedExpertsPayload | None = None
- 
- 
- class CompletionResponse(OpenAIBaseModel):
-diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
-index 96cd7797c..0444f5435 100644
---- a/vllm/entrypoints/openai/completion/serving.py
-+++ b/vllm/entrypoints/openai/completion/serving.py
-@@ -29,6 +29,7 @@ from vllm.entrypoints.openai.engine.serving import (
-     GenerationError,
-     OpenAIServing,
-     clamp_prompt_logprobs,
-+    encode_routed_experts_payload,
- )
- from vllm.entrypoints.openai.models.serving import OpenAIServingModels
- from vllm.entrypoints.utils import get_max_tokens, should_include_usage
-@@ -520,6 +521,12 @@ class OpenAIServingCompletion(OpenAIServing):
-                 else:
-                     logprobs = None
- 
-+                routed_experts = (
-+                    encode_routed_experts_payload(output.routed_experts)
-+                    if request.return_routed_experts and output.finish_reason is not None
-+                    else None
-+                )
-+
-                 choice_data = CompletionResponseChoice(
-                     index=len(choices),
-                     text=output_text,
-@@ -533,6 +540,7 @@ class OpenAIServingCompletion(OpenAIServing):
-                     token_ids=(
-                         as_list(output.token_ids) if request.return_token_ids else None
-                     ),
-+                    routed_experts=routed_experts,
-                 )
-                 choices.append(choice_data)
- 
-diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
-index 8f6cdb3e6..fa44e8f40 100644
---- a/vllm/entrypoints/openai/engine/protocol.py
-+++ b/vllm/entrypoints/openai/engine/protocol.py
-@@ -268,3 +268,13 @@ class GenerationError(Exception):
-     def __init__(self, message: str = "Internal server error"):
-         super().__init__(message)
-         self.status_code = HTTPStatus.INTERNAL_SERVER_ERROR
-+
-+class RoutedExpertsPayload(OpenAIBaseModel):
-+    """Compact routed experts payload.
-+
-+    This is a vLLM-specific extension and not part of the OpenAI API spec.
-+    """
-+
-+    shape: list[int]
-+    dtype: str
-+    data_base64: str
-\ No newline at end of file
-diff --git a/vllm/entrypoints/openai/engine/serving.py b/vllm/entrypoints/openai/engine/serving.py
-index 2049b3adf..11b2702ea 100644
---- a/vllm/entrypoints/openai/engine/serving.py
-+++ b/vllm/entrypoints/openai/engine/serving.py
-@@ -1,6 +1,7 @@
- # SPDX-License-Identifier: Apache-2.0
- # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/entrypoints/grpc_server.py b/vllm/entrypoints/grpc_server.py
+index 5bb8ea1b4..a765d5c0b 100644
+--- a/vllm/entrypoints/grpc_server.py
++++ b/vllm/entrypoints/grpc_server.py
+@@ -21,6 +21,7 @@ Example:
+ import argparse
  import asyncio
-+import base64
- import contextlib
- import json
+ import signal
++import os
+ import sys
  import time
-@@ -41,6 +42,7 @@ from vllm.entrypoints.openai.engine.protocol import (
-     FunctionCall,
-     FunctionDefinition,
-     GenerationError,
-+    RoutedExpertsPayload,
- )
- from vllm.entrypoints.openai.models.serving import OpenAIServingModels
- from vllm.entrypoints.openai.responses.context import (
-@@ -1218,3 +1220,21 @@ def clamp_prompt_logprobs(
-             if logprob_values.logprob == float("-inf"):
-                 logprob_values.logprob = -9999.0
-     return prompt_logprobs
-+
-+def encode_routed_experts_payload(
-+    routed_experts: np.ndarray | None,
-+) -> RoutedExpertsPayload | None:
-+    """Encode routed experts in compact transport form.
-+
-+    Returns shape + dtype + base64 payload. The data is normalized to
-+    contiguous `int32` for stable wire compatibility.
-+    """
-+    if routed_experts is None:
-+        return None
-+
-+    array = np.ascontiguousarray(routed_experts, dtype=np.int32)
-+    return RoutedExpertsPayload(
-+        shape=list(array.shape),
-+        dtype=str(array.dtype),
-+        data_base64=base64.b64encode(array.tobytes(order="C")).decode("ascii"),
-+    )
-\ No newline at end of file
-diff --git a/vllm/entrypoints/serve/disagg/protocol.py b/vllm/entrypoints/serve/disagg/protocol.py
-index 028e8dee7..533b0d3ad 100644
---- a/vllm/entrypoints/serve/disagg/protocol.py
-+++ b/vllm/entrypoints/serve/disagg/protocol.py
-@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator
  
- from vllm.config import ModelConfig
- from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionLogProbs
--from vllm.entrypoints.openai.engine.protocol import StreamOptions
-+from vllm.entrypoints.openai.engine.protocol import StreamOptions, RoutedExpertsPayload
- from vllm.logprobs import Logprob
- from vllm.renderers import TokenizeParams
- from vllm.sampling_params import SamplingParams
-@@ -105,6 +105,22 @@ class GenerateRequest(BaseModel):
-         default=None,
-         description="KVTransfer parameters used for disaggregated serving.",
+@@ -28,6 +29,7 @@ try:
+     import grpc
+     from grpc_reflection.v1alpha import reflection
+     from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
++    from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
+     from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+ except ImportError:
+     raise ImportError(
+@@ -52,6 +54,11 @@ async def serve_grpc(args: argparse.Namespace):
+     """
+     Main gRPC serving function.
+ 
++    Creates a gRPC server with:
++    - HTTP/2 keepalive configuration to prevent "too many pings" errors
++    - Preemption event streaming support via PreemptionStatLogger
++    - VllmEngineServicer handling Generate, Abort, and SubscribePreemptionEvents RPCs
++
+     Args:
+         args: Parsed command line arguments
+     """
+@@ -68,27 +75,65 @@ async def serve_grpc(args: argparse.Namespace):
+         usage_context=UsageContext.OPENAI_API_SERVER,
      )
-+    return_routed_experts: bool = Field(
-+        default=False,
-+        description=(
-+            "If true, include routed expert indices in the final response only "
-+            "as `routed_experts`, encoded compactly using base64 bytes with "
-+            "shape metadata."
-+        ),
-+    )
+ 
+-    # Create AsyncLLM
++    # Create a preemption queue for bridging scheduler stats to gRPC stream.
++    # This queue receives preempted request IDs from PreemptionStatLogger
++    # (which is registered as a stat logger) and feeds them to
++    # SubscribePreemptionEvents for client streaming.
++    preemption_queue: asyncio.Queue[list[str]] = asyncio.Queue()
 +
-+    @classmethod
-+    def validate_return_routed_experts(cls, data):
-+        if data.get("return_routed_experts") and data.get("stream"):
-+            raise ValueError(
-+                "`return_routed_experts` is only available when `stream=False`."
-+            )
-+        return data
++    # Create PreemptionStatLogger as a stat logger factory.
++    # This captures threshold-crossed preemptions and enqueues them to the queue.
++    # The factory will be instantiated for each engine instance during AsyncLLM init.
++    def preemption_stat_logger_factory(vllm_config, engine_index=0):
++        return PreemptionStatLogger(
++            vllm_config,
++            engine_index=engine_index,
++            preemption_queue=preemption_queue,
++        )
++
++    # Create AsyncLLM with preemption stat logger registered.
+     async_llm = AsyncLLM.from_vllm_config(
+         vllm_config=vllm_config,
+         usage_context=UsageContext.OPENAI_API_SERVER,
+         enable_log_requests=args.enable_log_requests,
+         disable_log_stats=args.disable_log_stats,
++        stat_loggers=[preemption_stat_logger_factory],
+     )
  
-     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
-         return TokenizeParams(
-@@ -119,6 +135,7 @@ class GenerateResponseChoice(BaseModel):
-     # per OpenAI spec this is the default
-     finish_reason: str | None = "stop"
-     token_ids: list[int] | None = None
-+    routed_experts: RoutedExpertsPayload | None = None
+-    # Create servicer
+-    servicer = VllmEngineServicer(async_llm, start_time)
++    # Create servicer with preemption queue
++    servicer = VllmEngineServicer(async_llm, start_time, preemption_queue=preemption_queue)
++    logger.info("VllmEngineServicer initialized with preemption event streaming support")
++
++    # Get ping interval from environment or use default.
++    # The HTTP/2 protocol defaults to 300s, which is too strict for idle connections.
++    # A value of 5000ms (5s) provides a good balance:
++    #   - Tolerates client-side keepalive pings sent frequently (every few seconds)
++    #   - Detects dead connections within ~10-20 seconds (2-4 missed pings)
++    # Can be overridden via VLLM_GRPC_MIN_RECV_PING_INTERVAL_MS environment variable.
++    min_recv_ping_interval_ms = int(
++        os.environ.get("VLLM_GRPC_MIN_RECV_PING_INTERVAL_MS", "5000")
++    )
++    logger.info(
++        "gRPC server configured with min_recv_ping_interval_without_data_ms=%d",
++        min_recv_ping_interval_ms,
++    )
  
+-    # Create gRPC server
++    # Create gRPC server with HTTP/2 keepalive options
+     server = grpc.aio.server(
+         options=[
+             ("grpc.max_send_message_length", -1),
+             ("grpc.max_receive_message_length", -1),
+-            # Tolerate client keepalive pings every 10s (default 300s is too
+-            # strict for non-streaming requests where no DATA frames flow
+-            # during generation)
+-            ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
++            # Tolerate client keepalive pings at the configured interval
++            # to avoid "Too many pings" errors during idle periods in
++            # streaming requests (e.g., preemption notifications)
++            ("grpc.http2.min_recv_ping_interval_without_data_ms", min_recv_ping_interval_ms),
++            # Allow keepalive pings even when no calls are active.
++            # This is essential for streaming RPCs that may not send DATA frames
++            # for extended periods (e.g., SubscribePreemptionEvents waiting for events)
+             ("grpc.keepalive_permit_without_calls", True),
++            # Disable GOAWAY on ping-rate violations. The default max_ping_strikes=2
++            # causes premature connection kills during connect-time PING bursts.
++            ("grpc.http2.max_ping_strikes", 0),
+         ],
+     )
  
- class GenerateResponse(BaseModel):
 diff --git a/vllm/entrypoints/serve/disagg/serving.py b/vllm/entrypoints/serve/disagg/serving.py
-index 322314907..ee506a56c 100644
+index 322314907..b3a2cd185 100644
 --- a/vllm/entrypoints/serve/disagg/serving.py
 +++ b/vllm/entrypoints/serve/disagg/serving.py
-@@ -22,7 +22,11 @@ from vllm.entrypoints.openai.engine.protocol import (
-     RequestResponseMetadata,
-     UsageInfo,
- )
--from vllm.entrypoints.openai.engine.serving import OpenAIServing, clamp_prompt_logprobs
-+from vllm.entrypoints.openai.engine.serving import (
-+    OpenAIServing,
-+    clamp_prompt_logprobs,
-+    encode_routed_experts_payload,
-+)
- from vllm.entrypoints.openai.models.serving import OpenAIServingModels
- from vllm.entrypoints.serve.disagg.protocol import (
-     GenerateRequest,
-@@ -96,6 +100,9 @@ class ServingTokens(OpenAIServing):
+@@ -96,6 +96,9 @@ class ServingTokens(OpenAIServing):
          if raw_request:
              raw_request.state.request_metadata = request_metadata
  
@@ -309,7 +251,7 @@ index 322314907..ee506a56c 100644
          engine_prompts = await self._preprocess_completion(
              request,
              prompt_input=request.token_ids,
-@@ -130,6 +137,7 @@ class ServingTokens(OpenAIServing):
+@@ -130,6 +133,7 @@ class ServingTokens(OpenAIServing):
              lora_request=lora_request,
              trace_headers=trace_headers,
              priority=request.priority,
@@ -317,31 +259,1000 @@ index 322314907..ee506a56c 100644
          )
  
          # TODO(NickLucche): Implement streaming response
-@@ -164,6 +172,11 @@ class ServingTokens(OpenAIServing):
-         for output in final_res.outputs:
-             token_ids = output.token_ids
-             out_logprobs = output.logprobs
-+            routed_experts = (
-+                encode_routed_experts_payload(output.routed_experts)
-+                if request.return_routed_experts and output.finish_reason is not None
-+                else None
-+            )
+diff --git a/vllm/model_executor/models/arctic.py b/vllm/model_executor/models/arctic.py
+index 031b6534f..8d6b548bc 100644
+--- a/vllm/model_executor/models/arctic.py
++++ b/vllm/model_executor/models/arctic.py
+@@ -40,7 +40,7 @@ from vllm.platforms import current_platform
+ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.configs.arctic import ArcticConfig
  
-             # This is top_logprobs in completions API
-             if sampling_params.logprobs is not None:
-@@ -181,6 +194,7 @@ class ServingTokens(OpenAIServing):
-                 logprobs=logprobs,
-                 finish_reason=output.finish_reason if output.finish_reason else "stop",
-                 token_ids=as_list(output.token_ids),
-+                routed_experts=routed_experts,
-             )
+-from .interfaces import SupportsPP, SupportsQuant
++from .interfaces import SupportsPP, SupportsQuant, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     extract_layer_index,
+     is_pp_missing_parameter,
+@@ -427,7 +427,7 @@ class ArcticModel(nn.Module):
+         return hidden_states
  
-             choices.append(choice_data)
+ 
+-class ArcticForCausalLM(nn.Module, SupportsPP, SupportsQuant):
++class ArcticForCausalLM(nn.Module, SupportsPP, SupportsQuant, SupportsWeightLayoutSpec):
+     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+@@ -477,61 +477,68 @@ class ArcticForCausalLM(nn.Module, SupportsPP, SupportsQuant):
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
+-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-        ]
+-
+-        mlp_params_mapping: list[tuple[str, str, int]] = []
+-        expert_params_mapping: list[tuple[str, str, int]] = []
+-        num_layers = self.config.num_hidden_layers
+-
+-        for layer in range(num_layers):
+-            mlp_params_mapping.append(
+-                (
+-                    f"layers.{layer}.residual_mlp.w13.weight",
+-                    f"layers.{layer}.residual_mlp.w1.weight",
+-                    0,
+-                )
+-            )
+-            mlp_params_mapping.append(
+-                (
+-                    f"layers.{layer}.residual_mlp.w13.weight",
+-                    f"layers.{layer}.residual_mlp.w3.weight",
+-                    1,
+-                )
+-            )
++    def _build_layerwise_mappings(self):
++        """Returns (mlp_params, expert_params_spec, expert_params_load).
++        - mlp_params: list of (full_packed, full_hf, shard_id) for extra_stacked_params
++        - expert_params_spec: 4-tuples (packed, hf, expert_id, shard_id_str) for WeightLayoutSpec
++        - expert_params_load: 3-tuples (packed, hf, expert_id) for load_weights iteration
++        """
++        mlp_params = []
++        expert_params_spec = []
++        expert_params_load = []
++        for layer in range(self.config.num_hidden_layers):
++            mlp_params.append((
++                f"layers.{layer}.residual_mlp.w13.weight",
++                f"layers.{layer}.residual_mlp.w1.weight", 0))
++            mlp_params.append((
++                f"layers.{layer}.residual_mlp.w13.weight",
++                f"layers.{layer}.residual_mlp.w3.weight", 1))
+             if layer % 2 == 0:
+-                # MLP layers
+-                mlp_params_mapping.append(
+-                    (
+-                        f"layers.{layer}.block_sparse_moe.mlp.w13.weight",
+-                        f"layers.{layer}.block_sparse_moe.mlp.w1.weight",
+-                        0,
+-                    )
+-                )
+-                mlp_params_mapping.append(
+-                    (
+-                        f"layers.{layer}.block_sparse_moe.mlp.w13.weight",
+-                        f"layers.{layer}.block_sparse_moe.mlp.w3.weight",
+-                        1,
+-                    )
+-                )
++                mlp_params.append((
++                    f"layers.{layer}.block_sparse_moe.mlp.w13.weight",
++                    f"layers.{layer}.block_sparse_moe.mlp.w1.weight", 0))
++                mlp_params.append((
++                    f"layers.{layer}.block_sparse_moe.mlp.w13.weight",
++                    f"layers.{layer}.block_sparse_moe.mlp.w3.weight", 1))
+             else:
+-                # MoE layers
+-                for expert_id in range(self.config.num_local_experts):
+-                    expert_params_mapping.append(
+-                        ("ws", f"experts.{expert_id}.w1.weight", expert_id)
+-                    )
+-                    expert_params_mapping.append(
+-                        ("w2s", f"experts.{expert_id}.w2.weight", expert_id)
+-                    )
+-                    expert_params_mapping.append(
+-                        ("ws", f"experts.{expert_id}.w3.weight", expert_id)
+-                    )
++                for eid in range(self.config.num_local_experts):
++                    expert_params_spec += [
++                        ("ws", f"experts.{eid}.w1.weight", eid, "w1"),
++                        ("w2s", f"experts.{eid}.w2.weight", eid, "w2"),
++                        ("ws", f"experts.{eid}.w3.weight", eid, "w3"),
++                    ]
++                    expert_params_load += [
++                        ("ws",  f"experts.{eid}.w1.weight", eid),
++                        ("w2s", f"experts.{eid}.w2.weight", eid),
++                        ("ws",  f"experts.{eid}.w3.weight", eid),
++                    ]
++        return mlp_params, expert_params_spec, expert_params_load
++
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        mlp_params, expert_params_spec, _ = self._build_layerwise_mappings()
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": self.config.hidden_size // self.config.num_attention_heads,
++                "intermediate_size": self.config.intermediate_size,
++                "num_local_experts": self.config.num_local_experts,
++            },
++            extra_stacked_params=mlp_params,
++            expert_params=expert_params_spec if expert_params_spec else None,
++        )
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        spec = self.get_weight_layout_spec()
++        stacked_params_mapping = spec.stacked_params
++        mlp_params_mapping = list(spec.extra_stacked_params or [])
++        _, _, expert_params_mapping = self._build_layerwise_mappings()
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+diff --git a/vllm/model_executor/models/bailing_moe_linear.py b/vllm/model_executor/models/bailing_moe_linear.py
+index 9b54ec634..3f24d5be9 100644
+--- a/vllm/model_executor/models/bailing_moe_linear.py
++++ b/vllm/model_executor/models/bailing_moe_linear.py
+@@ -61,7 +61,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backend import AttentionMetadata
+ from vllm.v1.attention.backends.linear_attn import LinearAttentionMetadata
+ 
+-from .interfaces import HasInnerState, IsHybrid, SupportsPP
++from .interfaces import HasInnerState, IsHybrid, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -1131,7 +1131,7 @@ class BailingMoeV25Model(nn.Module):
+         return loaded_params
+ 
+ 
+-class BailingMoeV25ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
++class BailingMoeV25ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP, SupportsWeightLayoutSpec):
+     """Bailing MoE v2.5 For CausalLM."""
+ 
+     packed_modules_mapping = {
+@@ -1238,6 +1238,9 @@ class BailingMoeV25ForCausalLM(nn.Module, HasInnerState, IsHybrid, SupportsPP):
+     def get_mamba_state_copy_func(cls) -> tuple:
+         return MambaStateCopyFuncCalculator.linear_attention_state_copy_func()
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(stacked_params=[], packing_metadata={})
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index f31e9ac3e..6229a35e2 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -92,6 +92,8 @@ from .interfaces import (
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from .utils import (
+     PPMissingLayer,
+@@ -1301,6 +1303,7 @@ class DeepseekV2ForCausalLM(
+     SupportsLoRA,
+     SupportsEagle,
+     SupportsEagle3,
++    SupportsWeightLayoutSpec,
+ ):
+     packed_modules_mapping = {
+         "gate_up_proj": ["gate_proj", "up_proj"],
+@@ -1420,28 +1423,40 @@ class DeepseekV2ForCausalLM(
+             num_redundant_experts=0,
+         )
+ 
+-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        rocm_aiter_moe_shared_expert_enabled = (
+-            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+-        )
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        stacked_params = [
+             ("gate_up_proj", "gate_proj", 0),
+             ("gate_up_proj", "up_proj", 1),
+         ]
+-        mla_params_mapping = [
+-            ("fused_qkv_a_proj", "q_a_proj", 0),
+-            ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
+-        ]
+-        mha_params_mapping = [
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-        ]
+         if self.use_mha:
+-            stacked_params_mapping.extend(mha_params_mapping)
++            stacked_params += [
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++            ]
+         else:
+-            stacked_params_mapping.extend(mla_params_mapping)
++            stacked_params += [
++                ("fused_qkv_a_proj", "q_a_proj", 0),
++                ("fused_qkv_a_proj", "kv_a_proj_with_mqa", 1),
++            ]
++        return WeightLayoutSpec(
++            stacked_params=stacked_params,
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": self.config.num_key_value_heads,
++                "head_size": self.config.hidden_size // self.config.num_attention_heads,
++                "intermediate_size": self.config.intermediate_size,
++                "num_experts": self.config.n_routed_experts,
++                "moe_intermediate_size": self.config.moe_intermediate_size,
++            },
++            expert_params=self.get_expert_mapping(),
++        )
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        rocm_aiter_moe_shared_expert_enabled = (
++            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
++        )
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+ 
+         # Params for weights, fp8 weight scales, fp8 activation scales
+         # (param_name, weight_name, expert_id, shard_id)
+diff --git a/vllm/model_executor/models/gemma.py b/vllm/model_executor/models/gemma.py
+index 6e35020a6..11caef6a5 100644
+--- a/vllm/model_executor/models/gemma.py
++++ b/vllm/model_executor/models/gemma.py
+@@ -45,7 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     is_pp_missing_parameter,
+@@ -324,15 +324,27 @@ class GemmaModel(nn.Module):
+         hidden_states, _ = self.norm(hidden_states, residual)
+         return hidden_states
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                ("gate_up_proj", "gate_proj", 0),
++                ("gate_up_proj", "up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            ("gate_up_proj", "gate_proj", 0),
+-            ("gate_up_proj", "up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         for name, loaded_weight in weights:
+@@ -363,7 +375,7 @@ class GemmaModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
++class GemmaForCausalLM(nn.Module, SupportsWeightLayoutSpec, SupportsLoRA, SupportsPP):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -416,6 +428,9 @@ class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.model.embed_tokens, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/gemma2.py b/vllm/model_executor/models/gemma2.py
+index 425ecc651..00f6d1fe6 100644
+--- a/vllm/model_executor/models/gemma2.py
++++ b/vllm/model_executor/models/gemma2.py
+@@ -45,7 +45,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+ )
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     extract_layer_index,
+@@ -316,15 +316,27 @@ class Gemma2Model(nn.Module):
+         hidden_states, _ = self.norm(hidden_states, residual)
+         return hidden_states
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                ("gate_up_proj", "gate_proj", 0),
++                ("gate_up_proj", "up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            ("gate_up_proj", "gate_proj", 0),
+-            ("gate_up_proj", "up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         for name, loaded_weight in weights:
+@@ -369,7 +381,7 @@ class Gemma2Model(nn.Module):
+         return loaded_params
+ 
+ 
+-class Gemma2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
++class Gemma2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -423,6 +435,9 @@ class Gemma2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.model.embed_tokens, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/gemma3.py b/vllm/model_executor/models/gemma3.py
+index b2352a3c9..9d3eba837 100644
+--- a/vllm/model_executor/models/gemma3.py
++++ b/vllm/model_executor/models/gemma3.py
+@@ -51,7 +51,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backend import AttentionType
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     extract_layer_index,
+@@ -371,15 +371,27 @@ class Gemma3Model(nn.Module):
+         hidden_states, _ = self.norm(hidden_states, residual)
+         return hidden_states
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                ("gate_up_proj", "gate_proj", 0),
++                ("gate_up_proj", "up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            ("gate_up_proj", "gate_proj", 0),
+-            ("gate_up_proj", "up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         for name, loaded_weight in weights:
+@@ -449,7 +461,7 @@ class Gemma3Model(nn.Module):
+         return loaded_params
+ 
+ 
+-class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
++class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -512,6 +524,9 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 094887530..943c4ca48 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -13,6 +13,7 @@ from collections.abc import (
+ from contextlib import ExitStack, contextmanager, nullcontext
+ from typing import (
+     TYPE_CHECKING,
++    Any,
+     ClassVar,
+     Literal,
+     Protocol,
+@@ -525,6 +526,66 @@ def supports_score_template(
+     return getattr(model, "supports_score_template", False)
+ 
+ 
++# ---------------------------------------------------------------------------
++# WeightLayoutSpec and SupportsWeightLayoutSpec
++# ---------------------------------------------------------------------------
++from dataclasses import dataclass
++
++
++@dataclass
++class WeightLayoutSpec:
++    """Describes how a vLLM model's packed parameters map to HF weight components.
++
++    stacked_params:
++        Each entry: (packed_param_suffix, hf_component_suffix, shard_id).
++        shard_id is "q"/"k"/"v" for QKV; int 0/1 for gate_up_proj.
++    packing_metadata:
++        Model config values (num_heads, num_kv_heads, head_size, intermediate_size,
++        num_experts, moe_intermediate_size) needed to compute split sizes.
++        All values come from self.config — no new data is introduced.
++    expert_params:
++        For MoE models: output of get_expert_mapping(). Format per entry:
++        (packed_param_suffix, hf_weight_suffix, expert_id, shard_id)
++        where shard_id is "w1" (gate), "w2" (down), or "w3" (up).
++        None for non-MoE models.
++    extra_stacked_params:
++        For models with full layer-qualified paths (e.g., Arctic).
++        Each entry: (full_packed_path, full_hf_path, shard_id).
++        None for standard models.
++    """
++
++    stacked_params: list[tuple[str, str, "str | int"]]
++    packing_metadata: dict[str, Any]
++    expert_params: "list[tuple[str, str, int, str]] | None" = None
++    extra_stacked_params: "list[tuple[str, str, str | int]] | None" = None
++
++
++@runtime_checkable
++class SupportsWeightLayoutSpec(Protocol):
++    """Interface for vLLM models that expose their weight packing structure.
++
++    All ForCausalLM / ForConditionalGeneration top-level model classes should
++    implement this interface. load_weights() should call get_weight_layout_spec()
++    instead of re-declaring stacked_params_mapping as a local variable.
++    """
++
++    supports_weight_layout_spec = True  # type: ClassVar[Literal[True]]
++
++    def get_weight_layout_spec(self) -> "WeightLayoutSpec":
++        """Return the weight layout specification for this model.
++
++        The returned spec must be consistent with stacked_params_mapping used
++        inside load_weights(). Changing one must change the other.
++        """
++        ...
++
++    @classmethod
++    def __subclasshook__(cls, C: type) -> bool:
++        if cls is SupportsWeightLayoutSpec:
++            return hasattr(C, "get_weight_layout_spec")
++        return NotImplemented  # type: ignore[return-value]
++
++
+ @runtime_checkable
+ class SupportsLoRA(Protocol):
+     """The interface required for all models that support LoRA."""
+diff --git a/vllm/model_executor/models/internlm2.py b/vllm/model_executor/models/internlm2.py
+index c00b9a0ee..7892b0eb2 100644
+--- a/vllm/model_executor/models/internlm2.py
++++ b/vllm/model_executor/models/internlm2.py
+@@ -38,7 +38,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .interfaces_base import default_pooling_type
+ from .utils import (
+     StageMissingLayer,
+@@ -309,7 +309,7 @@ class InternLM2Model(nn.Module):
+         return hidden_states
+ 
+ 
+-class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
++class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsWeightLayoutSpec):
+     packed_modules_mapping = {
+         "wqkv": ["wqkv"],
+         "gate_up_proj": ["w1", "w3"],
+@@ -367,12 +367,23 @@ class InternLM2ForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+         logits = self.logits_processor(self.output, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("gate_up_proj", "w1", 0),
++                ("gate_up_proj", "w3", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": self.config.hidden_size // self.config.num_attention_heads,
++                "intermediate_size": self.config.intermediate_size,
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("gate_up_proj", "w1", 0),
+-            ("gate_up_proj", "w3", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         for name, loaded_weight in weights:
+diff --git a/vllm/model_executor/models/jamba.py b/vllm/model_executor/models/jamba.py
+index 980bcffb5..f32309c09 100644
+--- a/vllm/model_executor/models/jamba.py
++++ b/vllm/model_executor/models/jamba.py
+@@ -45,6 +45,8 @@ from .interfaces import (
+     SupportsLoRA,
+     SupportsMambaPrefixCaching,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from .utils import (
+     AutoWeightsLoader,
+@@ -387,15 +389,27 @@ class JambaModel(nn.Module):
+             num_experts=self.config.num_experts,
+         )
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                (".gate_up_proj", ".gate_proj", 0),
++                (".gate_up_proj", ".up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
++                "head_size": self.config.hidden_size // self.config.num_attention_heads,
++                "intermediate_size": self.config.intermediate_size,
++                "num_experts": self.config.num_experts,
++            },
++            expert_params=self.get_expert_mapping(),
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            (".gate_up_proj", ".gate_proj", 0),
+-            (".gate_up_proj", ".up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+@@ -465,6 +479,7 @@ class JambaForCausalLM(
+     SupportsPP,
+     IsHybrid,
+     SupportsMambaPrefixCaching,
++    SupportsWeightLayoutSpec,
+ ):
+     hf_to_vllm_mapper = WeightsMapper(
+         orig_to_new_substr={".self_attn.": ".", ".A_log": ".A"},
+@@ -578,6 +593,9 @@ class JambaForCausalLM(
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+ 
+ class JambaForSequenceClassification(JambaForCausalLM):
+     is_pooling_model = True
+diff --git a/vllm/model_executor/models/kimi_k25.py b/vllm/model_executor/models/kimi_k25.py
+index 2f809f929..55b0308a7 100644
+--- a/vllm/model_executor/models/kimi_k25.py
++++ b/vllm/model_executor/models/kimi_k25.py
+@@ -33,6 +33,8 @@ from vllm.model_executor.models.interfaces import (
+     SupportsMultiModal,
+     SupportsPP,
+     SupportsQuant,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from vllm.model_executor.models.kimi_k25_vit import (
+     KimiK25MultiModalProjector,
+@@ -319,6 +321,7 @@ class KimiK25ForConditionalGeneration(
+     SupportsQuant,
+     SupportsEagle,
+     SupportsEagle3,
++    SupportsWeightLayoutSpec,
+ ):
+     """Kimi-K2.5 model for conditional generation.
+ 
+@@ -493,6 +496,9 @@ class KimiK25ForConditionalGeneration(
+     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+         return self.language_model.get_eagle3_aux_hidden_state_layers()
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(stacked_params=[], packing_metadata={})
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 2ecced3df..5067a3883 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -66,6 +66,8 @@ from .interfaces import (
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from .utils import (
+     AutoWeightsLoader,
+@@ -438,15 +440,27 @@ class LlamaModel(nn.Module, EagleModelMixin):
+             return hidden_states, aux_hidden_states
+         return hidden_states
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                (".qkv_proj", ".q_proj", "q"),
++                (".qkv_proj", ".k_proj", "k"),
++                (".qkv_proj", ".v_proj", "v"),
++                (".gate_up_proj", ".gate_proj", 0),
++                (".gate_up_proj", ".up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            (".qkv_proj", ".q_proj", "q"),
+-            (".qkv_proj", ".k_proj", "k"),
+-            (".qkv_proj", ".v_proj", "v"),
+-            (".gate_up_proj", ".gate_proj", 0),
+-            (".gate_up_proj", ".up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+         for name, loaded_weight in weights:
+@@ -504,7 +518,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
+ 
+ 
+ class LlamaForCausalLM(
+-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
++    nn.Module, SupportsWeightLayoutSpec, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+ ):
+     packed_modules_mapping = {
+         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+@@ -586,6 +600,9 @@ class LlamaForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/mamba.py b/vllm/model_executor/models/mamba.py
+index ec2a7255e..bd7dd0a37 100644
+--- a/vllm/model_executor/models/mamba.py
++++ b/vllm/model_executor/models/mamba.py
+@@ -32,6 +32,8 @@ from vllm.model_executor.models.interfaces import (
+     IsAttentionFree,
+     SupportsMambaPrefixCaching,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from vllm.sequence import IntermediateTensors
+ 
+@@ -190,7 +192,8 @@ class MambaModel(nn.Module):
+ 
+ 
+ class MambaForCausalLM(
+-    nn.Module, HasInnerState, IsAttentionFree, SupportsPP, SupportsMambaPrefixCaching
++    nn.Module, HasInnerState, IsAttentionFree, SupportsPP, SupportsMambaPrefixCaching,
++    SupportsWeightLayoutSpec
+ ):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         config = vllm_config.model_config.hf_config
+@@ -277,6 +280,9 @@ class MambaForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(stacked_params=[], packing_metadata={})
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/mixtral.py b/vllm/model_executor/models/mixtral.py
+index 376fd7a17..be0b9b195 100644
+--- a/vllm/model_executor/models/mixtral.py
++++ b/vllm/model_executor/models/mixtral.py
+@@ -60,7 +60,7 @@ from vllm.model_executor.model_loader.weight_utils import (
+ )
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
++from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -374,13 +374,27 @@ class MixtralModel(nn.Module):
+             num_redundant_experts=self.num_redundant_experts,
+         )
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++                "num_experts": self.config.num_local_experts,
++            },
++            expert_params=self.get_expert_mapping(),
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+@@ -480,7 +494,7 @@ class MixtralModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
++class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts, SupportsWeightLayoutSpec):
+     fall_back_to_pt_during_load = False
+ 
+     packed_modules_mapping = {
+@@ -591,6 +605,9 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP, MixtureOfExperts):
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/olmoe.py b/vllm/model_executor/models/olmoe.py
+index f0afe0e99..d4e88a78e 100644
+--- a/vllm/model_executor/models/olmoe.py
++++ b/vllm/model_executor/models/olmoe.py
+@@ -49,7 +49,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     is_pp_missing_parameter,
+@@ -345,13 +345,25 @@ class OlmoeModel(nn.Module):
+             num_experts=self.config.num_experts,
+         )
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
++                "head_size": self.config.hidden_size // self.config.num_attention_heads,
++                "intermediate_size": self.config.intermediate_size,
++                "num_experts": self.config.num_experts,
++            },
++            expert_params=self.get_expert_mapping(),
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+@@ -433,7 +445,7 @@ class OlmoeModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class OlmoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
++class OlmoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsWeightLayoutSpec):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -496,3 +508,6 @@ class OlmoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()
++
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
+diff --git a/vllm/model_executor/models/phi.py b/vllm/model_executor/models/phi.py
+index 75c42c0d3..3e79efcb3 100644
+--- a/vllm/model_executor/models/phi.py
++++ b/vllm/model_executor/models/phi.py
+@@ -65,7 +65,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     is_pp_missing_parameter,
+@@ -257,13 +257,26 @@ class PhiModel(nn.Module):
+ 
+         return hidden_states
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": getattr(self.config, "n_inner",
++                                             4 * self.config.hidden_size),
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+ 
+@@ -299,7 +312,7 @@ class PhiModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class PhiForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
++class PhiForCausalLM(nn.Module, SupportsWeightLayoutSpec, SupportsLoRA, SupportsPP):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -358,6 +371,9 @@ class PhiForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.lm_head, hidden_states, self.lm_head.bias)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
 diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
-index 27aa6175b..a6ecbeb63 100644
+index 27aa6175b..cd9847fd4 100644
 --- a/vllm/model_executor/models/qwen2.py
 +++ b/vllm/model_executor/models/qwen2.py
-@@ -189,6 +189,13 @@ class Qwen2Attention(nn.Module):
+@@ -68,6 +68,8 @@ from .interfaces import (
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from .utils import (
+     AutoWeightsLoader,
+@@ -189,6 +191,13 @@ class Qwen2Attention(nn.Module):
              if attn_type == AttentionType.ENCODER_ONLY
              else Attention
          )
@@ -355,7 +1266,7 @@ index 27aa6175b..a6ecbeb63 100644
          self.attn = attn_cls(
              self.num_heads,
              self.head_dim,
-@@ -231,7 +238,11 @@ class Qwen2Attention(nn.Module):
+@@ -231,7 +240,11 @@ class Qwen2Attention(nn.Module):
              k = k.view(total_tokens, self.kv_size)
  
          q, k = self.rotary_emb(positions, q, k)
@@ -368,6 +1279,348 @@ index 27aa6175b..a6ecbeb63 100644
          output, _ = self.o_proj(attn_output)
          return output
  
+@@ -458,15 +471,27 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+ 
+         return hidden_states
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                ("gate_up_proj", "gate_proj", 0),
++                ("gate_up_proj", "up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads",
++                                        self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim",
++                                     self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++            },
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            ("gate_up_proj", "gate_proj", 0),
+-            ("gate_up_proj", "up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+         params_dict = dict(self.named_parameters(remove_duplicate=False))
+         loaded_params: set[str] = set()
+         for name, loaded_weight in weights:
+@@ -525,7 +550,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+ 
+ 
+ class Qwen2ForCausalLM(
+-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
++    nn.Module, SupportsWeightLayoutSpec, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+ ):
+     packed_modules_mapping = {
+         "qkv_proj": [
+@@ -592,6 +617,9 @@ class Qwen2ForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/qwen2_moe.py b/vllm/model_executor/models/qwen2_moe.py
+index 4b0c75616..11cb20882 100644
+--- a/vllm/model_executor/models/qwen2_moe.py
++++ b/vllm/model_executor/models/qwen2_moe.py
+@@ -58,7 +58,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+ from vllm.sequence import IntermediateTensors
+ 
+-from .interfaces import SupportsLoRA, SupportsPP
++from .interfaces import SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .utils import (
+     AutoWeightsLoader,
+     extract_layer_index,
+@@ -430,15 +430,28 @@ class Qwen2MoeModel(nn.Module):
+             num_experts=self.config.num_experts,
+         )
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                ("gate_up_proj", "gate_proj", 0),
++                ("gate_up_proj", "up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
++                "head_size": self.config.hidden_size // self.config.num_attention_heads,
++                "intermediate_size": self.config.intermediate_size,
++                "num_experts": self.config.num_experts,
++                "moe_intermediate_size": getattr(self.config, "moe_intermediate_size", self.config.intermediate_size),
++            },
++            expert_params=self.get_expert_mapping(),
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            ("gate_up_proj", "gate_proj", 0),
+-            ("gate_up_proj", "up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
+@@ -535,7 +548,7 @@ class Qwen2MoeModel(nn.Module):
+         return loaded_params
+ 
+ 
+-class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
++class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA, SupportsWeightLayoutSpec):
+     fall_back_to_pt_during_load = False
+     packed_modules_mapping = {
+         "qkv_proj": [
+@@ -602,3 +615,6 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()
++
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
+diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+index 91931f9f4..348285e0f 100644
+--- a/vllm/model_executor/models/qwen3.py
++++ b/vllm/model_executor/models/qwen3.py
+@@ -48,7 +48,7 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
+-from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
++from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP, SupportsWeightLayoutSpec, WeightLayoutSpec
+ from .qwen2 import Qwen2MLP as Qwen3MLP
+ from .qwen2 import Qwen2Model
+ from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+@@ -259,7 +259,7 @@ class Qwen3Model(Qwen2Model):
+ 
+ 
+ class Qwen3ForCausalLM(
+-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
++    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3, SupportsWeightLayoutSpec
+ ):
+     packed_modules_mapping = {
+         "qkv_proj": [
+@@ -331,6 +331,9 @@ class Qwen3ForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index 9b1dc7468..68fdc4004 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -78,6 +78,8 @@ from .interfaces import (
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+     _require_is_multimodal,
+ )
+ from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
+@@ -623,6 +625,9 @@ class Qwen3_5ForCausalLMBase(
+     ) -> torch.Tensor | None:
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(stacked_params=[], packing_metadata={})
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+@@ -631,11 +636,11 @@ class Qwen3_5ForCausalLMBase(
+         return loader.load_weights(weights)
+ 
+ 
+-class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
++class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase, SupportsWeightLayoutSpec):
+     pass
+ 
+ 
+-class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
++class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts, SupportsWeightLayoutSpec):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__(vllm_config=vllm_config, prefix=prefix)
+ 
+diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
+index f2ce070be..b5efa3161 100644
+--- a/vllm/model_executor/models/qwen3_moe.py
++++ b/vllm/model_executor/models/qwen3_moe.py
+@@ -72,6 +72,8 @@ from .interfaces import (
+     SupportsEagle3,
+     SupportsLoRA,
+     SupportsPP,
++    SupportsWeightLayoutSpec,
++    WeightLayoutSpec,
+ )
+ from .utils import (
+     AutoWeightsLoader,
+@@ -525,15 +527,28 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+             num_redundant_experts=self.num_redundant_experts,
+         )
+ 
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return WeightLayoutSpec(
++            stacked_params=[
++                ("qkv_proj", "q_proj", "q"),
++                ("qkv_proj", "k_proj", "k"),
++                ("qkv_proj", "v_proj", "v"),
++                ("gate_up_proj", "gate_proj", 0),
++                ("gate_up_proj", "up_proj", 1),
++            ],
++            packing_metadata={
++                "num_heads": self.config.num_attention_heads,
++                "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
++                "head_size": getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads),
++                "intermediate_size": self.config.intermediate_size,
++                "num_experts": self.config.num_experts,
++                "moe_intermediate_size": getattr(self.config, "moe_intermediate_size", self.config.intermediate_size),
++            },
++            expert_params=self.get_expert_mapping(),
++        )
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+-        stacked_params_mapping = [
+-            # (param_name, shard_name, shard_id)
+-            ("qkv_proj", "q_proj", "q"),
+-            ("qkv_proj", "k_proj", "k"),
+-            ("qkv_proj", "v_proj", "v"),
+-            ("gate_up_proj", "gate_proj", 0),
+-            ("gate_up_proj", "up_proj", 1),
+-        ]
++        stacked_params_mapping = self.get_weight_layout_spec().stacked_params
+ 
+         # Skip loading extra parameters for GPTQ/modelopt models.
+         ignore_suffixes = (
+@@ -670,7 +685,7 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+ 
+ 
+ class Qwen3MoeForCausalLM(
+-    nn.Module, SupportsPP, SupportsLoRA, SupportsEagle, SupportsEagle3, MixtureOfExperts
++    nn.Module, SupportsPP, SupportsLoRA, SupportsEagle, SupportsEagle3, MixtureOfExperts, SupportsWeightLayoutSpec
+ ):
+     packed_modules_mapping = {
+         "qkv_proj": [
+@@ -783,3 +798,6 @@ class Qwen3MoeForCausalLM(
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()
++
++    def get_weight_layout_spec(self) -> WeightLayoutSpec:
++        return self.model.get_weight_layout_spec()
+diff --git a/vllm/multimodal/inputs.py b/vllm/multimodal/inputs.py
+index 1e25142f3..555df7ce1 100644
+--- a/vllm/multimodal/inputs.py
++++ b/vllm/multimodal/inputs.py
+@@ -1115,6 +1115,36 @@ def mm_inputs(
+ 
+     return inputs
+ 
++class TokensInput(_InputOptions):
++    """Represents token-based input to the engine."""
++
++    type: Literal["token"]
++    """The type of input."""
++
++    prompt_token_ids: list[int]
++    """The token IDs of the prompt."""
++
++    prompt: NotRequired[str]
++    """The prompt text corresponding to the token IDs, if available."""
++
++def tokens_input(
++    prompt_token_ids: list[int],
++    *,
++    prompt: str | None = None,
++    cache_salt: str | None = None,
++) -> TokensInput:
++    """
++    Construct [`TokensInput`][vllm.inputs.engine.TokensInput]
++    from optional values.
++    """
++    inputs = TokensInput(type="token", prompt_token_ids=prompt_token_ids)
++
++    if prompt is not None:
++        inputs["prompt"] = prompt
++    if cache_salt is not None:
++        inputs["cache_salt"] = cache_salt
++
++    return inputs
+ 
+ class MultiModalEncDecInputs(MultiModalInputs):
+     """
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ea2c2a6cd..4e1a5d844 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -83,6 +83,10 @@ class Scheduler(SchedulerInterface):
+         self.kv_events_config = vllm_config.kv_events_config
+         self.parallel_config = vllm_config.parallel_config
+         self.log_stats = log_stats
++        # Accumulates request IDs to forward to an external gateway when
++        # preemption_notification_threshold is configured. Cleared each step
++        # in make_stats(). Empty list when feature is disabled.
++        self.preemption_req_ids: list[str] = []
+         self.observability_config = vllm_config.observability_config
+         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
+         if self.observability_config.kv_cache_metrics:
+@@ -948,6 +952,12 @@ class Scheduler(SchedulerInterface):
+         # Put the request back to the waiting queue.
+         self.waiting.prepend_request(request)
+ 
++        # Notify external gateway if threshold is configured and waiting queue
++        # is already congested — local re-queuing would only worsen the load.
++        threshold = self.scheduler_config.preemption_notification_threshold
++        if self.log_stats and threshold is not None and len(self.waiting) > threshold:
++            self.preemption_req_ids.append(request.request_id)
++
+     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+         # Advance the number of computed tokens for the request AFTER
+         # the request is scheduled.
+@@ -1924,6 +1934,8 @@ class Scheduler(SchedulerInterface):
+         connector_stats_payload = (
+             kv_connector_stats.data if kv_connector_stats else None
+         )
++        preemption_req_ids = self.preemption_req_ids
++        self.preemption_req_ids = []
+         return SchedulerStats(
+             num_running_reqs=len(self.running),
+             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
+@@ -1936,6 +1948,7 @@ class Scheduler(SchedulerInterface):
+             kv_connector_stats=connector_stats_payload,
+             cudagraph_stats=cudagraph_stats,
+             perf_stats=perf_stats,
++            preemption_req_ids=preemption_req_ids,
+         )
+ 
+     def _get_encoder_cache_usage(self) -> float:
 diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
 index a9c42e78e..c876e9c39 100644
 --- a/vllm/v1/engine/async_llm.py
@@ -867,17 +2120,21 @@ index f20d78542..ea096eeb4 100644
          if not custom_prometheus_logger:
              self.stat_loggers.append(
 diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
-index 4a1e8b6f3..a7223c866 100644
+index 4a1e8b6f3..76c153677 100644
 --- a/vllm/v1/metrics/stats.py
 +++ b/vllm/v1/metrics/stats.py
-@@ -170,6 +170,10 @@ class KVCacheEvictionEvent:
+@@ -170,6 +170,14 @@ class KVCacheEvictionEvent:
  @dataclass
  class SchedulerStats:
      """Stats associated with the scheduler."""
 +    # NOTE(lhy): we need to add this field to the scheduler stats for PSRL.
-+    need_to_abort_reqs: list[str] = field(default_factory=list)
 +    req_id_to_prompt_token_num: dict[str, int] | None = None
 +    req_id_to_response_token_num: dict[str, int] | None = None
++    preemption_req_ids: list[str] = field(default_factory=list)
++    """Threshold-filtered subset of preempted requests to forward to an external
++    gateway for global re-scheduling. Populated by ``Scheduler.make_stats()``
++    when ``SchedulerConfig.preemption_notification_threshold`` is set.
++    """
  
      num_running_reqs: int = 0
      num_waiting_reqs: int = 0

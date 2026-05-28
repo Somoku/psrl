@@ -16,7 +16,6 @@ from psrl.utils.logger import (
     log_dual_events,
 )
 from psrl.utils.server.command import Command, CommandExtension, CommandType
-from psrl.workers.gen_dplb.stats_collector import EngineStats
 from psrl.workers.gen_dplb.smg_adapter import (
     ROUTING_LOOP_STATUS_PATH,
     WORKERS_STATS_PATH,
@@ -25,6 +24,7 @@ from psrl.workers.gen_dplb.smg_adapter import (
     build_weight_version_updates,
     build_worker_stats_update,
 )
+from psrl.workers.gen_dplb.stats_collector import EngineStats
 from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, RolloutInstanceId
 from psrl.workers.gen_dplb.zmq_queue import ZMQPullQueue
 
@@ -251,8 +251,7 @@ class RolloutCoordinator(CommandExtension):
             raise RuntimeError(f"Unexpected routing loop state after {path}: expected={expected}, got={actual}")
 
     async def _fetch_filtered_request_meta(self, version_tag: int) -> list[tuple[int, bool]]:
-        data = await self._gateway_get_json("/routing_loop/filter", params={"version_tag": version_tag})
-        requests = data.get("requests", [])
+        requests = await self._gateway_get_json("/routing_loop/filter", params={"version_tag": version_tag})
         filtered_request_meta: list[tuple[int, bool]] = []
         for req in requests:
             request_id = int(req.get("request_id"))
@@ -747,6 +746,9 @@ class RolloutCoordinator(CommandExtension):
             await asyncio.sleep(interval)
             if not self.stop_stats_recorder:
                 self._stats_recorder.record(self.instance_to_engine_status)
+                routing_loop_status = await self._gateway_get_json(ROUTING_LOOP_STATUS_PATH)
+                workers_stats = await self._gateway_get_json(WORKERS_STATS_PATH)
+                self._stats_recorder.record_smg_routing_status(routing_loop_status, workers_stats)
         psrl_logger.info("Stopped stats recorder loop.")
 
     async def _is_routing(self) -> bool:
@@ -908,6 +910,8 @@ class RolloutCoordinator(CommandExtension):
         """
         old_version = self.instance_to_model_version.get(rollout_instance_id, None)
         self.instance_to_model_version[rollout_instance_id] = version_tag
+        if rollout_instance_id in self.instance_to_engine_status:
+            self.instance_to_engine_status[rollout_instance_id].model_version = version_tag
         psrl_logger.info(
             f"Updated rollout instance {rollout_instance_id} model version: {old_version} -> {version_tag}"
         )

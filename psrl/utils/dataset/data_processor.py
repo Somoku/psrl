@@ -8,11 +8,11 @@ import numpy as np
 import ray
 import torch
 import transfer_queue as tq
+from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transfer_queue import KVBatchMeta
-
-from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils import tensordict_utils as tu
+from verl.utils.dataset.rl_dataset import collate_fn
 
 from psrl.utils.dataset.utils import create_multi_rl_datasets, create_rl_dataset, create_rl_sampler
 from psrl.utils.logger import DualOutputHandler
@@ -502,7 +502,7 @@ class DataProcessor:
         dataset_type: DatasetType,
         group_repeat: bool = True,
         return_meta: bool = True,
-    ) -> dict | KVBatchMeta:
+    ) -> TensorDict | KVBatchMeta:
         """
         Get a single batch from the dataset for single controller training.
 
@@ -528,9 +528,6 @@ class DataProcessor:
             rollout_n = self.val_rollout_n
         else:
             raise ValueError(f"Unsupported dataset type: {dataset_type}")
-
-        if not return_meta:
-            return batch_dict
 
         batch_size = len(batch_dict[list(batch_dict.keys())[0]])
         if dataset_type == DatasetType.train:
@@ -562,22 +559,19 @@ class DataProcessor:
             batch = batch.repeat_interleave(repeats=rollout_n)
             tu.assign_non_tensor_stack(batch, "uid", request_ids)
             keys = [str(uid) for uid in request_ids]
-            tags = [
-                {"uid": request_id}
-                for request_id in request_ids
-            ]
+            tags = [{"uid": request_id, "status": "running"} for request_id in request_ids]
         else:
             keys = [str(uid) for uid in sample_ids]
-            tags = [
-                {"uid": sample_id}
-                for sample_id in sample_ids
-            ]
+            tags = [{"uid": sample_id} for sample_id in sample_ids]
 
         # add `parent_id` tag
         if rollout_n > 1:
             for i in range(batch_size):
                 for j in range(rollout_n):
                     tags[i * rollout_n + j]["parent_id"] = sample_ids[i]
+
+        if not return_meta:
+            return batch
 
         batch_meta = tq.kv_batch_put(
             keys=keys,
@@ -713,19 +707,20 @@ class DataProcessor:
                 # `fit(...)` in `verl/trainer/ppo/ray_trainer.py`, you can find it by searching for
                 # `batch: DataProto = DataProto.from_single_dict(batch_dict)` in that file.
 
-                batch_meta: KVBatchMeta = self.get_single_controller_batch(DatasetType.train)
-                batch_size = len(batch_meta) // self.rollout_n
+                batch_meta: dict = self.get_single_controller_batch(DatasetType.train, return_meta=False)
+                batch = batch_meta
+                batch_size = len(batch) // self.rollout_n
 
-                # Register with PSManager and dispatch group-by-group to the
-                # agent-loop manager. Only KVBatchMeta crosses Ray.
-                psrl_logger.debug(
-                    f"Generating {batch_size} prompts x rollout_n={self.rollout_n} children"
-                )
-                prompt_batch_metas = batch_meta.chunk(batch_size)
-                for prompt_batch_meta in prompt_batch_metas:
-                    request_ids = [tag["uid"] for tag in prompt_batch_meta.tags]
-                    ray.get(self.ps_manager_handle.add_request.remote(request_ids))
-                    ray.get(self.agent_loop_manager_handle.put_data.remote(prompt_batch_meta))
+                # Register all requests with PSManager and dispatch the entire batch
+                # to the agent-loop manager in a single call for maximal dispatch
+                # throughput and rollout batching efficiency.
+                psrl_logger.debug(f"Generating {batch_size} prompts x rollout_n={self.rollout_n} children")
+                if isinstance(batch, KVBatchMeta):
+                    all_request_ids = [tag["uid"] for tag in batch.tags]
+                else:
+                    all_request_ids = tu.get(batch, "uid")
+                ray.get(self.ps_manager_handle.add_request.remote(all_request_ids))
+                ray.get(self.agent_loop_manager_handle.put_data.remote(batch))
 
                 self.global_steps += 1
                 if self.total_training_steps is not None and self.global_steps >= self.total_training_steps:

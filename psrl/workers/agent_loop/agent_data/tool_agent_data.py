@@ -377,23 +377,22 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
                 "uid": np.array([self.session_data.request_id]),
                 "n_trajectory": np.array([len(self.session_data.trajectories)]),
                 "data_source": np.array([self.session_data.data_source]),
+                "reward_model": np.array([self.session_data.reward_model], dtype=object),
+                "extra_info": np.array([self.session_data.extra_info], dtype=object),
+                "reward_model_dicts": np.array([self.session_data.reward_model_dicts], dtype=object),
             }
             if self.session_data.parent_id is not None:
                 tensor_dict["parent_id"] = np.array([self.session_data.parent_id])
-            data = tu.get_tensordict(
-                tensor_dict=tensor_dict,
-                non_tensor_dict={"validate": self.session_data.validate},
-            )
-            reward_meta_infos = [{
-                "reward_model": self.session_data.reward_model,
-                "extra_info": self.session_data.extra_info,
-                "reward_model_dicts": self.session_data.reward_model_dicts,
-            }]
 
-            self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(
-                data,
-                reward_meta_infos=reward_meta_infos,
-            )["reward_score"]
+            reward_data = tu.get_tensordict(
+                tensor_dict=tensor_dict,
+                non_tensor_dict={
+                    "validate": self.session_data.validate,
+                },
+            )
+
+            reward_result = await self.reward_manager.compute_score.remote(reward_data)
+            self.get_current_step().model_reward = reward_result["reward_score"]
 
         # Check if response length limit is reached
         if self.session_data.trajectories[-1].response_length >= self.config.gen_actor_rollout_ref.rollout.response_length:

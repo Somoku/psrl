@@ -54,8 +54,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
             cfg_get(config, "data.max_prompt_length", cfg_get(config, "rollout.prompt_length", 8192))
         ),
         request_budget=request_budget,
-        enable_routing_loop=routing_method
-        in {"request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"},
+        enable_routing_loop=True,
         routing_loop_check_interval_ms=int(cfg_get(config, "psrl.routing_strategy.check_interval_in_ms", 10)),
         routing_loop_request_sort_key=str(
             cfg_get(config, "psrl.routing_strategy.request_sort_indicator", "short_length")

@@ -82,6 +82,7 @@ class AgentLoopConfig(_VeRLAgentLoopConfig):
     gamma: float = 0.0
     reward_bonus_coeff: float = 0.0
     traj_reward_mode: str = "traj"
+    default_agent_loop: str = "generate_only_agent"
 
 
 @dataclass

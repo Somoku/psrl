@@ -12,6 +12,8 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig
 
+from psrl.utils.common.http_utils import init_distributed_post_pool
+from psrl.utils.dataset import DatasetType
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -35,6 +37,7 @@ class PSRL_AgentLoopManager:
         data_queue_size: int,
         agent_loop_workers: list[ray.actor.ActorHandle],
         ps_manager_handle: ray.actor.ActorHandle,
+        data_processor: ray.actor.ActorHandle,
         group_post_process_fn=None,
         buffer_post_process_fn=None,
     ):
@@ -47,6 +50,7 @@ class PSRL_AgentLoopManager:
             data_queue_size (int): Size of the data queue.
             agent_loop_workers (list[ray.actor.ActorHandle]): List of agent loop worker instances.
             ps_manager_handle (ray.actor.ActorHandle): Handle to the parameter server manager.
+            data_processor (ray.actor.ActorHandle): Handle to the data processor.
             group_post_process_fn (Optional[callable]): Optional function to post-process
                 grouped entry data before occupying the buffer
             buffer_post_process_fn (Optional[callable]): Optional function to post-process
@@ -81,8 +85,11 @@ class PSRL_AgentLoopManager:
 
         self.train_data_queue: asyncio.Queue = asyncio.Queue(maxsize=data_queue_size)
         self.val_data_queue: asyncio.Queue = asyncio.Queue(maxsize=data_queue_size)
+        self.result_queue = asyncio.Queue()
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
+        self.data_processor = data_processor
+        self.distributed_post_actors: list[ray.actor.ActorHandle] = []
 
         self._request_counter = 0
         self._dispatch_idx = 0
@@ -92,6 +99,7 @@ class PSRL_AgentLoopManager:
         self.val_dispatch_task: asyncio.Task | None = None
         self.stop_train_dispatch_task = False
         self.stop_val_dispatch_task = False
+        self.stop_collect_task = False
 
         self.curr_ps_version_tag = 0
 
@@ -134,6 +142,60 @@ class PSRL_AgentLoopManager:
     # AGENT(VERL): `generate_sequences`, `_run_agent_loop` are moved to agent loop workers.
     # The manager only handles data distribution and coordination.
 
+    async def _init_distributed_post_pool(self) -> None:
+        if (
+            not self.config.psrl.rollout_gateway.use_distributed_post
+            or self.distributed_post_actors
+        ):
+            return
+
+        n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
+        n_validate_instances = (
+            self.config.psrl.deployment.n_validate_instances
+            if self.config.psrl.colocate_validate_and_train
+            else 0
+        )
+        n_active_instance = n_rollout_instances + n_validate_instances
+
+        total_concurrency = self.config.psrl.rollout_gateway.server_max_concurrency * n_active_instance
+        post_actor_num_per_node = self.config.psrl.rollout_gateway.get("post_actor_num_per_node", 1)
+        self.distributed_post_actors = init_distributed_post_pool(
+            total_concurrency=total_concurrency,
+            post_actor_num_per_node=post_actor_num_per_node,
+        )
+        await asyncio.gather(
+            *[
+                worker.set_distributed_post_actors.remote(
+                    self.distributed_post_actors,
+                    True,
+                    worker_index,
+                )
+                for worker_index, worker in enumerate(self.agent_loop_workers)
+            ]
+        )
+        psrl_logger.info(
+            "Distributed POST pool started: actors=%d actors_per_node=%d total_concurrency=%d "
+            "server_max_concurrency=%d engines=%d.",
+            len(self.distributed_post_actors),
+            post_actor_num_per_node,
+            total_concurrency,
+            self.config.psrl.rollout_gateway.server_max_concurrency,
+            n_active_instance,
+        )
+
+    async def _shutdown_distributed_post_pool(self) -> None:
+        if not self.distributed_post_actors:
+            return
+        await asyncio.gather(
+            *[worker.set_distributed_post_actors.remote(None, False, 0) for worker in self.agent_loop_workers],
+            return_exceptions=True,
+        )
+        await asyncio.gather(
+            *[actor.aclose.remote() for actor in self.distributed_post_actors],
+            return_exceptions=True,
+        )
+        self.distributed_post_actors = []
+
     def set_val_buffer_size(self, val_buffer_size: int):
         """Set the validation buffer size."""
         self.val_buffer_size = val_buffer_size
@@ -149,6 +211,7 @@ class PSRL_AgentLoopManager:
             return
 
         # Start the busy loop of agent loop workers.
+        await self._init_distributed_post_pool()
         await asyncio.gather(
             *[worker.start_busy_loop.remote() for worker in self.agent_loop_workers]
         )
@@ -159,33 +222,86 @@ class PSRL_AgentLoopManager:
         self.train_dispatch_task.add_done_callback(lambda f: f.result())
         self.val_dispatch_task = self.running_loop.create_task(self._val_dispatch_data())
         self.val_dispatch_task.add_done_callback(lambda f: f.result())
+        self.collect_task = self.running_loop.create_task(self._collect_results())
+        self.collect_task.add_done_callback(lambda f: f.result())
 
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for all tasks to complete."""
         if (
             (not self.train_dispatch_task or self.train_dispatch_task.done())
             and (not self.val_dispatch_task or self.val_dispatch_task.done())
+            and (not self.collect_task or self.collect_task.done())
         ):
             return
 
         self.stop_train_dispatch_task = True
         self.stop_val_dispatch_task = True
-        await asyncio.gather(self.train_dispatch_task, self.val_dispatch_task)
+        self.stop_collect_task = True
+        await asyncio.gather(self.train_dispatch_task, self.val_dispatch_task, self.collect_task)
 
         await asyncio.gather(
             *[worker.stop_busy_loop.remote() for worker in self.agent_loop_workers]
         )
+        await self._shutdown_distributed_post_pool()
 
-    async def put_data(self, batch_meta: KVBatchMeta, is_validate: bool = False):
+    async def put_data(self, batch: TensorDict, is_validate: bool = False):
         """Put objectref of data into the manager's data queue."""
         queue = self.val_data_queue if is_validate else self.train_data_queue
-        await queue.put(batch_meta)
+        await queue.put(batch)
+
+    async def put_result(self, result: dict):
+        """Put result data into the manager's result queue."""
+        await self.result_queue.put(result)
+
+    async def _collect_results(self):
+        """Main collection loop that gathers results from workers.
+
+        Drains all available results from the queue and processes them.
+        Validation results are batched through ``occupy_requests`` to avoid
+        per-request lock acquisition overhead. Training results still go
+        through the per-request path because group sampling can trigger retry
+        and abort side effects per prompt.
+        """
+        while not self.stop_collect_task:
+            # Drain all available results from the queue, separating train/val.
+            train_results: list[dict] = []
+            val_results: list[dict] = []
+            while not self.result_queue.empty():
+                result = self.result_queue.get_nowait()
+                if result.get("is_validate", False):
+                    val_results.append(result)
+                else:
+                    train_results.append(result)
+
+            if val_results:
+                await self.occupy_requests(
+                    request_id=[r["request_id"] for r in val_results],
+                    prompt_id=[r["prompt_id"] for r in val_results],
+                    rollout_instance_id=[r["rollout_instance_id"] for r in val_results],
+                    version_tag=[r["version_tag"] for r in val_results],
+                    n_trajectory=[r.get("n_trajectory", 1) for r in val_results],
+                    is_validate=True,
+                )
+
+            # Process training results one-by-one (group sampling requires it).
+            for result in train_results:
+                occupy_success = await self.occupy_requests(**result)
+                if not occupy_success and result["n_trajectory"] > 1:
+                    keys = [f"{result['request_id']}_{i}" for i in range(result["n_trajectory"])]
+                    await tq.async_kv_clear(
+                        keys=keys,
+                        partition_id="train",
+                    )
+
+            if not train_results and not val_results:
+                await asyncio.sleep(0)  # Yield control to the event loop only when idle
+        psrl_logger.info("Stop collecting results.")
 
     async def _train_dispatch_data(self):
         """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_train_dispatch_task:
             if not self.train_data_queue.empty():
-                data: KVBatchMeta | None = self.train_data_queue.get_nowait()
+                data: TensorDict | None = self.train_data_queue.get_nowait()
             else:
                 await asyncio.sleep(0)
                 continue
@@ -195,8 +311,6 @@ class PSRL_AgentLoopManager:
                 psrl_logger.info("Received END signal, stopping agent loop manager train dispatch task.")
                 self.stop_train_dispatch_task = True
                 continue
-
-            batch_size = len(data)
 
             # Wait for version update in ps
             # NOTE(lhy): we restrict the extra dispatched data to be no more than (staleness + 1) * buffer_size
@@ -212,20 +326,20 @@ class PSRL_AgentLoopManager:
                 psrl_logger.info(f"ps model version updated to {self.curr_ps_version_tag}, continue to dispatch")
 
             # Initialize the version tag to -1 for all requests
-            data = kv_batch_meta_update_tags(data, "version_tag", -1)
+            tu.assign_non_tensor_stack(data, "version_tag", [-1] * len(data))
 
             # Dispatch data to agent loop workers
             await self._inner_dispatch_data(data, is_validate=False)
             # Increment counter after dispatch so _get_expected_ps_version reflects the number
             # of requests that have actually been sent out.
-            self._request_counter += batch_size
+            self._request_counter += len(data)
             await asyncio.sleep(0)  # Yield control to the event loop
 
     async def _val_dispatch_data(self):
         """Main dispatch loop that processes data from the queue and routes to workers."""
         while not self.stop_val_dispatch_task:
             if not self.val_data_queue.empty():
-                data: KVBatchMeta | None = self.val_data_queue.get_nowait()
+                data: TensorDict | None = self.val_data_queue.get_nowait()
             else:
                 await asyncio.sleep(0)
                 continue
@@ -236,9 +350,9 @@ class PSRL_AgentLoopManager:
                 self.stop_val_dispatch_task = True
                 continue
 
-            batch_size = len(data)
             # Validation samples all share the current PS version.
-            data = kv_batch_meta_update_tags(data, "version_tag", [self.curr_ps_version_tag] * batch_size)
+            # data = kv_batch_meta_update_tags(data, "version_tag", [self.curr_ps_version_tag] * batch_size)
+            tu.assign_non_tensor_stack(data, "version_tag", [self.curr_ps_version_tag] * len(data))
 
             # Dispatch data to agent loop workers
             await self._inner_dispatch_data(data, is_validate=True)
@@ -260,9 +374,8 @@ class PSRL_AgentLoopManager:
             if data is None:
                 raise ValueError("Data queue should not contain None when retrying requests.")
 
-        batch_size = len(data)
         data = kv_batch_meta_update_tags(data, "version_tag", -1)
-        psrl_logger.info(f"Retry {batch_size} requests")
+        psrl_logger.info(f"Retry {len(data)} requests")
         await self._inner_dispatch_data(data, is_validate=False)
 
     def _get_expected_ps_version(self):
@@ -277,11 +390,11 @@ class PSRL_AgentLoopManager:
         expected_ps_version = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
         return expected_ps_version
 
-    async def _inner_dispatch_data(self, data: KVBatchMeta, is_validate: bool = False):
+    async def _inner_dispatch_data(self, data: TensorDict, is_validate: bool = False):
         """Update request status to RUNNING in PSManager, then fan out to workers."""
         # Rows are ordered as contiguous groups of `rollout_n` children per parent.
-        uids = [tag["uid"] for tag in data.tags]
-        versions = [tag["version_tag"] for tag in data.tags]
+        uids = tu.get(data, "uid")
+        versions = tu.get(data, "version_tag")
 
         # Update request status from PENDING to RUNNING
         update_status_success = await self.ps_manager_handle.update_request_status.remote(
@@ -295,20 +408,11 @@ class PSRL_AgentLoopManager:
 
         dispatch_plan = self.get_dispatch_plan(data, is_validate=is_validate)
         for worker_index, batch in dispatch_plan.items():
-            if not batch:
-                continue
-
-            # Dispatch data to the corresponding worker
-            requests = batch.chunk(len(batch))
-            tasks = [
-                self.agent_loop_workers[worker_index].add_agent_program.remote(request)
-                for request in requests
-            ]
-            await asyncio.gather(*tasks)
+            self.agent_loop_workers[worker_index].add_agent_program.remote(batch)
 
     def get_dispatch_plan(
-        self, data: KVBatchMeta, is_validate: bool = False
-    ) -> dict[int, KVBatchMeta]:
+        self, data: TensorDict, is_validate: bool = False
+    ) -> dict[int, TensorDict]:
         """Round-robin dispatch plan keyed by worker index, co-locating siblings.
 
         Children sharing a ``parent_id`` (group sampling) land on the same worker.
@@ -316,10 +420,7 @@ class PSRL_AgentLoopManager:
         keys_by_worker: dict[int, list[str]] = {}
         prompt_to_worker: dict[int, int] = {}
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-        if rollout_n > 1:
-            prompt_ids = [tag["parent_id"] for tag in data.tags]
-        else:
-            prompt_ids = [tag["uid"] for tag in data.tags]
+        prompt_ids = tu.get(data, "parent_id") if rollout_n > 1 else tu.get(data, "uid")
 
         # Round-robin dispatching
         for i, prompt_id in enumerate(prompt_ids):
@@ -328,146 +429,172 @@ class PSRL_AgentLoopManager:
             else:
                 worker_index = (self._dispatch_idx + prompt_id) % len(self.agent_loop_workers)
                 prompt_to_worker[prompt_id] = worker_index
-            keys_by_worker.setdefault(worker_index, []).append(data.keys[i])
+            keys_by_worker.setdefault(worker_index, []).append(i)
 
         return {
-            worker_index: data.select_keys(keys) if keys else None
+            worker_index: data[keys] if keys else None
             for worker_index, keys in keys_by_worker.items()
         }
 
     async def occupy_requests(
         self,
-        request_id: int,
-        prompt_id: int,
+        request_id: int | list[int],
+        prompt_id: int | list[int],
         rollout_instance_id: RolloutInstanceId | tuple | list,
-        version_tag: int,
-        n_trajectory: int = 1,
+        version_tag: int | list[int],
+        n_trajectory: int | list[int] = 1,
         is_validate: bool = False,
     ) -> bool:
         """Flat-arg RPC invoked by rollout workers once a request finishes.
 
-        The rollout worker has already written the per-sample TensorDict to
-        TQ under ``str(request_id)``. This method just appends the
-        corresponding ``EntryInfo`` into the manager's trackers and triggers
-        PSManager occupation, running group/buffer post-processing on
-        KVBatchMeta slices (never on tensor payload).
-        
+        The rollout worker has already written the per-sample TensorDict to TQ
+        under ``str(request_id)``. This method accepts either a single request
+        via scalar arguments or a batch via list arguments (all list args must
+        share the same length). It appends the corresponding ``EntryInfo``
+        objects into the manager's trackers and triggers PSManager occupation,
+        running group/buffer post-processing on KVBatchMeta slices (never on
+        tensor payload).
+
         Returns:
             bool: True if the request is occupied, False if the request is aborted.
         """
+        # Normalize scalar inputs to batch form.
+        if isinstance(request_id, list):
+            request_ids, prompt_ids, rollout_instance_ids, version_tags = (
+                request_id, prompt_id, rollout_instance_id, version_tag
+            )
+            n_trajectories = n_trajectory if isinstance(n_trajectory, list) else [n_trajectory] * len(request_ids)
+        else:
+            request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories = (
+                [request_id], [prompt_id], [rollout_instance_id], [version_tag], [n_trajectory]
+            )
+
+        if not request_ids:
+            return False
+
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             alg_rollout_n = self.val_rollout_n if is_validate else self.alg_rollout_n
 
-            ready_buffer_ids: set[int] = set() # Buffer IDs that are READY after occupation
+            ready_buffer_ids: set[int] = set()
             occupy_futures: list = []
-            abort_request_ids: list[int] = [] # Used to abort requests in the data pool
-            prompt_to_occupy_requests: dict[int, list[EntryInfo]] = {}
+            abort_request_ids: list[int] = []
 
             # 1. Judge whether to abort requests and occupy requests in the PS worker
-            if rollout_n > 1:
-                entry_info = EntryInfo(
-                    rollout_instance_id=rollout_instance_id,
-                    request_idx=request_id % rollout_n,
-                    prompt_id=prompt_id,
-                    model_version=version_tag,
-                    n_trajectory=n_trajectory,
-                    is_validate=is_validate,
-                )
-                self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
-                psrl_logger.debug(
-                    f"Store data for prompt {prompt_id} with info {entry_info}, "
-                    f"request num: {len(self.rollout_request_tracker[prompt_id])}"
-                )
-
-                if len(self.rollout_request_tracker[prompt_id]) >= alg_rollout_n:
-                    psrl_logger.debug(
-                        f"Reached/Required: "
-                        f"({len(self.rollout_request_tracker[prompt_id])}/{alg_rollout_n}) "
-                        f"samples for prompt {prompt_id}"
-                    )
-                    entry_infos = self.rollout_request_tracker.pop(prompt_id)
-                    psrl_logger.debug(
-                        f"Popped entry_infos from rollout_request_tracker for prompt_id {prompt_id}, "
-                        f"entry count: {len(entry_infos)}"
-                    )
-
-                    all_child_idxs = set(range(rollout_n))
-                    stored_child_idxs = set()
-                    for entry_info in entry_infos:
-                        assert isinstance(entry_info.request_idx, int), (
-                            f"entry_info.request_idx should be int, but got {type(entry_info.request_idx)}"
-                        )
-                        request_idx: int = entry_info.request_idx
-                        stored_child_idxs.add(request_idx)
-                    abort_child_idxs = all_child_idxs - stored_child_idxs
-                    abort_child_ids = [prompt_id * rollout_n + idx for idx in abort_child_idxs]
-                    psrl_logger.debug(
-                        f"Stored child IDs: "
-                        f"{[prompt_id * rollout_n + idx for idx in stored_child_idxs]}, "
-                        f"Abort child IDs: {abort_child_ids}"
-                    )
-
-                    # Notify the request status manager to abort the child requests
-                    if abort_child_ids:
-                        assert not is_validate, "Abort child requests should not happen in validation"
-                        psrl_logger.info(f"Aborting child requests {abort_child_ids} for sample {prompt_id}.")
-                        with log_dual_events(
-                            f"Abort {len(abort_child_ids)} requests",
-                            psrl_logger,
-                            level=logging.INFO,
-                            event_type=EventType.OTHER,
-                        ):
-                            await self.ps_manager_handle.abort_requests.remote(
-                                list(abort_child_ids), blocking=False
-                            )
-
-                    # Abort the extra finished entries beyond alg_rollout_n
-                    abort_request_ids.extend(
-                        [
-                            prompt_id * rollout_n + entry_info.request_idx
-                            for entry_info in entry_infos[alg_rollout_n:]
-                        ]
-                    )
-
-                    alg_entry_infos = entry_infos[:alg_rollout_n]
-                    add_data = True
-                    # Perform group post-processing for training data only
-                    if self.group_post_process_fn:
-                        add_data = await self._group_post_process(alg_entry_infos)
-
-                    if not add_data:
-                        # Retry immediately and no occupation
-                        # NOTE(linsh): data has been cleared in `_group_post_process`
-                        psrl_logger.info(
-                            f"Post-processing function returned empty data for "
-                            f"prompt {prompt_id}. Retrying immediately."
-                        )
-                        # Clear the reserved entries for the group entry
-                        await self.ps_manager_handle.clear_reserved_entries.remote(prompt_id, is_validate)
-                        # Notify agent loop manager to retry new requests
-                        await self._retry_data()
-                    else:
-                        prompt_to_occupy_requests[prompt_id] = alg_entry_infos
-                        request_ids = [
-                            prompt_id * rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
-                        ]
-                        occupy_futures.append(
-                            self.ps_manager_handle.occupy_rollout_instance_request.remote(
-                                prompt_id=prompt_id,
-                                request_ids=request_ids,
-                                is_validate=is_validate,
-                            )
-                        )
-            else:
-                # Without group sampling (e.g., PPO)
-                # Group post processing is not used and every data will be added
-                occupy_futures.append(
-                    self.ps_manager_handle.occupy_rollout_instance_request.remote(
-                        prompt_id=request_id,
+            for request_id, prompt_id, rollout_instance_id, version_tag, n_trajectory in zip(
+                request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories
+            ):
+                # Update n_trajectory in PSManager (moved from worker to avoid
+                # an extra per-request PSManager RPC on the worker's critical path).
+                if n_trajectory > 1:
+                    await self.ps_manager_handle.update_request_n_trajectory.remote(
+                        request_id=request_id,
+                        n_trajectory=n_trajectory,
                         is_validate=is_validate,
                     )
-                )
+
+                if rollout_n > 1:
+                    entry_info = EntryInfo(
+                        rollout_instance_id=rollout_instance_id,
+                        request_idx=request_id % rollout_n,
+                        prompt_id=prompt_id,
+                        model_version=version_tag,
+                        n_trajectory=n_trajectory,
+                        is_validate=is_validate,
+                    )
+                    self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
+                    psrl_logger.debug(
+                        f"Store data for prompt {prompt_id} with info {entry_info}, "
+                        f"request num: {len(self.rollout_request_tracker[prompt_id])}"
+                    )
+
+                    if len(self.rollout_request_tracker[prompt_id]) >= alg_rollout_n:
+                        psrl_logger.debug(
+                            f"Reached/Required: "
+                            f"({len(self.rollout_request_tracker[prompt_id])}/{alg_rollout_n}) "
+                            f"samples for prompt {prompt_id}"
+                        )
+                        entry_infos = self.rollout_request_tracker.pop(prompt_id)
+                        psrl_logger.debug(
+                            f"Popped entry_infos from rollout_request_tracker for prompt_id {prompt_id}, "
+                            f"entry count: {len(entry_infos)}"
+                        )
+
+                        all_child_idxs = set(range(rollout_n))
+                        stored_child_idxs = set()
+                        for entry_info in entry_infos:
+                            assert isinstance(entry_info.request_idx, int), (
+                                f"entry_info.request_idx should be int, but got {type(entry_info.request_idx)}"
+                            )
+                            request_idx: int = entry_info.request_idx
+                            stored_child_idxs.add(request_idx)
+                        abort_child_idxs = all_child_idxs - stored_child_idxs
+                        abort_child_ids = [prompt_id * rollout_n + idx for idx in abort_child_idxs]
+                        psrl_logger.debug(
+                            f"Stored child IDs: "
+                            f"{[prompt_id * rollout_n + idx for idx in stored_child_idxs]}, "
+                            f"Abort child IDs: {abort_child_ids}"
+                        )
+
+                        # Notify the request status manager to abort the child requests
+                        if abort_child_ids:
+                            assert not is_validate, "Abort child requests should not happen in validation."
+                            psrl_logger.info(f"Aborting child requests {abort_child_ids} for sample {prompt_id}.")
+                            with log_dual_events(
+                                f"Abort {len(abort_child_ids)} requests",
+                                psrl_logger,
+                                level=logging.INFO,
+                                event_type=EventType.OTHER,
+                            ):
+                                await self.ps_manager_handle.abort_requests.remote(
+                                    list(abort_child_ids), blocking=False
+                                )
+
+                        # Abort the extra finished entries beyond alg_rollout_n
+                        abort_request_ids.extend(
+                            [
+                                prompt_id * rollout_n + entry_info.request_idx
+                                for entry_info in entry_infos[alg_rollout_n:]
+                            ]
+                        )
+
+                        alg_entry_infos = entry_infos[:alg_rollout_n]
+                        add_data = True
+                        # Perform group post-processing for training data only.
+                        if self.group_post_process_fn and not is_validate:
+                            add_data = await self._group_post_process(alg_entry_infos)
+
+                        if not add_data:
+                            # Retry immediately and no occupation.
+                            # NOTE(linsh): data has been cleared in `_group_post_process`.
+                            psrl_logger.info(
+                                f"Post-processing function returned empty data for "
+                                f"prompt {prompt_id}. Retrying immediately."
+                            )
+                            # Clear the reserved entries for the group entry.
+                            await self.ps_manager_handle.clear_reserved_entries.remote(prompt_id, is_validate)
+                            # Notify agent loop manager to retry new requests.
+                            await self._retry_data()
+                        else:
+                            child_request_ids = [
+                                prompt_id * rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
+                            ]
+                            occupy_futures.append(
+                                self.ps_manager_handle.occupy_rollout_instance_request.remote(
+                                    prompt_id=prompt_id,
+                                    request_ids=child_request_ids,
+                                    is_validate=is_validate,
+                                )
+                            )
+                else:
+                    # Without group sampling (e.g., PPO).
+                    # Group post processing is not used and every data will be added.
+                    occupy_futures.append(
+                        self.ps_manager_handle.occupy_rollout_instance_request.remote(
+                            prompt_id=request_id,
+                            is_validate=is_validate,
+                        )
+                    )
 
             # 2. Occupy requests in the PS worker
             if not occupy_futures:
@@ -601,8 +728,14 @@ class PSRL_AgentLoopManager:
         keys: list[str] = []
         tags: list[dict] = []
         for entry_info in entry_infos:
-            request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
-            n_trajectories = entry_info.n_trajectory if isinstance(entry_info.n_trajectory, list) else [entry_info.n_trajectory] * len(request_idxs)
+            request_idxs = (
+                entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
+            )
+            n_trajectories = (
+                entry_info.n_trajectory
+                if isinstance(entry_info.n_trajectory, list)
+                else [entry_info.n_trajectory] * len(request_idxs)
+            )
             request_idxs, n_trajectories = zip(*sorted(zip(request_idxs, n_trajectories), key=lambda x: x[0]))
             model_versions = (
                 entry_info.model_version if isinstance(entry_info.model_version, list) else [entry_info.model_version]
@@ -659,7 +792,7 @@ class PSRL_AgentLoopManager:
             else:
                 for i in range(entry_info.n_trajectory):
                     keys.append(f"{entry_info.prompt_id * self.rollout_n + entry_info.request_idx}_{i}")
-        
+
         # TODO(linsh): optimize by only fetching necessary columns for post-processing instead of the full TD.
         meta = KVBatchMeta(
             keys=keys,
@@ -727,7 +860,7 @@ class PSRL_AgentLoopManager:
         request_ids = tu.get_non_tensor_data(processed_data, "uid")
         trajectory_indexs = tu.get_non_tensor_data(processed_data, "trajectory_index")
         trajectory_nums = tu.get_non_tensor_data(processed_data, "trajectory_num")
-        
+
         kept_keys = []
         for request_id, trajectory_index, trajectory_num in zip(request_ids, trajectory_indexs, trajectory_nums):
             if trajectory_num == 1:
@@ -854,7 +987,7 @@ class PSRL_AgentLoopManager:
                     is_validate=is_validate,
                 )
                 entry_infos_map[request_id] = entry_info
-        return list(entry_infos_map.values())   
+        return list(entry_infos_map.values())
 
     def log_ready_buffer(self, buffer_id: int, is_validate: bool = False):
         """Log the ready buffer.
@@ -896,7 +1029,7 @@ class PSRL_AgentLoopManager:
             return
         min_ready_buffer_id = min(data_buffers.keys())
 
-         # Wake all Futures waiting for this buffer
+        # Wake all Futures waiting for this buffer
         if min_ready_buffer_id in _buffer_waiters:
             batch: KVBatchMeta = self.consume_buffer(min_ready_buffer_id, is_validate=is_validate)
             assert len(_buffer_waiters[min_ready_buffer_id]) == 1, (
@@ -950,9 +1083,7 @@ class PSRL_AgentLoopManager:
                     f"and moving some occupied entries from other buffers to make it ready."
                 )
                 # First, abort the reserved requests in the buffer
-                aborted_entry_num, _ = await self.ps_manager_handle.abort_reserved_requests.remote(
-                    buffer_id
-                )
+                aborted_entry_num, _ = await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
                 # NOTE(linsh): the aborted requests have been cleared from tq in ps manager
 
                 # Then, move the occupied entries from other buffers to the buffer
@@ -1060,14 +1191,20 @@ class PSRL_AgentLoopManager:
         self._val_buffer_waiters.setdefault(buffer_id, []).append(fut)
         return await fut
 
-    async def generate_validate_sequences(self, batch: KVBatchMeta) -> int:
+    async def generate_validate_sequences(self) -> int:
         """Dispatch a validation batch; returns the val buffer id."""
-        prompt_num = len(batch) // self.val_rollout_n
-        prompt_batch_metas = batch.chunk(prompt_num)
-        for prompt_batch_meta in prompt_batch_metas:
-            request_ids = [tag["uid"] for tag in prompt_batch_meta.tags]
-            await self.ps_manager_handle.add_request.remote(request_ids, is_validate=True)
-            await self.put_data(prompt_batch_meta, is_validate=True)
+        test_batch: TensorDict = await self.data_processor.get_single_controller_batch.remote(
+            DatasetType.val, return_meta=False
+        )
+        prompt_num = len(test_batch) // self.val_rollout_n
+        self.set_val_buffer_size(prompt_num)
+        await self.ps_manager_handle.set_val_staleness_inventory_capacity.remote(prompt_num)
+
+        # Batch dispatch: register all request IDs and send the full batch in one
+        # call for maximal dispatch throughput and vLLM batching efficiency.
+        all_request_ids = tu.get(test_batch, "uid")
+        await self.ps_manager_handle.add_request.remote(all_request_ids, is_validate=True)
+        await self.put_data(test_batch, is_validate=True)
         self._val_buffer_id += 1
 
         return self._val_buffer_id - 1

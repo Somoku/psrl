@@ -637,24 +637,21 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 "uid": np.array([self.session_data.request_id]),
                 "n_trajectory": np.array([len(outputs)]),
                 "data_source": np.array([self.session_data.data_source]),
+                "reward_model": np.array([self.session_data.reward_model], dtype=object),
+                "extra_info": np.array([self.session_data.extra_info], dtype=object),
+                "reward_model_dicts": np.array([self.session_data.reward_model_dicts], dtype=object),
             }
             if self.session_data.parent_id is not None:
                 tensor_dict["parent_id"] = np.array([self.session_data.parent_id])
 
-            data = tu.get_tensordict(
+            reward_data = DataProto.from_dict(
                 tensor_dict=tensor_dict,
-                non_tensor_dict={"validate": self.session_data.validate},
+                non_tensor_dict={
+                    "validate": self.session_data.validate,
+                },
             )
-            reward_meta_infos = [{
-                "reward_model": self.session_data.reward_model,
-                "extra_info": self.session_data.extra_info,
-                "reward_model_dicts": self.session_data.reward_model_dicts,
-            }]
 
-            reward_result = await self.reward_manager.compute_score.remote(
-                data,
-                reward_meta_infos=reward_meta_infos,
-            )
+            reward_result = await self.reward_manager.compute_score.remote(reward_data)
             if not self.config.reward.launch_reward_fn_async:
                 if not reward_result:
                     return None

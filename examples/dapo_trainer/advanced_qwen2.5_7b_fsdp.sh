@@ -166,12 +166,12 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.grad_clip=1.0 \
     train_actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
     \
-    reward.reward_models.0.reward_manager.name=dapo \
-    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
-    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
-    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
-    reward.reward_models.0.reward_kwargs.overlong_buffer_cfg.log=False \
-    reward.reward_models.0.reward_kwargs.max_resp_len=${max_response_length} \
+    reward.active_managers='[dapo]' \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.log=False \
+    reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

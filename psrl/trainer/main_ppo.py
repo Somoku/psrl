@@ -17,6 +17,7 @@ from verl.utils.device import auto_set_device, is_cuda_available
 
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.config import validate_config
+from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen_dplb.vllm_rollout import PSRL_ServerAdapter
 
 psrl_logger = logging.getLogger(__file__)
@@ -307,7 +308,7 @@ class TaskRunner:
 
         # Reward model resource pool
         total_reward_pool_id_list = [] if not deployment_config.elastic_rm.enable else ["shared_rollout_pool"]
-        for reward_model in config.reward.reward_models:
+        for reward_model in resolve_active_managers(config.reward):
             if reward_model.reward_loop_type != "gen":
                 continue
             if deployment_config.elastic_rm.enable:

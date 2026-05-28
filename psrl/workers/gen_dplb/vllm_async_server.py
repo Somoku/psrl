@@ -302,7 +302,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
             )
             dp_args = {
-                "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
                 "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
                 "data_parallel_address": self._master_address,
@@ -310,7 +309,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             }
             args.update(dp_args)
 
-        args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
+        args.update({
+            "data_parallel_size": self.config.data_parallel_size,
+            "enable_expert_parallel": self.config.expert_parallel_size > 1,
+        })
 
         # used for torch.distributed.init_process_group
         if self.nnodes > 1:

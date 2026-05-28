@@ -5,7 +5,7 @@ pytestmark = pytest.mark.cpu_test
 
 
 def test_reward_yaml_merges_psrl_fields():
-    """Verify that ppo_trainer config composes both veRL base and PSRL incremental reward fields."""
+    """Verify that ppo_trainer config composes PSRL reward fields correctly."""
     import os
 
     from hydra import compose, initialize_config_dir
@@ -14,15 +14,19 @@ def test_reward_yaml_merges_psrl_fields():
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         cfg = compose(config_name="ppo_trainer")
 
-    # veRL base fields (from verl's reward/reward.yaml via PSRLSearchPath)
-    assert cfg.reward.num_workers == 8
-    assert cfg.reward.reward_manager.name == "naive"
-    assert cfg.reward.reward_model.enable is False
-
-    # PSRL incremental fields (from psrl_reward.yaml, merged into same key)
-    assert "reward_models" in cfg.reward
-    assert isinstance(cfg.reward.reward_models, list)
-    assert cfg.reward.reward_normalization.enable is False
-    assert cfg.reward.reward_normalization.level == "batch"
+    # PSRL reward fields (from psrl's reward/reward.yaml)
+    assert "managers" in cfg.reward
+    assert isinstance(dict(cfg.reward.managers), dict)
+    assert "active_managers" in cfg.reward
+    assert isinstance(list(cfg.reward.active_managers), list)
+    assert "dapo" in cfg.reward.active_managers
+    assert "dapo" in cfg.reward.managers
     assert cfg.reward.launch_reward_fn_async is False
-    assert cfg.reward.data_processor.path is None
+
+    # Verify the dapo manager has expected structure
+    dapo_cfg = cfg.reward.managers.dapo
+    assert dapo_cfg.reward_loop_type == "dapo"
+    assert dapo_cfg.reward_manager.name == "dapo"
+    assert dapo_cfg.reward_manager.source == "register"
+    assert dapo_cfg.reward_kwargs.max_resp_len == 5120
+    assert dapo_cfg.reward_kwargs.overlong_buffer_cfg.enable is True

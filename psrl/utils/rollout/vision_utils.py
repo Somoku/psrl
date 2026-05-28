@@ -3,9 +3,7 @@ import base64
 import io
 import logging
 from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from PIL import Image as PILImage
+from PIL import Image as PILImage
 
 psrl_logger = logging.getLogger(__name__)
 

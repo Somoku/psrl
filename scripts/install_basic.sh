@@ -79,7 +79,7 @@ python -c "from smg.router import Router; print('  ✓ smg.router binding instal
 echo "7. Install vllm and verl"
 if [ -z "$VLLM_PATH" ]; then
     pushd $THIRD_PARTY_PATH
-    git clone -b releases/v0.18.0 https://github.com/vllm-project/vllm.git
+    git clone -b releases/v0.18.1 https://github.com/vllm-project/vllm.git
     VLLM_PATH=$THIRD_PARTY_PATH/vllm
     popd
 fi
@@ -94,7 +94,7 @@ if [ -z "$VERL_PATH" ]; then
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     cd $VERL_PATH
-    git checkout a97e217b
+    git checkout 03bc8411
     popd
 fi
 pushd $VERL_PATH

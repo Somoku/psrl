@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import copy
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -9,21 +8,25 @@ from contextlib import nullcontext
 import numpy as np
 import ray
 import torch
-from PIL import Image
 import transfer_queue as tq
+from PIL import Image
+from tensordict import NonTensorData, NonTensorStack, TensorDict
 from transfer_queue import KVBatchMeta
-from tensordict import  NonTensorData, NonTensorStack
 from transformers import AutoProcessor, AutoTokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.tokenizer import normalize_token_ids
 
-from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
+from psrl.utils.common.http_utils import (
+    is_distributed_post_enabled,
+    request_json_maybe_distributed,
+)
+from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
 from psrl.workers.agent_loop.sticky_session import sticky_session
-
 from psrl.workers.gen_dplb.utils import TokenInput, TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -208,6 +211,8 @@ class AgentLoopBase(ABC):
             outputs = [outputs]
         # NOTE(linsh): Only compute reward for the last trajectory.
         final_output = outputs[-1]
+
+        # Build TensorDict: tensors in batch, metadata in non_tensor_batch/meta_info
         tensor_dict = {
             "prompts": torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0),
             "responses": torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0),
@@ -217,24 +222,21 @@ class AgentLoopBase(ABC):
             "uid": np.array([kwargs.get("uid")]),
             "n_trajectory": np.array([len(outputs)]),
             "data_source": np.array([kwargs.get("data_source", "unknown")]),
+            "reward_model": np.array([kwargs.get("reward_model", {})], dtype=object),
+            "extra_info": np.array([kwargs.get("extra_info", {})], dtype=object),
+            "reward_model_dicts": np.array([kwargs.get("reward_model_dicts", [])], dtype=object),
         }
-        if kwargs.get("parent_id", None) is not None:
+        if kwargs.get("parent_id") is not None:
             tensor_dict["parent_id"] = np.array([kwargs.get("parent_id")])
+
         reward_requests = tu.get_tensordict(
             tensor_dict=tensor_dict,
-            non_tensor_dict={"validate": kwargs.get("validate", False)},
-        )
-        reward_meta_infos = [{
-            "reward_model": kwargs.get("reward_model", {}),
-            "extra_info": kwargs.get("extra_info", {}),
-            "reward_model_dicts": kwargs.get("reward_model_dicts", None),
-        }]
-
-        reward_result = await self.reward_manager.compute_score.remote(
-            reward_requests,
-            reward_meta_infos=reward_meta_infos,
+            non_tensor_dict={
+                "validate": kwargs.get("validate", False),
+            },
         )
 
+        reward_result = await self.reward_manager.compute_score.remote(reward_requests)
         if not self.config.reward.launch_reward_fn_async:
             if not reward_result:
                 return None
@@ -339,19 +341,20 @@ class AgentLoopBase(ABC):
         }
 
         # Multimodal payload
-        images = request_input.multi_modal_data.get("images")
-        videos = request_input.multi_modal_data.get("videos")
-        if images:
-            payload["image_data"] = await serialize_image_inputs(images)
-        if videos:
-            payload["video_data"] = videos
-        if images or videos:
-            modalities = []
+        if request_input.multi_modal_data is not None:
+            images = request_input.multi_modal_data.get("images")
+            videos = request_input.multi_modal_data.get("videos")
             if images:
-                modalities.append("multi-images" if len(images) > 1 else "image")
+                payload["image_data"] = await serialize_image_inputs(images)
             if videos:
-                modalities.append("video")
-            payload["modalities"] = modalities
+                payload["video_data"] = videos
+            if images or videos:
+                modalities = []
+                if images:
+                    modalities.append("multi-images" if len(images) > 1 else "image")
+                if videos:
+                    modalities.append("video")
+                payload["modalities"] = modalities
 
         # Call SMG /generate directly via aiohttp so we can read both the
         # response body (a JSON array) and the worker-instance headers in one pass.
@@ -532,7 +535,7 @@ class AgentLoopBase(ABC):
         is_validate = request.get("validate", False)
         prompt_id = request.get("parent_id", request["uid"])
         rollout_instance_id = request.get("rollout_instance_id", None)
-        
+
         multi_modal_data = None
         messages = None
         if "raw_prompt_ids" not in request:
@@ -721,60 +724,47 @@ class AgentLoopBase(ABC):
         that the caller never has to deal with the mismatch between http_utils._post()
         (which assumes a JSON dict body) and the array response shape.
 
+        HTTP I/O is handled by a dedicated background thread so that socket callbacks
+        do not contend with the Ray actor's event loop.
+
         Returns:
             - responses: list of GenerateResponse dicts (may be empty on error)
             - base_worker_id: value of x-base-worker-id response header, or None
             - target_dp_rank: value of x-target-dp-rank response header, or None
         """
-        import aiohttp
+        if is_distributed_post_enabled():
+            response = await request_json_maybe_distributed(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        else:
+            io_thread = get_http_io_thread()
+            response = await io_thread.request_json(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        base_worker_id = response.headers.get("x-base-worker-id", None)
+        target_dp_rank = response.headers.get("x-target-dp-rank", None)
 
-        from psrl.utils.common.http_utils import _ensure_http_client
+        responses = response.data
+        # SMG /generate returns either a single dict or a list; normalise to list.
+        if isinstance(responses, dict):
+            responses = [responses]
+        elif not isinstance(responses, list):
+            psrl_logger.error(
+                "_post_generate: unexpected response type %s from %s.",
+                type(responses),
+                url,
+            )
+            responses = []
 
-        client = await _ensure_http_client()
-        retry_count = 0
-        while retry_count <= max_retries:
-            try:
-                async with client.post(url, json=payload, headers=headers) as response:
-                    base_worker_id = response.headers.get("x-base-worker-id", None)
-                    target_dp_rank = response.headers.get("x-target-dp-rank", None)
-
-                    if response.status >= 400:
-                        response_text = await response.text()
-                        raise aiohttp.ClientResponseError(
-                            request_info=response.request_info,
-                            history=response.history,
-                            status=response.status,
-                            message=response_text,
-                            headers=response.headers,
-                        )
-
-                    responses = await response.json(content_type=None)
-                    # SMG /generate returns either a single dict or a list; normalise to list.
-                    if isinstance(responses, dict):
-                        responses = [responses]
-                    elif not isinstance(responses, list):
-                        psrl_logger.error(
-                            "_post_generate: unexpected response type %s from %s",
-                            type(responses),
-                            url,
-                        )
-                        responses = []
-
-                    return responses, base_worker_id, target_dp_rank
-            except Exception as e:
-                retry_count += 1
-                psrl_logger.info(
-                    "Error: %s, retrying... (attempt %s/%s, url=%s)",
-                    e,
-                    retry_count,
-                    max_retries + 1,
-                    url,
-                )
-                if retry_count > max_retries:
-                    raise
-                await asyncio.sleep(1)
-
-        return [], None, None
+        return responses, base_worker_id, target_dp_rank
 
     async def _post_chat(
         self,
@@ -785,49 +775,42 @@ class AgentLoopBase(ABC):
     ) -> tuple[dict | None, str | None, str | None]:
         """POST to SMG /v1/chat/completions and return (response_dict, base_worker_id, target_dp_rank).
 
+        HTTP I/O is handled by a dedicated background thread.
+
         Returns:
             - response: the parsed JSON dict (OpenAI ChatCompletionResponse), or None on error
             - base_worker_id: value of x-base-worker-id response header, or None
             - target_dp_rank: value of x-target-dp-rank response header, or None
         """
-        import aiohttp
+        if is_distributed_post_enabled():
+            response = await request_json_maybe_distributed(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        else:
+            io_thread = get_http_io_thread()
+            response = await io_thread.request_json(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        base_worker_id = response.headers.get("x-base-worker-id", None)
+        target_dp_rank = response.headers.get("x-target-dp-rank", None)
 
-        from psrl.utils.common.http_utils import _ensure_http_client
+        if not isinstance(response.data, dict):
+            psrl_logger.error(
+                "_post_chat: unexpected response type %s from %s.",
+                type(response.data),
+                url,
+            )
+            return None, base_worker_id, target_dp_rank
 
-        client = await _ensure_http_client()
-        retry_count = 0
-        while retry_count <= max_retries:
-            try:
-                async with client.post(url, json=payload, headers=headers) as response:
-                    base_worker_id = response.headers.get("x-base-worker-id", None)
-                    target_dp_rank = response.headers.get("x-target-dp-rank", None)
-
-                    if response.status >= 400:
-                        response_text = await response.text()
-                        raise aiohttp.ClientResponseError(
-                            request_info=response.request_info,
-                            history=response.history,
-                            status=response.status,
-                            message=response_text,
-                            headers=response.headers,
-                        )
-
-                    resp_json = await response.json(content_type=None)
-                    return resp_json, base_worker_id, target_dp_rank
-            except Exception as e:
-                retry_count += 1
-                psrl_logger.info(
-                    "Error: %s, retrying... (attempt %s/%s, url=%s)",
-                    e,
-                    retry_count,
-                    max_retries + 1,
-                    url,
-                )
-                if retry_count > max_retries:
-                    raise
-                await asyncio.sleep(1)
-
-        return None, None, None
+        return response.data, base_worker_id, target_dp_rank
 
     @abstractmethod
     async def run(self, request: dict) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
@@ -861,7 +844,6 @@ class AgentLoopBase(ABC):
             # request metadata
             "uid",
             "parent_id",
-            "version_tag",
             "validate",
             "rollout_instance_id",
             # prompt
@@ -872,11 +854,11 @@ class AgentLoopBase(ABC):
             # multi-modal data
             "multi_modal_data",
         ]
-        
+
         return fields
 
     async def run_with_termination_handling(
-        self, request: KVBatchMeta, raise_on_error: bool = True
+        self, request: TensorDict, raise_on_error: bool = True
     ) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """Run the agent loop with termination event handling.
 
@@ -892,14 +874,8 @@ class AgentLoopBase(ABC):
                 A tuple containing the output data (if any) and the termination reason.
         """
         try:
-            fields = self.get_generate_fields()
-            if fields:
-                data = await tq.async_kv_batch_get(keys=request.keys, partition_id=request.partition_id, select_fields=fields)
-            else:
-                data = await tq.async_kv_batch_get_by_meta(request)
-            
             prompt = {}
-            for k, v in data.items():
+            for k, v in request.items():
                 if isinstance(v, torch.Tensor):
                     prompt[k] = v[0]
                 elif isinstance(v, NonTensorStack):
@@ -910,9 +886,6 @@ class AgentLoopBase(ABC):
                     psrl_logger.exception(f"Unsupported type {type(v)} for key {k}")
 
             coro = self.run(prompt)
-            # output, terminate_reason = await asyncio.wait_for(
-            #     coro, timeout=self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
-            # )
             output, terminate_reason = await coro
             if output is not None:
                 return output, terminate_reason

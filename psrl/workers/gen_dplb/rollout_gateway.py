@@ -86,6 +86,17 @@ class RolloutGateway:
         staleness_buffer_entries = int(self._cfg_get("psrl.staleness_buffer_entries", 512))
         return max(1, staleness_buffer_entries * rollout_n // n_rollout_instances)
 
+    def _estimate_http_client_concurrency(self) -> int:
+        """Estimate the shared SMG HTTP budget for this rollout gateway."""
+        server_max_concurrency = int(self._cfg_get("psrl.rollout_gateway.server_max_concurrency", 256))
+        n_rollout_instances = int(self._cfg_get("psrl.deployment.n_rollout_instances", 1))
+        colocate_validate = bool(self._cfg_get("psrl.colocate_validate_and_train", False))
+        n_validate_instances = (
+            int(self._cfg_get("psrl.deployment.n_validate_instances", 0)) if colocate_validate else 0
+        )
+        active_instances = max(1, n_rollout_instances + n_validate_instances)
+        return server_max_concurrency * active_instances
+
     def _init_router_args(self):
         ps_manager_addr = f"{self.ps_manager_grpc_ip}:{int(self.ps_manager_grpc_port)}"
         return build_rollout_router_args(self.config, self.smg_ip, self.smg_port, ps_manager_addr)
@@ -128,18 +139,22 @@ class RolloutGateway:
 
         session_port = find_available_port(base_port=8200)
         session_ip = self.smg_ip
+        session_client_concurrency = self._estimate_http_client_concurrency()
 
-        def _run_session_router(smg_url, host, port):
+        def _run_session_router(smg_url, host, port, client_concurrency):
             import uvicorn
 
             from psrl.workers.gen_dplb.session_router import SessionRouter
 
-            router = SessionRouter(smg_url=smg_url)
+            router = SessionRouter(
+                smg_url=smg_url,
+                client_concurrency=client_concurrency,
+            )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
         self.session_router_process = multiprocessing.Process(
             target=_run_session_router,
-            args=(self.smg_url, session_ip, session_port),
+            args=(self.smg_url, session_ip, session_port, session_client_concurrency),
         )
         self.session_router_process.daemon = True
         self.session_router_process.start()

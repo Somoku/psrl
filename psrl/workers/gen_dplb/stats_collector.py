@@ -111,7 +111,7 @@ class DPLBStatCollector(StatLoggerBase):
             self.log_prefix = f"DPLBStatCollector_{self.role}_I{self.replica_idx}"
             psrl_logger.propagate = False
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
-            psrl_logger.info(f"Initialized DPLBStatCollector for replica {self.replica_idx}.")
+            psrl_logger.info(f"Initialized DPLBStatCollector for replica {self.replica_idx} (role={self.role}).")
 
     def begin_record(self):
         """

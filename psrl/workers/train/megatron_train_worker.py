@@ -144,6 +144,10 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         # NOTE(lhy): the init_nixl_client is called before the initialization of the actor module now
         # Because in UCX 1.18.0, this may enhance the communication performance
         # assert self.actor_module, "The actor module must be initialized before calling init_nixl_client."
+        # When DCP save is enabled, disable NIXL background UCX progress thread to prevent
+        # heap corruption from DCP's all_gather_object (large temporary allocations corrupt
+        # UCX endpoint address structures read by the background thread).
+        enable_prog_thread = not self.psrl_config.checkpoint.use_dcp_save
         self.nixl_storage_client = NIXLStorageClient(
             client_name=train_client_name(self.rank),
             server_name=NIXL_META_SERVER_NAME,
@@ -153,6 +157,7 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             nixl_interface=self.nixl_interface,
             # client_group_id=self.get_replica_id()
             logging_path=self.psrl_config.logging_path,
+            enable_prog_thread=enable_prog_thread,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
@@ -478,8 +483,8 @@ class PSRL_MegatronTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                         self.config.load_weight = False
 
             ActorRolloutRefWorker.init_model(self)
-
-            # Restore load_weight config
+            # Override checkpoint strategy from psrl config (bypasses McoreEngineConfig dataclass).
+            self.checkpoint_mananager.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
             if skip_load_weight:
                 OmegaConf.set_struct(self.config, True)
                 with open_dict(self.config):

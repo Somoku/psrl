@@ -263,6 +263,108 @@ index df927583..1ce90c5e 100644
 -from .checkpoint_handler import CheckpointHandler, OrchestrationMode
 -
 -__all__ = ["CheckpointHandler", "OrchestrationMode"]
+diff --git a/verl/utils/checkpoint/megatron_checkpoint_manager.py b/verl/utils/checkpoint/megatron_checkpoint_manager.py
+index 6e643bb9..3f9651e7 100644
+--- a/verl/utils/checkpoint/megatron_checkpoint_manager.py
++++ b/verl/utils/checkpoint/megatron_checkpoint_manager.py
+@@ -129,6 +129,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         bridge=None,
+         provider=None,
+         peft_cls=None,
++        use_per_rank_checkpoint: bool = False,
+         **kwargs,
+     ):
+         super().__init__(
+@@ -156,6 +157,7 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         self.provider = provider
+         self.vanilla_bridge = self.provider is None
+         self.peft_cls = peft_cls
++        self.use_per_rank_checkpoint = use_per_rank_checkpoint
+         self.rank = torch.distributed.get_rank()
+         # Megatron-Bridge is Okay to load/save HF checkpoint for value model as well
+         self.use_dist_checkpointing = (
+@@ -445,11 +447,26 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+         sharded_state_dict = self._maybe_filter_peft_state_dict(sharded_state_dict)
+         log_with_rank(f"Generated state dict for loading: {sharded_state_dict.keys()}", rank=self.rank, logger=logger)
+ 
+-        # Load Dist Checkpointing
+-        state_dict = load_dist_checkpointing(
+-            sharded_state_dict=sharded_state_dict,
+-            ckpt_dir=dist_checkpoint_path,
+-        )
++        # DISPATCH POINT 2: Use PSRL per-rank load instead of DCP
++        if self.use_per_rank_checkpoint:
++            from psrl.utils.checkpoint import load_megatron_checkpoint
++            log_with_rank(
++                f"Loading PSRL per-rank checkpoint from {dist_checkpoint_path}",
++                rank=self.rank, logger=logger, log_only_rank_0=True
++            )
++            state_dict = load_megatron_checkpoint(
++                sharded_state_dict=sharded_state_dict,
++                ckpt_dir=dist_checkpoint_path,
++            )
++        else:
++            log_with_rank(
++                f"Loading DCP checkpoint from {dist_checkpoint_path}",
++                rank=self.rank, logger=logger, log_only_rank_0=True
++            )
++            state_dict = load_dist_checkpointing(
++                sharded_state_dict=sharded_state_dict,
++                ckpt_dir=dist_checkpoint_path,
++            )
+ 
+         if should_load_dist_model:
+             assert "model" in state_dict or any(
+@@ -545,20 +562,36 @@ class MegatronCheckpointManager(BaseCheckpointManager):
+                     log_with_rank(
+                         f"Generated state dict for saving: {state_dict['model'].keys()}", rank=self.rank, logger=logger
+                     )
+-            # Start Async save if enabled
+-            async_save_request = save_dist_checkpointing(
+-                sharded_state_dict=state_dict,
+-                ckpt_path=dist_checkpoint_path,
+-                async_save=self.checkpoint_config.async_save,
+-                content_metadata=sharded_sd_metadata,
+-            )
+-
+-            # Synchronize all async save requests
+-            if not self.checkpoint_config.async_save:
+-                assert async_save_request is None, "Async save request should be None when not using async save."
++            # DISPATCH POINT 1: Use PSRL per-rank save instead of DCP
++            if self.use_per_rank_checkpoint:
++                from psrl.utils.checkpoint import save_megatron_checkpoint
++                log_with_rank(
++                    f"Using PSRL per-rank checkpoint save (UCX-safe) to {dist_checkpoint_path}",
++                    rank=self.rank, logger=logger, log_only_rank_0=True
++                )
++                save_megatron_checkpoint(
++                    sharded_state_dict=state_dict,
++                    ckpt_path=dist_checkpoint_path,
++                    async_save=False,  # PSRL doesn't support async
++                )
++                async_save_request = None
+                 torch.distributed.barrier()
+-        else:
+-            assert self.use_hf_checkpoint, "When not using distributed checkpointing, use_hf_checkpoint should be True."
++            else:
++                log_with_rank(
++                    f"Using DCP save to {dist_checkpoint_path}",
++                    rank=self.rank, logger=logger, log_only_rank_0=True
++                )
++                async_save_request = save_dist_checkpointing(
++                    sharded_state_dict=state_dict,
++                    ckpt_path=dist_checkpoint_path,
++                    async_save=self.checkpoint_config.async_save,
++                    content_metadata=sharded_sd_metadata,
++                )
++
++                # Synchronize all async save requests
++                if not self.checkpoint_config.async_save:
++                    assert async_save_request is None, "Async save request should be None when not using async save."
++                    torch.distributed.barrier()
+             # Generate optimizer and exra state dicts
+             sharded_sd_metadata = self._build_sharded_state_dict_metadata()
+             state_dict = self.generate_state_dict(
 diff --git a/verl/utils/import_utils.py b/verl/utils/import_utils.py
 index ab427315..8aebd3dd 100644
 --- a/verl/utils/import_utils.py
@@ -339,6 +441,74 @@ index ab427315..8aebd3dd 100644
 +
 +    for name in names:
 +        lazy_import_to_globals(module_path, name, target_globals=target_globals)
+diff --git a/verl/utils/megatron/dist_checkpointing.py b/verl/utils/megatron/dist_checkpointing.py
+index 08139661..c1066d58 100644
+--- a/verl/utils/megatron/dist_checkpointing.py
++++ b/verl/utils/megatron/dist_checkpointing.py
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++import queue as _stdlib_queue
++
+ import megatron.core
+ import torch
+ from megatron.core import dist_checkpointing, mpu
+@@ -26,6 +28,54 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+ from packaging import version
+ 
+ 
++# ---------------------------------------------------------------------------
++# NCCL no-fork patch for DCP async save
++#
++# DCP's FileSystemWriterAsync.write_preloaded_data_multiproc forks child
++# processes via mp.get_context("fork"). Forked children inherit NCCL
++# communicators; when the child exits, ncclCommAbort runs and corrupts the
++# parent's NCCL state, eventually causing a 600-second timeout and SIGABRT.
++#
++# The fix: replace the multiproc entry-point with a sequential in-process
++# version that uses stdlib queue.SimpleQueue instead of forking.
++# ---------------------------------------------------------------------------
++from megatron.core.dist_checkpointing.strategies import filesystem_async as _fsa
++
++_orig_write_preloaded_data = _fsa.FileSystemWriterAsync.write_preloaded_data
++
++
++def _write_preloaded_data_multiproc_nofork(transform_list, use_msc, rank, write_buckets, global_results_queue):
++    """Sequential no-fork replacement for FileSystemWriterAsync.write_preloaded_data_multiproc.
++
++    Processes write buckets one at a time in the current process to avoid
++    forking NCCL communicators which causes ncclCommAbort corruption.
++    """
++    write_results = {}
++    for i, write_bucket in enumerate(write_buckets):
++        results_q = _stdlib_queue.SimpleQueue()
++        count_q = _stdlib_queue.Queue()
++        count_q.put(i)
++        kwargs = {
++            "local_proc_idx": i,
++            "write_bucket": write_bucket,
++            "results_queue": results_q,
++            "count_queue": count_q,
++            "use_fsync": True,
++        }
++        if use_msc:
++            kwargs["use_msc"] = use_msc
++        _orig_write_preloaded_data(transform_list, **kwargs)
++        local_proc_idx, local_results_or_exc = results_q.get()
++        if isinstance(local_results_or_exc, Exception):
++            raise local_results_or_exc
++        write_results[local_proc_idx] = local_results_or_exc
++    global_results_queue.put(write_results)
++
++
++_fsa.FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(_write_preloaded_data_multiproc_nofork)
++# ---------------------------------------------------------------------------
++
++
+ def save_dist_checkpointing(
+     sharded_state_dict,
+     ckpt_path,
 diff --git a/verl/workers/actor/megatron_actor.py b/verl/workers/actor/megatron_actor.py
 index cd35e6ae..60795398 100644
 --- a/verl/workers/actor/megatron_actor.py
@@ -1040,7 +1210,7 @@ index f052448d..cb03d19c 100644
          self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
              self.config
 diff --git a/verl/workers/megatron_workers.py b/verl/workers/megatron_workers.py
-index 6693df70..375233a2 100644
+index 6693df70..af55e791 100644
 --- a/verl/workers/megatron_workers.py
 +++ b/verl/workers/megatron_workers.py
 @@ -33,14 +33,10 @@ except ImportError:
@@ -1466,7 +1636,15 @@ index 6693df70..375233a2 100644
  
          override_model_config = OmegaConf.to_container(OmegaConf.create(self.config.model.get("override_config", {})))
          if self._is_actor:
-@@ -773,7 +798,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -686,6 +711,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+                 bridge=self.bridge,
+                 provider=self.provider,
+                 use_dist_checkpointing=self.config.actor.megatron.use_dist_checkpointing,
++                use_per_rank_checkpoint=not self.psrl_config.checkpoint.use_dcp_save,
+                 peft_cls=self.peft_cls,
+             )
+ 
+@@ -773,7 +799,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          set_expandable_segments(True)
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -1474,7 +1652,7 @@ index 6693df70..375233a2 100644
      @DistProfiler.annotate(color="red", role="actor_update")
      def update_actor(self, data: DataProto):
          assert self._is_actor
-@@ -819,7 +843,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -819,7 +844,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
@@ -1482,7 +1660,7 @@ index 6693df70..375233a2 100644
      @DistProfiler.annotate(color="red", role="rollout_generate")
      def generate_sequences(self, prompts: DataProto):
          assert self._is_rollout
-@@ -869,7 +892,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -869,7 +893,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -1490,7 +1668,7 @@ index 6693df70..375233a2 100644
      @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
      def compute_ref_log_prob(self, data: DataProto):
          if self.peft_cls is not None:
-@@ -895,7 +917,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
+@@ -895,7 +918,6 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
          return output
  
      @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -1498,7 +1676,7 @@ index 6693df70..375233a2 100644
      @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
      def compute_log_prob(self, data: DataProto):
          assert self._is_actor
-@@ -1036,13 +1057,22 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1036,13 +1058,22 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              self, DistProfiler(rank=self.rank, config=profiler_config, tool_config=tool_config)
          )
          self.config: McoreCriticConfig = config
@@ -1521,7 +1699,7 @@ index 6693df70..375233a2 100644
          if not torch.distributed.is_initialized():
              set_numa_affinity()
              rank = int(os.environ["LOCAL_RANK"])
-@@ -1075,10 +1105,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1075,10 +1106,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
  
          set_random_seed(seed=self.config.megatron.seed)
  
@@ -1532,7 +1710,7 @@ index 6693df70..375233a2 100644
          # normalize config
          self.config.ppo_mini_batch_size *= self.config.rollout_n
          self.config.ppo_mini_batch_size //= mpu.get_data_parallel_world_size()
-@@ -1086,8 +1112,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1086,8 +1113,6 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              self.config.ppo_micro_batch_size //= mpu.get_data_parallel_world_size()
              self.config.ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size
  
@@ -1541,7 +1719,7 @@ index 6693df70..375233a2 100644
      def _build_critic_model_optimizer(
          self, model_path, optim_config, override_model_config, override_transformer_config, override_ddp_config
      ):
-@@ -1097,7 +1121,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1097,7 +1122,12 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
              init_megatron_optim_config,
          )
          from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
@@ -1555,7 +1733,7 @@ index 6693df70..375233a2 100644
  
          self._init_hf_config_and_tf_config(
              model_path,
-@@ -1180,12 +1209,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
+@@ -1180,12 +1210,23 @@ class CriticWorker(MegatronWorker, DistProfilerExtension):
          # create critic
  
          from verl.utils.torch_dtypes import PrecisionType

@@ -11,6 +11,45 @@ from verl.utils.model import get_generation_config, update_model_config
 
 __all__ = ["HFModelConfig"]
 
+@dataclass
+class MtpConfig(BaseConfig):
+    """
+    Configuration for MTP model.
+
+    enable: Enable loading and saving of MTP parameters, but do not use them
+
+    enable_train: Whether to enable using MTP parameters during training
+    enable_rollout: Whether to enable using MTP parameters during rollout
+
+    Training parameters:
+        detach_encoder: Whether to detach encoder parameters during MTP training
+        mtp_loss_scaling_factor: Loss scaling factor during MTP training
+
+    vLLM rollout parameters:
+        method: "mtp"
+        num-speculative-tokens: 1
+
+    SGLang rollout parameters:
+        speculative-algorithm: EAGLE
+        speculative-num-steps: 3
+        speculative-eagle-topk: 1
+        speculative-num-draft-tokens: 4
+    """
+
+    enable: bool = False
+    enable_train: bool = False
+    enable_rollout: bool = False
+
+    detach_encoder: bool = False
+    mtp_loss_scaling_factor: float = 0.1
+
+    speculative_algorithm: str = "EAGLE"
+    speculative_num_steps: int = 3
+    speculative_eagle_topk: int = 1
+    speculative_num_draft_tokens: int = 4
+
+    method: str = "mtp"
+    num_speculative_tokens: int = 1
 
 @dataclass
 class HFModelConfig(BaseConfig):
@@ -26,6 +65,7 @@ class HFModelConfig(BaseConfig):
         "architectures",
         "local_hf_config_path",
         "local_tokenizer_path",
+	"mtp",
     }
 
     path: str = MISSING
@@ -65,12 +105,20 @@ class HFModelConfig(BaseConfig):
     target_modules: str | None = "all-linear"
 
     exclude_modules: str | None = None
+
+    lora: dict[str, Any] = field(default_factory=dict)
+
+    lora_adapter_path: str | None = None
     use_liger: bool = False
 
     use_fused_kernels: bool = False
     fused_kernel_options: dict = field(default_factory=dict)
 
+    tiled_mlp: dict = field(default_factory=lambda: {"enabled": False, "num_shards": 4})
+
     architectures: list[str] | None = None
+
+    mtp: MtpConfig = field(default_factory=MtpConfig)
 
     def __post_init__(self):
         import_external_libs(self.external_lib)

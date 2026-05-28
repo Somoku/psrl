@@ -14,6 +14,9 @@ defaults:
   # Rollout model config in gen worker.
   - rollout@gen_actor_rollout_ref.rollout: rollout
 
+  - model@train_actor_rollout_ref.model: hf_model
+  - model@gen_actor_rollout_ref.model: hf_model
+
   # data: trainer/config/data/data.yaml
   - data@data: data
 
@@ -47,36 +50,6 @@ train_actor_rollout_ref:
   # seconds, default is 10 minutes for torch, you can set it to a larger value if you have long-running operations like 32B or 72B model using megatron
   nccl_timeout: 600
 
-  # model config.
-  model:
-
-    # path to the megatron model
-    path: ~/models/deepseek-llm-7b-chat
-
-    # custom chat template for the model
-    custom_chat_template: null
-
-    # whether to use external libs for the model
-    external_lib: null
-
-    # override hf config
-    override_config:
-
-      model_config: {}
-
-      moe_config:
-
-        freeze_moe_router: False
-
-    # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
-    use_fused_kernels: False
-
-    # whether to trust remote code.
-    trust_remote_code: False
-
-    # Whether to remove padding tokens in inputs during training
-    use_remove_padding: false
-
   # Rollout instance config.
   rollout:
 
@@ -89,33 +62,6 @@ gen_actor_rollout_ref:
 
   # Whether it's a hybrid engine, currently only supports hybrid engine
   hybrid_engine: False
-
-  # model config.
-  model:
-
-    # path to the megatron model
-    path: ${oc.select:train_actor_rollout_ref.model.path}
-
-    # custom chat template for the model
-    custom_chat_template: null
-
-    # whether to use external libs for the model
-    external_lib: null
-
-    # override hf config
-    override_config:
-
-      model_config: {}
-
-      moe_config:
-
-        freeze_moe_router: False
-
-    # Whether to use custom fused kernels (PostProcessing, for memory efficiency)
-    use_fused_kernels: False
-
-    # whether to trust remote code.
-    trust_remote_code: False
 
   # Timeout for operations executed against the process group
   nccl_timeout: 600

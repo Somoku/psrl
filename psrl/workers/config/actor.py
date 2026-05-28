@@ -5,6 +5,7 @@ from omegaconf import MISSING
 from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 from verl.utils.profiler.config import ProfilerConfig
+from verl.utils.qat import QATConfig
 
 from .engine import FSDPEngineConfig, McoreEngineConfig
 from .model import HFModelConfig
@@ -149,6 +150,7 @@ class ActorConfig(BaseConfig):
     # batch_num_tokens: number of valid tokens in global batch
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
+    qat: QATConfig = field(default_factory=QATConfig)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

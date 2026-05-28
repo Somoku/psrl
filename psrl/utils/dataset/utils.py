@@ -34,7 +34,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
                 f"'{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset"
             )
     else:
-        from verl.utils.dataset.rl_dataset import RLHFDataset
+        from psrl.utils.dataset.rl_dataset import RLHFDataset
 
         # Use the default RLHFDataset class if no custom class is specified
         dataset_cls = RLHFDataset

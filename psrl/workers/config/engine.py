@@ -10,6 +10,54 @@ from .optimizer import OptimizerConfig
 
 __all__ = ["FSDPEngineConfig", "McoreEngineConfig", "TrainingWorkerConfig"]
 
+@dataclass
+class EngineRouterReplayConfig(BaseConfig):
+    """Configuration for router replay in MoE models.
+
+    This configuration controls the routing behavior for Mixture of Experts (MoE) models,
+    allowing for deterministic training through route recording and replay.
+
+    Args:
+        mode (str): Router replay mode. Options: 'disabled', 'R2', 'R3'.
+            - 'disabled': No router replay functionality
+            - 'R2': Use Router Replay routing strategy
+            - 'R3': Use Rollout Router Replay routing strategy
+        record_file (Optional[str]): File path to save recorded routing decisions.
+            Required when mode is 'record', 'R2', or 'R3'.
+        replay_file (Optional[str]): File path to load recorded routing decisions for replay.
+            Required when mode is 'replay'.
+    """
+
+    mode: str = "disabled"
+    record_file: str | None = None
+    replay_file: str | None = None
+
+    def __post_init__(self):
+        """Validate router replay configuration."""
+        valid_modes = ["disabled", "R2", "R3"]
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
+
+
+@dataclass
+class QATEngineConfig(BaseConfig):
+    """Configuration for QAT (Quantization-Aware Training) within an engine.
+
+    Args:
+        enable (bool): Whether to enable QAT, default False
+        mode (str): Quantization mode, "w4a16" or "w4a4", default "w4a16"
+        group_size (int): Group size for blockwise quantization, default 16
+        ignore_patterns (list[str]): Module name patterns to exclude from quantization
+        activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
+        quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
+    """
+
+    enable: bool = False
+    mode: str = "w4a16"
+    group_size: int = 16
+    ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
+    activation_observer: str = "static_minmax"
+    quantization_config_path: str | None = None
 
 @dataclass
 class EngineConfig(BaseConfig):
@@ -51,6 +99,7 @@ class EngineConfig(BaseConfig):
     seed: int = 42
 
     full_determinism: bool = False
+    router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
 
     def __post_init__(self):
         pass
@@ -98,17 +147,22 @@ class McoreEngineConfig(EngineConfig):
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: int | None = None
     context_parallel_size: int = 1
+    dynamic_context_parallel: bool = False
+    max_seqlen_per_dp_cp_rank: int | None = None
     sequence_parallel: bool = True
     use_distributed_optimizer: bool = True
     use_dist_checkpointing: bool = False
     dist_checkpointing_path: str | None = None
     dist_checkpointing_prefix: str = ""
+    dist_ckpt_optim_fully_reshardable: bool = False
+    distrib_optim_fully_reshardable_mem_efficient: bool = False
     override_ddp_config: dict[str, Any] = field(default_factory=dict)
     override_transformer_config: dict[str, Any] = field(default_factory=dict)
     override_mcore_model_config: dict[str, Any] = field(default_factory=dict)
     use_mbridge: bool = False
     vanilla_mbridge: bool = True
     strategy: str = "megatron"
+    qat: QATEngineConfig = field(default_factory=QATEngineConfig)
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -161,6 +215,7 @@ class FSDPEngineConfig(EngineConfig):
     use_torch_compile: bool = True
     entropy_checkpointing: bool = False
     strategy: str = "fsdp"
+    qat: QATEngineConfig = field(default_factory=QATEngineConfig)
 
     def __post_init__(self):
         super().__post_init__()

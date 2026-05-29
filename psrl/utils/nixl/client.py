@@ -71,6 +71,7 @@ class NIXLStorageClient:
         binded_agent: nixl_agent | None = None,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
+        enable_prog_thread: bool = True,
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -100,7 +101,7 @@ class NIXLStorageClient:
                 if self.nixl_interface.port_scanner is None
                 else ray.get(self.nixl_interface.port_scanner.find_free_port.remote(host=get_worker_info()[0]))
             )
-            self.agent = nixl_agent(self.client_name, nixl_agent_config(True, True, self.client_port))
+            self.agent = nixl_agent(self.client_name, nixl_agent_config(enable_prog_thread, True, self.client_port))
         else:
             self.agent = binded_agent
 

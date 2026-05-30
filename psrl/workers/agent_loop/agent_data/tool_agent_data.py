@@ -156,7 +156,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
     def format_chat_completions(self, observation: ConversationType, *, is_init: bool) -> ConversationType:
         """ToolEnvironment already uses ConversationType as observation, so return as-is."""
-        return observation
+        return list(observation)
 
     def decode_action_from_token_ids(self, token_ids: list[int]) -> ToolAction:
         """Decode model generated token ids into ToolAction.

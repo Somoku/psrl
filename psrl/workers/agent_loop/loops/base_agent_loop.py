@@ -19,6 +19,7 @@ from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.tokenizer import normalize_token_ids
 
 from psrl.utils.common.http_utils import (
+    RequestAbortedByGatewayError,
     is_distributed_post_enabled,
     request_json_maybe_distributed,
 )
@@ -904,6 +905,15 @@ class AgentLoopBase(ABC):
                 return None, TerminateReason.UNKNOWN
             else:
                 raise RuntimeError("Agent loop run did not return a valid TokenOutput output.")
+        except RequestAbortedByGatewayError as e:
+            # PS Manager has already taken ownership of cleaning the request's data
+            # flow (TQ entry cleared, staleness inventory updated).
+            psrl_logger.info(
+                "Request %s aborted by PS Manager (gateway returned `request_aborted`); "
+                "ending data flow without retry.",
+                e.request_id or "N/A",
+            )
+            return None, TerminateReason.ABORTED
         except asyncio.TimeoutError:
             psrl_logger.error(
                 "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",  # noqa: E501

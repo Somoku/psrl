@@ -101,6 +101,13 @@ class DataProcessor:
         # Threads for data processing
         self.data_process_thread = None
         self.stop_data_process = False
+        self.dataloader_lock = threading.Lock()
+
+        # Partial dataloader batch left over from a previous
+        # `sample_train_prompts` call. Successive small retries amortise into
+        # one underlying dataloader fetch by draining `retry_buffer` first
+        # before pulling a fresh batch via `get_train_next`.
+        self.retry_buffer: dict | None = None
 
         # Build logger
         self.log_prefix = "DataProcessor"
@@ -406,6 +413,11 @@ class DataProcessor:
                 All iterators are reset before re-raising so the next call starts
                 a fresh epoch.
         """
+        with self.dataloader_lock:
+            return self._get_train_next()
+
+    def _get_train_next(self) -> dict:
+        """Body of `get_train_next` without acquiring `dataloader_lock`."""
         if self.train_dataloader_iters is None:
             self.train_dataloader_iters = [iter(dl) for dl in self.train_dataloaders]
 
@@ -490,11 +502,12 @@ class DataProcessor:
         Returns:
             list: A list of sample IDs for the training batch.
         """
-        sample_ids = []
-        for i in range(batch_size):
-            sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
-            sample_ids.append(sample_id)
-        self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
+        with self.dataloader_lock:
+            sample_ids = []
+            for i in range(batch_size):
+                sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
+                sample_ids.append(sample_id)
+            self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
         return sample_ids
 
     def get_single_controller_batch(
@@ -581,6 +594,107 @@ class DataProcessor:
         )
 
         return batch_meta
+
+    def sample_train_prompts(self, n_prompts: int) -> TensorDict | None:
+        """Sample exactly `n_prompts` fresh training prompts on demand.
+
+        Args:
+            n_prompts (int): Number of fresh prompts to sample. Must be > 0.
+
+        Returns:
+            TensorDict | None:
+                Ready-to-dispatch TensorDict, or `None` if the dataloader
+                was exhausted before any prompt could be sampled.
+        """
+        assert n_prompts > 0, f"n_prompts must be positive, got {n_prompts!r}."
+        rollout_n = self.rollout_n
+
+        # drain leftover and fetch from dataloader
+        chunks: list[dict] = []
+        remaining = n_prompts
+        with self.dataloader_lock:
+            while remaining > 0:
+                if self.retry_buffer is None or self._retry_buffer_size() == 0:
+                    try:
+                        self.retry_buffer = self._get_train_next_unlocked()
+                    except StopIteration:
+                        psrl_logger.warning(
+                            f"sample_train_prompts: dataloader exhausted after "
+                            f"{n_prompts - remaining} of {n_prompts} prompts."
+                        )
+                        break
+
+                leftover_size = self._retry_buffer_size()
+                take = min(remaining, leftover_size)
+                chunks.append({k: v[:take] for k, v in self.retry_buffer.items()})
+                if take < leftover_size:
+                    self.retry_buffer = {k: v[take:] for k, v in self.retry_buffer.items()}
+                else:
+                    self.retry_buffer = None
+                remaining -= take
+
+        if not chunks:
+            return None
+
+        actual_n_prompts = n_prompts - remaining
+
+        # Merge chunks
+        batch_dict = chunks[0] if len(chunks) == 1 else self._concat_dict_chunks(chunks)
+        sample_ids = self.get_train_sample_ids(actual_n_prompts)
+
+        batch = tu.get_tensordict(batch_dict)
+        tu.assign_non_tensor_stack(batch, "global_steps", [self.global_steps] * actual_n_prompts)
+        tu.assign_non_tensor_stack(batch, "validate", [False] * actual_n_prompts)
+        tu.assign_non_tensor_stack(
+            batch,
+            "parent_id" if rollout_n > 1 else "uid",
+            sample_ids,
+        )
+
+        if rollout_n > 1:
+            request_ids = [
+                sample_ids[i] * rollout_n + j
+                for i in range(actual_n_prompts)
+                for j in range(rollout_n)
+            ]
+            batch = batch.repeat_interleave(repeats=rollout_n)
+            tu.assign_non_tensor_stack(batch, "uid", request_ids)
+        else:
+            request_ids = sample_ids
+
+        ray.get(self.ps_manager_handle.add_request.remote(request_ids))
+
+        psrl_logger.debug(
+            f"sample_train_prompts: produced {actual_n_prompts} prompts "
+            f"({len(request_ids)} children) for retry."
+        )
+        return batch
+
+    def _retry_buffer_size(self) -> int:
+        """Return the number of prompt rows currently held in `retry_buffer`."""
+        if self.retry_buffer is None:
+            return 0
+        first_key = next(iter(self.retry_buffer))
+        return len(self.retry_buffer[first_key])
+
+    @staticmethod
+    def _concat_dict_chunks(chunks: list[dict]) -> dict:
+        """Concatenate a list of dataloader-shaped dicts along dim 0."""
+        if len(chunks) == 1:
+            return chunks[0]
+        merged: dict = {}
+        for key in chunks[0].keys():
+            values = [chunk[key] for chunk in chunks]
+            sample = values[0]
+            if isinstance(sample, torch.Tensor):
+                merged[key] = torch.cat(values, dim=0)
+            elif isinstance(sample, np.ndarray):
+                merged[key] = np.concatenate(values, axis=0)
+            else:
+                raise TypeError(
+                    f"Unsupported value type {type(sample)!r} for key {key!r} in retry chunks."
+                )
+        return merged
 
     # ------- Streaming Data Processing Methods -------
     def start_busy_loop(self):

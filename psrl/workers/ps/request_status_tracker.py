@@ -56,6 +56,20 @@ class PSRL_RequestStatus(Enum):
     REWARD_COMPLETED = enum.auto()
     COMPLETED = enum.auto()
 
+# Statuses for which the request's payload has already been committed to the TransferQueue
+# (`tq.kv_batch_put` was issued before the status transition). Only requests currently in
+# one of these statuses are guaranteed to have an entry in the TQ partition, so only these
+# keys are safe targets for `tq.kv_clear` during abort/stale handling.
+# 
+# Clearing keys that were never written triggers TQ controller errors
+# because `kv_retrieve_meta(create=False)` is all-or-nothing.
+TQ_COMMITTED_STATUSES: frozenset = frozenset(
+    {
+        PSRL_RequestStatus.ROLLOUT_COMPLETED,
+        PSRL_RequestStatus.REWARD_RUNNING,
+        PSRL_RequestStatus.REWARD_COMPLETED,
+    }
+)
 
 class RequestStatusTracker:
     """
@@ -175,7 +189,9 @@ class RequestStatusTracker:
                         self._running_min_version,
                     )
                     request_update_success[i] = False
-                    abort_request_ids.append(str(req_id))
+                    current_status = self._request_id_to_status.get(req_id)
+                    if current_status in TQ_COMMITTED_STATUSES:
+                        abort_request_ids.append(str(req_id))
                     continue
             else:
                 raise KeyError(f"Request ID {req_id} not found in request info map.")
@@ -370,20 +386,18 @@ class RequestStatusTracker:
         abort_requests_for_rollout = set()
         abort_requests_for_reward = set()
         abort_requests_for_completed = set()
+        abort_requests_with_tq_entry: set[int] = set()
 
         for status, req_ids in status_to_req_ids.items():
             psrl_logger.info(f"Classifying aborted requests in status {status}: {req_ids}")
-            # if status in {
-            #     PSRL_RequestStatus.ROLLOUT_ROUTING,
-            #     PSRL_RequestStatus.ROLLOUT_DISPATCHED,
-            #     PSRL_RequestStatus.ROLLOUT_RUNNING
-            # }:
             if status in {PSRL_RequestStatus.ROLLOUT_RUNNING}:
                 abort_requests_for_rollout.update(req_ids)
             elif status in {PSRL_RequestStatus.REWARD_RUNNING}:
                 abort_requests_for_reward.update(req_ids)
             elif status in {PSRL_RequestStatus.COMPLETED}:
                 abort_requests_for_completed.update(req_ids)
+            if status in TQ_COMMITTED_STATUSES:
+                abort_requests_with_tq_entry.update(req_ids)
 
         futures = []
         # Abort requests in rollout stage (ROLLOUT_RUNNING)
@@ -423,11 +437,13 @@ class RequestStatusTracker:
         if futures and blocking:
             ray.get(futures)
 
-        # Clear data from transfer queue for the aborted requests that are not in COMPLETED status
-        tq.kv_clear(
-            keys=[str(req_id) for req_id in (request_ids - abort_requests_for_completed)],
-            partition_id="train",
-        )
+        # Clear data from transfer queue only for aborted requests whose payload was already
+        # committed to the partition.
+        if abort_requests_with_tq_entry:
+            tq.kv_clear(
+                keys=[str(req_id) for req_id in abort_requests_with_tq_entry],
+                partition_id="train",
+            )
 
     def classify_requests_in_status(self, request_ids: list[int] | int) -> dict:
         """

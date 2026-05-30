@@ -644,7 +644,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             if self.session_data.parent_id is not None:
                 tensor_dict["parent_id"] = np.array([self.session_data.parent_id])
 
-            reward_data = DataProto.from_dict(
+            reward_data = tu.get_tensordict(
                 tensor_dict=tensor_dict,
                 non_tensor_dict={
                     "validate": self.session_data.validate,

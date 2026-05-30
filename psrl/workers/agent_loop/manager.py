@@ -360,23 +360,49 @@ class PSRL_AgentLoopManager:
 
         psrl_logger.info("Agent loop manager validation dispatch task stopped.")
 
-    async def _retry_data(self, data: KVBatchMeta | None = None):
-        """Notify the agent loop manager to retry processing some data."""
+    async def _retry_data(self, n_prompts: int = 1) -> int:
+        """Retry exactly `n_prompts` prompts by sampling fresh data on demand.
+
+        Args:
+            n_prompts (int): Number of prompts to retry. Each prompt expands
+                to `rollout_n` children. Defaults to 1.
+
+        Returns:
+            int: Number of requests actually dispatched. `0` if the agent
+            loop is shutting down, `n_prompts <= 0`, or the dataloader was
+            exhausted.
+        """
         if not (self.running_loop and not self.stop_train_dispatch_task):
-            psrl_logger.warning("Busy loop of the agent loop manager has stopped, the retry operation will be skipped")
-            return
+            psrl_logger.warning(
+                "Busy loop of the agent loop manager has stopped, the retry operation will be skipped."
+            )
+            return 0
+        if n_prompts <= 0:
+            return 0
 
-        # If data is None, the new data from the data queue will be used.
-        if data is None:
-            if self.train_data_queue.empty():
-                return
-            data = await self.train_data_queue.get()
-            if data is None:
-                raise ValueError("Data queue should not contain None when retrying requests.")
+        rollout_n = (
+            self.config.psrl.redundant_rollout.redundant_rollout_n
+            if self.config.psrl.redundant_rollout.enable
+            else self.rollout_n
+        )
 
-        data = kv_batch_meta_update_tags(data, "version_tag", -1)
-        psrl_logger.info(f"Retry {len(data)} requests")
+        data: TensorDict | None = await self.data_processor.sample_train_prompts.remote(
+            n_prompts=n_prompts,
+        )
+        if data is None or len(data) == 0:
+            psrl_logger.warning(
+                f"Retry skipped: DataProcessor returned no data for n_prompts={n_prompts}."
+            )
+            return 0
+
+        tu.assign_non_tensor_stack(data, "version_tag", [-1] * len(data))
+        psrl_logger.info(f"Retry {len(data)} requests ({len(data) // rollout_n} prompts).")
         await self._inner_dispatch_data(data, is_validate=False)
+
+        # Account retry dispatches in the staleness throttle so that
+        # `_train_dispatch_data` doesn't over-dispatch on top of retry bursts.
+        self._request_counter += len(data)
+        return len(data)
 
     def _get_expected_ps_version(self):
         """
@@ -574,7 +600,7 @@ class PSRL_AgentLoopManager:
                             # Clear the reserved entries for the group entry.
                             await self.ps_manager_handle.clear_reserved_entries.remote(prompt_id, is_validate)
                             # Notify agent loop manager to retry new requests.
-                            await self._retry_data()
+                            await self._retry_data(n_prompts=1)
                         else:
                             child_request_ids = [
                                 prompt_id * rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
@@ -1123,8 +1149,7 @@ class PSRL_AgentLoopManager:
                     f"Moved {total_moved_entries} occupied entries (the total gap is {gap}) "
                     f"from other buffers to buffer {buffer_id}."
                 )
-                for _ in range(aborted_entry_num):
-                    await self._retry_data()
+                await self._retry_data(n_prompts=aborted_entry_num)
 
         elif self.config.psrl.proactive_filter_strategy.method == "truncate":
             raise NotImplementedError("Truncate strategy is not implemented yet.")

@@ -302,6 +302,49 @@ def _raise_for_status(status: int, body: bytes, response: Any) -> None:
         headers=headers,
     )
 
+class RequestAbortedByGatewayError(Exception):
+    """SMG returned the `request_aborted` 400 sentinel for the request.
+
+    Callers should treat this as a deliberate termination and propagate it
+    up to the agent loop boundary as `TerminateReason.ABORTED` rather than
+    retry or log it as a transport error.
+    """
+
+    def __init__(self, request_id: str, message: str):
+        super().__init__(f"Request {request_id!r} aborted by gateway: {message}")
+        self.request_id = request_id
+        self.message = message
+
+
+def _classify_http_error(
+    exc: BaseException,
+    request_headers: Mapping[str, str] | None = None,
+) -> BaseException:
+    """Return a more specific exception when `exc` is an SMG `request_aborted` 400.
+
+    Otherwise returns `exc` unchanged. Callers should `raise` the returned
+    exception; chained `__cause__` is preserved when a translation occurs.
+    """
+    if not isinstance(exc, aiohttp.ClientResponseError):
+        return exc
+    if exc.status != 400:
+        return exc
+    response_headers = exc.headers or {}
+    # Header lookups must be case-insensitive: aiohttp returns a `CIMultiDict`
+    # that supports it natively, but plain `dict` instances (e.g. from a mock)
+    # do not, so fall back to a manual scan.
+    code = response_headers.get("x-smg-error-code")
+    if code is None and not hasattr(response_headers, "getall"):
+        for key, value in response_headers.items():
+            if key.lower() == "x-smg-error-code":
+                code = value
+                break
+    if code != "request_aborted":
+        return exc
+    request_id = (request_headers or {}).get("x-request-id", "")
+    translated = RequestAbortedByGatewayError(request_id=request_id, message=str(exc.message))
+    translated.__cause__ = exc
+    return translated
 
 def _parse_body(body: bytes) -> tuple[Any, str | None]:
     text: str | None = None
@@ -342,6 +385,10 @@ async def request_raw(
                 _raise_for_status(status, body, response)
             return HttpResponse(status=status, body=body, headers=response_headers)
         except Exception as e:
+            # handle abort error
+            translated = _classify_http_error(e, headers)
+            if isinstance(translated, RequestAbortedByGatewayError):
+                raise translated from e
             retry_count += 1
             if retry_count >= attempts:
                 raise
@@ -386,6 +433,10 @@ async def request_json(
             data, text = _parse_body(body)
             return JsonHttpResponse(status=status, data=data, headers=response_headers, text=text)
         except Exception as e:
+            # handle abort error
+            translated = _classify_http_error(e, headers)
+            if isinstance(translated, RequestAbortedByGatewayError):
+                raise translated from e
             retry_count += 1
             psrl_logger.info(
                 "Error: %s, retrying... (attempt %s/%s, url=%s)",

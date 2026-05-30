@@ -14,6 +14,8 @@ import aiohttp
 
 from psrl.utils.common.http_utils import (
     JsonHttpResponse,
+    RequestAbortedByGatewayError,
+    _classify_http_error,
     _parse_body,
     _raise_for_status,
     filter_http_headers,
@@ -110,6 +112,10 @@ class HttpIOThread:
                     data, text = _parse_body(body)
                     return JsonHttpResponse(status=status, data=data, headers=resp_headers, text=text)
                 except Exception as e:
+                    # handle abort error
+                    http_error = _classify_http_error(e, headers)
+                    if isinstance(http_error, RequestAbortedByGatewayError):
+                        raise http_error from e
                     retry_count += 1
                     if retry_count >= max_retries:
                         raise

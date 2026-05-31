@@ -22,8 +22,13 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     from verl.utils.dataset.rl_dataset import get_dataset_class
 
-    # Get the dataset class
-    dataset_cls = get_dataset_class(data_config)
+    if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
+        dataset_cls = get_dataset_class(data_config)
+    else:
+        from psrl.utils.dataset.rl_dataset import PSRLRLHFDataset
+
+        dataset_cls = PSRLRLHFDataset
+        print(f"Using dataset class: {dataset_cls.__name__}")
 
     # Instantiate the dataset using the determined dataset class
     dataset = dataset_cls(

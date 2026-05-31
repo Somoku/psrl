@@ -8,13 +8,20 @@ import torch
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
 from safetensors import safe_open
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 from verl.utils.fs import copy_to_local
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
 from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.hf_converter import convert_hf_inplace
+from psrl.utils.converter.hf_converter import (
+    convert_hf_inplace,
+    maybe_convert_to_smaller_parts
+)
+from psrl.utils.converter.model_mappings import (
+    slice_attn_conv1d,
+    slice_qwen3_5_in_proj_qkv,
+)
 from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.nixl import (
     NIXLClientType,
@@ -285,8 +292,8 @@ class PSStorageWorker:
             local_path,
             trust_remote_code=self.model_config.get("trust_remote_code", False),
         )
-        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
-            model_class = AutoModelForVision2Seq
+        if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
+            model_class = AutoModelForImageTextToText
         else:
             model_class = AutoModelForCausalLM
 
@@ -313,6 +320,13 @@ class PSStorageWorker:
         self._tied_weights_alias_map = self._build_tied_weights_alias_map(self.train_meta_hf_model, local_path)
         if self._tied_weights_alias_map:
             psrl_logger.info(f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}")
+        
+        # Save model info
+        self.model_info = create_parameter_mapping(
+            "HuggingFace", 
+            self.train_meta_hf_model.config
+        ).get_model_info()
+
         psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
 
     @staticmethod
@@ -336,6 +350,10 @@ class PSStorageWorker:
         # If lm_head.weight is already in the checkpoint, no alias mapping needed.
         if alias in ckpt_keys:
             return {}
+
+        if canonical not in ckpt_keys:
+            # NOTE(zym) For Qwen3_5ForConditionalGeneration
+            canonical = "model.language_model.embed_tokens.weight"
 
         assert canonical in ckpt_keys, (
             f"_build_tied_weights_alias_map: tie_word_embeddings=True but "
@@ -397,8 +415,9 @@ class PSStorageWorker:
         for shard_file in shard_files:
             psrl_logger.debug(f"[preload_checkpoint_to_cpu] Opening shard {shard_file}.")
             with safe_open(shard_file, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    cache[key] = f.get_tensor(key)
+                param_dict = maybe_convert_to_smaller_parts(self.model_info, key, full_tensor)
+                for param_name, param in param_dict.items():
+                    cache[param_name] = param
 
         # Expand tied-weight aliases so phase 2 can do a direct key lookup.
         alias_count = 0

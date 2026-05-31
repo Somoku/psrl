@@ -120,17 +120,32 @@ class ReplayBuffer:
 
         self.poll_interval = poll_interval
         self.lock = threading.Lock()
+        self._stop_event = threading.Event()
         self.poll_thread = threading.Thread(target=self._poll_from_transfer_queue, daemon=True)
         self.poll_thread.start()
 
     def _poll_from_transfer_queue(self):
         """Periodically poll metadata from transfer queue."""
-        while True:
-            data = tq.kv_list()
-            if data is not None:
-                for partition_id, items in data.items():
-                    self.add(partition_id, items)
-            time.sleep(self.poll_interval)
+        try:
+            while not self._stop_event.is_set():
+                data = tq.kv_list()
+                if data is not None:
+                    for partition_id, items in data.items():
+                        self.add(partition_id, items)
+                self._stop_event.wait(self.poll_interval)
+        except Exception as e:
+            if not self._stop_event.is_set():
+                psrl_logger.error(f"Error in _poll_from_transfer_queue: {e}")
+                os._exit(1)
+
+    def close(self):
+        """Stop the background polling thread."""
+        if not self.poll_thread.is_alive():
+            return
+        self._stop_event.set()
+        self.poll_thread.join(timeout=self.poll_interval + 1.0)
+        if self.poll_thread.is_alive():
+            psrl_logger.warning("ReplayBuffer poll thread did not stop within timeout")
 
     def add(self, partition_id: str, items: dict[str, dict]):
         """Add items to the replay buffer.
@@ -339,6 +354,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # otherwise, it will cause error when running Megatron backend
         self._init_tokenizer()
         self._init_data_processor()
+        self._init_dump_executor()
 
         # Build logger
         self.log_prefix = "MainRayTrainer"
@@ -963,6 +979,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # AGENT(VERL): PSRL use `parent_id` to group samples of the same prompt together,
         # while verl use `uid` instead.
         sample_parent_ids = []
+        
+        dump_all_inputs: list[str] = []
+        dump_all_outputs: list[str] = []
+        dump_all_keys: list[str] = []
+        session_to_sample_idx: dict[str, int] = {}
 
         val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
         val_batch_num = ray.get(self.data_processor.get_val_batch_num.remote())
@@ -986,7 +1007,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # 4. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
             # Keys have format {uid}_{index}; keep only the highest index per session.
-            final_indices = []
             session_max: dict[str, tuple[int, int]] = {}  # session_key -> (max_index, position)
             for pos, key in enumerate(test_result.keys):
                 parts = key.rsplit("_", 1)
@@ -997,20 +1017,23 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         session_max[session_key] = (index, pos)
                 else:
                     session_max[key] = (0, pos)
-            final_indices = sorted(pos for _, pos in session_max.values())
+            sorted_sessions = sorted(session_max.items(), key=lambda x: x[1][1])
+            final_indices = [pos for _, (_, pos) in sorted_sessions]
             final_keys = [test_result.keys[i] for i in final_indices]
 
-            fields = [
-                "uid",
-                "parent_id",
-                "prompts",
-                "responses",
-                "rm_scores",
-                "reward_extra_info",
-                "num_turns",
-                "reward_model",
-                "data_source",
-            ]
+            base_offset = len(sample_scores)
+            session_to_sample_idx.update(
+                {session_key: base_offset + j for j, (session_key, _) in enumerate(sorted_sessions)}
+            )
+            text_data = tq.kv_batch_get(
+                keys=test_result.keys, partition_id=test_result.partition_id, select_fields=["prompts", "responses"]
+            )
+            text_data["prompts"] = text_data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            text_data["responses"] = text_data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+            all_inputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["prompts"]]
+            all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
+
+            fields = ["uid", "parent_id", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
             data = tq.kv_batch_get(keys=final_keys, partition_id=test_result.partition_id, select_fields=fields)
 
             scores = data["rm_scores"].sum(dim=1).tolist()
@@ -1029,18 +1052,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 reward_extra_infos_dict["acc"].append(acc)
 
             # Store generated outputs
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["responses"]]
-            sample_outputs.extend(output_texts)
+            sample_outputs.extend(all_outputs[i] for i in final_indices)
 
             # Store original inputs
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in data["prompts"]]
-            sample_inputs.extend(input_texts)
+            sample_inputs.extend(all_inputs[i] for i in final_indices)
 
             sample_parent_ids.extend(tu.get(data, "parent_id" if val_rollout_n > 1 else "uid"))
 
             ground_truths = [
                 item.get("ground_truth", None)
-                for item in (tu.get(data, "reward_model") or [{}] * len(final_keys))
+                for item in (tu.get(data, "reward_model", None) or [{}] * len(final_keys))
             ]
             sample_gts.extend(ground_truths)
             sample_turns.extend(data.pop("num_turns").tolist())
@@ -1048,25 +1069,45 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             data_source = tu.get(data, "data_source") or ["unknown"] * len(final_keys)
             data_sources.extend(data_source)
 
+            dump_all_inputs.extend(all_inputs)
+            dump_all_outputs.extend(all_outputs)
+            dump_all_keys.extend(test_result.keys)
+
             # 5. Release TQ storage for this val batch.
             tq.kv_clear(keys=test_result.keys, partition_id=test_result.partition_id)
             self.replay_buffer.remove(test_result.keys, test_result.partition_id)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_extra_infos_to_dump = {
-            k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in reward_extra_infos_dict.items()
-        }
-
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            # Sort according to uid (so that generations in the same rollout are together)
+            sort_keys = []
+            for key in dump_all_keys:
+                parts = key.rsplit("_", 1)
+                sort_keys.append((parts[0], int(parts[1])) if len(parts) == 2 else (key, 0))
+            sorted_indices = sorted(range(len(dump_all_keys)), key=lambda i: sort_keys[i])
+            dump_all_inputs = [dump_all_inputs[i] for i in sorted_indices]
+            dump_all_outputs = [dump_all_outputs[i] for i in sorted_indices]
+            dump_all_keys = [dump_all_keys[i] for i in sorted_indices]
+            
+            # For ground truths, scores and reward extra infos, find the values in the
+            # lists for the final samples of each session
+            dump_all_sessions = [
+                f"{parts[0]}" if len(parts) == 2 else key
+                for key in dump_all_keys
+                for parts in [key.rsplit("_", 1)]
+            ]
+            session_final_indices = [session_to_sample_idx[session] for session in dump_all_sessions]
             self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                gts=sample_gts,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                inputs=dump_all_inputs,
+                outputs=dump_all_outputs,
+                gts=[sample_gts[i] for i in session_final_indices],
+                scores=[sample_scores[i] for i in session_final_indices],
+                reward_extra_infos_dict={
+                    k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
+                } | {"uid": dump_all_keys},
                 dump_path=val_data_dir,
             )
 
@@ -1087,10 +1128,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         return self._val_metrics_update(data_sources, sample_parent_ids, reward_extra_infos_dict, sample_turns)
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
-        """Dump rollout/validation samples as JSONL."""
+    @staticmethod
+    def _write_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Write generation samples as JSONL (runs in background thread)."""
         os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
 
         n = len(inputs)
         base_data = {
@@ -1098,7 +1140,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [self.global_steps] * n,
+            "step": [global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
@@ -1112,19 +1154,51 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 return float(obj)
             elif isinstance(obj, np.bool_):
                 return bool(obj)
-            elif isinstance(obj, np.ndarray):
+            elif hasattr(obj, "tolist"):
                 return obj.tolist()
             raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
-        lines = []
-        for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False, default=json_encode_default))
-
         with open(filename, "w") as f:
-            f.write("\n".join(lines) + "\n")
+            for i in range(n):
+                entry = {k: v[i] for k, v in base_data.items()}
+                f.write(json.dumps(entry, ensure_ascii=False, default=json_encode_default) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Dump rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        # Clean up completed futures and surface any exceptions early
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _init_dump_executor(self):
+        """Create or recreate the dump executor and futures list."""
+        self._dump_executor = ThreadPoolExecutor(max_workers=1)
+        self._dump_futures = []
+
+    def _shutdown_dump_executor(self):
+        """Drain pending dump futures and shut down the executor."""
+        for f in self._dump_futures:
+            f.result()
+        self._dump_futures.clear()
+        self._dump_executor.shutdown(wait=True)
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():
@@ -2727,6 +2801,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         from omegaconf import OmegaConf
         from verl.utils.tracking import Tracking
 
+        if self._dump_executor._shutdown:
+            self._init_dump_executor()
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -2800,6 +2877,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                self._shutdown_dump_executor()
                 return
 
         # AGENT(VERL): skip RolloutSkip part in PSRL
@@ -3034,6 +3112,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if is_last_step:
                 if hasattr(self.actor_wg, "async_calls_finalize_fn_exec"):
                     self.actor_wg.async_calls_finalize_fn_exec(blocking=True)
+                self._shutdown_dump_executor()
                 psrl_logger.info(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
                 break
@@ -3047,9 +3126,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ray.get(self.elastic_executor.stop_busy_loop.remote())
             self.elastic_executor = None
         self.stop_ps_manager()
+        self._shutdown_dump_executor()
 
-        if self.config.transfer_queue.enable:
-            tq.close()
+        self.replay_buffer.close()
+        tq.close()
 
         # AGENT(VERL): skip `on_batch_end` processing in PSRL.
 

@@ -31,6 +31,8 @@ class TokenInput:
     """the multi-modal data for this generation, e.g., image/video features or metadata"""
     is_validate: bool = False
     """whether this request is for validation purpose"""
+    stop_token_ids: list[int] | None = None
+    """extra stop token ids required by model-specific tool parsers"""
 
 @dataclass
 class TokenOutput:

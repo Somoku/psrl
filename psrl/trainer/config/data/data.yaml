@@ -5,6 +5,11 @@ defaults:
 # Use multi-dataset mode, fallback to veRL legacy mode if False.
 use_multi_dataset: False
 
+# Number of workers for filtering overlong prompts.
+# For large-scale datasets, filtering can be time-consuming.
+# Use multiprocessing to speed up. Default is 32.
+filter_overlong_prompts_workers: 32
+
 # Each entry specifies one dataset with its file path, prompt key,
 # sample limit, and per-dataset reward model routing configuration.
 #

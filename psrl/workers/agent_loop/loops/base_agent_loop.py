@@ -8,10 +8,8 @@ from contextlib import nullcontext
 import numpy as np
 import ray
 import torch
-import transfer_queue as tq
 from PIL import Image
 from tensordict import NonTensorData, NonTensorStack, TensorDict
-from transfer_queue import KVBatchMeta
 from transformers import AutoProcessor, AutoTokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
@@ -254,6 +252,10 @@ class AgentLoopBase(ABC):
     async def generate_sequence(self, request: dict, is_sticky_session: bool = False) -> "TokenOutput":
         request_input: TokenInput = await self.pre_process_inputs(request)
         sampling_params = self._get_sampling_params(request_input)
+        if request_input.stop_token_ids:
+            sampling_params["stop_token_ids"] = list(
+                set((sampling_params.get("stop_token_ids") or []) + request_input.stop_token_ids)
+            )
         if self.config.psrl.rollout_gateway.enable:
             if not self.gateway_addr:
                 raise RuntimeError("Rollout gateway is enabled but gateway address is empty.")
@@ -300,6 +302,7 @@ class AgentLoopBase(ABC):
                     request_input.rollout_instance_id,
                     request_input.cu_response_len,
                     request_input.is_validate,
+                    request_input.stop_token_ids,
                 )
         return output
 
@@ -592,6 +595,7 @@ class AgentLoopBase(ABC):
             multi_modal_data=multi_modal_data,
             raw_prompt=messages,
             is_validate=is_validate,
+            stop_token_ids=request.get("stop_token_ids", None),
         )
 
     async def _normalize_messages(self, messages: list[dict]) -> list[dict]:

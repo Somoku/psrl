@@ -52,9 +52,9 @@ echo "Notice: TransformerEngine installation can take a long time, please be pat
 NVTE_FRAMEWORK=pytorch python -m pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
 
 echo "3. Install Megatron"
-python -m pip install --no-deps --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0
+python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@b2a8ec7 --no-deps --no-build-isolation
 
 echo "4. Install mbridge"
-python -m pip install --no-cache-dir mbridge==v0.15.1
+python -m pip install git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@0a21da4 --no-deps --no-build-isolation
 
 echo "Successfully installed all packages for Megatron"

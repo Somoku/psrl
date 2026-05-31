@@ -13,16 +13,22 @@ from vllm.model_executor.layers.linear import (
     set_weight_attrs,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
 from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
 
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     MappingType,
     ParameterMapping,
+    slice_in_proj_ba,
+    slice_in_proj_qkvz,
+    slice_qwen3_5_in_proj_qkv,
     slice_fused_moe_w2_weight,
     slice_fused_moe_w13_weight,
     slice_gate_up_proj,
     slice_qkv_proj,
+    slice_attn_conv1d,
+    reshape_visual_block_qkv,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -175,14 +181,23 @@ class VllmConverter(BaseConverter):
         if hasattr(model, "lm_head"):
             lm_head_module = model.lm_head
             lm_head_module_prefix = "lm_head"
+        if hasattr(model, "language_model") and hasattr(model.language_model, "lm_head"):
+            lm_head_module = model.language_model.lm_head
+            lm_head_module_prefix = "lm_head"
 
         seen_module_prefixes = set()
         for module_prefix, module in model.named_modules():
+            if module_prefix.startswith("visual"):
+                module_prefix = f"model.{module_prefix}"
+            if module_prefix.startswith("language_model.model"):
+                module_prefix = f"model.language_model.{module_prefix[21:]}"
+            if module_prefix.startswith("language_model.lm_head"):
+                module_prefix = f"lm_head"
             seen_module_prefixes.add(module_prefix)
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
-                sharding = self.get_sharding_for_param(module, param_name)
+                sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
                     new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
@@ -195,7 +210,7 @@ class VllmConverter(BaseConverter):
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
-                sharding = self.get_sharding_for_param(module, param_name)
+                sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
                     new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
                     converted_state_dict[new_param_name] = new_param
@@ -249,6 +264,9 @@ class VllmConverter(BaseConverter):
                 return out
             elif mapping_type == MappingType.GATE_UP_PROJ_SPLIT:
                 intermediate_size = model_info["intermediate_size"]
+                if intermediate_size is None:
+                    intermediate_size = self.model_info["moe_intermediate_size"]
+                assert intermediate_size is not None, "Intermediate size must be specified in model_info for gate_up_proj split"
                 try:
                     sliced_params = slice_gate_up_proj(
                         fused_param=param,
@@ -262,6 +280,62 @@ class VllmConverter(BaseConverter):
                     assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
                     new_param = sliced_params[shard_id]
                     new_param_name = hf_name if is_full_path else full_name.replace(vllm_name, hf_name)
+                    out[new_param_name] = new_param
+                return out
+            elif mapping_type == MappingType.IN_PROJ_QKVZ_SPLIT:
+                key_dim = self.model_info.get("linear_key_dim")
+                value_dim = self.model_info.get("linear_value_dim")
+                if key_dim is None or value_dim is None:
+                    raise ValueError(
+                        "Qwen3.5 linear attention dims are missing in model_info; "
+                        f"got linear_key_dim={key_dim} and linear_value_dim={value_dim}."
+                    )
+                try:
+                    sliced_params = slice_in_proj_qkvz(
+                        fused_param=param,
+                        key_dim=key_dim,
+                        value_dim=value_dim,
+                        tp_size=tp_size,
+                    )
+                except Exception as e:
+                    raise ValueError(f"Failed to slice in_proj_qkvz parameter {full_name}: {e}") from e
+                out = {}
+                for hf_name, shard_id in mappings:
+                    assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
+                    new_param = sliced_params[shard_id]
+                    new_param_name = full_name.replace(vllm_name, hf_name)
+                    if shard_id == 0:
+                        qkv_names = [new_param_name + "_q", new_param_name + "_k", new_param_name + "_v"]
+                        qkv_params = slice_qwen3_5_in_proj_qkv(
+                            fused_param=new_param, 
+                            key_dim=key_dim,
+                            value_dim=value_dim,
+                            tp_size=tp_size,
+                        )
+                        out.update(dict(zip(qkv_names, qkv_params)))
+                        continue
+                    out[new_param_name] = new_param
+                return out
+            elif mapping_type == MappingType.IN_PROJ_BA_SPLIT:
+                num_v_heads = self.model_info.get("linear_num_value_heads")
+                if num_v_heads is None:
+                    raise ValueError(
+                        "Qwen3.5 linear attention num_v_heads is missing in model_info; "
+                        f"got linear_num_value_heads={num_v_heads}."
+                    )
+                try:
+                    sliced_params = slice_in_proj_ba(
+                        fused_param=param,
+                        num_v_heads=num_v_heads,
+                        tp_size=tp_size,
+                    )
+                except Exception as e:
+                    raise ValueError(f"Failed to slice in_proj_ba parameter {full_name}: {e}") from e
+                out = {}
+                for hf_name, shard_id in mappings:
+                    assert shard_id < len(sliced_params), f"Shard id {shard_id} is out of range for {vllm_name}"
+                    new_param = sliced_params[shard_id]
+                    new_param_name = full_name.replace(vllm_name, hf_name)
                     out[new_param_name] = new_param
                 return out
             elif mapping_type == MappingType.FUSED_MOE_W13_SPLIT:
@@ -296,7 +370,7 @@ class VllmConverter(BaseConverter):
                         fused_param=param,
                     )
                 except Exception as e:
-                    raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}") from e
+                    raise ValueError(f"Failed to slice w2_weight parameter {full_name}: {e}") from e
                 out = {}
                 ep_size = getattr(module, "ep_size", 1)
                 ep_rank = self.tp_rank if ep_size > 1 else 0
@@ -316,10 +390,26 @@ class VllmConverter(BaseConverter):
                 return out
             else:
                 raise ValueError(f"Unsupported mapping type: {mapping_type}")
+
+        if "linear_attn.conv1d.weight" in full_name:
+            new_param_names = [full_name + "_q", full_name + "_k", full_name + "_v"]
+            new_params = slice_attn_conv1d(
+                fused_param=param,
+                num_k_heads=self.model_info["linear_num_key_heads"],
+                num_v_heads=self.model_info["linear_num_value_heads"],
+                k_head_size=self.model_info["linear_key_head_dim"],
+                v_head_size=self.model_info["linear_value_head_dim"],
+                tp_size=tp_size,
+            )
+            return dict(zip(new_param_names, new_params))
+
+        if "visual.blocks" in full_name and "qkv" in full_name:
+            param = reshape_visual_block_qkv(param)
+
         # Default: No conversion needed
         return {full_name: param}
 
-    def get_sharding_for_param(self, module, param_name) -> NIXLSharding:
+    def get_sharding_for_param(self, module, param_name, full_name=None) -> NIXLSharding:
         """
         Generate sharding info for a parameter given its module and tp_rank.
         Returns a NIXLSharding object.
@@ -341,9 +431,18 @@ class VllmConverter(BaseConverter):
                     VocabParallelEmbedding,
                 ),
             ):
-                shard_dim = 0
+                if "visual.blocks" in full_name and "qkv" in full_name:
+                    shard_dim = 1
+                else:
+                    shard_dim = 0
             elif isinstance(module, RowParallelLinear):
-                shard_dim = 1
+                if param_name == "bias":
+                    # NOTE(zym) bias doesn't need to be sharded
+                    tp_size = 1
+                    shard_indices = [(0,)]
+                    shard_dim = 0
+                else:
+                    shard_dim = 1
             elif isinstance(module, FusedMoE):
                 if "w13" in param_name:
                     shard_dim = 0
@@ -357,6 +456,9 @@ class VllmConverter(BaseConverter):
                 # Refer to vllm/vllm/model_executor/layers/linear.py
                 tp_size = 1
                 shard_indices = [(0,)]
+                shard_dim = 0
+            elif isinstance(module, Qwen3_5GatedDeltaNet):
+                # NOTE(zym): For param dt_bias and A_log
                 shard_dim = 0
             else:
                 raise ValueError(f"Unsupported module type for sharding: {type(module)}")

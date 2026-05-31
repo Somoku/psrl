@@ -62,6 +62,7 @@ class MultiTurnConfig(_VeRLMultiTurnConfig):
     enable: bool = False
     max_turns: int | None = None
     tool_config_path: str | None = None
+    function_tool_path: str | None = None
     max_parallel_calls: int = 1
     max_tool_response_length: int = 256
     tool_response_truncate_side: str = "middle"

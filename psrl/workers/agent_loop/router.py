@@ -30,27 +30,6 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote(concurrency_groups={"control": 1})
 class RolloutRouter:
-    # add_worker
-    # health
-    # route_generate -> token-in-token-out
-    # route_chat -> OAI spec
-    # route_completion -> OAI spec
-    # route_responses -> OAI spec
-    # 以 replica 为单位注册，一个 replica 内部可能有若干个 instance（传参指定）
-
-    # V2
-    # 启动 sglang router，传入路由策略相关参数
-    # add_worker -> 计算相关参数，调用 sglang router 的 "{base_url}/workers"
-    #               并传入额外相关参数
-    #               (TP, PP 由 server_info 得到，balanced_concurrent_seqs_per_instance 为 policy 侧固定参数，max_model_len 由 engine stats 传入)  # noqa: E501
-    # update_instance_status -> 由 coordinator 定期调用，改写到 Rust 端，通过 "{base_url}/push_engine_stats" 接口传入，供路由策略使用  # noqa: E501
-    # pause/resume/is_routing -> 改写到 Rust 端，通过 "{base_url}/request_queue/pause" 等接口控制，用于管理 PSRL 策略的路由循环的暂停和恢复  # noqa: E501
-    # routing_loop -> 改写到 Rust 端，放在 router.rs 内运行，`route_typed_request_once()` 调用时变成加入请求队列，等待结果。  # noqa: E501
-    # _route_single_request -> 涉及实际的调用，改写到 Rust 端，注意做 partial rollout 时的相关处理，在调用前后进行 PS manager 的交互。  # noqa: E501
-    # pause/resume_instance -> 改为 delete/add worker
-    # wait_interrupted_partial_requests_loop_back -> 替换为对 vllm worker 的 `wait_for_requests_to_drain` 调用。
-    # check_should_migrate/sync -> 迁移到 coordinator 调用，router 侧暴露接口供 coordinator 调用以查询和触发迁移。
-
     def __init__(
         self,
         config: DictConfig,
@@ -497,6 +476,7 @@ class RolloutRouter:
         rollout_instance_id: RolloutInstanceId | None = None,
         cu_response_len: int = 0,
         is_validate: bool = False,
+        stop_token_ids: list[int] | None = None,
     ) -> TokenOutput:
         """Asynchronously generate response for a single request.
 
@@ -543,9 +523,10 @@ class RolloutRouter:
             rollout_instance_id=rollout_instance_id,
             cu_response_len=cu_response_len,
             is_validate=is_validate,
+            stop_token_ids=stop_token_ids,
         )
         self.requests_to_route.put(request)
-        # psrl_logger.info(f"Adding request {request_id} to priority queue")
+        psrl_logger.info(f"Adding request {request_id} to priority queue")
         # Wait for the request to be processed
         with log_dual_events(
             f"Routing request {request_id} and waiting for it to be processed",
@@ -731,6 +712,10 @@ class RolloutRouter:
                 sampling_params["top_k"] = val_config.top_k
                 sampling_params["top_p"] = val_config.top_p
                 sampling_params["temperature"] = val_config.temperature
+            if request.stop_token_ids:
+                sampling_params["stop_token_ids"] = list(
+                    set((sampling_params.get("stop_token_ids") or []) + request.stop_token_ids)
+                )
 
             # Generate response
             replica_id, data_parallel_rank = instance_id
@@ -802,6 +787,7 @@ class RolloutRouter:
             rollout_instance_id=output.rollout_instance_id,
             cu_response_len=new_cu_response_len,
             is_validate=request.is_validate,
+            stop_token_ids=request.stop_token_ids,
         )
         return updated_request
 
@@ -1090,7 +1076,6 @@ class RolloutRouter:
 
         return True
 
-    '''
     @ray.method(concurrency_group="control")
     async def wait_interrupted_partial_requests_loop_back(self, instance_ids: list[RolloutInstanceId]):
         """Wait for the interrupted partial requests to be looped back in the priority queue.
@@ -1106,9 +1091,9 @@ class RolloutRouter:
                     instance_id not in finished_instance_ids
                     and len(self.instance_to_inflight_request_ids[instance_id]) == 0
                 ):
+                    psrl_logger.info(f"All requests on instance {instance_id} are looped back")
                     finished_instance_ids.add(instance_id)
             if len(finished_instance_ids) == len(instance_ids):
                 break
             await asyncio.sleep(0)
         psrl_logger.info("The interrupted partial requests are looped back in the priority queue")
-    '''

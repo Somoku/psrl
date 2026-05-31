@@ -260,30 +260,33 @@ class TrainClientActor:
         """Initialize Megatron model"""
         hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
         dtype = PrecisionType.to_dtype(torch.bfloat16)
-        tf_config = hf_to_mcore_config(hf_config, dtype)
         self.print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
 
-        def model_provider(pre_process, post_process, vp_stage=None):
-            """Model provider function"""
-            model = init_mcore_model(
-                tf_config,
-                hf_config,
-                pre_process,
-                post_process,
-                share_embeddings_and_output_weights=getattr(hf_config, "tie_word_embeddings", False),
-                value=False,
-                vp_stage=vp_stage,
-            )
-            model.to(get_device_name())
-            for p in model.parameters():
-                p.data.fill_(1)
-            return model
+        use_mbridge = True
 
-        self.model = get_model(
-            model_provider,
-            wrap_with_ddp=True,
-            use_distributed_optimizer=True,
+        if use_mbridge:
+            from verl.models.mcore.mbridge import AutoBridge
+
+            bridge = AutoBridge.from_config(hf_config, dtype=dtype)
+            tf_config = bridge.config
+            tf_config.fp16 = dtype == torch.float16
+            tf_config.bf16 = dtype == torch.bfloat16
+        else:
+            tf_config = hf_to_mcore_config(hf_config, dtype)
+
+        from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
+
+        wrap_config = McoreModuleWrapperConfig()
+        actor_module, _ = make_megatron_module(
+            wrap_config,
+            tf_config,
+            hf_config,
+            bridge=bridge if use_mbridge else None,
         )
+        self.model = actor_module
+
+        for name, param in self.model[0].named_parameters():
+            param.data.fill_(1)
         self.print(f"[Rank {self.rank}] Model initialized: {self.model}")
 
     def init_finished(self):
@@ -500,7 +503,7 @@ class GenClientActor:
                     ps_client_name,
                     key,
                     "gen_pull",
-                    merge_and_cache_xfer=True,
+                    merge_and_cache_xfer=False,
                 )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
@@ -715,13 +718,17 @@ def test_nixl_e2e(cfg: DictConfig):
     # Fetch and verify gen client state_dicts
     print("[CHECK] Verifying GenClientActor state_dicts are all ones...")
     gen_state_dicts = ray.get([g.get_state_dict.remote() for g in gen_actors])
+    incorrect_keys = []
     for gen_idx, state_dict in enumerate(gen_state_dicts):
         for k, v in state_dict.items():
-            assert torch.allclose(v, torch.ones_like(v), atol=1e-6), (
-                f"[VERIFY] Gen client {gen_idx} param {k} is not all ones: {v}"
-            )
+            if not torch.allclose(v, torch.ones_like(v), atol=1e-6):
+                incorrect_keys.append((gen_idx, k))
+                print(f"[VERIFY] Gen client {gen_idx} param {k} is not all ones: {v}")
         print(f"[PASS] Gen client {gen_idx} is all ones.")
-    print("[PASS] All GenClientActor parameters are all ones.")
+    if incorrect_keys:
+        print(f"[FAIL] Parameters {incorrect_keys} are not all ones")
+    else:
+        print("[PASS] All GenClientActor parameters are all ones.")
 
     # Shutdown all actors and Ray
     for t in train_actors:

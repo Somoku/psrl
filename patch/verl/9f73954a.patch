@@ -1,23 +1,28 @@
-From 33964cc4faff1f9a4a9a7087a5fefcc5591a7076 Mon Sep 17 00:00:00 2001
+From 7a4e2cf70d747ff7e7dfbf24ff0c1215dc15ff0a Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Wed, 8 Apr 2026 10:51:26 +0800
-Subject: [PATCH] [PATCH] tms, metrics, ray resource num, data sampling
+Date: Sun, 31 May 2026 18:32:47 +0800
+Subject: [PATCH] tms, metrics, ray resource num, data sampling, multi-reward
 
 ---
- verl/protocol.py                              |  37 ++++--
+ verl/protocol.py                              |  38 +++--
  verl/single_controller/ray/base.py            |   6 +-
- verl/trainer/ppo/metric_utils.py              |  30 ++++-
- verl/utils/dataset/rl_dataset.py              |  52 +++++++-
+ verl/trainer/config/data/legacy_data.yaml     |   2 +-
+ verl/trainer/config/engine/fsdp.yaml          |   2 +
+ verl/trainer/config/engine/megatron.yaml      |   2 +
+ verl/trainer/ppo/metric_utils.py              |  38 ++++-
+ verl/trainer/ppo/padding_utils.py             |  26 ++-
+ verl/trainer/ppo/rollout_corr_helper.py       |  30 ++--
+ verl/utils/dataset/rl_dataset.py              |  31 ++++
  verl/workers/config/engine.py                 |   1 +
- verl/workers/engine/fsdp/transformer_impl.py  |  59 +++++----
- .../engine/megatron/transformer_impl.py       | 125 ++++++++++--------
- 7 files changed, 211 insertions(+), 99 deletions(-)
+ verl/workers/engine/fsdp/transformer_impl.py  |  59 ++++---
+ .../engine/megatron/transformer_impl.py       | 159 ++++++++++--------
+ 12 files changed, 248 insertions(+), 146 deletions(-)
 
 diff --git a/verl/protocol.py b/verl/protocol.py
-index 6f541f6b..21fee5db 100644
+index 59f91d83..2a67859f 100644
 --- a/verl/protocol.py
 +++ b/verl/protocol.py
-@@ -935,22 +935,31 @@ class DataProto:
+@@ -936,22 +936,32 @@ class DataProto:
          # Merge meta_info with special handling for metrics
          merged_meta_info = {}
          if data:
@@ -29,7 +34,8 @@ index 6f541f6b..21fee5db 100644
 -                for k, v in d.meta_info.items():
 -                    if k == "metrics":
 +                all_keys.update(d.meta_info.keys())
-+            
++
++            # Merge non-metric meta_info and aggregate metrics from all workers.
 +            all_metrics = []  # for key "metrics" only
 +            for k in all_keys:
 +                if k == "metrics":
@@ -64,7 +70,7 @@ index 6f541f6b..21fee5db 100644
              # Flatten list of dicts to dict of lists for consistent metrics structure
              if all_metrics:
 diff --git a/verl/single_controller/ray/base.py b/verl/single_controller/ray/base.py
-index 2ab1f406..8feb6280 100644
+index 58b7148c..b04c64b8 100644
 --- a/verl/single_controller/ray/base.py
 +++ b/verl/single_controller/ray/base.py
 @@ -118,6 +118,7 @@ class RayResourcePool(ResourcePool):
@@ -92,7 +98,7 @@ index 2ab1f406..8feb6280 100644
              if self.accelerator_type is not None:
                  bundle[self.accelerator_type] = 1e-4
          pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
-@@ -620,7 +622,7 @@ class RayWorkerGroup(WorkerGroup):
+@@ -624,7 +626,7 @@ class RayWorkerGroup(WorkerGroup):
          if self.use_gpu and not use_gpu:
              raise ValueError("use_gpu is True but resource_pool.use_gpu is False")
          local_world_size = resource_pool.store[0]
@@ -101,37 +107,89 @@ index 2ab1f406..8feb6280 100644
  
          # we pass in environment variable at option so that Worker can use environment variable to set
          env_vars = {
+diff --git a/verl/trainer/config/data/legacy_data.yaml b/verl/trainer/config/data/legacy_data.yaml
+index cf4e7d5a..cda42ee5 100644
+--- a/verl/trainer/config/data/legacy_data.yaml
++++ b/verl/trainer/config/data/legacy_data.yaml
+@@ -62,7 +62,7 @@ return_raw_chat: True
+ return_full_prompt: False
+ 
+ # Whether to shuffle the data in the dataloader.
+-shuffle: True
++shuffle: False
+ 
+ # Seed to use when shuffling the data
+ seed: null
+diff --git a/verl/trainer/config/engine/fsdp.yaml b/verl/trainer/config/engine/fsdp.yaml
+index ea690c02..3f88763f 100644
+--- a/verl/trainer/config/engine/fsdp.yaml
++++ b/verl/trainer/config/engine/fsdp.yaml
+@@ -38,6 +38,8 @@ use_orig_params: false
+ # Random seed for reproducibility.
+ seed: 42
+ 
++load_weight: true
++
+ # Whether to enable full determinism for distributed training, only for debugging.
+ full_determinism: false
+ 
+diff --git a/verl/trainer/config/engine/megatron.yaml b/verl/trainer/config/engine/megatron.yaml
+index 89d2dd2f..2dcc49b9 100644
+--- a/verl/trainer/config/engine/megatron.yaml
++++ b/verl/trainer/config/engine/megatron.yaml
+@@ -59,6 +59,8 @@ distrib_optim_fully_reshardable_mem_efficient: False
+ # oc.select: default val for ref.megatron.seed
+ seed: 42
+ 
++load_weight: true
++
+ # Allow to override Distributed Data Parallel (DDP) config
+ override_ddp_config: {}
+ 
 diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
-index 4dd7d2d0..4bab970b 100644
+index 946f7611..ae2648b8 100644
 --- a/verl/trainer/ppo/metric_utils.py
 +++ b/verl/trainer/ppo/metric_utils.py
-@@ -125,6 +125,24 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+@@ -116,8 +116,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+     advantages = batch.batch["advantages"]
+     returns = batch.batch["returns"]
+ 
+-    max_prompt_length = batch.batch["prompts"].shape[-1]
+-    max_response_length = batch.batch["responses"].shape[-1]
++    max_prompt_length = batch.meta_info.get("max_prompt_length", batch.batch["prompts"].shape[-1])
++    max_response_length = batch.meta_info.get("max_response_length", batch.batch["responses"].shape[-1])
+ 
+     response_mask = batch.batch["response_mask"].bool()
+ 
+@@ -130,6 +130,26 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+ 
      non_aborted_sequence_score = sequence_score[non_aborted_mask]
      non_aborted_sequence_reward = sequence_reward[non_aborted_mask]
++    
++    if "original_reward_score" in batch.non_tensor_batch and "data_source" in batch.non_tensor_batch:
++        np_non_aborted_mask = non_aborted_mask.numpy()
++        non_aborted_original_scores = batch.non_tensor_batch["original_reward_score"][np_non_aborted_mask]
++        non_aborted_data_sources = batch.non_tensor_batch["data_source"][np_non_aborted_mask]
++        data_sources, data_source_counts = np.unique(non_aborted_data_sources, return_counts=True)
++        print("In this batch, the data sources are:")
++        for data_source, data_source_count in zip(data_sources, data_source_counts):
++            print(f"{data_source}: {data_source_count}")
++        print("--------------------------------")
++        data_src2original_score_metrics = defaultdict(dict)
++        for data_source in data_sources:
++            ds_mask = non_aborted_data_sources == data_source
++            ds_original_scores = non_aborted_original_scores[ds_mask]
++            data_src2original_score_metrics[data_source]["mean"] = np.mean(ds_original_scores)
++            data_src2original_score_metrics[data_source]["max"] = np.max(ds_original_scores)
++            data_src2original_score_metrics[data_source]["min"] = np.min(ds_original_scores)
++    else:
++        data_src2original_score_metrics = {}
++        data_sources = []
  
-+    np_non_aborted_mask = non_aborted_mask.numpy()
-+    non_aborted_original_scores = batch.non_tensor_batch["original_reward_score"][np_non_aborted_mask]
-+    non_aborted_data_sources = batch.non_tensor_batch["data_source"][np_non_aborted_mask]
-+    # print(non_aborted_data_sources)
-+    # import time; time.sleep(10000000)
-+    data_sources, data_source_counts = np.unique(non_aborted_data_sources, return_counts=True)
-+    print("In this batch, the data sources are:")
-+    for data_source, data_source_count in zip(data_sources, data_source_counts):
-+        print(f"{data_source}: {data_source_count}")
-+    print("--------------------------------")
-+    data_src2original_score_metrics = defaultdict(dict)
-+    for data_source in data_sources:
-+        ds_mask = non_aborted_data_sources == data_source
-+        ds_original_scores = non_aborted_original_scores[ds_mask]
-+        data_src2original_score_metrics[data_source]["mean"] = np.mean(ds_original_scores)
-+        data_src2original_score_metrics[data_source]["max"] = np.max(ds_original_scores)
-+        data_src2original_score_metrics[data_source]["min"] = np.min(ds_original_scores)
-+
-     score_mean = torch.mean(non_aborted_sequence_score).detach().item()
-     score_max = torch.max(non_aborted_sequence_score).detach().item()
-     score_min = torch.min(non_aborted_sequence_score).detach().item()
-@@ -158,6 +176,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
-         raise ValueError("All samples are aborted, this should not happen.")
+     if non_aborted_sequence_score.numel() > 0:
+         score_mean = torch.mean(non_aborted_sequence_score).detach().item()
+@@ -212,6 +232,15 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
+         critic_value_metrics = {}
  
      metrics = {
 +        **{
@@ -143,60 +201,165 @@ index 4dd7d2d0..4bab970b 100644
 +                f"critic/original_score/{data_source}/min": data_src2original_score_metrics[data_source]["min"],
 +            }.items()
 +        },
-+
          # score
          "critic/score/mean": score_mean,
          "critic/score/max": score_max,
-@@ -594,7 +622,7 @@ def process_validation_metrics(
+@@ -636,8 +665,9 @@ def process_validation_metrics(
+             var_dict = uid_dict.setdefault(uid, {})
  
              for var_name, var_vals in var2vals.items():
-                 # skip empty or string values
+-                # skip empty or string values
 -                if not var_vals or isinstance(var_vals[0], str):
-+                if not var_vals or isinstance(var_vals[0], str) or isinstance(var_vals[0], dict):
++                # skip empty, string, or non-numeric values (e.g. dicts from
++                # reward_extra_info that aggregate per-loop reward metadata)
++                if not var_vals or not isinstance(var_vals[0], (int, float)):
                      continue
  
                  # compute mean and std
+diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
+index 436e17bc..011a0c76 100644
+--- a/verl/trainer/ppo/padding_utils.py
++++ b/verl/trainer/ppo/padding_utils.py
+@@ -71,6 +71,7 @@ def construct_minimal_padding_template(
+     source_td: dict,
+     source_tag: dict,
+     eos_token_id: int,
++    pad_uid: int,
+ ) -> tuple[dict, dict]:
+     """Construct a minimal text-only padding template of one prompt token and one response token.
+ 
+@@ -101,6 +102,7 @@ def construct_minimal_padding_template(
+ 
+     # Update the fields and remove redundant parts
+     template_sample.update(
++        uid=pad_uid,
+         prompts=prompts,
+         responses=prompts.clone(),
+         input_ids=input_ids,
+@@ -112,6 +114,8 @@ def construct_minimal_padding_template(
+         rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
+         rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+     )
++    if "parent_id" in template_sample:
++        template_sample["parent_id"] = pad_uid
+     if "multi_modal_inputs" in template_sample:
+         template_sample["multi_modal_inputs"] = {}
+     if routed_experts is not None:
+@@ -120,7 +124,7 @@ def construct_minimal_padding_template(
+         template_sample.pop("routed_experts", None)
+ 
+     # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
+-    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
++    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2, parent_id=pad_uid)
+     return template_sample, template_tag
+ 
+ 
+@@ -154,26 +158,18 @@ def upsample_batch_to_divisible_size(
+     source_key = batch.keys[source_idx]
+     source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
+ 
+-    # Construct the minimal padding template of one prompt token and one response token
+-    template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id)
+-
+-    # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
+-    # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
+-    pad_uid = f"pad{uuid.uuid4().hex}"
+-    template_sample["uid"] = pad_uid
+-
+     # Construct the padding samples in a for-loop
+     pad_keys = []
+     pad_tags = []
+     pad_fields = []
+     pad_size = batch_multiple - remainder
+     for local_idx in range(pad_size):
+-        sample = copy.deepcopy(template_sample)
+-        # Use incremental local_idx as different session_ids
+-        pad_keys.append(f"{pad_uid}_{local_idx}_0")
+-        if "session_id" in sample:
+-            sample["session_id"] = local_idx
+-        pad_fields.append(sample)
++        pad_uid = -(local_idx + 1)
++        template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id, pad_uid)
++        pad_keys.append(f"{pad_uid}_0")
++        if "session_id" in template_sample:
++            template_sample["session_id"] = local_idx
++        pad_fields.append(template_sample)
+         pad_tags.append(copy.deepcopy(template_tag))
+ 
+     tq.kv_batch_put(
+diff --git a/verl/trainer/ppo/rollout_corr_helper.py b/verl/trainer/ppo/rollout_corr_helper.py
+index 0f4d558c..da740f11 100644
+--- a/verl/trainer/ppo/rollout_corr_helper.py
++++ b/verl/trainer/ppo/rollout_corr_helper.py
+@@ -760,18 +760,24 @@ def compute_is_metrics(
+     if rollout_is_weights.dim() > 1:
+         seq_mean_weights: torch.Tensor = verl_F.masked_mean(rollout_is_weights, response_mask, axis=-1)
+ 
+-        metrics["rollout_is_seq_mean"] = seq_mean_weights.mean().item()
+-        metrics["rollout_is_seq_std"] = seq_mean_weights.std().item() if seq_mean_weights.numel() > 1 else 0.0
+-        metrics["rollout_is_seq_max"] = seq_mean_weights.max().item()
+-        metrics["rollout_is_seq_min"] = seq_mean_weights.min().item()
+-
+-        # Sequence deviation from ideal weight (1.0)
+-        seq_deviation: torch.Tensor = (seq_mean_weights - 1.0).abs()
+-        metrics["rollout_is_seq_max_deviation"] = seq_deviation.max().item()
+-
+-        # Fraction of sequences with extreme weights
+-        metrics["rollout_is_seq_fraction_high"] = (seq_mean_weights > rollout_is_threshold).float().mean().item()
+-        metrics["rollout_is_seq_fraction_low"] = (seq_mean_weights < rollout_is_threshold_lower).float().mean().item()
++        seq_valid_mask_is: torch.Tensor = response_mask.sum(dim=-1) > 0
++        seq_mean_weights_valid: torch.Tensor = seq_mean_weights[seq_valid_mask_is]
++
++        if seq_mean_weights_valid.numel() > 0:
++            metrics["rollout_is_seq_mean"] = seq_mean_weights_valid.mean().item()
++            metrics["rollout_is_seq_std"] = (
++                seq_mean_weights_valid.std().item() if seq_mean_weights_valid.numel() > 1 else 0.0
++            )
++            metrics["rollout_is_seq_max"] = seq_mean_weights_valid.max().item()
++            metrics["rollout_is_seq_min"] = seq_mean_weights_valid.min().item()
++
++            # Sequence deviation from ideal weight (1.0)
++            seq_deviation: torch.Tensor = (seq_mean_weights - 1.0).abs()
++            metrics["rollout_is_seq_max_deviation"] = seq_deviation.max().item()
++
++            # Fraction of sequences with extreme weights
++            metrics["rollout_is_seq_fraction_high"] = (seq_mean_weights > rollout_is_threshold).float().mean().item()
++            metrics["rollout_is_seq_fraction_low"] = (seq_mean_weights < rollout_is_threshold_lower).float().mean().item()
+ 
+     return metrics
+ 
 diff --git a/verl/utils/dataset/rl_dataset.py b/verl/utils/dataset/rl_dataset.py
-index 9e38a24f..53bf7ad4 100644
+index dc4fcf07..a6a80fae 100644
 --- a/verl/utils/dataset/rl_dataset.py
 +++ b/verl/utils/dataset/rl_dataset.py
-@@ -87,6 +87,7 @@ class RLHFDataset(Dataset):
+@@ -22,6 +22,7 @@ import traceback
+ from collections import defaultdict
+ from io import BytesIO
+ from typing import Any, Optional
++from omegaconf import OmegaConf
  
-     def __init__(
-         self,
-+        dataset_config: DictConfig,
-         data_files: str | list[str],
-         tokenizer: PreTrainedTokenizer,
-         config: DictConfig,
-@@ -96,6 +97,18 @@ class RLHFDataset(Dataset):
-         if not isinstance(data_files, list | ListConfig):
-             data_files = [data_files]
+ import datasets
+ import numpy as np
+@@ -117,6 +118,18 @@ class RLHFDataset(Dataset):
+         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+         self.mm_processor_kwargs = config.get("mm_processor_kwargs", {})
  
-+        self.dataset_config = dataset_config
-+        self.prompt_key = dataset_config.get("prompt_key", "prompt")
-+        self.data_source_name = dataset_config.get("data_source_name", data_files[0])
-+
++        self.data_source_name = config.get("data_source_name", data_files[0])
 +        default_reward_model_dict = {
 +            "reward_loop_type": "naive",
 +            "reward_fn": "default",
 +            "reward_model_name": "null",
 +            "reward_coef": 1.0,
 +        }
-+        self.reward_model_dicts = dataset_config.get("reward_model_dicts", [default_reward_model_dict])
++        self.reward_model_dicts = OmegaConf.to_container(
++            config.get("reward_model_dicts", [default_reward_model_dict]),
++            resolve=True,
++        )
 +
-         self.data_files = copy.deepcopy(data_files)
-         self.original_data_files = copy.deepcopy(data_files)  # use for resume
-         self.tokenizer = tokenizer
-@@ -104,7 +117,7 @@ class RLHFDataset(Dataset):
-         self.config = config
- 
-         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
--        self.prompt_key = config.get("prompt_key", "prompt")
-+        # self.prompt_key = config.get("prompt_key", "prompt")
-         self.image_key = config.get("image_key", "images")
-         self.video_key = config.get("video_key", "videos")
-         self.image_patch_size = config.get("image_patch_size", 14)
-@@ -287,6 +300,25 @@ class RLHFDataset(Dataset):
+         # Mirror AgentLoopWorker's tool loading so length filtering sees the
+         # same schemas the rollout will.
+         self.tool_config_path = config.get("tool_config_path", None)
+@@ -280,6 +293,17 @@ class RLHFDataset(Dataset):
          else:
              print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
  
@@ -205,14 +368,6 @@ index 9e38a24f..53bf7ad4 100644
 +
 +        total = len(self.dataframe)
 +        target_size = int(np.ceil(total * over_sample_ratio))
-+
-+        # if self.shuffle:
-+        #     rng = np.random.default_rng(self.seed)
-+        #     indices = rng.choice(total, size=target_size, replace=True)
-+        # else:
-+        #     repeat_times = int(np.ceil(over_sample_ratio))
-+        #     indices = np.tile(np.arange(total), repeat_times)[:target_size]
-+
 +        repeat_times = int(np.ceil(over_sample_ratio))
 +        indices = np.tile(np.arange(total), repeat_times)[:target_size]
 +
@@ -222,36 +377,25 @@ index 9e38a24f..53bf7ad4 100644
      def __getstate__(self):
          if not self.serialize_dataset:
              state = self.__dict__.copy()
-@@ -377,6 +409,24 @@ class RLHFDataset(Dataset):
+@@ -389,6 +413,13 @@ class RLHFDataset(Dataset):
+             logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict["data_source"])
          row_dict["index"] = index
          row_dict["tools_kwargs"] = tools_kwargs
-         row_dict["interaction_kwargs"] = interaction_kwargs
-+
 +        # add reward loop type and reward fn
-+        # reward_loop_type = self.reward_loop_type
-+        # reward_fn = self.reward_fn
-+        # reward_model_name = self.reward_model_name
-+
-+        # reward_model_dict = {
-+        #     "reward_loop_type": reward_loop_type,
-+        #     "reward_fn": reward_fn,
-+        #     "reward_model_name": reward_model_name,
-+        # }
-+        # row_dict["reward_model_dict"] = reward_model_dict
 +        row_dict["reward_model_dicts"] = self.reward_model_dicts
 +
 +        data_source = row_dict.get("data_source", None)
 +        if data_source is None:
 +            data_source = self.data_source_name
 +        row_dict["data_source"] = data_source
+         row_dict["interaction_kwargs"] = interaction_kwargs
          return row_dict
  
-     @classmethod
 diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
-index 87880a7d..06a004c9 100644
+index b5ad8e9c..b6727a82 100644
 --- a/verl/workers/config/engine.py
 +++ b/verl/workers/config/engine.py
-@@ -106,6 +106,7 @@ class EngineConfig(BaseConfig):
+@@ -112,6 +112,7 @@ class EngineConfig(BaseConfig):
      use_remove_padding: bool = True
  
      seed: int = 42
@@ -260,10 +404,10 @@ index 87880a7d..06a004c9 100644
      full_determinism: bool = False
      router_replay: EngineRouterReplayConfig = field(default_factory=EngineRouterReplayConfig)
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index f8506206..b7f94099 100644
+index 2c66c6a3..01ea9cbc 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
-@@ -75,6 +75,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+@@ -76,6 +76,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
  from .utils import create_device_mesh, get_sharding_strategy
  
@@ -277,7 +421,7 @@ index f8506206..b7f94099 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -517,32 +524,36 @@ class FSDPEngine(BaseEngine):
+@@ -543,32 +550,36 @@ class FSDPEngine(BaseEngine):
      def _build_model_optimizer(self):
          from verl.utils.model import print_model_size
  
@@ -339,10 +483,10 @@ index f8506206..b7f94099 100644
              optimizer = None
              lr_scheduler = None
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 31c4c314..063ad4b0 100644
+index 93e98f23..5bb3ca6b 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -64,6 +64,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+@@ -69,6 +69,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import postprocess_batch_func, prepare_micro_batches
  from .utils import set_random_seed
  
@@ -356,7 +500,7 @@ index 31c4c314..063ad4b0 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -365,74 +372,78 @@ class MegatronEngine(BaseEngine):
+@@ -367,83 +374,87 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._build_tf_config()
  
@@ -364,21 +508,22 @@ index 31c4c314..063ad4b0 100644
 -
 -        if self._qat_enabled and not self.engine_config.forward_only:
 -            from verl.utils.modelopt import apply_qat_to_modules
-+        tms_weight_ctx = torch_memory_saver.region() if USE_TMS else nullcontext()
-+        with tms_weight_ctx:
-+            self.module = self._build_megatron_module()
- 
+-
 -            self.module = apply_qat_to_modules(self.module, self._qat_config)
-+            if self._qat_enabled and not self.engine_config.forward_only:
-+                from verl.utils.modelopt import apply_qat_to_modules
- 
+-
 -        self._maybe_enable_fused_kernels()
-+                self.module = apply_qat_to_modules(self.module, self._qat_config)
- 
+-
 -        if self.model_config.mtp.enable:
 -            patch_engine_mtp(self.module, self.model_config)
-+            self._maybe_enable_fused_kernels()
- 
+-        elif (
+-            self.engine_config.forward_only
+-            and self.engine_config.override_transformer_config.get("mtp_num_layers") == 0
+-        ):
+-            from verl.models.mcore.mtp_patch import patch_postprocess
+-
+-            for model in self.module:
+-                patch_postprocess(model)
+-
 -        # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
 -        if self.engine_config.forward_only:
 -            self.optimizer = None
@@ -386,26 +531,13 @@ index 31c4c314..063ad4b0 100644
 -            self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
 -            log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
 -            return
-+            if self.model_config.mtp.enable:
-+                patch_engine_mtp(self.module, self.model_config)
- 
+-
 -        self.optimizer = self._build_optimizer()
 -        self.lr_scheduler = self._build_lr_scheduler()
-+            # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
-+            if self.engine_config.forward_only:
-+                self.optimizer = None
-+                self.lr_scheduler = None
-+                self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
-+                log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
-+                return
- 
+-
 -        full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
 -        mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
-+        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
-+        with tms_optim_ctx:
-+            self.optimizer = self._build_optimizer()
-+            self.lr_scheduler = self._build_lr_scheduler()
- 
+-
 -        tmp_config = OmegaConf.create(
 -            {
 -                "model": {"path": self.model_config.local_path},
@@ -415,10 +547,46 @@ index 31c4c314..063ad4b0 100644
 -                },
 -            }
 -        )
+-
+-        role = "actor" if not self.is_value_model else "critic"
++        tms_weight_ctx = torch_memory_saver.region() if USE_TMS else nullcontext()
++        with tms_weight_ctx:
++            self.module = self._build_megatron_module()
++
++            if self._qat_enabled and not self.engine_config.forward_only:
++                from verl.utils.modelopt import apply_qat_to_modules
++
++                self.module = apply_qat_to_modules(self.module, self._qat_config)
++
++            self._maybe_enable_fused_kernels()
++
++            if self.model_config.mtp.enable:
++                patch_engine_mtp(self.module, self.model_config)
++            elif (
++                self.engine_config.forward_only
++                and self.engine_config.override_transformer_config.get("mtp_num_layers") == 0
++            ):
++                from verl.models.mcore.mtp_patch import patch_postprocess
++
++                for model in self.module:
++                    patch_postprocess(model)
++
++            # For forward_only, we don't need optimizer, lr_scheduler, checkpoint_mananager
++            if self.engine_config.forward_only:
++                self.optimizer = None
++                self.lr_scheduler = None
++                self.to(device="cpu", model=self._is_offload_param, optimizer=False, grad=False)
++                log_gpu_memory_usage("After offload model during init (forward_only)", logger=logger)
++                return
++
++        tms_optim_ctx = torch_memory_saver.region(enable_cpu_backup=True) if USE_TMS else nullcontext()
++        with tms_optim_ctx:
++            self.optimizer = self._build_optimizer()
++            self.lr_scheduler = self._build_lr_scheduler()
++
 +            full_reshardable = self.engine_config.dist_ckpt_optim_fully_reshardable
 +            mem_eff = self.engine_config.distrib_optim_fully_reshardable_mem_efficient
- 
--        role = "actor" if not self.is_value_model else "critic"
++
 +            tmp_config = OmegaConf.create(
 +                {
 +                    "model": {"path": self.model_config.local_path},
@@ -449,6 +617,7 @@ index 31c4c314..063ad4b0 100644
 -            provider=self.provider,
 -            peft_cls=self.peft_cls,
 -            use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
+-            use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
 -        )
 +            role = "actor" if not self.is_value_model else "critic"
 +
@@ -472,6 +641,7 @@ index 31c4c314..063ad4b0 100644
 +                provider=self.provider,
 +                peft_cls=self.peft_cls,
 +                use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
++                use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
 +            )
  
 -        self.to(

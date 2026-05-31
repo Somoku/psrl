@@ -381,6 +381,17 @@ nixl:
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
 
+# Checkpoint strategy config
+checkpoint:
+
+  # Use DCP (verl's default dist_checkpointing) for save/load.
+  # When False (default), uses PSRL's UCX-safe per-rank torch.save to avoid
+  # NIXL background thread (enable_prog_thread) corruption during save.
+  # When True: DCP is used with NCCL no-fork patch (applied automatically);
+  # NIXL prog_thread is automatically disabled (enable_prog_thread=False)
+  # to prevent UCX heap corruption from DCP's all_gather_object metadata gather.
+  use_dcp_save: True
+
 # Post processor for group requests in streaming mode
 group_post_process:
 

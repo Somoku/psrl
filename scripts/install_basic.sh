@@ -17,7 +17,7 @@ python -m uv pip install --no-cache-dir "torch==2.9.1" "torchvision==0.24.1" "to
 python -m uv pip install --no-cache-dir "triton==3.5.1" "tensordict==0.10.0" torchdata
 
 echo "2. Install basic packages"
-python -m uv pip install "transformers[hf_xet]>=4.55.4" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
+python -m uv pip install "transformers==5.5.0" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
     "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko sortedcontainers \
     ray[default]==2.49.1 codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
     pytest py-spy pre-commit ruff meson ninja pynvml requests einops trl
@@ -94,7 +94,7 @@ if [ -z "$VERL_PATH" ]; then
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     cd $VERL_PATH
-    git checkout 03bc8411
+    git checkout 9f73954a
     popd
 fi
 pushd $VERL_PATH

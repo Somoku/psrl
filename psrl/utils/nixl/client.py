@@ -102,7 +102,7 @@ class NIXLStorageClient:
                 replica_idx=replica_idx,
                 worker_index=worker_index,
             )
-            self.agent = nixl_agent(self.client_name, nixl_agent_config(True, True, self.client_port))
+            self.agent = nixl_agent(self.client_name, nixl_agent_config(enable_prog_thread, True, self.client_port))
         else:
             self.agent = binded_agent
 
@@ -1795,6 +1795,7 @@ class NIXLMultiStorageClients:
         worker_index: int = 0,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
+        enable_prog_thread: bool = True,
     ):
         self.agent_name = agent_name
         self.multi_client_names = multi_client_names

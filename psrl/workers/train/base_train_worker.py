@@ -308,6 +308,11 @@ class PSRL_BaseTrainWorker:
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
+            with torch.no_grad():
+                for key, param in self.unified_state_dict.items():
+                    if "linear_attn.norm.weight" in key:
+                        param.add_(1)
+
             # ---- DEBUG: log train info BEFORE push ----
             # self._debug_log_train_info(label=f"TRAIN_BEFORE_PUSH_R{self.worker_rank}")
             self.nixl_push_model()
@@ -316,6 +321,11 @@ class PSRL_BaseTrainWorker:
             self.wait_for_nixl_push_completion()
             # ---- DEBUG: log PS info AFTER push completes ----
             # self._debug_log_ps_info(label=f"PS_AFTER_PUSH_R{self.worker_rank}")
+
+            with torch.no_grad():
+                for key, param in self.unified_state_dict.items():
+                    if "linear_attn.norm.weight" in key:
+                        param.sub_(1)
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
@@ -352,6 +362,11 @@ class PSRL_BaseTrainWorker:
                 ps_manager_handle.get_ps_nixl_train_storage_client_names.remote()
             )
         self.nixl_pull_model_core(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_train_storage_client_names)
+
+        with torch.no_grad():
+            for key, param in self.unified_state_dict.items():
+                if "linear_attn.norm.weight" in key:
+                    param.sub_(1)
 
     def nixl_pull_model_core(self, ps_nixl_agent_names: list[str], ps_nixl_train_storage_client_names: list[str]):
         """

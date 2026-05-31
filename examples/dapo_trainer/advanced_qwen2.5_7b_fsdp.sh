@@ -87,7 +87,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.validate_ngpus_per_node_per_instance=${VAL_NGPUS_PER_NODE_PER_INSTANCE} \
     psrl.deployment.train_nnodes=${TRAIN_NNODES} \
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
-    psrl.nixl.server_port=23456 \
+    psrl.deployment.total_nnodes=${NNODES} \
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \

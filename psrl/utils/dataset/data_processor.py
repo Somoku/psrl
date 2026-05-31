@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 import sys
@@ -8,6 +9,7 @@ import numpy as np
 import ray
 import torch
 import transfer_queue as tq
+from omegaconf import open_dict
 from tensordict import TensorDict
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transfer_queue import KVBatchMeta
@@ -146,6 +148,15 @@ class DataProcessor:
         self.agent_loop_manager_handle = agent_loop_manager_handle
 
     # ------- Dataset and Dataloader Building Methods -------
+    def with_rollout_tool_paths(self, data_config):
+        """Attach rollout tool paths to a data config copy for prompt filtering."""
+        cfg = copy.deepcopy(data_config)
+        multi_turn = self.config.gen_actor_rollout_ref.rollout.multi_turn
+        with open_dict(cfg):
+            cfg.tool_config_path = multi_turn.get("tool_config_path", None)
+            cfg.function_tool_path = multi_turn.get("function_tool_path", None)
+        return cfg
+
     def build_train_and_val_dataset(self) -> None:
         """Build the training and validation datasets.
 
@@ -165,7 +176,7 @@ class DataProcessor:
         if self.config.data.get("use_multi_dataset", True):
             # ── Multi-dataset path (PSRL) ──────────────────────────────────────
             self.train_datasets = create_multi_rl_datasets(
-                self.config.data.train_datas,
+                [self.with_rollout_tool_paths(data_config) for data_config in self.config.data.train_datas],
                 self.tokenizer,
                 self.processor,
             )
@@ -187,7 +198,7 @@ class DataProcessor:
                 dataset.over_sample_dataset(oversample_ratio)
 
             self.val_datasets = create_multi_rl_datasets(
-                self.config.data.val_datas,
+                [self.with_rollout_tool_paths(data_config) for data_config in self.config.data.val_datas],
                 self.tokenizer,
                 self.processor,
             )
@@ -199,7 +210,7 @@ class DataProcessor:
             self.train_datasets = [
                 create_rl_dataset(
                     data_paths=self.config.data.train_files,
-                    data_config=self.config.data,
+                    data_config=self.with_rollout_tool_paths(self.config.data),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     max_samples=self.config.data.get("train_max_samples", -1),
@@ -208,7 +219,7 @@ class DataProcessor:
             self.val_datasets = [
                 create_rl_dataset(
                     data_paths=self.config.data.val_files,
-                    data_config=self.config.data,
+                    data_config=self.with_rollout_tool_paths(self.config.data),
                     tokenizer=self.tokenizer,
                     processor=self.processor,
                     max_samples=self.config.data.get("val_max_samples", -1),

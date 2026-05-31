@@ -66,7 +66,9 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         self.tool_schemas = sort_tool_schema_keys(self.env.get_tool_schemas())
         self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
         self.max_turns = self.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-        self.tool_parser = ToolParser.get_tool_parser(self.config.gen_actor_rollout_ref.rollout.multi_turn.format, self.tokenizer)
+        self.tool_parser_name = self.config.gen_actor_rollout_ref.rollout.multi_turn.format
+        self.tool_parser = ToolParser.get_tool_parser(self.tool_parser_name, self.tokenizer)
+        self.tool_call_names: list[str] = []
 
         # Pre-compute system prompt token ids for incremental turn stripping.
         # This mirrors AgentLoopBase._get_system_prompt_ids() but lives here so
@@ -105,6 +107,22 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
 
         if not observation:
             return [], is_init
+
+        if not is_init and self.tool_parser_name in {"gpt-oss", "gemma4"}:
+            if images or videos:
+                raise NotImplementedError(
+                    f"Tool parser '{self.tool_parser_name}' uses manually formatted tool responses and "
+                    "does not support multimodal tool response encoding yet."
+                )
+            if self.tool_parser_name == "gpt-oss":
+                response_text = self._format_gpt_oss_tool_response(observation)
+            else:
+                response_text = self._format_gemma4_tool_response(observation)
+            tokenized_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.encode(response_text, add_special_tokens=False),
+            )
+            return normalize_token_ids(tokenized_prompt), False
 
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
@@ -164,7 +182,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         Returns a list of OpenAI-function-call style dicts:
         [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
         """
-        _, tool_calls = self.tool_parser.extract_tool_calls_from_token_ids(token_ids)
+        _, tool_calls = self.tool_parser.extract_tool_calls_from_token_ids(token_ids, tools=self.tool_schemas)
         tool_calls_dict = [
             {
                 "id": f"call_{uuid.uuid4().hex[:12]}",
@@ -177,6 +195,11 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         for i, call in enumerate(tool_calls_dict):
             if isinstance(call.get("function", {}).get("arguments"), dict):
                 tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        self.tool_call_names = [
+            call["function"]["name"]
+            for call in tool_calls_dict
+            if isinstance(call, dict) and isinstance(call.get("function"), dict)
+        ]
         return tool_calls_dict
 
     def decode_action_from_response_str(self, response_str: str) -> ToolAction:
@@ -185,7 +208,7 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         Returns a list of OpenAI-function-call style dicts:
         [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
         """
-        _, tool_calls = self.tool_parser.extract_tool_calls_from_str(response_str)
+        _, tool_calls = self.tool_parser.extract_tool_calls_from_str(response_str, tools=self.tool_schemas)
         tool_calls_dict = [
             {
                 "id": f"call_{uuid.uuid4().hex[:12]}",
@@ -198,7 +221,45 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
         for i, call in enumerate(tool_calls_dict):
             if isinstance(call.get("function", {}).get("arguments"), dict):
                 tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        self.tool_call_names = [
+            call["function"]["name"]
+            for call in tool_calls_dict
+            if isinstance(call, dict) and isinstance(call.get("function"), dict)
+        ]
         return tool_calls_dict
+
+    def _tool_message_text(self, message: dict) -> str:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return "".join(
+                str(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return "" if content is None else str(content)
+
+    def _format_gpt_oss_tool_response(self, observation: ConversationType) -> str:
+        parts = []
+        for message, tool_name in zip(observation, self.tool_call_names, strict=False):
+            content = self._tool_message_text(message)
+            parts.append(
+                f"<|start|>functions.{tool_name} to=assistant<|channel|>commentary"
+                f"<|message|>{content}<|end|>"
+            )
+        return "".join(parts) + "<|start|>assistant"
+
+    def _format_gemma4_tool_response(self, observation: ConversationType) -> str:
+        parts = []
+        for message, tool_name in zip(observation, self.tool_call_names, strict=False):
+            content = self._tool_message_text(message)
+            parts.append(f'<|tool_response>response:{tool_name}{{value:<|"|>{content}<|"|>}}<tool_response|>')
+        return "".join(parts)
+
+    def prepare_generation_request(self, request: dict) -> dict:
+        request = super().prepare_generation_request(request)
+        if self.tool_parser.stop_token_ids:
+            request["stop_token_ids"] = self.tool_parser.stop_token_ids
+        return request
 
     def reset(self) -> None:
         """Reset the agent data to initial state.
@@ -287,7 +348,6 @@ class ToolAgentData(AgentData[ConversationType, ToolAction]):
             # Fill normalized ConversationType for logging/debugging.
             step.chat_completions = self.format_chat_completions(observation, is_init=is_init)
 
-            # NOTE(linsh): currently we do not support gpt-oss style tool calls.
             token_ids, is_prompt = await self.encode_observation(
                 observation,
                 images=images,

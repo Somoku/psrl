@@ -25,12 +25,12 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.18.0")
+@min_vllm_version("0.18.1")
 class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
     """
     Replace `torch.cuda.graph()` with `torch_memory_saver.cuda_graph()`
 
-    Compatible with vLLM 0.18.0+
+    Compatible with vLLM 0.18.1+
     """
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:

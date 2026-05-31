@@ -9,7 +9,7 @@ from omegaconf import DictConfig
 from transformers import AutoProcessor, AutoTokenizer
 
 from psrl.environments.base import ConversationType, Environment, EnvStepOutput
-from psrl.tools.base import ToolGroup, ToolResponse, initialize_tools_from_config
+from psrl.tools.base import ToolGroup, ToolResponse, load_all_tools
 
 ToolAction = list[dict] | dict
 
@@ -49,9 +49,10 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         cls.tool_response_truncate_side = config.gen_actor_rollout_ref.rollout.multi_turn.tool_response_truncate_side
         cls.max_parallel_calls = config.gen_actor_rollout_ref.rollout.multi_turn.max_parallel_calls
 
-        # Initialize tools from configuration file
+        # Initialize native and function-based tools from configuration.
         tool_config_path = config.gen_actor_rollout_ref.rollout.multi_turn.tool_config_path
-        tools = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        function_tool_path = config.gen_actor_rollout_ref.rollout.multi_turn.function_tool_path
+        tools = load_all_tools(tool_config_path=tool_config_path, function_tool_path=function_tool_path)
 
         # Per-sample tool selection: filter global tools by extra_info.tool_selection
         extra_info = kwargs.get("extra_info", {}) or {}
@@ -317,9 +318,9 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         tool_response_text = tool_response.output.get("text", None)
         if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
             if self.tool_response_truncate_side == "left":
-                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
-            elif self.tool_response_truncate_side == "right":
                 tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
+            elif self.tool_response_truncate_side == "right":
+                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
             else:
                 half = self.max_tool_response_length // 2
                 tool_response_text = tool_response_text[:half] + "...(truncated)..." + tool_response_text[-half:]

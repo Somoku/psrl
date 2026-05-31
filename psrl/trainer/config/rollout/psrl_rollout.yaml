@@ -20,6 +20,13 @@ _target_: psrl.workers.config.RolloutConfig
 # PSRL only support vllm backend.
 name: vllm
 
+# Async mode in PSRL
+mode: psrl_async
+
+# Which loader to use for rollout model weights: dummy, hf, megatron, etc.
+# safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
+load_format: dummy
+
 # Whether disable attention for profiling.
 disable_attn: ${oc.select:psrl.profile.disable_attn,False}
 
@@ -63,8 +70,19 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_turns: null
 
-  # null for no tool
+  # YAML config for PSRL native tools that subclass ``Tool``.
+  # Use this when a tool needs per-trajectory state, async ``create``/``release``
+  # lifecycle hooks, or custom rewards.
+  # null disables this code path.
   tool_config_path: null
+
+  # Path to a Python file with ``@function_tool``-decorated functions, loaded
+  # once per ``AgentLoopWorker``. Use this for stateless tools where the
+  # OpenAI-compatible JSON schema can be inferred from the function signature
+  # and Google-style docstring. Coexists with ``tool_config_path``; name
+  # collisions across the two raise an error.
+  # null disables this code path.
+  function_tool_path: null
 
   # max parallel call for tools in single turn
   max_parallel_calls: 1
@@ -90,7 +108,7 @@ multi_turn:
   # - ignore_strippable: ignore strippable tokens when checking tokenization sanity
   tokenization_sanity_check_mode: strict
 
-  # Format of the multi-turn interaction. Options: hermes, llama3_json, ...
+  # Format of the multi-turn interaction. Options: hermes, gpt-oss, qwen3_coder, gemma4.
   format: hermes
 
 # [PSRL] Agent loop configuration (overrides veRL's AgentLoopConfig with PSRL variant).

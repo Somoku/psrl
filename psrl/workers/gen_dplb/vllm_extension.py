@@ -6,7 +6,6 @@ import torch
 from omegaconf import DictConfig
 from torch.distributed.tensor import DTensor
 from verl.utils.device import get_device_id
-from verl.utils.fs import copy_to_local
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec

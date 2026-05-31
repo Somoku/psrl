@@ -30,7 +30,7 @@ from psrl.utils.converter import create_parameter_mapping
 if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
 
-from mbridge.core.util import unwrap_model
+from megatron.bridge.models.conversion.utils import unwrap_model
 try:
     from psrl.utils.converter.megatron_converter import convert_megatron_inplace  # noqa: E402
 except ImportError:
@@ -140,6 +140,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     def init_nixl_client(self):
         """Initialize the NIXL GPU-to-GPU weight-streaming client."""
+        # When DCP save is enabled, disable NIXL background UCX progress thread to prevent
+        # heap corruption from DCP's all_gather_object (large temporary allocations corrupt
+        # UCX endpoint address structures read by the background thread).
+        enable_prog_thread = not self.psrl_config.checkpoint.use_dcp_save
         self.nixl_storage_client = NIXLStorageClient(
             client_name=train_client_name(self.rank),
             server_name=NIXL_META_SERVER_NAME,
@@ -149,6 +153,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             replica_idx=0,  # replica idx is not used on the train side
             worker_index=self.rank,
             logging_path=self.psrl_config.logging_path,
+            enable_prog_thread=enable_prog_thread,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
@@ -367,7 +372,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     @deprecated("Reserved as a manual memory management example for Megatron. Use torch_memory_saver instead.")
     def _sleep_megatron_model(self, models):
         """Release GPU memory for Megatron model chunks by resizing buffers/params to 0."""
-        from mbridge.core.util import unwrap_model  # noqa: PLC0415
+        from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
 
         try:
             from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
@@ -397,7 +402,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     @deprecated("Reserved as a manual memory management example for Megatron. Use torch_memory_saver instead.")
     def _wake_up_megatron_model(self, models):
         """Restore GPU memory allocation for Megatron model chunks (no data copy)."""
-        from mbridge.core.util import unwrap_model  # noqa: PLC0415
+        from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
 
         try:
             from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
@@ -479,6 +484,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
             try:
                 ActorRolloutRefWorker.init_model(self)
+                # Override checkpoint strategy from psrl config (bypasses McoreEngineConfig dataclass).
+                self.checkpoint_mananager.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
             finally:
                 if skip_load_weight:
                     OmegaConf.set_struct(self.config, True)

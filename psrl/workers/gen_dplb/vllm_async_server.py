@@ -110,6 +110,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             nnodes,
             cuda_visible_devices,
         )
+        
+        # model weights will be loaded by pulling from ps
+        self.config.load_format = "dummy"
 
         self.psrl_config = psrl_config
         self.gen_interface = gen_interface
@@ -258,7 +261,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
-            "seed": self.replica_rank + self.config.get("seed", 0),
+            "seed": self.replica_rank + (self.config.get("seed") or 0),
             "override_generation_config": json.dumps(override_generation_config),
             "quantization": quantization,
             "hf_overrides": hf_overrides,

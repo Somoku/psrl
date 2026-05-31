@@ -11,7 +11,6 @@ import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.distillation import is_distillation_enabled
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
 
@@ -384,31 +383,34 @@ class TaskRunner:
 
         tq.init(config.transfer_queue)
 
-        self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
+        try:
+            self.add_actor_rollout_worker(config)
+            self.add_critic_worker(config)
 
-        # AGENT(VERL): PSRL use reward model worker.
-        self.add_reward_model_worker(config)
+            # AGENT(VERL): PSRL use reward model worker.
+            self.add_reward_model_worker(config)
 
-        # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
-        self.add_dummy_worker(config)
+            # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
+            self.add_dummy_worker(config)
 
-        resource_pool_manager = self.init_resource_pool_mgr(config)
+            resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
-        # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
-        from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
+            # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
+            # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
+            from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
-        # Initialize the PPO trainer.
-        trainer = PSRL_RayPPOTrainer(
-            config=config,
-            role_worker_mapping=self.role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
-        )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
-        # Start the training process.
-        trainer.fit()
+            # Initialize the PPO trainer.
+            trainer = PSRL_RayPPOTrainer(
+                config=config,
+                role_worker_mapping=self.role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+            )
+            # Initialize the workers of the trainer.
+            trainer.init_workers()
+            # Start the training process.
+            trainer.fit()
+        finally:
+            tq.close()
 
 
 if __name__ == "__main__":

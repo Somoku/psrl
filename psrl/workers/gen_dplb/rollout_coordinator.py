@@ -200,18 +200,13 @@ class RolloutCoordinator(CommandExtension):
         """Sleep level for server.sleep(). Rollout uses level=2 (full GPU release). Subclasses may override."""
         return 2
 
-    async def _do_sleep_instance(self, replica_id: str, data_parallel_rank: int) -> None:
+    async def _do_sleep_instance(self, replica_id: str) -> None:
         """Execute sleep on one (replica_id, dp_rank). Rollout path uses nixl_sleep. Subclasses may override."""
-        await self.server_handles[replica_id].nixl_sleep.remote(
-            level=self._get_sleep_level(),
-            data_parallel_rank=data_parallel_rank,
-        )
+        await self.server_handles[replica_id].nixl_sleep.remote(level=self._get_sleep_level())
 
-    async def _do_wake_up_instance(self, replica_id: str, data_parallel_rank: int) -> None:
+    async def _do_wake_up_instance(self, replica_id: str) -> None:
         """Execute wake_up on one (replica_id, dp_rank). Rollout path uses nixl_wake_up. Subclasses may override."""
-        await self.server_handles[replica_id].nixl_wake_up.remote(
-            data_parallel_rank=data_parallel_rank,
-        )
+        await self.server_handles[replica_id].nixl_wake_up.remote()
 
     async def _gateway_post_json(self, path: str, payload, params: dict | None = None):
         if self.gateway_base_url is None:
@@ -239,16 +234,20 @@ class RolloutCoordinator(CommandExtension):
     async def _set_routing_loop_running(self, running: bool):
         path = "/routing_loop/resume" if running else "/routing_loop/pause"
         # When pausing, pass wait=true so the call only returns after the routing loop
-        # finishes its current dispatch round (is_routing becomes false). This prevents
+        # drains in-flight worker selection (selecting becomes false). This prevents
         # a race where update_currently_syncing_instances and the SYNC command are issued
         # while the loop is still assigning requests using the pre-sync version.
         params = {"wait": "true"} if not running else {}
         psrl_logger.info(f"Setting routing loop running state to {running} via {path}")
         data = await self._gateway_post_json(path, payload={}, params=params)
-        expected = running
-        actual = data.get("running")
-        if actual is not None and bool(actual) != expected:
-            raise RuntimeError(f"Unexpected routing loop state after {path}: expected={expected}, got={actual}")
+        expected_paused = not running
+        actual_paused = data.get("paused")
+        if actual_paused is not None and bool(actual_paused) != expected_paused:
+            raise RuntimeError(
+                f"Unexpected routing loop pause state after {path}: expected={expected_paused}, got={actual_paused}"
+            )
+        if not running and bool(data.get("selecting", False)):
+            raise RuntimeError("Routing loop is still selecting after pause wait")
 
     async def _fetch_filtered_request_meta(self, version_tag: int) -> list[tuple[int, bool]]:
         requests = await self._gateway_get_json("/routing_loop/filter", params={"version_tag": version_tag})
@@ -495,9 +494,7 @@ class RolloutCoordinator(CommandExtension):
                             # TODO(linsh): merge dp ranks of the same replica to reduce RPC calls
                             replica_id, data_parallel_rank = instance_id
                             futures.append(
-                                self.server_handles[replica_id].abort_all_requests.remote(
-                                    data_parallel_rank=data_parallel_rank
-                                )
+                                self.server_handles[replica_id].abort_all_requests.remote()
                             )
 
                     if not futures:
@@ -534,7 +531,7 @@ class RolloutCoordinator(CommandExtension):
                     # Skip instances that are sleeping
                     is_sleeping = await asyncio.gather(
                         *[
-                            self.server_handles[instance_id[0]].is_sleeping.remote(data_parallel_rank=instance_id[1])
+                            self.server_handles[instance_id[0]].is_sleeping.remote()
                             for instance_id in instance_ids
                         ]
                     )
@@ -554,11 +551,11 @@ class RolloutCoordinator(CommandExtension):
                         sync_futures = []
 
                         for instance_id in instance_ids:
-                            replica_id, data_parallel_rank = instance_id
+                            # NOTE(linsh): ignore dp rank for now
+                            replica_id, _ = instance_id
                             sync_future = self.server_handles[replica_id].sync_with_ps.remote(
                                 curr_ps_model_version,
                                 pause_generation=True,
-                                data_parallel_rank=data_parallel_rank,
                             )
                             sync_futures.append(sync_future)
 
@@ -586,8 +583,9 @@ class RolloutCoordinator(CommandExtension):
 
                     sleep_futures = []
                     for instance_id in instance_ids:
-                        replica_id, data_parallel_rank = instance_id
-                        sleep_futures.append(self._do_sleep_instance(replica_id, data_parallel_rank))
+                        # NOTE(linsh): ignore dp rank for now
+                        replica_id, _ = instance_id
+                        sleep_futures.append(self._do_sleep_instance(replica_id))
                     await asyncio.gather(*sleep_futures)
                     self._complete_command(command_id, None)
                 elif command_type == CommandType.WAKE_UP:
@@ -600,8 +598,9 @@ class RolloutCoordinator(CommandExtension):
 
                     wake_up_futures = []
                     for instance_id in instance_ids:
-                        replica_id, data_parallel_rank = instance_id
-                        wake_up_futures.append(self._do_wake_up_instance(replica_id, data_parallel_rank))
+                        # NOTE(linsh): ignore dp rank for now
+                        replica_id, _ = instance_id
+                        wake_up_futures.append(self._do_wake_up_instance(replica_id))
                     await asyncio.gather(*wake_up_futures)
 
                     # Resume routing after the instances have woken up
@@ -751,20 +750,18 @@ class RolloutCoordinator(CommandExtension):
                 self._stats_recorder.record_smg_routing_status(routing_loop_status, workers_stats)
         psrl_logger.info("Stopped stats recorder loop.")
 
-    async def _is_routing(self) -> bool:
-        """Check if any agent loop worker is currently routing requests
-        (i.e., the router is currently routing requests).
+    async def _is_selecting(self) -> bool:
+        """Check if the router is currently selecting a worker for queued requests.
 
         Returns:
-            bool: True if any agent loop worker is currently routing requests,
-                False otherwise.
+            bool: True if any worker-selection stage is active, False otherwise.
         """
         if self.use_rust_gateway:
             data = await self._gateway_get_json("/routing_loop/status")
-            is_routing = bool(data.get("is_routing", False))
+            is_selecting = bool(data.get("selecting", False))
         else:
-            is_routing = await self.rollout_router.is_routing.remote()
-        return is_routing
+            is_selecting = await self.rollout_router.is_routing.remote()
+        return is_selecting
 
     async def _greedy_sync_and_migrate_loop(self):
         """
@@ -842,10 +839,10 @@ class RolloutCoordinator(CommandExtension):
                 if engine_stats.model_version <= self.instance_to_latest_stale_model_version.get(instance_id, -1):
                     have_syncing_instance = True
                     continue
-                # We do not synchronize with PS if the router is currently routing requests
-                if await self._is_routing():
+                # We do not synchronize with PS if the router is currently selecting workers.
+                if await self._is_selecting():
                     # psrl_logger.info(f"Skipping synchronization with PS for instance
-                    # {instance_id} because the router is currently routing requests")
+                    # {instance_id} because the router is currently selecting workers")
                     continue
                 # Check whether instance version lags behind PS version
                 if self.instance_to_model_version.get(instance_id, 0) == self.ps_model_version:

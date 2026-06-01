@@ -99,18 +99,24 @@ class SessionRouter:
             state.inflight += 1
             state.drained.clear()
 
+        body_bytes = await request.body()
+        headers = self.add_session_headers(request, sid)
+        result: HttpResponse | None = None
         try:
-            body = json.loads(await request.body())
-            body["logprobs"] = True
-            headers = self.add_session_headers(request, sid)
             result = await self._request_upstream(
                 "POST",
                 "v1/chat/completions",
-                content=json.dumps(body).encode(),
+                content=body_bytes,
                 headers=headers,
             )
-            if result.status < 400:
-                async with state.lock:
+        finally:
+            # Single combined critical section: close out inflight bookkeeping
+            # and, on success, advance the turn counter.
+            async with state.lock:
+                state.inflight = max(0, state.inflight - 1)
+                if state.inflight == 0:
+                    state.drained.set()
+                if result is not None and result.status < 400:
                     if state.turn != expected_turn:
                         psrl_logger.warning(
                             "SessionRouter stale write detected for sid=%s expected_turn=%s current_turn=%s.",
@@ -120,12 +126,7 @@ class SessionRouter:
                         )
                     else:
                         state.turn += 1
-            return self.build_response(result)
-        finally:
-            async with state.lock:
-                state.inflight = max(0, state.inflight - 1)
-                if state.inflight == 0:
-                    state.drained.set()
+        return self.build_response(result)
 
     async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
         headers = self.add_session_headers(request, sid)
@@ -138,6 +139,9 @@ class SessionRouter:
         return self.build_response(result)
 
     async def _ensure_state(self, sid: str) -> SessionState:
+        state = self.states.get(sid)
+        if state is not None:
+            return state
         async with self.states_lock:
             state = self.states.get(sid)
             if state is None:
@@ -182,7 +186,14 @@ class SessionRouter:
             )
 
     async def _ensure_client(self) -> aiohttp.ClientSession:
-        if self.client is None or self.client.closed:
+        existing = self.client
+        if existing is None:
+            self.client = create_aiohttp_client(concurrency=self.client_concurrency)
+            return self.client
+        is_closed = getattr(existing, "closed", None)
+        if is_closed is None:
+            is_closed = getattr(existing, "is_closed", False)
+        if is_closed:
             self.client = create_aiohttp_client(concurrency=self.client_concurrency)
         return self.client
 
@@ -195,12 +206,6 @@ class SessionRouter:
                 status_code=result.status,
                 headers=result.headers,
                 media_type=content_type or None,
-            )
-        if content_type.startswith("application/json"):
-            return JSONResponse(
-                content=json.loads(result.body or b"{}"),
-                status_code=result.status,
-                headers=result.headers,
             )
         return Response(
             content=result.body,

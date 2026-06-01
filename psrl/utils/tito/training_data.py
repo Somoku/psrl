@@ -6,11 +6,37 @@ into prompt_ids, response_ids, response_mask, and logprobs arrays.
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
 import os
 
+import numpy as np
+
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def _assemble_routed_experts(records: list[dict], total_len: int) -> np.ndarray | None:
+    """Assemble per-turn routed-experts blobs into one position-indexed tensor."""
+    blobs = []
+    for record in records:
+        re = record.get("routed_experts")
+        if not re:
+            continue
+        arr = np.load(io.BytesIO(base64.b64decode(re["data"])))
+        blobs.append((int(re["prompt_start"]), arr))
+
+    if not blobs:
+        return None
+
+    _, sample = blobs[0]
+    routed_experts = np.zeros((max(total_len, 0), *sample.shape[1:]), dtype=sample.dtype)
+    for prompt_start, arr in blobs:
+        end = min(prompt_start + arr.shape[0], total_len)
+        if end > prompt_start:
+            routed_experts[prompt_start:end] = arr[: end - prompt_start]
+    return routed_experts
 
 
 def build_training_arrays(
@@ -46,6 +72,7 @@ def build_training_arrays(
             "response_ids": [],
             "response_mask": [],
             "logprobs": [],
+            "routed_experts": None,
             "num_turns": 0,
         }
 
@@ -126,12 +153,14 @@ def build_training_arrays(
 
     first_prompt_len = records[0]["prompt_token_count"]
     prompt_ids = list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
+    routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
 
     psrl_logger.info(
         "[TITO build_training_arrays] prompt_len=%d tito_prompt_len=%d response_len=%d "
-        "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d",
+        "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d re_tokens=%s",
         len(prompt_ids), first_prompt_len, len(all_response_ids), sum(all_response_mask),
         len(all_logprobs), len(records), total_acc_len,
+        None if routed_experts is None else routed_experts.shape[0],
     )
 
     return {
@@ -139,5 +168,6 @@ def build_training_arrays(
         "response_ids": all_response_ids,
         "response_mask": all_response_mask,
         "logprobs": all_logprobs,
+        "routed_experts": routed_experts,
         "num_turns": len(records),
     }

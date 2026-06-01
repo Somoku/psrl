@@ -104,7 +104,7 @@ class StatsRecorder:
             "running_request_num": routing_loop_status.get("running_request_num"),
             "running_tasks": routing_loop_status.get("running_tasks"),
             "paused": routing_loop_status.get("paused"),
-            "routing": routing_loop_status.get("routing"),
+            "selecting": routing_loop_status.get("selecting"),
             "queue_keys": routing_loop_status.get("queue_keys", []),
             "partition_queue_lens": routing_loop_status.get("partition_queue_lens", {}),
             "workers": workers_stats,

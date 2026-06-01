@@ -1,6 +1,17 @@
 """Tests for TITO training data builder."""
 
+import base64
+import io
+
+import numpy as np
+
 from psrl.utils.tito.training_data import build_training_arrays
+
+
+def _npy_b64(arr: np.ndarray) -> str:
+    buf = io.BytesIO()
+    np.save(buf, arr)
+    return base64.b64encode(buf.getvalue()).decode()
 
 
 def test_single_turn_no_trim():
@@ -84,3 +95,55 @@ def test_no_logprobs():
     assert result["prompt_ids"] == [1, 2]
     assert result["response_ids"] == []
     assert result["response_mask"] == []
+
+
+def test_routed_experts_none_when_absent():
+    """No routed_experts in records → None (backward compatible)."""
+    accumulated = [1, 2, 3, 10, 11, 12]
+    records = [
+        {
+            "prompt_token_count": 3,
+            "output_logprobs": [[-0.5, 10], [-0.3, 11], [-0.1, 12]],
+            "finish_reason": "stop",
+        }
+    ]
+    assert build_training_arrays(accumulated, records)["routed_experts"] is None
+
+
+def test_routed_experts_cross_turn_assembly():
+    """Per-turn RE blobs are placed at their absolute positions and tiled gap-free.
+
+    Two turns; assembled length = 3 prompt + 6 response = 9 tokens, but the final
+    sampled token has no RE, so the tensor has 8 rows.  Cross-turn prompt_start:
+    turn 1 covers [0, 5), turn 2 covers [5, 8) — together filling all 8 rows.
+    """
+    accumulated = [1, 2, 3, 10, 11, 20, 21, 30, 31]
+    num_layers, top_k = 2, 3
+    t1 = np.arange(5 * num_layers * top_k, dtype=np.uint8).reshape(5, num_layers, top_k)
+    t2 = np.arange(100, 100 + 3 * num_layers * top_k, dtype=np.uint8).reshape(3, num_layers, top_k)
+    records = [
+        {
+            "prompt_token_count": 3,
+            "output_logprobs": [[-0.5, 10], [-0.3, 11]],
+            "finish_reason": "tool_calls",
+            "routed_experts": {
+                "data": _npy_b64(t1), "num_layers": num_layers, "top_k": top_k,
+                "dtype": "uint8", "prompt_start": 0,
+            },
+        },
+        {
+            "prompt_token_count": 7,
+            "output_logprobs": [[-0.2, 30], [-0.1, 31]],
+            "finish_reason": "stop",
+            "routed_experts": {
+                "data": _npy_b64(t2), "num_layers": num_layers, "top_k": top_k,
+                "dtype": "uint8", "prompt_start": 5,
+            },
+        },
+    ]
+    re = build_training_arrays(accumulated, records)["routed_experts"]
+    # 9 tokens assembled, last sampled token has no RE → 8 rows.
+    assert re.shape == (8, num_layers, top_k)
+    assert re.dtype == np.uint8
+    np.testing.assert_array_equal(re[0:5], t1)
+    np.testing.assert_array_equal(re[5:8], t2)

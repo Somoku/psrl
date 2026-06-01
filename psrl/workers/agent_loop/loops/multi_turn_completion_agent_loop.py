@@ -326,6 +326,10 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
             trajectory.response_ids = training_arrays["response_ids"]
             trajectory.response_mask = training_arrays["response_mask"]
             trajectory.response_logprobs = training_arrays["logprobs"]
+            # Routing replay (MoE): assembled per-turn, aligned to prompt+response.
+            # Left as the default [] when absent so finalize_output's len() guard holds.
+            if training_arrays["routed_experts"] is not None:
+                trajectory.routed_experts = training_arrays["routed_experts"]
 
             return await self.agent_data.finalize_output(), terminate_reason
 

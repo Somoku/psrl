@@ -234,3 +234,32 @@ def test_makedirs_creates_logging_path(tmp_path):
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
     StatsRecorder(cfg, str(new_dir))
     assert new_dir.exists()
+
+
+@pytest.mark.unit
+def test_record_smg_routing_status_uses_selecting(tmp_path):
+    """SMG routing-loop snapshots record the worker-selection barrier state."""
+    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+
+    cfg = MagicMock()
+    cfg.status_collection.stats_recorder.interval_in_s = 5.0
+    recorder = StatsRecorder(cfg, str(tmp_path))
+
+    routing_loop_status = {
+        "queue_len": 2,
+        "pending_request_num": 2,
+        "running_request_num": 1,
+        "running_tasks": 3,
+        "paused": True,
+        "selecting": False,
+        "queue_keys": [1],
+        "partition_queue_lens": {"1": 2},
+    }
+    recorder.record_smg_routing_status(routing_loop_status, workers_stats=[])
+    recorder.close()
+
+    rows = [json.loads(line) for line in (tmp_path / "smg_routing_status.jsonl").read_text().splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["selecting"] is False
+    assert "routing" not in row

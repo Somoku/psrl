@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import io
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -340,8 +341,6 @@ class AgentLoopBase(ABC):
             "sampling_params": payload_sampling_params,
             "stream": False,
             "return_logprob": sampling_params.get("logprobs") is not None,
-            # TODO: implement it
-            # "return_routed_experts": self.config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay,
         }
 
         # Multimodal payload
@@ -401,8 +400,14 @@ class AgentLoopBase(ABC):
         # Determine interrupted based on finish_reason
         interrupted = finish_reason == "abort"
 
-        # routing replay is not supported via SMG /generate (no routed_experts field)
+        # Routing replay: SMG returns routed_experts as a base64 .npy blob in
+        # meta_info (aligned to absolute positions [0, prompt_len + completion_len - 1)).
+        # Partial-rollout loopback is merged gateway-side.
         routed_experts = None
+        if self.rollout_config.enable_rollout_routing_replay:
+            routed_experts = self._decode_routed_experts_payload(
+                first.get("meta_info", {}).get("routed_experts")
+            )
 
         return TokenOutput(
             prompt_ids=request_input.input_ids,
@@ -687,33 +692,21 @@ class AgentLoopBase(ABC):
         return sampling_params
 
     @staticmethod
-    def _decode_routed_experts_payload(routed_experts_payload: dict | None) -> np.ndarray | None:
-        """Decode compact routed experts payload to a numpy array.
+    def _decode_routed_experts_payload(routed_experts_b64: str | None) -> np.ndarray | None:
+        """Decode SMG's routed-experts payload into a numpy array.
 
-        Expected payload schema:
-            {
-                "shape": [d0, d1, ...],
-                "dtype": "int32",
-                "data_base64": "..."
-            }
+        SMG serializes ``routed_experts`` as a base64-encoded NumPy ``.npy``
+        v1.0 file (see ``smg/crates/protocols/src/npy.rs``), identical to vLLM's
+        own HTTP response format. The decoded array has shape
+        ``[num_tokens, num_layers, top_k]`` with dtype ``uint8``/``uint16``,
+
+        ``num_tokens == (prompt_len - routed_experts_prompt_start) + completion_len - 1``
         """
-        if routed_experts_payload is None:
+        if not routed_experts_b64:
             return None
 
-        shape = routed_experts_payload["shape"]
-        dtype = np.dtype(routed_experts_payload["dtype"])
-        data_base64 = routed_experts_payload["data_base64"]
-
-        raw_bytes = base64.b64decode(data_base64)
-        routed_experts = np.frombuffer(raw_bytes, dtype=dtype)
-
-        expected_size = int(np.prod(shape, dtype=np.int64))
-        if routed_experts.size != expected_size:
-            raise ValueError(
-                f"Decoded routed_experts size mismatch: got={routed_experts.size}, expected={expected_size}, shape={shape}"  # noqa: E501
-            )
-
-        return routed_experts.reshape(shape).copy()
+        raw_bytes = base64.b64decode(routed_experts_b64)
+        return np.load(io.BytesIO(raw_bytes)).copy()
 
     async def _post_generate(
         self,

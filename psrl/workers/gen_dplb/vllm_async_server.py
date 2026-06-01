@@ -110,7 +110,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             nnodes,
             cuda_visible_devices,
         )
-        
+
         # model weights will be loaded by pulling from ps
         self.config.load_format = "dummy"
 
@@ -172,14 +172,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         timeout: float | None = None,
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
-        data_parallel_rank: int | None = None,
     ):
         await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
             args=args,
             kwargs=kwargs,
-            data_parallel_rank=data_parallel_rank,
         )
 
     def _get_worker_extension_cls(self) -> str:
@@ -295,6 +293,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             }
             args["speculative_config"] = speculative_config
 
+        # Always report data_parallel_size so SMG's DP discovery step can find it
+        # in the gRPC server_info response (required for worker registration).
+        args["data_parallel_size"] = self.config.data_parallel_size
         if self.config.data_parallel_size > 1:
             assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
                 "gpus_per_node should be divisible by tensor_model_parallel_size"
@@ -312,10 +313,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             }
             args.update(dp_args)
 
-        args.update({
-            "data_parallel_size": self.config.data_parallel_size,
-            "enable_expert_parallel": self.config.expert_parallel_size > 1,
-        })
+        args.update({"enable_expert_parallel": self.config.expert_parallel_size > 1})
 
         # used for torch.distributed.init_process_group
         if self.nnodes > 1:
@@ -549,24 +547,24 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     # AGENT(VERL): PSRL-specific async methods for server control and coordination.
     # We add `data_parallel_rank` parameters to these methods to support DP-aware control in PSRL.
 
-    async def is_sleeping(self, data_parallel_rank: int | None = None) -> bool:
-        return await self.engine.is_sleeping(data_parallel_rank=data_parallel_rank)
+    async def is_sleeping(self) -> bool:
+        return await self.engine.is_sleeping()
 
-    async def sleep(self, level: int, data_parallel_rank: int | None = None):
-        await self.engine.sleep(level, data_parallel_rank=data_parallel_rank)
+    async def sleep(self, level: int):
+        await self.engine.sleep(level)
         if self.psrl_config.tms.range in ["rollout", "all"]:
             # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
             # Here we do an aggressive empty cache for TMS.
             aggressive_empty_cache(force_sync=True)
 
-    async def wake_up(self, data_parallel_rank: int | None = None):
+    async def wake_up(self):
         wake_up_tags = ["weights", "kv_cache"]
         if self.psrl_config.tms.enable_cuda_graph:
             wake_up_tags.append("graph")
-        await self.engine.wake_up(tags=wake_up_tags, data_parallel_rank=data_parallel_rank)
+        await self.engine.wake_up(tags=wake_up_tags)
 
-    async def clear_kv_cache(self, data_parallel_rank: int | None = None):
-        await self.engine.reset_prefix_cache(data_parallel_rank=data_parallel_rank)
+    async def clear_kv_cache(self):
+        await self.engine.reset_prefix_cache()
 
     async def pause_generation(
         self,
@@ -587,7 +585,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self.engine.wait_for_requests_to_drain()
 
     async def abort_all_requests(
-        self, reset_prefix_cache: bool = False, data_parallel_rank: int | None = None
+        self, reset_prefix_cache: bool = False
     ) -> dict[str, Any]:
         """
         Abort all ongoing requests asynchronously.
@@ -600,11 +598,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         """
         # AGENT(VERL): the implementation is different from verl, skip when bump dependency.
 
-        if not data_parallel_rank:
-            request_states_snapshot = list(self.engine.output_processor.request_states.items())
-            request_ids = [req_id for req_id, _ in request_states_snapshot]
-        else:
-            request_ids = list(self.engine.output_processor.engine_request_ids[data_parallel_rank])
+        request_states_snapshot = list(self.engine.output_processor.request_states.items())
+        request_ids = [req_id for req_id, _ in request_states_snapshot]
         if not request_ids:
             return {"aborted_count": 0, "request_ids": []}
 
@@ -612,7 +607,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # Try to reset prefix cache to ensure clean state
         if reset_prefix_cache:
-            await self.engine.reset_prefix_cache(data_parallel_rank=data_parallel_rank)
+            await self.engine.reset_prefix_cache()
 
         return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
@@ -1022,87 +1017,65 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     ###### NIXL Integration ######
 
-    async def init_nixl_client(self, data_parallel_ranks: int | None = None):
+    async def init_nixl_client(self):
         await self._is_init_model.wait()
-        if data_parallel_ranks is None:
-            data_parallel_ranks = range(self.get_instance_num())
-        elif isinstance(data_parallel_ranks, int):
-            data_parallel_ranks = [data_parallel_ranks]
-
-        await asyncio.gather(
-            *[
-                self.collective_rpc(
-                    method="init_nixl_client",
-                    args=(
-                        self.psrl_config.nixl,
-                        self.get_replica_idx(),
-                        self.psrl_config.logging_path,
-                    ),
-                    data_parallel_rank=data_parallel_rank,
-                )
-                for data_parallel_rank in data_parallel_ranks
-            ]
+        await self.collective_rpc(
+            method="init_nixl_client",
+            args=(
+                self.psrl_config.nixl,
+                self.get_replica_idx(),
+                self.psrl_config.logging_path,
+            ),
         )
 
         self._is_init_nixl_client.set()
 
-    async def nixl_convert_params(self, data_parallel_rank: int | None = None):
+    async def nixl_convert_params(self):
         await self._is_init_model.wait()
         await self.collective_rpc(
             method="nixl_convert_params",
             args=(self.model_config,),
-            data_parallel_rank=data_parallel_rank,
         )
 
-    async def nixl_protocol(self, mode: str = "full", data_parallel_rank: int | None = None):
+    async def nixl_protocol(self, mode: str = "full"):
         await self._is_init_model.wait()
         await self._is_init_nixl_client.wait()
         await self.collective_rpc(
             method="nixl_protocol",
             args=(self.model_config, mode),
-            data_parallel_rank=data_parallel_rank,
         )
 
-    async def nixl_wake_up(self, data_parallel_rank: int | None = None):
+    async def nixl_wake_up(self):
         await self._is_init_nixl_client.wait()
-        await self.wake_up(data_parallel_rank=data_parallel_rank)
-        await self.collective_rpc(method="nixl_register_after_wake_up", data_parallel_rank=data_parallel_rank)
+        await self.wake_up()
+        await self.collective_rpc(method="nixl_register_after_wake_up")
 
-    async def nixl_sleep(self, level: int, data_parallel_rank: int | None = None):
+    async def nixl_sleep(self, level: int):
         await self._is_init_nixl_client.wait()
-        await self.sleep(level, data_parallel_rank=data_parallel_rank)
-        await self.collective_rpc(method="nixl_deregister", data_parallel_rank=data_parallel_rank)
+        await self.sleep(level)
+        await self.collective_rpc(method="nixl_deregister")
 
-    async def nixl_send_local_info_to(self, dst_agent_names: str | list[str], data_parallel_rank: int | None = None):
+    async def nixl_send_local_info_to(self, dst_agent_names: str | list[str]):
         await self._is_init_nixl_client.wait()
         await self.collective_rpc(
             method="nixl_send_local_info_to",
             args=(dst_agent_names,),
-            data_parallel_rank=data_parallel_rank,
         )
 
-    async def nixl_wait_for_update_infos(self, info_num: int, data_parallel_rank: int | None = None):
+    async def nixl_wait_for_update_infos(self, info_num: int):
         await self._is_init_nixl_client.wait()
         await self.collective_rpc(
             method="nixl_wait_for_update_infos",
             args=(info_num,),
-            data_parallel_rank=data_parallel_rank,
         )
 
     ###### Weights Update ######
 
     async def sync_with_ps(
-        self, ps_version: int, pause_generation: bool = False, data_parallel_rank: int | None = None
+        self, ps_version: int, pause_generation: bool = False
     ):
-        if data_parallel_rank is None:
-            data_parallel_ranks = range(self.get_instance_num())
-            await asyncio.gather(
-                *[
-                    self.sync_with_ps(ps_version, pause_generation, data_parallel_rank=dp_rank)
-                    for dp_rank in data_parallel_ranks
-                ]
-            )
-            return
+        data_parallel_ranks = range(self.get_instance_num())
+        data_parallel_rank = 0 # take dp 0 as representative for the replica
 
         # psrl_logger.info(f"{self.curr_rollout_instance_model_version=}, dp_rank = {data_parallel_rank}")
         if self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version:
@@ -1112,19 +1085,20 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if pause_generation:
             await self.pause_generation(clear_cache=False)
             psrl_logger.info(
-                f"Generation paused on replica {self.get_replica_idx()} instance {data_parallel_rank} for sync with PS"
+                f"Generation paused on replica {self.get_replica_idx()} for sync with PS"
             )
 
         # Step 2. Pull model from PS
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
             with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
-                await self.pull_model(data_parallel_rank=data_parallel_rank)
+                await self.pull_model()
 
-        self.curr_rollout_instance_model_version[
-            data_parallel_rank
-        ] = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(
+        curr_model_version = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(
             (self.base_worker_id, data_parallel_rank)
         )
+        for dp_rank in data_parallel_ranks:
+            self.curr_rollout_instance_model_version[dp_rank] = curr_model_version
+        
         assert self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version, (
             f"Current rollout instance model version should not be less than the required PS version, "
             f"but got {self.curr_rollout_instance_model_version[data_parallel_rank]} vs. {ps_version}"
@@ -1136,25 +1110,26 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 f"which is higher than the required PS version {ps_version}"
             )
         if self.stat_collector is not None:
-            self.stat_collector.record_model_version_update(
-                self.curr_rollout_instance_model_version[data_parallel_rank], data_parallel_rank
-            )
+            for dp_rank in data_parallel_ranks:
+                self.stat_collector.record_model_version_update(
+                    self.curr_rollout_instance_model_version[data_parallel_rank], dp_rank
+                )
 
         # Step 3: Resume generation
         await self.resume_generation()
-        psrl_logger.info(f"Generation resumed on replica {self.get_replica_idx()} instance {data_parallel_rank}")
+        psrl_logger.info(f"Generation resumed on replica {self.get_replica_idx()}")
 
-    async def pull_model(self, data_parallel_rank: int | None = None):
+    async def pull_model(self):
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            await self.ray_pull_model(data_parallel_rank)
+            await self.ray_pull_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            await self.nixl_pull_model(data_parallel_rank)
+            await self.nixl_pull_model()
         else:
             raise NotImplementedError(f"PSRL does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Important: the prefix cache needs to be cleared after pulling the model
-        await self.clear_kv_cache(data_parallel_rank=data_parallel_rank)
+        await self.clear_kv_cache()
 
-    async def nixl_pull_model(self, data_parallel_rank: int | None = None) -> None:
+    async def nixl_pull_model(self) -> None:
         assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"
         assert self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu", (
             "nixl_pull_model should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
@@ -1173,28 +1148,20 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     self._cached_ps_nixl_agent_names,
                     self._cached_ps_nixl_gen_storage_client_names,
                 ),
-                data_parallel_rank=data_parallel_rank,
             )
-        if data_parallel_rank is None:
-            data_parallel_ranks = range(self.get_instance_num())
-        elif isinstance(data_parallel_rank, int):
-            data_parallel_ranks = [data_parallel_rank]
-
+        data_parallel_ranks = range(self.get_instance_num())
         pulled_instance_ids = [(self.base_worker_id, data_parallel_rank) for data_parallel_rank in data_parallel_ranks]
         await ps_manager_handle.pull_model_state_dict_nixl.remote(
             pulled_instance_ids
         )  # This only updates the model version
         psrl_logger.info("NIXL pull model done.")
 
-    async def ray_pull_model(self, data_parallel_rank: int | None = None) -> None:
+    async def ray_pull_model(self) -> None:
         assert self.gen_interface.ps_manager_handle is not None, "ray_pull_model requires a PS manager handle"
         ps_manager_handle = self.gen_interface.ps_manager_handle
 
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
-            if data_parallel_rank is None:
-                data_parallel_ranks = range(self.get_instance_num())
-            else:
-                data_parallel_ranks = [data_parallel_rank]
+            data_parallel_ranks = range(self.get_instance_num())
             rollout_instance_ids = [(self.base_worker_id, dp_rank) for dp_rank in data_parallel_ranks]
 
             if self.psrl_config.ps_mode == "cpu":
@@ -1220,7 +1187,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 loaded_params = await self.engine.collective_rpc(
                     "load_weights",
                     args=(params_to_load,),
-                    data_parallel_rank=data_parallel_rank,
                 )
                 if loaded_params is None:
                     raise RuntimeError(f"Worker failed to update weights. Result: {loaded_params}")
@@ -1229,11 +1195,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     ###### Utility Methods ######
 
-    async def estimate_max_model_len(self, data_parallel_rank: int | None = None) -> int:
+    async def estimate_max_model_len(self) -> int:
         await self._is_init_model.wait()
         max_model_len = await self.collective_rpc(
             method="estimate_max_model_len",
-            data_parallel_rank=data_parallel_rank,
         )
         return max_model_len
 

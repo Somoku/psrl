@@ -93,18 +93,15 @@ class RewardModelCoordinator(RolloutCoordinator):
         """Reward model sleep level=1: releases KV cache but retains model weights in GPU memory."""
         return 1
 
-    async def _do_sleep_instance(self, replica_id: str, data_parallel_rank: int) -> None:
+    async def _do_sleep_instance(self, replica_id: str) -> None:
         """Reward model sleep: calls server.sleep() (non-nixl path; no NIXL deregistration needed)."""
         await self.server_handles[replica_id].sleep.remote(
             level=self._get_sleep_level(),
-            data_parallel_rank=data_parallel_rank,
         )
 
-    async def _do_wake_up_instance(self, replica_id: str, data_parallel_rank: int) -> None:
+    async def _do_wake_up_instance(self, replica_id: str) -> None:
         """Reward model wake_up: calls server.wake_up() (non-nixl path)."""
-        await self.server_handles[replica_id].wake_up.remote(
-            data_parallel_rank=data_parallel_rank,
-        )
+        await self.server_handles[replica_id].wake_up.remote()
 
     # ── Elastic RM: gateway backlog monitoring ─────────────────────────────
 

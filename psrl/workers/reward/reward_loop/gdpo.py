@@ -2,7 +2,6 @@
 import inspect
 
 from tensordict import TensorDict
-
 from verl.utils import tensordict_utils as tu
 
 from psrl.utils.reward_score import default_compute_score_async
@@ -35,8 +34,10 @@ class GDPORewardManager(RewardManagerBase):
 
         data_source = tu.get(data_item, "data_source")
         ground_truth = tu.get(data_item, "reward_model")["ground_truth"]
-        extra_info = tu.get(data_item, "extra_info", {})
-        extra_info["experiment_name"] = self.config.trainer.experiment_name
+        extra_info = self.merge_extra_info(
+            data_item,
+            experiment_name=self.config.trainer.experiment_name,
+        )
 
         response_str = await self.loop.run_in_executor(
             None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)

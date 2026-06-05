@@ -1,15 +1,14 @@
 # Modified from verl/experimental/reward/reward_loop/base.py
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
-
 from omegaconf import DictConfig
 from tensordict import TensorDict
 from transformers import AutoTokenizer
-from verl.utils.ray_utils import get_event_loop
 from verl.utils import tensordict_utils as tu
+from verl.utils.ray_utils import get_event_loop
 
 RawRewardFn = Callable[..., Any] | None
 
@@ -41,6 +40,25 @@ class RewardManagerBase(ABC):
     @abstractmethod
     async def run_single(self, data: TensorDict):
         raise NotImplementedError
+
+    @staticmethod
+    def merge_extra_info(
+        data_item: TensorDict,
+        **runtime_info: Any,
+    ) -> dict[str, Any]:
+        """Build the reward-facing metadata"""
+        merged: dict[str, Any] = {}
+        for field_name in ("extra_info", "agent_reward_info"):
+            value = tu.get(data_item, field_name, None)
+            if isinstance(value, Mapping):
+                merged.update(value)
+
+        tool_extra_fields = tu.get(data_item, "tool_extra_fields", None)
+        if tool_extra_fields is not None:
+            merged.update(tool_extra_fields.items())
+
+        merged.update(runtime_info)
+        return merged
 
     @classmethod
     def assemble_rm_scores(cls, data: TensorDict, scores: list[float]) -> torch.Tensor:

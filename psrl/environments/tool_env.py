@@ -10,6 +10,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from psrl.environments.base import ConversationType, Environment, EnvStepOutput
 from psrl.tools.base import ToolGroup, ToolResponse, load_all_tools
+from psrl.utils.logger import FileOnlyHandler
 
 ToolAction = list[dict] | dict
 
@@ -62,6 +63,12 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             tools = selected
         
         cls.tools = ToolGroup(tools=tools)
+
+        # Build a class-level logger for tool calls.
+        log_prefix = "ToolEnvironment"
+        psrl_logger.propagate = False
+        psrl_logger.addHandler(FileOnlyHandler(config.psrl.logging_path, log_prefix))
+        psrl_logger.info("ToolEnvironment logger initialized for tool calls.")
 
     def __init__(
         self,
@@ -334,7 +341,11 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
                 if attr_value is not None:
                     tool_response_kwargs[attr_name] = attr_value
 
-        psrl_logger.debug(f"Tool {tool_name} called with args {tool_args}, response: {tool_response_kwargs}")
+        # Log each tool invocation with its input arguments and (possibly truncated) output.
+        psrl_logger.info(
+            f"Tool call - name: {tool_name}, id: {tool_call['id']}, args: {tool_args}, "
+            f"response: {tool_response_text}, reward: {tool_reward}"
+        )
         return ToolResponse(**tool_response_kwargs), tool_reward
 
     async def close(self) -> None:

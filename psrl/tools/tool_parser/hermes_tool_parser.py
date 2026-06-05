@@ -48,7 +48,7 @@ class HermesToolParser(ToolParser):
                 name, arguments = tool_call["name"], tool_call["arguments"]
                 tool_calls.append(ToolCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
-                psrl_logger.warning(f"Failed to decode tool call: {e}")
+                psrl_logger.warning(f"Failed to decode tool call from response: {response_str}, the error is: {e}")
 
         # remaing text exclude tool call tokens
         content = self.tool_call_regex.sub("", response_str)

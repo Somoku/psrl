@@ -17,12 +17,12 @@ from verl.utils.chat_template import apply_chat_template, initialize_system_prom
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.utils.tokenizer import normalize_token_ids
 
+from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.common.http_utils import (
     RequestAbortedByGatewayError,
     is_distributed_post_enabled,
     request_json_maybe_distributed,
 )
-from psrl.utils.common.http_io_thread import get_http_io_thread
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
@@ -200,12 +200,14 @@ class AgentLoopBase(ABC):
     ) -> TokenOutput | list[TokenOutput] | None:
         """Compute reward score for the generated response and merge it into the output.
 
-        This function sends the generated response to the reward manager and waits for the computed reward score. If the reward computation is successful, it merges the reward score into the output data structure. If the request is aborted during reward computation (e.g., due to staleness check failure), it returns None to indicate that the request should be aborted.
+        This function sends the generated response to the reward manager and waits for the
+        computed reward score. If reward computation succeeds, it merges the score into the
+        output. If the request is aborted during reward computation, it returns ``None``.
 
         Args:
             data (TokenOutput): The output data structure containing the generated response and associated metadata.
         Returns:
-            TokenOutput | None: The updated output data structure with the computed reward score, or None if the request was aborted during reward computation.
+            TokenOutput | None: The output with reward score, or None if the request was aborted.
         """
         if not isinstance(outputs, list):
             outputs = [outputs]
@@ -373,6 +375,7 @@ class AgentLoopBase(ABC):
             return None
 
         first = gen_responses[0]
+        meta_info = first.get("meta_info", {})
 
         # rollout instance id
         replica_id = base_worker_id
@@ -386,12 +389,12 @@ class AgentLoopBase(ABC):
         # for that position. We take the first (top-1) entry at each position.
         log_probs = None
         if sampling_params.get("logprobs") is not None:
-            raw_logprobs = first.get("meta_info", {}).get("output_token_logprobs")
+            raw_logprobs = meta_info.get("output_token_logprobs")
             if raw_logprobs is not None:
                 log_probs = [next((lp for lp in per_pos if lp is not None), 0.0) for per_pos in raw_logprobs]
 
         # finish_reason: SMG returns {"type": "stop"} or {"type": "length", "length": N}
-        finish_reason_raw = first.get("meta_info", {}).get("finish_reason", {})
+        finish_reason_raw = meta_info.get("finish_reason", {})
         if isinstance(finish_reason_raw, dict):
             finish_reason = finish_reason_raw.get("type", "stop")
         else:
@@ -406,7 +409,7 @@ class AgentLoopBase(ABC):
         routed_experts = None
         if self.rollout_config.enable_rollout_routing_replay:
             routed_experts = self._decode_routed_experts_payload(
-                first.get("meta_info", {}).get("routed_experts")
+                meta_info.get("routed_experts")
             )
 
         return TokenOutput(
@@ -486,8 +489,9 @@ class AgentLoopBase(ABC):
             replica_id, dp_rank = request_input.rollout_instance_id
             req_headers["x-base-worker-id"] = str(replica_id)
             req_headers["x-target-dp-rank"] = str(dp_rank)
+
         if is_sticky_session:
-            req_headers["x-manual-target-worker"] = "true"
+            req_headers["x-is-sticky"] = "true"
 
         chat_url = f"{self.gateway_addr.rstrip('/')}/v1/chat/completions"
 
@@ -864,13 +868,14 @@ class AgentLoopBase(ABC):
         It enables timeouts and error handling based on the provided configuration.
 
         Args:
-            request (KVBatchMeta): Input request to process.
+            request (TensorDict): Input request to process.
             raise_on_error (bool): Whether to raise exceptions on errors.
 
         Returns:
             Tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
                 A tuple containing the output data (if any) and the termination reason.
         """
+        request_ids = tu.get(request, "uid", "N/A")
         try:
             prompt = {}
             for k, v in request.items():
@@ -883,18 +888,15 @@ class AgentLoopBase(ABC):
                 else:
                     psrl_logger.exception(f"Unsupported type {type(v)} for key {k}")
 
-            coro = self.run(prompt)
-            output, terminate_reason = await coro
+            timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
+            output, terminate_reason = await asyncio.wait_for(
+                self.run(prompt), timeout=timeout,
+            )
             if output is not None:
                 return output, terminate_reason
-            elif output is None and terminate_reason in (
-                TerminateReason.ABORTED,
-                TerminateReason.UNKNOWN,
-                TerminateReason.TIMEOUT,
-                TerminateReason.ENV_TIMEOUT,
-                TerminateReason.ERROR,
-                TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
-                TerminateReason.MAX_TURNS_EXCEEDED,
+            elif output is None and (
+                terminate_reason.is_aborted
+                or terminate_reason.needs_worker_retry()
             ):
                 # Legitimate termination with no output (e.g. request aborted)
                 return None, terminate_reason
@@ -914,15 +916,15 @@ class AgentLoopBase(ABC):
         except asyncio.TimeoutError:
             psrl_logger.error(
                 "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",  # noqa: E501
-                request.non_tensor_batch.get("uid", "N/A"),
+                request_ids,
                 exc_info=True,
             )
-            return None, TerminateReason.TIMEOUT
-        except Exception as e:
+            return None, TerminateReason.TRAJECTORY_TIMEOUT
+        except Exception:
             if not raise_on_error:
                 psrl_logger.error(
-                    f"Exception in agent_loop.run for request {request.non_tensor_batch.get('uid', 'N/A')}",
+                    f"Exception in agent_loop.run for request {request_ids}",
                     exc_info=True,
                 )
-                return None, TerminateReason.ERROR
-            raise e
+                return None, TerminateReason.ROLLOUT_ERROR
+            raise

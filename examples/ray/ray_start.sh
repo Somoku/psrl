@@ -19,6 +19,14 @@ workers=( "${hosts[@]:1}" )
 # unset http_proxy && \
 # unset https_proxy && \
 
+# 清理所有节点上的残留 Ray 进程，防止多个 raylet 共存导致 GPU 资源声明混乱
+echo "Stopping any existing Ray processes on all nodes..."
+for host in "${hosts[@]}"; do
+    pssh -H "${host}" -i "source ${env_file} && ray stop --force 2>/dev/null || true" &
+done
+wait
+echo "All nodes cleaned up."
+
 # 启动Head节点
 echo "Starting Head node at ${HEAD_IP}"
 pssh -H "${HEAD_IP}" -i \

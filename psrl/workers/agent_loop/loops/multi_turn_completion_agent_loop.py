@@ -10,10 +10,10 @@ from psrl.environments.base import Environment
 from psrl.utils.common.http_utils import delete, get, post
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.utils.tito.training_data import build_training_arrays
-from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
+from psrl.workers.gen_dplb.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -165,7 +165,7 @@ class MultiTurnCompletionAgentLoop(AgentLoopBase):
         return extra_headers
 
     @rollout_trace_op
-    async def run(self, request: dict, **kwargs) -> tuple[TokenOutput | None, TerminateReason]:
+    async def run(self, request: dict) -> tuple[TokenOutput | None, TerminateReason]:
         """Execute generation for a single request using chat completions.
 
         Args:

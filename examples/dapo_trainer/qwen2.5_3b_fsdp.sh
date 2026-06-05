@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 staleness=${1:-3}
-project_name=psrl_compare
+project_name=psrl_example
 experiment_name=DAPO-Qwen2.5-3B-fsdp-staleness_${staleness}
 fix_weight=${2:-False}
 disable_attn=${3:-False}
@@ -14,11 +14,14 @@ HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
 
-GEN_DP=1
+CKPT_ROOT=${CKPT_ROOT:-$PWD}
+default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
+
+GEN_DP=1 # DP in the generation side
 GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
-VAL_DP=1
+VAL_DP=1 # DP in the training side for validation
 VAL_TP=1 # TP in the training side for validation
 VAL_PP=1 # PP in the training side for validation
 
@@ -120,8 +123,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     train_actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     train_actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
-    train_actor_rollout_ref.rollout.val_kwargs.n=2 \
-    train_actor_rollout_ref.rollout.data_parallel_size=${VAL_DP} \
+    train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
@@ -151,6 +153,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
+    data.reward_model_dicts.0.reward_loop_type=dapo \
+    data.reward_model_dicts.0.reward_fn=compute_score \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
     data.truncation='left' \
@@ -164,6 +168,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.logger='["console","wandb"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${experiment_name}" \
+    trainer.default_local_dir="${default_local_dir}" \
     trainer.val_before_train=True \
     trainer.test_freq=5 \
     trainer.save_freq=200 \

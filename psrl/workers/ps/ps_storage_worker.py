@@ -395,12 +395,21 @@ class PSStorageWorker:
         Must be called after init_model() (needs _tied_weights_alias_map).
         Does NOT require nixl_protocol() or init_nixl_client() to have run.
 
+        When broadcast_init is enabled, only rank-0 reads from disk; all other workers
+        skip disk I/O and wait for their buffers to be filled via NIXL broadcast.
+
         Stores every tensor found in the checkpoint into self._checkpoint_cpu_cache
         (dict[str, torch.Tensor]).  Tied-weight aliases are expanded here so that
         write_checkpoint_to_registered_tensors() can do a single-pass write without
         re-reading shards.  The cache is consumed and released by
         write_checkpoint_to_registered_tensors().
         """
+        if self.psrl_config.broadcast_init.enabled and self.rank != 0:
+            psrl_logger.info(
+                f"[preload_checkpoint_to_cpu] broadcast_init enabled, rank {self.rank} skips disk read."
+            )
+            return
+
         assert hasattr(self, "_tied_weights_alias_map"), (
             "preload_checkpoint_to_cpu: _tied_weights_alias_map not found — "
             "init_model() must be called before this method."
@@ -440,7 +449,17 @@ class PSStorageWorker:
         Must be called after nixl_protocol() has completed (registered tensors exist)
         and after preload_checkpoint_to_cpu() has run (_checkpoint_cpu_cache populated).
         Releases self._checkpoint_cpu_cache on completion.
+
+        When broadcast_init is enabled, only rank-0 writes from the preloaded CPU cache;
+        all other workers skip this step and receive weights via NIXL broadcast instead.
         """
+        if self.psrl_config.broadcast_init.enabled and self.rank != 0:
+            psrl_logger.info(
+                f"[write_checkpoint_to_registered_tensors] broadcast_init enabled, "
+                f"rank {self.rank} skips CPU→buffer write (weights will arrive via broadcast)."
+            )
+            return
+
         assert self.nixl_multi_storage_clients is not None, (
             "NIXL clients must be initialized (call init_nixl_client()) before writing weights."
         )
@@ -587,6 +606,119 @@ class PSStorageWorker:
             target_original_state_dict[key_shard_idx_tuple].copy_(src_original_state_dict[key_shard_idx_tuple])
         if sync and self.use_gpu:
             torch.cuda.synchronize()
+
+    # ------------------------------------------------------------------
+    # Broadcast initialization helpers
+    # ------------------------------------------------------------------
+
+    def _ps_agent_name_for_rank(self, rank: int) -> str:
+        """
+        Return the NIXL agent name for the PS worker at the given rank.
+
+        Args:
+            rank (int): Target PS worker rank.
+
+        Returns:
+            str: Agent name, e.g. 'NIXLPSClient_1'.
+        """
+        return ps_agent_name(rank)
+
+    def _ps_train_client_name_for_rank(self, rank: int) -> str:
+        """
+        Return the NIXL push-side (train buffer) client name for the PS worker at the given rank.
+
+        Args:
+            rank (int): Target PS worker rank.
+
+        Returns:
+            str: Push client name, e.g. 'NIXLPSClient_1_for_push'.
+        """
+        return ps_client_push_name(rank)
+
+    def broadcast_send_to_children(self, round_idx: int, plan) -> None:
+        """
+        Write all model keys from this worker's train buffer to each child's train buffer.
+
+        Called by PSManager via Ray remote after the previous round's barrier clears.
+        Uses NIXL client_write to perform GPU-Direct transfers to the target PS workers.
+        Blocks until all transfers complete, so PSManager's ray.get barrier is sufficient
+        to synchronize rounds.
+
+        Args:
+            round_idx (int): Current broadcast round index (used only for logging).
+            plan: BroadcastPlan instance providing the tree topology.
+        """
+        children = plan.get_children(self.rank)
+        if not children:
+            psrl_logger.info(
+                f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: no children, skipping."
+            )
+            return
+
+        train_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        # Use NIXL-registered keys (model.state_dict) rather than checkpoint keys so that
+        # tied-weight aliases (e.g. lm_head.weight when tie_word_embeddings=True) are also
+        # broadcast.  The alias buffer on the sender already holds the correct data because
+        # write_checkpoint_to_registered_tensors() filled it; using checkpoint keys would
+        # silently skip it and leave children with uninitialised alias buffers.
+        transfer_keys = list(train_client.local_client_info.tensor_infos.keys())
+        psrl_logger.info(
+            f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: "
+            f"sending {len(transfer_keys)} keys to children {children}."
+        )
+
+        for child_rank in children:
+            child_agent = self._ps_agent_name_for_rank(child_rank)
+            child_client = self._ps_train_client_name_for_rank(child_rank)
+            for key in transfer_keys:
+                train_client.client_write(
+                    target_agent=child_agent,
+                    target_client=child_client,
+                    key=key,
+                    tag="ps_broadcast_init",
+                    use_comm_plan=False,
+                )
+
+        # Poll until every NIXL transfer completes. torch.cuda.synchronize() only covers
+        # CUDA ops and does not block on NIXL network transfers; without explicit wait()
+        # the round barrier (ray.get) would return while data is still in-flight.
+        for child_rank in children:
+            child_client = self._ps_train_client_name_for_rank(child_rank)
+            for key in transfer_keys:
+                train_client.wait(key, "ps_broadcast_init", "WRITE", target_client=child_client)
+        train_client.clear_intermediate_cached_data()
+
+        psrl_logger.info(
+            f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: all transfers done."
+        )
+
+    def do_transfer_train_to_gen_after_broadcast(self) -> None:
+        """
+        Copy train buffer to gen buffer after broadcast completes, if they are not shared.
+
+        Called by PSManager on all PS workers after the broadcast rounds finish.
+        No-op when train_gen_model_share() is True.
+        """
+        if self.storage_plan.train_gen_model_share():
+            return
+        # Use the NIXL-registered key set (model.state_dict keys) rather than the
+        # checkpoint key set.  The two differ when tie_word_embeddings=True: the alias
+        # key (lm_head.weight) is registered in the NIXL buffer but absent from the
+        # checkpoint, so using _get_checkpoint_keys would silently leave the gen buffer
+        # for that key uninitialised on non-rank-0 workers.
+        push_client = self.nixl_multi_storage_clients.get_client_by_name(self.client_for_push_name)
+        registered_keys = list(push_client.local_client_info.tensor_infos.keys())
+        psrl_logger.info(
+            f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: "
+            f"transferring {len(registered_keys)} keys from train to gen buffer."
+        )
+        for key in registered_keys:
+            self.transfer_train_to_gen(key=key, sync=False)
+        if self.use_gpu:
+            torch.cuda.synchronize()
+        psrl_logger.info(
+            f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: transfer done."
+        )
 
     def shutdown(self):
         self.nixl_multi_storage_clients.shutdown()

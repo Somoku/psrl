@@ -179,6 +179,7 @@ def run_ppo(config, task_runner_class=None) -> None:
     else:
         runner = task_runner_class.remote()
     ray.get(runner.run.remote(config))
+    ray.shutdown()
 
     # [Optional] get the path of the timeline trace file from the configuration, default to None
     # This file is used for performance analysis
@@ -396,7 +397,7 @@ class TaskRunner:
             resource_pool_manager = self.init_resource_pool_mgr(config)
 
             # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
-            # during the initialization of `GLOBAL_PORT_SCANNER` in nixl.`
+            # during initialization of nixl modules.
             from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
             # Initialize the PPO trainer.

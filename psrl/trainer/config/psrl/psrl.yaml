@@ -22,15 +22,40 @@ ps_mode: cpu_ref
 # Logging path
 logging_path: ~/psrl_logs
 
+# Agentic RL feature toggles.
+agentic_rl:
+
+  # Whether to enable sticky session in agent loops.
+  # When True, all generation calls within a single trajectory are pinned to
+  # the same rollout instance (improves prefix-cache hit rate).
+  sticky_session: False
+
+  # Error handling for terminations where TerminateReason.needs_manager_retry()
+  # is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
+  # (unclassified failure / zero turns produced). Timeouts and aborts are
+  # handled by their own paths and do NOT route through this switch.
+  # True  (default): on training failure, worker notifies manager to dispatch a
+  #                  replacement request so the buffer slot is eventually filled;
+  #                  on validation failure, manager shrinks val_buffer_size by 1
+  #                  so the waiter is unblocked (result has fewer rows).
+  # False           : raise RuntimeError immediately, crashing the worker so the
+  #                   failure is visible rather than silently stalling training.
+  manager_retry_on_error: True
+
+  # TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml
+
 server_rollout:
+
   # Whether to enable server rollout service.
   enable: False
 
   # Rollout gateway config.
   # This gateway is an HTTP entrypoint used by agent loops to call rollout service.
   gateway:
+
     # Bind address for the gateway process.
     router_ip: ${psrl.ps_manager_ip}
+
     router_port: 18080
 
   # Max concurrent connections per rollout server for the HTTP client.
@@ -188,7 +213,7 @@ status_collection:
 
   # The level of logging to file
   # Available options: "none", "partial_rollout", "prompt", "generation", "all"
-  dump_logging_to_file_level: generation
+  dump_logging_to_file_level: all
 
   # Logging interval in milliseconds
   dump_logging_to_file_interval_in_ms: 500
@@ -242,7 +267,7 @@ redundant_rollout:
 partial_rollout:
 
   # Whether to enbale partial rollout
-  enable: False
+  enable: True
 
   # Whether view interrupted trajectories as new prompts
   interrupt_as_prompt: False
@@ -251,9 +276,32 @@ partial_rollout:
 routing_strategy:
 
   # Method for rollout routing
-  # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"
+  # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget", "kv_cache_aware"
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
   method: round_robin
+
+  # KV cache transfer: when re-routing a request to a different rollout instance,
+  # transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)
+  # so instance B can skip re-prefill. Requires lmcache.enable and lmcache.enable_p2p.
+  kv_transfer:
+
+    # Master switch for KV cache transfer.
+    enable: False
+
+    # Transfer timing mode.
+    # "async"    -- (default) fire-and-forget: dispatch to B immediately while
+    #              transfer runs in background.  Lowest routing latency.
+    # "sync"     -- await transfer completion, NO pin.  If LRU evicts during
+    #              transfer, it fails gracefully and B re-prefills.  Moderate
+    #              latency, no CPU backend memory pressure from pinning.
+    # "pin_sync" -- pin → await transfer → unpin.  Strongest guarantee: prevents
+    #              LRU eviction during transfer.  Highest latency; risks CPU
+    #              backend pressure under high concurrency.
+    transfer_mode: async
+
+    # Timeout in milliseconds for "sync" and "pin_sync" modes.
+    # On timeout the transfer is abandoned and B falls back to re-prefill.
+    transfer_timeout_ms: 5000
 
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500
@@ -284,6 +332,18 @@ routing_strategy:
   # Request budget in tokens for each request
   # It is used to estimate the length of the response tokens
   request_budget: 1024
+
+  # [kv_cache_aware] Timeout in milliseconds for a single kv_get_cache_info RPC
+  # per candidate instance. Instances that exceed the timeout receive score 0
+  # (graceful degradation). Ignored by all other routing strategies.
+  #
+  # NOTE: kv_get_cache_info calls psrl_get_gpu_cache_info via call_utility_async,
+  # which is sent to the EngineCore's input queue and only processed AFTER the
+  # current GPU step (schedule + execute_model + update_from_output) completes.
+  # For long sequences (e.g., AIME), a single step can easily take 5–20 seconds.
+  # Set this high enough to cover the worst-case step duration; a timeout merely
+  # degrades routing quality (score 0) but does not affect correctness.
+  kv_query_timeout_ms: 30000
 
   # Snapshot staleness threshold in milliseconds
   # Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
@@ -376,10 +436,19 @@ nixl:
   server_port: 23456
 
   # Pinned temp memory slots num for non-contiguous transfer
-  max_pinned_temp_memory_slots: 64
+  max_pinned_temp_memory_slots: 16
 
   # Enable TMS management for NIXL temp buffers
   enable_tms_for_temp_buffers: ${psrl.tms.enable_nixl}
+
+# Broadcast initialization: rank-0 PS worker reads checkpoint, distributes to others via NIXL.
+broadcast_init:
+
+  # Set to true to use rank-0 broadcast initialization instead of each worker reading disk.
+  enabled: False
+
+  # Broadcast algorithm. Supported: binary_tree. Reserved for future: ring.
+  algorithm: binary_tree
 
 # Checkpoint strategy config
 checkpoint:
@@ -423,7 +492,7 @@ retry_ratio: 1.0
 # Whether to colocate validate and training workers
 colocate_validate_and_train: True
 
-# Whether to dispatch requests to both rollout and validate instances (for validate_on_psrl only)
+# Whether to dispatch requests to both rollout and validate instances
 fuse_rollout_with_validate: True
 
 # Whether to use torch_memory_saver (TMS) for GPU management
@@ -444,6 +513,102 @@ tms:
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
   enable_nixl: True
+
+# LMCache KV cache offloading configuration.
+# When enabled, vLLM offloads KV cache to the specified backend (CPU by default),
+# enabling prefix cache hits across multi-turn agent loop turns without re-prefill.
+lmcache:
+
+  # Whether to enable LMCache KV offloading in vLLM.
+  enable: False
+
+  # Backend for offloaded KV: "cpu", "disk", or "remote" (TODO: remote).
+  backend: cpu
+
+  # Total offload budget in GiB, summed across all TP ranks.
+  # vLLM automatically divides this by the number of KV ranks (TP x PP) to
+  # compute the per-rank budget passed to LMCache as max_local_cpu_size.
+  # Do NOT set LMCACHE_MAX_LOCAL_CPU_SIZE as an env var — that would apply
+  # the total budget to every rank, overcounting memory.
+  offload_size_gb: 10.0
+
+  # Token chunk size for hash-based KV indexing (must divide the block size).
+  chunk_size: 256
+
+  # Full LMCache YAML config path.  When set, overrides all individual fields.
+  config_file: null
+
+  # Whether to clear stale KV cache after model weight pull from PS.
+  clear_on_weight_update: True
+
+  # --- CPU backend ---
+
+  # GiB of CPU memory to keep free and never use for KV offloading.
+  reserve_local_cpu_size: 0.0
+
+  # --- Disk backend ---
+
+  # Filesystem path for disk-backed KV storage (required when backend=disk).
+  disk_path: null
+
+  # Max disk usage in GiB when using the disk backend.
+  max_disk_size_gb: 50.0
+
+  # --- Remote backend (TODO) ---
+
+  # Remote LMCache server URL (e.g., "redis://host:6379").
+  remote_url: null
+
+  # --- Cache behaviour ---
+
+  # Also cache KV from decode steps (increases memory, helps multi-turn reuse).
+  save_decode_cache: True
+
+  # NOTE(lhy): Buggy, do not use. 
+  # Persist a chunk even when not fully filled (helps short prompts < chunk_size).
+  save_unfull_chunk: False
+
+  # Eviction policy: "LRU" (default) or "FIFO".
+  cache_policy: LRU
+
+  # Overlap KV cache retrieval with prefill computation to reduce TTFT.
+  enable_async_loading: True
+
+  # --- P2P cross-instance KV transfer ---
+  # Required when routing_strategy.kv_transfer.enable is True.
+
+  # Enable P2P cross-instance KV transfer via LMCache Controller.
+  # A shared Controller process is started by RolloutCoordinator and its URL is
+  # broadcast to all GenWorker instances at startup.
+  # Each instance is automatically assigned lmcache_instance_id = psrl_instance_{id}.
+  enable_p2p: False
+
+  # Transport channel for P2P transfer.
+  # "nixl" -- uses UCX (PSRL already has NIXL/UCX installed); automatically
+  #           selects shared-memory/IPC on same node and RDMA on multi-node.
+  #           Recommended for all deployment topologies.
+  # "tcp"  -- fallback when NIXL/UCX is unavailable.
+  p2p_transfer_channel: nixl
+
+  # Base port for the shared LMCache Controller's HTTP API (FastAPI/uvicorn).
+  # PSRL calls this port for /move, /lookup etc. REST endpoints.
+  # RolloutCoordinator picks the actual port starting from this value
+  # using find_available_port().
+  controller_base_port: 9000
+
+  # Host where the LMCache Controller runs. Defaults to psrl.ps_manager_ip.
+  # Both PSRL (HTTP) and LMCache workers (ZMQ) connect to this host.
+  controller_host: ${psrl.ps_manager_ip}
+
+  # ZMQ PULL port: Controller listens here for LMCache worker registrations
+  # and heartbeats. Each vLLM instance's LMCache worker connects to this port
+  # on startup to register itself with the Controller.
+  controller_pull_port: 8300
+
+  # ZMQ REPLY port: Controller sends task instructions (move, clear, etc.)
+  # to LMCache workers through this port. Workers connect here to receive
+  # commands dispatched by the Controller after a /move HTTP request.
+  controller_reply_port: 8400
 
 rollout_gateway:
 

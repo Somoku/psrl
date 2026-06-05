@@ -2,7 +2,6 @@
 import inspect
 
 from tensordict import TensorDict
-
 from verl.utils import tensordict_utils as tu
 
 from psrl.utils.reward_score import default_compute_score_async
@@ -35,15 +34,13 @@ class NaiveRewardManager(RewardManagerBase):
 
         data_source = tu.get(data_item, "data_source")
         ground_truth = tu.get(data_item, "reward_model")["ground_truth"]
-        extra_info = tu.get(data_item, "extra_info", {})
-        tool_extra_fields = tu.get(data_item, "tool_extra_fields", None)
-        if tool_extra_fields is not None:
-            extra_info.update(tool_extra_fields.items())
-
         num_turns = tu.get(data_item, "num_turns", None)
         rollout_reward_scores = tu.get(data_item, "reward_scores", {})
-        extra_info["num_turns"] = num_turns
-        extra_info["rollout_reward_scores"] = rollout_reward_scores
+        extra_info = self.merge_extra_info(
+            data_item,
+            num_turns=num_turns,
+            rollout_reward_scores=rollout_reward_scores,
+        )
 
         response_str = await self.loop.run_in_executor(
             None,

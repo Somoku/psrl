@@ -8,10 +8,10 @@ from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from psrl.environments.base import Environment
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
-from psrl.workers.gen_dplb.utils import TokenOutput
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
+from psrl.workers.gen_dplb.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -62,7 +62,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
         return fields
 
     @rollout_trace_op
-    async def run(self, request: dict, **kwargs) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
+    async def run(self, request: dict) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """Execute generation for a single request.
 
         Args:
@@ -83,7 +83,6 @@ class MultiTurnAgentLoop(AgentLoopBase):
             tokenizer=self.tokenizer,
             processor=self.processor,
             dataset_cls=self.dataset_cls,
-            **kwargs,
         )
         self.agent_data = AgentData.get_agent_data(
             data_class,
@@ -113,7 +112,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
             # check redundant padding in single-request case
             output = await self.generate_sequence(
                 self.agent_data.prepare_generation_request(request),
-                is_sticky_session=True,
+                is_sticky_session=self.config.psrl.agentic_rl.sticky_session,
             )
 
             if output is None:

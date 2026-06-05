@@ -275,8 +275,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             else:
                 raise NotImplementedError(f"wake_up_model does not support strategy '{strategy}'.")
 
-        aggressive_empty_cache(force_sync=True)
-
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} wake_up")
 
@@ -484,8 +482,9 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
             try:
                 ActorRolloutRefWorker.init_model(self)
-                # Override checkpoint strategy from psrl config (bypasses McoreEngineConfig dataclass).
-                self.checkpoint_mananager.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
+                if strategy == "megatron":
+                    # Override checkpoint strategy from psrl config (bypasses McoreEngineConfig dataclass).
+                    self.checkpoint_mananager.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
             finally:
                 if skip_load_weight:
                     OmegaConf.set_struct(self.config, True)

@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 staleness=${1:-0}
-project_name=psrl_compare
+project_name=psrl_example
 experiment_name=DAPO-Qwen2.5-3B-megatron-staleness_${staleness}
 fix_weight=${2:-False}
 disable_attn=${3:-False}
@@ -18,13 +18,13 @@ python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PAT
 TRAIN_FILE=/jizhicfs/lhy/data/dapo/dapo-math-17k.parquet
 TEST_FILE=/jizhicfs/lhy/data/dapo/aime-2024.parquet
 
-GEN_DP=1
+GEN_DP=1 # DP in the generation side
 GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
-VAL_DP=1
+VAL_DP=1 # DP in the training side for validation
 VAL_TP=1 # TP in the training side for validation
-VAL_PP=1
+VAL_PP=1 # PP in the training side for validation
 
 TRAIN_TP=2 # TP in the training side 
 TRAIN_PP=1 # PP in the training side 
@@ -178,6 +178,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
+    data.reward_model_dicts.0.reward_loop_type=dapo \
+    data.reward_model_dicts.0.reward_fn=compute_score \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
     data.truncation='left' \

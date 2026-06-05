@@ -253,7 +253,7 @@ class GenRewardManager(RewardManagerBase):
         data_source = tu.get(data_item, "data_source", "unknown")
         reward_model_info = tu.get(data_item, "reward_model", {})
         ground_truth = reward_model_info.get("ground_truth", "") if isinstance(reward_model_info, dict) else ""
-        extra_info = tu.get(data_item, "extra_info", {})
+        extra_info = self.merge_extra_info(data_item)
 
         # Build RM prompt and tokenize
         rm_prompt = self.reward_function.prompt_constructor(prompt_str=prompt_str, response_str=response_str)

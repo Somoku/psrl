@@ -22,7 +22,7 @@ reward_loop_worker:
 # Only managers listed here will be used at runtime.
 # Example: active_managers: [dapo, gen_qwen3_8b]
 active_managers:
-  - dapo
+  - naive
 
 # Named reward manager definitions (keyed by name).
 # Each entry defines a complete reward manager configuration.

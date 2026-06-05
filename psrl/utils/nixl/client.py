@@ -73,6 +73,7 @@ class NIXLStorageClient:
         binded_agent: nixl_agent | None = None,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
+        enable_prog_thread: bool = True,
     ):
         self.client_name = client_name
         self.server_name = server_name
@@ -98,10 +99,11 @@ class NIXLStorageClient:
 
         # Initialize NIXL agent
         if binded_agent is None:
-            self.client_port = find_free_port_with_scope(
-                replica_idx=replica_idx,
-                worker_index=worker_index,
-            )
+            from psrl.utils.nixl.port_scanner import get_port_scanner
+
+            worker_ip = get_worker_info()[0]
+            port_scanner = get_port_scanner(worker_ip)
+            self.client_port = ray.get(port_scanner.find_free_port.remote())
             self.agent = nixl_agent(self.client_name, nixl_agent_config(enable_prog_thread, True, self.client_port))
         else:
             self.agent = binded_agent
@@ -829,7 +831,7 @@ class NIXLStorageClient:
 
         psrl_logger.debug(f"{self.client_name} deregistered all local tensors.")
 
-    def connect_to_server(self, timeout: float = 600.0):
+    def connect_to_server(self, timeout: float = 1200.0):
         """
         Connect to the storage/meta server.
         """
@@ -874,7 +876,7 @@ class NIXLStorageClient:
             pickle.dumps({self.client_name: self._temp_desc_bytes_mapping}),
         )
 
-    def wait_for_server_sharding(self, timeout: float = 600.0):
+    def wait_for_server_sharding(self, timeout: float = 1200.0):
         """
         Wait for the server sharding to be fetched.
         """
@@ -897,7 +899,7 @@ class NIXLStorageClient:
         self._unified_sharding_dict_fetched = True
         return self._unified_sharding_dict
 
-    def wait_for_server_info(self, timeout: float = 600.0):
+    def wait_for_server_info(self, timeout: float = 1200.0):
         """
         Wait for the server info to be fetched.
         For storage_server mode, wait for the storage server info to be fetched.
@@ -948,7 +950,7 @@ class NIXLStorageClient:
             time.sleep(0.1)
         self._all_client_infos_fetched = True
 
-    def wait_for_server_temp_mappings(self, timeout: float = 600.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 1200.0):
         """Wait for the server temporary mappings to be fetched."""
         assert self._is_connected, "Not connected to server"
         start = time.time()
@@ -978,7 +980,7 @@ class NIXLStorageClient:
         for dst_agent_name in dst_agent_names:
             self.agent.send_notif(dst_agent_name, payload)
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float = 1200.0):
         """Wait for updated client infos from other clients.
 
         Args:
@@ -1057,7 +1059,22 @@ class NIXLStorageClient:
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
     ) -> list[tuple[int, ...]]:
-        """Read from another client, supports shard alignment and communication plan."""
+        """Read from another client, supports shard alignment and communication plan.
+
+        Args:
+            target_agent: NIXL agent name of the remote worker to read from.
+            target_client: Client name on the remote agent that holds the tensor.
+            key: Parameter name identifying the tensor to transfer.
+            tag: Opaque string used to track the transfer handle (must be unique
+                per concurrent in-flight transfer for the same key).
+            comm_plan: Optional explicit communication plan overriding
+                ``self._comm_plan``.  When ``None`` the stored plan (if any) is
+                used; when supplied it takes precedence.
+            merge_and_cache_xfer: When ``True``, accumulate descriptors into an
+                internal cache for later bulk submission via
+                ``merge_and_finish_cached_xfer()`` instead of posting the
+                transfer immediately.
+        """
         plan = comm_plan or self._comm_plan
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
@@ -1154,7 +1171,9 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
-            # Contiguous xfer can be merged and executed together later
+            # Contiguous xfer can be merged and executed together later.
+            # NOTE(claude): Use continue (not return) here so all shards are processed before returning.
+            # Returning inside the loop would silently skip all remaining shards for this key.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
                 return []
@@ -1207,6 +1226,10 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client READ transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
+        # Return [] so the caller knows there is nothing to wait on immediately.
+        if merge_and_cache_xfer:
+            return []
         return shards_to_transfer
 
     def client_write(
@@ -1217,9 +1240,29 @@ class NIXLStorageClient:
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
         merge_and_cache_xfer: bool | None = False,
+        use_comm_plan: bool = True,
     ) -> list[tuple[int, ...]]:
-        """Write to another client, supports shard alignment and communication plan."""
-        plan = comm_plan or self._comm_plan
+        """Write to another client, supports shard alignment and communication plan.
+
+        Args:
+            target_agent: NIXL agent name of the remote worker to write to.
+            target_client: Client name on the remote agent that holds the tensor.
+            key: Parameter name identifying the tensor to transfer.
+            tag: Opaque string used to track the transfer handle (must be unique
+                per concurrent in-flight transfer for the same key).
+            comm_plan: Optional explicit communication plan overriding
+                ``self._comm_plan``.  When ``None`` the stored plan (if any) is
+                used; when supplied it takes precedence.
+            merge_and_cache_xfer: When ``True``, accumulate descriptors into an
+                internal cache for later bulk submission via
+                ``merge_and_finish_cached_xfer()`` instead of posting the
+                transfer immediately.
+            use_comm_plan: If ``False``, ignore both ``comm_plan`` and the stored
+                ``self._comm_plan`` and fall back to default shard-alignment.
+                Useful when writing to a target that is not covered by the
+                existing comm plan (e.g. PS-to-PS broadcast transfers).
+        """
+        plan = (comm_plan or self._comm_plan) if use_comm_plan else None
         self._ensure_client_info_fetched(target_client)
         remote_info = self._all_client_infos[target_client].get_tensor_info(key)
         local_info = self.local_client_info.get_tensor_info(key)
@@ -1325,9 +1368,11 @@ class NIXLStorageClient:
             )
             local_desc = self._deserialize_to_xfer_descs(local_desc_bytes)
             remote_desc = self._deserialize_to_xfer_descs(remote_desc_bytes)
+            # NOTE(claude): Use continue (not return) here so all shards are processed before returning.
+            # Returning inside the loop would silently skip all remaining shards for this key.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("WRITE", local_desc, remote_desc, target_agent, tag, target_client))
-                return []
+                continue
             # Real xfer
             try:
                 if (key, shard_idx) in self._write_contiguous_event_cache:
@@ -1361,6 +1406,10 @@ class NIXLStorageClient:
                     f"{self.client_name} posting client WRITE transfer to {target_client} failed for "
                     f"key {key} shard {shard_idx}."
                 )
+        # When merging and caching, transfers are deferred to merge_and_finish_cached_xfer.
+        # Return [] so the caller knows there is nothing to wait on immediately.
+        if merge_and_cache_xfer:
+            return []
         return shards_to_transfer
 
     def clear_intermediate_cached_data(self):
@@ -1373,7 +1422,7 @@ class NIXLStorageClient:
 
     # NOTE(lhy): This use low-level NIXL API to merge fragmented transfers into a single transfer,
     # which is more efficient than finishing each transfer individually.
-    def merge_and_finish_cached_xfer(self, timeout: float = 600.0):
+    def merge_and_finish_cached_xfer(self, timeout: float = 1200.0):
         """Merge and finish cached transfers."""
         if hasattr(self, "_cached_xfer_descs"):
             _cached_xfer_descs_by_op_type = {}
@@ -1519,7 +1568,7 @@ class NIXLStorageClient:
                                     f"Timeout waiting for merged transfer ({op_type}, {target_client}, {tag}) "
                                     f"from {self.client_name}"
                                 )
-                            time.sleep(0.0001)
+                            time.sleep(0.001)  # 1ms backoff to avoid CPU starvation at large scale
                         end = time.time()
                         psrl_logger.debug(
                             f"{self.client_name} finished client {op_type} transfer to {target_client} for tag {tag} "
@@ -1534,7 +1583,7 @@ class NIXLStorageClient:
         op_type: str,
         target_client: str | None = None,
         shard_idx: int | None = None,
-        timeout: float = 600.0,
+        timeout: float = 1800.0,
     ):
         """
         Wait for a transfer to be completed.
@@ -1600,7 +1649,7 @@ class NIXLStorageClient:
                         f"Timeout waiting for transfer ({key}, {tag}, {op_type}, shard {shard_idx}) "
                         f"from {self.client_name} to {target_client}"
                     )
-                # time.sleep(0.0001)
+                time.sleep(0.001)  # 1ms backoff to avoid CPU starvation on PS nodes at large scale
 
     def load_state_dict_into_registered_tensors(
         self,
@@ -1795,7 +1844,6 @@ class NIXLMultiStorageClients:
         worker_index: int = 0,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
-        enable_prog_thread: bool = True,
     ):
         self.agent_name = agent_name
         self.multi_client_names = multi_client_names
@@ -1806,10 +1854,11 @@ class NIXLMultiStorageClients:
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
         # Initialize NIXL agent
-        self.client_port = find_free_port_with_scope(
-            replica_idx=replica_idx,
-            worker_index=worker_index,
-        )
+        from psrl.utils.nixl.port_scanner import get_port_scanner
+
+        worker_ip = get_worker_info()[0]
+        port_scanner = get_port_scanner(worker_ip)
+        self.client_port = ray.get(port_scanner.find_free_port.remote())
         self.agent = nixl_agent(self.agent_name, nixl_agent_config(True, True, self.client_port))
 
         # Initialize multi clients
@@ -1843,7 +1892,7 @@ class NIXLMultiStorageClients:
         for client in self.multi_clients:
             client.release_temp_memory()
 
-    def connect_to_server(self, timeout: float = 600.0):
+    def connect_to_server(self, timeout: float = 1200.0):
         assert not self._is_connected, "Already connected to server"
         self.agent.fetch_remote_metadata(self.server_name, self.server_ip, self.server_port)
         self.agent.send_local_metadata(self.server_ip, self.server_port)
@@ -1881,7 +1930,7 @@ class NIXLMultiStorageClients:
             pickle.dumps({client.client_name: client._temp_desc_bytes_mapping for client in self.multi_clients}),
         )
 
-    def wait_for_server_sharding(self, timeout: float = 600.0):
+    def wait_for_server_sharding(self, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         start = time.time()
         if self._multi_unified_sharding_dicts_fetched:
@@ -1907,7 +1956,7 @@ class NIXLMultiStorageClients:
         self._multi_unified_sharding_dicts_fetched = True
         return {client.client_name: client._unified_sharding_dict for client in self.multi_clients}
 
-    def wait_for_server_info(self, timeout: float = 600.0):
+    def wait_for_server_info(self, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_info(timeout)
         if len(self.multi_clients) > 1:
@@ -1916,14 +1965,14 @@ class NIXLMultiStorageClients:
                 client._comm_plan = self.multi_clients[0]._comm_plan
                 client._all_client_infos_fetched = True
 
-    def wait_for_server_temp_mappings(self, timeout: float = 600.0):
+    def wait_for_server_temp_mappings(self, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_server_temp_mappings(timeout)
         if len(self.multi_clients) > 1:
             for client in self.multi_clients[1:]:
                 client._all_temp_mappings = self.multi_clients[0]._all_temp_mappings
 
-    def wait_for_update_infos(self, expected_agents: int, timeout: float = 600.0):
+    def wait_for_update_infos(self, expected_agents: int, timeout: float = 1200.0):
         assert self._is_connected, "Not connected to server"
         self.multi_clients[0].wait_for_update_infos(expected_agents, timeout)
         if len(self.multi_clients) > 1:
@@ -1956,10 +2005,11 @@ class NIXLMultiStorageClients:
         key: str,
         tag: str,
         comm_plan: NIXLCommPlan | None = None,
+        use_comm_plan: bool = True,
     ):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)
-        client.client_write(target_agent, target_client, key, tag, comm_plan)
+        client.client_write(target_agent, target_client, key, tag, comm_plan, use_comm_plan=use_comm_plan)
 
     def wait(
         self,
@@ -1968,7 +2018,7 @@ class NIXLMultiStorageClients:
         tag: str,
         op_type: str,
         target_client: str | None = None,
-        timeout: float = 600.0,
+        timeout: float = 1200.0,
     ):
         assert self._is_connected, "Not connected to server"
         client = self.get_client_by_name(cur_client)

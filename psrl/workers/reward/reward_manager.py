@@ -600,6 +600,11 @@ class RewardLoopManager(CommandExtension):
                             self.request_key_to_future[request_key] = fut
                         self.request_key_to_attempt[request_key] = attempt_id
                     else:
+                        psrl_logger.warning(
+                            "compute_score:update_request_status(REWARD_RUNNING) failed for uid=%s "
+                            "(aborted?), returning None.",
+                            request_id,
+                        )
                         existing_fut = self.request_key_to_future.pop(request_key, None)
                         if existing_fut is not None and not existing_fut.done():
                             existing_fut.set_result(None)

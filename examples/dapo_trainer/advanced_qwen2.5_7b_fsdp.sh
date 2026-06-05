@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 staleness=${1:-2}
-project_name=psrl_compare
+project_name=psrl_example
 experiment_name=DAPO-Qwen2.5-7B-fsdp-staleness_${staleness}
 fix_weight=${2:-False}
 disable_attn=${3:-False}
@@ -10,27 +10,27 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
-HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen2.5-Math-7B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
 TRAIN_FILE=${PSRL_WORKSPACE}/data/gsm8k/train.parquet
 TEST_FILE=${PSRL_WORKSPACE}/data/gsm8k/test.parquet
 
-GEN_DP=1
+GEN_DP=1 # DP in the generation side
 GEN_TP=1 # TP in the generation side
 GEN_PP=1 # PP in the generation side
 
-VAL_DP=1
+VAL_DP=1 # DP in the training side for validation
 VAL_TP=1 # TP in the training side for validation
 VAL_PP=1 # PP in the training side for validation
 
-NNODES=2
+NNODES=4
 NGPUS_PER_NODE=8
 
-GEN_NNODES=1 # Number of nodes for generation
+GEN_NNODES=2 # Number of nodes for generation
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE} # Number of GPUs per node for generation
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=1 # Number of nodes for training
+TRAIN_NNODES=2 # Number of nodes for training
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
@@ -174,6 +174,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="${TRAIN_FILE}" \
+    data.reward_model_dicts.0.reward_loop_type=dapo \
+    data.reward_model_dicts.0.reward_fn=compute_score \
     data.val_files="${TEST_FILE}" \
     data.prompt_key=prompt \
     data.truncation='left' \

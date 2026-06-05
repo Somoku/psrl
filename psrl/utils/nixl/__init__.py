@@ -10,6 +10,7 @@ from .nixl_spec import (
     NIXLTensorInfo,
     find_free_port_with_scope,
 )
+from .port_scanner import get_port_scanner
 from .server import NIXLMetaServer
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "NIXLMetaServer",
     "NIXLStorageClient",
     "NIXLMultiStorageClients",
+    "get_port_scanner",
     "GLOBAL_TOPOLOGY",
     "NIXL_META_SERVER_NAME",
     "find_free_port_with_scope",

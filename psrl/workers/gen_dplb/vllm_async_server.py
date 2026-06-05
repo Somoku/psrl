@@ -6,13 +6,14 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pprint import pprint
 from typing import Any
 
 import aiohttp
 import ray
 from grpc_reflection.v1alpha import reflection
+from omegaconf import OmegaConf
 from ray.actor import ActorHandle
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
@@ -51,6 +52,7 @@ from vllm.v1.engine import PauseMode
 from vllm.v1.engine.async_llm import AsyncLLM
 
 import grpc
+from psrl.utils.kv_cache import KVCacheManager, LMCacheConfig
 from psrl.utils.logger import (
     DualOutputHandler,
     EventType,
@@ -133,7 +135,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 * self.psrl_config.rollout_n
                 // self.psrl_config.deployment.n_rollout_instances
             )
-        self.log_active_tasks_interval = self.avg_max_active_tasks_len // 8
+        self.log_active_tasks_interval = max(self.avg_max_active_tasks_len // 8, 1)
         self.active_task_num = {}
 
         # Async event management
@@ -156,6 +158,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # For async model pulling
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+
+        # Created before vLLM engine init so LMCache env vars and engine args
+        # are visible to vLLM, then attached to the live engine in run_server().
+        self.kv_cache_manager: KVCacheManager | None = None
+        self._kv_cache_hash_consumer_task: asyncio.Task | None = None
 
         # NOTE(linsh): determine at construction time whether this server runs a pooling model
         # (e.g., reward / embedding model) so that generate() can dispatch to encode() accordingly.
@@ -182,6 +189,110 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     def _get_worker_extension_cls(self) -> str:
         return "psrl.workers.gen_dplb.vllm_extension.vLLMWorkerExtension"
+
+    def _build_kv_cache_manager(self) -> KVCacheManager:
+        """Build and configure `KVCacheManager` before vLLM engine initialization."""
+        lmcache_raw = OmegaConf.to_container(
+            self.psrl_config.get("lmcache", OmegaConf.create()),
+            resolve=True,
+        ) or {}
+
+        lmcache_instance_id = f"psrl_instance_{self.get_replica_idx()}"
+        if lmcache_raw.get("enable_p2p", False):
+            lmcache_raw.setdefault(
+                "controller_host",
+                str(self.psrl_config.get("ps_manager_ip", "127.0.0.1")),
+            )
+            lmcache_raw["lmcache_instance_id"] = lmcache_instance_id
+
+        lmcache_cfg = LMCacheConfig(**lmcache_raw)
+        if lmcache_cfg.enable_p2p:
+            self._configure_lmcache_p2p_runtime(lmcache_cfg)
+
+        kv_cache_manager = KVCacheManager(lmcache_cfg)
+        kv_cache_manager.set_instance_id(self.get_replica_idx())
+        kv_cache_manager.apply_env_vars()
+        return kv_cache_manager
+
+    def _configure_lmcache_p2p_runtime(self, lmcache_cfg: LMCacheConfig) -> None:
+        """Fill runtime-only LMCache P2P fields for this server actor."""
+        from psrl.utils.common.http_utils import get_host_info
+        from psrl.utils.nixl.port_scanner import get_port_scanner
+
+        # A server actor owns all local vLLM workers for this replica node. In
+        # DP mode, each local DP x TP worker may create an LMCache worker.
+        lmcache_cfg.num_kv_workers = max(1, len(self.workers))
+        _, worker_ip = get_host_info()
+        lmcache_cfg.worker_host = worker_ip
+
+        port_scanner = get_port_scanner(worker_ip)
+        num_ports_needed = lmcache_cfg.num_kv_workers * 3
+        ports = ray.get([port_scanner.find_free_port.remote() for _ in range(num_ports_needed)])
+        n = lmcache_cfg.num_kv_workers
+        lmcache_cfg.allocated_worker_ports = ports[0:n]
+        lmcache_cfg.allocated_p2p_init_ports = ports[n : 2 * n]
+        lmcache_cfg.allocated_p2p_lookup_ports = ports[2 * n : 3 * n]
+
+    async def _consume_kv_cache_hash_queue(self, kv_cache_hash_queue) -> None:
+        """Consume pushed GPU/LMCache cache snapshots into `KVCacheManager`."""
+        import queue as _queue
+
+        assert self.kv_cache_manager is not None, "kv_cache_manager must be initialized."
+
+        lmcache_log_count = 0
+        lmcache_hash_verified = False
+        while True:
+            try:
+                latest_snapshot = None
+                while True:
+                    try:
+                        latest_snapshot = kv_cache_hash_queue.get_nowait()
+                    except _queue.Empty:
+                        break
+
+                if latest_snapshot is not None:
+                    self.kv_cache_manager.update_gpu_cache_snapshot(latest_snapshot)
+                    lmcache_snapshot = latest_snapshot.get("lmcache")
+                    if lmcache_snapshot is not None:
+                        self.kv_cache_manager.update_lmcache_backend_snapshot(lmcache_snapshot)
+                        lmcache_log_count += 1
+                        if not lmcache_hash_verified and "hash_probe" in lmcache_snapshot:
+                            lmcache_hash_verified = True
+                            expected = lmcache_snapshot["hash_probe"]
+                            none_hash = lmcache_snapshot.get("none_hash", 0)
+                            local_fn = self.kv_cache_manager._get_lmcache_hash_fn()
+                            local_probe = local_fn((none_hash, (0, 1, 2, 3), ()))
+                            if local_probe != expected:
+                                psrl_logger.error(
+                                    "[KVCacheConsumer] Hash mismatch. "
+                                    f"EngineCore hash_probe={expected}, "
+                                    f"server hash_probe={local_probe}. "
+                                    "Set PYTHONHASHSEED=0 before launching Ray/Python."
+                                )
+                            else:
+                                psrl_logger.info(
+                                    "[KVCacheConsumer] Hash consistency verified "
+                                    f"(algo={lmcache_snapshot.get('hash_algo', 'N/A')})."
+                                )
+                        if lmcache_log_count <= 3 or lmcache_log_count % 100 == 0:
+                            psrl_logger.info(
+                                "[KVCacheConsumer] LMCache snapshot received "
+                                f"(count={lmcache_log_count}, "
+                                f"chunk_hash_set size={len(lmcache_snapshot.get('chunk_hash_set', []))}, "
+                                f"hash_algo={lmcache_snapshot.get('hash_algo', 'N/A')})."
+                            )
+                    elif lmcache_log_count == 0:
+                        lmcache_log_count = -1
+                        psrl_logger.warning(
+                            "[KVCacheConsumer] Snapshot received without lmcache key. "
+                            f"Keys: {list(latest_snapshot.keys())!r}."
+                        )
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                psrl_logger.warning(f"Error consuming kv_cache_hash_queue: {e!r}.")
+                await asyncio.sleep(0.5)
 
     async def launch_server(
         self, master_address: str | None = None, master_port: int | None = None, dp_rpc_port: int | None = None
@@ -269,6 +380,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "runner": self.config.get("runner", "generate"),
             **engine_kwargs,
         }
+
+        self.kv_cache_manager = self._build_kv_cache_manager()
+        args.update(self.kv_cache_manager.get_engine_kwargs())
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -433,6 +547,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             _endpoint = self.gen_interface.status_endpoint or ""
             self.status_queue = ZMQPushQueue(_endpoint)
             self.stat_collector.init_output_queue(self.status_queue)
+            import queue as _queue
+
+            self.kv_cache_hash_queue: _queue.SimpleQueue = _queue.SimpleQueue()
+            self.stat_collector.init_kv_cache_hash_queue(self.kv_cache_hash_queue)
             for data_parallel_rank in range(self.config.data_parallel_size):
                 self.stat_collector.record_model_version_update(0, data_parallel_rank)
             kwargs["stat_loggers"] = [self.stat_collector, self.psrl_preemption_logger]
@@ -453,6 +571,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # AGENT(VERL): use gRPC server instead of HTTP server in PSRL
 
         self.engine = engine_client
+        assert self.kv_cache_manager is not None, "kv_cache_manager must be initialized before engine startup."
+        self.kv_cache_manager.attach_engine(engine_client)
+        if hasattr(self, "kv_cache_hash_queue"):
+            self._kv_cache_hash_consumer_task = asyncio.ensure_future(
+                self._consume_kv_cache_hash_queue(self.kv_cache_hash_queue)
+            )
+        psrl_logger.info("[KVCacheManager]: Engine attached after vLLM server initialization.")
+
         # self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
         self._server_port = await self._start_grpc_server(engine_client)
 
@@ -564,7 +690,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self.engine.wake_up(tags=wake_up_tags)
 
     async def clear_kv_cache(self):
-        await self.engine.reset_prefix_cache()
+        await self.engine.reset_prefix_cache(reset_connector=True)
+        await self.engine.reset_mm_cache()
+        await self.engine.reset_encoder_cache()
 
     async def pause_generation(
         self,
@@ -607,7 +735,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # Try to reset prefix cache to ensure clean state
         if reset_prefix_cache:
-            await self.engine.reset_prefix_cache()
+            await self.engine.reset_prefix_cache(reset_connector=True)
 
         return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
@@ -905,13 +1033,16 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.log_active_tasks(data_parallel_rank, task_done=True)
 
         return TokenOutput(
-            token_ids=token_ids,
-            log_probs=log_probs,
+            prompt_ids=prompt_ids,
+            response_ids=token_ids,
+            response_mask=[1] * len(token_ids),
+            response_log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             interrupted=interrupted,
             update_status=update_status,
+            rollout_instance_id=rollout_instance_id,
         )
 
     async def _encode_internal(
@@ -1007,7 +1138,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.log_active_tasks(data_parallel_rank, task_done=True)
 
         return TokenOutput(
-            token_ids=[],
+            prompt_ids=prompt_ids,
+            response_ids=[],
+            response_mask=[],
             pooling_output=pooling_output,
             stop_reason="completed",
             interrupted=False,
@@ -1069,6 +1202,96 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             args=(info_num,),
         )
 
+    ###### KV Cache Management ######
+
+    def _assert_kv_cache_manager(self) -> KVCacheManager:
+        assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
+        assert self.kv_cache_manager.is_attached, (
+            "KVCacheManager engine is not attached. Call launch_server() before KV cache operations."
+        )
+        return self.kv_cache_manager
+
+    async def kv_get_cache_info(self, tokens: list[int]) -> dict:
+        """Query GPU prefix-cache and LMCache backend usage for the given tokens."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        info = await kv_cache_manager.get_cache_info(tokens)
+        return asdict(info)
+
+    async def kv_pin(self, tokens: list[int], targets: list[str]) -> bool:
+        """Pin the cached prefix blocks/chunks for `tokens`."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        assert targets, "targets must be a non-empty list."
+        assert all(target in ("gpu", "backend") for target in targets), (
+            f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+        )
+        return await kv_cache_manager.pin(tokens, targets)
+
+    async def kv_unpin(self, tokens: list[int], targets: list[str]) -> bool:
+        """Unpin the cached prefix blocks/chunks for `tokens`."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        assert targets, "targets must be a non-empty list."
+        assert all(target in ("gpu", "backend") for target in targets), (
+            f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+        )
+        return await kv_cache_manager.unpin(tokens, targets)
+
+    async def kv_clear_from_backend(self, tokens: list[int]) -> int:
+        """Remove the cached prefix chunks for `tokens` from the LMCache backend."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        return await kv_cache_manager.clear_from_backend(tokens)
+
+    async def kv_transfer(
+        self,
+        tokens: list[int],
+        src: tuple[str, str],
+        dst: tuple[str, str],
+        copy: bool = False,
+    ) -> bool:
+        """Transfer KV cache through the shared LMCache Controller."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        assert len(src) == 2, f"src must be a 2-tuple, got length {len(src)}."
+        assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
+        result = await kv_cache_manager.transfer(tokens, src, dst, copy)
+        if not result:
+            err = getattr(kv_cache_manager, "_last_transfer_error", "unknown")
+            psrl_logger.warning(
+                "[KVTransfer] transfer() returned False: "
+                f"src={src!r}, dst={dst!r}, tokens_len={len(tokens)}, error={err!r}."
+            )
+        return result
+
+    async def kv_transfer_direct(
+        self,
+        tokens: list[int],
+        src: tuple[str, str],
+        dst: tuple[str, str],
+        copy: bool = False,
+    ) -> bool:
+        """Transfer KV cache directly through the local LMCacheWorker ZMQ socket."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        assert len(src) == 2, f"src must be a 2-tuple, got length {len(src)}."
+        assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
+        return await kv_cache_manager.transfer_direct(tokens, src, dst, copy)
+
+    def kv_set_peer_registry(self, registry: dict[str, str], worker_zmq_url: str | None = None) -> None:
+        """Set peer registry for direct LMCache transfer bypass."""
+        assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
+        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_url)
+
+    def set_lmcache_controller_url(self, controller_url: str) -> None:
+        """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""
+        assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
+        from psrl.utils.common.http_utils import init_http_client
+
+        init_http_client(server_concurrency=4, rollout_engine_num=1)
+        self.kv_cache_manager.set_controller_url(controller_url)
+
     ###### Weights Update ######
 
     async def sync_with_ps(
@@ -1128,6 +1351,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             raise NotImplementedError(f"PSRL does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Important: the prefix cache needs to be cleared after pulling the model
         await self.clear_kv_cache()
+        if self.kv_cache_manager is not None and self.kv_cache_manager.should_clear_on_weight_update:
+            await self.collective_rpc(method="lmcache_clear_all_from_backend")
+            psrl_logger.debug("Cleared LMCache backend after model weight update.")
 
     async def nixl_pull_model(self) -> None:
         assert self.gen_interface.ps_manager_handle is not None, "nixl_pull_model requires a PS manager handle"

@@ -2,13 +2,15 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 
 import aiohttp
 import numpy as np
 import ray
+from ray.actor import ActorHandle
 
-from psrl.utils.common.http_utils import find_available_port
+from psrl.utils.common.http_utils import find_available_port, get_host_info
 from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.logger import (
     DualOutputHandler,
@@ -34,7 +36,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 STATUS_QUEUE_POLL_TIMEOUT_SECS = 0.2
 
-
+@ray.remote
 class RolloutCoordinator(CommandExtension):
     def __init__(
         self,
@@ -131,6 +133,10 @@ class RolloutCoordinator(CommandExtension):
         # Engine status tracking
         # Track the latest engine stats of each instance
         self.instance_to_engine_status: dict[RolloutInstanceId, EngineStats] = {}
+
+        # LMCache P2P Controller subprocess handle (started by init_lmcache_p2p, if enabled).
+        self._lmcache_controller_proc: subprocess.Popen | None = None
+        self._lmcache_controller_url: str | None = None
 
         # Build logger
         self.log_prefix = "RolloutCoordinator"
@@ -280,6 +286,19 @@ class RolloutCoordinator(CommandExtension):
             raise ValueError(f"Unknown tag {tag} for getting server handles and number")
         server_handles = [self.server_handles[replica_id] for replica_id in replica_ids]
         return server_handles
+
+    def _get_ordered_server_items(self, tag: str = "all") -> list[tuple[int, str, ActorHandle]]:
+        """Return `(replica_idx, replica_id, server_handle)` sorted by replica index."""
+        if tag in ["rollout", "validate"]:
+            replica_ids = self.tag_to_replica_ids[tag]
+        elif tag == "all":
+            replica_ids = self.replica_ids
+        else:
+            raise ValueError(f"Unknown tag {tag} for getting server handles")
+        return [
+            (self.rollout_replicas[replica_id].replica_rank, replica_id, self.server_handles[replica_id])
+            for replica_id in sorted(replica_ids, key=lambda rid: self.rollout_replicas[rid].replica_rank)
+        ]
 
     async def init_nixl_client(self):
         """Init the NIXL client on rollout and validate instances."""
@@ -1244,3 +1263,160 @@ class RolloutCoordinator(CommandExtension):
             replica_id, dp_rank = instance_id
             futures.append(self.server_handles[replica_id].wait_for_requests_to_drain.remote())
         await asyncio.gather(*futures)
+
+    # ------- FUNCTIONS FOR LMCACHE P2P -------
+
+    async def init_lmcache_p2p(self) -> None:
+        """
+        Broadcast the Controller URL to all rollout server actors.
+
+        Requires start_lmcache_controller() to have been called first.
+        Must be called after init_model() has completed on all instances.
+        """
+        assert self._lmcache_controller_url is not None, (
+            "start_lmcache_controller() must be called before init_lmcache_p2p()"
+        )
+        controller_url = self._lmcache_controller_url
+
+        server_items = self._get_ordered_server_items("all")
+        futures = [
+            server_handle.set_lmcache_controller_url.remote(controller_url)
+            for _, _, server_handle in server_items
+        ]
+        await asyncio.gather(*futures)
+        psrl_logger.info(
+            f"LMCache P2P Controller at {controller_url!r} broadcast to all {len(server_items)} replicas."
+        )
+
+        # After Controller URL is set and Workers are registered, broadcast the
+        # peer registry so server actors can bypass the Controller for KV transfers.
+        await self._broadcast_peer_registry()
+
+    async def _broadcast_peer_registry(self) -> None:
+        """
+        Query the Controller for each replica's peer_init_url and worker ZMQ URL,
+        then broadcast to all server actors for direct transfer bypass.
+
+        This enables `kv_transfer_direct()` on each server actor to send MoveWorkerMsg
+        directly to the local LMCacheWorker via ZMQ, eliminating the Controller as
+        a centralized bottleneck under burst transfer scenarios.
+        """
+        from psrl.utils.common.http_utils import init_http_client, post
+
+        controller_url = self._lmcache_controller_url
+        assert controller_url, "start_lmcache_controller() must be called first."
+
+        # Ensure HTTP client is initialized in the Coordinator process.
+        init_http_client(server_concurrency=4, rollout_engine_num=1)
+
+        server_items = self._get_ordered_server_items("all")
+
+        # Build peer registry: instance_id → peer_init_url
+        # Also collect each instance's own worker ZMQ URL (ip:port) for direct cmd dispatch.
+        peer_registry: dict[str, str] = {}
+        worker_zmq_urls: dict[int, str] = {}  # replica_idx → worker zmq url
+
+        for replica_idx, _, _ in server_items:
+            instance_id = f"psrl_instance_{replica_idx}"
+            resp = await post(
+                f"{controller_url}/query_worker_info",
+                {"instance_id": instance_id},
+                max_retries=3,
+            )
+            assert resp and "worker_infos" in resp and resp["worker_infos"], (
+                f"[LMCache] query_worker_info returned empty for {instance_id!r}. "
+                f"Workers may not have registered yet. resp={resp!r}"
+            )
+            worker_info = resp["worker_infos"][0]
+            peer_init_url = worker_info.get("peer_init_url", "")
+            if peer_init_url:
+                peer_registry[instance_id] = peer_init_url
+            # Worker ZMQ URL = ip:port (the Worker's REP socket for commands).
+            worker_ip = worker_info.get("ip", "")
+            worker_port = worker_info.get("port", 0)
+            if worker_ip and worker_port:
+                worker_zmq_urls[replica_idx] = f"{worker_ip}:{worker_port}"
+
+        assert peer_registry, (
+            "[LMCache] Peer registry is empty after querying Controller. "
+            "No instances have peer_init_url — P2P is not configured correctly."
+        )
+
+        # Broadcast to each server actor with instance-specific worker_zmq_url.
+        futures = []
+        for replica_idx, _, server_handle in server_items:
+            zmq_url = worker_zmq_urls.get(replica_idx)
+            futures.append(
+                server_handle.kv_set_peer_registry.remote(peer_registry, zmq_url)
+            )
+        await asyncio.gather(*futures)
+
+        psrl_logger.info(
+            f"[LMCache] Peer registry broadcast to {len(server_items)} replicas: "
+            f"{len(peer_registry)} peers, "
+            f"{len(worker_zmq_urls)} workers with ZMQ URLs."
+        )
+
+    def start_lmcache_controller(self) -> str:
+        """
+        Start the LMCache Controller subprocess (synchronous, non-async).
+
+        Must be called BEFORE init_model() so the Controller is already listening
+        when LMCache workers inside EngineCore try to register at startup.
+
+        Returns:
+            str: Base URL of the Controller, e.g. `"http://10.0.0.1:9042"`.
+        """
+        self._lmcache_controller_url = self._start_lmcache_controller()
+        return self._lmcache_controller_url
+
+    def _start_lmcache_controller(self) -> str:
+        """
+        Start the `lmcache_controller` subprocess and poll until healthy.
+
+        Uses `find_available_port` to pick an unused port starting from
+        `psrl.lmcache.controller_base_port` and `get_host_info` to determine
+        the bind address.  Polls `GET /openapi.json` up to 90 times (1 s interval)
+        to account for LMCache's slow import (~20 s on some nodes).
+
+        Returns:
+            str: Base URL of the Controller, e.g. `"http://10.0.0.1:9042"`.
+
+        Raises:
+            RuntimeError: If the Controller does not become healthy within 90 s.
+        """
+        import requests as _requests
+
+        _, host = get_host_info()
+        port = find_available_port(self.config.psrl.lmcache.controller_base_port)
+        cmd = [
+            "lmcache_controller",
+            "--host", host,
+            "--port", str(port),
+        ]
+        psrl_logger.info(f"[LMCache] Starting shared Controller: {' '.join(cmd)}.")
+        self._lmcache_controller_proc = subprocess.Popen(cmd)
+        controller_url = f"http://{host}:{port}"
+
+        # Poll GET /openapi.json (FastAPI built-in, always available once uvicorn binds).
+        # LMCache's /health is a POST endpoint requiring a body, so we use openapi.json instead.
+        health_url = f"{controller_url}/openapi.json"
+        max_attempts = 90
+        for attempt in range(max_attempts):
+            try:
+                resp = _requests.get(health_url, timeout=2)
+                if resp.status_code == 200:
+                    psrl_logger.info(
+                        f"[LMCache] Controller healthy at {controller_url!r} "
+                        f"(attempt {attempt + 1}/{max_attempts})."
+                    )
+                    return controller_url
+            except Exception:
+                pass
+            time.sleep(1)
+
+        self._lmcache_controller_proc.kill()
+        self._lmcache_controller_proc = None
+        raise RuntimeError(
+            f"LMCache Controller did not become healthy at {health_url!r} within {max_attempts} s."
+        )

@@ -176,4 +176,34 @@ def validate_config(
             and config.train_actor_rollout_ref.actor.fsdp_config.optimizer_offload
         ), "Optimizer offload must be enabled when TMS is not enabled for training workers"
 
+    # Check LMCache and KV transfer configuration
+    lmcache_cfg = config.psrl.get("lmcache", {})
+    kv_transfer_cfg = config.psrl.routing_strategy.get("kv_transfer", {})
+
+    if kv_transfer_cfg.get("enable", False):
+        assert lmcache_cfg.get("enable", False), (
+            "psrl.lmcache.enable must be True when psrl.routing_strategy.kv_transfer.enable is True."
+        )
+        assert lmcache_cfg.get("enable_p2p", False), (
+            "psrl.lmcache.enable_p2p must be True when psrl.routing_strategy.kv_transfer.enable is True."
+        )
+        assert config.psrl.partial_rollout.enable, (
+            "psrl.partial_rollout.enable must be True when psrl.routing_strategy.kv_transfer.enable is True."
+        )
+
+    if lmcache_cfg.get("enable_p2p", False):
+        assert lmcache_cfg.get("enable", False), (
+            "psrl.lmcache.enable must be True when psrl.lmcache.enable_p2p is True."
+        )
+        assert config.psrl.ps_mode in ("nixl_cpu", "nixl_gpu"), (
+            "psrl.ps_mode must be nixl_cpu or nixl_gpu when psrl.lmcache.enable_p2p is True "
+            "(NIXL infrastructure is required for P2P transfer)."
+        )
+
+    if lmcache_cfg.get("enable", False):
+        assert config.gen_actor_rollout_ref.rollout.enable_prefix_caching, (
+            "gen_actor_rollout_ref.rollout.enable_prefix_caching must be True "
+            "when psrl.lmcache.enable is True (LMCache requires prefix caching)."
+        )
+
     print("[validate_config] All configuration checks passed successfully!")

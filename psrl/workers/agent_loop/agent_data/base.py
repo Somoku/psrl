@@ -4,10 +4,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
-import torch
 import numpy as np
 import ray
+import torch
 from omegaconf import DictConfig
+from PIL import Image
 from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
@@ -147,7 +148,7 @@ class SessionData:
     # val/train session data
     validate: bool = False
 
-    # NOTE(linsh): the source of the following three fileds is dataset
+    # NOTE(linsh): The following fields come from the dataset.
     # Data source of current session
     data_source: str = "unknown"
     # Reward model info (e.g., ground truth)
@@ -156,6 +157,9 @@ class SessionData:
     extra_info: dict = field(default_factory=dict)
     # List of reward model dict
     reward_model_dicts: list[dict] = field(default_factory=list)
+
+    # Reward metadata produced by the agent loop during rollout
+    agent_reward_info: dict = field(default_factory=dict)
 
     # List of Step objects comprising this trajectory
     steps: list[Step] = field(default_factory=list)
@@ -377,7 +381,13 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         return
 
     @abstractmethod
-    async def encode_observation(self, observation: ObsType, *, is_init: bool = False) -> tuple[list[int], bool]:
+    async def encode_observation(
+        self,
+        observation: ObsType,
+        images: list[Image.Image] | None = None,
+        videos: list[tuple[torch.Tensor, dict]] | None = None,
+        is_init: bool = False,
+    ) -> tuple[list[int], bool]:
         """Encode an environment observation into token IDs (async).
 
         Implementations should offload blocking tokenizer calls to the default
@@ -609,6 +619,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 # TODO(linsh): check whether use global num_turns
                 num_turns=self.session_data.assistant_turns + self.session_data.user_turns + 1,
                 rollout_instance_id=self.session_data.curr_rollout_instance_id,
+                agent_reward_info=self.session_data.agent_reward_info,
                 extra_fields={
                     "tool_rewards": trajectory.tool_rewards,
                     "turn_scores": trajectory.turn_scores,
@@ -639,6 +650,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 "data_source": np.array([self.session_data.data_source]),
                 "reward_model": np.array([self.session_data.reward_model], dtype=object),
                 "extra_info": np.array([self.session_data.extra_info], dtype=object),
+                "agent_reward_info": np.array([self.session_data.agent_reward_info], dtype=object),
                 "reward_model_dicts": np.array([self.session_data.reward_model_dicts], dtype=object),
             }
             if self.session_data.parent_id is not None:

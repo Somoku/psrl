@@ -32,6 +32,7 @@ python plot.py ../paper_exp/e2e/logs/4+4_moe_staleness_1_greedy \
 --processor instance_request_num_indexed_by_time
 '''
 
+'''
 python plot.py /jizhicfs/lhy/verl/lhy_exp/ablation_new \
 --substring StatCollector \
 --xlabel "time(s)" \
@@ -39,11 +40,12 @@ python plot.py /jizhicfs/lhy/verl/lhy_exp/ablation_new \
 --out ablation_verl.png \
 --mode subplot \
 --processor instance_request_num_indexed_by_time
+'''
 
-python plot.py /jizhicfs/lhy/psrl/examples/paper_exp/ablation/logs/ours_staleness_3 \
+python plot.py /jizhicfs/lhy/psrl_agent/examples/mini_swe/megatron_psrl_log/GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_1 \
 --substring StatCollector \
 --xlabel "time(s)" \
 --ylabel "instance request num" \
---out ablation_ours.png \
+--out new_ablation_ours.png \
 --mode subplot \
 --processor instance_request_num_indexed_by_time

@@ -1,7 +1,7 @@
-import torch
-
 from dataclasses import dataclass, field
 from typing import Any
+
+import torch
 
 # (worker_id, data_parallel_rank)
 RolloutInstanceId = tuple[str, int]
@@ -68,6 +68,8 @@ class TokenOutput:
     """status of the request"""
     rollout_instance_id: RolloutInstanceId | None = None
     """the rollout instance id used for this generation"""
+    agent_reward_info: dict[str, Any] = field(default_factory=dict)
+    """Reward metadata produced by the agent loop"""
     extra_fields: dict[str, Any] = field(default_factory=dict)
     """Extra fields for dynamic addition."""
 
@@ -89,6 +91,7 @@ class TokenOutput:
             "num_turns": self.num_turns,
             "update_status": self.update_status,
             "rollout_instance_id": self.rollout_instance_id,
+            "agent_reward_info": self.agent_reward_info,
             **self.extra_fields,  # Include any extra fields in the dictionary
         }
 

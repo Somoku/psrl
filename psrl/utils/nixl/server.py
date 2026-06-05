@@ -18,7 +18,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 class NIXLMetaServer:
-    def __init__(self, server_name: str, nixl_config: DictConfig):
+    def __init__(self, server_name: str, nixl_config: DictConfig, broadcast_init_enabled: bool = False):
         self.server_name = server_name
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
@@ -36,6 +36,12 @@ class NIXLMetaServer:
         self._is_all_client_shardings_recved = False
         self._is_all_client_infos_recved = False
         self._is_all_temp_mappings_recved = False
+        
+        # NOTE(claude): When broadcast_init is enabled, PS workers act as both senders and
+        # receivers during initialization and need each other's GPU descriptors to perform
+        # direct NIXL writes. This flag causes _get_relevant_client_names_for_agent to include
+        # all PS clients in the Phase 2b info broadcast for PS agents.
+        self._broadcast_init_enabled = broadcast_init_enabled
 
     def _add_client(self, agent_name: str, client_name: str):
         if agent_name not in self.connected_clients:
@@ -218,7 +224,9 @@ class NIXLMetaServer:
         Only the initiating side needs the remote descriptors, so the rules are:
           - PUSH_SIDE needs: all PS_FOR_PUSH (train pushes to PS)
           - PULL_SIDE needs: all PS_FOR_PULL (gen pulls from PS)
-          - PS clients do not initiate transfers and need no remote infos beyond their own.
+          - PS clients do not initiate transfers and need no remote infos beyond their own,
+            unless broadcast_init is enabled — in that case PS workers write to each other
+            and therefore need every other PS worker's descriptors.
         """
         my_clients: set[str] = set(self.connected_clients[agent_name])
         relevant: set[str] = set(my_clients)  # always include own clients
@@ -236,6 +244,17 @@ class NIXLMetaServer:
         for client_name, client_info in self.client_infos.items():
             if client_info.type in needed_types:
                 relevant.add(client_name)
+
+        # When broadcast_init is enabled, each PS worker writes directly to every other PS
+        # worker's train buffer via NIXL. Include all PS clients so every PS agent receives
+        # the GPU descriptors it needs for the broadcast. This piggybacks on the existing
+        # Phase 2b info exchange — no extra coordination round is required.
+        if self._broadcast_init_enabled:
+            ps_types = {NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL}
+            if my_types & ps_types:
+                for client_name, client_info in self.client_infos.items():
+                    if client_info.type in ps_types:
+                        relevant.add(client_name)
 
         return relevant
 
@@ -328,7 +347,15 @@ class NIXLMetaServer:
 
         for agent_name in dst_agent_names:
             # Send notification with updated client infos
-            self.agent.send_notif(agent_name, payload)
+            try:
+                self.agent.send_notif(agent_name, payload)
+            except Exception as e:
+                raise RuntimeError(
+                    f"{self.server_name}: Failed to send update client infos to agent {agent_name}: {e}, "
+                    f"connected clients: {self.connected_clients}, "
+                    f"dst agent names: {dst_agent_names}, "
+                    f"update client names: {update_client_names}"
+                ) from e
 
         psrl_logger.debug(
             f"Broadcast update client infos to agents: {dst_agent_names}, include clients: {update_client_names}"

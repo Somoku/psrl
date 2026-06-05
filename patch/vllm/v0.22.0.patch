@@ -1,0 +1,893 @@
+diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
+index fb6951ea7..893a242bc 100644
+--- a/vllm/config/scheduler.py
++++ b/vllm/config/scheduler.py
+@@ -154,6 +154,18 @@ class SchedulerConfig:
+     while a larger value (e.g., 10) reduces host overhead and may increase throughput
+     by batching multiple tokens before sending."""
+ 
++    preemption_notification_threshold: int | None = Field(default=None, ge=0)
++    """Number of waiting sequences above which a preempted request is forwarded
++    to an external gateway (via StatLoggers) for global re-scheduling rather than
++    being silently re-queued locally.
++
++    - ``None`` (default): feature disabled; zero runtime overhead.
++    - ``0``: notify whenever any request is waiting after a preemption.
++    - ``N``: notify when ``len(waiting) > N`` after a preemption.
++
++    This is a generic observability hook; it is not tied to any specific gateway.
++    """
++
+     @staticmethod
+     def default_factory(**kwargs):
+         """
+diff --git a/vllm/entrypoints/grpc_server.py b/vllm/entrypoints/grpc_server.py
+index b9173b302..c1809d97e 100644
+--- a/vllm/entrypoints/grpc_server.py
++++ b/vllm/entrypoints/grpc_server.py
+@@ -22,6 +22,7 @@ import argparse
+ import asyncio
+ import signal
+ import sys
++import os
+ import time
+ 
+ try:
+@@ -29,6 +30,7 @@ try:
+     from grpc_health.v1 import health_pb2_grpc
+     from grpc_reflection.v1alpha import reflection
+     from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
++    from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
+     from smg_grpc_servicer.vllm.health_servicer import VllmHealthServicer
+     from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+ except ImportError as e:
+@@ -73,16 +75,34 @@ async def serve_grpc(args: argparse.Namespace):
+         usage_context=UsageContext.OPENAI_API_SERVER,
+     )
+ 
+-    # Create AsyncLLM
++    # Create a preemption queue for bridging scheduler stats to gRPC stream.
++    # This queue receives preempted request IDs from PreemptionStatLogger
++    # (which is registered as a stat logger) and feeds them to
++    # SubscribePreemptionEvents for client streaming.
++    preemption_queue: asyncio.Queue[list[str]] = asyncio.Queue()
++
++    # Create PreemptionStatLogger as a stat logger factory.
++    # This captures threshold-crossed preemptions and enqueues them to the queue.
++    # The factory will be instantiated for each engine instance during AsyncLLM init.
++    def preemption_stat_logger_factory(vllm_config, engine_index=0):
++        return PreemptionStatLogger(
++            vllm_config,
++            engine_index=engine_index,
++            preemption_queue=preemption_queue,
++        )
++
++    # Create AsyncLLM with preemption stat logger registered.
+     async_llm = AsyncLLM.from_vllm_config(
+         vllm_config=vllm_config,
+         usage_context=UsageContext.OPENAI_API_SERVER,
+         enable_log_requests=args.enable_log_requests,
+         disable_log_stats=args.disable_log_stats,
++        stat_loggers=[preemption_stat_logger_factory],
+     )
+ 
+-    # Create servicer
+-    servicer = VllmEngineServicer(async_llm, start_time)
++    # Create servicer with preemption queue
++    servicer = VllmEngineServicer(async_llm, start_time, preemption_queue=preemption_queue)
++    logger.info("VllmEngineServicer initialized with preemption event streaming support")
+ 
+     # Create gRPC server
+     server = grpc.aio.server(
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 44797874a..ba5fdf129 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -1326,6 +1326,31 @@ class DeepseekV2Model(nn.Module):
+             return hidden_states, aux_hidden_states
+         return hidden_states
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        if self.use_mha:
++            # MHA mode: standard QKV fusion
++            builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        elif self.fuse_qkv_a_proj:
++            # MLA mode with Q low-rank projection: fused_qkv_a_proj split
++            # disable_tp=True on this linear, so full sizes from config.
++            q_size = self.config.q_lora_rank
++            kv_size = self.config.kv_lora_rank + self.config.qk_rope_head_dim
++            builder.merged("fused_qkv_a_proj", [
++                ("q_a_proj", q_size),
++                ("kv_a_proj_with_mqa", kv_size),
++            ])
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight",
++            "{i}.down_proj.weight",
++            num_experts=self.config.n_routed_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         rocm_aiter_moe_shared_expert_enabled = (
+             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+@@ -1701,6 +1726,9 @@ class DeepseekV2ForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        return self.model.build_weight_layout()
++
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         # Params for weights, fp8 weight scales, fp8 activation scales
+         # (param_name, weight_name, expert_id, shard_id)
+diff --git a/vllm/model_executor/models/gemma.py b/vllm/model_executor/models/gemma.py
+index 6e35020a6..868246e7b 100644
+--- a/vllm/model_executor/models/gemma.py
++++ b/vllm/model_executor/models/gemma.py
+@@ -416,6 +416,14 @@ class GemmaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.model.embed_tokens, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/gemma2.py b/vllm/model_executor/models/gemma2.py
+index 425ecc651..b1e4d58b0 100644
+--- a/vllm/model_executor/models/gemma2.py
++++ b/vllm/model_executor/models/gemma2.py
+@@ -423,6 +423,14 @@ class Gemma2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.model.embed_tokens, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/gemma3.py b/vllm/model_executor/models/gemma3.py
+index f61f7c6f7..a556ca59d 100644
+--- a/vllm/model_executor/models/gemma3.py
++++ b/vllm/model_executor/models/gemma3.py
+@@ -506,6 +506,14 @@ class Gemma3ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/gemma3_mm.py b/vllm/model_executor/models/gemma3_mm.py
+index 6ecadbcd6..59e003a60 100644
+--- a/vllm/model_executor/models/gemma3_mm.py
++++ b/vllm/model_executor/models/gemma3_mm.py
+@@ -631,6 +631,13 @@ class Gemma3ForConditionalGeneration(
+     ) -> torch.Tensor | None:
+         return self.language_model.compute_logits(hidden_states)
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.mount_module("language_model", self.language_model)
++        builder.exclude_substr("vision_tower")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/interfaces.py b/vllm/model_executor/models/interfaces.py
+index 3d46bda7f..1416ebe75 100644
+--- a/vllm/model_executor/models/interfaces.py
++++ b/vllm/model_executor/models/interfaces.py
+@@ -43,6 +43,7 @@ from .interfaces_base import VllmModel
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+     from vllm.model_executor.models.utils import WeightsMapper
++    from vllm.model_executor.models.weight_layout import WeightLayoutPlan
+     from vllm.multimodal.inputs import MultiModalFeatureSpec
+     from vllm.multimodal.registry import _ProcessorFactories
+     from vllm.sequence import IntermediateTensors
+@@ -55,6 +56,7 @@ if TYPE_CHECKING:
+ else:
+     VllmConfig = object
+     WeightsMapper = object
++    WeightLayoutPlan = object
+     MultiModalFeatureSpec = object
+     _ProcessorFactories = object
+     IntermediateTensors = object
+@@ -534,6 +536,48 @@ def supports_score_template(
+     return getattr(model, "supports_score_template", False)
+ 
+ 
++@runtime_checkable
++class SupportsWeightLayout(Protocol):
++    """Interface for vLLM models that expose unified weight layout specifications.
++
++    This is the new unified API for describing how vLLM parameters map to
++    HuggingFace parameters, including tensor transforms, model composition,
++    and auxiliary parameter synchronization.
++
++    The returned WeightLayoutPlan is consumed by PSRL to generate HF state dicts
++    and NIXL sharding without model-specific knowledge.
++
++    This protocol is designed to work with both:
++    - Models using AutoWeightsLoader (direct parameter mapping)
++    - Models with manual load_weights() (including custom stacked_params_mapping)
++    """
++
++    supports_weight_layout: ClassVar[bool] = True
++
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        """Build the unified weight layout plan for this model.
++
++        Returns:
++            WeightLayoutPlan describing:
++            - How vLLM parameters map to HF parameters
++            - Tensor transformations (reshape, split, concat, etc.)
++            - Sub-model composition (mounting)
++            - Parameter synchronization policy (MTP, Eagle, VL, etc.)
++
++        This plan must be:
++        - Reversible (enabling both vLLM -> HF and HF -> vLLM conversion)
++        - Comprehensive (covering all packed/fused/auxiliary parameters)
++        - Consistent (if model has load_weights(), use same mapping)
++        """
++        ...
++
++    @classmethod
++    def __subclasshook__(cls, C: type) -> bool:
++        if cls is SupportsWeightLayout:
++            return hasattr(C, "build_weight_layout")
++        return NotImplemented  # type: ignore[return-value]
++
++
+ @runtime_checkable
+ class SupportsLoRA(Protocol):
+     """The interface required for all models that support LoRA."""
+@@ -1659,3 +1703,20 @@ def supports_encoder_cudagraph(
+     model: type[object] | object,
+ ) -> TypeIs[type[SupportsEncoderCudaGraph]] | TypeIs[SupportsEncoderCudaGraph]:
+     return isinstance(model, SupportsEncoderCudaGraph)
++
++
++@overload
++def supports_weight_layout(
++    model: type[object],
++) -> TypeIs[type[SupportsWeightLayout]]: ...
++
++
++@overload
++def supports_weight_layout(model: object) -> TypeIs[SupportsWeightLayout]: ...
++
++
++def supports_weight_layout(
++    model: type[object] | object,
++) -> TypeIs[type[SupportsWeightLayout]] | TypeIs[SupportsWeightLayout]:
++    """Check if a model implements SupportsWeightLayout protocol."""
++    return isinstance(model, SupportsWeightLayout)
+\ No newline at end of file
+diff --git a/vllm/model_executor/models/kimi_k25.py b/vllm/model_executor/models/kimi_k25.py
+index 89cda63c8..40e25e141 100644
+--- a/vllm/model_executor/models/kimi_k25.py
++++ b/vllm/model_executor/models/kimi_k25.py
+@@ -460,6 +460,16 @@ class KimiK25ForConditionalGeneration(
+     def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+         return self.language_model.get_eagle3_aux_hidden_state_layers()
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        # Delegate all language-model transformations to DeepSeekV2's plan.
++        builder.mount_module("language_model", self.language_model)
++        # Vision components have no fused params — exclude so they pass through.
++        builder.exclude_substr("vision_tower")
++        builder.exclude_substr("mm_projector")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/kimi_vl.py b/vllm/model_executor/models/kimi_vl.py
+index e3bc08c65..5f69ac8f9 100644
+--- a/vllm/model_executor/models/kimi_vl.py
++++ b/vllm/model_executor/models/kimi_vl.py
+@@ -411,6 +411,13 @@ class KimiVLForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
+     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
+         return self.language_model.compute_logits(hidden_states)
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.mount_module("language_model", self.language_model)
++        builder.exclude_substr("vision_tower")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 3c797d05e..8814a2a37 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -581,6 +581,14 @@ class LlamaForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/llama4.py b/vllm/model_executor/models/llama4.py
+index bfcb72a6a..8abe8823a 100644
+--- a/vllm/model_executor/models/llama4.py
++++ b/vllm/model_executor/models/llama4.py
+@@ -541,6 +541,20 @@ class Llama4Model(LlamaModel):
+ 
+         return expert_param_loaded
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight",
++            "{i}.down_proj.weight",
++            num_experts=self.num_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         # Name mapping from the parameter name to the shard name and
+         # corresponding shard id.
+diff --git a/vllm/model_executor/models/olmoe.py b/vllm/model_executor/models/olmoe.py
+index 1f342ad17..c3736915b 100644
+--- a/vllm/model_executor/models/olmoe.py
++++ b/vllm/model_executor/models/olmoe.py
+@@ -492,6 +492,19 @@ class OlmoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight",
++            "{i}.down_proj.weight",
++            num_experts=self.config.num_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/phi.py b/vllm/model_executor/models/phi.py
+index 75c42c0d3..96d12c164 100644
+--- a/vllm/model_executor/models/phi.py
++++ b/vllm/model_executor/models/phi.py
+@@ -358,6 +358,13 @@ class PhiForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+         logits = self.logits_processor(self.lm_head, hidden_states, self.lm_head.bias)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index b83fedc70..835678ce6 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -189,6 +189,13 @@ class Qwen2Attention(nn.Module):
+             if attn_type == AttentionType.ENCODER_ONLY
+             else Attention
+         )
++
++        self.disable_attn = False
++        import os
++        if "VLLM_DISABLE_ATTN" in os.environ and os.environ["VLLM_DISABLE_ATTN"] == "1":
++            print("Hijacking the attention in Qwen2 to forbid the use of the attention.")
++            self.disable_attn = True
++
+         self.attn = attn_cls(
+             self.num_heads,
+             self.head_dim,
+@@ -231,7 +238,11 @@ class Qwen2Attention(nn.Module):
+             k = k.view(total_tokens, self.kv_size)
+ 
+         q, k = self.rotary_emb(positions, q, k)
+-        attn_output = self.attn(q, k, v)
++        # For profiling, we hijack here to forbid the use of the attention.
++        if self.disable_attn:
++            attn_output = q
++        else:
++            attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -425,6 +436,22 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+ 
+         return hidden_states
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        """Build weight layout plan for Qwen2 model.
++
++        Maps vLLM runtime parameters to HuggingFace checkpoint format:
++        - QKV fusion: qkv_proj.weight -> q_proj.weight, k_proj.weight, v_proj.weight
++        - MLP fusion: gate_up_proj.weight -> gate_proj.weight, up_proj.weight
++        All other parameters (o_proj, down_proj, norms, embeddings) pass through as-is.
++        """
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+@@ -559,6 +586,15 @@ class Qwen2ForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/qwen2_5_vl.py b/vllm/model_executor/models/qwen2_5_vl.py
+index 0dec41430..528a75e03 100644
+--- a/vllm/model_executor/models/qwen2_5_vl.py
++++ b/vllm/model_executor/models/qwen2_5_vl.py
+@@ -1960,6 +1960,32 @@ class Qwen2_5_VLForConditionalGeneration(
+     ) -> torch.Tensor | None:
+         return self.language_model.compute_logits(hidden_states)
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import (
++            ReversibleNameMap,
++            WeightLayoutBuilder,
++        )
++
++        builder = WeightLayoutBuilder(self)
++        builder.name_map(
++            ReversibleNameMap.from_prefix_pairs(
++                {
++                    "language_model.model.": "model.language_model.",
++                    "language_model.lm_head.": "lm_head.",
++                    "visual.": "model.visual.",
++                },
++                mode="prefix",
++            )
++        )
++        builder.mount_module("language_model", self.language_model)
++        visual_builder = WeightLayoutBuilder(self.visual)
++        visual_builder.merged(
++            "mlp.gate_up_proj",
++            [("mlp.gate_proj", None), ("mlp.up_proj", None)],
++        )
++        builder.mount_plan("visual", visual_builder.build())
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/qwen2_moe.py b/vllm/model_executor/models/qwen2_moe.py
+index 77eea390e..0b8c828a2 100644
+--- a/vllm/model_executor/models/qwen2_moe.py
++++ b/vllm/model_executor/models/qwen2_moe.py
+@@ -429,6 +429,28 @@ class Qwen2MoeModel(nn.Module):
+             num_experts=self.config.num_experts,
+         )
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        """Build weight layout plan for Qwen2-MoE model.
++
++        Maps vLLM runtime parameters to HuggingFace checkpoint format:
++        - QKV fusion: qkv_proj.weight -> q_proj.weight, k_proj.weight, v_proj.weight
++        - MLP gate_up fusion (dense + shared-expert): gate_up_proj.weight -> gate_proj.weight, up_proj.weight
++        - Expert FusedMoE: w13_weight/w2_weight -> per-expert gate/up/down_proj.weight
++        All other parameters pass through as-is.
++        """
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight", "{i}.down_proj.weight",
++            num_experts=self.config.num_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+@@ -595,6 +617,20 @@ class Qwen2MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight", "{i}.down_proj.weight",
++            num_experts=self.config.num_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/qwen2_vl.py b/vllm/model_executor/models/qwen2_vl.py
+index 869e044c2..74fe5ea90 100644
+--- a/vllm/model_executor/models/qwen2_vl.py
++++ b/vllm/model_executor/models/qwen2_vl.py
+@@ -1718,6 +1718,13 @@ class Qwen2VLForConditionalGeneration(
+     ) -> torch.Tensor | None:
+         return self.language_model.compute_logits(hidden_states)
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++        builder = WeightLayoutBuilder(self)
++        builder.mount_module("language_model", self.language_model)
++        builder.exclude_substr("visual")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+index 6dec60232..83ab2939b 100644
+--- a/vllm/model_executor/models/qwen3.py
++++ b/vllm/model_executor/models/qwen3.py
+@@ -332,6 +332,15 @@ class Qwen3ForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/qwen3_5.py b/vllm/model_executor/models/qwen3_5.py
+index e698fe7a5..e9a768eed 100644
+--- a/vllm/model_executor/models/qwen3_5.py
++++ b/vllm/model_executor/models/qwen3_5.py
+@@ -517,6 +517,57 @@ class Qwen3_5ForCausalLMBase(
+     ) -> torch.Tensor | None:
+         return self.logits_processor(self.lm_head, hidden_states)
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++
++        num_experts = getattr(self.config, "num_experts", 0)
++        if num_experts:
++            builder.fused_moe(
++                "w13_weight", "w2_weight",
++                "{i}.gate_proj.weight", "{i}.up_proj.weight",
++                "{i}.down_proj.weight",
++                num_experts=num_experts,
++            )
++
++        for module in self.modules():
++            if (hasattr(module, "in_proj_qkvz")
++                    and hasattr(module.in_proj_qkvz, "output_sizes")):
++                tp_size = getattr(module.in_proj_qkvz, "tp_size", 1)
++                q_size, k_size, v_size, z_size = [
++                    size // tp_size
++                    for size in module.in_proj_qkvz.output_sizes
++                ]
++                builder.split_param(
++                    "in_proj_qkvz.weight",
++                    (
++                        ("in_proj_qkv.weight_q", q_size),
++                        ("in_proj_qkv.weight_k", k_size),
++                        ("in_proj_qkv.weight_v", v_size),
++                        ("in_proj_z.weight", z_size),
++                    ),
++                )
++                builder.merged("in_proj_ba",
++                               [("in_proj_b", None),
++                                ("in_proj_a", None)])
++                conv_tp_size = getattr(module.conv1d, "tp_size", 1)
++                conv_k_size = module.num_k_heads * module.head_k_dim // conv_tp_size
++                conv_v_size = module.num_v_heads * module.head_v_dim // conv_tp_size
++                builder.split_param(
++                    "conv1d.weight",
++                    (
++                        ("conv1d.weight_q", conv_k_size),
++                        ("conv1d.weight_k", conv_k_size),
++                        ("conv1d.weight_v", conv_v_size),
++                    ),
++                )
++                break
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(
+             self,
+diff --git a/vllm/model_executor/models/qwen3_moe.py b/vllm/model_executor/models/qwen3_moe.py
+index 4ec1be336..1a7041b36 100644
+--- a/vllm/model_executor/models/qwen3_moe.py
++++ b/vllm/model_executor/models/qwen3_moe.py
+@@ -528,6 +528,28 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
+             num_redundant_experts=self.num_redundant_experts,
+         )
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        """Build weight layout plan for Qwen3-MoE model.
++
++        Maps vLLM runtime parameters to HuggingFace checkpoint format:
++        - QKV fusion: qkv_proj.weight -> q_proj.weight, k_proj.weight, v_proj.weight
++        - MLP gate_up fusion (dense + shared-expert): gate_up_proj.weight -> gate_proj.weight, up_proj.weight
++        - Expert FusedMoE: w13_weight/w2_weight -> per-expert gate/up/down_proj.weight
++        All other parameters pass through as-is.
++        """
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight", "{i}.down_proj.weight",
++            num_experts=self.config.num_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         stacked_params_mapping = [
+             # (param_name, shard_name, shard_id)
+@@ -780,6 +802,20 @@ class Qwen3MoeForCausalLM(
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import WeightLayoutBuilder
++
++        builder = WeightLayoutBuilder(self)
++        builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
++        builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
++        builder.fused_moe(
++            "w13_weight", "w2_weight",
++            "{i}.gate_proj.weight", "{i}.up_proj.weight", "{i}.down_proj.weight",
++            num_experts=self.config.num_experts,
++        )
++        builder.exclude_substr("rotary_emb.inv_freq")
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights)
+diff --git a/vllm/model_executor/models/qwen3_vl.py b/vllm/model_executor/models/qwen3_vl.py
+index d7765351e..88f403261 100644
+--- a/vllm/model_executor/models/qwen3_vl.py
++++ b/vllm/model_executor/models/qwen3_vl.py
+@@ -2847,6 +2847,26 @@ class Qwen3VLForConditionalGeneration(
+     ) -> torch.Tensor | None:
+         return self.language_model.compute_logits(hidden_states)
+ 
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import (
++            ReversibleNameMap,
++            WeightLayoutBuilder,
++        )
++
++        builder = WeightLayoutBuilder(self)
++        builder.name_map(
++            ReversibleNameMap.from_prefix_pairs(
++                {
++                    "language_model.model.": "model.language_model.",
++                    "language_model.lm_head.": "lm_head.",
++                    "visual.": "model.visual.",
++                },
++                mode="prefix",
++            )
++        )
++        builder.mount_module("language_model", self.language_model)
++        return builder.build()
++
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/qwen3_vl_moe.py b/vllm/model_executor/models/qwen3_vl_moe.py
+index 195b3355e..91deb1a5d 100644
+--- a/vllm/model_executor/models/qwen3_vl_moe.py
++++ b/vllm/model_executor/models/qwen3_vl_moe.py
+@@ -473,3 +473,23 @@ class Qwen3VLMoeForConditionalGeneration(
+ 
+         # Set MoE hyperparameters
+         self.set_moe_parameters()
++
++    def build_weight_layout(self) -> "WeightLayoutPlan":
++        from vllm.model_executor.models.weight_layout import (
++            ReversibleNameMap,
++            WeightLayoutBuilder,
++        )
++
++        builder = WeightLayoutBuilder(self)
++        builder.name_map(
++            ReversibleNameMap.from_prefix_pairs(
++                {
++                    "language_model.model.": "model.language_model.",
++                    "language_model.lm_head.": "lm_head.",
++                    "visual.": "model.visual.",
++                },
++                mode="prefix",
++            )
++        )
++        builder.mount_module("language_model", self.language_model)
++        return builder.build()
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index c69c9a811..436a648c4 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -81,6 +81,10 @@ class Scheduler(SchedulerInterface):
+         self.kv_events_config = vllm_config.kv_events_config
+         self.parallel_config = vllm_config.parallel_config
+         self.log_stats = log_stats
++        # Accumulates request IDs to forward to an external gateway when
++        # preemption_notification_threshold is configured. Cleared each step
++        # in make_stats(). Empty list when feature is disabled.
++        self.preemption_req_ids: list[str] = []
+         self.observability_config = vllm_config.observability_config
+         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
+         if self.observability_config.kv_cache_metrics:
+@@ -947,6 +951,11 @@ class Scheduler(SchedulerInterface):
+ 
+         # Put the request back to the waiting queue.
+         self.waiting.prepend_request(request)
++        # Notify external gateway if threshold is configured and waiting queue
++        # is already congested — local re-queuing would only worsen the load.
++        threshold = self.scheduler_config.preemption_notification_threshold
++        if self.log_stats and threshold is not None and len(self.waiting) > threshold:
++            self.preemption_req_ids.append(request.request_id)
+ 
+     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+         # Advance the number of computed tokens for the request AFTER
+@@ -1989,6 +1998,8 @@ class Scheduler(SchedulerInterface):
+         connector_stats_payload = (
+             kv_connector_stats.data if kv_connector_stats else None
+         )
++        preemption_req_ids = self.preemption_req_ids
++        self.preemption_req_ids = []
+         return SchedulerStats(
+             num_running_reqs=len(self.running),
+             num_waiting_reqs=len(self.waiting),
+@@ -2001,6 +2012,7 @@ class Scheduler(SchedulerInterface):
+             kv_connector_stats=connector_stats_payload,
+             cudagraph_stats=cudagraph_stats,
+             perf_stats=perf_stats,
++            preemption_req_ids=preemption_req_ids,
+         )
+ 
+     def make_spec_decoding_stats(
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index c26380e6e..4e57d916a 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -642,6 +642,10 @@ class MPClient(EngineCoreClient):
+             if not success:
+                 self._finalizer()
+ 
++    @property
++    def num_engines(self) -> int:
++        return len(self.core_engines)
++
+     def shutdown(self, timeout: float | None = None) -> None:
+         """Shutdown engine manager under timeout and clean up resources."""
+         if self._finalizer.detach() is not None:
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 6855efd9f..c98612f1f 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -1318,11 +1318,14 @@ class StatLoggerManager:
+                     custom_prometheus_logger = True
+             else:
+                 # per engine logger
+-                global_stat_logger = PerEngineStatLoggerAdapter(
+-                    vllm_config=vllm_config,
+-                    engine_indexes=self.engine_indexes,
+-                    per_engine_stat_logger_factory=stat_logger_factory,  # type: ignore[arg-type]
+-                )
++                if not isinstance(stat_logger_factory, Callable):
++                    global_stat_logger = stat_logger_factory
++                else:
++                    global_stat_logger = PerEngineStatLoggerAdapter(
++                        vllm_config=vllm_config,
++                        engine_indexes=self.engine_indexes,
++                        per_engine_stat_logger_factory=stat_logger_factory,  # type: ignore[arg-type]
++                    )
+             self.stat_loggers.append(global_stat_logger)
+         if not custom_prometheus_logger:
+             self.stat_loggers.append(
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index a7a5fb7a2..c3a40dd95 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -170,6 +170,10 @@ class KVCacheEvictionEvent:
+ @dataclass
+ class SchedulerStats:
+     """Stats associated with the scheduler."""
++    # NOTE(lhy): we need to add this field to the scheduler stats for PSRL.
++    req_id_to_prompt_token_num: dict[str, int] | None = None
++    req_id_to_response_token_num: dict[str, int] | None = None
++    preemption_req_ids: list[str] = field(default_factory=list)
++    # NOTE(lhy): GPU prefix cache hash snapshot for push-based KV cache info.
++    # Populated by RolloutScheduler.make_stats(), consumed by StatCollector.record().
++    gpu_prefix_cache_snapshot: dict | None = None
+
+     num_running_reqs: int = 0
+ 

@@ -20,6 +20,7 @@ from psrl.utils.logger import (
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.utils.ray import add_busy_polling_lock
 from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
+from psrl.workers.ps.broadcast import build_broadcast_plan
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 from psrl.workers.ps.request_status_tracker import RequestStatusTracker, _state_locked
 from psrl.workers.ps.staleness_controller import (
@@ -134,6 +135,9 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_agent_names: list[str] | None = None
         self.ps_nixl_train_storage_client_names: list[str] | None = None
         self.ps_nixl_gen_storage_client_names: list[str] | None = None
+        # NOTE(claude): Populated by bind_ps_worker_group; ordered by rank so that
+        # _coordinate_broadcast_init can index workers directly by rank.
+        self.ps_worker_handles_by_rank: list = []
 
         # Lock state for push/pull operations
         # _exclusive_push_locked: True if a push operation is in progress (exclusive lock)
@@ -409,8 +413,13 @@ class PSManager(RequestStatusTracker):
         else:
             is_single_request = False
 
+        if isinstance(is_validate, bool):
+            validate_per_request = [is_validate] * len(request_idx)
+        else:
+            validate_per_request = is_validate
+
         multi_results = []
-        for request_id in request_idx:
+        for request_id, is_validate in zip(request_idx, validate_per_request):
             results = []
             staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
@@ -640,6 +649,21 @@ class PSManager(RequestStatusTracker):
         # Update the corresponding entries, and clear entries if necessary (handled at the end)
         clear_entries = []
         for prompt_id, abort_request_idxs in prompt_id_to_abort_request_idxs.items():
+            if prompt_id not in self.staleness_inventory.data_tracker:
+                # The prompt was never reserved in the staleness inventory.
+                # This happens when a group fails before any response completed
+                # (e.g. all workers crash with rollout_instance_id=None, so
+                # occupy_rollout_instance_request was never called for this prompt).
+                # The request IDs remain in abort_request_ids and will be added to
+                # _abort_request_ids below, so any future update_request_status call
+                # for those UIDs will return False.  No inventory manipulation needed.
+                psrl_logger.warning(
+                    "abort_requests: prompt %d not in staleness data_tracker — "
+                    "group never completed, skipping inventory cleanup for uids %s.",
+                    prompt_id,
+                    [prompt_id * self.rollout_n + idx for idx in abort_request_idxs],
+                )
+                continue
             assert prompt_id in self.staleness_inventory.data_tracker, (
                 f"Prompt {prompt_id} must have existing mapping in data tracker."
             )
@@ -934,7 +958,12 @@ class PSManager(RequestStatusTracker):
             expected_agents (int): Number of expected NIXL clients to connect
         """
         self.expected_agents = expected_agents
-        self.nixl_meta_server = NIXLMetaServer("NIXLMetaServer", self.psrl_config.nixl)
+        broadcast_init_enabled = self.psrl_config.broadcast_init.enabled
+        self.nixl_meta_server = NIXLMetaServer(
+            "NIXLMetaServer",
+            self.psrl_config.nixl,
+            broadcast_init_enabled=broadcast_init_enabled,
+        )
 
     def nixl_protocol(self):
         """Execute the NIXL protocol for distributed communication setup.
@@ -1016,11 +1045,74 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_agent_names = ray.get(ps_nixl_agent_name_futures)
         self.ps_nixl_train_storage_client_names = ray.get(ps_nixl_train_storage_client_name_futures)
         self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
+        # NOTE(claude): _workers is ordered by rank (set during PSWorkerGroup construction),
+        # so indexing by rank in _coordinate_broadcast_init is safe.
+        self.ps_worker_handles_by_rank = list(self.ps_worker_group._workers)
         psrl_logger.info(
             f"PS worker group initialized with NIXL agent names: {self.ps_nixl_agent_names}, "
             f"train storage client names: {self.ps_nixl_train_storage_client_names}, "
             f"gen storage client names: {self.ps_nixl_gen_storage_client_names}"
         )
+        if self.psrl_config.broadcast_init.enabled:
+            self.enable_broadcast_init_on_server()
+
+    def enable_broadcast_init_on_server(self) -> None:
+        """
+        No-op placeholder; broadcast_init is enabled at MetaServer construction time via
+        the broadcast_init_enabled flag (passed in init_nixl_server).
+
+        This method exists for testability: tests can assert it is called when
+        broadcast_init.enabled=True and not called otherwise.
+        """
+        psrl_logger.info(
+            "[enable_broadcast_init_on_server] broadcast_init is active; "
+            "PS-to-PS ClientInfos were distributed during nixl_protocol Phase 2b."
+        )
+
+    def _coordinate_broadcast_init(self) -> None:
+        """
+        Coordinate binary-tree broadcast of checkpoint weights across all PS workers.
+
+        Must be called after bind_ps_worker_group() and after rank-0 has written its
+        checkpoint into its registered buffers (write_checkpoint_to_registered_tensors).
+
+        For each broadcast round, signals all senders in that round to write to their
+        children via NIXL, then waits (barrier) before proceeding to the next round.
+        After all rounds complete, triggers transfer_train_to_gen on every worker.
+        """
+        world_size = len(self.ps_worker_handles_by_rank)
+        plan = build_broadcast_plan(
+            world_size=world_size,
+            algorithm=self.psrl_config.broadcast_init.algorithm,
+        )
+        psrl_logger.info(
+            f"[_coordinate_broadcast_init] world_size={world_size}, "
+            f"algorithm={self.psrl_config.broadcast_init.algorithm!r}, "
+            f"num_rounds={plan.num_rounds()}."
+        )
+
+        for round_idx in range(plan.num_rounds()):
+            senders = plan.senders_in_round(round_idx)
+            if not senders:
+                continue
+            psrl_logger.info(
+                f"[_coordinate_broadcast_init] round {round_idx}: senders={senders}."
+            )
+            futures = [
+                self.ps_worker_handles_by_rank[rank].broadcast_send_to_children.remote(
+                    round_idx, plan
+                )
+                for rank in senders
+            ]
+            ray.get(futures)  # round barrier: wait for all senders before next round
+
+        # All workers now have their train buffers populated; copy train → gen if needed.
+        psrl_logger.info("[_coordinate_broadcast_init] all rounds done; triggering transfer_train_to_gen.")
+        ray.get([
+            w.do_transfer_train_to_gen_after_broadcast.remote()
+            for w in self.ps_worker_handles_by_rank
+        ])
+        psrl_logger.info("[_coordinate_broadcast_init] broadcast initialization complete.")
 
     def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:
         """Get the PS worker handle by the client name."""

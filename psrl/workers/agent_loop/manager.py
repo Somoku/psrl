@@ -21,7 +21,6 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import AsyncBusyPollingRayLock
-from psrl.utils.transferqueue_utils import kv_batch_meta_update_tags
 from psrl.workers.gen_dplb.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
@@ -135,6 +134,10 @@ class PSRL_AgentLoopManager:
             str | int, list[EntryInfo]
         ] = {}  # Maps parent request ids to "occupied" child entries
 
+        # Track groups whose failure has already been processed to avoid duplicate handling
+        # when multiple siblings in the same group fail concurrently.
+        self._failed_group_ids: set[int] = set()
+
         # Build logger
         self.log_prefix = "AgentLoopManager"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
@@ -199,6 +202,7 @@ class PSRL_AgentLoopManager:
     def set_val_buffer_size(self, val_buffer_size: int):
         """Set the validation buffer size."""
         self.val_buffer_size = val_buffer_size
+        self._failed_group_ids.clear()
 
     async def start_busy_loop(self):
         """Start the busy loop for continuous data processing from the queue."""
@@ -308,7 +312,11 @@ class PSRL_AgentLoopManager:
 
             # Receive END signal to stop processing data queue
             if data is None:
-                psrl_logger.info("Received END signal, stopping agent loop manager train dispatch task.")
+                psrl_logger.info(
+                    "Received END signal, stopping train dispatch. "
+                    "request_counter=%d, result_queue=%d.",
+                    self._request_counter, self.result_queue.qsize(),
+                )
                 self.stop_train_dispatch_task = True
                 continue
 
@@ -351,7 +359,6 @@ class PSRL_AgentLoopManager:
                 continue
 
             # Validation samples all share the current PS version.
-            # data = kv_batch_meta_update_tags(data, "version_tag", [self.curr_ps_version_tag] * batch_size)
             tu.assign_non_tensor_stack(data, "version_tag", [self.curr_ps_version_tag] * len(data))
 
             # Dispatch data to agent loop workers
@@ -404,6 +411,145 @@ class PSRL_AgentLoopManager:
         self._request_counter += len(data)
         return len(data)
 
+    def _request_tq_keys(self, request_id: int, n_trajectory: int) -> list[str]:
+        if n_trajectory == 1:
+            return [str(request_id)]
+        return [f"{request_id}_{i}" for i in range(n_trajectory)]
+
+    def _entry_info_tq_keys(self, entry_info: EntryInfo, rollout_n: int) -> list[str]:
+        request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
+        n_trajectories = (
+            entry_info.n_trajectory
+            if isinstance(entry_info.n_trajectory, list)
+            else [entry_info.n_trajectory] * len(request_idxs)
+        )
+        keys: list[str] = []
+        for request_idx, n_trajectory in zip(request_idxs, n_trajectories):
+            request_id = entry_info.prompt_id * rollout_n + request_idx
+            keys.extend(self._request_tq_keys(request_id, n_trajectory))
+        return keys
+
+    async def _purge_tracker_group(self, parent_id: int, rollout_n: int) -> list[EntryInfo]:
+        """Drop partially accumulated tracker entries and their TQ payloads."""
+        entries = self.rollout_request_tracker.pop(parent_id, [])
+        if not entries:
+            return []
+
+        keys: list[str] = []
+        for entry_info in entries:
+            keys.extend(self._entry_info_tq_keys(entry_info, rollout_n))
+        if keys:
+            await tq.async_kv_clear(
+                keys=keys,
+                partition_id="train",
+            )
+        psrl_logger.info(
+            "_purge_tracker_group: removed %d partial entries (%d TQ keys) for parent_id=%s.",
+            len(entries),
+            len(keys),
+            parent_id,
+        )
+        return entries
+
+    async def _flush_ready_buffer(self, buffer_id: int, is_validate: bool) -> bool:
+        """Assemble and publish an accumulated buffer that reached its target."""
+        accumulated_buffers = self.val_accumulated_buffers if is_validate else self.train_accumulated_buffers
+        accumulated_buffer_size = (
+            self.val_accumulated_buffer_size if is_validate else self.train_accumulated_buffer_size
+        )
+        if buffer_id not in accumulated_buffers:
+            return False
+
+        prompt_entry_infos: list[EntryInfo] = []
+        for model_version in sorted(list(accumulated_buffers[buffer_id].keys())):
+            prompt_entry_infos.extend(accumulated_buffers[buffer_id][model_version])
+        # NOTE(linsh): sort by prompt_id to ensure the order of prompt_entry_infos
+        # is the same as the order of prompt_ids in the buffer
+        prompt_entry_infos.sort(key=lambda ei: ei.prompt_id)
+
+        batch = self.entry_infos_to_kv_batch_meta(prompt_entry_infos, is_validate)
+        add_buffer = self.maybe_add_buffer(buffer_id, batch, is_validate)
+        if add_buffer:
+            psrl_logger.info(
+                "%s buffer %d is READY with %d entries.",
+                "Validation" if is_validate else "Training",
+                buffer_id,
+                len(batch),
+            )
+            await self.handle_ready_buffer(buffer_id, is_validate)
+            accumulated_buffers.pop(buffer_id, None)
+            accumulated_buffer_size.pop(buffer_id, None)
+        return add_buffer
+
+    async def notify_group_failed(self, parent_id: int, failed_uid: int, is_validate: bool):
+        """Recover a rollout group after one child fails without producing data."""
+        async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
+            if parent_id in self._failed_group_ids:
+                psrl_logger.warning(
+                    "notify_group_failed: parent_id=%s is_validate=%s already handled; "
+                    "skip duplicate failed_uid=%s.",
+                    parent_id,
+                    is_validate,
+                    failed_uid,
+                )
+                return
+            self._failed_group_ids.add(parent_id)
+
+            all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
+            sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]
+            if sibling_uids:
+                psrl_logger.info(
+                    "notify_group_failed: aborting %d sibling uids=%s for parent_id=%s.",
+                    len(sibling_uids), sibling_uids, parent_id,
+                )
+                await self.ps_manager_handle.abort_requests.remote(sibling_uids, blocking=False)
+
+            await self._purge_tracker_group(parent_id, rollout_n)
+
+            if is_validate:
+                if self.val_buffer_size is None or self.val_buffer_size <= 0:
+                    psrl_logger.warning(
+                        "notify_group_failed: val_buffer_size=%s, cannot shrink for parent_id=%s.",
+                        self.val_buffer_size,
+                        parent_id,
+                    )
+                    return
+                self.val_buffer_size -= 1
+                psrl_logger.warning(
+                    "notify_group_failed: val_buffer_size decremented to %d for parent_id=%s.",
+                    self.val_buffer_size,
+                    parent_id,
+                )
+                for buffer_id, accumulated_size in list(self.val_accumulated_buffer_size.items()):
+                    if accumulated_size == self.val_buffer_size and buffer_id not in self.val_data_buffers:
+                        psrl_logger.info(
+                            "notify_group_failed (val): buffer_id=%d now meets "
+                            "adjusted val_buffer_size=%d, assembling and firing.",
+                            buffer_id, self.val_buffer_size,
+                        )
+                        await self._flush_ready_buffer(buffer_id, is_validate=True)
+            else:
+                if self.stop_train_dispatch_task:
+                    psrl_logger.warning(
+                        "notify_group_failed (train): dispatch task stopped, "
+                        "skipping replacement for parent_id=%s.",
+                        parent_id,
+                    )
+                    return
+                if self.train_data_queue.empty():
+                    psrl_logger.warning(
+                        "notify_group_failed (train): train_data_queue is empty, "
+                        "no replacement available for parent_id=%s.",
+                        parent_id,
+                    )
+                    return
+                psrl_logger.info(
+                    "notify_group_failed (train): dispatching replacement group for parent_id=%s.",
+                    parent_id,
+                )
+                await self._retry_data(n_prompts=1)
+
     def _get_expected_ps_version(self):
         """
         Get the expected PS version tag based on the current staleness and request counter.
@@ -413,7 +559,9 @@ class PSRL_AgentLoopManager:
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
-        expected_ps_version = max(self._request_counter - self.staleness * buffer_size, 0) // buffer_size
+        max_dispatch_ahead = self.config.psrl.get("max_dispatch_ahead", 5)
+        effective_staleness = min(self.staleness, max_dispatch_ahead)
+        expected_ps_version = max(self._request_counter - effective_staleness * buffer_size, 0) // buffer_size
         return expected_ps_version
 
     async def _inner_dispatch_data(self, data: TensorDict, is_validate: bool = False):
@@ -453,10 +601,11 @@ class PSRL_AgentLoopManager:
             if prompt_id in prompt_to_worker:
                 worker_index = prompt_to_worker[prompt_id]
             else:
-                worker_index = (self._dispatch_idx + prompt_id) % len(self.agent_loop_workers)
+                worker_index = (self._dispatch_idx + len(prompt_to_worker)) % len(self.agent_loop_workers)
                 prompt_to_worker[prompt_id] = worker_index
             keys_by_worker.setdefault(worker_index, []).append(i)
 
+        self._dispatch_idx = (self._dispatch_idx + len(prompt_to_worker)) % len(self.agent_loop_workers)
         return {
             worker_index: data[keys] if keys else None
             for worker_index, keys in keys_by_worker.items()
@@ -510,6 +659,20 @@ class PSRL_AgentLoopManager:
             for request_id, prompt_id, rollout_instance_id, version_tag, n_trajectory in zip(
                 request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories
             ):
+                if prompt_id in self._failed_group_ids:
+                    psrl_logger.warning(
+                        "occupy_requests: discarding late arrival request_id=%s from failed "
+                        "group parent_id=%s is_validate=%s.",
+                        request_id,
+                        prompt_id,
+                        is_validate,
+                    )
+                    await tq.async_kv_clear(
+                        keys=self._request_tq_keys(request_id, n_trajectory),
+                        partition_id="val" if is_validate else "train",
+                    )
+                    continue
+
                 # Update n_trajectory in PSManager (moved from worker to avoid
                 # an extra per-request PSManager RPC on the worker's critical path).
                 if n_trajectory > 1:
@@ -692,30 +855,7 @@ class PSRL_AgentLoopManager:
 
             # 5. Process READY buffers
             for buffer_id in sorted(list(ready_buffer_ids)):
-                # Collect all prompt entry infos for the buffer
-                accumulated_buffers = (
-                    self.val_accumulated_buffers if is_validate else self.train_accumulated_buffers
-                )
-                accumulated_buffer_size = (
-                    self.val_accumulated_buffer_size if is_validate else self.train_accumulated_buffer_size
-                )
-
-                prompt_entry_infos: list[EntryInfo] = []
-                for model_version in sorted(list(accumulated_buffers[buffer_id].keys())):
-                    prompt_entry_infos.extend(accumulated_buffers[buffer_id][model_version])
-
-                # NOTE(linsh): sort by prompt_id to ensure the order of prompt_entry_infos
-                # is the same as the order of prompt_ids in the buffer
-                prompt_entry_infos.sort(key=lambda ei: ei.prompt_id)
-
-                batch = self.entry_infos_to_kv_batch_meta(prompt_entry_infos, is_validate)
-                # Apply buffer post-processing if exists and add to data_buffers
-                add_buffer = self.maybe_add_buffer(buffer_id, batch, is_validate)
-                if add_buffer:
-                    psrl_logger.info(f"Buffer {buffer_id} is READY with {len(batch)} entries.")
-                    await self.handle_ready_buffer(buffer_id, is_validate)
-                    accumulated_buffers.pop(buffer_id)
-                    accumulated_buffer_size.pop(buffer_id)
+                await self._flush_ready_buffer(buffer_id, is_validate)
             return True
 
     def maybe_add_buffer(self, buffer_id: int, batch: KVBatchMeta, is_validate: bool = False) -> bool:
@@ -779,19 +919,17 @@ class PSRL_AgentLoopManager:
                         "rollout_instance_id": entry_info.rollout_instance_id,
                     })
                 else:
-                    keys.append(f"{entry_info.prompt_id * rollout_n + request_idx}_{n_trajectory}")
-                    tags.extend(
-                        [
-                            {
-                                "uid": entry_info.prompt_id * rollout_n + request_idx,
-                                "parent_id": entry_info.prompt_id,
-                                "version_tag": (
-                                    model_versions[j] if j < len(model_versions) else model_versions[-1]
-                                ),
-                                "rollout_instance_id": entry_info.rollout_instance_id,
-                            } for _ in range(n_trajectory)
-                        ]
-                    )
+                    request_id = entry_info.prompt_id * rollout_n + request_idx
+                    for trajectory_index in range(n_trajectory):
+                        keys.append(f"{request_id}_{trajectory_index}")
+                        tags.append({
+                            "uid": request_id,
+                            "parent_id": entry_info.prompt_id,
+                            "version_tag": (
+                                model_versions[j] if j < len(model_versions) else model_versions[-1]
+                            ),
+                            "rollout_instance_id": entry_info.rollout_instance_id,
+                        })
         return KVBatchMeta(keys=keys, tags=tags, partition_id=partition)
 
     async def _group_post_process(self, entry_infos: list[EntryInfo]) -> bool:
@@ -1103,54 +1241,73 @@ class PSRL_AgentLoopManager:
                         f"Not enough entries in other buffers to make buffer {buffer_id} ready, "
                         f"the gap is {gap}, but only {total_available_entries} entries are available"
                     )
-                    return
-                psrl_logger.info(
-                    f"Aborting the rest {gap} entries in buffer {buffer_id} "
-                    f"and moving some occupied entries from other buffers to make it ready."
-                )
-                # First, abort the reserved requests in the buffer
-                aborted_entry_num, _ = await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
-                # NOTE(linsh): the aborted requests have been cleared from tq in ps manager
-
-                # Then, move the occupied entries from other buffers to the buffer
-                total_moved_entries = 0
-                moved_occupied_entry_infos: list[EntryInfo] = []
-                for other_buffer_id in sorted(list(self.train_accumulated_buffers.keys()), reverse=True):
-                    if other_buffer_id == buffer_id:
-                        break
-                    for model_version in sorted(list(self.train_accumulated_buffers[other_buffer_id].keys())):
-                        moved_entry_infos: list[EntryInfo] = []
-                        for entry_info in self.train_accumulated_buffers[other_buffer_id][model_version]:
-                            moved_entry_infos.append(entry_info)
-                            total_moved_entries += 1
+                    if not self.stop_train_dispatch_task:
+                        # More data may still arrive; keep waiting.
+                        return
+                    # Dispatch has stopped — no more data will ever arrive.
+                    # Fall through to the force-ready logic below.
+                else:
+                    psrl_logger.info(
+                        f"Aborting the rest {gap} entries in buffer {buffer_id} "
+                        f"and moving some occupied entries from other buffers to make it ready."
+                    )
+                    # First, abort the reserved requests in the buffer
+                    aborted_entry_num, _ = await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
+                    # NOTE(linsh): the aborted requests have been cleared from tq in ps manager
+                    # Then, move the occupied entries from other buffers to the buffer
+                    total_moved_entries = 0
+                    moved_occupied_entry_infos: list[EntryInfo] = []
+                    for other_buffer_id in sorted(list(self.train_accumulated_buffers.keys()), reverse=True):
+                        if other_buffer_id == buffer_id:
+                            break
+                        for model_version in sorted(list(self.train_accumulated_buffers[other_buffer_id].keys())):
+                            moved_entry_infos: list[EntryInfo] = []
+                            for entry_info in self.train_accumulated_buffers[other_buffer_id][model_version]:
+                                moved_entry_infos.append(entry_info)
+                                total_moved_entries += 1
+                                if total_moved_entries == gap:
+                                    break
+                            self.train_accumulated_buffers[buffer_id].setdefault(model_version, [])
+                            for moved_entry_info in moved_entry_infos:
+                                moved_occupied_entry_infos.append(moved_entry_info)
+                                self.train_accumulated_buffers[buffer_id][model_version].append(moved_entry_info)
+                                self.train_accumulated_buffer_size[buffer_id] += 1
+                                self.train_accumulated_buffers[other_buffer_id][model_version].remove(moved_entry_info)
+                                self.train_accumulated_buffer_size[other_buffer_id] -= 1
                             if total_moved_entries == gap:
                                 break
-                        self.train_accumulated_buffers[buffer_id].setdefault(model_version, [])
-                        for moved_entry_info in moved_entry_infos:
-                            moved_occupied_entry_infos.append(moved_entry_info)
-                            self.train_accumulated_buffers[buffer_id][model_version].append(moved_entry_info)
-                            self.train_accumulated_buffer_size[buffer_id] += 1
-                            self.train_accumulated_buffers[other_buffer_id][model_version].remove(moved_entry_info)
-                            self.train_accumulated_buffer_size[other_buffer_id] -= 1
+                        for model_version in list(self.train_accumulated_buffers[other_buffer_id].keys()):
+                            if len(self.train_accumulated_buffers[other_buffer_id][model_version]) == 0:
+                                self.train_accumulated_buffers[other_buffer_id].pop(model_version)
                         if total_moved_entries == gap:
                             break
-                    for model_version in list(self.train_accumulated_buffers[other_buffer_id].keys()):
-                        if len(self.train_accumulated_buffers[other_buffer_id][model_version]) == 0:
-                            self.train_accumulated_buffers[other_buffer_id].pop(model_version)
-                    if total_moved_entries == gap:
-                        break
-                for other_buffer_id in list(self.train_accumulated_buffers.keys()):
-                    if len(self.train_accumulated_buffers[other_buffer_id]) == 0:
-                        self.train_accumulated_buffers.pop(other_buffer_id)
-                        self.train_accumulated_buffer_size.pop(other_buffer_id)
-                # Finally, notify the PS manager to move the occupied entries to the buffer
-                await self.ps_manager_handle.move_occupied_entries.remote(moved_occupied_entry_infos, buffer_id)
-                psrl_logger.info(
-                    f"Moved {total_moved_entries} occupied entries (the total gap is {gap}) "
-                    f"from other buffers to buffer {buffer_id}."
-                )
-                await self._retry_data(n_prompts=aborted_entry_num)
+                    for other_buffer_id in list(self.train_accumulated_buffers.keys()):
+                        if len(self.train_accumulated_buffers[other_buffer_id]) == 0:
+                            self.train_accumulated_buffers.pop(other_buffer_id)
+                            self.train_accumulated_buffer_size.pop(other_buffer_id)
+                    # Finally, notify the PS manager to move the occupied entries to the buffer
+                    await self.ps_manager_handle.move_occupied_entries.remote(moved_occupied_entry_infos, buffer_id)
+                    psrl_logger.info(
+                        f"Moved {total_moved_entries} occupied entries (the total gap is {gap}) "
+                        f"from other buffers to buffer {buffer_id}."
+                    )
+                    await self._retry_data(n_prompts=aborted_entry_num)
+                    return  # Move succeeded; buffer will reach target via normal accumulation path.
 
+            # When the dispatch task has stopped, no new data will ever arrive to fill the remaining
+            # gap. Force the buffer ready with whatever has accumulated so far by aborting any
+            # still-reserved (in-flight) entries and overriding the accumulated-size counter so that
+            # the caller's readiness check passes with partial data.
+            remaining_gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
+            if self.stop_train_dispatch_task and remaining_gap > 0:
+                psrl_logger.warning(
+                    f"Train dispatch stopped: buffer {buffer_id} is stuck at "
+                    f"{self.train_accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer} entries "
+                    f"(gap={remaining_gap}). Aborting reserved entries and forcing buffer ready with partial data."
+                )
+                await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
+                # Override the counter so the caller's equality check sees the buffer as full.
+                self.train_accumulated_buffer_size[buffer_id] = self.ready_entries_per_buffer
         elif self.config.psrl.proactive_filter_strategy.method == "truncate":
             raise NotImplementedError("Truncate strategy is not implemented yet.")
 
@@ -1199,7 +1356,8 @@ class PSRL_AgentLoopManager:
 
     async def wait_for_validation_batch(self, buffer_id: int) -> KVBatchMeta:
         """Await a validation batch, returning a ``KVBatchMeta``."""
-        await self.ps_manager_handle.ensure_validate_buffer_exists.remote()
+        async with AsyncBusyPollingRayLock(self.ps_manager_handle):
+            await self.ps_manager_handle.ensure_validate_buffer_exists.remote()
 
         if buffer_id in self.val_data_buffers:
             # If the buffer is ready, return immediately

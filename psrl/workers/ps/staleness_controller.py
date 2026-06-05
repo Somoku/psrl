@@ -549,9 +549,10 @@ class StalenessInventory:
         """
         Check whether an entry can be reserved for a given model version without a new reserve entry.
         """
+        staleness = self.staleness if self.staleness is not None else 0
         if entry_info.prompt_id in self.data_tracker:
             buffer_id, _ = self.data_tracker[entry_info.prompt_id]
-            if entry_info.is_validate or model_version + self.staleness >= buffer_id:
+            if model_version + staleness >= buffer_id:
                 return True
         return False
 

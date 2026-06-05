@@ -1,0 +1,38 @@
+/* PSRL Documentation Custom Styles */
+
+:root {
+    --pst-color-primary: #0071c5;
+}
+
+/* Bolder admonition titles */
+.admonition .admonition-title {
+    font-weight: 700;
+}
+
+/* Feature cards hover effect */
+.sd-card:hover {
+    transform: translateY(-2px);
+    transition: transform 0.2s ease;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+/* Mermaid diagram container */
+.mermaid {
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+/* Code block improvements */
+div.highlight pre {
+    font-size: 0.85em;
+}
+
+/* TBD badges */
+.badge-tbd {
+    background-color: #ffc107;
+    color: #000;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.75em;
+    font-weight: 600;
+}

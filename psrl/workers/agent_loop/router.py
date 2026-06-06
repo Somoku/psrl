@@ -762,6 +762,9 @@ class RolloutRouter:
                 # psrl_logger.info(f"Request {request.request_id} on instance {new_instance_id} is aborted")
                 result = None
 
+        if result is None:
+            self.partial_request_output_store.pop(request.request_id, None)
+
         # Set the result for the request
         self._set_result(request.request_id, result)
 
@@ -783,9 +786,11 @@ class RolloutRouter:
             input_ids=new_input_ids,
             request_id=request.request_id,
             prompt_id=request.prompt_id,
+            raw_prompt=request.raw_prompt,
             version_tag=request.version_tag,
             rollout_instance_id=output.rollout_instance_id,
             cu_response_len=new_cu_response_len,
+            multi_modal_data=request.multi_modal_data,
             is_validate=request.is_validate,
             stop_token_ids=request.stop_token_ids,
         )
@@ -805,9 +810,18 @@ class RolloutRouter:
         request_id = request.request_id
         if request_id not in self.partial_request_output_store:
             self.partial_request_output_store[request_id] = {
+                "prompt_ids": list(output.prompt_ids),
+                "response_ids": [],
+                "response_mask": [],
                 "log_probs": [],
+                "profiling_data": None,
+                "profiling_reroute_submit_ts": 0.0,
             }
-        self.partial_request_output_store[request_id]["log_probs"].extend(output.log_probs)
+        stored = self.partial_request_output_store[request_id]
+        stored["response_ids"].extend(output.response_ids)
+        stored["response_mask"].extend(output.response_mask)
+        if output.response_log_probs is not None:
+            stored["log_probs"].extend(output.response_log_probs)
 
     def _consolidate_request_output(self, output: TokenOutput, request: TokenInput) -> TokenOutput:
         """Consolidate the request output for partial rollout.
@@ -820,10 +834,15 @@ class RolloutRouter:
         """
         request_id = request.request_id
         if request_id in self.partial_request_output_store:
-            stored_log_probs = self.partial_request_output_store[request_id]["log_probs"]
+            stored = self.partial_request_output_store[request_id]
+            output.prompt_ids = stored["prompt_ids"]
+            output.response_ids = stored["response_ids"] + output.response_ids
+            output.response_mask = stored["response_mask"] + output.response_mask
+            stored_log_probs = stored["log_probs"]
             # Combine stored log probs with current output log probs
-            combined_log_probs = stored_log_probs + output.log_probs
-            output.log_probs = combined_log_probs
+            if stored_log_probs:
+                output.response_log_probs = stored_log_probs + (output.response_log_probs or [])
+
             # Remove from store after consolidation
             del self.partial_request_output_store[request_id]
         return output

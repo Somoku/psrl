@@ -1176,7 +1176,7 @@ class NIXLStorageClient:
             # Returning inside the loop would silently skip all remaining shards for this key.
             if merge_and_cache_xfer and is_contiguous:
                 self._cached_xfer_descs.append(("READ", local_desc, remote_desc, target_agent, tag, target_client))
-                return []
+                continue
             # Real xfer
             try:
                 if running_key is not None and running_shard_idx is not None:

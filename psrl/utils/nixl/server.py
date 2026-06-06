@@ -196,7 +196,11 @@ class NIXLMetaServer:
 
         psrl_logger.info("Making communication plan...")
         start = time.time()
-        self.comm_plan = CommunicationPlanner().make_comm_plan(self.client_infos)
+        try:
+            self.comm_plan = CommunicationPlanner().make_comm_plan(self.client_infos)
+        except Exception as e:
+            psrl_logger.error(f"Failed to make communication plan: {e}")
+            raise e
         psrl_logger.info(f"Communication plan made after {time.time() - start} seconds.")
 
     def notify_all_client_shardings(self):

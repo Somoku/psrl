@@ -1,35 +1,21 @@
-"""
-NIXL end-to-end test.
-
-Requires: multi-GPU node with megatron, nixl, and full PSRL environment.
-Run via: python tests/nixl/test_nixl_e2e.py (on a GPU node with env activated).
-
-This file is skipped during pytest collection on nodes where megatron or the
-required nixl symbols are not available.
-"""
-
 import asyncio
 import math
 import os
 import time
 
-import pytest
-
-# Skip the entire module at collection time if required packages are unavailable.
-# pytest.importorskip raises Skipped before any further imports are attempted.
-pytest.importorskip("megatron", reason="test_nixl_e2e requires megatron")
 import hydra
 import ray
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state as mpu
 from omegaconf import DictConfig, OmegaConf
+from psrl.utils.common.worker_naming import gen_client_name, train_client_name
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.fsdp_converter import convert_fsdp_inplace
 from psrl.utils.converter.megatron_converter import convert_megatron_inplace
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
-from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.nixl import (
+    NIXL_META_SERVER_NAME,
     NIXLClientType,
     NIXLMetaServer,
     NIXLStorageClient,
@@ -42,19 +28,87 @@ from psrl.workers.ps import (
     PSStorageWorker,
     PSWorkerGroup,
 )
+from verl.models.mcore import hf_to_mcore_config, init_mcore_model
+from verl.utils.fs import copy_to_local
+from verl.utils.device import get_device_name
+from verl.utils.fsdp_utils import apply_fsdp2, fsdp2_load_full_state_dict
+from verl.utils.megatron_utils import get_model
+from verl.utils.model import get_hf_auto_model_class
+from verl.utils.torch_dtypes import PrecisionType
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy
 from transformers import AutoConfig, AutoModelForCausalLM
-from verl.models.mcore import hf_to_mcore_config, init_mcore_model
-from verl.utils.device import get_device_name
-from verl.utils.megatron_utils import get_model
-from verl.utils.torch_dtypes import PrecisionType
-from verl.workers.megatron_workers import set_random_seed
-from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
+from verl.workers.engine.megatron.utils import set_random_seed
 
 NUM_GPU_PER_NODE = 8
+
+
+def resolve_torch_dtype(dtype_name: str | None) -> torch.dtype:
+    if dtype_name is None:
+        return torch.bfloat16
+    normalized = str(dtype_name).lower()
+    if normalized in ("float32", "fp32"):
+        return torch.float32
+    if normalized in ("bfloat16", "bf16"):
+        return torch.bfloat16
+    if normalized in ("float16", "fp16", "half"):
+        return torch.float16
+    raise ValueError(f"Unsupported dtype {dtype_name!r}.")
+
+
+def validate_parallel_config(cfg: DictConfig) -> None:
+    num_train = cfg.test.num_train
+    num_gen = cfg.test.num_gen
+    train_engine_type = cfg.test.train_engine_type
+    gen_tp = cfg.test.gen.tensor_parallel_size
+    gen_pp = cfg.test.gen.pipeline_parallel_size
+    gen_ep = cfg.test.gen.get("expert_parallel_size", 1)
+    gen_dp = cfg.test.gen.get("data_parallel_size", None)
+
+    assert num_gen % (gen_tp * gen_pp) == 0, (
+        f"num_gen {num_gen} must be divisible by gen TP*PP {gen_tp * gen_pp}."
+    )
+    computed_dp = num_gen // (gen_tp * gen_pp)
+    if gen_dp is not None and gen_dp > 1:
+        assert computed_dp == gen_dp, (
+            f"gen data_parallel_size={gen_dp} conflicts with computed DP="
+            f"{computed_dp} (num_gen={num_gen}, TP={gen_tp}, PP={gen_pp})."
+        )
+    if gen_ep > 1:
+        assert gen_ep == gen_tp, f"vLLM EP currently follows TP in PSRL; got gen EP {gen_ep} and TP {gen_tp}."
+
+    if train_engine_type == "fsdp_hybrid":
+        ddp_size = cfg.test.fsdp_hybrid.ddp_size
+        fsdp_size = cfg.test.fsdp_hybrid.fsdp_size
+        assert num_train % (ddp_size * fsdp_size) == 0, (
+            f"num_train {num_train} must be divisible by HSDP DDP*FSDP {ddp_size * fsdp_size}."
+        )
+    elif train_engine_type == "megatron":
+        megatron = cfg.test.megatron
+        train_tp = megatron.tensor_model_parallel_size
+        train_pp = megatron.pipeline_model_parallel_size
+        train_cp = megatron.get("context_parallel_size", 1)
+        train_ep = megatron.get("expert_model_parallel_size", 1)
+        model_parallel_size = train_tp * train_pp * train_cp
+        assert num_train % model_parallel_size == 0, (
+            f"num_train {num_train} must be divisible by Megatron TP*PP*CP {model_parallel_size}."
+        )
+        train_dp = num_train // model_parallel_size
+        assert train_dp % train_ep == 0, f"Megatron DP {train_dp} must be divisible by EP {train_ep}."
+
+
+def assert_state_dict_all_ones(state_dict: dict[str, torch.Tensor], actor_label: str) -> None:
+    assert state_dict, f"{actor_label} state_dict is empty."
+    for key, tensor in state_dict.items():
+        expected = torch.ones_like(tensor)
+        if not torch.allclose(tensor, expected, atol=1e-6):
+            max_abs_diff = (tensor - expected).abs().max().item()
+            raise AssertionError(
+                f"{actor_label} parameter {key!r} is not all ones. "
+                f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, max_abs_diff={max_abs_diff}."
+            )
 
 
 def make_dual_print(log_path, prefix=None):
@@ -116,12 +170,15 @@ class MetaServerActor:
     def protocol(self):
         self.print("step1: wait_for_client_shardings")
         self.server.wait_for_client_shardings(self.expected_agents, timeout=120)
+        # self.print(f"client_sharding_dicts: {self.server.client_sharding_dicts}")
         self.print("step2: make_unified_sharding")
         self.server.make_unified_sharding()
+        # self.print(f"client_unified_sharding_dicts: {self.server.client_unified_sharding_dicts}")
         self.print("step3: notify_all_client_shardings")
         self.server.notify_all_client_shardings()
         self.print("step4: wait_for_client_infos")
         self.server.wait_for_client_infos(self.expected_agents, timeout=120)
+        # self.print(f"client_infos: {self.server.client_infos}")
         self.print("step5: make_comm_plan")
         self.server.make_comm_plan()
         self.print("step6: notify_all_client_infos_and_comm_plan")
@@ -152,6 +209,7 @@ class TrainClientActor:
         log_dir,
         ps_for_push_worker_handles,
         model_path,
+        model_config,
         fsdp_hybrid_config=None,
         megatron_config=None,
     ):
@@ -168,7 +226,10 @@ class TrainClientActor:
         self.engine_type = engine_type
         self.rank = rank
         self.world_size = world_size
-        self.client_name = f"train_client_{rank}"
+        self.client_name = train_client_name(rank)
+        self.model_config = model_config
+        self.trust_remote_code = False
+        self.train_dtype = resolve_torch_dtype(model_config.get("train_dtype", "bfloat16"))
         self.fsdp_hybrid_config = fsdp_hybrid_config
         self.megatron_config = megatron_config
         os.makedirs(log_dir, exist_ok=True)
@@ -193,8 +254,12 @@ class TrainClientActor:
         )
 
         if engine_type == "fsdp" or engine_type == "fsdp_hybrid":
-            model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
-            # Set all model parameters to 1
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=self.train_dtype,
+                trust_remote_code=self.trust_remote_code,
+            )
+            # Set all model parameters to a deterministic source value.
             for p in model.parameters():
                 p.data.fill_(1)
             torch.manual_seed(42)
@@ -225,6 +290,7 @@ class TrainClientActor:
             set_random_seed(42)
             self._init_megatron_model(model_path)
         self.ps_for_push_worker_handles = ps_for_push_worker_handles
+        # self._log_env_info()
 
     def _log_env_info(self):
         for k in sorted(os.environ):
@@ -240,7 +306,7 @@ class TrainClientActor:
             return mpu.get_data_parallel_rank()
 
     def _init_megatron_parallel(self, megatron_config):
-        """Initialize Megatron parallel state"""
+        """Initialize Megatron parallel state."""
         virtual_pipeline_model_parallel_size = megatron_config.get("virtual_pipeline_model_parallel_size", 1)
         if virtual_pipeline_model_parallel_size == 1:
             virtual_pipeline_model_parallel_size = None
@@ -250,16 +316,18 @@ class TrainClientActor:
             virtual_pipeline_model_parallel_size=virtual_pipeline_model_parallel_size,
             use_sharp=False,
             context_parallel_size=megatron_config.get("context_parallel_size", 1),
-            expert_model_parallel_size=1,
-            expert_tensor_parallel_size=1,
+            expert_model_parallel_size=megatron_config.get("expert_model_parallel_size", 1),
+            expert_tensor_parallel_size=megatron_config.get("expert_tensor_parallel_size", 1),
             nccl_communicator_config_path=None,
         )
         self.print(f"[Rank {self.rank}] Megatron parallel initialized")
 
     def _init_megatron_model(self, model_path):
-        """Initialize Megatron model"""
-        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
-        dtype = PrecisionType.to_dtype(torch.bfloat16)
+        """Initialize a Megatron-Bridge model like the current train worker."""
+        local_model_path = copy_to_local(model_path)
+        hf_config = AutoConfig.from_pretrained(local_model_path, trust_remote_code=self.trust_remote_code)
+
+        dtype = PrecisionType.to_dtype(self.train_dtype)
         self.print(f"[Rank {self.rank}] Config loaded: {hf_config.model_type}")
 
         use_mbridge = True
@@ -287,7 +355,14 @@ class TrainClientActor:
 
         for name, param in self.model[0].named_parameters():
             param.data.fill_(1)
+        for name, param in self.model[0].named_buffers():
+            param.data.fill_(1)
+
         self.print(f"[Rank {self.rank}] Model initialized: {self.model}")
+        # self.print(f"[Rank {self.rank}] Model state_dict keys: "
+        #            f"{[submodel.state_dict().keys() for submodel in self.model]}")
+        # self.print(f"[Rank {self.rank}] Model named parameter keys: "
+        #            f"{[name for submodel in self.model for name, _ in submodel.named_parameters()]}")
 
     def init_finished(self):
         self.print(f"Train client init finished on ip {os.environ.get('LOCAL_IP')}")
@@ -298,15 +373,19 @@ class TrainClientActor:
         if self.engine_type == "fsdp" or self.engine_type == "fsdp_hybrid":
             from transformers import AutoConfig
 
-            model_config = AutoConfig.from_pretrained(model_path)
+            model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
             parameter_mapping = create_parameter_mapping("FSDP", model_config)
             state_dict, sharding = convert_fsdp_inplace(parameter_mapping, self.model, fsdp_strategy="fsdp")
         elif self.engine_type == "megatron":
             from transformers import AutoConfig
 
-            model_config = AutoConfig.from_pretrained(model_path)
+            model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
             parameter_mapping = create_parameter_mapping("Megatron", model_config)
             state_dict, sharding = convert_megatron_inplace(parameter_mapping, self.model)
+        for tensor in state_dict.values():
+            if torch.is_tensor(tensor) and tensor.is_floating_point():
+                tensor.data.fill_(1)
+        # self.print(f"state_dict keys: {state_dict.keys()}")
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -343,18 +422,24 @@ class TrainClientActor:
                 )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
+                    # self.print(f"Pushing {key} to {ps_client_name}")
+            # self.print(f"Waiting for {len(wait_operations)} push operations")
             for key, ps_client_name, shards_to_transfer in wait_operations:
+                # start_time = time.time()
                 try:
                     self.client.wait(key, "train_push", "WRITE", target_client=ps_client_name)
                 except Exception as e:
                     self.print(f"Wait failed for key {key} to {ps_client_name}. error: {e}")
                     raise e
+                # end_time = time.time()
+                # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
                 futures.append(
                     self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(
                         key, shards_to_transfer
                     )
                 )
         ray.get(futures)
+        # self.client.merge_and_finish_cached_xfer()
 
     def shutdown(self):
         self.client.shutdown()
@@ -374,6 +459,7 @@ class GenClientActor:
         torch_port,
         log_dir,
         model_path,
+        model_config,
         gen_config,
     ):
         from vllm import LLM
@@ -394,7 +480,28 @@ class GenClientActor:
         os.environ["MASTER_PORT"] = str(torch_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
-        self.client_name = f"gen_client_{rank}"
+        self.tp_size = gen_config.get("tensor_parallel_size", 2)
+        self.pp_size = gen_config.get("pipeline_parallel_size", 1)
+        self.ep_size = gen_config.get("expert_parallel_size", 1)
+        self.rank = rank
+        self.tp_rank = rank % self.tp_size
+        self.instance_world_size = self.tp_size * self.pp_size
+        assert world_size % (self.tp_size * self.pp_size) == 0, (
+            f"world_size {world_size} is not divisible by {self.tp_size * self.pp_size}"
+        )
+        # Use explicit data_parallel_size from config if provided, otherwise compute from world_size
+        config_dp_size = gen_config.get("data_parallel_size", None)
+        computed_dp_size = world_size // self.instance_world_size
+        if config_dp_size is not None and config_dp_size > 1:
+            assert computed_dp_size == config_dp_size, (
+                f"Computed dp_size {computed_dp_size} != config data_parallel_size {config_dp_size}. "
+                f"Ensure num_gen ({world_size}) == TP ({self.tp_size}) * PP ({self.pp_size}) * DP ({config_dp_size})."
+            )
+        self.dp_size = computed_dp_size
+        self.model_config = model_config
+        self.trust_remote_code = False
+        self.gen_dtype = model_config.get("gen_dtype", "bfloat16")
+        self.client_name = gen_client_name(0, rank)
         os.makedirs(log_dir, exist_ok=True)
         log_path = os.path.join(log_dir, f"{self.client_name}.log")
         self.print = make_dual_print(log_path, prefix=self.client_name)
@@ -403,13 +510,6 @@ class GenClientActor:
         torch.manual_seed(42)
         os.environ["LOCAL_RANK"] = str(0)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
-        self.tp_size = gen_config.get("tensor_parallel_size", 2)
-        self.pp_size = gen_config.get("pipeline_parallel_size", 1)
-        self.rank = rank
-        self.tp_rank = rank % self.tp_size
-        assert world_size % (self.tp_size * self.pp_size) == 0, (
-            f"world_size {world_size} is not divisible by {self.tp_size * self.pp_size}"
-        )
 
         # NOTE(lhy): must create client here before loading the model
         self.client = NIXLStorageClient(
@@ -418,23 +518,26 @@ class GenClientActor:
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=psrl_config.nixl,
-            replica_idx=self._get_replica_id(),
-            worker_index=self.rank,
+            replica_idx=0,
+            worker_index=rank,
             logging_path=log_dir,
         )
 
-        llm = LLM(
-            model=model_path,
-            enable_sleep_mode=False,
-            dtype="bfloat16",
-            tensor_parallel_size=self.tp_size,
-            pipeline_parallel_size=self.pp_size,
-            distributed_executor_backend="external_launcher",
-            enforce_eager=True,
-            disable_custom_all_reduce=True,
-            # disable_mm_preprocessor_cache=True,
-            seed=42,
-        )
+        llm_kwargs = {
+            "model": model_path,
+            "dtype": self.gen_dtype,
+            "tensor_parallel_size": self.tp_size,
+            "pipeline_parallel_size": self.pp_size,
+            "distributed_executor_backend": "external_launcher",
+            "enforce_eager": True,
+            "disable_custom_all_reduce": True,
+            "trust_remote_code": self.trust_remote_code,
+            "enable_expert_parallel": self.ep_size > 1,
+            "seed": 42,
+        }
+        if self.dp_size > 1:
+            llm_kwargs["data_parallel_size"] = self.dp_size
+        llm = LLM(**llm_kwargs)
         self.model = llm.llm_engine.model_executor.driver_worker.model_runner.model
         self.print(f"local rank {self.rank} model: {self.model}")
         """
@@ -447,7 +550,17 @@ class GenClientActor:
         """
 
     def _get_replica_id(self):
-        return self.rank // (self.tp_size * self.pp_size)
+        return self.rank // self.instance_world_size
+
+    def _get_ep_rank(self):
+        if self.ep_size <= 1:
+            return 0
+        try:
+            from vllm.distributed.parallel_state import get_ep_group
+
+            return get_ep_group().rank_in_group
+        except AssertionError:
+            return 0
 
     def init_finished(self):
         self.print(f"Gen client init finished on ip {os.environ.get('LOCAL_IP')}")
@@ -459,18 +572,25 @@ class GenClientActor:
     def protocol(self, model_path):
         self.print("step0: convert_vllm_inplace")
         from transformers import AutoConfig
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+        from vllm_patches.interfaces import supports_weight_layout
 
-        model_config = AutoConfig.from_pretrained(model_path)
-        parameter_mapping = (
+        vllm_model = self.model
+        if isinstance(vllm_model, CUDAGraphWrapper):
+            vllm_model = vllm_model.unwrap()
+        model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
+        param_mapping = (
             None
-            if isinstance(self.model, SupportsWeightLayoutSpec)
-            else create_parameter_mapping(type(self.model), model_config)
+            if supports_weight_layout(vllm_model)
+            else create_parameter_mapping(type(vllm_model), model_config)
         )
         state_dict, sharding = convert_vllm_inplace(
-            self.model,
+            vllm_model,
             tp_rank=self.tp_rank,
-            parameter_mapping=parameter_mapping,
+            ep_rank=self._get_ep_rank(),
+            parameter_mapping=param_mapping,
         )
+        # self.print(f"state_dict keys: {list(state_dict.keys())}")
         self.state_dict = state_dict
         self.sharding = sharding
         self.state_dict_keys = list(state_dict.keys())
@@ -481,12 +601,14 @@ class GenClientActor:
         self.client.send_local_sharding(sharding)
         self.print("step3: wait_for_server_sharding")
         self.unified_sharding = self.client.wait_for_server_sharding()
+        # self.print(f"unified_sharding: {self.unified_sharding}")
         self.print("step4: register_local_tensors")
         self.client.register_local_tensors(self.state_dict, self.unified_sharding)
         self.print("step5: send_local_info")
         self.client.send_local_info()
         self.print("step6: wait_for_server_info (client infos & comm plan)")
         self.client.wait_for_server_info()
+        # self.print(f"comm plan: {self.client._comm_plan}")
         self.print("step7: send_local_temp_mapping")
         self.client.send_local_temp_mapping()
         self.print("step8: wait_for_server_temp_mappings")
@@ -498,6 +620,8 @@ class GenClientActor:
         total_start_time = time.time()
         for key in self.state_dict_keys:
             for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
+                # self.print(f"pull {key} from {ps_client_name}")
+                # start_time = time.time()
                 shards_to_transfer = self.client.client_read(
                     ps_agent_name,
                     ps_client_name,
@@ -505,20 +629,36 @@ class GenClientActor:
                     "gen_pull",
                     merge_and_cache_xfer=False,
                 )
+                # end_time = time.time()
                 if len(shards_to_transfer) > 0:
+                    # self.print(f"Read launched for (key {key}, shards {shards_to_transfer}) from {ps_client_name}. "
+                    #            f"time: {end_time - start_time}s")
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
         for key, ps_client_name, shards_to_transfer in wait_operations:
+            # start_time = time.time()
             self.client.wait(key, "gen_pull", "READ", target_client=ps_client_name)
+            # end_time = time.time()
+            # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
+        # start_time = time.time()
         self.client.merge_and_finish_cached_xfer()
+        # end_time = time.time()
+        # self.print(f"Finish cached xfer done. time: {end_time - start_time}s")
         total_end_time = time.time()
+        # torch.cuda.synchronize()
         self.print(f"Total pull from ps done: {total_end_time - total_start_time}s")
 
     def shutdown(self):
         self.client.shutdown()
 
 
-def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path):
-    model_config = OmegaConf.create({"path": model_path, "use_shm": False, "trust_remote_code": False})
+def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_config):
+    ps_model_config = OmegaConf.create(
+        {
+            "path": model_config.path,
+            "use_shm": False,
+            "trust_remote_code": False,
+        }
+    )
     ray_nodes = ray.nodes()
     ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
     nodes = [ray_nodes_sorted[-i - 1] for i in range(num_ps)]
@@ -533,13 +673,13 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path):
         ]
     )
     storage_plan = PSStoragePlan(
-        train_model_dtype=torch.bfloat16 if train_engine_type == "megatron" else torch.float32,
-        gen_model_dtype=torch.bfloat16,
+        train_model_dtype=resolve_torch_dtype(model_config.get("train_dtype", "bfloat16")),
+        gen_model_dtype=resolve_torch_dtype(model_config.get("gen_dtype", "bfloat16")),
     )
     ps_cls_with_init = PSClassWithInitArgs(
         ray.remote(PSStorageWorker),
         storage_plan,
-        model_config,
+        ps_model_config,
         psrl_config,
     )
     ps_wg = PSWorkerGroup(ps_resource_pool, ps_cls_with_init)
@@ -548,6 +688,7 @@ def create_ps_worker_group(train_engine_type, num_ps, psrl_config, model_path):
 
 @hydra.main(config_path="config", config_name="nixl_e2e", version_base=None)
 def test_nixl_e2e(cfg: DictConfig):
+    validate_parallel_config(cfg)
     log_dir = cfg.logging.path
     os.makedirs(log_dir, exist_ok=True)
     ray.init(
@@ -560,15 +701,27 @@ def test_nixl_e2e(cfg: DictConfig):
     backend = cfg.network.backend
     torch_port_train = cfg.network.torch_port_train
     torch_port_gen = cfg.network.torch_port_gen
+    # Number of train GPUs
     num_train = cfg.test.num_train
+    # Number of gen GPUs
     num_gen = cfg.test.num_gen
+    # Number of PS Nodes (align with the number of nodes used for gen)
     num_ps = math.ceil(num_gen / NUM_GPU_PER_NODE)
     ray_nodes = ray.nodes()
     ray_nodes_sorted = sorted(ray_nodes, key=lambda n: n["NodeManagerAddress"])
+    # Use the first num_train / NUM_GPU_PER_NODE nodes for train
     train_nnodes = math.ceil(num_train / NUM_GPU_PER_NODE)
+    assert len(ray_nodes_sorted) >= train_nnodes, (
+        f"Need {train_nnodes} train node(s), but Ray has {len(ray_nodes_sorted)} node(s)."
+    )
     train_nodes = [ray_nodes_sorted[i] for i in range(train_nnodes)]
+    # Use the last num_gen / NUM_GPU_PER_NODE nodes for gen
     gen_nnodes = math.ceil(num_gen / NUM_GPU_PER_NODE)
+    assert len(ray_nodes_sorted) >= gen_nnodes, (
+        f"Need {gen_nnodes} gen node(s), but Ray has {len(ray_nodes_sorted)} node(s)."
+    )
     gen_nodes = [ray_nodes_sorted[-i - 1] for i in range(gen_nnodes)]
+    # print(f"train_nodes: {train_nodes}, gen_nodes: {gen_nodes}")
     train_engine_type = cfg.test.train_engine_type
 
     psrl_config = OmegaConf.create(
@@ -589,6 +742,8 @@ def test_nixl_e2e(cfg: DictConfig):
 
     start_time = time.time()
     ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
+
+    # Create per-node PortScanner actors (required by NIXLStorageClient).
     assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
     server = MetaServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)
@@ -598,7 +753,7 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] server init done. time: {end_time - start_time}s")
 
     start_time = time.time()
-    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model.path)
+    ps_wg = create_ps_worker_group(train_engine_type, num_ps, psrl_config, cfg.model)
     ray.get(ps_wg.execute_all_async("init_model"))
     ray.get(ps_wg.execute_all_async("init_nixl_client"))
     ps_agent_names = ray.get(ps_wg.execute_all_async("get_nixl_agent_name"))
@@ -615,6 +770,7 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] ps init done. time: {end_time - start_time}s")
 
     start_time = time.time()
+    # Prepare configuration for train actors
     fsdp_hybrid_config = cfg.test.fsdp_hybrid if train_engine_type == "fsdp_hybrid" else None
     megatron_config = cfg.test.megatron if train_engine_type == "megatron" else None
 
@@ -636,6 +792,7 @@ def test_nixl_e2e(cfg: DictConfig):
             log_dir,
             ps_for_push_worker_handles,
             cfg.model.path,
+            cfg.model,
             fsdp_hybrid_config,
             megatron_config,
         )
@@ -657,6 +814,7 @@ def test_nixl_e2e(cfg: DictConfig):
             torch_port_gen,
             log_dir,
             cfg.model.path,
+            cfg.model,
             cfg.test.gen,
         )
         for rank in range(num_gen)
@@ -669,6 +827,7 @@ def test_nixl_e2e(cfg: DictConfig):
     print(f"[PASS] client init done. time: {end_time - start_time}s")
 
     start_time = time.time()
+    # Run protocol for server, clients, and PS workers
     server.protocol.remote()
     futures = []
     for t in train_actors:
@@ -718,17 +877,10 @@ def test_nixl_e2e(cfg: DictConfig):
     # Fetch and verify gen client state_dicts
     print("[CHECK] Verifying GenClientActor state_dicts are all ones...")
     gen_state_dicts = ray.get([g.get_state_dict.remote() for g in gen_actors])
-    incorrect_keys = []
     for gen_idx, state_dict in enumerate(gen_state_dicts):
-        for k, v in state_dict.items():
-            if not torch.allclose(v, torch.ones_like(v), atol=1e-6):
-                incorrect_keys.append((gen_idx, k))
-                print(f"[VERIFY] Gen client {gen_idx} param {k} is not all ones: {v}")
+        assert_state_dict_all_ones(state_dict, f"Gen client {gen_idx}")
         print(f"[PASS] Gen client {gen_idx} is all ones.")
-    if incorrect_keys:
-        print(f"[FAIL] Parameters {incorrect_keys} are not all ones")
-    else:
-        print("[PASS] All GenClientActor parameters are all ones.")
+    print("[PASS] All GenClientActor parameters are all ones.")
 
     # Shutdown all actors and Ray
     for t in train_actors:

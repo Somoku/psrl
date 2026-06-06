@@ -13,9 +13,10 @@ from vllm.model_executor.layers.linear import (
     set_weight_attrs,
 )
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from vllm.model_executor.models.qwen3_5 import Qwen3_5GatedDeltaNet
-from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
+from vllm.model_executor.models.qwen3_5 import QwenGatedDeltaNetAttention
+from vllm_patches.interfaces import supports_weight_layout
 
+from psrl.utils.converter.weight_layout_plan import PlanExecutor
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     MappingType,
@@ -54,10 +55,11 @@ def enable_sharded_weight_attrs(params: dict[str, Parameter]):
 class VllmConverter(BaseConverter):
     """Convert vLLM model to a unified format (i.e., HuggingFace) and generate sharding info."""
 
-    def __init__(self, parameter_mapping: ParameterMapping | None, tp_rank: int | None = 1):
+    def __init__(self, parameter_mapping: ParameterMapping | None, tp_rank: int | None = 0, ep_rank: int = 0):
         super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
         self.tp_rank = tp_rank
+        self.ep_rank = ep_rank
 
     def _build_fused_mappings(
         self,
@@ -103,19 +105,6 @@ class VllmConverter(BaseConverter):
 
         return fused_mappings
 
-    @staticmethod
-    def _spec_has_content(spec) -> bool:
-        return bool(spec.stacked_params or spec.expert_params or spec.extra_stacked_params)
-
-    def _build_from_spec(self, spec) -> tuple[dict, dict]:
-        """Build fused_mappings and model_info from a non-empty WeightLayoutSpec."""
-        fused = self._build_fused_mappings(
-            spec.stacked_params,
-            spec.extra_stacked_params or [],
-            spec.expert_params or [],
-        )
-        return fused, spec.packing_metadata
-
     def _build_from_parameter_mapping(self) -> tuple[dict, dict]:
         fused_mappings: dict = {}
         for vllm_name, hf_name, mapping_type, shard_id in self.parameter_mapping.get_mappings():
@@ -131,6 +120,89 @@ class VllmConverter(BaseConverter):
         model_info = self.parameter_mapping.get_model_info()
         return fused_mappings, model_info
 
+    def _convert_with_weight_layout_plan(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
+        """
+        Convert vLLM model using the unified WeightLayoutPlan from build_weight_layout().
+
+        This is the canonical conversion path for all models implementing
+        SupportsWeightLayout. Errors are NOT silenced — they propagate to the caller.
+        """
+        if not self.model_info:
+            config = getattr(model, "config", None)
+            if config is None and hasattr(model, "model"):
+                config = getattr(model.model, "config", None)
+            if config is not None:
+                from psrl.utils.converter.modeling.hf_modeling import HFParameterMapping
+
+                self.model_info = HFParameterMapping(config).get_model_info()
+
+        # Build and flatten the plan — let any error propagate
+        plan = model.build_weight_layout()
+        resolved_plan = plan.flatten()
+
+        executor = PlanExecutor(
+            resolved_plan,
+            tp_rank=self.tp_rank or 0,
+            ep_rank=self.ep_rank,
+        )
+
+        converted_state_dict: dict[str, torch.Tensor] = {}
+        sharding_dict: dict[str, NIXLSharding] = {}
+
+        for module_prefix, module in model.named_modules():
+            # ── Parameters ────────────────────────────────────────────────
+            for param_name, param in module.named_parameters(recurse=False):
+                # Skip pipeline-parallel placeholder tensors (wrong stage)
+                if getattr(param, "is_pp_missing_parameter", False):
+                    continue
+
+                full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
+
+                for converted in executor.execute(full_name, param, module):
+                    sharding = converted.sharding
+                    if sharding is None:
+                        sharding = self.get_sharding_for_param(module, param_name, full_name)
+                    converted_name = converted.name
+                    converted_param = converted.param
+                    if "visual.blocks" in converted_name and "qkv" in converted_name:
+                        converted_param = reshape_visual_block_qkv(converted_param)
+                    sharding = self._adjust_kv_sharding(
+                        converted_name, sharding, module, self.model_info
+                    )
+                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(
+                        converted_name, converted_param, sharding
+                    )
+                    converted_state_dict[converted_name] = converted_param
+                    sharding_dict[converted_name] = sharding
+
+            # ── Buffers (non-parameter registered tensors, e.g. w_kc/w_vc) ──
+            # Only export buffers that have an explicit rule in the plan —
+            # most runtime buffers (rotary caches, etc.) should be skipped.
+            for buf_name, buf in module.named_buffers(recurse=False):
+                if buf is None:
+                    continue
+                full_name = f"{module_prefix}.{buf_name}" if module_prefix else buf_name
+
+                # Only process if there's an explicit rule for this buffer
+                if not resolved_plan.matches_rules(full_name, module):
+                    continue
+
+                for converted in executor.execute(full_name, buf, module):
+                    sharding = converted.sharding
+                    if sharding is None:
+                        # Buffers are typically replicated (EP/TP handled by transform)
+                        sharding = NIXLSharding(
+                            shard_mesh=OrderedDict([(0, 1)]),
+                            shard_indices=[(0,)],
+                        )
+                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(
+                        converted.name, converted.param, sharding
+                    )
+                    converted_state_dict[converted.name] = converted_param
+                    sharding_dict[converted.name] = sharding
+
+        return converted_state_dict, sharding_dict
+
     def convert_state_and_sharding_dict(self, model) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
         """
         Convert vLLM model to unified state dict and generate sharding info.
@@ -139,36 +211,15 @@ class VllmConverter(BaseConverter):
         Returns:
             (converted_state_dict, sharding_dict)
         """
-        if isinstance(model, SupportsWeightLayoutSpec):
-            top_spec = model.get_weight_layout_spec()
-            if self._spec_has_content(top_spec):
-                # Pattern A/B/E: top-level spec is non-empty — use it directly.
-                fused_mappings, model_info = self._build_from_spec(top_spec)
-            else:
-                # Pattern C/D: top-level spec is empty.
-                # Walk sub-modules to find the first non-empty spec (Pattern D: e.g. KimiK25
-                # wrapping DeepseekV2). If none is found, all weights are already in HF format
-                # and passthrough is correct (Pattern C: e.g. Mamba, Qwen3).
-                sub_spec = next(
-                    (
-                        spec
-                        for _, m in model.named_modules()
-                        if isinstance(m, SupportsWeightLayoutSpec)
-                        and self._spec_has_content(spec := m.get_weight_layout_spec())
-                    ),
-                    None,
-                )
-                fused_mappings, model_info = self._build_from_spec(sub_spec) if sub_spec else ({}, {})
-            # Sync self.model_info so that maybe_reshape_qkv_to_3d (which reads
-            # self.model_info) sees the packing_metadata from the spec.
-            self.model_info = model_info
-        elif self.parameter_mapping is not None:
+        if supports_weight_layout(model):
+            return self._convert_with_weight_layout_plan(model)
+        if self.parameter_mapping is not None:
             fused_mappings, model_info = self._build_from_parameter_mapping()
         else:
             raise ValueError(
-                f"{type(model).__name__} does not implement SupportsWeightLayoutSpec "
+                f"{type(model).__name__} does not implement SupportsWeightLayout "
                 "and no parameter_mapping was provided. Either implement "
-                "get_weight_layout_spec() in the model, or pass parameter_mapping= "
+                "build_weight_layout() in the model, or pass parameter_mapping= "
                 "to convert_vllm_inplace()."
             )
 
@@ -199,7 +250,10 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
                 sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
-                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, sharding)
+                    adjusted_sharding = self._adjust_kv_sharding(
+                        new_param_name, sharding, module, model_info
+                    )
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, adjusted_sharding)
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
 
@@ -409,6 +463,43 @@ class VllmConverter(BaseConverter):
         # Default: No conversion needed
         return {full_name: param}
 
+    def _adjust_kv_sharding(
+        self, param_name: str, sharding: NIXLSharding, module, model_info: dict
+    ) -> NIXLSharding:
+        """Adjust sharding for K/V projection weights when KV heads are replicated.
+
+        In GQA with num_kv_heads < tp_size, vLLM replicates KV heads across TP ranks.
+        For example, with num_kv_heads=2 and tp_size=4: ranks 0,1 share KV head 0,
+        ranks 2,3 share KV head 1. The effective KV tp_size is num_kv_heads (not tp_size).
+
+        Without this adjustment, maybe_reshape_qkv_to_3d uses the full tp_size and
+        produces a 3D shape incompatible with the PS side.
+        """
+        if not isinstance(module, QKVParallelLinear):
+            return sharding
+        # Only adjust for K/V weights (not Q)
+        if not (param_name.endswith("k_proj.weight") or param_name.endswith("v_proj.weight")
+                or param_name.endswith("k_proj.bias") or param_name.endswith("v_proj.bias")):
+            return sharding
+
+        num_kv_heads = model_info.get("num_kv_heads")
+        tp_size = getattr(module, "tp_size", 1)
+        if num_kv_heads is None or tp_size <= 1 or num_kv_heads >= tp_size:
+            return sharding
+
+        # Effective KV sharding: only num_kv_heads unique partitions exist
+        effective_kv_tp = num_kv_heads
+        # num_kv_head_replicas = tp_size // num_kv_heads
+        # Each TP rank's KV partition index = tp_rank // replicas
+        num_kv_head_replicas = tp_size // num_kv_heads
+        effective_rank = self.tp_rank // num_kv_head_replicas
+
+        shard_dim = next(iter(sharding.shard_mesh.keys()))
+        return NIXLSharding(
+            shard_mesh=OrderedDict([(shard_dim, effective_kv_tp)]),
+            shard_indices=[(effective_rank,)],
+        )
+
     def get_sharding_for_param(self, module, param_name, full_name=None) -> NIXLSharding:
         """
         Generate sharding info for a parameter given its module and tp_rank.
@@ -431,7 +522,7 @@ class VllmConverter(BaseConverter):
                     VocabParallelEmbedding,
                 ),
             ):
-                if "visual.blocks" in full_name and "qkv" in full_name:
+                if full_name is not None and "visual.blocks" in full_name and "qkv" in full_name:
                     shard_dim = 1
                 else:
                     shard_dim = 0
@@ -457,7 +548,7 @@ class VllmConverter(BaseConverter):
                 tp_size = 1
                 shard_indices = [(0,)]
                 shard_dim = 0
-            elif isinstance(module, Qwen3_5GatedDeltaNet):
+            elif isinstance(module, QwenGatedDeltaNetAttention):
                 # NOTE(zym): For param dt_bias and A_log
                 shard_dim = 0
             else:
@@ -475,15 +566,16 @@ class VllmConverter(BaseConverter):
 def convert_vllm_inplace(
     model,
     tp_rank: int = 0,
+    ep_rank: int = 0,
     *,
     parameter_mapping: ParameterMapping | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, NIXLSharding]]:
     """
     Convert a vLLM model to unified HF-format state dict with NIXL sharding info.
 
-    For models implementing SupportsWeightLayoutSpec, no parameter_mapping is needed.
+    For models implementing SupportsWeightLayout, no parameter_mapping is needed.
     For custom models not yet supporting the interface, pass parameter_mapping as
     a keyword argument.
     """
-    converter = VllmConverter(parameter_mapping=parameter_mapping, tp_rank=tp_rank)
+    converter = VllmConverter(parameter_mapping=parameter_mapping, tp_rank=tp_rank, ep_rank=ep_rank)
     return converter.convert_state_and_sharding_dict(model)

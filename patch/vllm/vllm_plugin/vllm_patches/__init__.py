@@ -87,6 +87,14 @@ def register_patches():
     logger.info("Initializing vLLM Custom Patches Plugin")
     logger.info("=" * 60)
 
+    from vllm_patches.weight_layouts import (
+        install_weight_layout_registry_hook,
+        register_weight_layouts,
+    )
+
+    install_weight_layout_registry_hook()
+    register_weight_layouts()
+
     # Import and register all available patches
     from vllm_patches.patches.cuda_graph import TMSCUDAGraphWrapperPatch
     from vllm_patches.patches.cudagraph_utils import TMSCudaGraphManagerPatch

@@ -19,15 +19,22 @@ test:
     pipeline_model_parallel_size: 2
     virtual_pipeline_model_parallel_size: 1
     context_parallel_size: 1
+    expert_model_parallel_size: 1
+    expert_tensor_parallel_size: 1
   
   # Generation configuration
   gen:
     tensor_parallel_size: 2
     pipeline_parallel_size: 1
+    expert_parallel_size: 1
+    data_parallel_size: 1
 
 # Model configuration
 model:
   path: ${oc.env:PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
+  trust_remote_code: false
+  train_dtype: bfloat16
+  gen_dtype: bfloat16
 
 # Logging configuration
 logging:

@@ -8,7 +8,7 @@ from torch.distributed.tensor import DTensor
 from verl.utils.device import get_device_id
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
-from vllm.model_executor.models.interfaces import SupportsWeightLayoutSpec
+from vllm_patches.interfaces import supports_weight_layout
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
 
@@ -87,6 +87,15 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
 
         return get_tensor_model_parallel_rank()
 
+    def get_instance_local_ep_rank(self):
+        from vllm.distributed.parallel_state import get_ep_group
+
+        try:
+            return get_ep_group().rank_in_group
+        except AssertionError:
+            # EP group not initialized (non-MoE model) — default to 0
+            return 0
+
     def init_nixl_client(
         self,
         nixl_config: DictConfig,
@@ -121,12 +130,13 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             vllm_model = vllm_model.unwrap()
         param_mapping = (
             None
-            if isinstance(vllm_model, SupportsWeightLayoutSpec)
+            if supports_weight_layout(vllm_model)
             else create_parameter_mapping(type(vllm_model), model_config)
         )
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
             vllm_model,
             tp_rank=self.get_instance_local_tp_rank(),
+            ep_rank=self.get_instance_local_ep_rank(),
             parameter_mapping=param_mapping,
         )
 

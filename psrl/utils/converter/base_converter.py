@@ -25,7 +25,7 @@ class BaseConverter(ABC):
 
         Args:
             parameter_mapping (ParameterMapping | None): Parameter mapping for the model.
-                When None (e.g. for models implementing SupportsWeightLayoutSpec),
+                When None (e.g. for models implementing SupportsWeightLayout),
                 model_info is populated lazily by the subclass during conversion.
         """
         self.model_info = parameter_mapping.get_model_info() if parameter_mapping is not None else {}
@@ -83,6 +83,8 @@ class BaseConverter(ABC):
         """
         num_heads = self.model_info.get("num_heads")
         if num_heads is None or not is_qkv_weight(param_name) or param.ndim not in (1, 2):
+            return param, sharding
+        if self.model_info.get("uses_mla_attention") and is_q_weight(param_name):
             return param, sharding
 
         num_kv_heads = self.model_info["num_kv_heads"]
@@ -148,14 +150,29 @@ class BaseConverter(ABC):
                 f"FSDP world size ({ws}) is not divisible by G_global={G_global} for {param_name}."
             )
             steps = ws // G_global
-            reshaped = make_slice_parameter(param.data.reshape(1, rows, H), param)
-            new_sharding = NIXLSharding(
-                shard_mesh=OrderedDict([(0, G_global), (1, steps)]),
-                shard_indices=[(rank // steps, rank % steps)],
-            )
             if attn_output_gate and is_q_weight(param_name):
-                raise NotImplementedError(
-                    "attn_output_gate is not supported for fine-grained sharding (Case C)"
+                # 5D reshape for Q with attn_output_gate in fine-grained Case C.
+                # Each rank holds (rows / ws) of the full Q weight, which is a fraction
+                # of one group's Q heads. Reshape the local slice into 5D:
+                #   (1, rows, H) → (1, q_heads_per_group_local, 2, head_size, H)
+                # where q_heads_per_group_local = rows / (2 * head_size).
+                assert rows % (2 * head_size) == 0, (
+                    f"rows={rows} must be divisible by 2*head_size={2 * head_size} "
+                    f"for attn_output_gate 5D reshape in Case C for {param_name}."
+                )
+                q_heads_per_group_local = rows // (2 * head_size)
+                reshaped = make_slice_parameter(
+                    param.data.reshape(1, q_heads_per_group_local, 2, head_size, H), param
+                )
+                new_sharding = NIXLSharding(
+                    shard_mesh=OrderedDict([(0, G_global), (1, steps)]),
+                    shard_indices=[(rank // steps, rank % steps)],
+                )
+            else:
+                reshaped = make_slice_parameter(param.data.reshape(1, rows, H), param)
+                new_sharding = NIXLSharding(
+                    shard_mesh=OrderedDict([(0, G_global), (1, steps)]),
+                    shard_indices=[(rank // steps, rank % steps)],
                 )
 
         return reshaped, new_sharding

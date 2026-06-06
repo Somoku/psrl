@@ -1,4 +1,7 @@
 #!/bin/bash
+set -e
+set -o pipefail
+trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 # Function: Install cuDNN and set CUDNN_PATH if not already installed or version is too low
 install_cudnn() {
@@ -52,9 +55,18 @@ echo "Notice: TransformerEngine installation can take a long time, please be pat
 NVTE_FRAMEWORK=pytorch python -m pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
 
 echo "3. Install Megatron"
-python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@b2a8ec7 --no-deps --no-build-isolation
+python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@d23ca85 --no-deps --no-build-isolation
 
-echo "4. Install mbridge"
-python -m pip install git+https://github.com/NVIDIA-NeMo/Megatron-Bridge.git@0a21da4 --no-deps --no-build-isolation
+echo "4. Install Megatron-Bridge"
+pushd $THIRD_PARTY_PATH
+git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+cd Megatron-Bridge
+git checkout 94d1870
+python -m uv pip install -e .
+popd
+
+pushd $PSRL_PATH/patch/megatron-bridge
+bash apply_patch.sh
+popd
 
 echo "Successfully installed all packages for Megatron"

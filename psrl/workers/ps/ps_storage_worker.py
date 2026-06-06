@@ -18,10 +18,6 @@ from psrl.utils.converter.hf_converter import (
     convert_hf_inplace,
     maybe_convert_to_smaller_parts
 )
-from psrl.utils.converter.model_mappings import (
-    slice_attn_conv1d,
-    slice_qwen3_5_in_proj_qkv,
-)
 from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.nixl import (
     NIXLClientType,
@@ -31,6 +27,16 @@ from psrl.utils.nixl import (
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
 
+
+# PSRL-maintained fallback fp32 patterns for models whose HuggingFace definitions
+# do not (yet) declare _keep_in_fp32_modules_strict. Keyed by substrings of the
+# model class name; matched against any module class in the model hierarchy.
+FP32_PATTERNS: dict[str, list[str]] = {
+    # Qwen3.5 / Qwen3-Next GDN (Gated DeltaNet) parameters:
+    # A_log is a logarithmic decay term in the recurrence that vLLM explicitly
+    # stores in float32 for numerical stability.
+    "Qwen3_5": ["A_log"],
+}
 
 # TODO(lhy): Implement the PSStoragePlan
 # support zero/half/full redundancy for PSStorageWorker
@@ -312,6 +318,12 @@ class PSStorageWorker:
                         torch_dtype=self.storage_plan.gen_model_dtype,
                         trust_remote_code=self.model_config.get("trust_remote_code", False),
                     )
+            # Fix per-parameter dtypes: from_config(torch_dtype=X) uniformly casts all
+            # parameters, but some (e.g., router bias in DeepSeekV3) must stay float32.
+            # Use HF model's _keep_in_fp32_modules_strict / _keep_in_fp32_modules to identify them.
+            self._fix_meta_model_dtypes(self.train_meta_hf_model)
+            if not self.storage_plan.train_gen_model_share():
+                self._fix_meta_model_dtypes(self.gen_meta_hf_model)
         else:
             raise ValueError(f"Invalid PS mode: {self.psrl_config.ps_mode}")
 
@@ -383,6 +395,97 @@ class PSStorageWorker:
                 return set(f.keys())
 
         raise FileNotFoundError(f"No safetensors checkpoint found under '{local_path}' for key scanning.")
+
+    @staticmethod
+    def _fix_meta_model_dtypes(meta_model: torch.nn.Module) -> None:
+        """Correct per-parameter dtypes on the meta model for architecturally-constrained params.
+
+        ``from_config(torch_dtype=X)`` uniformly casts all parameters to dtype X.
+        However, some parameters are architecturally constrained to float32 (e.g.,
+        DeepSeekV3's ``e_score_correction_bias`` for router scoring precision).
+
+        This method uses the same mechanism as HuggingFace Transformers:
+        - ``_keep_in_fp32_modules_strict``: parameter name substrings that must always
+          stay in float32, regardless of the user-specified dtype (bf16 or fp16).
+        - ``_keep_in_fp32_modules``: parameter name substrings that must stay in float32
+          only when the user-specified dtype is fp16 (not bf16).
+
+        These attributes are read directly from the HuggingFace model class (e.g.,
+        ``DeepseekV3ForCausalLM._keep_in_fp32_modules_strict = ["e_score_correction_bias"]``).
+        """
+        # Collect fp32 module patterns from the model class hierarchy (same as transformers)
+        keep_in_fp32_strict: set[str] = set()
+        keep_in_fp32: set[str] = set()
+
+        for module in meta_model.modules():
+            if patterns := getattr(module, "_keep_in_fp32_modules_strict", None):
+                keep_in_fp32_strict.update(patterns)
+            if patterns := getattr(module, "_keep_in_fp32_modules", None):
+                keep_in_fp32.update(patterns)
+
+        # PSRL fallback: supplement with patterns for models that don't define
+        # _keep_in_fp32_modules_strict in their HuggingFace class definition.
+        for module in meta_model.modules():
+            cls_name = type(module).__name__
+            for key, patterns in PSStorageWorker.FP32_PATTERNS.items():
+                if key in cls_name:
+                    keep_in_fp32_strict.update(patterns)
+
+        if not keep_in_fp32_strict and not keep_in_fp32:
+            return
+
+        # Determine which patterns apply based on the model's current dtype
+        # (which is the user-specified torch_dtype from from_config)
+        sample_param = next(meta_model.parameters(), None)
+        if sample_param is None:
+            return
+        current_dtype = sample_param.dtype
+
+        patterns_to_fix: set[str] = set()
+        # _keep_in_fp32_modules_strict: always upcast to fp32 for both fp16 and bf16
+        if current_dtype in (torch.float16, torch.bfloat16):
+            patterns_to_fix.update(keep_in_fp32_strict)
+        # _keep_in_fp32_modules: only upcast to fp32 for fp16 (not bf16)
+        if current_dtype == torch.float16:
+            patterns_to_fix.update(keep_in_fp32)
+
+        if not patterns_to_fix:
+            return
+
+        # Fix matching parameters and buffers
+        fixed_count = 0
+
+        # Fix parameters
+        for param_name, param in meta_model.named_parameters():
+            if param.dtype == torch.float32:
+                continue
+            if any(pattern in param_name for pattern in patterns_to_fix):
+                new_data = torch.empty(param.shape, dtype=torch.float32, device=param.device)
+                param.data = new_data
+                fixed_count += 1
+
+        # Fix buffers (e.g., e_score_correction_bias is a buffer in HF DeepseekV3)
+        for buf_name, buf in meta_model.named_buffers():
+            if buf is None or buf.dtype == torch.float32:
+                continue
+            if any(pattern in buf_name for pattern in patterns_to_fix):
+                # For buffers, we need to re-register on the owning module
+                parts = buf_name.rsplit(".", 1)
+                if len(parts) == 2:
+                    parent_path, attr_name = parts
+                    parent_module = meta_model.get_submodule(parent_path)
+                else:
+                    attr_name = parts[0]
+                    parent_module = meta_model
+                new_buf = torch.empty(buf.shape, dtype=torch.float32, device=buf.device)
+                parent_module.register_buffer(attr_name, new_buf)
+                fixed_count += 1
+
+        if fixed_count > 0:
+            psrl_logger.info(
+                f"_fix_meta_model_dtypes: corrected {fixed_count} parameter(s) to float32 "
+                f"(patterns: {patterns_to_fix})."
+            )
 
     # ------------------------------------------------------------------
     # Post-protocol weight loading

@@ -631,6 +631,9 @@ class ParameterMapping(ABC):
                 return getattr(obj, name)
             return getattr(obj, name, default)
 
+        def _is_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
         num_heads = _get_attr(text_cfg, "num_attention_heads")
         hidden_size = _get_attr(text_cfg, "hidden_size")
         intermediate_size = _get_attr(text_cfg, "intermediate_size", None)
@@ -640,7 +643,22 @@ class ParameterMapping(ABC):
         if attn_output_gate:
             num_heads *= 2
 
+        qk_nope_head_dim = _get_attr(text_cfg, "qk_nope_head_dim", None)
+        qk_rope_head_dim = _get_attr(text_cfg, "qk_rope_head_dim", None)
+        v_head_dim = _get_attr(text_cfg, "v_head_dim", None)
+        kv_lora_rank = _get_attr(text_cfg, "kv_lora_rank", None)
+        q_lora_rank = _get_attr(text_cfg, "q_lora_rank", None)
+
+        uses_mla_attention = (
+            _is_int(qk_nope_head_dim)
+            and _is_int(qk_rope_head_dim)
+            and _is_int(kv_lora_rank)
+            and (qk_nope_head_dim + qk_rope_head_dim) > 0
+        )
+
         head_size = _get_attr(text_cfg, "head_dim", None)
+        if head_size is None and uses_mla_attention:
+            head_size = qk_nope_head_dim + qk_rope_head_dim
         if head_size is None:
             head_size = hidden_size // num_heads
 
@@ -650,7 +668,37 @@ class ParameterMapping(ABC):
             "head_size": head_size,
             "intermediate_size": intermediate_size,
             "attn_output_gate": attn_output_gate,
+            "uses_mla_attention": uses_mla_attention,
         }
+
+        if uses_mla_attention:
+            info.update(
+                {
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_head_dim": qk_nope_head_dim + qk_rope_head_dim,
+                    "v_head_dim": v_head_dim,
+                    "kv_lora_rank": kv_lora_rank,
+                    "q_lora_rank": q_lora_rank,
+                }
+            )
+
+        num_experts = _get_attr(text_cfg, "num_experts", None)
+        if num_experts is None:
+            num_experts = _get_attr(text_cfg, "n_routed_experts", None)
+        moe_intermediate_size = _get_attr(text_cfg, "moe_intermediate_size", None)
+        n_shared_experts = _get_attr(text_cfg, "n_shared_experts", None)
+        shared_expert_intermediate_size = _get_attr(text_cfg, "shared_expert_intermediate_size", None)
+        if num_experts is not None:
+            info["num_experts"] = num_experts
+        if moe_intermediate_size is not None:
+            info["moe_intermediate_size"] = moe_intermediate_size
+        if n_shared_experts is not None:
+            info["n_shared_experts"] = n_shared_experts
+        if shared_expert_intermediate_size is not None:
+            info["shared_expert_intermediate_size"] = shared_expert_intermediate_size
+        elif moe_intermediate_size is not None and n_shared_experts is not None:
+            info["shared_expert_intermediate_size"] = moe_intermediate_size * n_shared_experts
 
         linear_num_key_heads = _get_attr(text_cfg, "linear_num_key_heads", None)
         linear_key_head_dim = _get_attr(text_cfg, "linear_key_head_dim", None)
@@ -675,6 +723,23 @@ class ParameterMapping(ABC):
                     "linear_value_dim": linear_num_value_heads * linear_value_head_dim,
                 }
             )
+
+        vision_cfg = _get_attr(cfg, "vision_config", None)
+        if vision_cfg is not None:
+            vision_num_heads = _get_attr(vision_cfg, "num_heads", None)
+            vision_hidden_size = _get_attr(vision_cfg, "hidden_size", None)
+            vision_head_size = _get_attr(vision_cfg, "head_dim", None)
+            if (
+                vision_head_size is None
+                and _is_int(vision_num_heads)
+                and _is_int(vision_hidden_size)
+            ):
+                vision_head_size = vision_hidden_size // vision_num_heads
+            if _is_int(vision_num_heads):
+                info["vision_num_heads"] = vision_num_heads
+                info["vision_num_kv_heads"] = _get_attr(vision_cfg, "num_key_value_heads", vision_num_heads)
+            if _is_int(vision_head_size):
+                info["vision_head_size"] = vision_head_size
 
         return info
 

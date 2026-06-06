@@ -22,17 +22,21 @@ psrl_logger = logging.getLogger(__name__)
 class SessionState:
     """Local concurrency state for one TITO session."""
 
+    headers: dict[str, str] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     drained: asyncio.Event = field(default_factory=asyncio.Event)
     closing: bool = False
     inflight: int = 0
     turn: int = 0
+    base_worker_id: str | None = None
+    target_dp_rank: str | None = None
 
     def __post_init__(self) -> None:
         if self.inflight == 0:
             self.drained.set()
         else:
             self.drained.clear()
+
 
 class SessionRouter:
     def __init__(
@@ -64,16 +68,25 @@ class SessionRouter:
         if self.client is not None and not self.client.closed:
             await self.client.close()
 
-    async def create_session(self) -> Response:
+    async def create_session(self, request: Request) -> Response:
         result = await self._request_upstream("POST", TITO_SESSIONS_PATH)
         if result.status < 400:
             session_id = self.extract_session_id(result)
             if session_id is not None:
-                await self._ensure_state(session_id)
+                state = await self._ensure_state(session_id)
+                async with state.lock:
+                    state.headers = self.session_headers(request.headers)
         return self.build_response(result)
 
     async def get_session(self, sid: str) -> Response:
         result = await self._request_upstream("GET", f"{TITO_SESSIONS_PATH}/{sid}")
+        state = self.states.get(sid)
+        if state is not None:
+            async with state.lock:
+                if state.base_worker_id is not None:
+                    result.headers["x-base-worker-id"] = state.base_worker_id
+                if state.target_dp_rank is not None:
+                    result.headers["x-target-dp-rank"] = state.target_dp_rank
         return self.build_response(result)
 
     async def delete_session(self, sid: str) -> Response:
@@ -96,17 +109,23 @@ class SessionRouter:
             if state.closing:
                 return JSONResponse(status_code=409, content={"error": "session is closing"})
             expected_turn = state.turn
+            session_headers = state.headers
+            base_worker_id = state.base_worker_id
+            target_dp_rank = state.target_dp_rank
             state.inflight += 1
             state.drained.clear()
 
-        body_bytes = await request.body()
-        headers = self.add_session_headers(request, sid)
+        headers = self.add_session_headers(request, sid, session_headers)
+        if base_worker_id is not None:
+            headers["x-base-worker-id"] = base_worker_id
+        if target_dp_rank is not None:
+            headers["x-target-dp-rank"] = target_dp_rank
         result: HttpResponse | None = None
         try:
             result = await self._request_upstream(
                 "POST",
                 "v1/chat/completions",
-                content=body_bytes,
+                content=await request.body(),
                 headers=headers,
             )
         finally:
@@ -117,6 +136,11 @@ class SessionRouter:
                 if state.inflight == 0:
                     state.drained.set()
                 if result is not None and result.status < 400:
+                    base_worker_id = result.headers.get("x-base-worker-id")
+                    target_dp_rank = result.headers.get("x-target-dp-rank")
+                    if base_worker_id is not None and target_dp_rank is not None:
+                        state.base_worker_id = base_worker_id
+                        state.target_dp_rank = target_dp_rank
                     if state.turn != expected_turn:
                         psrl_logger.warning(
                             "SessionRouter stale write detected for sid=%s expected_turn=%s current_turn=%s.",
@@ -129,7 +153,10 @@ class SessionRouter:
         return self.build_response(result)
 
     async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
-        headers = self.add_session_headers(request, sid)
+        state = await self._ensure_state(sid)
+        async with state.lock:
+            session_headers = state.headers
+        headers = self.add_session_headers(request, sid, session_headers)
         result = await self._request_upstream(
             request.method,
             path,
@@ -220,8 +247,28 @@ class SessionRouter:
         return session_id if isinstance(session_id, str) else None
 
     @staticmethod
-    def add_session_headers(request: Request, sid: str) -> dict[str, str]:
+    def session_headers(headers) -> dict[str, str]:
+        """Capture immutable routing metadata supplied when a session is created."""
+        allowed = {
+            "x-base-worker-id",
+            "x-is-sticky",
+            "x-is-validate",
+            "x-prompt-id",
+            "x-request-id",
+            "x-smg-tito-trajectory-id",
+            "x-target-dp-rank",
+            "x-version-tag",
+        }
+        return {key.lower(): value for key, value in headers.items() if key.lower() in allowed}
+
+    @staticmethod
+    def add_session_headers(
+        request: Request,
+        sid: str,
+        session_headers: dict[str, str] | None = None,
+    ) -> dict[str, str]:
         headers = filter_http_headers(request.headers)
+        headers.update(session_headers or {})
         headers["x-smg-tito-session-id"] = sid
         headers.setdefault("x-smg-tito-trajectory-id", "0")
         return headers

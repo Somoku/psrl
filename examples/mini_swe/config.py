@@ -5,7 +5,7 @@ Dataclass-based config for the mini-SWE-agent integration. These configs
 control the PSRL-side orchestration (sandbox timeouts, parallelism, templates).
 mini-swe-agent's own components (`DockerEnvironment`, `DefaultAgent`,
 `LitellmTextbasedModel`) are configured directly via their Python APIs
-in the agent loop -- no YAML generation is needed.
+in the black-box runner -- no YAML generation is needed.
 """
 
 from __future__ import annotations
@@ -30,9 +30,10 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 @dataclass
 class MiniEnvironmentConfig:
     """
-    Docker environment settings passed to `DockerEnvironment(**kwargs)`.
+    Environment settings passed to mini-swe-agent's `get_environment()`.
     """
 
+    environment_class: str = "docker"
     image: str = "python:3.11-slim"
     cwd: str = "/testbed"
     env: dict = field(
@@ -72,19 +73,10 @@ class MiniSandboxConfig:
     max_parallel_tasks_per_worker: int = 0
     environment: MiniEnvironmentConfig = field(default_factory=MiniEnvironmentConfig)
 
-    # Per-turn rollout timeout (seconds).  The generation loop wraps each
-    # `generate_async` call in `asyncio.wait_for(timeout=rollout_turn_timeout)`.
-    # When this fires it sends `_TerminateSignal("RolloutError")` to the agent
-    # thread so the thread exits cleanly instead of blocking on `query_timeout`.
-    #
-    # Must be strictly less than `query_timeout` so the generation loop always
-    # classifies a silent routing failure before the agent thread does.
+    # Per-turn timeout forwarded to mini-swe-agent's model client.
     rollout_turn_timeout: int = 480
 
-    # Timeout (seconds) for the agent thread's blocking `res_q.get()` call.
-    # This is a last-resort safety net: in the fixed code the generation loop
-    # always notifies the agent before this fires.  Set it higher than
-    # `rollout_turn_timeout` to give the generation loop time to act first.
+    # Legacy queue-bridge loop compatibility.
     query_timeout: int = 600
 
 
@@ -110,13 +102,14 @@ class MiniAgentConfig:
 @dataclass
 class MiniModelConfig:
     """
-    Model format settings forwarded to `LitellmTextbasedModel` during training
-    (via `_PSRLModel`) and to `get_model()` during standalone eval.
+    Model format settings forwarded to mini-swe-agent's `get_model()` during
+    session-routed training and standalone eval.
 
     Defaults match `LitellmTextbasedModelConfig` class-level defaults so that
     omitting this section from a YAML config is fully backwards-compatible.
 
     Fields:
+        model_class: mini-swe-agent model implementation name or import path.
         action_regex: Regex applied to the model's text output to extract the
             shell command.  Change this to switch action formats, e.g.
             ``"```bash\\\\s*\\\\n(.*?)\\\\n```"`` for a plain bash block.
@@ -127,6 +120,7 @@ class MiniModelConfig:
             ``action_regex`` finds 0 or >1 matches.
     """
 
+    model_class: str = "litellm_textbased"
     action_regex: str = r"```mswea_bash_command\s*\n(.*?)\n```"
     observation_template: str = (
         "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}"

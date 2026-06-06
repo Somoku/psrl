@@ -1,13 +1,9 @@
 - name: mini_swe_agent
-  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
+  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop_v1.MiniSWEAgentLoopV1
   sandbox_config:
     max_parallel_tasks_per_worker: 0  # No limit on parallel tasks per worker.
-    # Per-turn rollout timeout (s). Must be < query_timeout so the generation
-    # loop always signals the agent before the agent's own queue wait fires.
+    # Per-turn timeout forwarded to mini-swe-agent's model client.
     rollout_turn_timeout: 2400
-    # Last-resort timeout (s) for the agent thread's res_q.get() call.
-    # Set higher than rollout_turn_timeout so the generation loop acts first.
-    query_timeout: 3600
     environment:
       # NOTE(lhy): image is intentionally left as a sentinel here.
       # Each SWE problem overrides it via extra_info.sandbox_overrides.environment.image,
@@ -195,7 +191,7 @@
       </instructions>
   model:
     # Action format used during training and eval.
-    # Both training (_PSRLModel) and standalone eval (eval_swebench.py) read
+    # Both session-routed training and standalone eval (eval_swebench.py) read
     # from this section, so editing one place changes both.
     action_regex: "```bash\\s*\\n(.*?)\\n```"
     observation_template: |

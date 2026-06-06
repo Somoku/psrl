@@ -20,12 +20,12 @@ Three training paths are supported:
 The training loop works as follows:
 
 1. **Data**: Each training sample contains a problem statement and grading metadata.
-2. **Rollout**: For each sample, mini-SWE-agent's `DefaultAgent` runs **in-process**
-   (in a worker thread). It manages a Docker container and has the model interact
-   with the codebase by running bash commands.
-3. **Model Bridge**: A custom `_PSRLModel` (inheriting `LitellmTextbasedModel`)
-   intercepts every `query()` call and routes generation through PSRL's vLLM
-   rollout engine via thread-safe queues — no HTTP proxy, no subprocess.
+2. **Rollout**: For each sample, PSRL dispatches one task to a local black-box
+   runner function. The runner owns mini-SWE-agent, Docker, and grading.
+3. **Model Routing**: PSRL creates one SMG TITO session per episode and gives
+   mini-swe-agent the session-scoped OpenAI-compatible URL. mini-swe-agent then
+   runs through its normal inference path, while SMG captures training tokens,
+   masks, logprobs, and routed experts.
 4. **Grading** (SWE-smith / SWE-Gym path): After the agent submits a patch, a fresh Docker
    container runs the SWE problem's FAIL_TO_PASS and PASS_TO_PASS tests.
 5. **Reward**: Score is computed from the grading result (or patch-text overlap for
@@ -38,7 +38,7 @@ The training loop works as follows:
 └──────────────────────┬──────────────────────────────┘
                        │  per-episode
           ┌────────────┴────────────┐
-          │  MiniSWEAgentLoop.run() │
+          │ MiniSWEAgentLoopV1.run()│
           │  (async event loop)     │
           └────────────┬────────────┘
                        │
@@ -46,14 +46,13 @@ The training loop works as follows:
      │                 │                  │
      ▼                 ▼                  ▼
 ┌──────────┐   ┌──────────────┐   ┌────────────────────┐
-│  Docker  │   │ _PSRLModel   │   │ DefaultAgent.run() │
-│container │   │ .query()     │◄──│ (worker thread)    │
-│(rollout) │   │(queue bridge)│   └────────────────────┘
-└──────────┘   └──────┬───────┘
-                      │
-               ┌──────┴───────┐
-               │ vLLM generate│
-               └──────┬───────┘
+│  Docker  │   │ SMG Session  │◄──│ mini-swe runner    │
+│container │   │ Router + TITO│   │ Python bindings    │
+│(rollout) │   └──────┬───────┘   └────────────────────┘
+└──────────┘          │
+               ┌─────┴────────┐
+               │ vLLM rollout │
+               └─────┬────────┘
                       │
                ┌──────┴────────────────┐
                │ grade_fresh_container │  ← SWE-smith / SWE-Gym paths
@@ -73,10 +72,12 @@ The training loop works as follows:
 examples/mini_swe/
 ├── README.md                             # This file
 ├── config.py                             # Runtime config dataclasses
+├── runner.py                             # Black-box mini-swe/Docker/grader runner
 ├── reward.py                             # Reward function (patch-overlap + test-execution)
 ├── swebench_grader.py                    # Fresh-container grader for SWE-smith / SWE-Gym / Verified (shared by training + eval)
 ├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset
 ├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (real RL)
+├── fsdp_qwen_7b_swe_smith_v1.sh          # Session-router/TITO v1 end-to-end entry point
 ├── fsdp_qwen_7b_swe_gym.sh               # Launch script — SWE-Gym (real RL, FSDP)
 ├── megatron_qwen_7b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 7B)
 ├── megatron_qwen_8b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 8B)
@@ -110,7 +111,9 @@ examples/mini_swe/
         └── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
 
 # Core integration modules inside psrl/
-psrl/workers/agent_loop/loops/mini_swe_agent_loop.py      # MiniSWEAgentLoop + _PSRLModel
+psrl/workers/agent_loop/loops/session_agent_loop.py       # Shared SessionRouter/TITO lifecycle
+psrl/workers/agent_loop/loops/mini_swe_agent_loop_v1.py   # Session-router/TITO black-box loop
+psrl/workers/agent_loop/loops/mini_swe_agent_loop.py      # Legacy queue-bridge loop
 psrl/workers/agent_loop/agent_data/mini_swe_agent_data.py # MiniSWEAgentData
 psrl/environments/mini_swe_env.py                         # MiniSWEEnvironment
 ```
@@ -417,36 +420,26 @@ which is written by `prepare_swebench.py`.
 
 ## Architecture: How It Works
 
-### _PSRLModel (in-process model bridge)
+### Session-routed black-box execution
 
-`_PSRLModel` inherits `LitellmTextbasedModel` and overrides only `query()`.
-When mini-swe-agent's `DefaultAgent` calls `model.query(messages)`:
+1. PSRL creates one TITO session and builds
+   `/sessions/{session_id}/v1` as mini-swe-agent's API base.
+2. The loop sends the session URL, task, sampling parameters, and runtime config
+   to the local black-box `runner.py` function.
+3. The runner uses mini-swe-agent's normal Python bindings. Session router
+   injects immutable TITO/PSRL routing headers and forwards each request body
+   unchanged to SMG.
+4. After mini-swe-agent exits, PSRL fetches the session once and converts the
+   captured trajectory into canonical training arrays.
+5. PSRL deletes the TITO session and removes rollout Docker containers in
+   `finally` cleanup.
 
-1. `_PSRLModel.query()` puts messages into a `request_queue` (thread-safe).
-2. The async generation loop picks up the request.
-3. PSRL's vLLM generates a response; the turn is recorded in `MiniSWEAgentData`.
-4. The response text is put into `response_queue`.
-5. `_PSRLModel.query()` returns the response to `DefaultAgent`.
+### Runner execution
 
-Inherited from `LitellmTextbasedModel`:
-- `format_observation_messages()` — renders Docker command output as observations.
-- `_parse_actions()` — extracts bash commands from `mswea_bash_command` blocks.
-- `format_message()` — formats system/user messages.
-
-### Thread bridging
-
-mini-swe-agent's `DefaultAgent.run()` is synchronous; PSRL's rollout is async.
-
-- `DefaultAgent.run(task)` runs in `_AGENT_THREAD_POOL` (32 threads, separate from
-  the default asyncio executor to avoid deadlocks with `asyncio.to_thread`).
-- `DockerEnvironment` is created in the worker thread (container starts on `__init__`).
-- The async loop polls `request_queue` and feeds `response_queue`.
-- `_PSRLModel.query()` blocks on `response_queue` with a 600 s timeout.
-
-After the rollout completes, for SWE-smith/SWE-Gym/Verified SWE problems, a second
-container is started from the same image via `_GRADER_THREAD_POOL` (separate
-16-thread pool) to run `grade_fresh_container` before the rollout container is
-cleaned up.
+The runner uses mini-swe-agent's official Python bindings and runs in a bounded,
+dedicated worker-thread pool. This keeps Docker rollout distributed with PSRL's
+AgentLoopWorkers, avoids a task-level HTTP hop or centralized agent-server
+bottleneck, and leaves the default executor available for timeout cleanup.
 
 ---
 

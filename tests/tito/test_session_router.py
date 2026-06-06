@@ -31,11 +31,18 @@ async def mock_delete(sid: str):
 
 @mock_smg.post("/v1/chat/completions")
 async def mock_chat(request: Request):
-    body = json.loads(await request.body())
+    raw_body = await request.body()
+    body = json.loads(raw_body)
     headers = dict(request.headers)
+    captured["chat_raw_body"] = raw_body
     captured["chat_body"] = body
     captured["chat_headers"] = headers
-    return {"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
+    response_body = json.dumps({"choices": [{"message": {"role": "assistant", "content": "hi"}}]})
+    return FastAPIResponse(
+        content=response_body,
+        media_type="application/json",
+        headers={"x-base-worker-id": "worker-a", "x-target-dp-rank": "2"},
+    )
 
 
 @mock_smg.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -72,11 +79,12 @@ def client(router):
 # Tests
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_create_session(client):
-    resp = await client.post("/sessions")
+async def test_create_session(client, router):
+    resp = await client.post("/sessions", headers={"x-request-id": "request-1", "x-unrelated": "ignored"})
     assert resp.status_code == 200
     data = resp.json()
     assert data["session_id"] == "test-sid-123"
+    assert router.states["test-sid-123"].headers == {"x-request-id": "request-1"}
 
 
 @pytest.mark.asyncio
@@ -95,24 +103,35 @@ async def test_delete_session(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_forces_logprobs(client):
-    payload = {"model": "my-model", "messages": [{"role": "user", "content": "hi"}]}
-    resp = await client.post("/sessions/sid-abc/v1/chat/completions", json=payload)
+async def test_chat_completions_preserves_body(client):
+    raw_body = b'{"model":"my-model","messages":[],"logprobs":false,"stream":true}'
+    resp = await client.post(
+        "/sessions/sid-abc/v1/chat/completions",
+        content=raw_body,
+        headers={"content-type": "application/json"},
+    )
     assert resp.status_code == 200
-
-    # The body forwarded to mock SMG must have logprobs=True
-    assert captured["chat_body"]["logprobs"] is True
-    # Original fields preserved
-    assert captured["chat_body"]["model"] == "my-model"
+    assert captured["chat_raw_body"] == raw_body
 
 
 @pytest.mark.asyncio
-async def test_chat_completions_overrides_logprobs_false(client):
-    """Even if the caller explicitly sets logprobs=false, the router forces True."""
-    payload = {"model": "m", "messages": [], "logprobs": False}
-    resp = await client.post("/sessions/sid-abc/v1/chat/completions", json=payload)
-    assert resp.status_code == 200
-    assert captured["chat_body"]["logprobs"] is True
+async def test_chat_completions_injects_session_metadata(client):
+    await client.post(
+        "/sessions",
+        headers={
+            "x-is-sticky": "true",
+            "x-request-id": "request-1",
+            "x-smg-tito-trajectory-id": "7",
+        },
+    )
+    await client.post(
+        "/sessions/test-sid-123/v1/chat/completions",
+        json={"model": "m", "messages": []},
+        headers={"x-request-id": "cannot-override"},
+    )
+    assert captured["chat_headers"]["x-is-sticky"] == "true"
+    assert captured["chat_headers"]["x-request-id"] == "request-1"
+    assert captured["chat_headers"]["x-smg-tito-trajectory-id"] == "7"
 
 
 @pytest.mark.asyncio
@@ -129,3 +148,16 @@ async def test_session_proxy_injects_header(client):
     assert resp.status_code == 200
     assert captured["proxy_headers"]["x-smg-tito-session-id"] == "sid-999"
     assert captured["proxy_path"] == "v1/some/other/endpoint"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_pins_worker_for_session(client):
+    payload = {"model": "m", "messages": []}
+    await client.post("/sessions/sid-sticky/v1/chat/completions", json=payload)
+    await client.post("/sessions/sid-sticky/v1/chat/completions", json=payload)
+    assert captured["chat_headers"]["x-base-worker-id"] == "worker-a"
+    assert captured["chat_headers"]["x-target-dp-rank"] == "2"
+
+    resp = await client.get("/sessions/sid-sticky")
+    assert resp.headers["x-base-worker-id"] == "worker-a"
+    assert resp.headers["x-target-dp-rank"] == "2"

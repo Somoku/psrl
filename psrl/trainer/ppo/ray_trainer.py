@@ -2480,6 +2480,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert resume_paths is not None, "Resume checkpoint paths are not resolved"
 
         actor_path, _ = resume_paths
+        resume_version = int(actor_path.split("global_step_")[-1].split("/")[0])
 
         if not self.is_rollout_mode_in_actor:
             # Path A: actor NIXL is live; load checkpoint then push.
@@ -2491,6 +2492,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     actor_path,
                     del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
                 )
+                # Pre-initialize PS version so push_model advances to the correct version
+                ray.get(self.ps_manager_handle.init_model_version_for_resume.remote(resume_version - 1))
                 psrl_logger.info("Resume (Path A): pushing resume weights to PS...")
                 ray.get(self.actor_wg.execute_all_async("push_model"))
                 psrl_logger.info("Resume (Path A): PS now holds resume checkpoint weights.")
@@ -2508,6 +2511,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     actor_path,
                     del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
                 )
+                # Pre-initialize PS version so push_model advances to the correct version
+                ray.get(self.ps_manager_handle.init_model_version_for_resume.remote(resume_version - 1))
                 psrl_logger.info("Resume (Path B): pushing resume weights to PS...")
                 ray.get(self.actor_wg.execute_all_async("push_model"))
                 # Sleep with "full" mode: release GPU memory AND deregister NIXL.
@@ -3079,6 +3084,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # AGENT(VERL): PSRL specific initialization process
         self.init_agent_loop_manager()
 
+        # Initialize agent loop manager with the resume version so it can correctly
+        # compute expected PS versions and avoid dispatching data with stale version tags
+        if self.global_steps > 0:
+            ray.get(self.agent_loop_manager.set_initial_ps_version.remote(self.global_steps))
+
         futures = []
         futures.append(self.data_processor.set_agent_loop_manager.remote(self.agent_loop_manager))
         for agent_loop_worker in self.agent_loop_workers:
@@ -3170,7 +3180,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # verl will handle gen batch processing and generation here.
                 with marked_timer("wait_for_gen", timing_raw, color="gray"):
                     if not self.config.psrl.colocate:
-                        buffer_id = self.global_steps - 1 - self._start_global_steps
+                        buffer_id = self.global_steps - 1
                         # will block until the training batch is ready
                         psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
                         with log_dual_events(

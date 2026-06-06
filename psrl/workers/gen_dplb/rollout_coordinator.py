@@ -908,12 +908,28 @@ class RolloutCoordinator(CommandExtension):
             version (int): The new PS model version to set.
         """
         self.ps_model_version = version
-        assert self.ps_model_version > 0, "PS model version must be greater than 0"
-        assert (self.ps_model_version - 1) in self.ready_buffers, (
-            "PS model version must be greater than the ready buffers"
-        )
-        self.ready_buffers.remove(self.ps_model_version - 1)
+        assert self.ps_model_version > 0, "PS model version must be greater than 0."
+        # NOTE(claude): Skip ready_buffers check on the first push after resume,
+        # where the coordinator is freshly initialized and no buffers have been consumed yet
+        if self.ready_buffers:
+            assert (self.ps_model_version - 1) in self.ready_buffers, (
+                "PS model version must be greater than the ready buffers."
+            )
+            self.ready_buffers.remove(self.ps_model_version - 1)
         psrl_logger.info(f"Updated PS model version to {version}")
+
+    def init_ps_model_version(self, version: int):
+        """
+        Initialize the PS model version during resume without the ready_buffers assertion.
+
+        Unlike set_ps_model_version (which expects the previous buffer to be consumed),
+        this method is used during checkpoint resume where no buffers have been consumed yet.
+
+        Args:
+            version (int): The PS model version to initialize to.
+        """
+        self.ps_model_version = version
+        psrl_logger.info(f"Initialized PS model version to {version} (resume)")
 
     # This is called by the PS manager to update the rollout instance model version after pulling
     def set_rollout_instance_model_version(self, rollout_instance_id: RolloutInstanceId, version_tag: int):

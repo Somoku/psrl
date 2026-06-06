@@ -1213,6 +1213,23 @@ class PSManager(RequestStatusTracker):
         self._shared_pull_count -= 1
 
     @_state_locked
+    def init_model_version_for_resume(self, version: int):
+        """
+        Initialize the PS model version for resume without triggering buffer deletion
+        or coordinator assertions.
+
+        This sets the model_store to the given version so that the next push_model call
+        from train workers will correctly compute next_version = version + 1.
+
+        Args:
+            version (int): The version to initialize to (typically checkpoint_step - 1).
+        """
+        self.model_store = ModelStore(version_tag=version)
+        if self.rollout_coordinator is not None:
+            self.rollout_coordinator.init_ps_model_version.remote(version)
+        psrl_logger.info(f"Initialized model version for resume: {version}")
+
+    @_state_locked
     def push_model_state_dict_cpu(self, version_tag: int, model_state_dict: Mapping[str, Tensor | DTensor] | None):
         """
         Push a model to the PS. In 'cpu' mode, store the real state dict. In 'cpu_ref' mode, this should not be called.

@@ -101,6 +101,7 @@ class PSRL_AgentLoopManager:
         self.stop_collect_task = False
 
         self.curr_ps_version_tag = 0
+        self.initial_ps_version = 0  # Set during resume to offset version calculations
 
         # Accumulated EntryInfo buffers (train path).
         self.train_data_buffers: dict[int, KVBatchMeta] = {}  # metadata of READY buffer in ps manager
@@ -561,8 +562,20 @@ class PSRL_AgentLoopManager:
 
         max_dispatch_ahead = self.config.psrl.get("max_dispatch_ahead", 5)
         effective_staleness = min(self.staleness, max_dispatch_ahead)
-        expected_ps_version = max(self._request_counter - effective_staleness * buffer_size, 0) // buffer_size
+        expected_ps_version = self.initial_ps_version + max(self._request_counter - effective_staleness * buffer_size, 0) // buffer_size
         return expected_ps_version
+
+    def set_initial_ps_version(self, version: int):
+        """
+        Set the initial PS version for resume. This offsets the expected version
+        calculation and initializes curr_ps_version_tag.
+
+        Args:
+            version (int): The initial PS model version (= checkpoint global_step).
+        """
+        self.initial_ps_version = version
+        self.curr_ps_version_tag = version
+        psrl_logger.info(f"Set initial PS version to {version} (resume)")
 
     async def _inner_dispatch_data(self, data: TensorDict, is_validate: bool = False):
         """Update request status to RUNNING in PSManager, then fan out to workers."""

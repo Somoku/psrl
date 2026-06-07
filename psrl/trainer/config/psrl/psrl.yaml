@@ -303,6 +303,19 @@ routing_strategy:
     # On timeout the transfer is abandoned and B falls back to re-prefill.
     transfer_timeout_ms: 5000
 
+  # [kv_cache_aware] Minimum cache-hit ratio for the approximate radix-tree path.
+  # Only used by the (non event-driven) token-tree fallback; event-driven scoring
+  # ignores it. Range 0.0-1.0.
+  cache_threshold: 0.3
+
+  # [kv_cache_aware] Weights for event-driven multi-tier overlap scoring.
+  # score(worker) = gpu_overlap_weight * gpu_hit_blocks
+  #               + lmcache_overlap_weight * lmcache_hit_blocks
+  # A GPU hit costs ~zero reload; an LMCache (off-GPU) hit must be loaded back to
+  # the GPU, so it is cheaper than re-prefill but not free. Keep gpu >= lmcache.
+  gpu_overlap_weight: 1.0
+  lmcache_overlap_weight: 0.5
+
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500
 
@@ -609,6 +622,12 @@ lmcache:
   # to LMCache workers through this port. Workers connect here to receive
   # commands dispatched by the Controller after a /move HTTP request.
   controller_reply_port: 8400
+
+  # Maximum number of GPU KV blocks PSRL may hold pinned simultaneously
+  # (used by routing_strategy.kv_transfer.transfer_mode == "pin_sync").
+  # When exceeded, the oldest-pinned trajectory is unpinned (PSRL-side LRU).
+  # 0 means no limit.
+  gpu_pin_block_budget: 0
 
 rollout_gateway:
 

@@ -233,6 +233,46 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         lmcache_cfg.allocated_p2p_init_ports = ports[n : 2 * n]
         lmcache_cfg.allocated_p2p_lookup_ports = ports[2 * n : 3 * n]
 
+    def _build_kv_events_args(self) -> dict:
+        """Build vLLM ``kv_events_config`` for SMG event-driven routing.
+
+        Returns an args fragment enabling the native ZMQ KV-event publisher when
+        the rollout router uses the cache-aware strategy. Returns ``{}`` (no
+        publisher) otherwise, so the feature is zero-cost when unused.
+
+        The publisher binds ``tcp://*:<base_port>`` on the server host; vLLM
+        offsets the port by ``dp_rank`` for each DP engine core
+        (``ZmqEventPublisher.offset_endpoint_port``), giving every rank an
+        independent stream + sequence counter. The SMG ``VllmEngineServicer``
+        bridge connects to ``127.0.0.1:<base_port + dp_rank>`` per the
+        ``dp_rank`` carried in the subscribe request.
+        """
+        routing_method = self.psrl_config.routing_strategy.method
+        if routing_method != "cache_aware":
+            return {}
+
+        # Allocate a free base port on this server's host (same PortScanner used
+        # for LMCache worker ports) so the publisher endpoint never collides.
+        from psrl.utils.common.http_utils import get_host_info
+        from psrl.utils.nixl.port_scanner import get_port_scanner
+
+        _, worker_ip = get_host_info()
+        port_scanner = get_port_scanner(worker_ip)
+        base_port = ray.get(port_scanner.find_free_port.remote())
+
+        instance_id = f"psrl_instance_{self.get_replica_idx()}"
+        kv_events_config = {
+            "enable_kv_cache_events": True,
+            "publisher": "zmq",
+            "endpoint": f"tcp://*:{base_port}",
+            "topic": f"kv@{instance_id}",
+        }
+        psrl_logger.info(
+            f"[KVEvents] Publishing KV cache events on tcp://{worker_ip}:{base_port} "
+            f"(topic=kv@{instance_id}, +dp_rank per rank)"
+        )
+        return {"kv_events_config": kv_events_config}
+
     async def _consume_kv_cache_hash_queue(self, kv_cache_hash_queue) -> None:
         """Consume pushed GPU/LMCache cache snapshots into `KVCacheManager`."""
         import queue as _queue
@@ -383,6 +423,15 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         self.kv_cache_manager = self._build_kv_cache_manager()
         args.update(self.kv_cache_manager.get_engine_kwargs())
+
+        # Enable native vLLM KV cache event publishing so SMG's event-driven
+        # cache-aware router can subscribe.
+        # vLLM merges GPU prefix cache + LMCache connector events into one ZMQ stream; 
+        # with DP it offsets the port per rank automatically (offset_endpoint_port).
+        # The SMG servicer bridge (SubscribeKvEvents) connects to this endpoint on localhost.
+        kv_events_args = self._build_kv_events_args()
+        if kv_events_args:
+            args.update(kv_events_args)
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -618,7 +667,12 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             - ``smg-grpc-servicer`` (``smg/grpc_servicer/``)
         """
         start_time = time.time()
-        servicer = VllmEngineServicer(engine_client, start_time, preemption_queue=self.preemption_queue)
+        servicer = VllmEngineServicer(
+            engine_client,
+            start_time,
+            preemption_queue=self.preemption_queue,
+            kv_cache_manager=self.kv_cache_manager,
+        )
 
         server = grpc.aio.server(
             options=[
@@ -791,6 +845,15 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             timeout = aiohttp.ClientTimeout(total=self._timeout)
             self._gateway_client = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
+        # KV cache-aware routing labels: instance id lets SMG address this
+        # instance as a migration transfer destination; the source instance
+        # resolves the peer URL from its own broadcast peer registry.
+        lmcache_instance_id = None
+        lmcache_peer_url = None
+        if self.kv_cache_manager is not None and self.kv_cache_manager.config.enable_p2p:
+            lmcache_instance_id = self.kv_cache_manager.config.lmcache_instance_id
+            lmcache_peer_url = self.kv_cache_manager.peer_registry.get(lmcache_instance_id)
+
         payload = build_worker_registration_payload(
             url=f"grpc://{self._server_address}:{self._server_port}",
             model_id=self.model_config.path,
@@ -798,6 +861,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             dp_size=self.config.data_parallel_size,
             tp_size=self.config.tensor_model_parallel_size,
             pp_size=self.config.pipeline_model_parallel_size,
+            lmcache_instance_id=lmcache_instance_id,
+            lmcache_peer_url=lmcache_peer_url,
         )
 
         try:

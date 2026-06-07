@@ -28,6 +28,13 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         cfg_get(config, "psrl.routing_strategy.enable_group_sampling_on_multi_instances", False)
     )
 
+    # KV-cache transfer on migration (only meaningful with cache_aware + migration).
+    kv_transfer_enable = bool(cfg_get(config, "psrl.routing_strategy.kv_transfer.enable", False))
+    kv_transfer_mode = str(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_mode", "async"))
+    kv_transfer_timeout_ms = int(
+        cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_timeout_ms", 30000)
+    )
+
     cli_args = argparse.Namespace(
         host=host,
         port=port,
@@ -40,6 +47,11 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         prefill_policy=None,
         decode_policy=None,
         disable_retries=True,
+        cache_threshold=float(cfg_get(config, "psrl.routing_strategy.cache_threshold", 0.3)),
+        gpu_overlap_weight=float(cfg_get(config, "psrl.routing_strategy.gpu_overlap_weight", 1.0)),
+        lmcache_overlap_weight=float(
+            cfg_get(config, "psrl.routing_strategy.lmcache_overlap_weight", 0.5)
+        ),
         max_concurrent_seqs_per_instance=int(
             cfg_get(config, "psrl.routing_strategy.max_concurrent_seqs_per_instance", 1024)
         ),
@@ -67,6 +79,9 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         psrl_enable_mig_strategy=bool(cfg_get(config, "psrl.sync_and_mig_strategy.mig.enable", False)),
         psrl_candidate_sort_key=str(cfg_get(config, "psrl.routing_strategy.candidate_sort_indicator", "version")),
         psrl_enable_group_sticky=not enable_group_sampling,
+        psrl_kv_transfer_enable=kv_transfer_enable,
+        psrl_kv_transfer_mode=kv_transfer_mode,
+        psrl_kv_transfer_timeout_ms=kv_transfer_timeout_ms,
         enable_tito=True,
         tito_debug=bool(cfg_get(config, "psrl.rollout_gateway.tito_debug", False)),
         tito_gc_threshold=cfg_get(config, "psrl.rollout_gateway.tito_gc_threshold", None),
@@ -127,19 +142,33 @@ def build_worker_registration_payload(
     dp_size: int,
     tp_size: int,
     pp_size: int,
+    kv_block_size: int | None = None,
+    lmcache_instance_id: str | None = None,
+    lmcache_peer_url: str | None = None,
 ) -> dict[str, Any]:
+    labels = {
+        "max_model_len": str(max_model_len),
+        "dp_size": str(dp_size),
+        "tp_size": str(tp_size),
+        "pp_size": str(pp_size),
+    }
+    # KV block size lets SMG's event-driven router seed a provisional block size
+    # before the first KV event arrives (kv_event_monitor falls back to this).
+    if kv_block_size:
+        labels["kv_block_size"] = str(kv_block_size)
+    # LMCache addressing for cross-instance KV transfer (consumed by SMG's
+    # KvTransferCoordinator to target this instance as a migration destination).
+    if lmcache_instance_id:
+        labels["lmcache_instance_id"] = lmcache_instance_id
+    if lmcache_peer_url:
+        labels["lmcache_peer_url"] = lmcache_peer_url
     return {
         "url": url,
         "worker_type": "regular",
         "connection_mode": "grpc",
         "runtime_type": "vllm",
         "models": [{"id": model_id}],
-        "labels": {
-            "max_model_len": str(max_model_len),
-            "dp_size": str(dp_size),
-            "tp_size": str(tp_size),
-            "pp_size": str(pp_size),
-        },
+        "labels": labels,
     }
 
 

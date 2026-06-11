@@ -88,6 +88,7 @@ class PSRL_AgentLoopManager:
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
         self.data_processor = data_processor
+        self.reward_manager = None
         self.distributed_post_actors: list[ray.actor.ActorHandle] = []
 
         self._request_counter = 0
@@ -204,6 +205,10 @@ class PSRL_AgentLoopManager:
         """Set the validation buffer size."""
         self.val_buffer_size = val_buffer_size
         self._failed_group_ids.clear()
+
+    def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
+        """Set the reward manager for awaiting async reward completion."""
+        self.reward_manager = reward_manager
 
     async def start_busy_loop(self):
         """Start the busy loop for continuous data processing from the queue."""
@@ -943,6 +948,14 @@ class PSRL_AgentLoopManager:
                             ),
                             "rollout_instance_id": entry_info.rollout_instance_id,
                         })
+        if (
+            not is_validate
+            and rollout_n > 1
+            and self.group_post_process_fn
+            and self.config.reward.launch_reward_fn_async
+        ):
+            for tag in tags:
+                tag["reward_ready"] = True
         return KVBatchMeta(keys=keys, tags=tags, partition_id=partition)
 
     async def _group_post_process(self, entry_infos: list[EntryInfo]) -> bool:
@@ -969,6 +982,14 @@ class PSRL_AgentLoopManager:
             else:
                 for i in range(entry_info.n_trajectory):
                     keys.append(f"{entry_info.prompt_id * self.rollout_n + entry_info.request_idx}_{i}")
+
+        # Wait for async reward computation to complete before filtering.
+        # When launch_reward_fn_async=True, the reward is computed in the background
+        # and may not yet be written to TQ when this method is called.
+        # The resulting batch metadata marks these keys as reward ready so the trainer
+        # can skip writing the same reward fields to TQ again.
+        if self.config.reward.launch_reward_fn_async:
+            await self.reward_manager.wait_for_reward_ready.remote(keys)
 
         # TODO(linsh): optimize by only fetching necessary columns for post-processing instead of the full TD.
         meta = KVBatchMeta(
@@ -1074,6 +1095,13 @@ class PSRL_AgentLoopManager:
             parent_ids = tu.get_non_tensor_data(processed_data, "parent_id")
             for parent_id, tag in zip(parent_ids, tags):
                 tag["parent_id"] = parent_id
+        if (
+            self.rollout_n > 1
+            and self.group_post_process_fn
+            and self.config.reward.launch_reward_fn_async
+        ):
+            for tag in tags:
+                tag["reward_ready"] = True
 
         new_meta = KVBatchMeta(
             keys=kept_keys,

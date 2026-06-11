@@ -23,6 +23,8 @@ from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason,
 from psrl.workers.gen_dplb.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
 _DEFAULT_EPISODE_TIMEOUT_SECS = 7200.0
 _RUNNER_THREAD_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=int(os.getenv("MINI_SWE_RUNNER_THREADS", "128")),
@@ -37,7 +39,7 @@ def _parse_timeout_secs(value: str) -> float:
     return float(match.group(1)) * {"h": 3600.0, "m": 60.0, "s": 1.0, "": 1.0}[match.group(2)]
 
 
-@register("mini_swe_agent_v1")
+@register("mini_swe_agent")
 class MiniSWEAgentLoopV1(SessionAgentLoop):
     """Dispatch mini-SWE-agent as a black box and collect its TITO trajectory."""
 
@@ -136,7 +138,7 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
             except asyncio.TimeoutError:
                 return None, TerminateReason.TRAJECTORY_TIMEOUT
             if result.get("exit_status") == "error":
-                psrl_logger.warning("mini-SWE-agent runner failed: %s.", result.get("error", "unknown error"))
+                psrl_logger.error("mini-SWE-agent runner failed: %s.", result.get("error", "unknown error"))
                 return None, TerminateReason.ROLLOUT_ERROR
 
             arrays = await self.get_training_arrays(session_id, request.get("trajectory_id", 0))

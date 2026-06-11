@@ -150,8 +150,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
     \
-    gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
@@ -219,7 +217,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     psrl.group_post_process.enable=${enable_dynamic_sampling_filter} \
     psrl.group_post_process.name=dynamic_sampling_filter \
-    algorithm.filter_groups.metric=score \
+    algorithm.filter_groups.metric=reward_score \
     \
     reward.active_managers='[dapo]' \
     reward.managers.dapo.reward_fn.0.path=${PSRL_PATH}/examples/mini_swe/reward.py \

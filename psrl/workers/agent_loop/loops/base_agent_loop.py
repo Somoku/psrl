@@ -470,6 +470,7 @@ class AgentLoopBase(ABC):
             "top_p": sampling_params.get("top_p", 1.0),
             "top_k": sampling_params.get("top_k", -1),
             "repetition_penalty": sampling_params.get("repetition_penalty", 1.0),
+            "ignore_eos": sampling_params.get("ignore_eos", False),
             "max_tokens": max_tokens,
             "stream": False,
             "logprobs": need_logprobs,
@@ -679,6 +680,7 @@ class AgentLoopBase(ABC):
             top_p=float(self.rollout_config.top_p),
             top_k=top_k,
             repetition_penalty=float(self.rollout_config.get("repetition_penalty", 1.0)),
+            ignore_eos=self.rollout_config.get("ignore_eos", False),
             detokenize=False,
             max_new_tokens=max_tokens,
         )
@@ -894,11 +896,23 @@ class AgentLoopBase(ABC):
             )
             if output is not None:
                 return output, terminate_reason
-            elif output is None and (
-                terminate_reason.is_aborted
-                or terminate_reason.needs_worker_retry()
-            ):
-                # Legitimate termination with no output (e.g. request aborted)
+            elif output is None and terminate_reason.is_aborted:
+                return None, terminate_reason
+            elif output is None and terminate_reason.needs_worker_retry():
+                # Error-class terminate reasons: respect raise_on_error so that
+                # errors are surfaced instead of being silently swallowed.
+                if terminate_reason.is_error:
+                    if raise_on_error:
+                        raise RuntimeError(
+                            f"Agent loop run for request {request_ids} "
+                            f"terminated with error: {terminate_reason.value}."
+                        )
+                    psrl_logger.error(
+                        "Agent loop run for request %s terminated with "
+                        "error: %s (raise_on_error=False, returning for retry/abort).",
+                        request_ids,
+                        terminate_reason.value,
+                    )
                 return None, terminate_reason
             elif not raise_on_error:
                 return None, TerminateReason.UNKNOWN

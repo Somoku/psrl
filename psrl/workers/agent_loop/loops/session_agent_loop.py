@@ -103,6 +103,7 @@ class SessionAgentLoop(AgentLoopBase):
             "top_p": float(config.top_p),
             "top_k": int(config.top_k),
             "repetition_penalty": float(self.rollout_config.get("repetition_penalty", 1.0)),
+            "ignore_eos": self.rollout_config.get("ignore_eos", False),
             "max_tokens": int(self.rollout_config.response_length),
             "logprobs": True,
             "top_logprobs": 0,

@@ -36,7 +36,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 STATUS_QUEUE_POLL_TIMEOUT_SECS = 0.2
 
-@ray.remote
+
 class RolloutCoordinator(CommandExtension):
     def __init__(
         self,

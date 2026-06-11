@@ -69,7 +69,7 @@ class RewardLoopWorker:
         self.worker_id = worker_id
         self.worker_num = worker_num
 
-        tq.init(self.config.transfer_queue)
+        tq.init()
 
         worker_cfg = self.config.reward.reward_loop_worker
         self.max_concurrency = worker_cfg.max_concurrency_per_worker

@@ -178,7 +178,7 @@ class _PSRLModel(LitellmTextbasedModel):
         )
 
 
-@register("mini_swe_agent")
+@register("mini_swe_agent_deprecated")
 class MiniSWEAgentLoop(AgentLoopBase):
     """Run mini-SWE-agent while using PSRL for every model turn."""
 

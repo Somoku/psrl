@@ -427,7 +427,7 @@ class PSStorageWorker:
         # _keep_in_fp32_modules_strict in their HuggingFace class definition.
         for module in meta_model.modules():
             cls_name = type(module).__name__
-            for key, patterns in PSStorageWorker.FP32_PATTERNS.items():
+            for key, patterns in FP32_PATTERNS.items():
                 if key in cls_name:
                     keep_in_fp32_strict.update(patterns)
 
@@ -527,9 +527,8 @@ class PSStorageWorker:
         for shard_file in shard_files:
             psrl_logger.debug(f"[preload_checkpoint_to_cpu] Opening shard {shard_file}.")
             with safe_open(shard_file, framework="pt", device="cpu") as f:
-                param_dict = maybe_convert_to_smaller_parts(self.model_info, key, full_tensor)
-                for param_name, param in param_dict.items():
-                    cache[param_name] = param
+                for key in f.keys():
+                    cache[key] = f.get_tensor(key)
 
         # Expand tied-weight aliases so phase 2 can do a direct key lookup.
         alias_count = 0

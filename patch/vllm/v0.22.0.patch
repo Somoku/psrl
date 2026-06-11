@@ -1,6 +1,6 @@
-From 21b5336b45c50284c5ccb19695168106c043d1bc Mon Sep 17 00:00:00 2001
+From 1c7bf6bd2ddea0c165279b85950c85844f6ad7c2 Mon Sep 17 00:00:00 2001
 From: Somoku <linsh0@protonmail.com>
-Date: Sat, 6 Jun 2026 11:22:13 +0800
+Date: Thu, 11 Jun 2026 16:16:09 +0800
 Subject: [PATCH] v0.22.0 patch
 
 ---
@@ -10,8 +10,8 @@ Subject: [PATCH] v0.22.0 patch
  vllm/v1/core/sched/scheduler.py     | 12 ++++++++++++
  vllm/v1/engine/core_client.py       |  4 ++++
  vllm/v1/metrics/loggers.py          | 13 ++++++++-----
- vllm/v1/metrics/stats.py            |  7 +++++++
- 7 files changed, 78 insertions(+), 9 deletions(-)
+ vllm/v1/metrics/stats.py            | 10 ++++++++++
+ 7 files changed, 81 insertions(+), 9 deletions(-)
 
 diff --git a/vllm/config/scheduler.py b/vllm/config/scheduler.py
 index fb6951ea7..893a242bc 100644
@@ -209,10 +209,10 @@ index 6855efd9f..c98612f1f 100644
          if not custom_prometheus_logger:
              self.stat_loggers.append(
 diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
-index a7a5fb7a2..ab019b20f 100644
+index a7a5fb7a2..303a0fe8a 100644
 --- a/vllm/v1/metrics/stats.py
 +++ b/vllm/v1/metrics/stats.py
-@@ -170,6 +170,13 @@ class KVCacheEvictionEvent:
+@@ -170,6 +170,16 @@ class KVCacheEvictionEvent:
  @dataclass
  class SchedulerStats:
      """Stats associated with the scheduler."""
@@ -223,6 +223,9 @@ index a7a5fb7a2..ab019b20f 100644
 +    # NOTE(lhy): GPU prefix cache hash snapshot for push-based KV cache info.
 +    # Populated by RolloutScheduler.make_stats(), consumed by StatCollector.record().
 +    gpu_prefix_cache_snapshot: dict | None = None
++    # NOTE(lhy): LMCache backend chunk hash snapshot for push-based cache info.
++    # Populated by RolloutScheduler.make_stats(), consumed by StatCollector.record().
++    lmcache_backend_snapshot: dict | None = None
  
      num_running_reqs: int = 0
  

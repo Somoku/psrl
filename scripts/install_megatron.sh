@@ -3,6 +3,10 @@ set -e
 set -o pipefail
 trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PSRL_PATH="$(dirname "$SCRIPT_DIR")"
+THIRD_PARTY_PATH="$PSRL_PATH/third_party"
+
 # Function: Install cuDNN and set CUDNN_PATH if not already installed or version is too low
 install_cudnn() {
     local required_version="9.8.0.87"
@@ -65,8 +69,6 @@ git checkout 94d1870
 python -m uv pip install -e .
 popd
 
-pushd $PSRL_PATH/patch/megatron-bridge
-bash apply_patch.sh
-popd
+bash "$PSRL_PATH/patch/apply_patch.sh" megatron_bridge
 
 echo "Successfully installed all packages for Megatron"

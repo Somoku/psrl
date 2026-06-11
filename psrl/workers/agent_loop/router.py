@@ -702,6 +702,7 @@ class RolloutRouter:
                 temperature=rollout_config.temperature,
                 top_p=rollout_config.top_p,
                 repetition_penalty=rollout_config.get("repetition_penalty", 1.0),
+                ignore_eos=rollout_config.get("ignore_eos", False),
                 output_kind=RequestOutputKind.CUMULATIVE,
                 detokenize=False,
             )

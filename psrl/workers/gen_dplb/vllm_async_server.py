@@ -33,6 +33,7 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
     build_cli_args_from_config,
+    build_mtp_speculative_config,
     get_vllm_max_lora_rank,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
@@ -450,11 +451,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # mtp (None for diffusion models; only LLM models use speculative decoding)
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            speculative_config = {
-                "method": self.config.mtp.method,
-                "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
-            }
-            args["speculative_config"] = speculative_config
+            args["speculative_config"] = build_mtp_speculative_config(
+                self.config.mtp.method,
+                self.config.mtp.num_speculative_tokens,
+                args.get("speculative_config"),
+            )
 
         # Always report data_parallel_size so SMG's DP discovery step can find it
         # in the gRPC server_info response (required for worker registration).

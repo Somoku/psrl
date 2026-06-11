@@ -156,8 +156,10 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 # Build list of tars (optional filter by wanted basenames).
+HAS_FILTER=0
 declare -A WANTED
 if [[ -n "$IMAGES_FILTER_REMOTE" ]]; then
+    HAS_FILTER=1
     while IFS= read -r b; do
         [[ -n "$b" ]] && WANTED["$b"]=1
     done <<< "$IMAGES_FILTER_REMOTE"
@@ -168,7 +170,7 @@ if [[ ${#TARS[@]} -eq 0 ]]; then
     echo "[$HOST] no *.tar in $IMAGE_DIR_REMOTE" >&2
     exit 1
 fi
-if [[ ${#WANTED[@]} -gt 0 ]]; then
+if [[ "$HAS_FILTER" -eq 1 ]]; then
     FILT=()
     for t in "${TARS[@]}"; do
         b=$(basename "$t" .tar)
@@ -273,20 +275,15 @@ PSSH_ARGS=(
 
 mkdir -p "$OUTDIR/stdout" "$OUTDIR/stderr"
 
-# Send env + script via stdin; remote bash -s executes it.
 echo "=== launching pssh ==="
 set +e
-IMAGE_DIR_REMOTE="$IMAGE_DIR" \
-SKIP_EXISTING_REMOTE="$SKIP_EXISTING" \
-JOBS_REMOTE="$PARALLEL_PER_NODE" \
-IMAGES_FILTER_REMOTE="$IMAGES_FILTER" \
-"$PSSH_BIN" "${PSSH_ARGS[@]}" -- bash -c '
-    # Re-export the env vars the remote side needs (pssh does not forward env).
-    export IMAGE_DIR_REMOTE='"$(printf %q "$IMAGE_DIR")"'
-    export SKIP_EXISTING_REMOTE='"$(printf %q "$SKIP_EXISTING")"'
-    export JOBS_REMOTE='"$(printf %q "$PARALLEL_PER_NODE")"'
-    export IMAGES_FILTER_REMOTE='"$(printf %q "$IMAGES_FILTER")"'
-    '"$REMOTE_SCRIPT"
+{
+    echo "export IMAGE_DIR_REMOTE=$(printf %q "$IMAGE_DIR")"
+    echo "export SKIP_EXISTING_REMOTE=$(printf %q "$SKIP_EXISTING")"
+    echo "export JOBS_REMOTE=$(printf %q "$PARALLEL_PER_NODE")"
+    echo "export IMAGES_FILTER_REMOTE=$(printf %q "$IMAGES_FILTER")"
+    printf '%s\n' "$REMOTE_SCRIPT"
+} | "$PSSH_BIN" "${PSSH_ARGS[@]}" -I -- bash -s
 PSSH_RC=$?
 set -e
 

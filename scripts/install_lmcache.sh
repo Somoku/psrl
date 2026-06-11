@@ -28,8 +28,6 @@ echo "Check if LMCache is installed correctly"
 python -c "import torch; import lmcache.c_ops as lmc_ops; print('OK')"
 
 echo "2. Apply patch for lmcache"
-pushd $PSRL_PATH/patch/lm_cache
-bash apply_patch.sh
-popd
+bash "$PSRL_PATH/patch/apply_patch.sh" lm_cache
 
 echo "Successfully installed LMCache"

@@ -627,7 +627,7 @@ class DataProcessor:
             while remaining > 0:
                 if self.retry_buffer is None or self._retry_buffer_size() == 0:
                     try:
-                        self.retry_buffer = self._get_train_next_unlocked()
+                        self.retry_buffer = self._get_train_next()
                     except StopIteration:
                         psrl_logger.warning(
                             f"sample_train_prompts: dataloader exhausted after "

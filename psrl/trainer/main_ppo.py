@@ -376,14 +376,13 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
         tq.init(config.transfer_queue)
-
+        trainer = None
         try:
             self.add_actor_rollout_worker(config)
             self.add_critic_worker(config)
@@ -411,6 +410,8 @@ class TaskRunner:
             # Start the training process.
             trainer.fit()
         finally:
+            if trainer:
+                trainer.replay_buffer.close()
             tq.close()
 
 

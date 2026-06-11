@@ -93,7 +93,7 @@ class PSRL_AgentLoopWorker:
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
 
         # TransferQueue bootstrap (connects to controller/storage spun up by the driver).
-        tq.init(self.config.transfer_queue)
+        tq.init()
 
         self.distillation_config = config.get("distillation", None)
         self.distillation_enabled = is_distillation_enabled(self.distillation_config)
@@ -305,7 +305,7 @@ class PSRL_AgentLoopWorker:
         """
         assert len(batch) == 1, "Only support single request for generation"
 
-        default_agent_name = self.config.gen_actor_rollout_ref.rollout.default_agent_loop
+        default_agent_name = self.config.gen_actor_rollout_ref.rollout.agent.default_agent_loop
         agent_name = tu.get(batch, "agent_name", [default_agent_name])[0]
         task = asyncio.create_task(self._run_agent_loop(agent_name, batch))
         task.add_done_callback(self._create_task_done_callback(task))
@@ -390,13 +390,27 @@ class PSRL_AgentLoopWorker:
                 event_type=EventType.GEN,
             ):
                 retry_limit = self.config.gen_actor_rollout_ref.rollout.agent.retry_limit
+                raised_error = None
                 for retry_attempt in range(1, retry_limit + 1):
                     raise_on_error = (
                         retry_attempt == retry_limit
                     ) and self.config.gen_actor_rollout_ref.rollout.agent.raise_on_error
-                    output, terminate_reason = await agent_loop.run_with_termination_handling(
-                        batch, raise_on_error=raise_on_error
-                    )
+                    try:
+                        output, terminate_reason = await agent_loop.run_with_termination_handling(
+                            batch, raise_on_error=raise_on_error
+                        )
+                    except Exception as e:
+                        # raise_on_error=True triggered from run_with_termination_handling.
+                        # Log the full traceback here (ensures visibility in DualOutputHandler),
+                        # then proceed with cleanup before re-raising.
+                        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+                        psrl_logger.error(
+                            f"Agent loop for requests {request_ids} raised an error "
+                            f"(will proceed with cleanup before re-raising):\n{tb_str}"
+                        )
+                        raised_error = e
+                        terminate_reason = TerminateReason.ROLLOUT_ERROR
+                        output = None
 
                     if not terminate_reason.needs_worker_retry():
                         break
@@ -485,6 +499,11 @@ class PSRL_AgentLoopWorker:
                     f"(terminate_reason={terminate_reason.value}), aborting in PSManager."
                 )
                 await self.ps_manager_handle.abort_requests.remote(request_ids)
+            
+            # After ALL cleanup is complete (notify_group_failed + abort_requests),
+            # re-raise the original error so it propagates to the task callback.
+            if raised_error is not None:
+                raise raised_error
 
     async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: TensorDict):
         """Process generation output: fire TQ write + notify manager (non-blocking occupy).

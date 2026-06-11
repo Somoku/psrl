@@ -101,6 +101,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             train_interface,
         )
 
+        # TODO(linsh): remove this hard patch to be cleaner
+        if self.config.actor.strategy == "megatron":
+            self.config.actor.megatron.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
+
         if self.psrl_config.tms.range in ["train", "all"]:
             if torch_memory_saver is None:
                 raise ImportError("torch_memory_saver is required when tms.range is 'train' or 'all'")
@@ -482,9 +486,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
             try:
                 ActorRolloutRefWorker.init_model(self)
-                if strategy == "megatron":
-                    # Override checkpoint strategy from psrl config (bypasses McoreEngineConfig dataclass).
-                    self.checkpoint_mananager.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
             finally:
                 if skip_load_weight:
                     OmegaConf.set_struct(self.config, True)

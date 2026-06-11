@@ -5,7 +5,8 @@ trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
 VLLM_PATH=${VLLM_PATH:-}
 VERL_PATH=${VERL_PATH:-}
-MAX_JOBS=${MAX_JOBS:-32}
+TQ_PATH=${TQ_PATH:-}
+MAX_JOBS=${MAX_JOBS:-64}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSRL_PATH="$(dirname "$SCRIPT_DIR")"
@@ -96,21 +97,30 @@ if [ -z "$VERL_PATH" ]; then
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     cd $VERL_PATH
-    git checkout 74cebc50
+    git checkout 41a52449
     popd
 fi
 pushd $VERL_PATH
 python -m uv pip install -e .
 popd
 
-pushd $PSRL_PATH/patch/vllm
-bash apply_patch.sh
+if [ -z "$TQ_PATH" ]; then
+    pushd $THIRD_PARTY_PATH
+    git clone https://github.com/Ascend/TransferQueue.git
+    TQ_PATH=$THIRD_PARTY_PATH/TransferQueue
+    cd $TQ_PATH
+    git checkout 434f8c4
+    popd
+fi
+pushd $TQ_PATH
+python -m uv pip install -e .
 popd
 
-echo "8. Apply patch for verl"
-pushd $PSRL_PATH/patch/verl
-bash apply_patch.sh
-popd
+echo "8. Apply patch for dependencies..."
+
+bash "$PSRL_PATH/patch/apply_patch.sh" vllm
+bash "$PSRL_PATH/patch/apply_patch.sh" verl
+bash "$PSRL_PATH/patch/apply_patch.sh" transfer_queue
 
 echo "9. Install torch_memory_saver"
 python -m uv pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@d64a6394d1e09c613fab90260054cecc2684586d --no-cache-dir --force-reinstall

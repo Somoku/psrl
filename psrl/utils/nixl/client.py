@@ -8,12 +8,13 @@ from typing import TYPE_CHECKING, Any
 
 import nixl._bindings as nixlBind
 import numpy as np
+import ray
 import torch
 from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.logger import DualOutputHandler, deprecated, log_tensor
+from psrl.utils.logger import DualOutputHandler, deprecated, log_tensor, get_worker_info
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip

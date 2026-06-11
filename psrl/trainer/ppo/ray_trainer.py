@@ -579,7 +579,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert self.rollout_router is not None, (
             "Rollout router must be initialized before initializing rollout coordinator."
         )
-        self.rollout_coordinator = RolloutCoordinator.options(
+        self.rollout_coordinator = ray.remote(RolloutCoordinator).options(
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=self.ip_to_node_id[self.config.psrl.ps_manager_ip], soft=False
             )
@@ -610,7 +610,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         Args:
             all_wg: dict mapping worker-group name → RayWorkerGroup.
         """
-        for rm_cfg in self.config.reward.reward_models:
+        for rm_cfg in resolve_active_managers(self.config.reward):
             if rm_cfg.reward_loop_type != "gen":
                 continue
             reward_model_name = rm_cfg.get("reward_model_name", rm_cfg.model.path.split("/")[-1])
@@ -3099,6 +3099,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         futures = []
         futures.append(self.data_processor.set_reward_manager.remote(self.reward_manager))
         futures.append(self.ps_manager_handle.set_reward_manager.remote(self.reward_manager))
+        futures.append(self.agent_loop_manager.set_reward_manager.remote(self.reward_manager))
         for agent_loop_worker in self.agent_loop_workers:
             futures.append(agent_loop_worker.set_reward_manager.remote(self.reward_manager))
         for reward_loop_worker in self.reward_loop_workers:
@@ -3383,9 +3384,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.elastic_executor = None
         self.stop_ps_manager()
         self._shutdown_dump_executor()
-
-        self.replay_buffer.close()
-        tq.close()
 
         # Kill all PortScanner actors to free resources.
         for handle in self.port_scanner_handles.values():

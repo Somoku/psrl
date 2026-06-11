@@ -653,11 +653,18 @@ class RewardLoopManager(CommandExtension):
         padding_keys: set[str] = {
             key for key, tag in zip(requests.keys, requests.tags) if tag.get("is_padding", False)
         }
+        # Reward may be ready in group post processing
+        ready_keys = {
+            key
+            for key, tag in zip(requests.keys, requests.tags)
+            if not is_validate and tag.get("reward_ready", False)
+        }
+        request_keys_to_put = [key for key in request_keys if key not in ready_keys]
         request_key_to_reward: dict[str, dict] = {}
         futures_to_wait = {}
 
         # Gather available rewards and futures for the requested IDs.
-        for request_key in request_keys:
+        for request_key in request_keys_to_put:
             if request_key in padding_keys:
                 request_key_to_reward[request_key] = {
                     "reward_score": 0.0,
@@ -680,7 +687,7 @@ class RewardLoopManager(CommandExtension):
                 request_key_to_reward[request_key] = reward
 
         fields = []
-        for request_key in request_keys:
+        for request_key in request_keys_to_put:
             reward = request_key_to_reward[request_key]
             if reward is None:
                 reward = self._default_reward_result()
@@ -693,17 +700,69 @@ class RewardLoopManager(CommandExtension):
             rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
             f["rm_scores"] = rm_score_tensor
 
-        await tq.async_kv_batch_put(
-            keys=request_keys,
-            partition_id=partition_id,
-            fields=list_of_dict_to_tensordict(fields),
-        )
+        if request_keys_to_put:
+            await tq.async_kv_batch_put(
+                keys=request_keys_to_put,
+                partition_id=partition_id,
+                fields=list_of_dict_to_tensordict(fields),
+            )
 
         if not is_validate and self.reward_normalization:
-            return await self.normalize_reward(requests)
-        else:
-            return requests
+            requests = await self.normalize_reward(requests)
 
+        return requests
+
+    async def wait_for_reward_ready(self, request_keys: list[str]) -> None:
+        """Wait until reward results are available for the given keys and write them to TQ.
+
+        This is used by AgentLoopManager's ``_group_post_process`` which needs the
+        ``reward_score`` field available in TQ for filtering. The AgentLoopManager
+        marks successfully processed keys in the resulting batch metadata so the
+        trainer can skip the redundant TQ put.
+        """
+        futures_to_wait: dict[str, asyncio.Future] = {}
+        resolved: dict[str, dict] = {}
+        for request_key in request_keys:
+            if request_key in self.request_key_to_reward:
+                resolved[request_key] = self.request_key_to_reward[request_key]
+            elif request_key in self.request_key_to_future:
+                fut = self.request_key_to_future[request_key]
+                if fut.done():
+                    resolved[request_key] = fut.result()
+                else:
+                    futures_to_wait[request_key] = fut
+            else:
+                # No future and no result — create a future so reward dispatch can resolve it.
+                fut = asyncio.get_running_loop().create_future()
+                self.request_key_to_future[request_key] = fut
+                futures_to_wait[request_key] = fut
+
+        if futures_to_wait:
+            results = await asyncio.gather(*futures_to_wait.values())
+            for request_key, result in zip(futures_to_wait.keys(), results):
+                resolved[request_key] = result
+
+        fields = []
+        for request_key in request_keys:
+            reward = resolved.get(request_key)
+            if reward is None:
+                reward = self._default_reward_result()
+            f = reward.copy()
+            response_len = f.pop("response_len", 1)
+            rm_score_tensor = torch.zeros(response_len, dtype=torch.float32)
+            rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
+            f["rm_scores"] = rm_score_tensor
+            fields.append(f)
+
+        if request_keys:
+            await tq.async_kv_batch_put(
+                keys=request_keys,
+                partition_id="train",
+                fields=list_of_dict_to_tensordict(fields),
+            )
+            for request_key in request_keys:
+                self.request_key_to_reward.pop(request_key, None)
+                self.request_key_to_future.pop(request_key, None)
 
     # TODO(linsh): we may remove methods below and put computation to reward workers
 

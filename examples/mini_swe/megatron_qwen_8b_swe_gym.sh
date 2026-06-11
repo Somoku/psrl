@@ -168,9 +168,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
     \
-    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
-    +gen_actor_rollout_ref.model.override_config.max_position_embeddings=40960 \
-    +gen_actor_rollout_ref.model.custom_chat_template=${PSRL_PATH}/examples/mini_swe/config/qwen_no_think_strip.jinja \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
@@ -190,7 +187,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.model.use_fused_kernels=False \
     train_actor_rollout_ref.model.use_remove_padding=True \
     +train_actor_rollout_ref.model.override_config.max_position_embeddings=40960 \
-    +train_actor_rollout_ref.model.custom_chat_template=${PSRL_PATH}/examples/mini_swe/config/qwen_no_think_strip.jinja \
+    train_actor_rollout_ref.model.custom_chat_template=${PSRL_PATH}/examples/mini_swe/config/qwen_no_think_strip.jinja \
     train_actor_rollout_ref.rollout.enable_chunked_prefill=True \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -240,7 +237,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     psrl.group_post_process.enable=${enable_dynamic_sampling_filter} \
     psrl.group_post_process.name=dynamic_sampling_filter \
-    algorithm.filter_groups.metric=score \
+    algorithm.filter_groups.metric=reward_score \
     \
     reward.active_managers='[dapo]' \
     reward.managers.dapo.reward_fn.0.path=${PSRL_PATH}/examples/mini_swe/reward.py \

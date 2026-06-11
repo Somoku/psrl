@@ -32,9 +32,9 @@ The PS answers this with three design decisions:
 1. **CPU-resident storage by default.** GPU memory is the scarcest resource in the
    cluster, the PS keeps the canonical model in pinned CPU memory so it never
    competes with vLLM's KV cache or the trainer's optimizer state.
-2. **Co-locate PS Workers with rollout instances.** A rollout instance pulling a new
-   version copies bytes from CPU memory on the **same node** to its local GPUs, no
-   cross-node hop is needed on the hot path.
+2. **Place PS Workers on participating nodes.** In `nixl_cpu` mode PSRL creates CPU
+   storage workers on distinct rollout, actor, and validation nodes involved in
+   model transfer. Consumers prefer a local shard source when available.
 3. **Separate control plane from data plane.** The PS Manager is a single Ray actor
    that tracks model versions and orchestrates push/pull permissions, the actual
    bytes are streamed by PS Workers over NIXL, never through the manager.
@@ -70,7 +70,7 @@ calls and updates metadata, but the actual bytes flow worker-to-worker.
 
 A group of CPU-side processes (`PSStorageWorker` +
 [`PSWorkerGroup`](https://github.com/lhy101/psrl/blob/main/psrl/workers/ps/ps_worker_group.py))
-**co-located with the rollout instances**. Each PS Worker holds a shard of the model
+placed on relevant rollout, actor, and validation nodes. Each PS Worker holds a shard of the model
 weights in pinned CPU memory and exposes NIXL endpoints that:
 
 - The **train side** writes into (push: each train rank streams its share of the
@@ -79,9 +79,8 @@ weights in pinned CPU memory and exposes NIXL endpoints that:
   shard from the local PS Worker, same-node DMA when possible, cross-node RDMA
   otherwise).
 
-Because PS Workers are co-located with rollout instances, a pull almost always
-becomes a same-node memcpy/RDMA loopback, not a cross-cluster transfer. This is the
-key throughput trick.
+Local PS workers make same-node transfers possible, while NIXL/UCX handles
+cross-node transfers when local placement is unavailable.
 
 ```{mermaid}
 sequenceDiagram
@@ -221,9 +220,9 @@ serve in parallel (typically `>= 4` nodes).
 | `psrl.broadcast_init.enabled` | bool | `False` | Rank-0 reads checkpoint, broadcasts to all PS Workers over NIXL instead of parallel disk reads. |
 | `psrl.broadcast_init.algorithm` | str | `binary_tree` | Broadcast topology. `binary_tree` is the only one currently shipped (`ring` is reserved). |
 
-PS-Worker count and placement are not configured directly, they are derived from
-`psrl.deployment.n_rollout_instances` + `rollout_nnodes_per_instance` (one PS Worker
-co-located with each rollout instance shard).
+PS-Worker count and placement are not configured directly. In `nixl_cpu` mode they
+are derived from the distinct nodes used by rollout, actor, and validation workers,
+so model consumers can prefer a local CPU storage worker when one is available.
 
 ---
 

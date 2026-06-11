@@ -20,9 +20,10 @@ Different complementary rollout coordination techniques in PSRL.
 
 When a rollout instance needs to sync to a new model version (triggered by the sync strategy), any in-progress generations present a dilemma: discarding them wastes all the compute spent so far, while waiting for them to finish delays the sync and increases staleness for future requests.
 
-**Partial rollout** offers a third option: **interrupt at the version boundary**. The in-progress generation is stopped at its current token position, and the partial output is preserved. It can then either:
-- Be treated as a complete (truncated) trajectory, or
-- Be resubmitted as a new prompt with the partial output as prefix, enabling prefix KV cache reuse on the new-version model.
+**Partial rollout** interrupts at the version boundary while preserving completed
+tokens. On the SMG path, the routing loop drains the aborted gRPC stream, accumulates
+tokens/log-probabilities, and loops the request back through worker selection until
+it reaches a terminal result.
 
 ### Configuration
 
@@ -44,8 +45,10 @@ psrl:
 **Always enable** partial rollout for asynchronous training (`staleness > 0`). It avoids wasting compute when a sync fires in the middle of long-running generations. The only reason to disable it is for debugging or when running fully synchronously.
 :::
 
-- **`interrupt_as_prompt: false`** (default): Interrupted trajectories are treated as truncated completions. Simpler, but the compute spent past the useful prefix is wasted if the truncation happens early.
-- **`interrupt_as_prompt: true`**: Interrupted trajectories are resubmitted as new prompts with their partial output as prefix. Maximizes compute reuse, but requires prefix KV cache support on the rollout instance.
+- **`interrupt_as_prompt: false`** (default): preserve the partial-rollout state and
+  continue the active request through routing loopback.
+- **`interrupt_as_prompt: true`**: expose the interrupted prefix as a prompt-style
+  continuation where supported by the selected path.
 
 ---
 
@@ -102,7 +105,9 @@ The second condition is the important one. For example, early in training the lo
 
 **Config**: `psrl.routing_strategy.*`
 
-The Router dispatches generation requests from Agent Workers to rollout instances. The routing strategy decides **which instance** handles each request.
+SMG is the default Router. Its routing policy ranks load/cache candidates only after
+the PSRL worker selector has enforced model-version eligibility, partial/sticky
+instance hints, prompt-group affinity, and PSManager reservation constraints.
 
 ### Method Options
 
@@ -113,7 +118,7 @@ The Router dispatches generation requests from Agent Workers to rollout instance
 | `request_num_balance` | Route to the instance with the fewest currently queued requests. |
 | `throughput_optimal` | Cost-model-based routing that estimates per-instance throughput using the Waterfall model. |
 | `throughput_optimal_with_budget` | Same as `throughput_optimal` plus token budget estimation for generation length prediction. |
-| `kv_cache_aware` | Maximize prefix cache hits by routing requests to instances that already hold relevant KV cache. |
+| `cache_aware` | Maximize prefix cache hits using SMG's multi-tier KV event/index data. |
 
 ```yaml
 psrl:
@@ -163,7 +168,10 @@ psrl:
 
 **Config**: `psrl.routing_strategy.kv_transfer.*`
 
-When the Router re-routes a request to a different instance (due to load imbalance or sync events), the KV cache accumulated on the previous instance can be **transferred** to the new instance instead of recomputed. The transfer is coordinated via the LMCache Controller.
+When SMG re-routes a request to a different instance, it can ask the LMCache transfer
+path to move accumulated KV instead of recomputing it. The source worker performs the
+data movement; the shared LMCache Controller provides registration and fallback
+control rather than carrying KV payloads itself.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -243,4 +251,3 @@ psrl:
 :::{tip}
 The sync and migration strategies work **together**, evaluated in order each tick: sync is considered first, and migration is only considered if no sync was triggered.
 :::
-

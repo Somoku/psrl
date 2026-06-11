@@ -1,75 +1,99 @@
 # Installation
 
-This guide covers installing PSRL and all its optional components from source.
+PSRL is installed from source because its core runtime combines pinned PyTorch,
+vLLM, veRL, SMG, NIXL, and optional KV-cache components.
 
 ## Prerequisites
 
-| Requirement | Minimum |
+| Requirement | Notes |
 |---|---|
-| GPU | NVIDIA GPU |
 | OS | Ubuntu 22.04+ |
-| CUDA | 12.8+ |
-| Python | 3.11 |
+| GPU | NVIDIA GPU supported by the pinned PyTorch/CUDA stack |
+| CUDA | CUDA 12.8-compatible driver/toolchain |
+| Python | 3.12 recommended |
+| Rust/Cargo | Required to build SMG's Rust gateway and Python binding |
+| Build tools | Git, C/C++ toolchain, CMake/Ninja, and sufficient disk space |
+| Multi-node network | InfiniBand/RoCE recommended for `nixl_cpu` and LMCache P2P |
 
-## Create Conda Environment
+Install Rust before running the core installer:
 
 ```bash
-conda create -n psrl python=3.11
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+rustc --version
+cargo --version
+```
+
+## Create the Environment
+
+```bash
+conda create -n psrl python=3.12
 conda activate psrl
 ```
 
-## Install Components
+All nodes in a Ray cluster must use the same environment and see the same PSRL
+checkout or installed package.
 
-PSRL is modular, install only what you need. The **Core** tab is mandatory, all other
-tabs are optional extensions that can be installed in any order *after* Core.
-
-:::{important}
-`scripts/install_basic.sh` (Core) **must** be run first. The remaining install scripts
-can be run in any order after Core completes.
-:::
-
-:::{tip}
-**Recommended: Install everything for maximum performance.**
-All optional components work together and are used in production deployments. Unless
-you have strong constraints on disk space or build time, install them all:
-
-```bash
-bash scripts/install_basic.sh    # Core (required)
-bash scripts/install_nixl.sh     # RDMA weight sync
-bash scripts/install_megatron.sh # Megatron-LM backend (large models)
-bash scripts/install_tms.sh      # GPU memory sharing (TMS)
-bash scripts/install_lmcache.sh  # KV cache offloading
-```
-:::
-
-::::{tab-set}
-
-:::{tab-item} Core
-:sync: core
-
-Installs PyTorch 2.9, vLLM, veRL, and FlashAttention, the minimum stack required for
-any PSRL training job.
+## Core Installation
 
 ```bash
 bash scripts/install_basic.sh
+pip install .
 ```
 
-This script pins compatible versions of all core dependencies, applies PSRL-specific
-patches to the vendored vLLM and veRL copies under `third_party/`, and may take 10--20
-minutes depending on network speed.
-:::
+`install_basic.sh` currently installs:
 
-:::{tab-item} NIXL
-:sync: nixl
+- PyTorch 2.11.0 for CUDA 12.8, Triton, TensorDict, FlashAttention, FlashInfer,
+  Apex, and common Python dependencies.
+- **SMG from the `psrl-dev` branch**, including the release Rust gateway, Python
+  binding, gRPC protocol/client package, PSRL state protocol, and gRPC servicer.
+- vLLM `releases/v0.22.0` and the PSRL vLLM patches.
+- A pinned veRL checkout and the PSRL veRL patches.
+- `torch_memory_saver`.
 
-Installs the NIXL library and UCX for RDMA-based weight synchronization between training
-and generation clusters. Required when using `ps_mode: nixl_cpu`.
+The installer clones sources under `third_party/`. Set `VLLM_PATH` or `VERL_PATH`
+before running it to use an existing checkout.
+
+## SMG Requirements
+
+SMG is not optional in the current default architecture:
+
+- `psrl.rollout_gateway.enable=True` launches an SMG Router process.
+- Rollout instances register as gRPC workers, so SMG's gRPC client/proto and
+  servicer packages must be installed.
+- The PSRL worker selector uses the SMG `psrl-state` gRPC protocol to contact
+  PSManager.
+- SessionRouter/TITO-based agent loops require an SMG build with TITO enabled.
+
+The core installer performs the equivalent of:
+
+```bash
+cd third_party/smg
+cargo build --release
+python -m pip install -e crates/grpc_client/python/
+python -m pip install -e crates/psrl_state/python/
+python -m pip install -e grpc_servicer/
+cd bindings/python
+maturin develop --features vendored-openssl
+```
+
+For SMG development, rebuild from the exact SMG checkout used by PSRL, then restart
+the training job so the gateway subprocess loads the new binding.
+
+## Optional Performance Components
+
+Run these after the core installer:
+
+::::{tab-set}
+
+:::{tab-item} NIXL / RDMA
 
 ```bash
 bash scripts/install_nixl.sh
 ```
 
-Requires InfiniBand/RoCE-capable NICs for multi-node GPU-direct transfers.
+Required for `psrl.ps_mode=nixl_cpu`. NIXL/UCX selects local shared-memory/IPC paths
+where possible and RDMA-capable transports across nodes.
 :::
 
 :::{tab-item} Megatron
@@ -81,19 +105,7 @@ Installs Megatron-LM as an alternative training backend for large models.
 bash scripts/install_megatron.sh
 ```
 
-Use this when training with TP/PP/CP/EP via the Megatron backend.
-:::
-
-:::{tab-item} TMS
-:sync: tms
-
-Installs `torch_memory_saver` (TMS), a GPU memory manager that transparently swaps
-idle tensors to CPU, enabling colocated rollout and training workers to share GPU
-efficiently.
-
-```bash
-bash scripts/install_tms.sh
-```
+Required for Megatron-LM actor/critic training with TP, PP, CP, or EP.
 :::
 
 :::{tab-item} LMCache
@@ -105,18 +117,20 @@ transfer. Dramatically reduces re-prefill cost in multi-turn agentic RL workload
 ```bash
 bash scripts/install_lmcache.sh
 ```
+
+Required for `psrl.lmcache.enable=True` and cross-instance KV transfer. P2P transfer
+with `p2p_transfer_channel=nixl` also requires NIXL/UCX.
 :::
 
 ::::
 
-## Install PSRL Package
+`torch_memory_saver` is installed by `install_basic.sh`; this checkout does not
+provide a separate `install_tms.sh`.
 
-After installing the desired components, install the PSRL package itself in editable
-mode:
+The pinned veRL requirements install `TransferQueue==0.1.7` during the core
+installation.
 
-```bash
-python -m pip install -e .
-```
+`SimpleStorage` is the default TransferQueue backend.
 
 ## Verification
 

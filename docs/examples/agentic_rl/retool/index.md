@@ -48,6 +48,11 @@ Train language models to **strategically invoke a Python code interpreter** whil
 
 **Reward shaping**: Correct answers get `+1.0`. Incorrect answers get a base of `-1.0` with a small tool-call bonus proportional to `num_turns`, floored at `-0.6`. This encourages the model to use the code interpreter even when heading toward a wrong answer.
 
+ReTool uses PSRL's native multi-turn `Environment` + `AgentData` integration. Model
+requests still use the default SMG RolloutGateway, and completed trajectories are
+written to TransferQueue. It does not require the SessionRouter/TITO black-box-agent
+path used by the recommended mini-SWE-agent v1 loop.
+
 ---
 
 ## Prerequisites
@@ -66,4 +71,3 @@ Full setup instructions including Docker image baking, Swarm deployment, and tro
 prepare
 training
 ```
-

@@ -148,9 +148,14 @@ first few hundred steps as the policy learns to solve more GSM8K problems.
 ## What Happens Under the Hood
 
 1. **Generation workers** (1 node, vLLM instances) generate rollouts from the current policy.
-2. **Training workers** (1 node) consume completed rollout batches and perform DAPO updates using FSDP.
-3. After each training step, the updated weights are pushed to the **Parameter Server (PS)** from **Training workers**.
-4. **Generation workers** pull weights from the PS on demand. Training and generation stay loosely coupled without blocking on each other.
+2. AgentLoopWorkers send requests through the **SMG RolloutGateway**, whose PSRL
+   worker selector checks version/admission state with PSManager before dispatching
+   to a vLLM gRPC replica.
+3. Completed trajectories are written to **TransferQueue**; the trainer receives a
+   lightweight `KVBatchMeta` and reads/writes fields as the DAPO stages execute.
+4. After each training step, training workers push updated weights to the
+   **Parameter Server**. Rollout workers pull new versions when coordinated by the
+   RolloutCoordinator.
 
 ```{seealso}
 - {doc}`configuration`: Full parameter reference and override syntax

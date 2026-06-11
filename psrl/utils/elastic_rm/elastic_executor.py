@@ -13,8 +13,8 @@ from psrl.utils.elastic_rm.diagnostics import log_elastic_rm_backlog_diag
 from psrl.utils.elastic_rm.scaling_policy import InstanceSignal, ScalingPolicy
 from psrl.utils.logger import DualOutputHandler, FileOnlyHandler
 from psrl.utils.server.command import Command, CommandType
-from psrl.workers.gen_dplb.stats_collector import EngineStats
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
+from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.gen.utils import RolloutInstanceId
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

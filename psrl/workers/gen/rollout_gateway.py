@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
-from psrl.workers.gen_dplb.smg_adapter import build_rollout_router_args
+from psrl.workers.gen.smg_adapter import build_rollout_router_args
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -144,7 +144,7 @@ class RolloutGateway:
         def _run_session_router(smg_url, host, port, client_concurrency):
             import uvicorn
 
-            from psrl.workers.gen_dplb.session_router import SessionRouter
+            from psrl.workers.gen.session_router import SessionRouter
 
             router = SessionRouter(
                 smg_url=smg_url,

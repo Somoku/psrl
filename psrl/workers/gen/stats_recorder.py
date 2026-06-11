@@ -8,8 +8,8 @@ from typing import IO, TYPE_CHECKING
 if TYPE_CHECKING:
     from omegaconf import DictConfig
 
-    from psrl.workers.gen_dplb.stats_collector import EngineStats
-    from psrl.workers.gen_dplb.utils import RolloutInstanceId
+    from psrl.workers.gen.stats_collector import EngineStats
+    from psrl.workers.gen.utils import RolloutInstanceId
 
 logger = logging.getLogger(__name__)
 

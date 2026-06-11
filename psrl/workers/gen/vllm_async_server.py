@@ -65,10 +65,10 @@ from psrl.utils.logger import (
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen_dplb.smg_adapter import build_worker_registration_payload
-from psrl.workers.gen_dplb.stats_collector import DPLBStatCollector
-from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
-from psrl.workers.gen_dplb.zmq_queue import ZMQPushQueue
+from psrl.workers.gen.smg_adapter import build_worker_registration_payload
+from psrl.workers.gen.stats_collector import DPLBStatCollector
+from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
+from psrl.workers.gen.zmq_queue import ZMQPushQueue
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 get_encoding()
@@ -189,7 +189,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
 
     def _get_worker_extension_cls(self) -> str:
-        return "psrl.workers.gen_dplb.vllm_extension.vLLMWorkerExtension"
+        return "psrl.workers.gen.vllm_extension.vLLMWorkerExtension"
 
     def _build_kv_cache_manager(self) -> KVCacheManager:
         """Build and configure `KVCacheManager` before vLLM engine initialization."""
@@ -517,7 +517,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             args.update({"enable_return_routed_experts": True})
 
         # AGENT(VERL): setup rollout scheduler for PSRL
-        args["scheduler_cls"] = "psrl.workers.gen_dplb.rollout_scheduler.RolloutScheduler"
+        args["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
         args["additional_config"] = {
             "max_model_len_used_in_estimation": self.config.max_model_len
             * self.psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,

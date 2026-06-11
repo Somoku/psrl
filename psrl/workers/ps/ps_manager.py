@@ -19,7 +19,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.utils.ray import add_busy_polling_lock
-from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
+from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.broadcast import build_broadcast_plan
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
 from psrl.workers.ps.request_status_tracker import RequestStatusTracker, _state_locked

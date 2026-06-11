@@ -9,7 +9,7 @@ from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
-from psrl.workers.gen_dplb.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput
 
 
 @register("multi_turn_completion_agent")

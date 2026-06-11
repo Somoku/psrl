@@ -13,7 +13,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import get_event_loop
 
 from psrl.environments.base import ConversationType, Environment
-from psrl.workers.gen_dplb.utils import RolloutInstanceId, TokenOutput
+from psrl.workers.gen.utils import RolloutInstanceId, TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

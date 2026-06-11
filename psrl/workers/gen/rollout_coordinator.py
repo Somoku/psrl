@@ -18,7 +18,7 @@ from psrl.utils.logger import (
     log_dual_events,
 )
 from psrl.utils.server.command import Command, CommandExtension, CommandType
-from psrl.workers.gen_dplb.smg_adapter import (
+from psrl.workers.gen.smg_adapter import (
     ROUTING_LOOP_STATUS_PATH,
     WORKERS_STATS_PATH,
     WORKERS_UPDATE_STATS_PATH,
@@ -26,9 +26,9 @@ from psrl.workers.gen_dplb.smg_adapter import (
     build_weight_version_updates,
     build_worker_stats_update,
 )
-from psrl.workers.gen_dplb.stats_collector import EngineStats
-from psrl.workers.gen_dplb.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, RolloutInstanceId
-from psrl.workers.gen_dplb.zmq_queue import ZMQPullQueue
+from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, RolloutInstanceId
+from psrl.workers.gen.zmq_queue import ZMQPullQueue
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -146,7 +146,7 @@ class RolloutCoordinator(CommandExtension):
         # Stats recorder (opt-in)
         self._stats_recorder = None
         if self.config.psrl.status_collection.stats_recorder.enable:
-            from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+            from psrl.workers.gen.stats_recorder import StatsRecorder
 
             self._stats_recorder = StatsRecorder(
                 self.config.psrl,

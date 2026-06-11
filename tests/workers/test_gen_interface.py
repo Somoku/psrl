@@ -9,7 +9,7 @@ pytestmark = pytest.mark.cpu_test
 
 # ---------------------------------------------------------------------------
 # Pre-import mocking: inject stubs for every heavy dependency so that
-# psrl.workers.gen_dplb.vllm_async_server can be imported on a CPU-only
+# psrl.workers.gen.vllm_async_server can be imported on a CPU-only
 # machine that has no ray / torch / vllm installed.
 # ---------------------------------------------------------------------------
 
@@ -74,12 +74,12 @@ _MOCKED_MODULES = [
     "psrl.utils.common.http_utils",
     "psrl.utils.logger",
     "psrl.utils.ray",
-    "psrl.workers.gen_dplb.stats_collector",
-    "psrl.workers.gen_dplb.zmq_queue",
+    "psrl.workers.gen.stats_collector",
+    "psrl.workers.gen.zmq_queue",
     "psrl.workers.ps",
     "psrl.workers.ps.request_status_tracker",
     # rollout_coordinator pulls in many deps via psrl.utils
-    "psrl.workers.gen_dplb.rollout_coordinator",
+    "psrl.workers.gen.rollout_coordinator",
 ]
 
 _injected: list[str] = []
@@ -96,18 +96,18 @@ sys.modules["ray.actor"].ActorHandle = object
 sys.modules["verl.workers.rollout.vllm_rollout.vllm_async_server"].vLLMHttpServer = object
 sys.modules["verl.workers.rollout.vllm_rollout.vllm_async_server"].vLLMReplica = object
 
-# Override gen_dplb __init__ so importing the package doesn't pull in
+# Override gen __init__ so importing the package doesn't pull in
 # RolloutCoordinator (which needs ray/torch at module level).
-import psrl.workers.gen_dplb as _gen_dplb_pkg  # noqa: E402
+import psrl.workers.gen as _gen_pkg  # noqa: E402
 
-sys.modules["psrl.workers.gen_dplb.rollout_coordinator"] = MagicMock()
-_gen_dplb_pkg.RolloutCoordinator = MagicMock()
+sys.modules["psrl.workers.gen.rollout_coordinator"] = MagicMock()
+_gen_pkg.RolloutCoordinator = MagicMock()
 
 # Now import GenInterface — the module may already be cached; force a fresh load.
-_target = "psrl.workers.gen_dplb.vllm_async_server"
+_target = "psrl.workers.gen.vllm_async_server"
 sys.modules.pop(_target, None)
 
-from psrl.workers.gen_dplb.vllm_async_server import GenInterface  # noqa: E402
+from psrl.workers.gen.vllm_async_server import GenInterface  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Tests

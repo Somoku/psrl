@@ -3,7 +3,7 @@ import os
 
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import TerminateReason, register
-from psrl.workers.gen_dplb.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

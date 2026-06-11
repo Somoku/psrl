@@ -24,13 +24,13 @@ _MOCKED = [
     "psrl.trainer.ppo.utils",
     "psrl.utils.elastic_rm.scaling_policy",
     "psrl.utils.elastic_rm.diagnostics",
-    "psrl.workers.gen_dplb.utils",
+    "psrl.workers.gen.utils",
 ]
 for _m in _MOCKED:
     if _m not in sys.modules:
         sys.modules[_m] = MagicMock()
 sys.modules["ray"].remote = lambda cls=None, **kw: (cls if cls is not None else lambda c: c)
-sys.modules["psrl.workers.gen_dplb.utils"].RolloutInstanceId = tuple
+sys.modules["psrl.workers.gen.utils"].RolloutInstanceId = tuple
 
 
 class _InstanceStatus(_enum.Enum):

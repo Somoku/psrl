@@ -13,7 +13,7 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     request_raw,
 )
-from psrl.workers.gen_dplb.smg_adapter import TITO_SESSIONS_PATH
+from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH
 
 psrl_logger = logging.getLogger(__name__)
 

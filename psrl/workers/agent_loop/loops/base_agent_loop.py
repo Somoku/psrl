@@ -27,7 +27,7 @@ from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
 from psrl.workers.agent_loop.sticky_session import sticky_session
-from psrl.workers.gen_dplb.utils import TokenInput, TokenOutput
+from psrl.workers.gen.utils import TokenInput, TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__name__)

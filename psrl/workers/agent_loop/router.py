@@ -20,8 +20,8 @@ from psrl.workers.agent_loop.route_strategy import (
     RouteStrategyBase,
     get_route_strategy_class,
 )
-from psrl.workers.gen_dplb.stats_collector import EngineStats
-from psrl.workers.gen_dplb.utils import RolloutInstanceId, TokenInput, TokenOutput
+from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.gen.utils import RolloutInstanceId, TokenInput, TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)

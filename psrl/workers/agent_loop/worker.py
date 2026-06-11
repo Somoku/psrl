@@ -30,7 +30,7 @@ from psrl.utils.common.http_utils import configure_distributed_post, init_http_c
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
-from psrl.workers.gen_dplb.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 psrl_logger = logging.getLogger(__file__)

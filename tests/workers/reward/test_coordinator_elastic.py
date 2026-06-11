@@ -26,9 +26,9 @@ _MOCKED = [
     "psrl.utils.elastic_rm.diagnostics",
     "psrl.utils.server",
     "psrl.utils.server.command",
-    "psrl.workers.gen_dplb.stats_collector",
-    "psrl.workers.gen_dplb.utils",
-    "psrl.workers.gen_dplb.zmq_queue",
+    "psrl.workers.gen.stats_collector",
+    "psrl.workers.gen.utils",
+    "psrl.workers.gen.zmq_queue",
 ]
 for _m in _MOCKED:
     if _m not in sys.modules:
@@ -37,9 +37,9 @@ for _m in _MOCKED:
 sys.modules["ray"].remote = lambda cls=None, **kw: (cls if cls is not None else lambda c: c)
 sys.modules["ray"].actor.ActorHandle = object
 sys.modules["ray.util"].get_node_ip_address = MagicMock(return_value="127.0.0.1")
-sys.modules["psrl.workers.gen_dplb.utils"].RolloutInstanceId = tuple
-sys.modules["psrl.workers.gen_dplb.utils"].DEFAULT_MAX_CONNECTIONS = 100
-sys.modules["psrl.workers.gen_dplb.utils"].DEFAULT_TIMEOUT = 60.0
+sys.modules["psrl.workers.gen.utils"].RolloutInstanceId = tuple
+sys.modules["psrl.workers.gen.utils"].DEFAULT_MAX_CONNECTIONS = 100
+sys.modules["psrl.workers.gen.utils"].DEFAULT_TIMEOUT = 60.0
 
 
 # Stub CommandExtension
@@ -66,7 +66,7 @@ def _load(rel):
     return mod
 
 
-_rc = _load("psrl/workers/gen_dplb/rollout_coordinator.py")
+_rc = _load("psrl/workers/gen/rollout_coordinator.py")
 RolloutCoordinator = _rc.RolloutCoordinator
 _rmc = _load("psrl/workers/reward/reward_model/coordinator.py")
 RewardModelCoordinator = _rmc.RewardModelCoordinator

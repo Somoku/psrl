@@ -13,7 +13,7 @@ from verl.utils.tokenizer import normalize_token_ids
 
 from psrl.environments.base import ConversationType, Environment
 from psrl.workers.agent_loop.agent_data.base import AgentData, SessionData, Trajectory
-from psrl.workers.gen_dplb.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput
 
 
 def normalize_openai_messages(openai_messages: list[dict]) -> ConversationType:

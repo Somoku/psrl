@@ -185,7 +185,7 @@ done
 echo ">>> [Step 3/4] Launching SessionRouter on ${HOST_IP}:${SESSION_ROUTER_PORT} ..."
 python -c "
 import uvicorn
-from psrl.workers.gen_dplb.session_router import SessionRouter
+from psrl.workers.gen.session_router import SessionRouter
 router = SessionRouter(smg_url='http://${HOST_IP}:${SMG_PORT}')
 uvicorn.run(router.app, host='0.0.0.0', port=${SESSION_ROUTER_PORT}, log_level='warning')
 " > "$LOG_DIR/session_router.log" 2>&1 &

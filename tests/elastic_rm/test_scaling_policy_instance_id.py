@@ -34,8 +34,8 @@ for _m in ["ray", "ray.actor", "ray.util", "ray.util.queue", "torch", "torch.dis
 if "psrl.utils.logger" not in sys.modules:
     sys.modules["psrl.utils.logger"] = MagicMock()
 
-# Load gen_dplb.utils directly (real module, provides RolloutInstanceId).
-_utils_mod = _load_direct("psrl.workers.gen_dplb.utils", "workers/gen_dplb/utils.py")
+# Load gen.utils directly (real module, provides RolloutInstanceId).
+_utils_mod = _load_direct("psrl.workers.gen.utils", "workers/gen/utils.py")
 RolloutInstanceId = _utils_mod.RolloutInstanceId
 
 # Load scaling_policy directly (real module under test).

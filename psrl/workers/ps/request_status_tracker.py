@@ -9,7 +9,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.logger import DualOutputHandler, deprecated, get_ps_logger
 from psrl.utils.server.command import Command, CommandType
-from psrl.workers.gen_dplb.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
+from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.staleness_controller import EntryInfo
 
 # Use the unified PS logger

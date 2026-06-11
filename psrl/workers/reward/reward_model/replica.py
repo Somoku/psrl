@@ -1,12 +1,12 @@
 from verl.workers.config import HFModelConfig
 
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen_dplb.vllm_async_server import GenInterface, PSRL_vLLMReplica
+from psrl.workers.gen.vllm_async_server import GenInterface, PSRL_vLLMReplica
 
 
 class RewardModelReplica(PSRL_vLLMReplica):
     """
-    Replica for reward-model / pooling-model inference in gen_dplb.
+    Replica for reward-model / pooling-model inference in gen.
 
     Extends ``PSRL_vLLMReplica`` with two key differences:
 

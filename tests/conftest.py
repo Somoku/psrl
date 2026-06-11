@@ -5,7 +5,7 @@ import sys
 from unittest.mock import MagicMock
 
 import pytest
-from psrl.workers.gen_dplb.utils import RolloutInstanceId  # = tuple[str, int]
+from psrl.workers.gen.utils import RolloutInstanceId  # = tuple[str, int]
 from psrl.workers.ps.staleness_controller import EntryInfo
 
 # ---------------------------------------------------------------------------
@@ -32,10 +32,10 @@ _PSRL = os.path.join(_HERE, "../psrl")
 if "psrl.utils.logger" not in sys.modules:
     sys.modules["psrl.utils.logger"] = MagicMock()
 
-# Load gen_dplb.utils directly (avoids ray via gen_dplb/__init__.py)
+# Load gen.utils directly (avoids ray via gen/__init__.py)
 _load_module_direct(
-    "psrl.workers.gen_dplb.utils",
-    os.path.join(_PSRL, "workers/gen_dplb/utils.py"),
+    "psrl.workers.gen.utils",
+    os.path.join(_PSRL, "workers/gen/utils.py"),
 )
 
 # Load staleness_controller directly (avoids ray via ps/__init__.py)

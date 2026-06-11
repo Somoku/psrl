@@ -29,7 +29,7 @@ RolloutInstanceId = tuple  # (str, int)
 @pytest.mark.unit
 def test_write_config_creates_file(tmp_path):
     """write_config() writes stats_config.json with correct fields."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -48,7 +48,7 @@ def test_write_config_creates_file(tmp_path):
 @pytest.mark.unit
 def test_record_creates_per_instance_files(tmp_path):
     """record() creates one JSONL file per (replica_id, dp_rank)."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -84,7 +84,7 @@ def test_record_creates_per_instance_files(tmp_path):
 @pytest.mark.unit
 def test_record_row_schema(tmp_path):
     """Each JSONL row has the expected fields and types."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -124,7 +124,7 @@ def test_record_row_schema(tmp_path):
 @pytest.mark.unit
 def test_record_nullable_iteration_stats(tmp_path):
     """avg_ttft and avg_itl are null when iteration_stats is absent."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -155,7 +155,7 @@ def test_record_nullable_iteration_stats(tmp_path):
 @pytest.mark.unit
 def test_record_empty_dict_skips_silently(tmp_path):
     """record() with empty dict creates no files."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -170,7 +170,7 @@ def test_record_empty_dict_skips_silently(tmp_path):
 @pytest.mark.unit
 def test_record_multiple_ticks_appends(tmp_path):
     """Calling record() twice appends two rows to the same file."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -198,7 +198,7 @@ def test_record_multiple_ticks_appends(tmp_path):
 @pytest.mark.unit
 def test_filename_sanitizes_replica_id(tmp_path):
     """Special characters in replica_id are sanitized to underscores."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0
@@ -225,7 +225,7 @@ def test_filename_sanitizes_replica_id(tmp_path):
 @pytest.mark.unit
 def test_makedirs_creates_logging_path(tmp_path):
     """StatsRecorder.__init__ creates logging_path if it doesn't exist."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     new_dir = tmp_path / "nested" / "logs"
     assert not new_dir.exists()
@@ -239,7 +239,7 @@ def test_makedirs_creates_logging_path(tmp_path):
 @pytest.mark.unit
 def test_record_smg_routing_status_uses_selecting(tmp_path):
     """SMG routing-loop snapshots record the worker-selection barrier state."""
-    from psrl.workers.gen_dplb.stats_recorder import StatsRecorder
+    from psrl.workers.gen.stats_recorder import StatsRecorder
 
     cfg = MagicMock()
     cfg.status_collection.stats_recorder.interval_in_s = 5.0

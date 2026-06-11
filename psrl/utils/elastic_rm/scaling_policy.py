@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from psrl.utils.logger import FileOnlyHandler
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
+from psrl.workers.gen.utils import RolloutInstanceId
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

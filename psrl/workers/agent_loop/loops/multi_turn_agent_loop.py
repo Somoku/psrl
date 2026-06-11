@@ -11,7 +11,7 @@ from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
-from psrl.workers.gen_dplb.utils import TokenOutput
+from psrl.workers.gen.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

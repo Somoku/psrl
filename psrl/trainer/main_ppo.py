@@ -17,7 +17,7 @@ from verl.utils.device import auto_set_device, is_cuda_available
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.config import validate_config
 from psrl.workers.config.reward_model import resolve_active_managers
-from psrl.workers.gen_dplb.vllm_rollout import PSRL_ServerAdapter
+from psrl.workers.gen.vllm_rollout import PSRL_ServerAdapter
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

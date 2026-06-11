@@ -8,8 +8,8 @@ from math import ceil
 
 import numpy as np
 
-from psrl.workers.gen_dplb.stats_collector import EngineStats
-from psrl.workers.gen_dplb.utils import RolloutInstanceId, TokenInput
+from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.gen.utils import RolloutInstanceId, TokenInput
 
 _ROUTE_STRATEGY_REGISTRY: dict[str, type["RouteStrategyBase"]] = {}
 

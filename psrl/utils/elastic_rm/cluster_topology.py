@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
+from psrl.workers.gen.utils import RolloutInstanceId
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

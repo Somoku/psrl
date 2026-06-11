@@ -5,7 +5,7 @@ from functools import wraps
 import numpy as np
 
 from psrl.utils.logger import get_ps_logger
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
+from psrl.workers.gen.utils import RolloutInstanceId
 
 # Use the unified PS logger
 psrl_logger = get_ps_logger()

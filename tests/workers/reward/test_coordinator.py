@@ -24,11 +24,11 @@ _MOCKED_MODULES = [
     "psrl.utils.elastic_rm.diagnostics",
     "psrl.utils.server",
     "psrl.utils.server.command",
-    "psrl.workers.gen_dplb.stats_collector",
-    "psrl.workers.gen_dplb.utils",
-    "psrl.workers.gen_dplb.zmq_queue",
-    "psrl.workers.gen_dplb",
-    "psrl.workers.gen_dplb.rollout_coordinator",
+    "psrl.workers.gen.stats_collector",
+    "psrl.workers.gen.utils",
+    "psrl.workers.gen.zmq_queue",
+    "psrl.workers.gen",
+    "psrl.workers.gen.rollout_coordinator",
 ]
 for _mod in _MOCKED_MODULES:
     if _mod not in sys.modules:
@@ -86,10 +86,10 @@ class _RolloutCoordinatorStub(_CommandExtensionStub):
         pass
 
 
-sys.modules["psrl.workers.gen_dplb.rollout_coordinator"].RolloutCoordinator = _RolloutCoordinatorStub
+sys.modules["psrl.workers.gen.rollout_coordinator"].RolloutCoordinator = _RolloutCoordinatorStub
 
-# Now stub the gen_dplb package __init__
-sys.modules["psrl.workers.gen_dplb"].RolloutCoordinator = _RolloutCoordinatorStub
+# Now stub the gen package __init__
+sys.modules["psrl.workers.gen"].RolloutCoordinator = _RolloutCoordinatorStub
 
 _coord_path = (
     pathlib.Path(__file__).parent.parent.parent.parent

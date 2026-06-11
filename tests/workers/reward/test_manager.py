@@ -36,8 +36,8 @@ _MOCKED = [
     "psrl.utils.logger",
     "psrl.utils.common",
     "psrl.utils.common.http_utils",
-    "psrl.workers.gen_dplb",
-    "psrl.workers.gen_dplb.vllm_async_server",
+    "psrl.workers.gen",
+    "psrl.workers.gen.vllm_async_server",
     "psrl.workers.reward.reward_model.coordinator",
 ]
 for _m in _MOCKED:

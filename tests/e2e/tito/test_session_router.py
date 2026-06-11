@@ -5,7 +5,7 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import Response as FastAPIResponse
 from httpx import ASGITransport
-from psrl.workers.gen_dplb.session_router import SessionRouter
+from psrl.workers.gen.session_router import SessionRouter
 
 # ---------------------------------------------------------------------------
 # Mock SMG server

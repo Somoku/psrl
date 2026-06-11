@@ -96,7 +96,7 @@ tests/
 ├── dataset/            # Data processor and dataset utilities
 ├── environments/       # Environment plugin registry
 ├── fsdp/               # FSDP1/FSDP2 model loading (GPU, torchrun)
-├── gen_dplb/           # StatsRecorder and rollout generation stats
+├── gen/           # StatsRecorder and rollout generation stats
 ├── megatron/           # Megatron model initialization (GPU)
 ├── nixl/               # NIXL communication planner, sharding, e2e (multi-node GPU)
 ├── parameter_server/   # RequestStatusTracker and PSManager

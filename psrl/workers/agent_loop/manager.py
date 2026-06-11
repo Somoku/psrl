@@ -21,7 +21,7 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import AsyncBusyPollingRayLock
-from psrl.workers.gen_dplb.utils import RolloutInstanceId
+from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
 

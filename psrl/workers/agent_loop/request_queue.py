@@ -4,7 +4,7 @@ from enum import Enum
 
 from sortedcontainers import SortedDict
 
-from psrl.workers.gen_dplb.utils import TokenInput
+from psrl.workers.gen.utils import TokenInput
 
 
 class RequestSortIndicator(Enum):

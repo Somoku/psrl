@@ -8,8 +8,8 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
-from psrl.workers.gen_dplb.rollout_gateway import _run_smg
-from psrl.workers.gen_dplb.smg_adapter import build_reward_router_args
+from psrl.workers.gen.rollout_gateway import _run_smg
+from psrl.workers.gen.smg_adapter import build_reward_router_args
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

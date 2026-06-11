@@ -82,10 +82,10 @@ from psrl.utils.server.command import Command, CommandType
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.router import RolloutRouter
-from psrl.workers.gen_dplb.rollout_coordinator import RolloutCoordinator
-from psrl.workers.gen_dplb.rollout_gateway import RolloutGateway
-from psrl.workers.gen_dplb.smg_adapter import build_pause_resume_payload
-from psrl.workers.gen_dplb.vllm_async_server import GenInterface, PSRL_vLLMReplica
+from psrl.workers.gen.rollout_coordinator import RolloutCoordinator
+from psrl.workers.gen.rollout_gateway import RolloutGateway
+from psrl.workers.gen.smg_adapter import build_pause_resume_payload
+from psrl.workers.gen.vllm_async_server import GenInterface, PSRL_vLLMReplica
 from psrl.workers.ps import (
     PSClassWithInitArgs,
     PSManager,

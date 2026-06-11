@@ -31,7 +31,7 @@ from psrl.workers.agent_loop.agent_data import (  # noqa: E402
 )
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase  # noqa: E402
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register  # noqa: E402
-from psrl.workers.gen_dplb.utils import TokenOutput  # noqa: E402
+from psrl.workers.gen.utils import TokenOutput  # noqa: E402
 
 _MIN_GEN_TOKENS = 256
 _QUEUE_POLL_INTERVAL = 0.05

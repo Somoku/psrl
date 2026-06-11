@@ -10,7 +10,7 @@ from verl.utils.fs import copy_to_local
 from verl.workers.config import HFModelConfig
 
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen_dplb.vllm_async_server import GenInterface
+from psrl.workers.gen.vllm_async_server import GenInterface
 from psrl.workers.reward.reward_model.coordinator import RewardModelCoordinator
 from psrl.workers.reward.reward_model.replica import RewardModelReplica
 

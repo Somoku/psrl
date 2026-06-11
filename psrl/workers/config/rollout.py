@@ -91,7 +91,7 @@ class RolloutConfig(_VeRLRolloutConfig):
     """PSRL extension of veRL RolloutConfig.
 
     Adds:
-    - pooling-model support (runner, task, reward_kwargs) for gen_dplb reward/embedding models
+    - pooling-model support (runner, task, reward_kwargs) for gen reward/embedding models
     - enable_weights_cpu_backup for TMS-style level-1 CPU sleep
     - PSRL-specific agent config (AgentLoopConfig with env/data sub-configs)
     """

@@ -82,6 +82,7 @@ from psrl.utils.server.command import Command, CommandType
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.router import RolloutRouter
+from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordinator import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway
 from psrl.workers.gen.smg_adapter import build_pause_resume_payload
@@ -95,12 +96,11 @@ from psrl.workers.ps import (
     PSStorageWorker,
     PSWorkerGroup,
 )
-from psrl.workers.config.reward_model import resolve_active_managers
-from psrl.workers.reward.reward_protocol import RewardModelRuntimeInfo
-from psrl.workers.reward.reward_worker import RewardLoopWorker
 from psrl.workers.reward.reward_manager import RewardLoopManager
 from psrl.workers.reward.reward_model import RewardModelManager
 from psrl.workers.reward.reward_model.gateway import RewardModelGateway
+from psrl.workers.reward.reward_protocol import RewardModelRuntimeInfo
+from psrl.workers.reward.reward_worker import RewardLoopWorker
 from psrl.workers.train import TrainInterface
 
 psrl_logger = logging.getLogger(__file__)
@@ -350,9 +350,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info("Initialized major ray trainer (single controller).")
 
         # Cache IP-to-Ray-node-ID mapping for scheduling actors to specific nodes.
-        self.ip_to_node_id: dict[str, str] = {
-            node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()
-        }
+        self.ip_to_node_id: dict[str, str] = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
 
         # Create per-node PortScanner actors for NIXL/LMCache port allocation.
         # Each scanner is pinned to its node via NodeAffinitySchedulingStrategy,
@@ -453,9 +451,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
 
         # Initialize the data processor
-        self.data_processor = DataProcessor.remote(
-            self.config, self.tokenizer, self.processor, self.ps_manager_handle
-        )
+        self.data_processor = DataProcessor.remote(self.config, self.tokenizer, self.processor, self.ps_manager_handle)
 
         # Get total training steps from the data processor where dataloaders are built
         self.total_training_steps = ray.get(self.data_processor.get_total_training_steps.remote())
@@ -579,14 +575,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         assert self.rollout_router is not None, (
             "Rollout router must be initialized before initializing rollout coordinator."
         )
-        self.rollout_coordinator = ray.remote(RolloutCoordinator).options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=self.ip_to_node_id[self.config.psrl.ps_manager_ip], soft=False
+        self.rollout_coordinator = (
+            ray.remote(RolloutCoordinator)
+            .options(
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=self.ip_to_node_id[self.config.psrl.ps_manager_ip], soft=False
+                )
             )
-        ).remote(
-            self.config,
-            self.ps_manager_handle,
-            self.rollout_gateway_url if self.config.psrl.rollout_gateway.enable else self.rollout_router,
+            .remote(
+                self.config,
+                self.ps_manager_handle,
+                self.rollout_gateway_url if self.config.psrl.rollout_gateway.enable else self.rollout_router,
+            )
         )
 
     def init_reward_gateways(self):
@@ -644,9 +644,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
         resp.raise_for_status()
         result = resp.json() if resp.content else {}
-        psrl_logger.warning(
-            f"[GATEWAY-CONTROL] After {action} over {len(instance_ids)} instances, resp = {result}"
-        )
+        psrl_logger.warning(f"[GATEWAY-CONTROL] After {action} over {len(instance_ids)} instances, resp = {result}")
         return result
 
     def start_rollout_coordinator(self):
@@ -851,7 +849,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         num_workers = worker_cfg.num_workers
         placement = worker_cfg.get("placement", "reward_service_ip")
         ip_to_node_id = self.ip_to_node_id
-        cpu_node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        cpu_node_ids = [
+            node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0
+        ]
         assert cpu_node_ids, "No alive CPU Ray nodes available for reward loop workers."
         reward_model_runtime_infos = self._build_reward_model_runtime_infos()
         max_concurrency = worker_cfg.max_concurrency_per_worker
@@ -906,7 +906,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ip_to_node_id[self.config.psrl.reward_service_ip],
                     soft=False,
-                )
+                ),
             )
             .remote(
                 config=self.config,
@@ -997,7 +997,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     dump_path=rollout_data_dir,
                 )
 
-    def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns) -> dict[str, float]:
+    def _val_metrics_update(
+        self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns
+    ) -> dict[str, float]:
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
@@ -1045,7 +1047,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # AGENT(VERL): PSRL use `parent_id` to group samples of the same prompt together,
         # while verl use `uid` instead.
         sample_parent_ids = []
-        
+
         dump_all_inputs: list[str] = []
         dump_all_outputs: list[str] = []
         dump_all_keys: list[str] = []
@@ -1165,13 +1167,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             dump_all_inputs = [dump_all_inputs[i] for i in sorted_indices]
             dump_all_outputs = [dump_all_outputs[i] for i in sorted_indices]
             dump_all_keys = [dump_all_keys[i] for i in sorted_indices]
-            
+
             # For ground truths, scores and reward extra infos, find the values in the
             # lists for the final samples of each session
             dump_all_sessions = [
-                f"{parts[0]}" if len(parts) == 2 else key
-                for key in dump_all_keys
-                for parts in [key.rsplit("_", 1)]
+                f"{parts[0]}" if len(parts) == 2 else key for key in dump_all_keys for parts in [key.rsplit("_", 1)]
             ]
             session_final_indices = [session_to_sample_idx[session] for session in dump_all_sessions]
             self._dump_generations(
@@ -1181,7 +1181,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 scores=[sample_scores[i] for i in session_final_indices],
                 reward_extra_infos_dict={
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
-                } | {"uid": dump_all_keys},
+                }
+                | {"uid": dump_all_keys},
                 dump_path=val_data_dir,
             )
 
@@ -1775,9 +1776,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
                     max_concurrency=max_concurrency_per_worker,
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
-                    ),
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=True),
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
@@ -1787,9 +1786,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     worker_num=num_agent_workers,
                 )
             )
-            psrl_logger.info(
-                f"Agent loop worker {i} scheduled on node {node_id} (soft=True)."
-            )
+            psrl_logger.info(f"Agent loop worker {i} scheduled on node {node_id} (soft=True).")
 
         psrl_logger.info("Initializing models and NIXL clients")
 
@@ -1990,8 +1987,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if self.config.psrl.rollout_gateway.enable:
                 paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
                 psrl_logger.warning(
-                    f"[INIT-PAUSE] rollout_gateway.enable=True, "
-                    f"paused_base_worker_ids={paused_base_worker_ids}"
+                    f"[INIT-PAUSE] rollout_gateway.enable=True, paused_base_worker_ids={paused_base_worker_ids}"
                 )
                 if paused_base_worker_ids:
                     psrl_logger.warning(
@@ -2044,7 +2040,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # NOTE(lhy): Two paths are supported:
             # 1. New training: load checkpoint directly to PS (may broadcast init)
             # 2. Resume training: load checkpoint into actor and push to PS
-            if self._resolve_resume_checkpoint_paths() == None:
+            if self._resolve_resume_checkpoint_paths() is None:
                 # Now that all NIXL buffers are allocated (meta tensors replaced),
                 # write the preloaded checkpoint tensors into the PS registered buffers.
                 with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
@@ -2440,9 +2436,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 return None
         elif self.config.trainer.resume_mode == "resume_path":
             assert isinstance(self.config.trainer.resume_from_path, str), "resume ckpt must be str type"
-            assert "global_step_" in self.config.trainer.resume_from_path, (
-                "resume ckpt must specify the global_steps"
-            )
+            assert "global_step_" in self.config.trainer.resume_from_path, "resume ckpt must specify the global_steps"
             global_step_folder = self.config.trainer.resume_from_path
             if not os.path.isabs(global_step_folder):
                 global_step_folder = os.path.join(os.getcwd(), global_step_folder)
@@ -2565,9 +2559,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # (see _resume_load_and_push_to_ps).  Skip re-loading here to avoid
         # overwriting the correct state with a redundant disk read.
         if getattr(self, "_actor_resume_loaded", False):
-            psrl_logger.info(
-                "Resume: actor checkpoint was already loaded in init_workers(); skipping actor re-load."
-            )
+            psrl_logger.info("Resume: actor checkpoint was already loaded in init_workers(); skipping actor re-load.")
         else:
             # In nixl_cpu/nixl_gpu + is_rollout_mode_in_actor: actor is in meta-sleep.
             # load_checkpoint() would hit a CUDA invalid-argument error (TMS.pause() active).
@@ -2576,9 +2568,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             is_nixl_mode = self.config.psrl.ps_mode in ["nixl_cpu", "nixl_gpu"]
             need_nixl_resume = is_nixl_mode and self.is_rollout_mode_in_actor
             if need_nixl_resume:
-                psrl_logger.info(
-                    "Resume (NIXL): deferring actor checkpoint load until after switch_to_trainer_mode."
-                )
+                psrl_logger.info("Resume (NIXL): deferring actor checkpoint load until after switch_to_trainer_mode.")
                 self._deferred_actor_ckpt_path = actor_path
             else:
                 # load actor (train only)
@@ -2772,9 +2762,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         rollout_correction = (
-            rollout_corr_config is not None
-            and "rollout_log_probs" in data.batch
-            and not bypass_recomputing_logprobs
+            rollout_corr_config is not None and "rollout_log_probs" in data.batch and not bypass_recomputing_logprobs
         )
         if rollout_correction:
             data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
@@ -3189,7 +3177,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                             psrl_logger,
                             event_type=EventType.WAIT,
                         ):
-                            batch: KVBatchMeta = ray.get(self.agent_loop_manager.wait_for_training_batch.remote(buffer_id))
+                            batch: KVBatchMeta = ray.get(
+                                self.agent_loop_manager.wait_for_training_batch.remote(buffer_id)
+                            )
                             self.replay_buffer.sample(batch.keys, batch.partition_id)
                         with log_dual_events("Switch to trainer mode", psrl_logger, event_type=EventType.SWITCH):
                             self.switch_to_trainer_mode()

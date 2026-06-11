@@ -10,8 +10,8 @@ import numpy as np
 import ray
 import torch
 import transfer_queue as tq
-from tensordict import TensorDict
 from omegaconf import DictConfig, ListConfig
+from tensordict import TensorDict
 from verl.utils import hf_tokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.fs import copy_to_local
@@ -191,9 +191,7 @@ class RewardLoopWorker:
         attempt_id = tu.get(request, "attempt_id")[0]
 
         try:
-            reward_data = await asyncio.get_event_loop().run_in_executor(
-                None, self.pre_process, request
-            )
+            reward_data = await asyncio.get_event_loop().run_in_executor(None, self.pre_process, request)
             response_len = reward_data["responses"].shape[-1]
 
             result = await self._compute_score(reward_data)

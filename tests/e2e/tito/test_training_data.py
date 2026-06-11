@@ -1,7 +1,6 @@
 """Tests for TITO training data builder."""
 
 import pytest
-
 from psrl.utils.tito.training_data import build_training_arrays
 
 

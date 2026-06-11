@@ -125,9 +125,10 @@ class Trajectory:
     # video_data: list of (video_tensor, metadata) tuples.
     image_data: list[Any] | None = None
     video_data: list[Any] | None = None
-    
+
     # Arbitrary extra fields for dynamic addition (e.g. tools_kwargs, interaction_kwargs).
     extra_fields: dict = field(default_factory=dict)
+
 
 @dataclass
 class SessionData:
@@ -176,6 +177,7 @@ class SessionData:
 
     # Trajectories inside a session
     trajectories: list[Trajectory] = field(default_factory=list)
+
 
 ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
@@ -346,7 +348,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         # Session-level stats
         self.session_data.assistant_turns += 1
         self.session_data.response_length += len(token_ids)
-        
+
         # Trajectory-level stats
         self.session_data.trajectories[-1].assistant_turns += 1
         self.session_data.trajectories[-1].response_ids += list(token_ids)
@@ -521,7 +523,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         request["raw_response_ids"] = np.array(self.session_data.trajectories[-1].response_ids)
         if self.session_data.curr_rollout_instance_id is not None:
             request["rollout_instance_id"] = self.session_data.curr_rollout_instance_id
-        
+
         # Propagate accumulated multi-modal data so generate_sequence() can
         # forward it to the inference backend on every turn.
         if (
@@ -589,10 +591,10 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
         outputs = []
         for trajectory in self.session_data.trajectories:
-            trajectory.response_ids = trajectory.response_ids[: response_length]
-            trajectory.response_mask = trajectory.response_mask[: response_length]
-            trajectory.response_logprobs = trajectory.response_logprobs[: response_length]
-            
+            trajectory.response_ids = trajectory.response_ids[:response_length]
+            trajectory.response_mask = trajectory.response_mask[:response_length]
+            trajectory.response_logprobs = trajectory.response_logprobs[:response_length]
+
             multi_modal_data = None
             if trajectory.image_data is not None or trajectory.video_data is not None:
                 multi_modal_data = {}
@@ -600,16 +602,12 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                     multi_modal_data["images"] = trajectory.image_data
                 if trajectory.video_data is not None:
                     multi_modal_data["videos"] = trajectory.video_data
-            
+
             output: TokenOutput = TokenOutput(
                 prompt_ids=trajectory.prompt_ids,
                 response_ids=trajectory.response_ids,
                 response_mask=trajectory.response_mask,
-                response_log_probs=(
-                    trajectory.response_logprobs
-                    if len(trajectory.response_logprobs) > 0
-                    else None
-                ),
+                response_log_probs=(trajectory.response_logprobs if len(trajectory.response_logprobs) > 0 else None),
                 routed_experts=(
                     trajectory.routed_experts[: len(trajectory.prompt_ids) + response_length]
                     if len(trajectory.routed_experts) > 0
@@ -623,10 +621,10 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                 extra_fields={
                     "tool_rewards": trajectory.tool_rewards,
                     "turn_scores": trajectory.turn_scores,
-                }
+                },
             )
             outputs.append(output)
-        
+
         if self.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode == "step":
             assert not self.config.reward.launch_reward_fn_async, (
                 "Asynchronous reward computation is not supported in 'step' traj_reward_mode."

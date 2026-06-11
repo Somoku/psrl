@@ -15,7 +15,9 @@ from verl.single_controller.ray import RayResourcePool
 from verl.trainer.config import AlgoConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
+
 # from verl.trainer.ppo.ray_trainer import compute_response_mask
+
 
 def compute_response_mask(data: DataProto):
     """Compute the attention mask for the response part of the sequence.
@@ -33,6 +35,7 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
 
 class PSRL_Role(Enum):
     Actor = enum.auto()
@@ -229,6 +232,7 @@ def PSRL_compute_advantage(
         data.batch["returns"] = returns
     return data
 
+
 def compute_advantage_for_multi_trajectories(
     data: DataProto,
     batch_keys: list[str],
@@ -302,6 +306,7 @@ def compute_advantage_for_multi_trajectories(
     data.batch["advantages"] = scores
     data.batch["returns"] = scores
     return data
+
 
 def _stats_to_timestamps(stats) -> dict | None:
     if stats is None:

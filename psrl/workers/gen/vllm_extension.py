@@ -8,9 +8,9 @@ from torch.distributed.tensor import DTensor
 from verl.utils.device import get_device_id
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
-from vllm_patches.interfaces import supports_weight_layout
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
+from vllm_patches.interfaces import supports_weight_layout
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import gen_client_name
@@ -129,9 +129,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         if isinstance(vllm_model, CUDAGraphWrapper):
             vllm_model = vllm_model.unwrap()
         param_mapping = (
-            None
-            if supports_weight_layout(vllm_model)
-            else create_parameter_mapping(type(vllm_model), model_config)
+            None if supports_weight_layout(vllm_model) else create_parameter_mapping(type(vllm_model), model_config)
         )
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
             vllm_model,
@@ -296,8 +294,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         connector = get_kv_transfer_group()
         assert connector is not None, (
-            "KV transfer group is None. "
-            "Ensure kv_transfer_config is set during vLLM engine initialization."
+            "KV transfer group is None. Ensure kv_transfer_config is set during vLLM engine initialization."
         )
         assert hasattr(connector, "_lmcache_engine"), (
             f"Connector {type(connector).__name__} does not have _lmcache_engine attribute. "
@@ -370,15 +367,11 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         try:
             chunk_bytes = backend.get_full_chunk_size_bytes()
         except Exception as e:
-            psrl_logger.warning(
-                f"[LMCache] get_full_chunk_size_bytes unavailable, bytes will be 0: {e!r}."
-            )
+            psrl_logger.warning(f"[LMCache] get_full_chunk_size_bytes unavailable, bytes will be 0: {e!r}.")
             chunk_bytes = 0
         lmcache_bytes = lmcache_hit_count * chunk_bytes
         lmcache_total_bytes = self._get_lmcache_total_bytes()
-        lmcache_usage_pct = (
-            lmcache_bytes / lmcache_total_bytes if lmcache_total_bytes > 0 else 0.0
-        )
+        lmcache_usage_pct = lmcache_bytes / lmcache_total_bytes if lmcache_total_bytes > 0 else 0.0
 
         return {
             "total_tokens": len(tokens),

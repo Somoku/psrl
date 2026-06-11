@@ -7,7 +7,7 @@ import msgspec
 
 from psrl.utils.common.http_utils import post
 from psrl.utils.kv_cache.config import LMCacheConfig
-from psrl.utils.kv_cache.types import KVCacheBackend, KVCacheStatus, TrajectoryCacheInfo
+from psrl.utils.kv_cache.types import KVCacheStatus, TrajectoryCacheInfo
 
 psrl_logger = logging.getLogger(__file__)
 
@@ -85,31 +85,19 @@ class KVCacheManager:
             psrl_logger.info("[LMCache] KV cache offloading is DISABLED.")
             return
 
-        psrl_logger.info(
-            "[LMCache] KV cache offloading is ENABLED with the following parameters:"
-        )
+        psrl_logger.info("[LMCache] KV cache offloading is ENABLED with the following parameters:")
         psrl_logger.info(f"  backend                = {self.config.backend!r}")
         psrl_logger.info(f"  offload_size_gb        = {self.config.offload_size_gb}")
         psrl_logger.info(f"  chunk_size             = {self.config.chunk_size}")
         psrl_logger.info(f"  cache_policy           = {self.config.cache_policy!r}")
         psrl_logger.info(f"  save_decode_cache      = {self.config.save_decode_cache}")
         psrl_logger.info(f"  save_unfull_chunk      = {self.config.save_unfull_chunk}")
-        psrl_logger.info(
-            f"  enable_async_loading   = {self.config.enable_async_loading}"
-        )
-        psrl_logger.info(
-            f"  clear_on_weight_update = {self.config.clear_on_weight_update}"
-        )
-        psrl_logger.info(
-            f"  gpu_pin_block_budget   = {self.config.gpu_pin_block_budget}"
-        )
+        psrl_logger.info(f"  enable_async_loading   = {self.config.enable_async_loading}")
+        psrl_logger.info(f"  clear_on_weight_update = {self.config.clear_on_weight_update}")
+        psrl_logger.info(f"  gpu_pin_block_budget   = {self.config.gpu_pin_block_budget}")
         if self.config.enable_p2p:
-            psrl_logger.info(
-                f"  enable_p2p             = {self.config.enable_p2p}"
-            )
-            psrl_logger.info(
-                f"  lmcache_instance_id    = {self.config.lmcache_instance_id!r}"
-            )
+            psrl_logger.info(f"  enable_p2p             = {self.config.enable_p2p}")
+            psrl_logger.info(f"  lmcache_instance_id    = {self.config.lmcache_instance_id!r}")
         if self.config.config_file:
             psrl_logger.info(f"  config_file            = {self.config.config_file!r}")
         self._verify_lmcache_importable()
@@ -122,9 +110,7 @@ class KVCacheManager:
             import lmcache  # type: ignore[import-untyped]
 
             version = getattr(lmcache, "__version__", "unknown")
-            psrl_logger.info(
-                f"[LMCache] lmcache package is importable, version={version!r}."
-            )
+            psrl_logger.info(f"[LMCache] lmcache package is importable, version={version!r}.")
         except ImportError:
             psrl_logger.error(
                 "[LMCache] lmcache package is NOT importable! "
@@ -160,9 +146,7 @@ class KVCacheManager:
             instance_id (int): Numeric identifier of this rollout instance.
         """
         self.config.lmcache_instance_id = f"psrl_instance_{instance_id}"
-        psrl_logger.info(
-            f"[LMCache] Instance ID set to {self.config.lmcache_instance_id!r}."
-        )
+        psrl_logger.info(f"[LMCache] Instance ID set to {self.config.lmcache_instance_id!r}.")
 
     def set_controller_url(self, controller_url: str) -> None:
         """
@@ -179,13 +163,9 @@ class KVCacheManager:
                 `"http://10.0.0.1:9042"`.
         """
         self._controller_url = controller_url
-        psrl_logger.info(
-            f"[LMCache] Controller URL set to {self._controller_url!r}."
-        )
+        psrl_logger.info(f"[LMCache] Controller URL set to {self._controller_url!r}.")
 
-    def set_peer_registry(
-        self, registry: dict[str, str], worker_zmq_url: str | None = None
-    ) -> None:
+    def set_peer_registry(self, registry: dict[str, str], worker_zmq_url: str | None = None) -> None:
         """
         Set the peer registry and local worker ZMQ URL for direct transfer bypass.
 
@@ -214,8 +194,7 @@ class KVCacheManager:
                 pass
             self._direct_zmq_socket = None
         psrl_logger.info(
-            f"[LMCache] Peer registry set with {len(registry)} entries, "
-            f"worker_zmq_url={worker_zmq_url!r}."
+            f"[LMCache] Peer registry set with {len(registry)} entries, worker_zmq_url={worker_zmq_url!r}."
         )
 
     # --- Push-based GPU prefix cache snapshot methods ---
@@ -400,13 +379,15 @@ class KVCacheManager:
             if self._lmcache_miss_log_count <= 5:
                 first_hash = hash_fn((none_hash, tuple(tokens[:chunk_size]), ()))
                 import sys
+
                 print(
                     f"[LMCache DIAG] First-chunk miss #{self._lmcache_miss_log_count}: "
                     f"tokens[:5]={tokens[:5]}, "
                     f"first_hash={first_hash}, "
                     f"hash_set_size={len(self._lmcache_chunk_hash_set)}, "
                     f"none_hash={none_hash}, num_full_chunks={num_full_chunks}",
-                    file=sys.stderr, flush=True
+                    file=sys.stderr,
+                    flush=True,
                 )
 
         cached_tokens = cached_chunks * chunk_size
@@ -439,9 +420,9 @@ class KVCacheManager:
                 self._lmcache_hash_fn_cached = hash
             else:
                 from vllm.utils.hashing import get_hash_fn_by_name
+
                 self._lmcache_hash_fn_cached = get_hash_fn_by_name(algo)
         return self._lmcache_hash_fn_cached
-
 
     @property
     def is_attached(self) -> bool:
@@ -485,9 +466,7 @@ class KVCacheManager:
 
         env_vars = self.config.to_env_vars()
         if not env_vars:
-            psrl_logger.info(
-                "[LMCache] No environment variables to set (LMCache disabled)."
-            )
+            psrl_logger.info("[LMCache] No environment variables to set (LMCache disabled).")
             return
         psrl_logger.info("[LMCache] Setting environment variables for LMCache...")
         for key, value in env_vars.items():
@@ -505,17 +484,14 @@ class KVCacheManager:
         if kwargs:
             psrl_logger.info(f"[LMCache] Injecting engine kwargs into vLLM: {kwargs}.")
         else:
-            psrl_logger.info(
-                "[LMCache] No engine kwargs to inject (LMCache disabled)."
-            )
+            psrl_logger.info("[LMCache] No engine kwargs to inject (LMCache disabled).")
         return kwargs
 
     # --- Private helpers ---
 
     def _assert_engine(self) -> None:
         assert self._inference_engine is not None, (
-            "KVCacheManager inference engine is not attached. "
-            "Call attach_engine() after the rollout is initialised."
+            "KVCacheManager inference engine is not attached. Call attach_engine() after the rollout is initialised."
         )
 
     async def _rpc(self, method: str, args: tuple) -> object:
@@ -720,6 +696,7 @@ class KVCacheManager:
             psrl_logger.error(msg)
             # Also print to ensure visibility (manager.py logger may lack handlers).
             import sys
+
             print(msg, file=sys.stderr, flush=True)
             return False
 
@@ -757,15 +734,12 @@ class KVCacheManager:
         self._assert_engine()
         assert tokens, "tokens must be a non-empty list."
         if not self.config.enable_p2p:
-            psrl_logger.warning(
-                "[LMCache] transfer_direct() called but enable_p2p is False."
-            )
+            psrl_logger.warning("[LMCache] transfer_direct() called but enable_p2p is False.")
             return False
 
         # Prerequisites must be met — no silent fallback.
         assert self.peer_registry, (
-            "[LMCache] transfer_direct() called but peer_registry is empty. "
-            "Call set_peer_registry() after P2P init."
+            "[LMCache] transfer_direct() called but peer_registry is empty. Call set_peer_registry() after P2P init."
         )
         assert self._worker_zmq_url, (
             "[LMCache] transfer_direct() called but worker_zmq_url is not set. "
@@ -787,13 +761,11 @@ class KVCacheManager:
         )
         if num_tokens > 0:
             psrl_logger.debug(
-                f"[LMCache] Direct transfer succeeded: {num_tokens} tokens "
-                f"moved from {src!r} to {dst!r}."
+                f"[LMCache] Direct transfer succeeded: {num_tokens} tokens moved from {src!r} to {dst!r}."
             )
         else:
             psrl_logger.info(
-                f"[LMCache] Direct transfer returned 0 tokens for "
-                f"{src!r} → {dst!r}. Source may not have cached data."
+                f"[LMCache] Direct transfer returned 0 tokens for {src!r} → {dst!r}. Source may not have cached data."
             )
         return num_tokens > 0
 
@@ -821,7 +793,6 @@ class KVCacheManager:
         """
         from lmcache.v1.cache_controller.message import (
             MoveWorkerMsg,
-            MoveWorkerRetMsg,
             Msg,
         )
 
@@ -846,9 +817,7 @@ class KVCacheManager:
         if hasattr(resp, "num_tokens"):
             return resp.num_tokens
         else:
-            psrl_logger.warning(
-                f"[LMCache] Unexpected response type from Worker: {type(resp).__name__}"
-            )
+            psrl_logger.warning(f"[LMCache] Unexpected response type from Worker: {type(resp).__name__}")
             return 0
 
     def _get_or_create_zmq_socket(self):
@@ -869,9 +838,7 @@ class KVCacheManager:
             # Set send/recv timeout to avoid hanging indefinitely.
             self._direct_zmq_socket.setsockopt(zmq.SNDTIMEO, 10000)  # 10s
             self._direct_zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
-            psrl_logger.info(
-                f"[LMCache] Direct ZMQ socket connected to {self._worker_zmq_url}."
-            )
+            psrl_logger.info(f"[LMCache] Direct ZMQ socket connected to {self._worker_zmq_url}.")
         return self._direct_zmq_socket
 
     # --- GPU pin budget internals ---
@@ -897,10 +864,7 @@ class KVCacheManager:
 
         if self._gpu_pin_budget > 0:
             # Evict oldest-pinned trajectories to make room.
-            while (
-                self._pinned_gpu_blocks + new_blocks > self._gpu_pin_budget
-                and self._gpu_pinned_order
-            ):
+            while self._pinned_gpu_blocks + new_blocks > self._gpu_pin_budget and self._gpu_pinned_order:
                 oldest_tokens = self._gpu_pinned_order.popleft()
                 # Use the actual freed count returned by lmcache_unpin_gpu rather
                 # than re-querying get_cache_info.  The cache-info query was
@@ -950,12 +914,6 @@ class KVCacheManager:
         self._pinned_gpu_blocks = max(0, self._pinned_gpu_blocks - freed)
         # Remove from order tracking (`deque` does not support arbitrary removal,
         # so rebuild without the evicted entry).
-        self._gpu_pinned_order = deque(
-            t for t in self._gpu_pinned_order if t != tokens
-        )
-        psrl_logger.debug(
-            f"[LMCache] GPU unpin: {freed} blocks freed, "
-            f"total={self._pinned_gpu_blocks}."
-        )
+        self._gpu_pinned_order = deque(t for t in self._gpu_pinned_order if t != tokens)
+        psrl_logger.debug(f"[LMCache] GPU unpin: {freed} blocks freed, total={self._pinned_gpu_blocks}.")
         return True
-

@@ -57,8 +57,7 @@ class Qwen3XMLToolParser(ToolParser):
                 return response_str, []
 
             tool_calls = [
-                self._parse_xml_function_call(function_call_str, tools)
-                for function_call_str in function_calls
+                self._parse_xml_function_call(function_call_str, tools) for function_call_str in function_calls
             ]
 
             content_index = response_str.find(self.tool_call_start_token)

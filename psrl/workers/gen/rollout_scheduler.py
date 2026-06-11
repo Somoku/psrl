@@ -50,7 +50,8 @@ class RolloutScheduler(Scheduler):
         # process, so get_kv_transfer_group() returns the active LMCache connector.
         lmcache_backend_snapshot = None
         try:
-            from vllm.distributed.kv_transfer import has_kv_transfer_group, get_kv_transfer_group
+            from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
+
             if has_kv_transfer_group():
                 connector = get_kv_transfer_group()
                 if hasattr(connector, "_lmcache_engine") and connector._lmcache_engine is not None:
@@ -82,27 +83,27 @@ class RolloutScheduler(Scheduler):
                         # NOTE: hash_fn (function object) is NOT serializable through
                         # zmq/msgspec, so we pass the algorithm name and none_hash value.
                         from lmcache.v1.token_database import NONE_HASH as _LM_NONE_HASH
+
                         lmcache_backend_snapshot["none_hash"] = _LM_NONE_HASH
                         # Pass the hash algorithm name so GenWorker loads the SAME function.
                         # LMCache uses config.pre_caching_hash_algorithm (default: "builtin"),
                         # which may differ from vLLM's prefix_caching_hash_algo (default: "sha256").
                         lmcache_backend_snapshot["hash_algo"] = getattr(
-                            lmcache_engine.token_database, "_hash_algo_name",
+                            lmcache_engine.token_database,
+                            "_hash_algo_name",
                             getattr(lmcache_engine.token_database.config, "pre_caching_hash_algorithm", "builtin")
-                            if lmcache_engine.token_database.config is not None else "builtin"
+                            if lmcache_engine.token_database.config is not None
+                            else "builtin",
                         )
                         # Hash consistency probe: GenWorker uses this to verify cross-process
                         # hash() determinism. If mismatch → PYTHONHASHSEED not set properly.
                         _hash_fn = lmcache_engine.token_database.hash_func
-                        lmcache_backend_snapshot["hash_probe"] = _hash_fn(
-                            (_LM_NONE_HASH, (0, 1, 2, 3), ())
-                        )
+                        lmcache_backend_snapshot["hash_probe"] = _hash_fn((_LM_NONE_HASH, (0, 1, 2, 3), ()))
         except Exception as exc:
             # Non-fatal: if snapshot fails, router falls back to collective_rpc.
             import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "LMCache backend snapshot failed: %r", exc, exc_info=True
-            )
+
+            _logging.getLogger(__name__).warning("LMCache backend snapshot failed: %r", exc, exc_info=True)
         # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
         # 1. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
         # 2. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
@@ -220,8 +221,7 @@ class RolloutScheduler(Scheduler):
                     f"Block {block.block_id} ref_cnt is {block.ref_cnt} after touch(). Expected > 0."
                 )
         psrl_logger.debug(
-            f"[LMCache] GPU pin (scheduler): {pinned} blocks pinned for token sequence "
-            f"of length {len(tokens)}."
+            f"[LMCache] GPU pin (scheduler): {pinned} blocks pinned for token sequence of length {len(tokens)}."
         )
         return pinned
 
@@ -254,8 +254,7 @@ class RolloutScheduler(Scheduler):
                 self._psrl_pinned_block_ids.discard(block.block_id)
                 freed += 1
         psrl_logger.debug(
-            f"[LMCache] GPU unpin (scheduler): {freed} blocks released for token sequence "
-            f"of length {len(tokens)}."
+            f"[LMCache] GPU unpin (scheduler): {freed} blocks released for token sequence of length {len(tokens)}."
         )
         return freed
 
@@ -265,9 +264,7 @@ class RolloutScheduler(Scheduler):
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
-        assert request.status == RequestStatus.RUNNING, (
-            "Only running requests can be preempted"
-        )
+        assert request.status == RequestStatus.RUNNING, "Only running requests can be preempted"
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED

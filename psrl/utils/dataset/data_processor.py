@@ -663,11 +663,7 @@ class DataProcessor:
         )
 
         if rollout_n > 1:
-            request_ids = [
-                sample_ids[i] * rollout_n + j
-                for i in range(actual_n_prompts)
-                for j in range(rollout_n)
-            ]
+            request_ids = [sample_ids[i] * rollout_n + j for i in range(actual_n_prompts) for j in range(rollout_n)]
             batch = batch.repeat_interleave(repeats=rollout_n)
             tu.assign_non_tensor_stack(batch, "uid", request_ids)
         else:
@@ -676,8 +672,7 @@ class DataProcessor:
         ray.get(self.ps_manager_handle.add_request.remote(request_ids))
 
         psrl_logger.debug(
-            f"sample_train_prompts: produced {actual_n_prompts} prompts "
-            f"({len(request_ids)} children) for retry."
+            f"sample_train_prompts: produced {actual_n_prompts} prompts ({len(request_ids)} children) for retry."
         )
         return batch
 
@@ -702,9 +697,7 @@ class DataProcessor:
             elif isinstance(sample, np.ndarray):
                 merged[key] = np.concatenate(values, axis=0)
             else:
-                raise TypeError(
-                    f"Unsupported value type {type(sample)!r} for key {key!r} in retry chunks."
-                )
+                raise TypeError(f"Unsupported value type {type(sample)!r} for key {key!r} in retry chunks.")
         return merged
 
     # ------- Streaming Data Processing Methods -------

@@ -2,7 +2,6 @@ import argparse
 from datetime import datetime, timezone
 from typing import Any
 
-
 WORKERS_UPDATE_STATS_PATH = "/workers/update_stats"
 WORKERS_UPDATE_WEIGHT_VERSION_PATH = "/workers/update_weight_version"
 WORKERS_STATS_PATH = "/workers/stats"
@@ -31,9 +30,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
     # KV-cache transfer on migration (only meaningful with cache_aware + migration).
     kv_transfer_enable = bool(cfg_get(config, "psrl.routing_strategy.kv_transfer.enable", False))
     kv_transfer_mode = str(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_mode", "async"))
-    kv_transfer_timeout_ms = int(
-        cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_timeout_ms", 30000)
-    )
+    kv_transfer_timeout_ms = int(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_timeout_ms", 30000))
 
     cli_args = argparse.Namespace(
         host=host,
@@ -49,9 +46,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         disable_retries=True,
         cache_threshold=float(cfg_get(config, "psrl.routing_strategy.cache_threshold", 0.3)),
         gpu_overlap_weight=float(cfg_get(config, "psrl.routing_strategy.gpu_overlap_weight", 1.0)),
-        lmcache_overlap_weight=float(
-            cfg_get(config, "psrl.routing_strategy.lmcache_overlap_weight", 0.5)
-        ),
+        lmcache_overlap_weight=float(cfg_get(config, "psrl.routing_strategy.lmcache_overlap_weight", 0.5)),
         max_concurrent_seqs_per_instance=int(
             cfg_get(config, "psrl.routing_strategy.max_concurrent_seqs_per_instance", 1024)
         ),
@@ -59,9 +54,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         max_num_waiting_reqs_after_preemption=int(
             cfg_get(config, "psrl.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
         ),
-        delta_throughput_threshold=float(
-            cfg_get(config, "psrl.routing_strategy.delta_throughput_threshold", 0.5)
-        ),
+        delta_throughput_threshold=float(cfg_get(config, "psrl.routing_strategy.delta_throughput_threshold", 0.5)),
         max_prompt_length=int(
             cfg_get(config, "data.max_prompt_length", cfg_get(config, "rollout.prompt_length", 8192))
         ),
@@ -116,9 +109,7 @@ def build_reward_router_args(config: Any, host: str, port: int, prometheus_port:
         max_num_waiting_reqs_after_preemption=int(
             cfg_get(config, "psrl.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
         ),
-        delta_throughput_threshold=float(
-            cfg_get(config, "psrl.routing_strategy.delta_throughput_threshold", 0.5)
-        ),
+        delta_throughput_threshold=float(cfg_get(config, "psrl.routing_strategy.delta_throughput_threshold", 0.5)),
         max_prompt_length=32768,
         request_budget=1024,
         enable_routing_loop=False,
@@ -204,6 +195,7 @@ def build_worker_stats_update(worker_id: str, dp_rank: int, snapshot: dict[str, 
             "kv_cache_usage": float(scheduler_stats.get("kv_cache_usage", 0.0)),
         },
     }
+
 
 def _parse_timestamp(value):
     if isinstance(value, str):

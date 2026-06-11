@@ -28,18 +28,14 @@ from psrl.workers.ps import (
     PSStorageWorker,
     PSWorkerGroup,
 )
-from verl.models.mcore import hf_to_mcore_config, init_mcore_model
-from verl.utils.fs import copy_to_local
-from verl.utils.device import get_device_name
-from verl.utils.fsdp_utils import apply_fsdp2, fsdp2_load_full_state_dict
-from verl.utils.megatron_utils import get_model
-from verl.utils.model import get_hf_auto_model_class
-from verl.utils.torch_dtypes import PrecisionType
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy
 from transformers import AutoConfig, AutoModelForCausalLM
+from verl.models.mcore import hf_to_mcore_config
+from verl.utils.fs import copy_to_local
+from verl.utils.torch_dtypes import PrecisionType
 from verl.workers.engine.megatron.utils import set_random_seed
 
 NUM_GPU_PER_NODE = 8
@@ -67,9 +63,7 @@ def validate_parallel_config(cfg: DictConfig) -> None:
     gen_ep = cfg.test.gen.get("expert_parallel_size", 1)
     gen_dp = cfg.test.gen.get("data_parallel_size", None)
 
-    assert num_gen % (gen_tp * gen_pp) == 0, (
-        f"num_gen {num_gen} must be divisible by gen TP*PP {gen_tp * gen_pp}."
-    )
+    assert num_gen % (gen_tp * gen_pp) == 0, f"num_gen {num_gen} must be divisible by gen TP*PP {gen_tp * gen_pp}."
     computed_dp = num_gen // (gen_tp * gen_pp)
     if gen_dp is not None and gen_dp > 1:
         assert computed_dp == gen_dp, (
@@ -580,9 +574,7 @@ class GenClientActor:
             vllm_model = vllm_model.unwrap()
         model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
         param_mapping = (
-            None
-            if supports_weight_layout(vllm_model)
-            else create_parameter_mapping(type(vllm_model), model_config)
+            None if supports_weight_layout(vllm_model) else create_parameter_mapping(type(vllm_model), model_config)
         )
         state_dict, sharding = convert_vllm_inplace(
             vllm_model,

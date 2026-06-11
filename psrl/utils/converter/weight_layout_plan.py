@@ -24,12 +24,13 @@ from psrl.utils.nixl.nixl_spec import NIXLSharding
 @dataclass
 class ConvertedWeight:
     """Output fragment from parameter conversion.
-    
+
     Attributes:
         name: HuggingFace parameter name
         param: Tensor (view or copy)
         sharding: Optional NIXL sharding metadata
     """
+
     name: str
     param: torch.Tensor
     sharding: NIXLSharding | None = None
@@ -37,7 +38,7 @@ class ConvertedWeight:
 
 class PlanExecutor:
     """Executes a WeightLayoutPlan to convert vLLM parameters to HF format.
-    
+
     Usage:
         plan = model.build_weight_layout().flatten()
         executor = PlanExecutor(plan, tp_rank=0)
@@ -46,7 +47,7 @@ class PlanExecutor:
                 output_state_dict[converted.name] = converted.param
                 output_sharding[converted.name] = converted.sharding
     """
-    
+
     def __init__(
         self,
         plan: ResolvedWeightLayoutPlan,
@@ -54,7 +55,7 @@ class PlanExecutor:
         ep_rank: int = 0,
     ):
         """Initialize executor with a plan.
-        
+
         Args:
             plan: Flattened WeightLayoutPlan from model.build_weight_layout().flatten()
             tp_rank: Tensor parallel rank
@@ -63,7 +64,7 @@ class PlanExecutor:
         self.plan = plan
         self.tp_rank = tp_rank
         self.ep_rank = ep_rank
-    
+
     def execute(
         self,
         param_name: str,

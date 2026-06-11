@@ -22,12 +22,12 @@ from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
     make_slice_parameter,
-    slice_qwen3_5_in_proj,
-    slice_qwen3_5_in_proj_qkv,
+    reshape_visual_block_qkv,
+    slice_attn_conv1d,
     slice_gate_up_proj,
     slice_qkv_proj_megatron,
-    slice_attn_conv1d,
-    reshape_visual_block_qkv,
+    slice_qwen3_5_in_proj,
+    slice_qwen3_5_in_proj_qkv,
 )
 from psrl.utils.converter.utils.parallel_states import ParallelStates
 from psrl.utils.nixl.nixl_spec import NIXLSharding
@@ -66,10 +66,8 @@ class MegatronConverter(BaseConverter):
         model_list = model if isinstance(model, (list, tuple)) else [model]
         models = unwrap_model(list(model_list))
         for m in models:
-            if hasattr(m, 'config') and not hasattr(m.config, 'share_embeddings_and_output_weights'):
-                m.config.share_embeddings_and_output_weights = getattr(
-                    m, 'share_embeddings_and_output_weights', False
-                )
+            if hasattr(m, "config") and not hasattr(m.config, "share_embeddings_and_output_weights"):
+                m.config.share_embeddings_and_output_weights = getattr(m, "share_embeddings_and_output_weights", False)
         conversion_tasks = self.bridge._model_bridge.build_conversion_tasks(self.parameter_mapping.config, models)
         task_by_local_name = {
             (task.vp_stage, task.param_name): task
@@ -120,7 +118,7 @@ class MegatronConverter(BaseConverter):
                     # (exported from the embedding on the PP stage that has it).
                     continue
                 elif name.startswith("vision_model."):
-                    hf_name = "model.visual." + name[len("vision_model."):]
+                    hf_name = "model.visual." + name[len("vision_model.") :]
                 else:
                     hf_name = name
                 # Visual QKV params must be reshaped to match vLLM's convention:
@@ -278,7 +276,9 @@ class MegatronConverter(BaseConverter):
                 tp_size=self.mpu.tp_size,
             )
         except Exception as e:
-            raise ValueError(f"Failed to convert concatenated qkv parameter {full_name} into {full_hf_name}: {e}") from e
+            raise ValueError(
+                f"Failed to convert concatenated qkv parameter {full_name} into {full_hf_name}: {e}"
+            ) from e
 
         qkv = torch.cat((q, k, v), dim=0)
         if "visual.blocks" in full_hf_name and "qkv" in full_hf_name:
@@ -286,9 +286,7 @@ class MegatronConverter(BaseConverter):
             param.partition_dim = 1
         return {full_hf_name: qkv}
 
-    def _convert_qwen35_in_proj_parameter(
-        self, full_name: str, param: Parameter, full_hf_names: list[str]
-    ) -> dict:
+    def _convert_qwen35_in_proj_parameter(self, full_name: str, param: Parameter, full_hf_names: list[str]) -> dict:
         assert "in_proj" in full_name, "Only in_proj should have 4 corresponding hf names after split"
         key_dim = self.model_info.get("linear_key_dim")
         value_dim = self.model_info.get("linear_value_dim")

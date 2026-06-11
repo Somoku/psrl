@@ -7,11 +7,11 @@ from torch.nn import Parameter
 
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
-    is_qkv_weight,
     is_q_weight,
+    is_qkv_weight,
     make_slice_parameter,
-    reshape_qkv_to_3d,
     reshape_q_to_5d,
+    reshape_qkv_to_3d,
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -161,9 +161,7 @@ class BaseConverter(ABC):
                     f"for attn_output_gate 5D reshape in Case C for {param_name}."
                 )
                 q_heads_per_group_local = rows // (2 * head_size)
-                reshaped = make_slice_parameter(
-                    param.data.reshape(1, q_heads_per_group_local, 2, head_size, H), param
-                )
+                reshaped = make_slice_parameter(param.data.reshape(1, q_heads_per_group_local, 2, head_size, H), param)
                 new_sharding = NIXLSharding(
                     shard_mesh=OrderedDict([(0, G_global), (1, steps)]),
                     shard_indices=[(rank // steps, rank % steps)],

@@ -3,9 +3,9 @@ import torch
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
+    reshape_visual_block_qkv,
     slice_attn_conv1d,
     slice_qwen3_5_in_proj_qkv,
-    reshape_visual_block_qkv
 )
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -79,7 +79,7 @@ def maybe_convert_to_smaller_parts(model_info, param_name, param):
     if "mlp.experts.gate_up_proj" in param_name:
         param_dict = {}
         num_experts = model_info["num_experts"]
-        name_prefix = param_name.rsplit('.', 1)[0]
+        name_prefix = param_name.rsplit(".", 1)[0]
         for i in range(num_experts):
             gate_name = f"{name_prefix}.{i}.gate_proj.weight"
             up_name = f"{name_prefix}.{i}.up_proj.weight"
@@ -90,7 +90,7 @@ def maybe_convert_to_smaller_parts(model_info, param_name, param):
     if "mlp.experts.down_proj" in param_name:
         param_dict = {}
         num_experts = model_info["num_experts"]
-        name_prefix = param_name.rsplit('.', 1)[0]
+        name_prefix = param_name.rsplit(".", 1)[0]
         for i in range(num_experts):
             down_name = f"{name_prefix}.{i}.down_proj.weight"
             param_dict[down_name] = param[i]

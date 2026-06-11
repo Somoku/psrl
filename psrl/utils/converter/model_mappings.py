@@ -7,6 +7,7 @@ from torch.nn import Parameter
 
 _MISSING = object()
 
+
 def make_slice_parameter(slice_data: torch.Tensor, param: Parameter) -> Parameter:
     """
     Make a slice parameter from a slice data tensor and a parameter.
@@ -60,6 +61,7 @@ def is_q_weight(param_name: str) -> bool:
         bool: True if the parameter is a Q projection weight or bias.
     """
     return any(param_name.endswith(suffix) for suffix in _Q_WEIGHT_SUFFIXES)
+
 
 def reshape_qkv_to_3d(
     param: Parameter,
@@ -126,8 +128,9 @@ def reshape_q_to_5d(
             where num_groups_local = gcd(num_heads_local, num_kv_heads_local).
     """
     num_groups_local, rows, hidden = param.shape
-    assert rows == num_heads_local // num_groups_local * head_size, \
+    assert rows == num_heads_local // num_groups_local * head_size, (
         f"Expected rows={num_heads_local * head_size} but got {rows}."
+    )
     q_num_heads_per_group = num_heads_local // num_groups_local // 2
     new_shape = (num_groups_local, q_num_heads_per_group, 2, head_size, hidden)
     # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
@@ -350,7 +353,9 @@ def slice_attn_conv1d(
     k_dim = num_k_heads * k_head_size // tp_size
     v_dim = num_v_heads * v_head_size // tp_size
     assert fused_param.data.shape[output_dim] == (k_dim * 2 + v_dim), (
-        f"Dim {output_dim} of fused parameter shape {fused_param.data.shape} must match the sum of k and v dims {[k_dim, v_dim]}"
+        f"Dim {output_dim} of fused parameter shape "
+        f"{fused_param.data.shape} must match the sum "
+        f"of k and v dims {[k_dim, v_dim]}"
     )
     offset_and_sizes = [
         (0, k_dim),
@@ -423,12 +428,10 @@ def slice_in_proj_qkvz(
     qkv_size = 2 * key_dim + value_dim
     z_size = value_dim
     assert qkv_size % tp_size == 0, (
-        "in_proj_qkv size must be divisible by tensor parallel size, "
-        f"got qkv_size={qkv_size} and tp_size={tp_size}."
+        f"in_proj_qkv size must be divisible by tensor parallel size, got qkv_size={qkv_size} and tp_size={tp_size}."
     )
     assert z_size % tp_size == 0, (
-        "in_proj_z size must be divisible by tensor parallel size, "
-        f"got z_size={z_size} and tp_size={tp_size}."
+        f"in_proj_z size must be divisible by tensor parallel size, got z_size={z_size} and tp_size={tp_size}."
     )
     qkv_size_local = qkv_size // tp_size
     z_size_local = z_size // tp_size
@@ -466,8 +469,7 @@ def slice_in_proj_ba(
     """
     assert tp_size >= 1, f"tp_size must be >= 1, got: {tp_size!r}."
     assert num_v_heads % tp_size == 0, (
-        "num_v_heads must be divisible by tensor parallel size, "
-        f"got num_v_heads={num_v_heads} and tp_size={tp_size}."
+        f"num_v_heads must be divisible by tensor parallel size, got num_v_heads={num_v_heads} and tp_size={tp_size}."
     )
     size_local = num_v_heads // tp_size
     expected = 2 * size_local
@@ -582,6 +584,7 @@ def slice_qwen3_5_in_proj_qkv(
         make_slice_parameter(k_data, fused_param),
         make_slice_parameter(v_data, fused_param),
     ]
+
 
 class MappingType(Enum):
     """Enum for mapping prototypes."""
@@ -729,11 +732,7 @@ class ParameterMapping(ABC):
             vision_num_heads = _get_attr(vision_cfg, "num_heads", None)
             vision_hidden_size = _get_attr(vision_cfg, "hidden_size", None)
             vision_head_size = _get_attr(vision_cfg, "head_dim", None)
-            if (
-                vision_head_size is None
-                and _is_int(vision_num_heads)
-                and _is_int(vision_hidden_size)
-            ):
+            if vision_head_size is None and _is_int(vision_num_heads) and _is_int(vision_hidden_size):
                 vision_head_size = vision_hidden_size // vision_num_heads
             if _is_int(vision_num_heads):
                 info["vision_num_heads"] = vision_num_heads

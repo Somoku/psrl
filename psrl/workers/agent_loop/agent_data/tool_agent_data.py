@@ -28,6 +28,7 @@ def sort_tool_schema_keys(value):
         return [sort_tool_schema_keys(item) for item in value]
     return copy.deepcopy(value)
 
+
 @AgentData.register("tool_agent_data")
 class ToolAgentData(ConversationAgentData):
     """
@@ -173,9 +174,7 @@ class ToolAgentData(ConversationAgentData):
         content = message.get("content", "")
         if isinstance(content, list):
             return "".join(
-                str(item.get("text", ""))
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
+                str(item.get("text", "")) for item in content if isinstance(item, dict) and item.get("type") == "text"
             )
         return "" if content is None else str(content)
 
@@ -184,8 +183,7 @@ class ToolAgentData(ConversationAgentData):
         for message, tool_name in zip(observation, self.tool_call_names, strict=False):
             content = self._tool_message_text(message)
             parts.append(
-                f"<|start|>functions.{tool_name} to=assistant<|channel|>commentary"
-                f"<|message|>{content}<|end|>"
+                f"<|start|>functions.{tool_name} to=assistant<|channel|>commentary<|message|>{content}<|end|>"
             )
         return "".join(parts) + "<|start|>assistant"
 

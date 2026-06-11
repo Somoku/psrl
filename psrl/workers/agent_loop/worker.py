@@ -2,8 +2,8 @@ import asyncio
 import atexit
 import logging
 import os
-import uuid
 import traceback
+import uuid
 from collections import deque
 
 import hydra
@@ -67,16 +67,14 @@ class PSRL_AgentLoopWorker:
         # reclaim only this actor's containers when the actor process dies,
         # which is robust under SIGKILL, OOM, Ray actor restart, and
         # multiple-actors-per-node packing.
-        self._actor_id = (
-            f"w{worker_id}-{os.uname().nodename}-{os.getpid()}-"
-            f"{uuid.uuid4().hex[:8]}"
-        )
+        self._actor_id = f"w{worker_id}-{os.uname().nodename}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         os.environ["PSRL_ACTOR_ID"] = self._actor_id
         # Use the config parameter directly (self.config is set below) so the
         # reaper log lands next to the AgentLoopWorker_N.log files.
         _reaper_log_dir = getattr(getattr(config, "psrl", None), "logging_path", None)
         self._reaper_proc = spawn_actor_reaper(
-            self._actor_id, log_dir=_reaper_log_dir,
+            self._actor_id,
+            log_dir=_reaper_log_dir,
         )
         # On graceful shutdown, _terminate_reaper synchronously reaps our
         # actor's containers (belt) AND signals the bash sidecar to skip its
@@ -87,7 +85,7 @@ class PSRL_AgentLoopWorker:
             f"reaper pid={self._reaper_proc.pid}, "
             f"reaper log_dir={_reaper_log_dir!r}."
         )
-        
+
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
@@ -151,10 +149,7 @@ class PSRL_AgentLoopWorker:
             if self.model_config.processor is not None:
                 self.model_config.processor.chat_template = resolved_template
             self.model_config.tokenizer.chat_template = resolved_template
-            psrl_logger.info(
-                f"Applied custom chat template from {custom_template_value!r} "
-                f"to agent-loop tokenizer."
-            )
+            psrl_logger.info(f"Applied custom chat template from {custom_template_value!r} to agent-loop tokenizer.")
 
         # Initialize rollout trace config
         trace_config = self.config.gen_actor_rollout_ref.rollout.get("trace", {})
@@ -233,7 +228,7 @@ class PSRL_AgentLoopWorker:
         if batch is None:
             self.pending_program_queue.append(None)
             return
-        
+
         n = len(batch)
         if n == 0:
             return
@@ -285,10 +280,7 @@ class PSRL_AgentLoopWorker:
                 future.result()  # This will raise an exception if the task failed
             except Exception as e:
                 tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                psrl_logger.error(
-                    f"Task {task} failed with exception: {e}\n"
-                    f"Traceback:\n{tb_str}"
-                )
+                psrl_logger.error(f"Task {task} failed with exception: {e}\nTraceback:\n{tb_str}")
             finally:
                 self.agent_programs.discard(task)
 
@@ -462,8 +454,7 @@ class PSRL_AgentLoopWorker:
                         )
                 else:
                     psrl_logger.debug(
-                        f"Agent loop for requests {request_ids} "
-                        f"terminated with reason {terminate_reason.value}."
+                        f"Agent loop for requests {request_ids} terminated with reason {terminate_reason.value}."
                     )
 
             # Put the output into the TransferQueue and notify PSManager
@@ -499,7 +490,7 @@ class PSRL_AgentLoopWorker:
                     f"(terminate_reason={terminate_reason.value}), aborting in PSManager."
                 )
                 await self.ps_manager_handle.abort_requests.remote(request_ids)
-            
+
             # After ALL cleanup is complete (notify_group_failed + abort_requests),
             # re-raise the original error so it propagates to the task callback.
             if raised_error is not None:

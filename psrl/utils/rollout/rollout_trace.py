@@ -10,7 +10,6 @@ from enum import Enum
 from typing import Optional
 
 from pydantic import BaseModel
-
 from verl.utils.ray_utils import get_event_loop
 
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
@@ -217,7 +216,7 @@ def rollout_trace_attr(
         yield
         return
 
-     # Add attributes to the appropriate backend
+    # Add attributes to the appropriate backend
     token = _trace_attributes.set(attributes)
     if backend == "weave":
         import weave
@@ -409,7 +408,9 @@ def _log_trackio_trace(op_name, inputs, output=None, exception=None):
     input_messages = _extract_messages_from_inputs(inputs)
     if isinstance(input_messages, list):
         messages = [
-            message for message in (_trackio_message_dict(message) for message in input_messages) if message is not None
+            message
+            for message in (_trackio_message_dict(message) for message in input_messages)
+            if message is not None
         ]
 
     if not messages:

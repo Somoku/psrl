@@ -61,7 +61,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         if tool_selection:
             selected = [tool for tool in tools if tool.name in tool_selection]
             tools = selected
-        
+
         cls.tools = ToolGroup(tools=tools)
 
         # Build a class-level logger for tool calls.
@@ -77,7 +77,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         max_turns: int,
         tokenizer: AutoTokenizer,
         processor: AutoProcessor | None = None,
-        dataset_cls = None,
+        dataset_cls=None,
         **kwargs,
     ):
         """
@@ -164,9 +164,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         self.num_turn = 0
 
         self.task = task
-        assert "raw_prompt" in task, (
-            "For ReTool recipe, task must contain 'raw_prompt' in non_tensor_batch"
-        )
+        assert "raw_prompt" in task, "For ReTool recipe, task must contain 'raw_prompt' in non_tensor_batch"
         initial_observation = task["raw_prompt"]
         self.tools_kwargs = task.get("tools_kwargs", {})
         images, videos = await self.process_vision_info(initial_observation)
@@ -220,9 +218,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             async with sem:
                 return await self._call_tool(tc, self.tools_kwargs)
 
-        results: list[tuple[ToolResponse, float | None]] = await asyncio.gather(
-            *[_guarded_call(tc) for tc in action]
-        )
+        results: list[tuple[ToolResponse, float | None]] = await asyncio.gather(*[_guarded_call(tc) for tc in action])
 
         next_observation: list[dict] = []
         new_images_this_turn: list[Any] = []
@@ -274,14 +270,12 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
             info={
                 "multi_modal_data": {
                     "images": new_images_this_turn if new_images_this_turn else None,
-                    "videos": None, # Video handling not implemented
+                    "videos": None,  # Video handling not implemented
                 }
-            }
+            },
         )
 
-    async def _call_tool(
-        self, tool_call: dict, tools_kwargs: dict | None = None
-    ) -> tuple[ToolResponse, float | None]:
+    async def _call_tool(self, tool_call: dict, tools_kwargs: dict | None = None) -> tuple[ToolResponse, float | None]:
         """Call a single tool and format the response.
 
         Executes the specified tool with the provided arguments, handles errors,

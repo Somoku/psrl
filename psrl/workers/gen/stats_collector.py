@@ -271,9 +271,7 @@ class DPLBStatCollector(StatLoggerBase):
                 "avg_inter_token_latencies": np.mean(inter_token_latencies_iter).item(),
             }
             avg_itl = iteration_stats_entry["avg_inter_token_latencies"]
-            snapshot["generation_throughput"] = (
-                num_generation_reqs / avg_itl if avg_itl > 0 else 0.0
-            )
+            snapshot["generation_throughput"] = num_generation_reqs / avg_itl if avg_itl > 0 else 0.0
             snapshot["iteration_stats"] = iteration_stats_entry
 
             # Accumulate prefill/decode wall time for this step.

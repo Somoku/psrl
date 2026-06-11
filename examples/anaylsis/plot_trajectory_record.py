@@ -181,12 +181,8 @@ def compute_stats(records: list[TrajectoryProfilingData]) -> dict:
         "env_fraction": _stat_dict(env_fractions, include_percentiles=False),
         # turn-level
         "avg_turn_duration_s": _stat_dict(avg_turn_durations),
-        "decode_throughput_tok_s": (
-            _stat_dict(decode_throughputs) if decode_throughputs else {}
-        ),
-        "prefill_seqlen": (
-            _stat_dict(prefill_seqlens) if prefill_seqlens else {}
-        ),
+        "decode_throughput_tok_s": (_stat_dict(decode_throughputs) if decode_throughputs else {}),
+        "prefill_seqlen": (_stat_dict(prefill_seqlens) if prefill_seqlens else {}),
         # trigger breakdown
         "prefill_trigger_breakdown": trigger_totals,
         # raw series (kept for plotting)
@@ -384,8 +380,9 @@ def _fraction_bar_ax(ax, stats: dict) -> None:
     stds = [stats[k]["std"] * 100 for k in keys]
 
     y_pos = np.arange(len(labels))
-    bars = ax.barh(y_pos, means, xerr=stds, color=colors, edgecolor="white",
-                   linewidth=0.4, capsize=4, error_kw={"linewidth": 1.2})
+    bars = ax.barh(
+        y_pos, means, xerr=stds, color=colors, edgecolor="white", linewidth=0.4, capsize=4, error_kw={"linewidth": 1.2}
+    )
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels, fontsize=9)
     ax.set_xlabel("fraction of total trajectory time (%)", fontsize=9)
@@ -442,30 +439,42 @@ def plot_stats(
     ax01 = fig.add_subplot(3, 3, 2)
     ax02 = fig.add_subplot(3, 3, 3)
 
-    _hist_ax(ax00, series.get("total_duration_s", []),
-             "Trajectory Total Duration", "seconds", color="#4C72B0")
-    _hist_ax(ax01, series.get("total_turns", []),
-             "Trajectory Turn Count", "turns", color="#55A868", bins=20)
-    _hist_ax(ax02, series.get("total_generated_tokens", []),
-             "Total Generated Tokens", "tokens", color="#8172B2")
+    _hist_ax(ax00, series.get("total_duration_s", []), "Trajectory Total Duration", "seconds", color="#4C72B0")
+    _hist_ax(ax01, series.get("total_turns", []), "Trajectory Turn Count", "turns", color="#55A868", bins=20)
+    _hist_ax(ax02, series.get("total_generated_tokens", []), "Total Generated Tokens", "tokens", color="#8172B2")
 
     # --- Row 1: cache hit rate, decode throughput, fraction bar ---
     ax10 = fig.add_subplot(3, 3, 4)
     ax11 = fig.add_subplot(3, 3, 5)
     ax12 = fig.add_subplot(3, 3, 6)
 
-    _hist_ax(ax10, series.get("avg_cache_hit_rate", []),
-             "Avg Cache Hit Rate (per trajectory)", "cache hit rate", color="#C44E52")
-    _hist_ax(ax11, series.get("decode_throughput_tok_s", []),
-             "Decode Throughput (per turn)", "tokens / second", color="#DD8452")
+    _hist_ax(
+        ax10,
+        series.get("avg_cache_hit_rate", []),
+        "Avg Cache Hit Rate (per trajectory)",
+        "cache hit rate",
+        color="#C44E52",
+    )
+    _hist_ax(
+        ax11,
+        series.get("decode_throughput_tok_s", []),
+        "Decode Throughput (per turn)",
+        "tokens / second",
+        color="#DD8452",
+    )
     _fraction_bar_ax(ax12, stats)
 
     # --- Row 2: prefill seqlen (wide) + trigger breakdown text ---
     ax20 = fig.add_subplot(3, 3, (7, 8))
     ax21 = fig.add_subplot(3, 3, 9)
 
-    _hist_ax(ax20, series.get("prefill_seqlen", []),
-             "Prefill Sequence Length (per prefill event)", "tokens", color="#64B5CD")
+    _hist_ax(
+        ax20,
+        series.get("prefill_seqlen", []),
+        "Prefill Sequence Length (per prefill event)",
+        "tokens",
+        color="#64B5CD",
+    )
 
     # Trigger breakdown as text panel.
     breakdown = stats.get("prefill_trigger_breakdown", {})
@@ -477,7 +486,8 @@ def plot_stats(
             pct = 100.0 * count / total
             lines.append(f"{trigger}\n  {count}  ({pct:.1f}%)")
         ax21.text(
-            0.05, 0.95,
+            0.05,
+            0.95,
             "\n".join(lines),
             transform=ax21.transAxes,
             va="top",

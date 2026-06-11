@@ -31,7 +31,6 @@ from collections.abc import Callable
 from typing import Any
 
 from transformers.utils import get_json_schema
-
 from verl.tools.schemas import OpenAIFunctionToolSchema
 
 from psrl.tools.base import Tool, ToolOutput, ToolResponse
@@ -39,8 +38,8 @@ from psrl.tools.base import Tool, ToolOutput, ToolResponse
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-FUNCTION_TOOL_REGISTRY: dict[str, "FunctionTool"] = {}
-_LOADED_FUNCTION_TOOL_PATHS: dict[str, list["FunctionTool"]] = {}
+FUNCTION_TOOL_REGISTRY: dict[str, FunctionTool] = {}
+_LOADED_FUNCTION_TOOL_PATHS: dict[str, list[FunctionTool]] = {}
 
 
 class FunctionTool(Tool):
@@ -209,8 +208,7 @@ def _normalize_response_reward_metrics(ret: Any) -> tuple[ToolResponse, float, d
     if isinstance(ret, tuple):
         if not 1 <= len(ret) <= 3:
             raise TypeError(
-                "@function_tool return tuple must have length 1, 2, or 3 "
-                f"(got length {len(ret)}: {ret!r})."
+                f"@function_tool return tuple must have length 1, 2, or 3 (got length {len(ret)}: {ret!r})."
             )
         response = _coerce_response(ret[0])
         reward = 0.0 if len(ret) < 2 or ret[1] is None else float(ret[1])

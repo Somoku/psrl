@@ -33,12 +33,12 @@ class ToolResponse(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _validate_list_fields(cls, values):
-        for field in ("image", "video"):
-            val = values.get(field)
+        for mm_field in ("image", "video"):
+            val = values.get(mm_field)
             if val is not None and not isinstance(val, list):
                 raise ValueError(
-                    f"ToolResponse.{field} must be a list, got {type(val)}. "
-                    f"Wrap single items: [{field}=obj] → [{field}=[obj]]."
+                    f"ToolResponse.{mm_field} must be a list, got {type(val)}. "
+                    f"Wrap single items: [{mm_field}=obj] → [{mm_field}=[obj]]."
                 )
         return values
 
@@ -47,6 +47,7 @@ class ToolResponse(BaseModel):
 
     def is_text_only(self) -> bool:
         return bool(self.text) and not self.image and not self.video
+
 
 @dataclass
 class ToolCall:

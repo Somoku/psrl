@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 
 from omegaconf import MISSING
 from verl.base_config import BaseConfig
+from verl.workers.config.rollout import (
+    AgentLoopConfig as _VeRLAgentLoopConfig,
+)
 
 # Re-export common classes from veRL (keep veRL's RolloutConfig as the base)
 from verl.workers.config.rollout import (
@@ -29,8 +32,9 @@ from verl.workers.config.rollout import (
 )
 from verl.workers.config.rollout import (
     MultiTurnConfig as _VeRLMultiTurnConfig,
+)
+from verl.workers.config.rollout import (
     RolloutConfig as _VeRLRolloutConfig,
-    AgentLoopConfig as _VeRLAgentLoopConfig,
 )
 
 
@@ -55,6 +59,7 @@ class EnvironmentConfig(BaseConfig):
 class AgentDataConfig(BaseConfig):
     name: str | None = MISSING
 
+
 @dataclass
 class MultiTurnConfig(_VeRLMultiTurnConfig):
     _mutable_fields = {"max_turns"}
@@ -69,6 +74,7 @@ class MultiTurnConfig(_VeRLMultiTurnConfig):
     use_inference_chat_template: bool = False
     tokenization_sanity_check_mode: str = "strict"
     format: str = "hermes"
+
 
 @dataclass
 class AgentLoopConfig(_VeRLAgentLoopConfig):

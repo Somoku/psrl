@@ -173,6 +173,4 @@ def build_broadcast_plan(world_size: int, algorithm: str) -> BroadcastPlan:
     """
     if algorithm == "binary_tree":
         return BinaryTreeBroadcastPlan(world_size)
-    raise ValueError(
-        f"Unknown broadcast algorithm: {algorithm!r}. Supported: 'binary_tree'."
-    )
+    raise ValueError(f"Unknown broadcast algorithm: {algorithm!r}. Supported: 'binary_tree'.")

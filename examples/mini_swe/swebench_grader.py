@@ -51,8 +51,8 @@ _OUTPUT_TAIL_BYTES = 4096
 _BASE_RUN_ARGS: list[str] = [
     "--rm",
     "--memory=30g",  # 10g was too small: heavy repos (scikit-learn, xarray)
-                     # run `pip install -e .` inside the container and can
-                     # temporarily exceed 10g, triggering cgroup OOM kills.
+    # run `pip install -e .` inside the container and can
+    # temporarily exceed 10g, triggering cgroup OOM kills.
     "--network",
     "host",
     "--add-host",
@@ -255,7 +255,7 @@ def _get_smith_eval_script(swe_problem: dict[str, Any]) -> str:
         [
             "#!/bin/bash",
             "set -uxo pipefail",
-            f"cd /testbed",
+            "cd /testbed",
             cmd,
         ]
     )
@@ -287,7 +287,6 @@ def _grade_verified(
             and ``resolved_by`` fields.
     """
     import json
-    import tempfile
 
     from swebench.harness.grading import get_eval_report
     from swebench.harness.test_spec.test_spec import make_test_spec
@@ -320,7 +319,7 @@ def _grade_verified(
             tf.write(eval_output)
             log_path = tf.name
         # swebench>=4.x returns a nested {instance_id: {resolved, tests_status, ...}} dict,
-        # not a flat one.  
+        # not a flat one.
         # Unwrap by instance_id before reading fields.
         report_map = get_eval_report(ts, prediction, log_path, include_tests_status=True)
         report = report_map.get(swe_problem["instance_id"], {})
@@ -337,9 +336,7 @@ def _grade_verified(
             "resolved_by": "harness",
         }
     except Exception as exc:
-        psrl_logger.warning(
-            f"[swebench_grader] Verified harness grading failed, falling back to returncode: {exc}."
-        )
+        psrl_logger.warning(f"[swebench_grader] Verified harness grading failed, falling back to returncode: {exc}.")
         return {
             "resolved": False,
             "f2p_pass": 0,
@@ -372,7 +369,6 @@ def _grade_smith(
     Returns:
         dict[str, Any]: Grading result.
     """
-    import tempfile
 
     from swesmith.harness.grading import get_eval_report as smith_get_eval_report
 
@@ -412,9 +408,7 @@ def _grade_smith(
             "resolved_by": "harness",
         }
     except Exception as exc:
-        psrl_logger.warning(
-            f"[swebench_grader] SWE-smith harness grading failed, falling back to returncode: {exc}."
-        )
+        psrl_logger.warning(f"[swebench_grader] SWE-smith harness grading failed, falling back to returncode: {exc}.")
         resolved_fallback = returncode == 0
         return {
             "resolved": resolved_fallback,
@@ -499,16 +493,20 @@ def _grade_gym(
         }
 
     try:
-        from swebench.harness.log_parsers.python import parse_log_pytest
+        from swebench.harness.constants import KEY_INSTANCE_ID
         from swebench.harness.grading import (
-            get_eval_tests_report,
-            get_resolution_status,
-            ResolvedStatus,
-            EvalType,
             FAIL_TO_PASS as _FAIL_TO_PASS,
+        )
+        from swebench.harness.grading import (
             PASS_TO_PASS as _PASS_TO_PASS,
         )
-        from swebench.harness.constants import KEY_INSTANCE_ID
+        from swebench.harness.grading import (
+            EvalType,
+            ResolvedStatus,
+            get_eval_tests_report,
+            get_resolution_status,
+        )
+        from swebench.harness.log_parsers.python import parse_log_pytest
 
         # parse_log_pytest returns {test_case: status_str} mapping.
         # The second argument (test_spec) is only used for type hints
@@ -522,9 +520,7 @@ def _grade_gym(
             _PASS_TO_PASS: p2p,
         }
 
-        report = get_eval_tests_report(
-            status_map, eval_ref, eval_type=EvalType.PASS_AND_FAIL
-        )
+        report = get_eval_tests_report(status_map, eval_ref, eval_type=EvalType.PASS_AND_FAIL)
         resolved = get_resolution_status(report) == ResolvedStatus.FULL.value
 
         f2p_status = report.get("FAIL_TO_PASS", {})
@@ -538,10 +534,7 @@ def _grade_gym(
             "resolved_by": "harness",
         }
     except Exception as exc:
-        psrl_logger.warning(
-            f"[swebench_grader] SWE-Gym harness grading failed, "
-            f"falling back to returncode: {exc}."
-        )
+        psrl_logger.warning(f"[swebench_grader] SWE-Gym harness grading failed, falling back to returncode: {exc}.")
         return {
             "resolved": False,
             "f2p_pass": 0,
@@ -640,9 +633,7 @@ def grade_fresh_container(
 
     policy = analyze_patch_policy(model_patch, swe_problem)
     if policy["violated"]:
-        psrl_logger.info(
-            f"{log_prefix} Patch policy violated: {policy['reasons']!r}, skipping eval container."
-        )
+        psrl_logger.info(f"{log_prefix} Patch policy violated: {policy['reasons']!r}, skipping eval container.")
         return {
             "policy_violated": True,
             "policy_reasons": policy["reasons"],
@@ -690,7 +681,9 @@ def grade_fresh_container(
         }
 
     # --- 2. Spawn fresh eval container ---
-    grader_label = f"psrl.grader_task_id={swe_task_id}__eval" if swe_task_id else f"psrl.grader_task_id={swe_problem_id}__eval"
+    grader_label = (
+        f"psrl.grader_task_id={swe_task_id}__eval" if swe_task_id else f"psrl.grader_task_id={swe_problem_id}__eval"
+    )
     run_args = list(_BASE_RUN_ARGS)
     if memory:
         # Override the --memory=Xg entry in _BASE_RUN_ARGS with the caller's value.
@@ -708,8 +701,12 @@ def grade_fresh_container(
     # Forward corporate proxy environment variables to the grading container
     # so that pip/apt inside the eval script can reach external package indexes.
     _PROXY_ENV_KEYS = [
-        "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
-        "no_proxy", "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "no_proxy",
+        "NO_PROXY",
     ]
 
     docker_env: DockerEnvironment | None = None
@@ -720,9 +717,7 @@ def grade_fresh_container(
     error_msg: str | None = None
 
     try:
-        psrl_logger.info(
-            f"{log_prefix} Spawning eval container: image={image_name!r}, grader_kind={grader_kind!r}."
-        )
+        psrl_logger.info(f"{log_prefix} Spawning eval container: image={image_name!r}, grader_kind={grader_kind!r}.")
         docker_env = DockerEnvironment(
             image=image_name,
             cwd="/testbed",
@@ -730,9 +725,7 @@ def grade_fresh_container(
             forward_env=_PROXY_ENV_KEYS,
             container_timeout=_DEFAULT_CONTAINER_TIMEOUT,
         )
-        psrl_logger.info(
-            f"{log_prefix} Eval container started: id={docker_env.container_id!r}."
-        )
+        psrl_logger.info(f"{log_prefix} Eval container started: id={docker_env.container_id!r}.")
 
         # --- 3. SWE-smith: restore F2P test files via HEAD~1 ---
         if grader_kind == "smith":
@@ -742,17 +735,14 @@ def grade_fresh_container(
             )
             if out["returncode"] != 0:
                 psrl_logger.warning(
-                    f"{log_prefix} git checkout HEAD~1 failed (rc={out['returncode']}): "
-                    f"{out['output'][:200]}."
+                    f"{log_prefix} git checkout HEAD~1 failed (rc={out['returncode']}): {out['output'][:200]}."
                 )
 
         # --- 4. Reset tree and apply model patch ---
         apply_cmd = "git reset --hard HEAD && git clean -fd"
         out = docker_env.execute({"command": apply_cmd}, cwd="/testbed")
         if out["returncode"] != 0:
-            psrl_logger.warning(
-                f"{log_prefix} git reset failed (rc={out['returncode']})."
-            )
+            psrl_logger.warning(f"{log_prefix} git reset failed (rc={out['returncode']}).")
 
         # Write patch to a tmp file inside the container via heredoc.
         delimiter = "PSRL_PATCH_EOF"
@@ -760,10 +750,7 @@ def grade_fresh_container(
         out2 = docker_env.execute({"command": apply_cmd2}, cwd="/testbed")
         apply_ok = out2["returncode"] == 0
         if not apply_ok:
-            psrl_logger.info(
-                f"{log_prefix} git apply failed (rc={out2['returncode']}): "
-                f"{out2['output'][:300]}."
-            )
+            psrl_logger.info(f"{log_prefix} git apply failed (rc={out2['returncode']}): {out2['output'][:300]}.")
 
         # --- 5. SWE-smith: revert test-file changes from the patch ---
         if grader_kind == "smith" and apply_ok:
@@ -775,9 +762,7 @@ def grade_fresh_container(
                     cwd="/testbed",
                 )
                 if out3["returncode"] != 0:
-                    psrl_logger.warning(
-                        f"{log_prefix} Reverting test files failed (rc={out3['returncode']})."
-                    )
+                    psrl_logger.warning(f"{log_prefix} Reverting test files failed (rc={out3['returncode']}).")
 
         # --- 6. Run eval script ---
         eval_delim = "PSRL_EVAL_EOF"

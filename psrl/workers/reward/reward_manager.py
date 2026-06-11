@@ -186,11 +186,7 @@ class RewardLoopManager(CommandExtension):
         self.stop_collect_task = True
         self.stop_dispatch_task = True
         # Wait for the background tasks to finish
-        tasks = [
-            task
-            for task in (self.command_loop_task, self.collect_task, self.dispatch_task)
-            if task is not None
-        ]
+        tasks = [task for task in (self.command_loop_task, self.collect_task, self.dispatch_task) if task is not None]
         await asyncio.gather(*tasks)
         await asyncio.gather(*[worker.stop_busy_loop.remote() for worker in self.reward_loop_workers])
 
@@ -326,7 +322,9 @@ class RewardLoopManager(CommandExtension):
             KVBatchMeta: Normalized reward batch.
         """
         fields = ["uid", "reward_score", "reward_extra_info"]
-        data = await tq.async_kv_batch_get(keys=reward_batch.keys, partition_id=reward_batch.partition_id, select_fields=fields)
+        data = await tq.async_kv_batch_get(
+            keys=reward_batch.keys, partition_id=reward_batch.partition_id, select_fields=fields
+        )
 
         uids = tu.get(data, "uid")
         reward_extra_infos = tu.get(data, "reward_extra_info")
@@ -550,7 +548,7 @@ class RewardLoopManager(CommandExtension):
 
         is_validate = tu.get(reward_inputs, "validate", False)
         request_ids = tu.get(reward_inputs, "uid")
-        n_trajectory = tu.get(reward_inputs, "n_trajectory")
+        n_trajectories = tu.get(reward_inputs, "n_trajectory")
 
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         request_keys = []
@@ -571,9 +569,9 @@ class RewardLoopManager(CommandExtension):
                 update_status_success = [update_status_success]
 
             for i, (request_id, n_trajectory, status_ok) in enumerate(
-                zip(request_ids, n_trajectory, update_status_success)
+                zip(request_ids, n_trajectories, update_status_success)
             ):
-                reward_input = reward_inputs[i: i + 1]
+                reward_input = reward_inputs[i : i + 1]
                 prompt_key = "parent_id" if rollout_n > 1 else "uid"
                 prompt_id = tu.get(reward_input, prompt_key)[0]
                 data_source = tu.get(reward_input, "data_source")[0]
@@ -655,9 +653,7 @@ class RewardLoopManager(CommandExtension):
         }
         # Reward may be ready in group post processing
         ready_keys = {
-            key
-            for key, tag in zip(requests.keys, requests.tags)
-            if not is_validate and tag.get("reward_ready", False)
+            key for key, tag in zip(requests.keys, requests.tags) if not is_validate and tag.get("reward_ready", False)
         }
         request_keys_to_put = [key for key in request_keys if key not in ready_keys]
         request_key_to_reward: dict[str, dict] = {}
@@ -862,7 +858,8 @@ class RewardLoopManager(CommandExtension):
             if manager is None:
                 # 1st fallback: match by reward_loop_type only
                 candidates = [
-                    (spec, mgr) for spec, mgr in self.reward_spec_to_manager.items()
+                    (spec, mgr)
+                    for spec, mgr in self.reward_spec_to_manager.items()
                     if spec.reward_manager_type == reward_spec.reward_manager_type
                 ]
                 if len(candidates) == 0:
@@ -980,10 +977,10 @@ class RewardLoopManager(CommandExtension):
         """
         is_validate = tu.get(reward_inputs, "validate", False)
         request_ids = tu.get(reward_inputs, "uid")
-        n_trajectory = tu.get(reward_inputs, "n_trajectory")
+        n_trajectories = tu.get(reward_inputs, "n_trajectory")
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         request_keys = []
-        for request_id, n_trajectory in zip(request_ids, n_trajectory):
+        for request_id, n_trajectory in zip(request_ids, n_trajectories):
             self.request_id_to_n_trajectory[request_id] = n_trajectory
             if n_trajectory > 1:
                 request_keys.extend([f"{request_id}_{i}" for i in range(n_trajectory)])
@@ -1011,7 +1008,7 @@ class RewardLoopManager(CommandExtension):
             event_type=EventType.OTHER,
         ):
             for i, request_id in enumerate(request_ids):
-                reward_input = reward_inputs[i: i + 1]
+                reward_input = reward_inputs[i : i + 1]
                 prompt_id_key = "parent_id" if rollout_n > 1 else "uid"
                 prompt_id = tu.get(reward_input, prompt_id_key)[0]
                 data_source = tu.get(reward_input, "data_source")[0]

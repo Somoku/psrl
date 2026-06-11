@@ -282,9 +282,7 @@ class AgentLoopBase(ABC):
                 )
 
             # ── Text-only: fast /generate path ──────────────────────────────
-            return await self._generate_via_generate_endpoint(
-                request_input, sampling_params, is_sticky_session
-            )
+            return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
         else:
             mm_data = request_input.multi_modal_data
             if mm_data is not None and (mm_data.get("images") or mm_data.get("videos")):
@@ -363,9 +361,7 @@ class AgentLoopBase(ABC):
 
         # Call SMG /generate directly via aiohttp so we can read both the
         # response body (a JSON array) and the worker-instance headers in one pass.
-        gen_responses, base_worker_id, target_dp_rank = await self._post_generate(
-            request_url, payload, req_headers
-        )
+        gen_responses, base_worker_id, target_dp_rank = await self._post_generate(request_url, payload, req_headers)
 
         if not gen_responses:
             psrl_logger.error(
@@ -408,9 +404,7 @@ class AgentLoopBase(ABC):
         # Partial-rollout loopback is merged gateway-side.
         routed_experts = None
         if self.rollout_config.enable_rollout_routing_replay:
-            routed_experts = self._decode_routed_experts_payload(
-                meta_info.get("routed_experts")
-            )
+            routed_experts = self._decode_routed_experts_payload(meta_info.get("routed_experts"))
 
         return TokenOutput(
             prompt_ids=request_input.input_ids,
@@ -454,9 +448,7 @@ class AgentLoopBase(ABC):
                 lambda: self.tokenizer.decode(request_input.input_ids, skip_special_tokens=True),
             )
 
-            content: list[dict] = [
-                {"type": "image_url", "image_url": {"url": url}} for url in image_data_urls
-            ]
+            content: list[dict] = [{"type": "image_url", "image_url": {"url": url}} for url in image_data_urls]
             content.append({"type": "text", "text": prompt_text})
             messages = [{"role": "user", "content": content}]
 
@@ -496,9 +488,7 @@ class AgentLoopBase(ABC):
 
         chat_url = f"{self.gateway_addr.rstrip('/')}/v1/chat/completions"
 
-        chat_resp, base_worker_id, target_dp_rank = await self._post_chat(
-            chat_url, chat_payload, req_headers
-        )
+        chat_resp, base_worker_id, target_dp_rank = await self._post_chat(chat_url, chat_payload, req_headers)
         if chat_resp is None:
             psrl_logger.error(
                 "Gateway /v1/chat/completions returned empty response for request_id=%s",
@@ -655,9 +645,7 @@ class AgentLoopBase(ABC):
             max_model_len = self.rollout_config.prompt_length + self.rollout_config.response_length
         max_possible_tokens = max_model_len - input_length
         if max_possible_tokens < 0:
-            raise ValueError(
-                f"Input length {input_length} exceeds the maximum model length {max_model_len}"
-            )
+            raise ValueError(f"Input length {input_length} exceeds the maximum model length {max_model_len}")
 
         max_tokens = self.rollout_config.response_length + self.rollout_config.prompt_length - input_length
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
@@ -892,7 +880,8 @@ class AgentLoopBase(ABC):
 
             timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
             output, terminate_reason = await asyncio.wait_for(
-                self.run(prompt), timeout=timeout,
+                self.run(prompt),
+                timeout=timeout,
             )
             if output is not None:
                 return output, terminate_reason

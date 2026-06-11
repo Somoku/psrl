@@ -56,11 +56,12 @@ class PSRL_RequestStatus(Enum):
     REWARD_COMPLETED = enum.auto()
     COMPLETED = enum.auto()
 
+
 # Statuses for which the request's payload has already been committed to the TransferQueue
 # (`tq.kv_batch_put` was issued before the status transition). Only requests currently in
 # one of these statuses are guaranteed to have an entry in the TQ partition, so only these
 # keys are safe targets for `tq.kv_clear` during abort/stale handling.
-# 
+#
 # Clearing keys that were never written triggers TQ controller errors
 # because `kv_retrieve_meta(create=False)` is all-or-nothing.
 TQ_COMMITTED_STATUSES: frozenset = frozenset(
@@ -70,6 +71,7 @@ TQ_COMMITTED_STATUSES: frozenset = frozenset(
         PSRL_RequestStatus.REWARD_COMPLETED,
     }
 )
+
 
 class RequestStatusTracker:
     """

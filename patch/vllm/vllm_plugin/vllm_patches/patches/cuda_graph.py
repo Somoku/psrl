@@ -86,9 +86,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
                     # across layers will make the cudagraph capture very slow.
                     # therefore, we only run gc for the first graph,
                     # and disable gc for the rest of the graphs.
-                    stack.enter_context(
-                        patch("gc.collect", lambda *args, **kwargs: None)
-                    )
+                    stack.enter_context(patch("gc.collect", lambda *args, **kwargs: None))
                     stack.enter_context(
                         patch(
                             "torch.accelerator.empty_cache",

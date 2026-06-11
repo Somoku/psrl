@@ -31,7 +31,6 @@ import re
 import sys
 from pathlib import Path
 
-
 # ---------------------------------------------------------------------------
 # Tokenisation
 # ---------------------------------------------------------------------------
@@ -43,11 +42,23 @@ DIRECTIVE_INFO_RE = re.compile(r"^\s*\{([\w-]+)\}")
 # one of these as a fenced directive, rewrite its body too — only the opening
 # and closing fence markers stay verbatim.
 PROSE_BODY_DIRECTIVES = {
-    "admonition", "seealso", "note", "warning", "tip", "caution",
-    "important", "attention", "danger", "error", "hint",
+    "admonition",
+    "seealso",
+    "note",
+    "warning",
+    "tip",
+    "caution",
+    "important",
+    "attention",
+    "danger",
+    "error",
+    "hint",
     "figure",  # caption text below options
-    "tab-item", "tab-set",
-    "grid", "grid-item", "grid-item-card",
+    "tab-item",
+    "tab-set",
+    "grid",
+    "grid-item",
+    "grid-item-card",
 }
 
 
@@ -133,9 +144,9 @@ def split_top_level(src: str) -> list[tuple[str, str]]:
 
 # Order matters: longest/most specific first.
 PROTECT_RE = re.compile(
-    r"(?P<bmath>\$\$[\s\S]*?\$\$)"     # block math (multiline)
+    r"(?P<bmath>\$\$[\s\S]*?\$\$)"  # block math (multiline)
     r"|(?P<imath>(?<!\\)\$[^\$\n]+?\$)"  # inline math (single line)
-    r"|(?P<code>`+[^`\n]+?`+)"          # inline code
+    r"|(?P<code>`+[^`\n]+?`+)"  # inline code
 )
 
 
@@ -176,13 +187,13 @@ def transform_prose(text: str) -> str:
 # A comma reads more natively in those cases (handled by the fall-through).
 LABEL_EMDASH_RE = re.compile(
     r"(?P<label>"
-    r"^\s{0,3}#{1,6}\s+[^\n—]*?"            # heading line content
-    r"|^\s{0,3}[-*+]\s+[^\n—]*?"            # bullet list item content
-    r"|^\s{0,3}\d+\.\s+[^\n—]*?"            # ordered list item content
-    r"|^\s*:::+\s*\{[^}\n]+\}[^\n—]*?"      # MyST directive title line
-    r"|`[^`\n]+`"                            # closing inline code
-    r"|\]\([^)\n]+\)"                        # closing markdown link
-    r"|\*\*[^*\n]+\*\*"                      # closing bold
+    r"^\s{0,3}#{1,6}\s+[^\n—]*?"  # heading line content
+    r"|^\s{0,3}[-*+]\s+[^\n—]*?"  # bullet list item content
+    r"|^\s{0,3}\d+\.\s+[^\n—]*?"  # ordered list item content
+    r"|^\s*:::+\s*\{[^}\n]+\}[^\n—]*?"  # MyST directive title line
+    r"|`[^`\n]+`"  # closing inline code
+    r"|\]\([^)\n]+\)"  # closing markdown link
+    r"|\*\*[^*\n]+\*\*"  # closing bold
     r")\s+—\s+",
     re.MULTILINE,
 )
@@ -252,9 +263,7 @@ def _rewrite(text: str) -> str:
 def process_file(path: Path) -> dict:
     original = path.read_text(encoding="utf-8")
     chunks = split_top_level(original)
-    rebuilt = "\n".join(
-        transform_prose(text) if kind == "prose" else text for kind, text in chunks
-    )
+    rebuilt = "\n".join(transform_prose(text) if kind == "prose" else text for kind, text in chunks)
 
     # Count what changed.
     stats = {
@@ -277,8 +286,7 @@ def iter_markdown(roots: list[Path]):
         if root.is_file() and root.suffix.lower() == ".md":
             yield root
             continue
-        for p in root.rglob("*.md"):
-            yield p
+        yield from root.rglob("*.md")
 
 
 def main() -> int:
@@ -297,9 +305,7 @@ def main() -> int:
         if args.dry_run:
             original = p.read_text(encoding="utf-8")
             chunks = split_top_level(original)
-            rebuilt = "\n".join(
-                transform_prose(text) if k == "prose" else text for k, text in chunks
-            )
+            rebuilt = "\n".join(transform_prose(text) if k == "prose" else text for k, text in chunks)
             changed = rebuilt != original
             em_d = original.count("—") - rebuilt.count("—")
             en_d = original.count("–") - rebuilt.count("–")
@@ -316,9 +322,7 @@ def main() -> int:
             total["em"] += em_d
             total["en"] += en_d
             total["semi"] += semi_d
-            print(
-                f"  {p}: -{em_d} em-dash, -{en_d} en-dash, -{semi_d} semicolon"
-            )
+            print(f"  {p}: -{em_d} em-dash, -{en_d} en-dash, -{semi_d} semicolon")
 
     print()
     print(

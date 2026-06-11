@@ -1,6 +1,7 @@
 """
 Utility helpers for working with TransferQueue's KVBatchMeta.
 """
+
 from transfer_queue import KVBatchMeta
 
 
@@ -23,8 +24,7 @@ def kv_batch_meta_update_tags(batch: KVBatchMeta, key: str, value) -> KVBatchMet
     if isinstance(value, list):
         if len(value) != n:
             raise ValueError(
-                f"kv_batch_meta_update_tags: value list length {len(value)} "
-                f"does not match batch size {n}."
+                f"kv_batch_meta_update_tags: value list length {len(value)} does not match batch size {n}."
             )
         new_tags = [{**tag, key: value[i]} for i, tag in enumerate(batch.tags)]
     else:

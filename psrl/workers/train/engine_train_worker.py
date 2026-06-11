@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING
 import ray
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
-from transformers import AutoConfig
 from tensordict import TensorDict
+from transformers import AutoConfig
 from verl.single_controller.base.decorator import (
     Dispatch,
     make_nd_compute_dataproto_dispatch_fn,
@@ -31,6 +31,7 @@ if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
 
 from megatron.bridge.models.conversion.utils import unwrap_model
+
 try:
     from psrl.utils.converter.megatron_converter import convert_megatron_inplace  # noqa: E402
 except ImportError:

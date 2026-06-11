@@ -36,7 +36,7 @@ class NIXLMetaServer:
         self._is_all_client_shardings_recved = False
         self._is_all_client_infos_recved = False
         self._is_all_temp_mappings_recved = False
-        
+
         # NOTE(claude): When broadcast_init is enabled, PS workers act as both senders and
         # receivers during initialization and need each other's GPU descriptors to perform
         # direct NIXL writes. This flag causes _get_relevant_client_names_for_agent to include

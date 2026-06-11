@@ -127,8 +127,7 @@ class MiniModelConfig:
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
     )
     format_error_template: str = (
-        "Please always provide EXACTLY ONE action in triple backticks, "
-        "found {{actions|length}} actions."
+        "Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions."
     )
 
 

@@ -94,9 +94,12 @@ def build_training_arrays(
             all_logprobs.extend([0.0] * len(env_ids))
 
             psrl_logger.info(
-                "[TITO turn %d] env_ids: cursor=%d, prompt_len=%d, "
-                "env_count=%d, env_ids[:5]=%s",
-                i, cursor, prompt_len, len(env_ids), str(env_ids[:5]),
+                "[TITO turn %d] env_ids: cursor=%d, prompt_len=%d, env_count=%d, env_ids[:5]=%s",
+                i,
+                cursor,
+                prompt_len,
+                len(env_ids),
+                str(env_ids[:5]),
             )
 
         # Assistant output tokens
@@ -120,8 +123,14 @@ def build_training_arrays(
                 "[TITO turn %d] trim analysis: is_last=%s, matched=%d, "
                 "trim_count=%d, allowed=%d, prompt_len=%d, "
                 "output_len=%d, total_acc_len=%d",
-                i, is_last, matched, trim_count, max_trim_tokens,
-                prompt_len, len(output_ids), total_acc_len,
+                i,
+                is_last,
+                matched,
+                trim_count,
+                max_trim_tokens,
+                prompt_len,
+                len(output_ids),
+                total_acc_len,
             )
 
             # Validate against the model-specific ceiling.
@@ -143,7 +152,9 @@ def build_training_arrays(
                 output_logprobs = output_logprobs[:matched]
                 psrl_logger.info(
                     "[TITO turn %d] trimmed %d tokens, remaining output_len=%d",
-                    i, trim_count, len(output_ids),
+                    i,
+                    trim_count,
+                    len(output_ids),
                 )
         all_response_ids.extend(output_ids)
         all_response_mask.extend([1] * len(output_ids))
@@ -152,14 +163,21 @@ def build_training_arrays(
         cursor = prompt_len + len(output_ids)
 
     first_prompt_len = records[0]["prompt_token_count"]
-    prompt_ids = list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
+    prompt_ids = (
+        list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
+    )
     routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
 
     psrl_logger.info(
         "[TITO build_training_arrays] prompt_len=%d tito_prompt_len=%d response_len=%d "
         "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d re_tokens=%s",
-        len(prompt_ids), first_prompt_len, len(all_response_ids), sum(all_response_mask),
-        len(all_logprobs), len(records), total_acc_len,
+        len(prompt_ids),
+        first_prompt_len,
+        len(all_response_ids),
+        sum(all_response_mask),
+        len(all_logprobs),
+        len(records),
+        total_acc_len,
         None if routed_experts is None else routed_experts.shape[0],
     )
 

@@ -147,20 +147,11 @@ class MiniSWEEnvironment(Environment[dict, None]):
         # fresh-container evaluation.  Empty string means no grading.
         # Support both current field names (swe_grader, swe_problem, ...) and
         # legacy field names (grader, instance, image_name) from old parquets.
-        swe_grader = str(
-            extra_info.get("swe_grader", "") or extra_info.get("grader", "") or ""
-        )
-        swe_problem = (
-            extra_info.get("swe_problem", None)
-            or extra_info.get("instance", None)
-            or {}
-        )
-        swe_problem_image = str(
-            extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or ""
-        )
+        swe_grader = str(extra_info.get("swe_grader", "") or extra_info.get("grader", "") or "")
+        swe_problem = extra_info.get("swe_problem", None) or extra_info.get("instance", None) or {}
+        swe_problem_image = str(extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or "")
         swe_restore_tests = bool(
-            extra_info.get("swe_restore_tests", False)
-            or extra_info.get("needs_head_minus_one", False)
+            extra_info.get("swe_restore_tests", False) or extra_info.get("needs_head_minus_one", False)
         )
 
         # Assert: after fallback, grading fields must be non-empty.

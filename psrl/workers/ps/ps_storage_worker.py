@@ -14,10 +14,7 @@ from verl.utils.fs import copy_to_local
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
 from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.hf_converter import (
-    convert_hf_inplace,
-    maybe_convert_to_smaller_parts
-)
+from psrl.utils.converter.hf_converter import convert_hf_inplace
 from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.nixl import (
     NIXLClientType,
@@ -37,6 +34,7 @@ FP32_PATTERNS: dict[str, list[str]] = {
     # stores in float32 for numerical stability.
     "Qwen3_5": ["A_log"],
 }
+
 
 # TODO(lhy): Implement the PSStoragePlan
 # support zero/half/full redundancy for PSStorageWorker
@@ -332,12 +330,9 @@ class PSStorageWorker:
         self._tied_weights_alias_map = self._build_tied_weights_alias_map(self.train_meta_hf_model, local_path)
         if self._tied_weights_alias_map:
             psrl_logger.info(f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}")
-        
+
         # Save model info
-        self.model_info = create_parameter_mapping(
-            "HuggingFace", 
-            self.train_meta_hf_model.config
-        ).get_model_info()
+        self.model_info = create_parameter_mapping("HuggingFace", self.train_meta_hf_model.config).get_model_info()
 
         psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
 
@@ -508,9 +503,7 @@ class PSStorageWorker:
         write_checkpoint_to_registered_tensors().
         """
         if self.psrl_config.broadcast_init.enabled and self.rank != 0:
-            psrl_logger.info(
-                f"[preload_checkpoint_to_cpu] broadcast_init enabled, rank {self.rank} skips disk read."
-            )
+            psrl_logger.info(f"[preload_checkpoint_to_cpu] broadcast_init enabled, rank {self.rank} skips disk read.")
             return
 
         assert hasattr(self, "_tied_weights_alias_map"), (
@@ -790,9 +783,7 @@ class PSStorageWorker:
                 train_client.wait(key, "ps_broadcast_init", "WRITE", target_client=child_client)
         train_client.clear_intermediate_cached_data()
 
-        psrl_logger.info(
-            f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: all transfers done."
-        )
+        psrl_logger.info(f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: all transfers done.")
 
     def do_transfer_train_to_gen_after_broadcast(self) -> None:
         """
@@ -818,9 +809,7 @@ class PSStorageWorker:
             self.transfer_train_to_gen(key=key, sync=False)
         if self.use_gpu:
             torch.cuda.synchronize()
-        psrl_logger.info(
-            f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: transfer done."
-        )
+        psrl_logger.info(f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: transfer done.")
 
     def shutdown(self):
         self.nixl_multi_storage_clients.shutdown()

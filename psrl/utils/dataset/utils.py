@@ -6,6 +6,7 @@ import torch
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+
 # AGENT(VERL): copy-in from verl. It should align with verl's implementation.
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):
     """Create a dataset.
@@ -41,6 +42,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     return dataset
 
+
 # AGENT(VERL): copy-in from verl. It should align with verl's implementation.
 def create_rl_sampler(data_config, dataset):
     """Create a sampler for the dataset.
@@ -69,6 +71,7 @@ def create_rl_sampler(data_config, dataset):
         sampler = SequentialSampler(data_source=dataset)
 
     return sampler
+
 
 def create_multi_rl_datasets(
     data_configs,

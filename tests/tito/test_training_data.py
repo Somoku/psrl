@@ -4,7 +4,6 @@ import base64
 import io
 
 import numpy as np
-
 from psrl.utils.tito.training_data import build_training_arrays
 
 
@@ -127,8 +126,11 @@ def test_routed_experts_cross_turn_assembly():
             "output_logprobs": [[-0.5, 10], [-0.3, 11]],
             "finish_reason": "tool_calls",
             "routed_experts": {
-                "data": _npy_b64(t1), "num_layers": num_layers, "top_k": top_k,
-                "dtype": "uint8", "prompt_start": 0,
+                "data": _npy_b64(t1),
+                "num_layers": num_layers,
+                "top_k": top_k,
+                "dtype": "uint8",
+                "prompt_start": 0,
             },
         },
         {
@@ -136,8 +138,11 @@ def test_routed_experts_cross_turn_assembly():
             "output_logprobs": [[-0.2, 30], [-0.1, 31]],
             "finish_reason": "stop",
             "routed_experts": {
-                "data": _npy_b64(t2), "num_layers": num_layers, "top_k": top_k,
-                "dtype": "uint8", "prompt_start": 5,
+                "data": _npy_b64(t2),
+                "num_layers": num_layers,
+                "top_k": top_k,
+                "dtype": "uint8",
+                "prompt_start": 5,
             },
         },
     ]

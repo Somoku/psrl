@@ -2,11 +2,9 @@ import sys
 from types import ModuleType, SimpleNamespace
 
 import torch.nn as nn
-
 from vllm_patches.interfaces import SupportsWeightLayout, supports_weight_layout
 from vllm_patches.weight_layout import WeightLayoutPlan
 from vllm_patches.weight_layouts import _LAYOUTS, register_weight_layouts_for_module
-
 
 EXPECTED_LAYOUT_TARGETS = {
     "deepseek_v2.DeepseekV2Model",
@@ -126,7 +124,4 @@ def test_deepseek_layout_does_not_require_patched_instance_fields(monkeypatch):
 
     plan = model.build_weight_layout()
     assert any(rule.vllm_pattern == "fused_qkv_a_proj.weight" for rule in plan.rules)
-    assert any(
-        rule.vllm_pattern == "experts.e_score_correction_bias"
-        for rule in plan.rules
-    )
+    assert any(rule.vllm_pattern == "experts.e_score_correction_bias" for rule in plan.rules)

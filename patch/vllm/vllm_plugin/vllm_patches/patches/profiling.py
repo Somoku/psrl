@@ -41,6 +41,7 @@ def apply_profiling_patches() -> None:
         created::
 
             from vllm_patches.patches.profiling import apply_profiling_patches
+
             apply_profiling_patches()
     """
     _patch_engine_core_event_type()
@@ -150,9 +151,7 @@ def _patch_scheduler_update_request_with_output() -> None:
     Scheduler._update_request_with_output = _patched
     setattr(Scheduler, _SENTINEL, True)
 
-    psrl_logger.info(
-        "Patched Scheduler._update_request_with_output to record FIRST_TOKEN and LAST_TOKEN."
-    )
+    psrl_logger.info("Patched Scheduler._update_request_with_output to record FIRST_TOKEN and LAST_TOKEN.")
 
 
 # -------------------------------------------------------
@@ -227,9 +226,7 @@ def _patch_request_state_event_accumulation() -> None:
     _original_new_request_output = RequestState._new_request_output
 
     def _patched_new_request_output(self, request_id, outputs, finished, kv_transfer_params=None):
-        request_output = _original_new_request_output(
-            self, request_id, outputs, finished, kv_transfer_params
-        )
+        request_output = _original_new_request_output(self, request_id, outputs, finished, kv_transfer_params)
         from vllm.outputs import RequestOutput
 
         if isinstance(request_output, RequestOutput) and self.accumulated_events:
@@ -240,9 +237,7 @@ def _patch_request_state_event_accumulation() -> None:
     RequestState._new_request_output = _patched_new_request_output
     setattr(RequestState, _SENTINEL, True)
 
-    psrl_logger.info(
-        "Patched RequestState.__init__ and _new_request_output for event accumulation."
-    )
+    psrl_logger.info("Patched RequestState.__init__ and _new_request_output for event accumulation.")
 
 
 # -----------------------------------------------------------
@@ -283,6 +278,4 @@ def _patch_output_processor_accumulate_events() -> None:
     OutputProcessor.process_outputs = _patched_process_outputs
     setattr(OutputProcessor, _SENTINEL, True)
 
-    psrl_logger.info(
-        "Patched OutputProcessor.process_outputs to accumulate events onto RequestState."
-    )
+    psrl_logger.info("Patched OutputProcessor.process_outputs to accumulate events onto RequestState.")

@@ -16,21 +16,21 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.models.qwen3_5 import QwenGatedDeltaNetAttention
 from vllm_patches.interfaces import supports_weight_layout
 
-from psrl.utils.converter.weight_layout_plan import PlanExecutor
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     MappingType,
     ParameterMapping,
-    slice_in_proj_ba,
-    slice_in_proj_qkvz,
-    slice_qwen3_5_in_proj_qkv,
+    reshape_visual_block_qkv,
+    slice_attn_conv1d,
     slice_fused_moe_w2_weight,
     slice_fused_moe_w13_weight,
     slice_gate_up_proj,
+    slice_in_proj_ba,
+    slice_in_proj_qkvz,
     slice_qkv_proj,
-    slice_attn_conv1d,
-    reshape_visual_block_qkv,
+    slice_qwen3_5_in_proj_qkv,
 )
+from psrl.utils.converter.weight_layout_plan import PlanExecutor
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 # QKV string shard_id → integer index
@@ -166,12 +166,8 @@ class VllmConverter(BaseConverter):
                     converted_param = converted.param
                     if "visual.blocks" in converted_name and "qkv" in converted_name:
                         converted_param = reshape_visual_block_qkv(converted_param)
-                    sharding = self._adjust_kv_sharding(
-                        converted_name, sharding, module, self.model_info
-                    )
-                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(
-                        converted_name, converted_param, sharding
-                    )
+                    sharding = self._adjust_kv_sharding(converted_name, sharding, module, self.model_info)
+                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted_name, converted_param, sharding)
                     converted_state_dict[converted_name] = converted_param
                     sharding_dict[converted_name] = sharding
 
@@ -195,9 +191,7 @@ class VllmConverter(BaseConverter):
                             shard_mesh=OrderedDict([(0, 1)]),
                             shard_indices=[(0,)],
                         )
-                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(
-                        converted.name, converted.param, sharding
-                    )
+                    converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted.name, converted.param, sharding)
                     converted_state_dict[converted.name] = converted_param
                     sharding_dict[converted.name] = sharding
 
@@ -243,17 +237,17 @@ class VllmConverter(BaseConverter):
             if module_prefix.startswith("language_model.model"):
                 module_prefix = f"model.language_model.{module_prefix[21:]}"
             if module_prefix.startswith("language_model.lm_head"):
-                module_prefix = f"lm_head"
+                module_prefix = "lm_head"
             seen_module_prefixes.add(module_prefix)
             for param_name, param in module.named_parameters(recurse=False):
                 full_name = f"{module_prefix}.{param_name}" if module_prefix else param_name
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
                 sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
-                    adjusted_sharding = self._adjust_kv_sharding(
-                        new_param_name, sharding, module, model_info
+                    adjusted_sharding = self._adjust_kv_sharding(new_param_name, sharding, module, model_info)
+                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(
+                        new_param_name, new_param, adjusted_sharding
                     )
-                    new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, adjusted_sharding)
                     converted_state_dict[new_param_name] = new_param
                     sharding_dict[new_param_name] = sharding_for_param
 
@@ -320,7 +314,9 @@ class VllmConverter(BaseConverter):
                 intermediate_size = model_info["intermediate_size"]
                 if intermediate_size is None:
                     intermediate_size = self.model_info["moe_intermediate_size"]
-                assert intermediate_size is not None, "Intermediate size must be specified in model_info for gate_up_proj split"
+                assert intermediate_size is not None, (
+                    "Intermediate size must be specified in model_info for gate_up_proj split"
+                )
                 try:
                     sliced_params = slice_gate_up_proj(
                         fused_param=param,
@@ -361,7 +357,7 @@ class VllmConverter(BaseConverter):
                     if shard_id == 0:
                         qkv_names = [new_param_name + "_q", new_param_name + "_k", new_param_name + "_v"]
                         qkv_params = slice_qwen3_5_in_proj_qkv(
-                            fused_param=new_param, 
+                            fused_param=new_param,
                             key_dim=key_dim,
                             value_dim=value_dim,
                             tp_size=tp_size,
@@ -463,9 +459,7 @@ class VllmConverter(BaseConverter):
         # Default: No conversion needed
         return {full_name: param}
 
-    def _adjust_kv_sharding(
-        self, param_name: str, sharding: NIXLSharding, module, model_info: dict
-    ) -> NIXLSharding:
+    def _adjust_kv_sharding(self, param_name: str, sharding: NIXLSharding, module, model_info: dict) -> NIXLSharding:
         """Adjust sharding for K/V projection weights when KV heads are replicated.
 
         In GQA with num_kv_heads < tp_size, vLLM replicates KV heads across TP ranks.
@@ -478,8 +472,12 @@ class VllmConverter(BaseConverter):
         if not isinstance(module, QKVParallelLinear):
             return sharding
         # Only adjust for K/V weights (not Q)
-        if not (param_name.endswith("k_proj.weight") or param_name.endswith("v_proj.weight")
-                or param_name.endswith("k_proj.bias") or param_name.endswith("v_proj.bias")):
+        if not (
+            param_name.endswith("k_proj.weight")
+            or param_name.endswith("v_proj.weight")
+            or param_name.endswith("k_proj.bias")
+            or param_name.endswith("v_proj.bias")
+        ):
             return sharding
 
         num_kv_heads = model_info.get("num_kv_heads")

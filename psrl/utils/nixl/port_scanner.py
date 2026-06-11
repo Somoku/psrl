@@ -3,7 +3,6 @@ import socket
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-
 _PORT_SCANNER_PREFIX = "psrl_port_scanner_"
 _PORT_SCANNER_NAMESPACE = "psrl"
 

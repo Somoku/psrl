@@ -187,8 +187,7 @@ def init_http_io_thread(
     _http_io_thread = HttpIOThread(max_concurrency=max_concurrency)
     _http_io_thread.start()
     psrl_logger.info(
-        "[Worker %d] HttpIOThread: max_concurrency=%d "
-        "(server=%d * engines=%d / producers=%d).",
+        "[Worker %d] HttpIOThread: max_concurrency=%d (server=%d * engines=%d / producers=%d).",
         producer_index,
         max_concurrency,
         server_concurrency,

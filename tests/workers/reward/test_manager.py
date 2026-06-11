@@ -67,9 +67,7 @@ def test_manager_requires_gateway_url():
 
     sig = inspect.signature(RewardModelManager.__init__)
     assert "gateway_url" in sig.parameters, "RewardModelManager.__init__ must have a 'gateway_url' parameter"
-    assert "status_queues" not in sig.parameters, (
-        "RewardModelManager.__init__ must NOT have 'status_queues' (old API)"
-    )
+    assert "status_queues" not in sig.parameters, "RewardModelManager.__init__ must NOT have 'status_queues' (old API)"
 
 
 def test_manager_has_get_gateway_url():

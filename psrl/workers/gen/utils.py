@@ -11,6 +11,7 @@ INVALID_ROLLOUT_INSTANCE_ID: RolloutInstanceId = ("", -1)
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_CONNECTIONS = 2000
 
+
 @dataclass
 class TokenInput:
     input_ids: list[int]
@@ -33,6 +34,7 @@ class TokenInput:
     """whether this request is for validation purpose"""
     stop_token_ids: list[int] | None = None
     """extra stop token ids required by model-specific tool parsers"""
+
 
 @dataclass
 class TokenOutput:

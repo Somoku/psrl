@@ -14,7 +14,7 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.logger import DualOutputHandler, deprecated, log_tensor, get_worker_info
+from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
 from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
@@ -24,7 +24,6 @@ from psrl.utils.nixl.nixl_spec import (
     NIXLSharding,
     NIXLShardMetaInfo,
     NIXLTensorInfo,
-    find_free_port_with_scope,
 )
 
 if TYPE_CHECKING:

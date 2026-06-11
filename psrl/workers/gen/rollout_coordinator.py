@@ -512,9 +512,7 @@ class RolloutCoordinator(CommandExtension):
                         for instance_id in instance_ids:
                             # TODO(linsh): merge dp ranks of the same replica to reduce RPC calls
                             replica_id, data_parallel_rank = instance_id
-                            futures.append(
-                                self.server_handles[replica_id].abort_all_requests.remote()
-                            )
+                            futures.append(self.server_handles[replica_id].abort_all_requests.remote())
 
                     if not futures:
                         interrupted_request_num = 0
@@ -549,10 +547,7 @@ class RolloutCoordinator(CommandExtension):
 
                     # Skip instances that are sleeping
                     is_sleeping = await asyncio.gather(
-                        *[
-                            self.server_handles[instance_id[0]].is_sleeping.remote()
-                            for instance_id in instance_ids
-                        ]
+                        *[self.server_handles[instance_id[0]].is_sleeping.remote() for instance_id in instance_ids]
                     )
                     sync_instance_ids = [
                         instance_id for instance_id, sleeping in zip(instance_ids, is_sleeping) if not sleeping
@@ -1296,8 +1291,7 @@ class RolloutCoordinator(CommandExtension):
 
         server_items = self._get_ordered_server_items("all")
         futures = [
-            server_handle.set_lmcache_controller_url.remote(controller_url)
-            for _, _, server_handle in server_items
+            server_handle.set_lmcache_controller_url.remote(controller_url) for _, _, server_handle in server_items
         ]
         await asyncio.gather(*futures)
         psrl_logger.info(
@@ -1362,9 +1356,7 @@ class RolloutCoordinator(CommandExtension):
         futures = []
         for replica_idx, _, server_handle in server_items:
             zmq_url = worker_zmq_urls.get(replica_idx)
-            futures.append(
-                server_handle.kv_set_peer_registry.remote(peer_registry, zmq_url)
-            )
+            futures.append(server_handle.kv_set_peer_registry.remote(peer_registry, zmq_url))
         await asyncio.gather(*futures)
 
         psrl_logger.info(
@@ -1407,8 +1399,10 @@ class RolloutCoordinator(CommandExtension):
         port = find_available_port(self.config.psrl.lmcache.controller_base_port)
         cmd = [
             "lmcache_controller",
-            "--host", host,
-            "--port", str(port),
+            "--host",
+            host,
+            "--port",
+            str(port),
         ]
         psrl_logger.info(f"[LMCache] Starting shared Controller: {' '.join(cmd)}.")
         self._lmcache_controller_proc = subprocess.Popen(cmd)
@@ -1423,8 +1417,7 @@ class RolloutCoordinator(CommandExtension):
                 resp = _requests.get(health_url, timeout=2)
                 if resp.status_code == 200:
                     psrl_logger.info(
-                        f"[LMCache] Controller healthy at {controller_url!r} "
-                        f"(attempt {attempt + 1}/{max_attempts})."
+                        f"[LMCache] Controller healthy at {controller_url!r} (attempt {attempt + 1}/{max_attempts})."
                     )
                     return controller_url
             except Exception:
@@ -1433,6 +1426,4 @@ class RolloutCoordinator(CommandExtension):
 
         self._lmcache_controller_proc.kill()
         self._lmcache_controller_proc = None
-        raise RuntimeError(
-            f"LMCache Controller did not become healthy at {health_url!r} within {max_attempts} s."
-        )
+        raise RuntimeError(f"LMCache Controller did not become healthy at {health_url!r} within {max_attempts} s.")

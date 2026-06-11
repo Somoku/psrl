@@ -1,14 +1,15 @@
 # Adapted from slime/slime/utils/http_utils.py
-import aiohttp
 import asyncio
 import json
 import logging
 import os
 import socket
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
+import aiohttp
 import ray
 
 psrl_logger = logging.getLogger(__name__)
@@ -92,6 +93,7 @@ class HttpRuntimeConfig:
     def effective_concurrency(self) -> int:
         return max(1, (self.total_concurrency + self.producer_count - 1) // self.producer_count)
 
+
 # Global HTTP client for POST/GET requests.
 _http_client: aiohttp.ClientSession | None = None
 
@@ -141,6 +143,7 @@ class JsonHttpResponse:
     headers: dict[str, str]
     text: str | None = None
 
+
 def _next_post_actor():
     global _post_actor_idx
     if not _post_actors:
@@ -169,8 +172,10 @@ def configure_distributed_post(
         _post_actor_idx,
     )
 
+
 def is_distributed_post_enabled() -> bool:
     return _distributed_post_enabled and bool(_post_actors)
+
 
 def filter_http_headers(
     headers: Mapping[str, str],
@@ -302,6 +307,7 @@ def _raise_for_status(status: int, body: bytes, response: Any) -> None:
         headers=headers,
     )
 
+
 class RequestAbortedByGatewayError(Exception):
     """SMG returned the `request_aborted` 400 sentinel for the request.
 
@@ -345,6 +351,7 @@ def _classify_http_error(
     translated = RequestAbortedByGatewayError(request_id=request_id, message=str(exc.message))
     translated.__cause__ = exc
     return translated
+
 
 def _parse_body(body: bytes) -> tuple[Any, str | None]:
     text: str | None = None
@@ -609,6 +616,7 @@ def init_distributed_post_pool(
     )
     return actors
 
+
 async def request_json_maybe_distributed(
     method: str,
     url: str,
@@ -704,9 +712,6 @@ async def delete(url, max_retries=1, headers: dict[str, str] | None = None) -> H
 # HTTP Concurrency Profiler
 # ---------------------------------------------------------------------------
 
-import time
-from dataclasses import field
-
 
 @dataclass
 class HttpConcurrencyProfiler:
@@ -736,8 +741,7 @@ class HttpConcurrencyProfiler:
         if not self._enabled or self._log_file is None:
             return
         record = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
-            + f".{int(time.time() * 1000) % 1000:03d}",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + f".{int(time.time() * 1000) % 1000:03d}",
             "epoch_ms": int(time.time() * 1000),
             "event": event,
             "inflight": self._inflight,

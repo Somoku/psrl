@@ -13,7 +13,7 @@ ActType = TypeVar("ActType")
 
 class EnvStepOutput(TypedDict):
     observation: ObsType
-    reward: list[SupportsFloat] # List of rewards for each tool call
+    reward: list[SupportsFloat]  # List of rewards for each tool call
     done: bool
     info: dict[str, Any] | None
 
@@ -43,7 +43,7 @@ class Environment(ABC, Generic[ObsType, ActType]):
         reward_manager: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
         processor: AutoProcessor | None = None,
-        dataset_cls = None,
+        dataset_cls=None,
     ):
         """Initialize the environment.
 

@@ -42,7 +42,7 @@ def seed_everything(seed: int):
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     auto_set_device(config)
-    
+
     config.transfer_queue.enable = True
 
     # validate config
@@ -187,6 +187,7 @@ def run_ppo(config, task_runner_class=None) -> None:
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
 
+
 @ray.remote(num_cpus=1)
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
@@ -216,6 +217,7 @@ class TaskRunner:
     def add_critic_worker(self, config):
         """Add critic worker using the engine-based PSRL_TrainWorker."""
         from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
+
         if need_critic(config):
             self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(PSRL_TrainWorker)
             self.mapping[PSRL_Role.Critic] = ["train_pool"]

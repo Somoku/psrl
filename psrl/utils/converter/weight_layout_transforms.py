@@ -48,6 +48,7 @@ class TransformFragment:
         shard_id: Optional shard identifier for expert/head selection
         sharding: Optional NIXL sharding metadata
     """
+
     name: str | None
     param: torch.Tensor
     shard_id: int | str | tuple[int, ...] | None = None
@@ -149,10 +150,7 @@ class TransformExecutor:
         to correctly handle GQA where Q != K == V in head count.
         """
         if not transform.pieces or len(transform.pieces) < 3:
-            raise ValueError(
-                f"QKV transform requires 3 pieces (Q, K, V), "
-                f"got {len(transform.pieces)}"
-            )
+            raise ValueError(f"QKV transform requires 3 pieces (Q, K, V), got {len(transform.pieces)}")
 
         meta = transform.metadata
         num_heads_attr = meta.get("num_heads_attr", "num_heads")
@@ -183,23 +181,16 @@ class TransformExecutor:
         total_check = q_size + k_size + v_size
         if param.shape[axis] != total_check:
             raise ValueError(
-                f"QKV param shape[{axis}]={param.shape[axis]} != "
-                f"q({q_size})+k({k_size})+v({v_size})={total_check}"
+                f"QKV param shape[{axis}]={param.shape[axis]} != q({q_size})+k({k_size})+v({v_size})={total_check}"
             )
 
         q_param = torch.narrow(param, axis, 0, q_size)
         k_param = torch.narrow(param, axis, q_size, k_size)
         v_param = torch.narrow(param, axis, q_size + k_size, v_size)
 
-        yield TransformFragment(
-            name=transform.pieces[0].hf_name, param=q_param, shard_id="q"
-        )
-        yield TransformFragment(
-            name=transform.pieces[1].hf_name, param=k_param, shard_id="k"
-        )
-        yield TransformFragment(
-            name=transform.pieces[2].hf_name, param=v_param, shard_id="v"
-        )
+        yield TransformFragment(name=transform.pieces[0].hf_name, param=q_param, shard_id="q")
+        yield TransformFragment(name=transform.pieces[1].hf_name, param=k_param, shard_id="k")
+        yield TransformFragment(name=transform.pieces[2].hf_name, param=v_param, shard_id="v")
 
     # ------------------------------------------------------------------
     # merged_column / split (generic)
@@ -253,20 +244,12 @@ class TransformExecutor:
         sum_explicit = sum(x for x in explicit if x is not None)
         remaining = total - sum_explicit
         if remaining < 0:
-            raise ValueError(
-                f"Sum of explicit lengths ({sum_explicit}) exceeds total ({total})"
-            )
+            raise ValueError(f"Sum of explicit lengths ({sum_explicit}) exceeds total ({total})")
         if remaining % n_none != 0:
-            raise ValueError(
-                f"Remaining {remaining} not evenly divisible among "
-                f"{n_none} auto-sized pieces"
-            )
+            raise ValueError(f"Remaining {remaining} not evenly divisible among {n_none} auto-sized pieces")
         auto_len = remaining // n_none
 
-        return [
-            (x if x is not None else auto_len)
-            for x in explicit
-        ]
+        return [(x if x is not None else auto_len) for x in explicit]
 
     # ------------------------------------------------------------------
     # qkv_interleaved (BLOOM/GPT-NeoX/Persimmon/Falcon → vLLM)
@@ -301,8 +284,7 @@ class TransformExecutor:
 
         if num_heads is None or head_dim is None:
             raise ValueError(
-                f"qkv_interleaved requires num_heads and head_dim; "
-                f"module {type(module).__name__} missing attributes"
+                f"qkv_interleaved requires num_heads and head_dim; module {type(module).__name__} missing attributes"
             )
         num_heads = int(num_heads)
         num_kv_heads = int(num_kv_heads) if num_kv_heads is not None else num_heads
@@ -318,13 +300,13 @@ class TransformExecutor:
 
         # In vLLM layout: [Q0..Qn, K0..Kn, V0..Vn]
         q_all = param[:q_size]  # (num_heads * head_dim, ...)
-        k_all = param[q_size:q_size + k_size]
-        v_all = param[q_size + k_size:]
+        k_all = param[q_size : q_size + k_size]
+        v_all = param[q_size + k_size :]
 
         # Reshape to per-head tensors
-        q_heads = q_all.reshape(num_heads, head_dim, *rest)    # (nh, hd, ...)
-        k_heads = k_all.reshape(num_kv_heads, head_dim, *rest) # (nkv, hd, ...)
-        v_heads = v_all.reshape(num_kv_heads, head_dim, *rest) # (nkv, hd, ...)
+        q_heads = q_all.reshape(num_heads, head_dim, *rest)  # (nh, hd, ...)
+        k_heads = k_all.reshape(num_kv_heads, head_dim, *rest)  # (nkv, hd, ...)
+        v_heads = v_all.reshape(num_kv_heads, head_dim, *rest)  # (nkv, hd, ...)
 
         # For GQA: repeat K/V heads to match Q heads if needed
         if num_kv_heads != num_heads:
@@ -369,9 +351,7 @@ class TransformExecutor:
 
         # Path 1: from expert_params_mapping format
         if "expert_mapping" in meta:
-            yield from self._fused_moe_from_expert_mapping(
-                transform, param, module, full_name
-            )
+            yield from self._fused_moe_from_expert_mapping(transform, param, module, full_name)
             return
 
         # Path 2: from explicit w13/w2/gate/up/down naming
@@ -422,8 +402,7 @@ class TransformExecutor:
                 yield TransformFragment(name=hf_down, param=down_slice)
         else:
             raise ValueError(
-                f"fused_moe: {full_name!r} does not match {w13_name!r} or {w2_name!r}; "
-                f"param shape is {param.shape}"
+                f"fused_moe: {full_name!r} does not match {w13_name!r} or {w2_name!r}; param shape is {param.shape}"
             )
 
     def _fused_moe_from_expert_mapping(
@@ -474,10 +453,7 @@ class TransformExecutor:
                 # down_proj = row local_i of w2
                 slice_tensor = param[local_i]
             else:
-                raise ValueError(
-                    f"Unknown expert shard_id: {shard_id!r}; "
-                    f"expected 'w1', 'w2', or 'w3'"
-                )
+                raise ValueError(f"Unknown expert shard_id: {shard_id!r}; expected 'w1', 'w2', or 'w3'")
             yield TransformFragment(name=hf_name, param=slice_tensor)
 
     # ------------------------------------------------------------------
@@ -571,9 +547,7 @@ class TransformExecutor:
             try:
                 new_shape = eval(shape_expr, {"__builtins__": {}}, eval_locals)  # noqa: S307
             except Exception as exc:
-                raise ValueError(
-                    f"Failed to evaluate shape_expr {shape_expr!r}: {exc}"
-                ) from exc
+                raise ValueError(f"Failed to evaluate shape_expr {shape_expr!r}: {exc}") from exc
         else:
             new_shape = shape_expr
 
@@ -597,11 +571,11 @@ class TransformExecutor:
         During HF→vLLM loading, Q/K weights go through::
 
             # from convert_hf_to_vllm or permute_rotary_embeddings
-            param.view(n_heads, head_dim//2, 2, hidden) .transpose(1,2) .reshape(original)
+            param.view(n_heads, head_dim // 2, 2, hidden).transpose(1, 2).reshape(original)
 
         The inverse (vLLM→HF) is::
 
-            param.view(n_heads, 2, head_dim//2, hidden) .transpose(1,2) .reshape(original)
+            param.view(n_heads, 2, head_dim // 2, hidden).transpose(1, 2).reshape(original)
         """
         if not transform.pieces:
             raise ValueError("permute_qk_rotary requires an output piece")
@@ -629,7 +603,7 @@ class TransformExecutor:
         # Reshape to (n_heads, 2, half, ...) then transpose dim 1 and 2 to get
         # back to HF layout (n_heads, half, 2, ...) then flatten to original shape.
         reshaped = param.reshape(n_heads, 2, half, *rest)
-        permuted = reshaped.transpose(1, 2)          # (n_heads, half, 2, ...)
+        permuted = reshaped.transpose(1, 2)  # (n_heads, half, 2, ...)
         result = permuted.reshape(original_shape)
 
         yield TransformFragment(name=transform.pieces[0].hf_name, param=result)
@@ -675,14 +649,11 @@ class TransformExecutor:
 
         if indices is None:
             raise ValueError(
-                "index_select requires 'indices' in metadata or "
-                "'index_attr' pointing to a module attribute"
+                "index_select requires 'indices' in metadata or 'index_attr' pointing to a module attribute"
             )
 
         if not isinstance(indices, torch.Tensor):
-            indices = torch.tensor(
-                list(indices), dtype=torch.long, device=param.device
-            )
+            indices = torch.tensor(list(indices), dtype=torch.long, device=param.device)
 
         selected = torch.index_select(param, dim, indices)
         yield TransformFragment(name=transform.pieces[0].hf_name, param=selected)
@@ -729,26 +700,19 @@ class TransformExecutor:
             fn = getattr(module, fn_name, None)
 
         if fn is None:
-            raise ValueError(
-                "derive transform requires 'fn' callable or 'fn_name' "
-                "pointing to a method on the module"
-            )
+            raise ValueError("derive transform requires 'fn' callable or 'fn_name' pointing to a method on the module")
 
         try:
             result = fn(param, module)
         except Exception as exc:
-            raise ValueError(
-                f"derive fn failed for {transform.pieces[0].hf_name!r}: {exc}"
-            ) from exc
+            raise ValueError(f"derive fn failed for {transform.pieces[0].hf_name!r}: {exc}") from exc
 
         if isinstance(result, (list, tuple)):
             # fn may return multiple (name, tensor) pairs
             for name, tensor in result:
                 yield TransformFragment(name=name, param=tensor)
         else:
-            yield TransformFragment(
-                name=transform.pieces[0].hf_name, param=result
-            )
+            yield TransformFragment(name=transform.pieces[0].hf_name, param=result)
 
     # ------------------------------------------------------------------
     # custom (ModelWeightTransform delegation)
@@ -763,21 +727,14 @@ class TransformExecutor:
         """Delegate to a ModelWeightTransform.vllm_to_hf() implementation."""
         custom_transform = transform.metadata.get("transform_instance")
         if custom_transform is None:
-            raise ValueError(
-                "custom transform requires 'transform_instance' in metadata"
-            )
+            raise ValueError("custom transform requires 'transform_instance' in metadata")
         if not hasattr(custom_transform, "vllm_to_hf"):
             raise ValueError(
-                f"Custom transform {type(custom_transform).__name__!r} "
-                "is missing the vllm_to_hf() method"
+                f"Custom transform {type(custom_transform).__name__!r} is missing the vllm_to_hf() method"
             )
 
         # Determine full_name (best effort)
-        full_name = (
-            transform.pieces[0].hf_name
-            if transform.pieces
-            else getattr(param, "_vllm_full_name", "unknown")
-        )
+        full_name = transform.pieces[0].hf_name if transform.pieces else getattr(param, "_vllm_full_name", "unknown")
 
         for name, tensor in custom_transform.vllm_to_hf(
             full_name=full_name,
@@ -805,4 +762,5 @@ class TransformExecutor:
 
 class _DummyModule(nn.Module):
     """Placeholder module for transforms called without a real module."""
+
     pass

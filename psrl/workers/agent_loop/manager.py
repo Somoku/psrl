@@ -148,17 +148,12 @@ class PSRL_AgentLoopManager:
     # The manager only handles data distribution and coordination.
 
     async def _init_distributed_post_pool(self) -> None:
-        if (
-            not self.config.psrl.rollout_gateway.use_distributed_post
-            or self.distributed_post_actors
-        ):
+        if not self.config.psrl.rollout_gateway.use_distributed_post or self.distributed_post_actors:
             return
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (
-            self.config.psrl.deployment.n_validate_instances
-            if self.config.psrl.colocate_validate_and_train
-            else 0
+            self.config.psrl.deployment.n_validate_instances if self.config.psrl.colocate_validate_and_train else 0
         )
         n_active_instance = n_rollout_instances + n_validate_instances
 
@@ -222,9 +217,7 @@ class PSRL_AgentLoopManager:
 
         # Start the busy loop of agent loop workers.
         await self._init_distributed_post_pool()
-        await asyncio.gather(
-            *[worker.start_busy_loop.remote() for worker in self.agent_loop_workers]
-        )
+        await asyncio.gather(*[worker.start_busy_loop.remote() for worker in self.agent_loop_workers])
 
         # Start the background task to process data
         self.running_loop = asyncio.get_running_loop()
@@ -249,9 +242,7 @@ class PSRL_AgentLoopManager:
         self.stop_collect_task = True
         await asyncio.gather(self.train_dispatch_task, self.val_dispatch_task, self.collect_task)
 
-        await asyncio.gather(
-            *[worker.stop_busy_loop.remote() for worker in self.agent_loop_workers]
-        )
+        await asyncio.gather(*[worker.stop_busy_loop.remote() for worker in self.agent_loop_workers])
         await self._shutdown_distributed_post_pool()
 
     async def put_data(self, batch: TensorDict, is_validate: bool = False):
@@ -319,9 +310,9 @@ class PSRL_AgentLoopManager:
             # Receive END signal to stop processing data queue
             if data is None:
                 psrl_logger.info(
-                    "Received END signal, stopping train dispatch. "
-                    "request_counter=%d, result_queue=%d.",
-                    self._request_counter, self.result_queue.qsize(),
+                    "Received END signal, stopping train dispatch. request_counter=%d, result_queue=%d.",
+                    self._request_counter,
+                    self.result_queue.qsize(),
                 )
                 self.stop_train_dispatch_task = True
                 continue
@@ -403,9 +394,7 @@ class PSRL_AgentLoopManager:
             n_prompts=n_prompts,
         )
         if data is None or len(data) == 0:
-            psrl_logger.warning(
-                f"Retry skipped: DataProcessor returned no data for n_prompts={n_prompts}."
-            )
+            psrl_logger.warning(f"Retry skipped: DataProcessor returned no data for n_prompts={n_prompts}.")
             return 0
 
         tu.assign_non_tensor_stack(data, "version_tag", [-1] * len(data))
@@ -493,8 +482,7 @@ class PSRL_AgentLoopManager:
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             if parent_id in self._failed_group_ids:
                 psrl_logger.warning(
-                    "notify_group_failed: parent_id=%s is_validate=%s already handled; "
-                    "skip duplicate failed_uid=%s.",
+                    "notify_group_failed: parent_id=%s is_validate=%s already handled; skip duplicate failed_uid=%s.",
                     parent_id,
                     is_validate,
                     failed_uid,
@@ -507,7 +495,9 @@ class PSRL_AgentLoopManager:
             if sibling_uids:
                 psrl_logger.info(
                     "notify_group_failed: aborting %d sibling uids=%s for parent_id=%s.",
-                    len(sibling_uids), sibling_uids, parent_id,
+                    len(sibling_uids),
+                    sibling_uids,
+                    parent_id,
                 )
                 await self.ps_manager_handle.abort_requests.remote(sibling_uids, blocking=False)
 
@@ -532,14 +522,14 @@ class PSRL_AgentLoopManager:
                         psrl_logger.info(
                             "notify_group_failed (val): buffer_id=%d now meets "
                             "adjusted val_buffer_size=%d, assembling and firing.",
-                            buffer_id, self.val_buffer_size,
+                            buffer_id,
+                            self.val_buffer_size,
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)
             else:
                 if self.stop_train_dispatch_task:
                     psrl_logger.warning(
-                        "notify_group_failed (train): dispatch task stopped, "
-                        "skipping replacement for parent_id=%s.",
+                        "notify_group_failed (train): dispatch task stopped, skipping replacement for parent_id=%s.",
                         parent_id,
                     )
                     return
@@ -567,7 +557,9 @@ class PSRL_AgentLoopManager:
 
         max_dispatch_ahead = self.config.psrl.get("max_dispatch_ahead", 5)
         effective_staleness = min(self.staleness, max_dispatch_ahead)
-        expected_ps_version = self.initial_ps_version + max(self._request_counter - effective_staleness * buffer_size, 0) // buffer_size
+        expected_ps_version = (
+            self.initial_ps_version + max(self._request_counter - effective_staleness * buffer_size, 0) // buffer_size
+        )
         return expected_ps_version
 
     def set_initial_ps_version(self, version: int):
@@ -602,9 +594,7 @@ class PSRL_AgentLoopManager:
         for worker_index, batch in dispatch_plan.items():
             self.agent_loop_workers[worker_index].add_agent_program.remote(batch)
 
-    def get_dispatch_plan(
-        self, data: TensorDict, is_validate: bool = False
-    ) -> dict[int, TensorDict]:
+    def get_dispatch_plan(self, data: TensorDict, is_validate: bool = False) -> dict[int, TensorDict]:
         """Round-robin dispatch plan keyed by worker index, co-locating siblings.
 
         Children sharing a ``parent_id`` (group sampling) land on the same worker.
@@ -624,10 +614,7 @@ class PSRL_AgentLoopManager:
             keys_by_worker.setdefault(worker_index, []).append(i)
 
         self._dispatch_idx = (self._dispatch_idx + len(prompt_to_worker)) % len(self.agent_loop_workers)
-        return {
-            worker_index: data[keys] if keys else None
-            for worker_index, keys in keys_by_worker.items()
-        }
+        return {worker_index: data[keys] if keys else None for worker_index, keys in keys_by_worker.items()}
 
     async def occupy_requests(
         self,
@@ -654,12 +641,19 @@ class PSRL_AgentLoopManager:
         # Normalize scalar inputs to batch form.
         if isinstance(request_id, list):
             request_ids, prompt_ids, rollout_instance_ids, version_tags = (
-                request_id, prompt_id, rollout_instance_id, version_tag
+                request_id,
+                prompt_id,
+                rollout_instance_id,
+                version_tag,
             )
             n_trajectories = n_trajectory if isinstance(n_trajectory, list) else [n_trajectory] * len(request_ids)
         else:
             request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories = (
-                [request_id], [prompt_id], [rollout_instance_id], [version_tag], [n_trajectory]
+                [request_id],
+                [prompt_id],
+                [rollout_instance_id],
+                [version_tag],
+                [n_trajectory],
             )
 
         if not request_ids:
@@ -828,15 +822,11 @@ class PSRL_AgentLoopManager:
                 )
 
                 # Accumulate data
-                accumulated_buffers = (
-                    self.val_accumulated_buffers if is_validate else self.train_accumulated_buffers
-                )
+                accumulated_buffers = self.val_accumulated_buffers if is_validate else self.train_accumulated_buffers
                 accumulated_buffer_size = (
                     self.val_accumulated_buffer_size if is_validate else self.train_accumulated_buffer_size
                 )
-                expected_buffer_size = (
-                    self.val_buffer_size if is_validate else self.ready_entries_per_buffer
-                )
+                expected_buffer_size = self.val_buffer_size if is_validate else self.ready_entries_per_buffer
 
                 if buffer_id not in accumulated_buffers:
                     accumulated_buffers[buffer_id] = {}
@@ -845,8 +835,7 @@ class PSRL_AgentLoopManager:
                 accumulated_buffers[buffer_id].setdefault(model_version, []).append(prompt_entry_info)
                 accumulated_buffer_size[buffer_id] += 1
                 psrl_logger.info(
-                    f"Accumulated buffer {buffer_id} size: "
-                    f"{accumulated_buffer_size[buffer_id]}/{expected_buffer_size}"
+                    f"Accumulated buffer {buffer_id} size: {accumulated_buffer_size[buffer_id]}/{expected_buffer_size}"
                 )
 
                 # Check if the buffer is the earliest waiting buffer
@@ -857,10 +846,7 @@ class PSRL_AgentLoopManager:
                         await self.handle_waiting_buffer(buffer_id)
 
                 # Check for READY buffers
-                if (
-                    accumulated_buffer_size[buffer_id] == expected_buffer_size
-                    and buffer_id not in ready_buffer_ids
-                ):
+                if accumulated_buffer_size[buffer_id] == expected_buffer_size and buffer_id not in ready_buffer_ids:
                     psrl_logger.info(f"Add buffer {buffer_id} to ready_buffer_ids")
                     ready_buffer_ids.add(buffer_id)
 
@@ -928,26 +914,26 @@ class PSRL_AgentLoopManager:
             for j, (request_idx, n_trajectory) in enumerate(zip(request_idxs, n_trajectories)):
                 if n_trajectory == 1:
                     keys.append(f"{entry_info.prompt_id * rollout_n + request_idx}")
-                    tags.append({
-                        "uid": entry_info.prompt_id * rollout_n + request_idx,
-                        "parent_id": entry_info.prompt_id,
-                        "version_tag": (
-                            model_versions[j] if j < len(model_versions) else model_versions[-1]
-                        ),
-                        "rollout_instance_id": entry_info.rollout_instance_id,
-                    })
+                    tags.append(
+                        {
+                            "uid": entry_info.prompt_id * rollout_n + request_idx,
+                            "parent_id": entry_info.prompt_id,
+                            "version_tag": (model_versions[j] if j < len(model_versions) else model_versions[-1]),
+                            "rollout_instance_id": entry_info.rollout_instance_id,
+                        }
+                    )
                 else:
                     request_id = entry_info.prompt_id * rollout_n + request_idx
                     for trajectory_index in range(n_trajectory):
                         keys.append(f"{request_id}_{trajectory_index}")
-                        tags.append({
-                            "uid": request_id,
-                            "parent_id": entry_info.prompt_id,
-                            "version_tag": (
-                                model_versions[j] if j < len(model_versions) else model_versions[-1]
-                            ),
-                            "rollout_instance_id": entry_info.rollout_instance_id,
-                        })
+                        tags.append(
+                            {
+                                "uid": request_id,
+                                "parent_id": entry_info.prompt_id,
+                                "version_tag": (model_versions[j] if j < len(model_versions) else model_versions[-1]),
+                                "rollout_instance_id": entry_info.rollout_instance_id,
+                            }
+                        )
         if (
             not is_validate
             and rollout_n > 1
@@ -1032,15 +1018,11 @@ class PSRL_AgentLoopManager:
         processed_data = self.buffer_post_process_fn(data)
 
         original_size = len(batch_meta)
-        processed_size = (
-            0 if processed_data is None else len(processed_data)
-        )
+        processed_size = 0 if processed_data is None else len(processed_data)
 
         if processed_data is not None and processed_size == original_size:
             # Just write mutations and keep the original meta.
-            tq.kv_batch_put(
-                keys=original_keys, partition_id=batch_meta.partition_id, fields=processed_data
-            )
+            tq.kv_batch_put(keys=original_keys, partition_id=batch_meta.partition_id, fields=processed_data)
             return True, batch_meta
 
         # Clear entries from accumulated_data_buffer
@@ -1068,9 +1050,7 @@ class PSRL_AgentLoopManager:
         dropped_keys = [k for k in original_keys if k not in set(kept_keys)]
         if dropped_keys:
             tq.kv_clear(keys=dropped_keys, partition_id=batch_meta.partition_id)
-        tq.kv_batch_put(
-            keys=kept_keys, partition_id=batch_meta.partition_id, fields=processed_data
-        )
+        tq.kv_batch_put(keys=kept_keys, partition_id=batch_meta.partition_id, fields=processed_data)
 
         prompt_entry_infos = self.extract_entry_infos_from_td(processed_data)
         for entry_info in prompt_entry_infos:
@@ -1086,20 +1066,18 @@ class PSRL_AgentLoopManager:
         version_tags = tu.get_non_tensor_data(processed_data, "version_tag")
         rollout_instance_ids = tu.get_non_tensor_data(processed_data, "rollout_instance_id")
         for request_id, version_tag, rollout_instance_id in zip(request_ids, version_tags, rollout_instance_ids):
-            tags.append({
-                "uid": request_id,
-                "version_tag": version_tag,
-                "rollout_instance_id": rollout_instance_id,
-            })
+            tags.append(
+                {
+                    "uid": request_id,
+                    "version_tag": version_tag,
+                    "rollout_instance_id": rollout_instance_id,
+                }
+            )
         if self.rollout_n > 1:
             parent_ids = tu.get_non_tensor_data(processed_data, "parent_id")
             for parent_id, tag in zip(parent_ids, tags):
                 tag["parent_id"] = parent_id
-        if (
-            self.rollout_n > 1
-            and self.group_post_process_fn
-            and self.config.reward.launch_reward_fn_async
-        ):
+        if self.rollout_n > 1 and self.group_post_process_fn and self.config.reward.launch_reward_fn_async:
             for tag in tags:
                 tag["reward_ready"] = True
 
@@ -1452,16 +1430,12 @@ class PSRL_AgentLoopManager:
             for version_tag in version_tag_counts.keys()
         }
 
-        psrl_logger.info(
-            f"{'VALIDATION' if is_validate else 'TRAINING'} Buffer {buffer_id} version tag distribution:"
-        )
+        psrl_logger.info(f"{'VALIDATION' if is_validate else 'TRAINING'} Buffer {buffer_id} version tag distribution:")
         for version_tag in sorted(version_tag_counts.keys()):
             count = version_tag_counts[version_tag]
             percentage = (count / total_count) * 100
             staleness = staleness_dict[version_tag]
-            psrl_logger.info(
-                f"version_tag={version_tag}: count={count} ({percentage:.2f}%), staleness={staleness}"
-            )
+            psrl_logger.info(f"version_tag={version_tag}: count={count} ({percentage:.2f}%), staleness={staleness}")
 
     def consume_buffer(self, buffer_id: int, is_validate: bool = False) -> KVBatchMeta:
         """

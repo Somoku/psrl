@@ -193,10 +193,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     def _build_kv_cache_manager(self) -> KVCacheManager:
         """Build and configure `KVCacheManager` before vLLM engine initialization."""
-        lmcache_raw = OmegaConf.to_container(
-            self.psrl_config.get("lmcache", OmegaConf.create()),
-            resolve=True,
-        ) or {}
+        lmcache_raw = (
+            OmegaConf.to_container(
+                self.psrl_config.get("lmcache", OmegaConf.create()),
+                resolve=True,
+            )
+            or {}
+        )
 
         lmcache_instance_id = f"psrl_instance_{self.get_replica_idx()}"
         if lmcache_raw.get("enable_p2p", False):
@@ -427,7 +430,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # Enable native vLLM KV cache event publishing so SMG's event-driven
         # cache-aware router can subscribe.
-        # vLLM merges GPU prefix cache + LMCache connector events into one ZMQ stream; 
+        # vLLM merges GPU prefix cache + LMCache connector events into one ZMQ stream;
         # with DP it offsets the port per rank automatically (offset_endpoint_port).
         # The SMG servicer bridge (SubscribeKvEvents) connects to this endpoint on localhost.
         kv_events_args = self._build_kv_events_args()
@@ -767,9 +770,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
 
-    async def abort_all_requests(
-        self, reset_prefix_cache: bool = False
-    ) -> dict[str, Any]:
+    async def abort_all_requests(self, reset_prefix_cache: bool = False) -> dict[str, Any]:
         """
         Abort all ongoing requests asynchronously.
 
@@ -1360,11 +1361,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     ###### Weights Update ######
 
-    async def sync_with_ps(
-        self, ps_version: int, pause_generation: bool = False
-    ):
+    async def sync_with_ps(self, ps_version: int, pause_generation: bool = False):
         data_parallel_ranks = range(self.get_instance_num())
-        data_parallel_rank = 0 # take dp 0 as representative for the replica
+        data_parallel_rank = 0  # take dp 0 as representative for the replica
 
         # psrl_logger.info(f"{self.curr_rollout_instance_model_version=}, dp_rank = {data_parallel_rank}")
         if self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version:
@@ -1373,9 +1372,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # Step 1. Interrupt generation if needed
         if pause_generation:
             await self.pause_generation(clear_cache=False)
-            psrl_logger.info(
-                f"Generation paused on replica {self.get_replica_idx()} for sync with PS"
-            )
+            psrl_logger.info(f"Generation paused on replica {self.get_replica_idx()} for sync with PS")
 
         # Step 2. Pull model from PS
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
@@ -1387,7 +1384,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
         for dp_rank in data_parallel_ranks:
             self.curr_rollout_instance_model_version[dp_rank] = curr_model_version
-        
+
         assert self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version, (
             f"Current rollout instance model version should not be less than the required PS version, "
             f"but got {self.curr_rollout_instance_model_version[data_parallel_rank]} vs. {ps_version}"

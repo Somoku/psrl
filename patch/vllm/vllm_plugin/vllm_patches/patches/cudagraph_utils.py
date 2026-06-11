@@ -5,10 +5,11 @@ from collections.abc import Callable
 import torch
 from torch_memory_saver import torch_memory_saver
 from tqdm import tqdm
+from vllm.compilation.counter import compilation_counter
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
 from vllm.model_executor.offloader.base import get_offloader
-from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CudaGraphManager, CapturedAttentionState
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor, CapturedAttentionState, CudaGraphManager
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
@@ -39,9 +40,7 @@ class TMSCudaGraphManagerPatch(vLLMPatch[CudaGraphManager]):
             create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
                 returns a function that runs forward with a given CUDAGraphMode.
         """
-        captured_attn_states: dict[
-            BatchExecutionDescriptor, CapturedAttentionState
-        ] = {}
+        captured_attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState] = {}
         with graph_capture(device=self.device):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated

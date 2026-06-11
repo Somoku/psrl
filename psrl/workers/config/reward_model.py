@@ -164,6 +164,7 @@ class MultiRewardModelConfig(BaseConfig):
     reward_loop_worker: RewardLoopWorkerConfig = field(default_factory=RewardLoopWorkerConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
 
+
 def resolve_active_managers(reward_config) -> list:
     """Resolve active_managers names to an ordered list of reward model configurations.
 
@@ -187,8 +188,7 @@ def resolve_active_managers(reward_config) -> list:
         if name not in managers:
             available = list(managers.keys())
             raise ValueError(
-                f"Reward manager '{name}' in active_managers not found in managers. "
-                f"Available: {available}"
+                f"Reward manager '{name}' in active_managers not found in managers. Available: {available}"
             )
         resolved.append(managers[name])
     return resolved

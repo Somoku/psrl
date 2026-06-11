@@ -148,8 +148,7 @@ def verify_training_arrays(accumulated, records, label, max_trim_tokens: int = 0
             last_prompt_len = records[-1]["prompt_token_count"]
             last_start = max(last_prompt_len, cursor)
             tail_matches = all(
-                last_start + j < len(accumulated)
-                and accumulated[last_start + j] == tid
+                last_start + j < len(accumulated) and accumulated[last_start + j] == tid
                 for j, tid in enumerate(last_output_ids)
             )
             if not tail_matches:
@@ -259,7 +258,11 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
             for m_entry in rec.get("mismatch_report", []):
                 mtype = m_entry.get("mismatch_type", "?")
                 if mtype != "assistant_text":
-                    print(f"  ✗ Turn {i} TITO mismatch [{mtype}] pos={m_entry.get('position')} {str(m_entry.get('detail', ''))[:80]}")
+                    print(
+                        f"  ✗ Turn {i} TITO mismatch [{mtype}] "
+                        f"pos={m_entry.get('position')} "
+                        f"{str(m_entry.get('detail', ''))[:80]}"
+                    )
                     ok = False
                 else:
                     print(f"  ~ Turn {i} TITO mismatch [assistant_text] (expected, non-fatal)")
@@ -336,7 +339,11 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
             for m_entry in rec.get("mismatch_report", []):
                 mtype = m_entry.get("mismatch_type", "?")
                 if mtype != "assistant_text":
-                    print(f"  ✗ Turn {i} TITO mismatch [{mtype}] pos={m_entry.get('position')} {str(m_entry.get('detail', ''))[:80]}")
+                    print(
+                        f"  ✗ Turn {i} TITO mismatch [{mtype}] "
+                        f"pos={m_entry.get('position')} "
+                        f"{str(m_entry.get('detail', ''))[:80]}"
+                    )
                     ok = False
                 else:
                     print(f"  ~ Turn {i} TITO mismatch [assistant_text] (expected, non-fatal)")

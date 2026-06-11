@@ -70,7 +70,7 @@ class PSManager(RequestStatusTracker):
                 rollout_n, staleness buffer entries, staleness limit, etc.
         """
         RequestStatusTracker.__init__(self, psrl_config)
-        
+
         tq.init()
 
         if self.psrl_config.redundant_rollout.enable:
@@ -1095,23 +1095,16 @@ class PSManager(RequestStatusTracker):
             senders = plan.senders_in_round(round_idx)
             if not senders:
                 continue
-            psrl_logger.info(
-                f"[_coordinate_broadcast_init] round {round_idx}: senders={senders}."
-            )
+            psrl_logger.info(f"[_coordinate_broadcast_init] round {round_idx}: senders={senders}.")
             futures = [
-                self.ps_worker_handles_by_rank[rank].broadcast_send_to_children.remote(
-                    round_idx, plan
-                )
+                self.ps_worker_handles_by_rank[rank].broadcast_send_to_children.remote(round_idx, plan)
                 for rank in senders
             ]
             ray.get(futures)  # round barrier: wait for all senders before next round
 
         # All workers now have their train buffers populated; copy train → gen if needed.
         psrl_logger.info("[_coordinate_broadcast_init] all rounds done; triggering transfer_train_to_gen.")
-        ray.get([
-            w.do_transfer_train_to_gen_after_broadcast.remote()
-            for w in self.ps_worker_handles_by_rank
-        ])
+        ray.get([w.do_transfer_train_to_gen_after_broadcast.remote() for w in self.ps_worker_handles_by_rank])
         psrl_logger.info("[_coordinate_broadcast_init] broadcast initialization complete.")
 
     def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:

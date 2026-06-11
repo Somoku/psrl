@@ -50,6 +50,4 @@ def _patch_engine_core_psrl_methods() -> None:
     EngineCore.psrl_unpin_gpu = psrl_unpin_gpu
     setattr(EngineCore, _SENTINEL, True)
 
-    psrl_logger.info(
-        "Patched EngineCore: added psrl_get_gpu_cache_info, psrl_pin_gpu, psrl_unpin_gpu."
-    )
+    psrl_logger.info("Patched EngineCore: added psrl_get_gpu_cache_info, psrl_pin_gpu, psrl_unpin_gpu.")

@@ -69,8 +69,7 @@ def main():
     # Validate checkpoint metadata
     metadata_path = os.path.join(args.input_dir, "parallel_config.json")
     assert os.path.exists(metadata_path), (
-        f"Metadata file not found: {metadata_path!r}.  "
-        f"Is {args.input_dir!r} a valid per-rank checkpoint directory?"
+        f"Metadata file not found: {metadata_path!r}.  Is {args.input_dir!r} a valid per-rank checkpoint directory?"
     )
     with open(metadata_path) as f:
         metadata = json.load(f)
@@ -95,16 +94,12 @@ def main():
 
     # Verify rank file exists
     rank_path = os.path.join(args.input_dir, f"rank_{rank}.pt")
-    assert os.path.exists(rank_path), (
-        f"[Rank {rank}] Per-rank file not found: {rank_path!r}"
-    )
+    assert os.path.exists(rank_path), f"[Rank {rank}] Per-rank file not found: {rank_path!r}"
 
     # Load per-rank checkpoint
     print(f"[Rank {rank}] Loading {rank_path}...")
     state_dict = torch.load(rank_path, map_location="cpu", weights_only=False)
-    assert isinstance(state_dict, dict), (
-        f"[Rank {rank}] Expected state_dict to be a dict, got {type(state_dict)}"
-    )
+    assert isinstance(state_dict, dict), f"[Rank {rank}] Expected state_dict to be a dict, got {type(state_dict)}"
     print(f"[Rank {rank}] Loaded. Keys: {list(state_dict.keys())}")
 
     # Re-save using DCP (no NIXL in this process → no UCX conflict)
@@ -154,9 +149,7 @@ def main():
 
     _orig_write_preloaded_data = _fsa.FileSystemWriterAsync.write_preloaded_data
 
-    def _write_preloaded_data_multiproc_nofork(
-        transform_list, use_msc, rank, write_buckets, global_results_queue
-    ):
+    def _write_preloaded_data_multiproc_nofork(transform_list, use_msc, rank, write_buckets, global_results_queue):
         """Sequential, no-fork replacement for write_preloaded_data_multiproc.
 
         Calls write_preloaded_data() directly in the main process for each bucket.
@@ -191,9 +184,7 @@ def main():
             write_results_or_exc[local_proc_idx] = local_results_or_exc
         global_results_queue.put(write_results_or_exc)
 
-    _fsa.FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(
-        _write_preloaded_data_multiproc_nofork
-    )
+    _fsa.FileSystemWriterAsync.write_preloaded_data_multiproc = staticmethod(_write_preloaded_data_multiproc_nofork)
     # ==================================================================================
 
     print(f"[Rank {rank}] Saving to DCP format: {args.output_dir}")

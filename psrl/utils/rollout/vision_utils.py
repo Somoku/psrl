@@ -2,7 +2,7 @@ import asyncio
 import base64
 import io
 import logging
-from typing import TYPE_CHECKING
+
 from PIL import Image as PILImage
 
 psrl_logger = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ async def pil_images_to_base64(images: list[PILImage.Image]) -> list[str]:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: [_encode_single_image(img) for img in images])
 
+
 def extract_image_ref(part: dict):
     part_type = part.get("type")
     if part_type == "image_url":
@@ -46,6 +47,7 @@ def extract_image_ref(part: dict):
     if part_type in ("image", "input_image"):
         return part.get("image") or part.get("url") or part.get("image_url")
     return None
+
 
 async def serialize_image_inputs(images: list) -> list[str]:
     if not images:

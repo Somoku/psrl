@@ -70,7 +70,7 @@ python -m uv pip install -e grpc_servicer/
 
 echo "Build python binding of smg..."
 cd bindings/python
-maturin develop --features vendored-openssl
+maturin develop --features vendored-openssl --release
 popd
 
 # Verify the binding is importable

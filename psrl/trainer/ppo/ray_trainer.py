@@ -20,7 +20,11 @@ from tqdm import tqdm
 from transfer_queue import KVBatchMeta
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
-from verl.single_controller.ray.base import SubRayResourcePool, create_colocated_worker_cls_fused
+from verl.single_controller.ray.base import (
+    SubRayResourcePool,
+    create_colocated_worker_cls_fused,
+    sort_placement_group_by_node_ip,
+)
 from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
@@ -122,7 +126,6 @@ class ReplayBuffer:
         self.lock = threading.Lock()
         self._stop_event = threading.Event()
         self.poll_thread = threading.Thread(target=self._poll_from_transfer_queue, daemon=True)
-        self.poll_thread.start()
 
     def _poll_from_transfer_queue(self):
         """Periodically poll metadata from transfer queue."""
@@ -137,6 +140,12 @@ class ReplayBuffer:
             if not self._stop_event.is_set():
                 psrl_logger.error(f"Error in _poll_from_transfer_queue: {e}")
                 os._exit(1)
+
+    def start_polling(self):
+        """Start the background polling thread."""
+        if not self.poll_thread.is_alive():
+            self.poll_thread.start()
+            psrl_logger.info("ReplayBuffer polling thread started.")
 
     def close(self):
         """Stop the background polling thread."""
@@ -362,6 +371,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self._init_ps_manager()
 
+        # NOTE(linsh): Create the rollout router/gateway early so it can boot
+        # during the remaining __init__ work (tokenizer, data processor, etc.).
+        # This overlaps gateway cold-boot with other initialization,
+        # reducing router wait in init_workers.
+        self.init_rollout_router()
+        if self.config.psrl.rollout_gateway.enable:
+            self._launch_router_future = self.rollout_router.launch_router.remote()
+        else:
+            self._launch_router_future = None
+
         # initialize data processor
         # NOTE(lhy): data processor must be initialized before initializing other workers
         # so that the total_training_steps can be obtained and the optimizer config
@@ -558,10 +577,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.config.psrl.ps_manager_ip,
                 self.ps_manager_grpc_port,
             )
-            self.rollout_gateway_url = ray.get(self.rollout_router.launch_router.remote())
-            self.session_router_url = ray.get(self.rollout_router.launch_session_router.remote())
-            psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}")
-            psrl_logger.info(f"Session router launched at {self.session_router_url}")
         else:
             self.rollout_router = RolloutRouter.options(max_concurrency=self.max_concurrency).remote(
                 self.config,
@@ -1759,8 +1774,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 all_wg[f"reward_model_{reward_model_name}_{i}"] for i in range(reward_model.num_replicas)
             ]
 
-        # initialize rollout router for registration
-        self.init_rollout_router()
+        # Dispatch actor NIXL early ONLY in the is_rollout_mode_in_actor branch.
+        # In that branch, actor inits first (before validate), so there's no GPU contention.
+        # In the else branch, validate inits first on the shared GPUs, so actor NIXL
+        # must be deferred until after validate sleeps to avoid GPU memory contention.
+        if self.is_rollout_mode_in_actor:
+            actor_nixl_futures = all_wg["actor"].execute_all_async("init_nixl_client")
+            psrl_logger.info("Dispatched actor NIXL init early (overlapping with router wait)")
+        else:
+            actor_nixl_futures = None
+
+        if self.config.psrl.rollout_gateway.enable:
+            self.rollout_gateway_url = ray.get(self._launch_router_future)
+            self.session_router_url = ray.get(self.rollout_router.launch_session_router.remote())
+            psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}")
+            psrl_logger.info(f"Session router launched at {self.session_router_url}")
 
         # create agent loop workers
         rollout_router = self.rollout_gateway_url if self.config.psrl.rollout_gateway.enable else self.rollout_router
@@ -1788,9 +1816,26 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             )
             psrl_logger.info(f"Agent loop worker {i} scheduled on node {node_id} (soft=True).")
 
-        psrl_logger.info("Initializing models and NIXL clients")
+        # start rollout coordinator
+        self.init_rollout_coordinator()
+        # set_rollout_coordinator must happen before push and pull from PS so that
+        # push_model (called inside the NIXL resume path) can notify the
+        # rollout coordinator of the new model version.
+        ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
+        # Start the LMCache Controller BEFORE init_model() so that LMCache workers
+        # inside EngineCore can register immediately when they start.
+        if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
+            ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
 
-        nixl_client_futures = []
+        # Launch rollout server init in a background thread BEFORE PS init.
+        # Rollout servers use entirely separate GPUs (rollout_pool_*) from actor/validate (train_pool).
+        # By starting this before PS init, vLLM model loading begins as soon as rollout workers boot,
+        # overlapping with PS init's blocking wait for actor workers to cold-start.
+        rollout_init_executor = ThreadPoolExecutor(max_workers=1)
+        rollout_init_future = rollout_init_executor.submit(self.init_rollout_servers, self.rollout_wg_list, "rollout")
+        psrl_logger.info("Launched rollout server init in background thread (before PS init)")
+
+        ps_nixl_futures = []
         model_init_futures = []
 
         # ---- Step 3: Create and init PS WorkerGroup ----
@@ -1817,11 +1862,26 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # ps is deployed on both generation and (maybe) actor nodes
                 ps_node_ids = set()
 
+                # Get node IDs from placement group metadata (GCS query, <1s)
+                # instead of execute_all_sync("get_node_id") which blocks ~430s
+                # waiting for actor workers to cold-boot.
+                def _get_node_ids_from_wg(wg: RayWorkerGroup) -> list[str]:
+                    """Extract node IDs from placement group GCS metadata without calling actors."""
+                    resource_pool = wg.resource_pool
+                    pgs = resource_pool.pgs
+                    assert pgs is not None, "Placement groups must be created before querying node IDs"
+                    local_world_size = resource_pool.store[0]
+                    node_ids = []
+                    for pg in sort_placement_group_by_node_ip(pgs):
+                        pg_data = ray._private.state.state.placement_group_table(pg.id)
+                        bundles_to_node = pg_data["bundles_to_node_id"]
+                        for local_rank in range(local_world_size):
+                            node_ids.append(bundles_to_node[local_rank])
+                    return node_ids
+
                 # Get all rollout instances' distinct node ids
-                # TODO(linsh): refactor naming to `W{i}_I{j}_R{k}` to make it
-                # more clear about (replica i, instance j, rank k)
                 for i in range(self.n_rollout_instances):
-                    rollout_instance_node_ids = all_wg[f"rollout_{i}"].execute_all_sync("get_node_id")
+                    rollout_instance_node_ids = _get_node_ids_from_wg(all_wg[f"rollout_{i}"])
                     for node_id in rollout_instance_node_ids:
                         ps_node_ids.add(node_id)
                     self.worker_to_node_id.update(
@@ -1832,7 +1892,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     )
 
                 # Get all actor instances' distinct node ids
-                actor_instance_node_ids = all_wg["actor"].execute_all_sync("get_node_id")
+                actor_instance_node_ids = _get_node_ids_from_wg(all_wg["actor"])
                 for node_id in actor_instance_node_ids:
                     ps_node_ids.add(node_id)
                 self.worker_to_node_id.update(
@@ -1841,7 +1901,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
                 # Get all validate instances' distinct node ids
                 for i in range(self.n_validate_instances):
-                    validate_instance_node_ids = all_wg[f"validate_{i}"].execute_all_sync("get_node_id")
+                    validate_instance_node_ids = _get_node_ids_from_wg(all_wg[f"validate_{i}"])
                     for node_id in validate_instance_node_ids:
                         ps_node_ids.add(node_id)
                     self.worker_to_node_id.update(
@@ -1873,7 +1933,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     ),
                 )
                 if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
-                    nixl_client_futures.extend(self.ps_wg.execute_all_async("init_nixl_client"))
+                    ps_nixl_futures = self.ps_wg.execute_all_async("init_nixl_client")
                 # Init model skeleton on meta device; weights are loaded after NIXL protocol completes.
                 model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
                 # NOTE(claude): dispatch preload immediately into each PS actor's serial queue; it will
@@ -1890,19 +1950,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # ---- Step 4: Initialize models in all worker groups ----
 
         psrl_logger.info("Initializing models in all rollout instances")
-        # start rollout coordinator
-        self.init_rollout_coordinator()
-        # set_rollout_coordinator must happen before push and pull from PS so that
-        # push_model (called inside the NIXL resume path) can notify the
-        # rollout coordinator of the new model version.
-        ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
-        # Start the LMCache Controller BEFORE init_model() so that LMCache workers
-        # inside EngineCore can register immediately when they start.
-        if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
-            ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
-
-        # simutaneously init all rollout instances
-        self.init_rollout_servers(self.rollout_wg_list, tag="rollout")
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -1953,8 +2000,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # init actor wg -> offload -> init validate wg
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
-            nixl_client_futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
-            ray.get(nixl_client_futures)
+            # Wait for early-dispatched actor NIXL futures (dispatched before router wait,
+            # so actor cold-boot overlapped with gateway boot).
+            ray.get(actor_nixl_futures)
             psrl_logger.info("Initialized NIXL client in actor worker group")
             self.actor_wg.init_model("empty")
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
@@ -1962,6 +2010,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             psrl_logger.info("Initializing validation model")
             self.init_rollout_servers(self.validate_wg_list, tag="validate")
+            # Wait for rollout init to complete (likely already done since it ran in parallel
+            # on separate GPUs during actor + validate initialization above)
+            rollout_init_future.result()
+            rollout_init_executor.shutdown(wait=False)
             ray.get(model_init_futures)
             ray.get(self.rollout_coordinator.init_nixl_client.remote())
             ray.get(self.rollout_coordinator.nixl_convert_params.remote())
@@ -1971,16 +2023,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 ray.get(self.rollout_coordinator.init_lmcache_p2p.remote())
         else:
             # init validate wg -> offload -> init actor wg
-            # ray.get(model_init_futures)
+            # Validate and actor share the same GPUs, so they must be sequential.
+            # Rollout is on separate GPUs and runs in background throughout.
             psrl_logger.info("Initializing validation model")
             self.init_rollout_servers(self.validate_wg_list, tag="validate")
-            ray.get(model_init_futures)
-            ray.get(self.rollout_coordinator.init_nixl_client.remote())
-            ray.get(self.rollout_coordinator.nixl_convert_params.remote())
-            # Start the shared LMCache Controller and broadcast its URL to all instances,
-            # enabling cross-instance KV cache migration for partial rollout re-routes.
-            if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
-                ray.get(self.rollout_coordinator.init_lmcache_p2p.remote())
             ray.get(self.rollout_coordinator.sleep.remote("validate"))
             # Pause validate instances in the router before sleeping them, so that the router
             # does not route rollout requests to validate instances that are in sleep state.
@@ -2005,14 +2051,29 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
             self.actor_wg.init_model("empty")
-            nixl_client_futures.extend(self.actor_wg.execute_all_async("init_nixl_client"))
-            ray.get(nixl_client_futures)
+            actor_nixl_futures = self.actor_wg.execute_all_async("init_nixl_client")
+            ray.get(actor_nixl_futures)
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
+
+            # Wait for rollout to complete — actor init overlapped with rollout in background.
+            # Coordinator NIXL ops need rollout registered, so we must wait here.
+            rollout_init_future.result()
+            rollout_init_executor.shutdown(wait=False)
+
+            ray.get(model_init_futures)
+            ray.get(self.rollout_coordinator.init_nixl_client.remote())
+            ray.get(self.rollout_coordinator.nixl_convert_params.remote())
+            # Start the shared LMCache Controller and broadcast its URL to all instances,
+            # enabling cross-instance KV cache migration for partial rollout re-routes.
+            if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
+                ray.get(self.rollout_coordinator.init_lmcache_p2p.remote())
 
         psrl_logger.info("All workers' models initialized successfully!")
 
         # initialize NIXL
         if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
+            if ps_nixl_futures:
+                ray.get(ps_nixl_futures)
             rollout_world_size = ray.get(self.rollout_coordinator.world_size.remote())
             psrl_logger.info(
                 f"Initializing NIXL server with {self.ps_wg.world_size} PS workers, "
@@ -2075,6 +2136,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 ray.get(initial_pull_futures)
 
         self.init_elastic_rm_runtime()
+
+        self.replay_buffer.start_polling()
+        psrl_logger.info("ReplayBuffer polling started after init_workers() completed.")
 
     def switch_to_rollout_mode(self):
         """Switch the PSRL colocate part to rollout mode for validation.

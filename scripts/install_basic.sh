@@ -97,7 +97,7 @@ if [ -z "$VERL_PATH" ]; then
     git clone https://github.com/volcengine/verl.git
     VERL_PATH=$THIRD_PARTY_PATH/verl
     cd $VERL_PATH
-    git checkout 41a52449
+    git checkout e5ca4acb
     popd
 fi
 pushd $VERL_PATH

@@ -128,6 +128,19 @@ index 89d2dd2f..6b3f6b90 100644
  # Allow to override Distributed Data Parallel (DDP) config
  override_ddp_config: {}
  
+diff --git a/verl/trainer/config/model/hf_model.yaml b/verl/trainer/config/model/hf_model.yaml
+index bef40f1d..3ebc6856 100644
+--- a/verl/trainer/config/model/hf_model.yaml
++++ b/verl/trainer/config/model/hf_model.yaml
+@@ -16,7 +16,7 @@ hf_config_path: null
+ tokenizer_path: null
+ 
+ # whether to use shared memory for model loading
+-use_shm: False
++use_shm: True
+ 
+ # whether to trust remote code.
+ trust_remote_code: False
 diff --git a/verl/trainer/ppo/metric_utils.py b/verl/trainer/ppo/metric_utils.py
 index 946f7611..b0dbb4d5 100644
 --- a/verl/trainer/ppo/metric_utils.py
@@ -561,7 +574,7 @@ index 0bcf14a2..5a47a4da 100644
      dist_checkpointing_prefix: str = ""
      dist_ckpt_optim_fully_reshardable: bool = False
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index 1e2b0c97..9ce58fea 100644
+index 991ccdb2..0b0d62be 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
 @@ -76,6 +76,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -693,7 +706,7 @@ index 1e2b0c97..9ce58fea 100644
              optimizer = None
              lr_scheduler = None
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 918d85ef..35ec432d 100644
+index 918d85ef..96b3e556 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -69,6 +69,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -745,7 +758,7 @@ index 918d85ef..35ec432d 100644
  
          if torch.distributed.get_rank() == 0:
              print_model_size(module[0])
-@@ -370,83 +378,87 @@ class MegatronEngine(BaseEngine):
+@@ -370,83 +378,89 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._build_tf_config()
  
@@ -883,11 +896,13 @@ index 918d85ef..35ec432d 100644
 +                use_distributed_optimizer=self.engine_config.use_distributed_optimizer,
 +                use_checkpoint_opt_param_scheduler=self.optimizer_config.use_checkpoint_opt_param_scheduler,
 +                use_dist_checkpointing=self.engine_config.use_dist_checkpointing,
++                use_per_rank_checkpoint=self.engine_config.use_per_rank_checkpoint,
 +                bridge=self.bridge,
 +                provider=self.provider,
 +                peft_cls=self.peft_cls,
 +                use_megatron_fsdp=self.engine_config.use_megatron_fsdp,
 +            )
++            self.checkpoint_mananager.use_per_rank_checkpoint = self.engine_config.use_per_rank_checkpoint
  
 -        self.to(
 -            device="cpu",
@@ -907,3 +922,24 @@ index 918d85ef..35ec432d 100644
  
      def train_mode(self, **kwargs):
          """
+diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
+index bf379b49..882e9f0b 100644
+--- a/verl/workers/engine_workers.py
++++ b/verl/workers/engine_workers.py
+@@ -85,8 +85,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
+ 
+         from verl.workers.engine import BaseEngine, EngineRegistry
+ 
+-        initialize_global_process_group_ray(timeout_second=None)
+-
+         set_numa_affinity()
+ 
+         self.config = config
+@@ -499,6 +497,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def init_model(self):
+         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
++        initialize_global_process_group_ray(timeout_second=None)
+ 
+         # 1. build reference model
+         if "ref" in self.role:

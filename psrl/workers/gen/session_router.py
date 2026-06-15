@@ -27,7 +27,8 @@ class SessionState:
     drained: asyncio.Event = field(default_factory=asyncio.Event)
     closing: bool = False
     inflight: int = 0
-    turn: int = 0
+    # Per-trajectory turn tracking: trajectory_id → current_turn
+    trajectory_turns: dict[int, int] = field(default_factory=dict)
     base_worker_id: str | None = None
     target_dp_rank: str | None = None
 
@@ -36,6 +37,15 @@ class SessionState:
             self.drained.set()
         else:
             self.drained.clear()
+
+    def get_trajectory_turn(self, trajectory_id: int) -> int:
+        """Get the current turn for a trajectory, initializing to 0 if new."""
+        return self.trajectory_turns.get(trajectory_id, 0)
+
+    def advance_trajectory_turn(self, trajectory_id: int) -> None:
+        """Advance the turn counter for a specific trajectory."""
+        current = self.trajectory_turns.get(trajectory_id, 0)
+        self.trajectory_turns[trajectory_id] = current + 1
 
 
 class SessionRouter:
@@ -104,11 +114,16 @@ class SessionRouter:
         return self.build_response(result)
 
     async def session_chat_completions(self, sid: str, request: Request) -> Response:
+        """Handle a chat completion request within a TITO session."""
         state = await self._ensure_state(sid)
+
+        # Extract trajectory_id from request headers (set in add_session_headers)
+        trajectory_id = self._extract_trajectory_id(request)
+
         async with state.lock:
             if state.closing:
                 return JSONResponse(status_code=409, content={"error": "session is closing"})
-            expected_turn = state.turn
+            expected_turn = state.get_trajectory_turn(trajectory_id)
             session_headers = state.headers
             base_worker_id = state.base_worker_id
             target_dp_rank = state.target_dp_rank
@@ -130,7 +145,7 @@ class SessionRouter:
             )
         finally:
             # Single combined critical section: close out inflight bookkeeping
-            # and, on success, advance the turn counter.
+            # and, on success, advance the trajectory's turn counter.
             async with state.lock:
                 state.inflight = max(0, state.inflight - 1)
                 if state.inflight == 0:
@@ -141,15 +156,25 @@ class SessionRouter:
                     if base_worker_id is not None and target_dp_rank is not None:
                         state.base_worker_id = base_worker_id
                         state.target_dp_rank = target_dp_rank
-                    if state.turn != expected_turn:
-                        psrl_logger.warning(
-                            "SessionRouter stale write detected for sid=%s expected_turn=%s current_turn=%s.",
+
+                    # Check for out-of-order response arrival
+                    current_turn = state.get_trajectory_turn(trajectory_id)
+                    if current_turn != expected_turn:
+                        # This is a turn skew: response arrived out of order.
+                        # With trajectory-aware tracking, this is expected during
+                        # partial rollout re-dispatch and doesn't block progress.
+                        psrl_logger.debug(
+                            "SessionRouter turn skew for sid=%s trajectory_id=%s "
+                            "expected_turn=%s current_turn=%s. "
+                            "This is expected during re-dispatch (hybrid fix active).",
                             sid,
+                            trajectory_id,
                             expected_turn,
-                            state.turn,
+                            current_turn,
                         )
-                    else:
-                        state.turn += 1
+
+                    state.advance_trajectory_turn(trajectory_id)
+
         return self.build_response(result)
 
     async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
@@ -223,6 +248,16 @@ class SessionRouter:
         if is_closed:
             self.client = create_aiohttp_client(concurrency=self.client_concurrency)
         return self.client
+
+    @staticmethod
+    def _extract_trajectory_id(request: Request) -> int:
+        """Extract trajectory_id from x-smg-tito-trajectory-id header.
+
+        Returns:
+            int: The trajectory_id, or 0 if not present or invalid.
+        """
+        trajectory_id_str = request.headers.get("x-smg-tito-trajectory-id", "0")
+        return int(trajectory_id_str)
 
     @staticmethod
     def build_response(result: HttpResponse) -> Response:

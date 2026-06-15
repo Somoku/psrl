@@ -52,6 +52,12 @@ defaults:
 # Any Hydra CLI override to actor_rollout_ref automatically propagates.
 actor_rollout_ref: ${train_actor_rollout_ref}
 
+# train_actor_rollout_ref has its own overrides for the training side.
+train_actor_rollout_ref:
+
+  # Timeout for operations executed against the process group
+  nccl_timeout: 600
+
 # gen_actor_rollout_ref has its own overrides for the generation side.
 gen_actor_rollout_ref:
 

@@ -104,7 +104,9 @@ def build_reward_router_args(config: Any, host: str, port: int, prometheus_port:
         prefill_policy=None,
         decode_policy=None,
         disable_retries=True,
-        max_concurrent_seqs_per_instance=1024,
+        max_concurrent_seqs_per_instance=int(
+            cfg_get(config, "psrl.routing_strategy.max_concurrent_seqs_per_instance", 1024)
+        ),
         cost_model_path=None,
         max_num_waiting_reqs_after_preemption=int(
             cfg_get(config, "psrl.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)

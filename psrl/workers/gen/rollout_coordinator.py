@@ -23,6 +23,7 @@ from psrl.workers.gen.smg_adapter import (
     WORKERS_STATS_PATH,
     WORKERS_UPDATE_STATS_PATH,
     WORKERS_UPDATE_WEIGHT_VERSION_PATH,
+    build_pause_resume_payload,
     build_weight_version_updates,
     build_worker_stats_update,
 )
@@ -107,6 +108,8 @@ class RolloutCoordinator(CommandExtension):
         self.running_loop = None
         self.command_handler_task = None
         self.sync_task = None
+        self.model_sync_tasks: set[asyncio.Task] = set()
+        self.replica_sync_tasks: dict[str, asyncio.Task] = {}
         self.process_status_queue_task = None
         self.sync_status_to_router_task = None
         self.stats_recorder_task = None
@@ -254,6 +257,82 @@ class RolloutCoordinator(CommandExtension):
             )
         if not running and bool(data.get("selecting", False)):
             raise RuntimeError("Routing loop is still selecting after pause wait")
+        if not running and int(data.get("active_dispatch_handoffs", 0)) != 0:
+            raise RuntimeError("Routing loop still has active dispatch handoffs after pause wait")
+
+    def _expand_replica_instance_ids(self, instance_ids: list[RolloutInstanceId]) -> list[RolloutInstanceId]:
+        replica_ids = {instance_id[0] for instance_id in instance_ids}
+        return sorted(instance_id for instance_id in self.instance_ids if instance_id[0] in replica_ids)
+
+    async def _publish_weight_version_updates(self, updates: list[dict]) -> None:
+        result = await self._gateway_post_json(WORKERS_UPDATE_WEIGHT_VERSION_PATH, payload=updates)
+        if int(result.get("rejected", 0)) != 0 or int(result.get("updated", 0)) != len(updates):
+            raise RuntimeError(f"Rust gateway rejected replica weight-version update: {result}")
+
+    async def _finish_rust_gateway_sync(
+        self,
+        replica_ids: list[str],
+        instance_ids: list[RolloutInstanceId],
+        advertised_version: int,
+        pull_futures: list,
+    ) -> None:
+        try:
+            actual_versions = await asyncio.gather(*pull_futures)
+            actual_updates = []
+            for replica_id, actual_version in zip(replica_ids, actual_versions):
+                replica_instance_ids = [instance_id for instance_id in instance_ids if instance_id[0] == replica_id]
+                for instance_id in replica_instance_ids:
+                    self.set_rollout_instance_model_version(instance_id, actual_version)
+                    self.instance_to_version_after_sync[instance_id] = actual_version
+                if actual_version != advertised_version:
+                    actual_updates.extend(build_weight_version_updates(replica_instance_ids, actual_version))
+            if actual_updates:
+                await self._publish_weight_version_updates(actual_updates)
+            await asyncio.gather(
+                *[self.server_handles[replica_id].resume_after_sync.remote() for replica_id in replica_ids]
+            )
+        except Exception:
+            psrl_logger.exception(f"Model sync failed for replicas {replica_ids}; keeping them unavailable")
+            await asyncio.gather(
+                *[self.server_handles[replica_id].fail_sync.remote() for replica_id in replica_ids],
+                return_exceptions=True,
+            )
+            await self._gateway_post_json("/workers/pause", payload=build_pause_resume_payload(instance_ids))
+            raise
+
+    async def _quarantine_failed_replicas(
+        self,
+        replica_ids: list[str],
+        instance_ids: list[RolloutInstanceId],
+    ) -> None:
+        await asyncio.gather(
+            *[self.server_handles[replica_id].fail_sync.remote() for replica_id in replica_ids],
+            return_exceptions=True,
+        )
+        await self._gateway_post_json("/workers/pause", payload=build_pause_resume_payload(instance_ids))
+        await self._set_routing_loop_running(True)
+
+    async def _wait_for_replica_syncs(self, replica_ids: list[str]) -> None:
+        pending = {
+            self.replica_sync_tasks[replica_id] for replica_id in replica_ids if replica_id in self.replica_sync_tasks
+        }
+        if pending:
+            await asyncio.gather(*pending)
+
+    def _track_model_sync_task(self, task: asyncio.Task, replica_ids: list[str]) -> None:
+        self.model_sync_tasks.add(task)
+        for replica_id in replica_ids:
+            self.replica_sync_tasks[replica_id] = task
+
+        def on_done(completed: asyncio.Task) -> None:
+            self.model_sync_tasks.discard(completed)
+            for replica_id in replica_ids:
+                if self.replica_sync_tasks.get(replica_id) is completed:
+                    del self.replica_sync_tasks[replica_id]
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(on_done)
 
     async def _fetch_filtered_request_meta(self, version_tag: int) -> list[tuple[int, bool]]:
         requests = await self._gateway_get_json("/routing_loop/filter", params={"version_tag": version_tag})
@@ -448,6 +527,8 @@ class RolloutCoordinator(CommandExtension):
         if self.stats_recorder_task is not None:
             await self.stats_recorder_task
             psrl_logger.info("Finished stats recorder task.")
+        if self.model_sync_tasks:
+            await asyncio.gather(*self.model_sync_tasks, return_exceptions=True)
         if self._stats_recorder is not None:
             self._stats_recorder.close()
         psrl_logger.info("All background tasks have been stopped.")
@@ -976,6 +1057,17 @@ class RolloutCoordinator(CommandExtension):
             level=logging.INFO,
             event_type=EventType.OTHER,
         ):
+            instance_ids = self._expand_replica_instance_ids(instance_ids)
+            replica_ids = sorted({instance_id[0] for instance_id in instance_ids})
+            if self.use_rust_gateway:
+                sleeping = await asyncio.gather(
+                    *[self.server_handles[replica_id].is_sleeping.remote() for replica_id in replica_ids]
+                )
+                replica_ids = [replica_id for replica_id, is_sleeping in zip(replica_ids, sleeping) if not is_sleeping]
+                instance_ids = [instance_id for instance_id in instance_ids if instance_id[0] in replica_ids]
+                if not replica_ids:
+                    return
+            await self._wait_for_replica_syncs(replica_ids)
             for instance_id in instance_ids:
                 self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
                     instance_id, 0
@@ -983,24 +1075,51 @@ class RolloutCoordinator(CommandExtension):
 
             if self.use_rust_gateway:
                 await self._set_routing_loop_running(False)
+                try:
+                    await asyncio.gather(
+                        *[self.server_handles[replica_id].pause_for_sync.remote() for replica_id in replica_ids]
+                    )
+                    if wait_interrupted_partial_requests_loop_back and self.config.psrl.partial_rollout.enable:
+                        await self._wait_interrupted_partial_requests_loop_back(instance_ids)
+
+                    pull_futures = [
+                        self.server_handles[replica_id].pull_model_for_sync.remote(self.ps_model_version)
+                        for replica_id in replica_ids
+                    ]
+                    updates = build_weight_version_updates(instance_ids, self.ps_model_version)
+                    await self._publish_weight_version_updates(updates)
+                    for instance_id in instance_ids:
+                        self.instance_to_version_after_sync[instance_id] = self.ps_model_version
+                    await asyncio.gather(
+                        *[
+                            self.server_handles[replica_id].open_grpc_generate_admission.remote()
+                            for replica_id in replica_ids
+                        ]
+                    )
+                    await self._set_routing_loop_running(True)
+                    psrl_logger.info(
+                        f"Published version {self.ps_model_version} and resumed routing for replicas {replica_ids}"
+                    )
+                except Exception:
+                    await self._quarantine_failed_replicas(replica_ids, instance_ids)
+                    raise
+
+                completion = self._finish_rust_gateway_sync(
+                    replica_ids,
+                    instance_ids,
+                    self.ps_model_version,
+                    pull_futures,
+                )
+                if wait_model_sync:
+                    await completion
+                else:
+                    self._track_model_sync_task(asyncio.create_task(completion), replica_ids)
+                return
             else:
                 await self.rollout_router.pause_routing.remote()
             psrl_logger.info("Paused routing for synchronization")
 
-            if self.use_rust_gateway:
-                for instance_id in instance_ids:
-                    self.instance_to_version_after_sync[instance_id] = self.ps_model_version
-                updates = build_weight_version_updates(instance_ids, self.ps_model_version)
-                await self._gateway_post_json(WORKERS_UPDATE_WEIGHT_VERSION_PATH, payload=updates)
-                psrl_logger.info(
-                    f"Pushed version_after_sync to Rust gateway for "
-                    f"{len(instance_ids)} instances to {self.ps_model_version}"
-                )
-            else:
-                # Original path: update via Router Ray RPC
-                await self.rollout_router.update_currently_syncing_instances.remote(
-                    instance_ids, self.ps_model_version
-                )
+            await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
 
             await self.exec_command(
                 Command(
@@ -1017,10 +1136,7 @@ class RolloutCoordinator(CommandExtension):
                     f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
                 )
 
-            if self.use_rust_gateway:
-                await self._set_routing_loop_running(True)
-            else:
-                await self.rollout_router.resume_routing.remote()
+            await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after synchronization")
 
     async def check_no_activate_tasks(self, instance_id: RolloutInstanceId) -> bool:
@@ -1269,10 +1385,10 @@ class RolloutCoordinator(CommandExtension):
         return []
 
     async def _wait_interrupted_partial_requests_loop_back(self, instance_ids: list[RolloutInstanceId]):
-        futures = []
-        for instance_id in instance_ids:
-            replica_id, dp_rank = instance_id
-            futures.append(self.server_handles[replica_id].wait_for_requests_to_drain.remote())
+        futures = [
+            self.server_handles[replica_id].wait_for_requests_to_drain.remote()
+            for replica_id in sorted({instance_id[0] for instance_id in instance_ids})
+        ]
         await asyncio.gather(*futures)
 
     # ------- FUNCTIONS FOR LMCACHE P2P -------

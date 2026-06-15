@@ -33,7 +33,7 @@ def _run_smg(args):
         return 1
 
 
-@ray.remote
+@ray.remote(num_cpus=0)
 class RolloutGateway:
     def __init__(
         self,

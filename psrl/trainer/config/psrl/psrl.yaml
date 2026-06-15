@@ -278,7 +278,7 @@ routing_strategy:
   # Method for rollout routing
   # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget", "kv_cache_aware"
   # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
-  method: round_robin
+  method: request_num_balance
 
   # KV cache transfer: when re-routing a request to a different rollout instance,
   # transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)

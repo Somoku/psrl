@@ -134,7 +134,6 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=40960 \
     \
-    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.name=vllm \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \

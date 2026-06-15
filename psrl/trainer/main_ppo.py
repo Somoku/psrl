@@ -10,14 +10,13 @@ import torch
 import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.device import auto_set_device, is_cuda_available
 
+from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
 from psrl.utils.config import validate_config
 from psrl.workers.config.reward_model import resolve_active_managers
-from psrl.workers.gen.vllm_rollout import PSRL_ServerAdapter
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -206,6 +205,7 @@ class TaskRunner:
 
     def add_actor_rollout_worker(self, config):
         """Add actor rollout worker (backend selected via config.actor.strategy)."""
+        from psrl.workers.gen.vllm_rollout import PSRL_ServerAdapter
         from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
 
         self.role_worker_mapping[PSRL_Role.Actor] = ray.remote(PSRL_TrainWorker)
@@ -356,6 +356,8 @@ class TaskRunner:
 
     def add_reward_model_worker(self, config):
         """Add reward model worker."""
+        from psrl.workers.gen.vllm_rollout import PSRL_ServerAdapter
+
         self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_ServerAdapter)
 
     def add_dummy_worker(self, config):
@@ -383,9 +385,12 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        tq.init(config.transfer_queue)
-        trainer = None
-        try:
+        from concurrent.futures import ThreadPoolExecutor
+
+        # Overlap tq.init (network/storage I/O, ~38s) with add_workers (Python imports, ~79s)
+        # since they have no shared dependencies. This reduces total from ~117s to ~79s.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            tq_future = executor.submit(tq.init, config.transfer_queue)
             self.add_actor_rollout_worker(config)
             self.add_critic_worker(config)
 
@@ -395,6 +400,10 @@ class TaskRunner:
             # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
             self.add_dummy_worker(config)
 
+            tq_future.result()
+
+        trainer = None
+        try:
             resource_pool_manager = self.init_resource_pool_mgr(config)
 
             # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()

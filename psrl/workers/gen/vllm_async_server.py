@@ -677,6 +677,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             preemption_queue=self.preemption_queue,
             kv_cache_manager=self.kv_cache_manager,
         )
+        self.grpc_servicer = servicer
 
         server = grpc.aio.server(
             options=[
@@ -766,6 +767,25 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def resume_generation(self):
         await self.engine.resume_generation()
+
+    async def close_grpc_generate_admission(self):
+        await self.grpc_servicer.close_generate_admission()
+
+    async def open_grpc_generate_admission(self):
+        await self.grpc_servicer.open_generate_admission()
+
+    async def pause_for_sync(self):
+        await self.close_grpc_generate_admission()
+        await self.pause_generation(clear_cache=False)
+        psrl_logger.info(f"Generation paused on replica {self.get_replica_idx()} for sync with PS")
+
+    async def resume_after_sync(self):
+        await self.resume_generation()
+        psrl_logger.info(f"Generation resumed on replica {self.get_replica_idx()}")
+
+    async def fail_sync(self):
+        await self.close_grpc_generate_admission()
+        await self.pause_generation(clear_cache=False)
 
     async def wait_for_requests_to_drain(self):
         await self.engine.wait_for_requests_to_drain()
@@ -1361,20 +1381,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     ###### Weights Update ######
 
-    async def sync_with_ps(self, ps_version: int, pause_generation: bool = False):
+    async def pull_model_for_sync(self, ps_version: int) -> int:
         data_parallel_ranks = range(self.get_instance_num())
         data_parallel_rank = 0  # take dp 0 as representative for the replica
 
-        # psrl_logger.info(f"{self.curr_rollout_instance_model_version=}, dp_rank = {data_parallel_rank}")
         if self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version:
-            return  # No need to sync if already up-to-date
+            return self.curr_rollout_instance_model_version[data_parallel_rank]
 
-        # Step 1. Interrupt generation if needed
-        if pause_generation:
-            await self.pause_generation(clear_cache=False)
-            psrl_logger.info(f"Generation paused on replica {self.get_replica_idx()} for sync with PS")
-
-        # Step 2. Pull model from PS
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
             with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
                 await self.pull_model()
@@ -1400,10 +1413,16 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 self.stat_collector.record_model_version_update(
                     self.curr_rollout_instance_model_version[data_parallel_rank], dp_rank
                 )
+        return curr_model_version
 
-        # Step 3: Resume generation
-        await self.resume_generation()
-        psrl_logger.info(f"Generation resumed on replica {self.get_replica_idx()}")
+    async def sync_with_ps(self, ps_version: int, pause_generation: bool = False):
+        if pause_generation:
+            await self.pause_for_sync()
+        version = await self.pull_model_for_sync(ps_version)
+        if pause_generation:
+            await self.open_grpc_generate_admission()
+            await self.resume_after_sync()
+        return version
 
     async def pull_model(self):
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
@@ -1571,7 +1590,7 @@ class PSRL_vLLMReplica(vLLMReplica):
             elif self.is_teacher_model:
                 name = f"{prefix}server_teacher_{self.replica_rank}_{node_rank}"
             else:
-                name = f"{prefix}server_{self.replica_rank}_{node_rank}"
+                name = f"{prefix}server_{self.tag}_{self.replica_rank}_{node_rank}"
 
             # AGENT(VERL): PSRL-specific environment variables.
             env_vars = {

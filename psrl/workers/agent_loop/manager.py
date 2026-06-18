@@ -43,6 +43,7 @@ class PSRL_AgentLoopManager:
         rollout_gateway_url,
         group_post_process_fn=None,
         buffer_post_process_fn=None,
+        data_processor_handle=None,
     ):
         """Initialize agent loop manager.
         Agent loop manager that manages a group of agent loop workers.
@@ -53,10 +54,13 @@ class PSRL_AgentLoopManager:
             data_queue_size (int): Size of the data queue.
             agent_loop_workers: List of agent loop worker instances.
             ps_manager_handle: Handle to the parameter server manager.
+            rollout_gateway_url: URL for the rollout gateway.
             group_post_process_fn (Optional[callable]): Optional function to post-process
                 grouped entry data before occupying the buffer
             buffer_post_process_fn (Optional[callable]): Optional function to post-process
                 ready buffer data
+            data_processor_handle (Optional[ray.actor.ActorHandle]): Handle to the DataProcessor
+                for fresh-data-fetch retry when pre-dispatch queue is empty.
         """
         self.config = config
         model_path = config.gen_actor_rollout_ref.model.path
@@ -90,6 +94,7 @@ class PSRL_AgentLoopManager:
         self.result_queue = asyncio.Queue()
         self.agent_loop_workers = agent_loop_workers
         self.ps_manager_handle = ps_manager_handle
+        self.data_processor_handle = data_processor_handle
 
         self._request_counter = 0  # For version tag setting
 
@@ -595,7 +600,11 @@ class PSRL_AgentLoopManager:
         Args:
             data (DataProto | None): Data to be retried. If None, the new data from the data queue will be used.
         """
-        if self.running_loop and not self.stop_train_dispatch_task:
+        # Caller-provided data (data is not None) is dispatched even after the train
+        # dispatch loop has stopped (post-END), because that is exactly the on-demand
+        # refill path for a failed group. Queue-sourced retries (data is None) still
+        # require an active dispatch loop.
+        if self.running_loop and (data is not None or not self.stop_train_dispatch_task):
             # If data is None, the new data from the data queue will be used.
             if data is None:
                 if not self.train_data_queue.empty():
@@ -712,26 +721,53 @@ class PSRL_AgentLoopManager:
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)
             else:
-                # --- train: dispatch a fresh group to fill the vacated slot ---
-                if self.stop_train_dispatch_task:
+                # --- train: refill the vacated slot with a FRESH group from the dataset ---
+                # A failed group must be compensated by ONE extra prompt from the dataset,
+                # regardless of whether the pre-dispatch queue still has data. Popping the
+                # queue (the old behavior) does NOT increase the total number of dispatched
+                # groups — it only consumes a future group early — so the deficit is merely
+                # deferred to the last buffer, which then has neither queue nor fresh data
+                # and hangs. The busy loop dispatches exactly `total_training_steps *
+                # buffer_size` groups, so the trainer needs that many SUCCESSES; each failure
+                # therefore requires one additional dataset fetch to keep the count whole.
+                if self.data_processor_handle is None:
                     psrl_logger.warning(
-                        "notify_group_failed (train): dispatch task stopped, "
-                        "skipping replacement for parent_id=%s.",
+                        "notify_group_failed (train): data_processor_handle not set; "
+                        "cannot fresh-fetch for parent_id=%s. Forcing buffers ready.",
                         parent_id,
                     )
+                    await self._terminal_force_ready_waiting_train_buffers()
                     return
-                if self.train_data_queue.empty():
+
+                try:
+                    fresh_group = await self.data_processor_handle.dispatch_one_more_train_group.remote()
+                except Exception as e:
+                    psrl_logger.error(
+                        "notify_group_failed (train): fresh-data-fetch errored for "
+                        "parent_id=%s: %r. Forcing buffers ready.",
+                        parent_id, e,
+                    )
+                    await self._terminal_force_ready_waiting_train_buffers()
+                    return
+
+                if fresh_group is None:
+                    # Dataset/epochs exhausted: no fresh prompt available. Force the
+                    # waiting train buffer(s) ready with partial data so the trainer
+                    # makes progress instead of hanging forever.
                     psrl_logger.warning(
-                        "notify_group_failed (train): train_data_queue is empty, "
-                        "no replacement available for parent_id=%s.",
+                        "notify_group_failed (train): dataset exhausted, no fresh prompt "
+                        "for parent_id=%s. Forcing buffers ready.",
                         parent_id,
                     )
+                    await self._terminal_force_ready_waiting_train_buffers()
                     return
+
                 psrl_logger.info(
-                    "notify_group_failed (train): dispatching replacement group for parent_id=%s.",
-                    parent_id,
+                    "notify_group_failed (train): fetched fresh group for parent_id=%s "
+                    "(%d rows), dispatching as replacement.",
+                    parent_id, len(fresh_group),
                 )
-                await self._retry_data()
+                await self._retry_data(data=fresh_group)
 
     def _get_expected_ps_version(self):
         """
@@ -879,6 +915,51 @@ class PSRL_AgentLoopManager:
             accumulated_buffers.pop(buffer_id)
             accumulated_buffer_size.pop(buffer_id)
         return add_buffer
+
+    async def _terminal_force_ready_waiting_train_buffers(self):
+        """
+        Force every train buffer that has a blocked waiter ready with partial data.
+
+        Terminal fallback for `notify_group_failed` when a failed group cannot be
+        refilled (dataset/epochs exhausted, or no data_processor_handle). Without this
+        the trainer's future in `_train_buffer_waiters` is never resolved and the run
+        hangs forever. Mirrors the partial-data force-ready in `handle_waiting_buffer`
+        (the `stop_train_dispatch_task` branch) but is independent of
+        `proactive_filter_strategy.method`.
+
+        Aborts still-reserved (in-flight) entries, overrides the accumulated-size
+        counter so the readiness check passes, and flushes the buffer (which resolves
+        the waiter via `handle_ready_buffer`). Must be called with the PS lock held.
+        """
+        # Snapshot keys: _flush_ready_buffer mutates train_accumulated_buffers.
+        waiting_buffer_ids = [
+            bid for bid in self._train_buffer_waiters
+            if bid in self.train_accumulated_buffers and bid not in self.train_data_buffers
+        ]
+        if not waiting_buffer_ids:
+            psrl_logger.warning(
+                "_terminal_force_ready_waiting_train_buffers: no waiting train buffer to "
+                "force ready (waiters=%s).",
+                list(self._train_buffer_waiters.keys()),
+            )
+            return
+        for buffer_id in sorted(waiting_buffer_ids):
+            remaining_gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
+            psrl_logger.warning(
+                "_terminal_force_ready_waiting_train_buffers: forcing buffer %d ready with "
+                "partial data (%d/%d entries, gap=%d); no fresh data available.",
+                buffer_id,
+                self.train_accumulated_buffer_size[buffer_id],
+                self.ready_entries_per_buffer,
+                remaining_gap,
+            )
+            if remaining_gap > 0:
+                _, aborted_request_ids = await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
+                if aborted_request_ids:
+                    self.remove_from_data_pool(aborted_request_ids)
+                # Override the counter so _flush_ready_buffer's readiness check passes.
+                self.train_accumulated_buffer_size[buffer_id] = self.ready_entries_per_buffer
+            await self._flush_ready_buffer(buffer_id, is_validate=False)
 
     async def put_result(self, result: DataProto):
         """Put result data into the manager's result queue."""

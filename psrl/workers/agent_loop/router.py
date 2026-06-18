@@ -1093,6 +1093,9 @@ class RolloutRouter:
             return
 
         # --- Step 1: Check whether old instance has anything cached in LMCache CPU backend. ---
+        # Rank 0 alone is authoritative here: KV is head/layer-sharded, not token-sharded,
+        # so the cached-token COUNT is identical across all TP/PP ranks. Querying all ranks
+        # would add N RPCs and an aggregation for zero correctness gain.
         try:
             cache_info_raw = await asyncio.wait_for(
                 self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
@@ -1130,19 +1133,29 @@ class RolloutRouter:
         async def _do_transfer() -> None:
             async with _sem:
                 try:
-                    success = await self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
+                    # Fan out to ALL TP/PP ranks: KV is sharded per rank (TP heads, PP
+                    # layers), so every rank must move its own shard to the destination's
+                    # same-rank endpoint. Each source rank's KVCacheManager looks up the
+                    # dst same-rank url internally. Args are broadcast identically to all
+                    # ranks (mixed types, not per-rank lists). The migration counts as
+                    # succeeded only if every rank moved >0 tokens, matching the
+                    # Controller's cross-rank consistency requirement.
+                    refs = self.rollout_wg_list[old_instance_id].execute_all_async(
                         "kv_transfer_direct",
                         tokens,
                         (src_id, "LocalCPUBackend"),
                         (dst_id, "LocalCPUBackend"),
                         True,  # copy=True → keep source data, let LRU evict naturally
                     )
+                    results = await asyncio.gather(*refs)
+                    success = bool(results) and all(results)
                     if success:
                         self._kv_transfer_stats["succeeded"] += 1
                         s = self._kv_transfer_stats
                         psrl_logger.info(
                             f"[KVTransfer] Transfer succeeded for uid={request_id!r}: "
-                            f"instance {old_instance_id!r} -> {new_instance_id!r}. "
+                            f"instance {old_instance_id!r} -> {new_instance_id!r} "
+                            f"({len(results)} ranks). "
                             f"[stats: ok={s['succeeded']}, no_data={s['no_cached_data']}, "
                             f"src_miss={s['transfer_returned_0']}, "
                             f"exc={s['transfer_exception']}, "
@@ -1150,24 +1163,70 @@ class RolloutRouter:
                         )
                     else:
                         self._kv_transfer_stats["transfer_returned_0"] += 1
-                except Exception:
+                        psrl_logger.debug(
+                            f"[KVTransfer] Transfer returned 0 tokens on some rank for "
+                            f"uid={request_id!r}: instance {old_instance_id!r} -> "
+                            f"{new_instance_id!r} (per-rank results: {results!r}). "
+                            "Source likely evicted or heterogeneous layout; dst will re-prefill."
+                        )
+                except Exception as exc:
                     self._kv_transfer_stats["transfer_exception"] += 1
+                    # Throttle: log full stack for the first few occurrences and then
+                    # periodically, so a burst of failures does not flood the log while
+                    # still surfacing the exception type and traceback for diagnosis.
+                    n = self._kv_transfer_stats["transfer_exception"]
+                    if n <= 10 or n % 100 == 0:
+                        psrl_logger.warning(
+                            f"[KVTransfer] Transfer raised {type(exc).__name__} for "
+                            f"uid={request_id!r}: instance {old_instance_id!r} -> "
+                            f"{new_instance_id!r} (occurrence #{n}): {exc!r}. "
+                            "Dispatch proceeds; dst will re-prefill.",
+                            exc_info=True,
+                        )
 
         if transfer_mode == "pin_sync":
             # Pin-sync mode: pin → transfer → unpin. Strongest guarantee —
-            # pin prevents LRU eviction while we await the transfer.
+            # pin prevents LRU eviction while we await the transfer. Pin on ALL ranks:
+            # each rank's LMCacheWorker holds its own KV shard, so pinning only rank 0
+            # would leave the other ranks' shards evictable mid-transfer.
+            # NOTE(claude): execute_all_async only per-rank-splits when ALL args are lists
+            # of length world_size. Here `tokens` is a long list (chunk-sized) and
+            # `["backend"]` has length 1, so both args are broadcast identically to every
+            # rank — the intended behavior.
             try:
-                await asyncio.wait_for(
-                    self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
-                        "kv_pin", tokens, ["backend"]
+                pin_results = await asyncio.wait_for(
+                    asyncio.gather(
+                        *self.rollout_wg_list[old_instance_id].execute_all_async(
+                            "kv_pin", tokens, ["backend"]
+                        )
                     ),
                     timeout=5.0,
                 )
+                pinned_ok = bool(pin_results) and all(pin_results)
             except Exception as e:
                 psrl_logger.warning(
                     f"[KVTransfer] CPU pin failed for uid={request_id!r} "
                     f"on instance {old_instance_id!r}: {e!r}. Skipping transfer."
                 )
+                return
+            if not pinned_ok:
+                psrl_logger.warning(
+                    f"[KVTransfer] CPU pin not satisfied on all ranks for uid={request_id!r} "
+                    f"on instance {old_instance_id!r} (per-rank: {pin_results!r}). "
+                    "Skipping transfer; dst will re-prefill."
+                )
+                # Best-effort unpin any ranks that did pin, then bail.
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *self.rollout_wg_list[old_instance_id].execute_all_async(
+                                "kv_unpin", tokens, ["backend"]
+                            )
+                        ),
+                        timeout=5.0,
+                    )
+                except Exception:
+                    pass
                 return
             try:
                 await asyncio.wait_for(_do_transfer(), timeout=timeout_s)
@@ -1180,8 +1239,10 @@ class RolloutRouter:
             finally:
                 try:
                     await asyncio.wait_for(
-                        self.rollout_wg_list[old_instance_id].execute_rank_zero_async(
-                            "kv_unpin", tokens, ["backend"]
+                        asyncio.gather(
+                            *self.rollout_wg_list[old_instance_id].execute_all_async(
+                                "kv_unpin", tokens, ["backend"]
+                            )
                         ),
                         timeout=5.0,
                     )

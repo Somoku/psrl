@@ -584,6 +584,7 @@ class PSRL_RayPPOTrainer:
                 self.gateway_base_url,
                 group_post_process_fn=self.group_post_process_fn,
                 buffer_post_process_fn=self.buffer_post_process_fn,
+                data_processor_handle=self.data_processor,
             )
         )
 

@@ -904,3 +904,4 @@ class PSRL_vLLMRollout:
         if len(request_ids) > 0:
             request_ids = [str(request_id) for request_id in request_ids]
             await self.inference_engine.abort(request_ids)
+

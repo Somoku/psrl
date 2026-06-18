@@ -564,22 +564,27 @@ class PSRL_GenWorker(Worker):
         return await self.kv_cache_manager.transfer_direct(tokens, src, dst, copy)
 
     def kv_set_peer_registry(
-        self, registry: dict[str, str], worker_zmq_url: str | None = None
+        self, registry: dict[str, list[str]], worker_zmq_url: str | None = None
     ) -> None:
         """
         Set the peer registry for direct KV transfer bypass.
 
         Called by `RolloutCoordinator._broadcast_peer_registry()` after P2P init.
-        Enables `kv_transfer_direct()` to bypass the centralized Controller.
+        Enables `kv_transfer_direct()` to bypass the centralized Controller. Forwards
+        this worker's own global rank so the manager can target the destination's
+        same-rank KV shard endpoint.
 
         Args:
-            registry (dict[str, str]): Maps lmcache_instance_id → peer_init_url.
+            registry (dict[str, list[str]]): Maps lmcache_instance_id → rank-sorted
+                list of peer_init_url (index = global rank).
             worker_zmq_url (str | None): ZMQ URL of local LMCacheWorker REP socket.
         """
         assert self.kv_cache_manager is not None, (
             "KVCacheManager not initialized. Call init_model() first."
         )
-        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_url)
+        self.kv_cache_manager.set_peer_registry(
+            registry, worker_zmq_url, self.get_instance_local_rank()
+        )
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
         """

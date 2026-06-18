@@ -306,9 +306,7 @@ class ConversationAgentData(AgentData[ConversationType, object]):
                     self.append_prompt_ids(token_ids)
                 else:
                     self.append_user_tokens(token_ids)
-        return self.trajectory.response_length >= (
-            self.config.gen_actor_rollout_ref.rollout.response_length
-        )
+        return self._is_overlong()
 
     async def update_from_model_token_ids(
         self,
@@ -374,9 +372,7 @@ class ConversationAgentData(AgentData[ConversationType, object]):
             )
             self.get_current_step().model_reward = await self.reward_manager.compute_score.remote(output)
 
-        overlong = self.trajectory.response_length >= (
-            self.config.gen_actor_rollout_ref.rollout.response_length
-        )
+        overlong = self._is_overlong()
         return action, overlong
 
     # --- Abstract hook subclasses must implement ---
@@ -399,6 +395,24 @@ class ConversationAgentData(AgentData[ConversationType, object]):
         raise NotImplementedError
 
     # --- Lifecycle ---
+
+    def _is_overlong(self) -> bool:
+        """
+        Return True when the accumulated context has hit the token budget.
+
+        Each turn feeds `prompt_ids + response_ids` to the engine, so the real
+        cap is `max_model_len = prompt_length + response_length`, not
+        `response_length` alone. Observation tokens are also appended into
+        `response_ids` (mask=0), so gating on `response_length` alone lets the
+        total context grow past `max_model_len` and crash the engine's block
+        table on the next submit. Gate on total context length instead;
+        `finalize_output` still truncates prompt and response to their
+        individual caps when the trajectory is emitted.
+        """
+        rollout = self.config.gen_actor_rollout_ref.rollout
+        max_model_len = rollout.prompt_length + rollout.response_length
+        context_len = len(self.trajectory.prompt_ids) + len(self.trajectory.response_ids)
+        return context_len >= max_model_len
 
     def _max_turns(self) -> int:
         """

@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_perf
-experiment_name=mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=back_mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -127,10 +127,10 @@ enable_overlong_buffer=False
 overlong_buffer_len=$((1024 * 4))
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=32
+train_prompt_bsz=64
 n_resp_per_prompt=8
 n_resp_per_prompt_val=8
-train_prompt_mini_bsz=16
+train_prompt_mini_bsz=32
 
 # --- Sampling ---
 temperature=1.4
@@ -224,7 +224,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=0 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -284,4 +284,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=100 \
     trainer.save_freq=50 \
     trainer.total_epochs=100 \
-    trainer.total_training_steps=10 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=5 2>&1 | tee ${experiment_name}.log

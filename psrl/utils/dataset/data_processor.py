@@ -94,6 +94,16 @@ class DataProcessor:
         self.data_process_thread = None
         self.stop_data_process = False
 
+        # Serializes access to the train dataloader iterator and the per-prompt
+        # registration in `_prepare_and_register_groups`. The busy-loop thread
+        # (`_process_data`) and the on-demand `dispatch_one_more_train_group`
+        # (called from the actor's main thread by AgentLoopManager.notify_group_failed)
+        # both pull from `train_dataloader_iter` and mutate `_train_sample_idx`;
+        # StatefulDataLoader iteration is not thread-safe, so concurrent access
+        # would corrupt iterator state and sample ids. This lock makes the two
+        # producers mutually exclusive.
+        self._dataloader_lock = threading.Lock()
+
         # Build logger
         self.log_prefix = "DataProcessor"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
@@ -351,6 +361,141 @@ class DataProcessor:
             self.data_process_thread.join()
             self.data_process_thread = None
 
+    def _prepare_and_register_groups(self, batch_dict) -> tuple[DataProto, int]:
+        """
+        Assign ids, register a training batch with the reward and PS managers, and
+        build the per-group generation batch.
+
+        This is the per-prompt setup shared by the streaming busy loop (`_process_data`)
+        and the on-demand refill (`dispatch_one_more_train_group`). It performs every
+        step EXCEPT enqueuing into the agent loop manager (`put_data`), so callers can
+        decide how to dispatch the prepared groups.
+
+        Args:
+            batch_dict: A raw collated batch dict from the train dataloader.
+
+        Returns:
+            tuple[DataProto, int]: The generation batch (already repeated `rollout_n`
+                times with child `uid`s assigned) and the number of prompts (groups).
+        """
+        batch_size = len(batch_dict[list(batch_dict.keys())[0]])
+
+        # Generate training sample IDs with cyclic wrapping to avoid overflow.
+        sample_ids = []
+        for i in range(batch_size):
+            sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
+            sample_ids.append(sample_id)
+        self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
+
+        # For Group Sampling, we use `parent_id` to indicate the shared prompt.
+        if self.rollout_n > 1:
+            batch_dict["parent_id"] = np.array(sample_ids)
+        else:
+            batch_dict["uid"] = np.array(sample_ids)
+
+        batch_dict = DataProto.from_single_dict(batch_dict)
+
+        # Pop the keys that are needed for generation to form the generation batch.
+        batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+        non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+        meta_info_keys_to_pop = []
+        if "multi_modal_inputs" in batch_dict.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
+        if "raw_prompt" in batch_dict.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("raw_prompt")
+        if "tools_kwargs" in batch_dict.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("tools_kwargs")
+        if "agent_name" in batch_dict.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("agent_name")
+        if "extra_info" in batch_dict.non_tensor_batch:
+            non_tensor_batch_keys_to_pop.append("extra_info")
+        if self.rollout_n > 1:
+            non_tensor_batch_keys_to_pop.append("parent_id")
+        else:
+            non_tensor_batch_keys_to_pop.append("uid")
+        if "do_sample" in batch_dict.meta_info:
+            meta_info_keys_to_pop.append("do_sample")
+
+        if self.config.psrl.colocate:
+            gen_batch = batch_dict
+        else:
+            gen_batch = batch_dict.pop(
+                batch_keys=batch_keys_to_pop,
+                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+                meta_info_keys=meta_info_keys_to_pop,
+            )
+
+        # Store the other batch fields in the request buffer of the reward manager.
+        # They will be merged with the reward data.
+        log_data_protocol(
+            batch_dict,
+            psrl_logger,
+            self.log_prefix + " before adding request data to ps manager",
+            level=logging.DEBUG,
+        )
+        ray.get(
+            self.reward_manager_handle.add_requests.remote(
+                {sample_ids[i]: batch_dict[i : i + 1] for i in range(batch_size)}
+            )
+        )
+
+        # We manually repeat prompts in the generation batch for Group Sampling.
+        # Requests in the batch are unique during generation and synchronized through parent tracker.
+        psrl_logger.debug(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
+        if self.rollout_n > 1:
+            gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
+            uid_list = []
+            for i in range(batch_size):
+                for j in range(self.rollout_n):
+                    child_id = sample_ids[i] * self.rollout_n + j
+                    uid_list.append(child_id)
+            gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
+
+        # Record the request status in the PS manager for each group.
+        for i in range(batch_size):
+            ray.get(
+                self.ps_manager_handle.add_request.remote(
+                    gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
+                )
+            )
+
+        return gen_batch, batch_size
+
+    def dispatch_one_more_train_group(self) -> DataProto | None:
+        """
+        Fetch ONE fresh prompt from the dataset and return it as a registered group.
+
+        Used by `AgentLoopManager.notify_group_failed` to refill a staleness-buffer
+        slot vacated by a failed trajectory AFTER the streaming busy loop has already
+        sent its END signal (so the pre-dispatch queue is empty). Unlike the busy
+        loop, this does NOT enqueue via `put_data`; it returns the fully-registered
+        one-group generation batch so the caller can dispatch it directly.
+
+        Returns:
+            DataProto | None: A one-group generation batch (`rollout_n` rows, reward
+                and PS managers already updated), or None if the dataset/epochs are
+                exhausted and no fresh prompt is available.
+        """
+        assert self.reward_manager_handle is not None, (
+            "Reward manager handle is not set. Call set_reward_manager() first."
+        )
+        # Hold the dataloader lock across BOTH the fetch and the registration so the
+        # busy-loop thread cannot interleave a `next()`/`_train_sample_idx` mutation
+        # between them and corrupt iterator/id state.
+        with self._dataloader_lock:
+            try:
+                batch_dict = self.get_train_next()
+            except StopIteration:
+                psrl_logger.info(
+                    "dispatch_one_more_train_group: dataset exhausted, no fresh prompt available."
+                )
+                return None
+
+            # Take exactly one prompt so we refill exactly one group, never over-provisioning.
+            one_prompt = {k: v[0:1] for k, v in batch_dict.items()}
+            gen_batch, _ = self._prepare_and_register_groups(one_prompt)
+        return gen_batch
+
     def _process_data(self):
         """
         Process the training data in a busy loop.
@@ -375,88 +520,16 @@ class DataProcessor:
         # loop until all epochs are processed
         while not self.stop_data_process:
             try:
-                batch_dict = next(self.train_dataloader_iter)
-                batch_size = len(batch_dict[list(batch_dict.keys())[0]])
+                # Acquire the dataloader lock only for the fetch + registration (which
+                # advance the iterator and `_train_sample_idx`); release it before the
+                # potentially slow `put_data` RPC loop so an on-demand
+                # `dispatch_one_more_train_group` is not blocked longer than necessary.
+                with self._dataloader_lock:
+                    batch_dict = next(self.train_dataloader_iter)
+                    gen_batch, batch_size = self._prepare_and_register_groups(batch_dict)
 
-                # Generate training sample IDs with cyclic wrapping to avoid overflow
-                sample_ids = []
+                # Put group-level requests to the data queue.
                 for i in range(batch_size):
-                    sample_id = (self._train_sample_idx + i) % self.MAX_TRAIN_ID
-                    sample_ids.append(sample_id)
-                self._train_sample_idx = (self._train_sample_idx + batch_size) % self.MAX_TRAIN_ID
-
-                # For Group Sampling, we use `parent_id` to indicate the shared prompt.
-                if self.rollout_n > 1:
-                    batch_dict["parent_id"] = np.array(sample_ids)
-                else:
-                    batch_dict["uid"] = np.array(sample_ids)
-
-                batch_dict = DataProto.from_single_dict(batch_dict)
-
-                # Pop the keys that are needed for generation to form the generation batch.
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                meta_info_keys_to_pop = []
-                if "multi_modal_inputs" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.extend(["multi_modal_data", "multi_modal_inputs"])
-                if "raw_prompt" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "agent_name" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("agent_name")
-                if "extra_info" in batch_dict.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("extra_info")
-                if self.rollout_n > 1:
-                    non_tensor_batch_keys_to_pop.append("parent_id")
-                else:
-                    non_tensor_batch_keys_to_pop.append("uid")
-                if "do_sample" in batch_dict.meta_info:
-                    meta_info_keys_to_pop.append("do_sample")
-
-                if self.config.psrl.colocate:
-                    gen_batch = batch_dict
-                else:
-                    gen_batch = batch_dict.pop(
-                        batch_keys=batch_keys_to_pop,
-                        non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                        meta_info_keys=meta_info_keys_to_pop,
-                    )
-
-                # Store the other batch fields in the request buffer of the reward manager
-                # They will be merged with the reward data.
-                log_data_protocol(
-                    batch_dict,
-                    psrl_logger,
-                    self.log_prefix + " before adding request data to ps manager",
-                    level=logging.DEBUG,
-                )
-                ray.get(
-                    self.reward_manager_handle.add_requests.remote(
-                        {sample_ids[i]: batch_dict[i : i + 1] for i in range(batch_size)}
-                    )
-                )
-
-                # We manually repeat prompts in the generation batch for Group Sampling.
-                # Requests in the batch are unique during generation and synchronized through parent tracker.
-                psrl_logger.debug(f"Generating {batch_size} requests with rollout n {self.rollout_n}")
-                if self.rollout_n > 1:
-                    gen_batch = gen_batch.repeat(repeat_times=self.rollout_n, interleave=True)
-                    uid_list = []
-                    for i in range(batch_size):
-                        for j in range(self.rollout_n):
-                            child_id = sample_ids[i] * self.rollout_n + j
-                            uid_list.append(child_id)
-                    gen_batch.non_tensor_batch["uid"] = np.array(uid_list)
-
-                # Record the request status in the request status manager and put the batch into the data queue.
-                # Put group-level requests to data queue
-                for i in range(batch_size):
-                    ray.get(
-                        self.ps_manager_handle.add_request.remote(
-                            gen_batch.non_tensor_batch["uid"][i * self.rollout_n : (i + 1) * self.rollout_n].tolist(),
-                        )
-                    )
                     ray.get(
                         self.agent_loop_manager_handle.put_data.remote(
                             gen_batch[i * self.rollout_n : (i + 1) * self.rollout_n]
@@ -475,7 +548,10 @@ class DataProcessor:
                     self.stop_data_process = True
                 else:
                     psrl_logger.debug("Reinitializing train_dataloader_iter for next epoch")
-                    self.train_dataloader_iter = iter(self.train_dataloader)
+                    # Reinit under the lock: the on-demand fetch also reads/advances
+                    # this iterator, so the swap must not race with it.
+                    with self._dataloader_lock:
+                        self.train_dataloader_iter = iter(self.train_dataloader)
             except Exception as e:
                 psrl_logger.error(f"Exception in data processing thread: {e}", exc_info=True)
 

@@ -22,7 +22,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RolloutCoordinator(CommandExtension):
-    DEFAULT_AWAIT_TIMEOUT_S = 1200
+    DEFAULT_AWAIT_TIMEOUT_S = 3600
 
     def __init__(
         self,
@@ -886,10 +886,13 @@ class RolloutCoordinator(CommandExtension):
         wg_list, _ = self._get_wgs("all")
         num_instances = len(wg_list)
 
-        # Build peer registry: instance_id → peer_init_url
-        # Also collect each instance's own worker ZMQ URL (ip:port) for direct cmd dispatch.
-        peer_registry: dict[str, str] = {}
-        worker_zmq_urls: dict[int, str] = {}  # instance_index → worker zmq url
+        # Build peer registry: instance_id → per-rank list of peer_init_url (index = global
+        # rank). KV is sharded per rank (TP heads, PP layers), so direct transfer must pair
+        # source rank r with destination rank r. `query_worker_info` returns worker_infos
+        # sorted by worker_id (== global rank), so list index is the rank.
+        peer_registry: dict[str, list[str]] = {}
+        # instance_index → per-rank list of worker ZMQ url (ip:port of each rank's REP socket).
+        per_instance_worker_zmq_urls: dict[int, list[str]] = {}
 
         for i in range(num_instances):
             instance_id = f"psrl_instance_{i}"
@@ -902,36 +905,45 @@ class RolloutCoordinator(CommandExtension):
                 f"[LMCache] query_worker_info returned empty for {instance_id!r}. "
                 f"Workers may not have registered yet. resp={resp!r}"
             )
-            worker_info = resp["worker_infos"][0]
-            peer_init_url = worker_info.get("peer_init_url", "")
-            if peer_init_url:
-                peer_registry[instance_id] = peer_init_url
-            # Worker ZMQ URL = ip:port (the Worker's REP socket for commands).
-            worker_ip = worker_info.get("ip", "")
-            worker_port = worker_info.get("port", 0)
-            if worker_ip and worker_port:
-                worker_zmq_urls[i] = f"{worker_ip}:{worker_port}"
+            infos = resp["worker_infos"]
+            ws = wg_list[i].world_size
+            assert len(infos) == ws, (
+                f"[LMCache] Instance {instance_id!r} reported {len(infos)} workers "
+                f"but world_size is {ws}. Expected one LMCacheWorker per rank."
+            )
+            # Rank-sorted lists; an empty entry means that rank has no P2P endpoint, which
+            # the per-transfer same-rank guard in KVCacheManager handles gracefully.
+            peer_registry[instance_id] = [
+                wi.get("peer_init_url", "") for wi in infos
+            ]
+            per_instance_worker_zmq_urls[i] = [
+                f"{wi.get('ip', '')}:{wi.get('port', 0)}" for wi in infos
+            ]
 
         assert peer_registry, (
             "[LMCache] Peer registry is empty after querying Controller. "
             "No instances have peer_init_url — P2P is not configured correctly."
         )
 
-        # Broadcast to each GenWorker with instance-specific worker_zmq_url.
+        # Broadcast to ALL ranks of each instance, giving each rank the full registry plus
+        # its own rank-local worker ZMQ url. Passing length-world_size lists makes
+        # execute_all_async split per-rank: rank r receives (peer_registry, zmq_url_r).
         futures = []
         for i in range(num_instances):
-            zmq_url = worker_zmq_urls.get(i)
-            futures.append(
-                wg_list[i].execute_rank_zero_async(
-                    "kv_set_peer_registry", peer_registry, zmq_url
+            ws = wg_list[i].world_size
+            futures.extend(
+                wg_list[i].execute_all_async(
+                    "kv_set_peer_registry",
+                    [peer_registry] * ws,
+                    per_instance_worker_zmq_urls[i],
                 )
             )
         await asyncio.gather(*futures)
 
+        total_ranks = sum(len(v) for v in per_instance_worker_zmq_urls.values())
         psrl_logger.info(
-            f"[LMCache] Peer registry broadcast to {num_instances} instances: "
-            f"{len(peer_registry)} peers, "
-            f"{len(worker_zmq_urls)} workers with ZMQ URLs."
+            f"[LMCache] Peer registry broadcast to {num_instances} instances "
+            f"({total_ranks} ranks total): {len(peer_registry)} instances with peers."
         )
 
     def start_lmcache_controller(self) -> str:

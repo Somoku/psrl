@@ -174,6 +174,15 @@ def _qwen2_5_vl_layout(model: Any) -> WeightLayoutPlan:
     builder.mount_plan("visual", visual_builder.build())
     return builder.build()
 
+def _qwen3_5_vl_layout(model: Any) -> WeightLayoutPlan:
+    builder = WeightLayoutBuilder(model)
+    builder.name_map(_vl_name_map())
+    builder.mount_module("language_model", model.language_model)
+    # TODO(linsh): Visual tensors may be CPU-resident?
+    builder.exclude_substr("visual")
+    # exclude defensively in case class hierarchy changes.
+    builder.exclude_substr("mtp")
+    return builder.build()
 
 def _qwen3_5_layout(model: Any) -> WeightLayoutPlan:
     builder = WeightLayoutBuilder(model)
@@ -242,6 +251,7 @@ _LAYOUTS: dict[str, LayoutBuilder] = {
     "qwen2_vl.Qwen2VLForConditionalGeneration": _qwen2_vl_layout,
     "qwen3.Qwen3ForCausalLM": _dense_layout,
     "qwen3_5.Qwen3_5ForCausalLMBase": _qwen3_5_layout,
+    "qwen3_5.Qwen3_5ForConditionalGeneration": _qwen3_5_vl_layout,
     "qwen3_moe.Qwen3MoeModel": _moe_layout,
     "qwen3_moe.Qwen3MoeForCausalLM": _moe_layout,
     "qwen3_vl.Qwen3VLForConditionalGeneration": _qwen_vl_layout,

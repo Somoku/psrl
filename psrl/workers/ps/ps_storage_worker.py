@@ -14,7 +14,10 @@ from verl.utils.fs import copy_to_local
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
 from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.hf_converter import convert_hf_inplace
+from psrl.utils.converter.hf_converter import (
+    convert_hf_inplace,
+    maybe_convert_to_smaller_parts,
+)
 from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.nixl import (
     NIXLClientType,
@@ -506,8 +509,8 @@ class PSStorageWorker:
             psrl_logger.info(f"[preload_checkpoint_to_cpu] broadcast_init enabled, rank {self.rank} skips disk read.")
             return
 
-        assert hasattr(self, "_tied_weights_alias_map"), (
-            "preload_checkpoint_to_cpu: _tied_weights_alias_map not found — "
+        assert hasattr(self, "_tied_weights_alias_map") and hasattr(self, "model_info"), (
+            "preload_checkpoint_to_cpu: _tied_weights_alias_map / model_info not found — "
             "init_model() must be called before this method."
         )
 
@@ -521,7 +524,10 @@ class PSStorageWorker:
             psrl_logger.debug(f"[preload_checkpoint_to_cpu] Opening shard {shard_file}.")
             with safe_open(shard_file, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    cache[key] = f.get_tensor(key)
+                    for split_key, split_tensor in maybe_convert_to_smaller_parts(
+                        self.model_info, key, f.get_tensor(key)
+                    ).items():
+                        cache[split_key] = split_tensor
 
         # Expand tied-weight aliases so phase 2 can do a direct key lookup.
         alias_count = 0

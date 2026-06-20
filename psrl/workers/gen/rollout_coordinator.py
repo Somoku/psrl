@@ -428,6 +428,22 @@ class RolloutCoordinator(CommandExtension):
         futures = [server_handle.pull_model.remote() for server_handle in self._tag_to_server(tag)]
         await asyncio.gather(*futures)
         psrl_logger.info(f"Initial PS pull complete for {len(futures)} replicas with tag {tag}.")
+        # Sync version tracking after the pull.  At this point ps_model_version has
+        # already been set correctly by the PS manager:
+        #   - fresh training: 0 (default)
+        #   - resume training: the checkpoint step
+        pulled_replica_ids = self.replica_ids if tag == "all" else self.tag_to_replica_ids[tag]
+        pulled_instance_ids = [inst_id for inst_id in self.instance_ids if inst_id[0] in pulled_replica_ids]
+        for instance_id in pulled_instance_ids:
+            self.instance_to_model_version[instance_id] = self.ps_model_version
+            self.instance_to_version_after_sync[instance_id] = self.ps_model_version
+        if self.use_rust_gateway and pulled_instance_ids:
+            updates = build_weight_version_updates(pulled_instance_ids, self.ps_model_version)
+            await self._publish_weight_version_updates(updates)
+            psrl_logger.info(
+                f"Published initial weight version {self.ps_model_version} to gateway "
+                f"for {len(pulled_instance_ids)} instances with tag '{tag}'."
+            )
 
     async def sleep(self, tag: str = "all"):
         """Make rollout instances sleep and release GPU memory.
@@ -1136,7 +1152,8 @@ class RolloutCoordinator(CommandExtension):
                     f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
                 )
 
-            await self.rollout_router.resume_routing.remote()
+            if not self.use_rust_gateway:
+                await self.rollout_router.resume_routing.remote()
             psrl_logger.info("Resumed routing after synchronization")
 
     async def check_no_activate_tasks(self, instance_id: RolloutInstanceId) -> bool:

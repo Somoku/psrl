@@ -37,9 +37,6 @@ FLASH_ATTENTION_FORCE_CXX11_ABI="FALSE" \
 FLASH_ATTENTION_SKIP_CUDA_BUILD="FALSE" \
 python -m uv pip install -U "flash-attn==2.8.1" --no-build-isolation --no-deps
 
-# Install flashinfer-python
-python -m uv pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.5.3"
-
 echo "5. Install apex"
 mkdir -p apex_src
 pushd apex_src
@@ -124,5 +121,17 @@ bash "$PSRL_PATH/patch/apply_patch.sh" transfer_queue
 
 echo "9. Install torch_memory_saver"
 python -m uv pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@d64a6394d1e09c613fab90260054cecc2684586d --no-cache-dir --force-reinstall
+
+echo "10. Install flashinfer"
+mkdir -p flashinfer_src
+pushd flashinfer_src
+git clone https://github.com/flashinfer-ai/flashinfer.git --recursive --branch v0.6.11.post3
+cd flashinfer
+python -m uv pip install -v .
+cd flashinfer-cubin
+python -m build --no-isolation --wheel
+python -m uv pip install dist/*.whl
+popd
+rm -rf flashinfer_src
 
 echo "Successfully installed all basic packages"

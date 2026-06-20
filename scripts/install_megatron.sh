@@ -59,7 +59,7 @@ echo "Notice: TransformerEngine installation can take a long time, please be pat
 NVTE_FRAMEWORK=pytorch python -m pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
 
 echo "3. Install Megatron"
-python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@d23ca85 --no-deps --no-build-isolation
+python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@c049020 --no-deps --no-build-isolation
 
 echo "4. Install Megatron-Bridge"
 pushd $THIRD_PARTY_PATH

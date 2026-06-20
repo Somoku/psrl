@@ -422,6 +422,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "compilation_config": compilation_config,
             # AGENT(VERL): thread runner/task through for pooling model support in PSRL
             "runner": self.config.get("runner", "generate"),
+            # NOTE(linsh): disable async scheduling for performance
+            "no_async_scheduling": True,
             **engine_kwargs,
         }
 
@@ -583,7 +585,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # AGENT(VERL): apply stat logger patch for PSRL
         # NOTE(linsh): enable custom stat collection for PSRL
-        self.preemption_queue: asyncio.Queue = asyncio.Queue()
+        self.preemption_queue: asyncio.Queue = asyncio.Queue(maxsize=0)
         self.psrl_preemption_logger = PreemptionStatLogger(
             vllm_config,
             engine_index=0,
@@ -600,10 +602,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             _endpoint = self.gen_interface.status_endpoint or ""
             self.status_queue = ZMQPushQueue(_endpoint)
             self.stat_collector.init_output_queue(self.status_queue)
-            import queue as _queue
+            if self.kv_cache_manager is not None:
+                import queue as _queue
 
-            self.kv_cache_hash_queue: _queue.SimpleQueue = _queue.SimpleQueue()
-            self.stat_collector.init_kv_cache_hash_queue(self.kv_cache_hash_queue)
+                self.kv_cache_hash_queue: _queue.SimpleQueue = _queue.SimpleQueue()
+                self.stat_collector.init_kv_cache_hash_queue(self.kv_cache_hash_queue)
             for data_parallel_rank in range(self.config.data_parallel_size):
                 self.stat_collector.record_model_version_update(0, data_parallel_rank)
             kwargs["stat_loggers"] = [self.stat_collector, self.psrl_preemption_logger]

@@ -23,12 +23,18 @@ name: vllm
 # Async mode in PSRL
 mode: psrl_async
 
+# logprobs mode for rollout logprobs
+logprobs_mode: raw_logprobs
+
 # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
 load_format: dummy
 
 # Whether disable attention for profiling.
 disable_attn: ${oc.select:psrl.profile.disable_attn,False}
+
+# disable logging statistics
+disable_log_stats: false
 
 # max length of sequences
 max_num_seqs: ${oc.select:psrl.routing_strategy.max_concurrent_seqs_per_instance,1024}

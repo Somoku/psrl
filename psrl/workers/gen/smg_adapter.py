@@ -67,6 +67,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         routing_loop_multi_priority_queue=bool(
             cfg_get(config, "psrl.routing_strategy.enable_multi_priority_queue", False)
         ),
+        routing_loop_dispatch_batch_size=1,
         worker_selection_strategy="psrl",
         psrl_ps_manager_addr=ps_manager_addr,
         psrl_enable_mig_strategy=bool(cfg_get(config, "psrl.sync_and_mig_strategy.mig.enable", False)),

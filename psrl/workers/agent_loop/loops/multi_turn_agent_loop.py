@@ -112,7 +112,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
             # check redundant padding in single-request case
             output = await self.generate_sequence(
                 self.agent_data.prepare_generation_request(request),
-                is_sticky_session=self.config.psrl.agentic_rl.sticky_session,
+                is_sticky_session=self.config.psrl.routing_strategy.enable_trajectory_sticky,
             )
 
             if output is None:
@@ -125,10 +125,11 @@ class MultiTurnAgentLoop(AgentLoopBase):
                 return await self.agent_data.finalize_output(), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             try:
-                env_step_output = await asyncio.wait_for(
-                    self.env.step(action),
-                    timeout=self.env_step_timeout,
-                )
+                with self.timer.env():
+                    env_step_output = await asyncio.wait_for(
+                        self.env.step(action),
+                        timeout=self.env_step_timeout,
+                    )
                 observation = env_step_output["observation"]
                 reward = env_step_output["reward"]
                 done = env_step_output["done"]

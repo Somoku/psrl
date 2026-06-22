@@ -45,18 +45,24 @@ class KVCacheManager:
         # via set_controller_url(). Until that call, transfer() will assert-fail.
         self._controller_url: str | None = None
 
-        # Direct transfer bypass: peer registry maps lmcache_instance_id → peer_init_url.
-        # Populated by set_peer_registry() after P2P init. When available, transfer_direct()
-        # sends MoveWorkerMsg directly to the local LMCacheWorker via ZMQ, bypassing the
-        # Controller HTTP round-trip.
-        self.peer_registry: dict[str, str] = {}
-        # Worker ZMQ URL for direct command dispatch (ip:port of local LMCacheWorker REP socket).
-        self._worker_zmq_url: str | None = None
-        # Async ZMQ socket for direct transfer (created lazily on first use).
-        self._direct_zmq_socket = None
+        # Direct transfer bypass: peer registry maps lmcache_instance_id → per-rank
+        # peer_init_url list, indexed by global rank (list[rank] = that rank's NIXL
+        # endpoint). Populated by set_peer_registry() after P2P init. KV is sharded
+        # per rank (TP heads, PP layers), so transfer_direct() moves each local rank's
+        # shard to the destination's same-rank endpoint, bypassing the Controller
+        # HTTP round-trip.
+        self.peer_registry: dict[str, list[str]] = {}
+        # This replica's local LMCacheWorker REP-socket URLs, indexed by local rank
+        # (one per vLLM worker / kv worker owned by this server actor).
+        self._worker_zmq_urls: list[str] = []
+        # Async ZMQ REQ sockets for direct transfer, keyed by local rank (created
+        # lazily on first use). One socket per rank because each rank talks to its
+        # own LMCacheWorker.
+        self._direct_zmq_sockets: dict[int, object] = {}
         self._direct_zmq_context = None
-        # Lock to serialize ZMQ REQ send/recv pairs (REQ pattern requires strict alternation).
-        self._direct_zmq_lock = asyncio.Lock()
+        # Per-rank locks to serialize ZMQ REQ send/recv pairs (REQ pattern requires
+        # strict per-socket alternation); separate locks let ranks transfer in parallel.
+        self._direct_zmq_locks: dict[int, asyncio.Lock] = {}
 
         # Push-based GPU prefix cache snapshot (updated by GenWorker background task).
         # The EngineCore pushes the hash set to a queue every ~100ms; the GenWorker
@@ -165,36 +171,46 @@ class KVCacheManager:
         self._controller_url = controller_url
         psrl_logger.info(f"[LMCache] Controller URL set to {self._controller_url!r}.")
 
-    def set_peer_registry(self, registry: dict[str, str], worker_zmq_url: str | None = None) -> None:
+    def set_peer_registry(
+        self,
+        registry: dict[str, list[str]],
+        worker_zmq_urls: list[str] | None = None,
+    ) -> None:
         """
-        Set the peer registry and local worker ZMQ URL for direct transfer bypass.
+        Set the peer registry and local worker ZMQ URLs for direct transfer bypass.
 
-        Maps each LMCache instance_id to its peer_init_url (NIXL endpoint).
-        When populated along with `worker_zmq_url`, `transfer_direct()` sends
-        MoveWorkerMsg directly to the local LMCacheWorker via ZMQ, bypassing
-        the Controller HTTP round-trip entirely.
+        Maps each LMCache instance_id to its per-rank list of peer_init_url (NIXL
+        endpoints), indexed by global rank. When populated along with
+        `worker_zmq_urls`, `transfer_direct()` sends one MoveWorkerMsg per local
+        rank directly to that rank's LMCacheWorker via ZMQ, bypassing the Controller
+        HTTP round-trip. Because KV is sharded per rank (TP heads, PP layers), each
+        local rank targets the destination's same-rank endpoint.
 
-        Called by `PSRL_GenWorker.kv_set_peer_registry()` after
+        Called by `PSRL_vLLMHttpServer.kv_set_peer_registry()` after
         `RolloutCoordinator._broadcast_peer_registry()` completes.
 
         Args:
-            registry (dict[str, str]): Maps lmcache_instance_id (e.g.
-                "psrl_instance_0") to peer_init_url (e.g. "10.0.0.1:18200").
-            worker_zmq_url (str | None): ZMQ REP URL of the local LMCacheWorker
-                (e.g. "10.0.0.1:18100"). If None, direct transfer falls back to
-                Controller HTTP path.
+            registry (dict[str, list[str]]): Maps lmcache_instance_id (e.g.
+                "psrl_instance_0") to a rank-sorted list of peer_init_url
+                (e.g. ["10.0.0.1:18200", "10.0.0.1:18201"]).
+            worker_zmq_urls (list[str] | None): Rank-sorted ZMQ REP URLs of this
+                replica's local LMCacheWorkers (e.g. ["10.0.0.1:18100", ...]).
+                Supplied only by the authoritative broadcast/init path; when None
+                (e.g. the per-request servicer seed), this replica's own URLs and
+                live sockets are left untouched.
         """
-        self.peer_registry = registry
-        self._worker_zmq_url = worker_zmq_url
-        # Reset ZMQ socket so it reconnects with new URL on next use.
-        if self._direct_zmq_socket is not None:
-            try:
-                self._direct_zmq_socket.close(linger=0)
-            except Exception:
-                pass
-            self._direct_zmq_socket = None
+        # Merge so the authoritative broadcast (full peer set) and an incremental
+        # per-request seed (single instance) compose without clobbering each other.
+        self.peer_registry.update(registry)
+        if worker_zmq_urls is not None:
+            # Only the broadcast/init path supplies this replica's own worker URLs.
+            # Reset sockets here (not on the per-request seed path, which is hot) so
+            # they reconnect with the new URLs on next use.
+            self._worker_zmq_urls = worker_zmq_urls
+            self._reset_all_zmq_sockets()
         psrl_logger.info(
-            f"[LMCache] Peer registry set with {len(registry)} entries, worker_zmq_url={worker_zmq_url!r}."
+            f"[LMCache] Peer registry updated ({len(registry)} entries this call, "
+            f"{len(self.peer_registry)} total), worker_zmq_urls={self._worker_zmq_urls!r}."
         )
 
     # --- Push-based GPU prefix cache snapshot methods ---
@@ -719,8 +735,10 @@ class KVCacheManager:
         - Controller single-process GIL bottleneck under burst
         - Controller event loop contention
 
-        Each GenWorker sends to its OWN Worker, so N instances under burst have
-        zero contention (fully parallel). Falls back to Controller path on failure.
+        Each replica's manager sends to its OWN per-rank Workers, so N instances
+        under burst have zero cross-instance contention. KV is sharded per rank, so
+        this fans out one MoveWorkerMsg per local rank, each moving that rank's shard
+        to the destination's same-rank endpoint. Falls back to re-prefill on failure.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
@@ -729,7 +747,7 @@ class KVCacheManager:
             copy (bool): If True, keep the data at `src` as well.
 
         Returns:
-            bool: True if the transfer succeeded.
+            bool: True if every local rank moved >0 tokens.
         """
         self._assert_engine()
         assert tokens, "tokens must be a non-empty list."
@@ -741,48 +759,77 @@ class KVCacheManager:
         assert self.peer_registry, (
             "[LMCache] transfer_direct() called but peer_registry is empty. Call set_peer_registry() after P2P init."
         )
-        assert self._worker_zmq_url, (
-            "[LMCache] transfer_direct() called but worker_zmq_url is not set. "
-            "Call set_peer_registry(registry, worker_zmq_url) after P2P init."
+        assert self._worker_zmq_urls, (
+            "[LMCache] transfer_direct() called but worker_zmq_urls is not set. "
+            "Call set_peer_registry(registry, worker_zmq_urls) after P2P init."
         )
 
         dst_instance_id = dst[0]
-        dst_peer_init_url = self.peer_registry.get(dst_instance_id)
-        assert dst_peer_init_url, (
-            f"[LMCache] No peer_init_url for {dst_instance_id!r} in registry. "
-            f"Available: {list(self.peer_registry.keys())!r}"
-        )
+        dst_urls = self.peer_registry.get(dst_instance_id)
+        # Same-rank pairing: local rank r moves its KV shard to the destination's
+        # rank r endpoint. Both this replica's worker_zmq_urls and dst_urls are
+        # rank-sorted (worker_id == global rank), so index r lines up. This is
+        # correct only for homogeneous layouts where src and dst share TP/PP (equal
+        # world_size). Heterogeneous layouts would need head/layer re-sharding, which
+        # LMCache cannot do; there the destination simply re-prefills, so skip.
+        num_ranks = len(self._worker_zmq_urls)
+        if not dst_urls or len(dst_urls) != num_ranks:
+            psrl_logger.warning(
+                f"[LMCache] Destination {dst_instance_id!r} has "
+                f"{0 if not dst_urls else len(dst_urls)} ranks but this replica has "
+                f"{num_ranks}; likely heterogeneous TP/PP layout. Skipping direct "
+                "transfer, destination will re-prefill."
+            )
+            return False
 
-        num_tokens = await self._send_move_worker_msg(
-            tokens=tokens,
-            old_position=src[1],  # backend location string
-            new_position=(dst_peer_init_url, dst[1]),
-            copy=copy,
-        )
-        if num_tokens > 0:
+        # Fan out one MoveWorkerMsg per local rank, each to its own LMCacheWorker.
+        async def _move_rank(rank: int) -> int:
+            dst_peer_init_url = dst_urls[rank]
+            if not dst_peer_init_url:
+                psrl_logger.warning(
+                    f"[LMCache] No same-rank peer_init_url for {dst_instance_id!r} "
+                    f"rank {rank}; skipping that rank's shard."
+                )
+                return 0
+            return await self._send_move_worker_msg(
+                rank=rank,
+                tokens=tokens,
+                old_position=src[1],  # backend location string
+                new_position=(dst_peer_init_url, dst[1]),
+                copy=copy,
+            )
+
+        per_rank_tokens = await asyncio.gather(*[_move_rank(r) for r in range(num_ranks)])
+        all_moved = all(n > 0 for n in per_rank_tokens)
+        if all_moved:
             psrl_logger.debug(
-                f"[LMCache] Direct transfer succeeded: {num_tokens} tokens moved from {src!r} to {dst!r}."
+                f"[LMCache] Direct transfer succeeded on all {num_ranks} ranks "
+                f"from {src!r} to {dst!r} (per-rank tokens: {per_rank_tokens!r})."
             )
         else:
             psrl_logger.info(
-                f"[LMCache] Direct transfer returned 0 tokens for {src!r} → {dst!r}. Source may not have cached data."
+                f"[LMCache] Direct transfer moved 0 tokens on some rank for "
+                f"{src!r} → {dst!r} (per-rank: {per_rank_tokens!r}). Source may have "
+                "evicted or layout mismatch; destination will re-prefill."
             )
-        return num_tokens > 0
+        return all_moved
 
     async def _send_move_worker_msg(
         self,
+        rank: int,
         tokens: list[int],
         old_position: str,
         new_position: tuple[str, str],
         copy: bool,
     ) -> int:
         """
-        Construct and send MoveWorkerMsg directly to the local LMCacheWorker via ZMQ.
+        Construct and send MoveWorkerMsg directly to one local LMCacheWorker via ZMQ.
 
         Replicates what LMCacheClusterExecutor.move() does (executor.py:281-350)
         but without the Controller intermediary. Uses async ZMQ for non-blocking I/O.
 
         Args:
+            rank: Local rank whose LMCacheWorker (and dedicated ZMQ socket) to use.
             tokens: Full token sequence.
             old_position: Source backend location (e.g. "LocalCPUBackend").
             new_position: Tuple of (dst_peer_init_url, dst_backend_location).
@@ -796,8 +843,6 @@ class KVCacheManager:
             Msg,
         )
 
-        socket = self._get_or_create_zmq_socket()
-
         worker_event_id = f"DirectMove_{uuid.uuid4().hex[:8]}"
         msg = MoveWorkerMsg(
             worker_event_id=worker_event_id,
@@ -808,10 +853,21 @@ class KVCacheManager:
         )
 
         serialized_msg = msgspec.msgpack.encode(msg)
-        # ZMQ REQ socket requires strict send→recv alternation; lock serializes concurrent calls.
-        async with self._direct_zmq_lock:
-            await socket.send(serialized_msg)
-            serialized_resp = await socket.recv()
+        lock = self._direct_zmq_locks.setdefault(rank, asyncio.Lock())
+        # ZMQ REQ socket requires strict send→recv alternation; the per-rank lock
+        # serializes concurrent calls to the same socket.
+        async with lock:
+            socket = self._get_or_create_zmq_socket(rank)
+            try:
+                await socket.send(serialized_msg)
+                serialized_resp = await socket.recv()
+            except Exception:
+                # A REQ socket that fails mid send→recv (e.g. RCVTIMEO fires) is
+                # stuck in a bad EFSM state: every subsequent send() raises until
+                # the socket is rebuilt. Reset it here so the next call reconnects,
+                # otherwise one timeout cascades into a burst of transfer failures.
+                self._reset_zmq_socket(rank)
+                raise
         resp = msgspec.msgpack.decode(serialized_resp, type=Msg)
 
         if hasattr(resp, "num_tokens"):
@@ -820,26 +876,74 @@ class KVCacheManager:
             psrl_logger.warning(f"[LMCache] Unexpected response type from Worker: {type(resp).__name__}")
             return 0
 
-    def _get_or_create_zmq_socket(self):
+    def _get_or_create_zmq_socket(self, rank: int):
         """
-        Get or lazily create an async ZMQ REQ socket connected to the local Worker.
+        Get or lazily create the async ZMQ REQ socket for a given local rank.
+
+        Args:
+            rank (int): Local rank whose LMCacheWorker REP socket to connect to.
 
         Returns:
-            zmq.asyncio.Socket: Connected ZMQ REQ socket.
+            zmq.asyncio.Socket: Connected ZMQ REQ socket for `rank`.
         """
-        if self._direct_zmq_socket is None:
+        socket = self._direct_zmq_sockets.get(rank)
+        if socket is None:
             import zmq
             import zmq.asyncio
 
-            assert self._worker_zmq_url is not None
-            self._direct_zmq_context = zmq.asyncio.Context()
-            self._direct_zmq_socket = self._direct_zmq_context.socket(zmq.REQ)
-            self._direct_zmq_socket.connect(f"tcp://{self._worker_zmq_url}")
+            assert 0 <= rank < len(self._worker_zmq_urls), (
+                f"[LMCache] rank {rank} out of range for {len(self._worker_zmq_urls)} worker zmq urls."
+            )
+            worker_zmq_url = self._worker_zmq_urls[rank]
+            if self._direct_zmq_context is None:
+                self._direct_zmq_context = zmq.asyncio.Context()
+            socket = self._direct_zmq_context.socket(zmq.REQ)
+            socket.connect(f"tcp://{worker_zmq_url}")
             # Set send/recv timeout to avoid hanging indefinitely.
-            self._direct_zmq_socket.setsockopt(zmq.SNDTIMEO, 10000)  # 10s
-            self._direct_zmq_socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
-            psrl_logger.info(f"[LMCache] Direct ZMQ socket connected to {self._worker_zmq_url}.")
-        return self._direct_zmq_socket
+            socket.setsockopt(zmq.SNDTIMEO, 10000)  # 10s
+            socket.setsockopt(zmq.RCVTIMEO, 30000)  # 30s
+            self._direct_zmq_sockets[rank] = socket
+            psrl_logger.info(f"[LMCache] Direct ZMQ socket connected to {worker_zmq_url} (rank {rank}).")
+        return socket
+
+    def _reset_zmq_socket(self, rank: int) -> None:
+        """
+        Close and discard one rank's direct ZMQ socket so the next call rebuilds it.
+
+        Called after a send/recv failure on the REQ socket. A REQ socket that
+        raised mid send→recv is stuck in a bad EFSM state and cannot be reused;
+        dropping it here lets `_get_or_create_zmq_socket` reconnect cleanly.
+
+        Caller must hold that rank's `_direct_zmq_locks[rank]`.
+
+        Args:
+            rank (int): Local rank whose socket to reset.
+        """
+        socket = self._direct_zmq_sockets.pop(rank, None)
+        if socket is not None:
+            try:
+                socket.close(linger=0)
+            except Exception:
+                pass
+            psrl_logger.warning(
+                f"[LMCache] Direct ZMQ socket for rank {rank} reset after transfer "
+                "failure; will reconnect on next transfer."
+            )
+
+    def _reset_all_zmq_sockets(self) -> None:
+        """
+        Close and discard all per-rank direct ZMQ sockets.
+
+        Called from `set_peer_registry` so sockets reconnect with the new worker
+        URLs on next use.
+        """
+        for rank in list(self._direct_zmq_sockets.keys()):
+            socket = self._direct_zmq_sockets.pop(rank, None)
+            if socket is not None:
+                try:
+                    socket.close(linger=0)
+                except Exception:
+                    pass
 
     # --- GPU pin budget internals ---
 

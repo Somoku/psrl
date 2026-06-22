@@ -194,6 +194,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
+    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \

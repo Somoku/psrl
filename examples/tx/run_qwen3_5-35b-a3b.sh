@@ -125,7 +125,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.kl_loss_coef=0.01 \
     train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
-    +train_actor_rollout_ref.actor.rollout_n=$rollout_N \
+    train_actor_rollout_ref.actor.rollout_n=$rollout_N \
     train_actor_rollout_ref.actor.use_dynamic_bsz=False \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=30720 \
     +train_actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=0 \
@@ -148,6 +148,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=$ETP \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=1 \
     train_actor_rollout_ref.actor.megatron.use_mbridge=True \
+    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     train_actor_rollout_ref.actor.megatron.use_remove_padding=False \
     \
     train_actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
@@ -184,7 +185,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.ref.megatron.expert_tensor_parallel_size=${ETP} \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.routing_strategy.enable_group_sticky=False \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \

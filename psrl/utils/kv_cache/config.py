@@ -90,6 +90,13 @@ class LMCacheConfig:
     # `find_available_port()` picks the actual port at runtime.
     controller_base_port: int = 9000
 
+    # Seconds RolloutCoordinator waits for the Controller HTTP API to become
+    # healthy before failing init. The controller imports torch+vLLM at startup
+    # (~30-40s standalone) and runs on the busy ps_manager node, so under cluster
+    # contention it can exceed the old hard-coded 90s budget. Read by
+    # RolloutCoordinator._start_lmcache_controller(); not exported as an env var.
+    controller_health_timeout_s: int = 300
+
     # Host where the LMCache Controller runs (defaults to ps_manager_ip).
     # Set by PSRL before engine init so LMCache workers know where to connect.
     controller_host: str = ""

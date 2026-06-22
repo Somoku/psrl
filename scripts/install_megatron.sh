@@ -59,13 +59,15 @@ echo "Notice: TransformerEngine installation can take a long time, please be pat
 NVTE_FRAMEWORK=pytorch python -m pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
 
 echo "3. Install Megatron"
-python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@d23ca85 --no-deps --no-build-isolation
+python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@c049020 --no-deps --no-build-isolation
 
 echo "4. Install Megatron-Bridge"
 pushd $THIRD_PARTY_PATH
 git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
 cd Megatron-Bridge
 git checkout 94d1870
+# Comment out the local megatron-core source (we install Megatron-LM separately above)
+sed -i 's|^megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }|# megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }|' pyproject.toml
 python -m uv pip install -e .
 popd
 

@@ -21,7 +21,6 @@ tensorflow/my_graph/*
 # =========================================================================
 # Common artifact file types
 **/*.log
-**/*.svg
 **/*.pdf
 **/*.pkl
 **/*.png

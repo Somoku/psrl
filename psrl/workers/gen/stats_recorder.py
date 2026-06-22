@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 from datetime import datetime, timezone
 from typing import IO, TYPE_CHECKING
 
@@ -14,17 +13,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _sanitize_replica_id(replica_id: str) -> str:
-    """Replace filesystem-unsafe characters with underscores."""
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", replica_id)
-
-
 class StatsRecorder:
     """
     Writes periodic per-replica stats snapshots to JSONL files.
 
-    One file per (replica_id, dp_rank):
-        {logging_path}/stats_{sanitized_replica_id}_dp{dp_rank}.jsonl
+    One file per (replica_idx, dp_rank):
+        {logging_path}/stats_r{replica_idx}_dp{dp_rank}.jsonl
 
     A run-level config file is written once at startup:
         {logging_path}/stats_config.json
@@ -65,13 +59,14 @@ class StatsRecorder:
 
         ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
-        for (replica_id, dp_rank), engine_stats in instance_to_engine_status.items():
+        for (_replica_id, dp_rank), engine_stats in instance_to_engine_status.items():
             snapshot = engine_stats.snapshot
             sched = snapshot.get("scheduler_stats", {})
             iter_stats = snapshot.get("iteration_stats", {})
 
             row = {
                 "ts": ts,
+                "total_elapsed_time": snapshot.get("total_elapsed_time", 0.0),
                 "model_version": engine_stats.model_version,
                 "num_running_reqs": sched.get("num_running_reqs", 0),
                 "num_waiting_reqs": sched.get("num_waiting_reqs", 0),
@@ -81,7 +76,7 @@ class StatsRecorder:
                 "avg_itl": iter_stats.get("avg_inter_token_latencies") if iter_stats else None,
             }
 
-            filename = self._get_filename(replica_id, dp_rank)
+            filename = self._get_filename(engine_stats.replica_idx, dp_rank)
             try:
                 fh = self._get_or_open(filename)
                 fh.write(json.dumps(row) + "\n")
@@ -133,9 +128,8 @@ class StatsRecorder:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_filename(self, replica_id: str, dp_rank: int) -> str:
-        safe = _sanitize_replica_id(replica_id)
-        return os.path.join(self._logging_path, f"stats_{safe}_dp{dp_rank}.jsonl")
+    def _get_filename(self, replica_idx: int, dp_rank: int) -> str:
+        return os.path.join(self._logging_path, f"stats_r{replica_idx}_dp{dp_rank}.jsonl")
 
     def _get_smg_routing_status_filename(self) -> str:
         return os.path.join(self._logging_path, "smg_routing_status.jsonl")

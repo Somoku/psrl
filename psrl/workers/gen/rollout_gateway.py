@@ -141,10 +141,13 @@ class RolloutGateway:
         session_ip = self.smg_ip
         session_client_concurrency = self._estimate_http_client_concurrency()
 
-        def _run_session_router(smg_url, host, port, client_concurrency):
+        def _run_session_router(smg_url, host, port, client_concurrency, logging_path):
             import uvicorn
 
-            from psrl.workers.gen.session_router import SessionRouter
+            from psrl.workers.gen.session_router import SessionRouter, psrl_logger as session_logger
+
+            if logging_path:
+                session_logger.addHandler(DualOutputHandler(logging_path, "SessionRouter"))
 
             router = SessionRouter(
                 smg_url=smg_url,
@@ -154,7 +157,7 @@ class RolloutGateway:
 
         self.session_router_process = multiprocessing.Process(
             target=_run_session_router,
-            args=(self.smg_url, session_ip, session_port, session_client_concurrency),
+            args=(self.smg_url, session_ip, session_port, session_client_concurrency, self.config.psrl.logging_path),
         )
         self.session_router_process.daemon = True
         self.session_router_process.start()

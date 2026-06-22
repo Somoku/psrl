@@ -61,7 +61,7 @@ class SessionAgentLoop(AgentLoopBase):
             "x-prompt-id": str(request.get("parent_id", request_id)),
             "x-version-tag": str(request.get("version_tag", 0)),
             "x-is-validate": str(request.get("validate", False)).lower(),
-            "x-is-sticky": str(bool(self.config.psrl.agentic_rl.sticky_session)).lower(),
+            "x-is-sticky": str(bool(self.config.psrl.routing_strategy.enable_trajectory_sticky)).lower(),
             "x-smg-tito-trajectory-id": str(request.get("trajectory_id", 0)),
         }
         rollout_instance_id = request.get("rollout_instance_id")
@@ -132,7 +132,8 @@ class SessionAgentLoop(AgentLoopBase):
             payload["tools"] = tools
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
-        return await post(f"{self.session_api_url(session_id)}/chat/completions", payload=payload)
+        with self.timer.generation():
+            return await post(f"{self.session_api_url(session_id)}/chat/completions", payload=payload)
 
     async def get_training_arrays(
         self,

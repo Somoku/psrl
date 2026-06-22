@@ -25,8 +25,8 @@ from verl.utils import tensordict_utils as tu
 from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.logger import DualOutputHandler
 from psrl.workers.reward.gen_reward_function import DefaultGenRewardFunction, GenRewardFunctionBase
-from psrl.workers.reward.reward_loop import register
 from psrl.workers.reward.reward_loop.base import RewardManagerBase
+from psrl.workers.reward.reward_loop.registry import register
 from psrl.workers.reward.reward_model.manager import RewardModelManager
 
 psrl_logger = logging.getLogger(__name__)

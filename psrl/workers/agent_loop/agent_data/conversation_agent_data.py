@@ -194,7 +194,7 @@ class ConversationAgentData(AgentData[ConversationType, object]):
         if reward is not None:
             trajectory.tool_rewards.append(float(np.sum(reward)))
 
-        return trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length
+        return self._is_overlong(trajectory)
 
     async def update_from_model_token_ids(
         self,
@@ -256,12 +256,36 @@ class ConversationAgentData(AgentData[ConversationType, object]):
             reward_result = await self.reward_manager.compute_score.remote(reward_data)
             self.get_current_step().model_reward = reward_result["reward_score"]
 
-        overlong = trajectory.response_length >= self.config.gen_actor_rollout_ref.rollout.response_length
+        overlong = self._is_overlong(trajectory)
         return action, overlong
 
     def decode_action_from_token_ids(self, token_ids: list[int]) -> object:
         """Parse an action from model output in concrete subclasses."""
         raise NotImplementedError
+
+    def _is_overlong(self, trajectory: Trajectory) -> bool:
+        """
+        Return True when the accumulated context has hit the token budget.
+
+        Each turn feeds `prompt_ids + response_ids` to the engine, so the real
+        cap is `max_model_len = prompt_length + response_length`, not
+        `response_length` alone. Observation tokens are also appended into
+        `response_ids` (mask=0), so gating on `response_length` alone lets the
+        total context grow past `max_model_len` and crash the engine's block
+        table on the next submit. Gate on total context length instead;
+        finalize/truncation still caps prompt and response to their individual
+        limits when the trajectory is emitted.
+
+        Args:
+            trajectory (Trajectory): The trajectory whose accumulated context to check.
+
+        Returns:
+            bool: True if `len(prompt_ids) + len(response_ids) >= max_model_len`.
+        """
+        rollout = self.config.gen_actor_rollout_ref.rollout
+        max_model_len = rollout.prompt_length + rollout.response_length
+        context_len = len(trajectory.prompt_ids) + len(trajectory.response_ids)
+        return context_len >= max_model_len
 
     def reset(self) -> None:
         """Reset all session state."""

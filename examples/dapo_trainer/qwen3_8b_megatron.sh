@@ -115,6 +115,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$tensor_model_parallel_size \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$pipeline_model_parallel_size \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=1 \
+    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -142,7 +143,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.routing_strategy.enable_group_sticky=False \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \

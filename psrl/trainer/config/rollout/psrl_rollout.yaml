@@ -30,7 +30,10 @@ load_format: dummy
 # Whether disable attention for profiling.
 disable_attn: ${oc.select:psrl.profile.disable_attn,False}
 
-# max length of sequences
+# Disable logging statistics.
+disable_log_stats: False
+
+# Max length of sequences.
 max_num_seqs: ${oc.select:psrl.routing_strategy.max_concurrent_seqs_per_instance,1024}
 
 # vLLM runner type: 'generate' for autoregressive LLMs, 'pooling' for

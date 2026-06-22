@@ -2,24 +2,32 @@
 env_file="${PSRL_WORKSPACE}/env/psrl.sh"
 source ${env_file}
 
-PORT=8887                # Ray节点通信端口
-DASHBOARD_PORT=8265      # Ray Dashboard端口
+HOSTFILE=${1:-""}
+PORT=8887                # Ray node communication port
+DASHBOARD_PORT=8265      # Ray Dashboard port
 
-# 读取hostfile
-mapfile -t hosts < <(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | head -n $NODE_NUM)
-if [ ${#hosts[@]} -eq 0 ]; then
-    echo "Error: NODE_IP_LIST is empty"
-    exit 1
+# Read host list
+if [ -n "${HOSTFILE}" ]; then
+    mapfile -t hosts < "${HOSTFILE}"
+    if [ ${#hosts[@]} -eq 0 ]; then
+        echo "Error: Empty hostfile"
+        exit 1
+    fi
+else
+    mapfile -t hosts < <(echo "$NODE_IP_LIST" | sed "s/:.//g; s/,/\\n/g" | head -n $NODE_NUM)
+    if [ ${#hosts[@]} -eq 0 ]; then
+        echo "Error: NODE_IP_LIST is empty"
+        exit 1
+    fi
 fi
 
-hosts=("${hosts[@]:0}")
 HEAD_IP=${hosts[0]}
 workers=( "${hosts[@]:1}" )
 
 # unset http_proxy && \
 # unset https_proxy && \
 
-# 清理所有节点上的残留 Ray 进程，防止多个 raylet 共存导致 GPU 资源声明混乱
+# Clean up leftover Ray processes on all nodes to prevent GPU resource conflicts from multiple raylets
 echo "Stopping any existing Ray processes on all nodes..."
 for host in "${hosts[@]}"; do
     pssh -H "${host}" -i "source ${env_file} && ray stop --force 2>/dev/null || true" &
@@ -27,7 +35,7 @@ done
 wait
 echo "All nodes cleaned up."
 
-# 启动Head节点
+# Start head node
 echo "Starting Head node at ${HEAD_IP}"
 pssh -H "${HEAD_IP}" -i \
     "source ${env_file} && \
@@ -37,7 +45,7 @@ pssh -H "${HEAD_IP}" -i \
     --dashboard-port=${DASHBOARD_PORT} \
     --num-cpus=32"
 
-# 启动Worker节点
+# Start worker nodes
 if [ ${#workers[@]} -gt 0 ]; then
     echo "Starting ${#workers[@]} Worker nodes"
     pssh -H "${workers[*]}" -i \

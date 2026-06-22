@@ -24,6 +24,8 @@ from psrl.utils.common.http_utils import (
     request_json_maybe_distributed,
 )
 from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.utils.rollout.loop_timer import LoopTimer
+from psrl.utils.rollout.trajectory_writer import TrajectoryWriter
 from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
 from psrl.workers.agent_loop.sticky_session import sticky_session
@@ -71,6 +73,8 @@ class AgentLoopBase(ABC):
         self.ps_manager_handle = ps_manager_handle
         self.tokenizer = tokenizer
         self.processor = processor
+        self.traj_writer = TrajectoryWriter.from_config(self.config)
+        self.timer = LoopTimer()
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
@@ -259,53 +263,54 @@ class AgentLoopBase(ABC):
             sampling_params["stop_token_ids"] = list(
                 set((sampling_params.get("stop_token_ids") or []) + request_input.stop_token_ids)
             )
-        if self.config.psrl.rollout_gateway.enable:
-            if not self.gateway_addr:
-                raise RuntimeError("Rollout gateway is enabled but gateway address is empty.")
+        with self.timer.generation():
+            if self.config.psrl.rollout_gateway.enable:
+                if not self.gateway_addr:
+                    raise RuntimeError("Rollout gateway is enabled but gateway address is empty.")
 
-            # Route multimodal requests to /v1/chat/completions (which has a full
-            # Rust-side vision preprocessing pipeline) and text-only requests to
-            # /generate (lower latency, returns output_ids directly).
-            mm_data = request_input.multi_modal_data
-            has_images = mm_data is not None and bool(mm_data.get("images"))
-            has_videos = mm_data is not None and bool(mm_data.get("videos"))
+                # Route multimodal requests to /v1/chat/completions (which has a full
+                # Rust-side vision preprocessing pipeline) and text-only requests to
+                # /generate (lower latency, returns output_ids directly).
+                mm_data = request_input.multi_modal_data
+                has_images = mm_data is not None and bool(mm_data.get("images"))
+                has_videos = mm_data is not None and bool(mm_data.get("videos"))
 
-            if has_videos:
-                raise NotImplementedError(
-                    "Video input is not yet supported via the SMG gateway. "
-                    "Implement a /v1/chat/completions video path when ready."
-                )
+                if has_videos:
+                    raise NotImplementedError(
+                        "Video input is not yet supported via the SMG gateway. "
+                        "Implement a /v1/chat/completions video path when ready."
+                    )
 
-            if has_images:
-                return await self._generate_via_chat_completions(
-                    request_input, sampling_params, is_sticky_session, mm_data
-                )
+                if has_images:
+                    return await self._generate_via_chat_completions(
+                        request_input, sampling_params, is_sticky_session, mm_data
+                    )
 
-            # ── Text-only: fast /generate path ──────────────────────────────
-            return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
-        else:
-            mm_data = request_input.multi_modal_data
-            if mm_data is not None and (mm_data.get("images") or mm_data.get("videos")):
-                psrl_logger.warning(
-                    "request_id=%s: Multi-modal data (images/videos) is present but the "
-                    "Ray-actor rollout path does not support forwarding image data. "
-                    "Enable the Rust gateway (psrl.rollout_gateway.enable=true) for "
-                    "multimodal inference.",
-                    request_input.request_id,
-                )
-            async with sticky_session(self.rollout_router, request) if is_sticky_session else nullcontext():
-                # TODO(linsh): move sampling params as param of `route_generate`
-                output = await self.rollout_router.route_generate.remote(
-                    request_input.input_ids,
-                    request_input.request_id,
-                    request_input.prompt_id,
-                    request_input.version_tag,
-                    request_input.rollout_instance_id,
-                    request_input.cu_response_len,
-                    request_input.is_validate,
-                    request_input.stop_token_ids,
-                )
-        return output
+                # ── Text-only: fast /generate path ──────────────────────────────
+                return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
+            else:
+                mm_data = request_input.multi_modal_data
+                if mm_data is not None and (mm_data.get("images") or mm_data.get("videos")):
+                    psrl_logger.warning(
+                        "request_id=%s: Multi-modal data (images/videos) is present but the "
+                        "Ray-actor rollout path does not support forwarding image data. "
+                        "Enable the Rust gateway (psrl.rollout_gateway.enable=true) for "
+                        "multimodal inference.",
+                        request_input.request_id,
+                    )
+                async with sticky_session(self.rollout_router, request) if is_sticky_session else nullcontext():
+                    # TODO(linsh): move sampling params as param of `route_generate`
+                    output = await self.rollout_router.route_generate.remote(
+                        request_input.input_ids,
+                        request_input.request_id,
+                        request_input.prompt_id,
+                        request_input.version_tag,
+                        request_input.rollout_instance_id,
+                        request_input.cu_response_len,
+                        request_input.is_validate,
+                        request_input.stop_token_ids,
+                    )
+            return output
 
     async def _generate_via_generate_endpoint(
         self,
@@ -884,6 +889,9 @@ class AgentLoopBase(ABC):
                 timeout=timeout,
             )
             if output is not None:
+                await self._resolve_version_for_dump(output, prompt)
+                self._attach_loop_timing(output)
+                self._dump_trajectory_text(prompt, output, terminate_reason)
                 return output, terminate_reason
             elif output is None and terminate_reason.is_aborted:
                 return None, terminate_reason
@@ -931,3 +939,187 @@ class AgentLoopBase(ABC):
                 )
                 return None, TerminateReason.ROLLOUT_ERROR
             raise
+
+    def _attach_loop_timing(self, output: "TokenOutput | list[TokenOutput]") -> None:
+        """Stamp the per-trajectory wall-clock timing onto each output.
+
+        Read directly from ``self.timer`` (one loop instance == one trajectory).
+        Stored under ``extra_fields['loop_timing']`` so it survives the trip back
+        to ``_dump_trajectory_text``. Never raises.
+        """
+        try:
+            timing = self.timer.as_dict()
+            for out in output if isinstance(output, list) else [output]:
+                out.extra_fields.setdefault("loop_timing", timing)
+        except Exception:
+            psrl_logger.debug("Failed to attach loop timing.", exc_info=True)
+
+    async def _resolve_version_for_dump(self, output: "TokenOutput | list[TokenOutput]", prompt: dict) -> None:
+        """Resolve the real served model version for trajectory bucketing.
+
+        Dispatch tags train requests with ``version_tag == -1``; the real version
+        is only resolved server-side and stored in the PS, so the prompt's
+        ``version_tag`` would otherwise land trajectories in ``v-1/``. Look up the
+        instance's current version via the PS manager and stash it under
+        ``extra_fields['resolved_version']``. Never raises: falls back to the
+        current PS version, then to 0.
+        """
+        prompt_version = prompt.get("version_tag", 0)
+        if prompt_version not in (None, -1):
+            return
+        if self.ps_manager_handle is None:
+            return
+        outs = output if isinstance(output, list) else [output]
+        for out in outs:
+            resolved: int | None = None
+            try:
+                if out.rollout_instance_id is not None:
+                    resolved = await self.ps_manager_handle.get_rollout_instance_model_version.remote(
+                        out.rollout_instance_id
+                    )
+                else:
+                    resolved = await self.ps_manager_handle.get_ps_model_version.remote(debug_info="trajectory_dump")
+            except Exception:
+                psrl_logger.debug(
+                    "Failed to resolve served version for uid=%s; falling back to 0.",
+                    prompt.get("uid", "N/A"),
+                    exc_info=True,
+                )
+            if resolved is not None:
+                out.extra_fields["resolved_version"] = int(resolved)
+
+    def _build_summary_text(
+        self,
+        out: "TokenOutput",
+        terminate_reason: "TerminateReason",
+    ) -> str:
+        """Build the ``=== Submission ===`` / ``=== Summary ===`` trailer for one trajectory."""
+        info = out.agent_reward_info or {}
+        patch = info.get("patch")
+
+        n_prompt = len(out.prompt_ids)
+        n_assistant = out.response_mask.count(1) if out.response_mask else 0
+        n_env = out.response_mask.count(0) if out.response_mask else 0
+        total_tokens = n_prompt + n_assistant + n_env
+
+        turns = info.get("num_turns")
+        if turns is None:
+            turns = out.num_turns if out.num_turns is not None else 0
+
+        # Prefer the loop's wall-clock timing; mini-swe carries finer timing under
+        # agent_reward_info['timing'] (assistant/env/prep/grading) measured in the runner.
+        loop_timing = (out.extra_fields or {}).get("loop_timing", {})
+        runner_timing = info.get("timing", {}) or {}
+        generation_s = runner_timing.get("assistant_s", loop_timing.get("generation_s", 0.0))
+        env_s = runner_timing.get("env_s", loop_timing.get("env_s", 0.0))
+        elapsed_s = runner_timing.get("elapsed_s", loop_timing.get("elapsed_s", 0.0))
+
+        breakdown = [f"generation: {generation_s:.1f}s", f"env: {env_s:.1f}s"]
+        if runner_timing.get("grading_s"):
+            breakdown.append(f"grading: {runner_timing['grading_s']:.1f}s")
+        if runner_timing.get("prep_s"):
+            breakdown.append(f"prep: {runner_timing['prep_s']:.1f}s")
+
+        text = ""
+        if patch:
+            text += f"=== Submission ===\n{patch}\n\n"
+        text += (
+            "=== Summary ===\n"
+            f"turns: {turns}, patch: {'yes' if patch else 'no'}, "
+            f"stop: {terminate_reason.value}, elapsed: {elapsed_s:.1f}s\n"
+            f"[Token Counts] prompt: {n_prompt} | assistant: {n_assistant} | "
+            f"env: {n_env} | total: {total_tokens}\n"
+            f"[Time Breakdown] {' | '.join(breakdown)}\n"
+        )
+        return text
+
+    def _dump_trajectory_text(
+        self,
+        prompt: dict,
+        output: "TokenOutput | list[TokenOutput]",
+        terminate_reason: "TerminateReason",
+    ) -> None:
+        """Write per-trajectory text for any agent loop via the shared writer.
+
+        Renders text uniformly from the returned ``TokenOutput`` (prompt + the
+        assistant/observation segments of ``response_ids``, split by
+        ``response_mask``), then appends a ``=== Summary ===`` block (turns, stop
+        reason, token counts, wall-clock timing) and, when a patch is present, a
+        ``=== Submission ===`` block. This is the single chokepoint all loops pass
+        through, so no per-loop wiring is needed. Never raises: a dump failure must
+        not break a rollout.
+
+        Args:
+            prompt (dict): The unwrapped request dict (carries ``uid`` and
+                ``version_tag``).
+            output (TokenOutput | list[TokenOutput]): The loop's generation
+                output(s).
+            terminate_reason (TerminateReason): Final termination classification,
+                surfaced as the ``stop:`` field of the summary.
+        """
+        if not getattr(self, "traj_writer", None) or not self.traj_writer.enable:
+            return
+        try:
+            outs = output if isinstance(output, list) else [output]
+            uid = prompt.get("uid", "N/A")
+            for idx, out in enumerate(outs):
+                version = int((out.extra_fields or {}).get("resolved_version", prompt.get("version_tag", 0)) or 0)
+                prompt_text = self.tokenizer.decode(out.prompt_ids, skip_special_tokens=False)
+                parts = [f"=== Prompt ===\n{prompt_text}\n\n"]
+                turn = 0
+                for role, text in self._segment_by_mask(out.response_ids, out.response_mask):
+                    if role == "assistant":
+                        turn += 1
+                        parts.append(f"=== Turn {turn} (assistant) ===\n{text}\n\n")
+                    else:
+                        parts.append(f"--- observation ---\n{text}\n\n")
+                parts.append(self._build_summary_text(out, terminate_reason))
+                traj_id = str(uid) if len(outs) == 1 else f"{uid}_{idx}"
+                self.traj_writer.write(version, traj_id, "".join(parts))
+        except Exception:
+            psrl_logger.warning(
+                "Failed to dump trajectory text for uid=%s.",
+                prompt.get("uid", "N/A"),
+                exc_info=True,
+            )
+
+    def _segment_by_mask(
+        self,
+        response_ids: list[int],
+        response_mask: list[int],
+    ) -> list[tuple[str, str]]:
+        """Split ``response_ids`` into ordered (role, text) runs by ``response_mask``.
+
+        Contiguous tokens with mask==1 are assistant-generated; mask==0 are
+        observation/tool tokens. Each run is decoded separately so turn
+        boundaries are preserved in the dumped text.
+
+        Args:
+            response_ids (list[int]): Response token ids.
+            response_mask (list[int]): Parallel mask (1=assistant, 0=observation).
+
+        Returns:
+            list[tuple[str, str]]: Ordered (role, decoded_text) segments.
+        """
+        segments: list[tuple[str, str]] = []
+        if not response_ids:
+            return segments
+        if not response_mask or len(response_mask) != len(response_ids):
+            # No usable mask: emit the whole response as a single assistant run.
+            return [("assistant", self.tokenizer.decode(response_ids, skip_special_tokens=False))]
+        run_ids: list[int] = []
+        run_mask: int | None = None
+        for tok, mask in zip(response_ids, response_mask, strict=False):
+            mask = int(bool(mask))
+            if run_mask is None:
+                run_mask = mask
+            if mask != run_mask:
+                role = "assistant" if run_mask == 1 else "observation"
+                segments.append((role, self.tokenizer.decode(run_ids, skip_special_tokens=False)))
+                run_ids = []
+                run_mask = mask
+            run_ids.append(tok)
+        if run_ids:
+            role = "assistant" if run_mask == 1 else "observation"
+            segments.append((role, self.tokenizer.decode(run_ids, skip_special_tokens=False)))
+        return segments

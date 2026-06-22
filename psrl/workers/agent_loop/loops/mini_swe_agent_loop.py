@@ -444,7 +444,7 @@ class MiniSWEAgentLoop(AgentLoopBase):
                 output = await asyncio.wait_for(
                     self.generate_sequence(
                         agent_data.prepare_generation_request(request),
-                        is_sticky_session=self.config.psrl.agentic_rl.sticky_session,
+                        is_sticky_session=self.config.psrl.routing_strategy.enable_trajectory_sticky,
                     ),
                     timeout=rollout_turn_timeout,
                 )

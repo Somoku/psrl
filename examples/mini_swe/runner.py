@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
 
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
 psrl_logger = logging.getLogger(__name__)
+
 _PROXY_ENV_KEYS = [
     "http_proxy",
     "https_proxy",
@@ -125,11 +127,45 @@ def _grade_patch(payload: dict[str, Any], patch: str) -> dict[str, Any] | None:
 
 def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one task through mini-SWE-agent's standard Python bindings."""
+    from examples.mini_swe.eval.xml_fc_model import PromptOverflowError
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.environments import get_environment
     from minisweagent.models import get_model
 
+    class _TimedAgent(DefaultAgent):
+        """DefaultAgent that accumulates wall-clock model vs environment time.
+
+        ``step()`` decomposes into ``query()`` (model/assistant turn) and
+        ``execute_actions()`` (environment/tool execution), so timing each gives a
+        clean assistant-vs-env split for the trajectory summary.
+        """
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.assistant_s = 0.0
+            self.env_s = 0.0
+
+        def query(self, *args: Any, **kwargs: Any) -> Any:
+            t = time.time()
+            try:
+                return super().query(*args, **kwargs)
+            finally:
+                self.assistant_s += time.time() - t
+
+        def execute_actions(self, *args: Any, **kwargs: Any) -> Any:
+            t = time.time()
+            try:
+                return super().execute_actions(*args, **kwargs)
+            finally:
+                self.env_s += time.time() - t
+
     environment = None
+    agent = None
+    run_start = time.time()
+    # `timing` is mutated in the finally block, and every return dict below holds a
+    # reference to this same object, so assistant/env/elapsed are captured on ALL
+    # paths -- including PromptOverflowError / other exceptions raised mid-run.
+    timing: dict[str, float] = {"prep_s": 0.0, "assistant_s": 0.0, "env_s": 0.0, "grading_s": 0.0, "elapsed_s": 0.0}
     try:
         environment = get_environment(_build_environment_config(payload))
         model = get_model(config=_build_model_config(payload))
@@ -137,17 +173,35 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
         agent_config["instance_template"] = agent_config.pop("problem_template")
         agent_config["step_limit"] = payload["max_turns"]
         agent_config["output_path"] = None
-        result = DefaultAgent(model, environment, **agent_config).run(payload["task"])
+        timing["prep_s"] = time.time() - run_start
+        agent = _TimedAgent(model, environment, **agent_config)
+        result = agent.run(payload["task"])
         patch = result.get("submission", "") or ""
         try:
             environment.cleanup()
             environment = None
         except Exception:
             psrl_logger.warning("mini-SWE-agent environment cleanup before grading failed.", exc_info=True)
+        grade_start = time.time()
+        grader_result = _grade_patch(payload, patch)
+        timing["grading_s"] = time.time() - grade_start
         return {
             "exit_status": result.get("exit_status", ""),
             "submission": patch,
-            "grader_result": _grade_patch(payload, patch),
+            "grader_result": grader_result,
+            "timing": timing,
+        }
+    except PromptOverflowError as exc:
+        # The turn prompt exceeded the engine context window. Turns generated
+        # before the overflow are valid; the loop recovers them from the TITO
+        # session and treats this as a normal max-length termination instead of
+        # a fatal rollout error.
+        psrl_logger.warning("mini-SWE-agent stopped on context overflow: %s.", exc)
+        return {
+            "exit_status": "context_exceeded",
+            "submission": "",
+            "grader_result": None,
+            "timing": timing,
         }
     except Exception as exc:
         psrl_logger.warning("mini-SWE-agent task failed: %s.", exc, exc_info=True)
@@ -156,8 +210,15 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
             "submission": "",
             "grader_result": None,
             "error": str(exc),
+            "timing": timing,
         }
     finally:
+        # Capture accumulated timing regardless of how we exit (success, overflow,
+        # or error). Runs before control leaves; the return dicts share `timing`.
+        if agent is not None:
+            timing["assistant_s"] = agent.assistant_s
+            timing["env_s"] = agent.env_s
+        timing["elapsed_s"] = time.time() - run_start
         if environment is not None:
             try:
                 environment.cleanup()

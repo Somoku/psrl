@@ -25,11 +25,6 @@ logging_path: ~/psrl_logs
 # Agentic RL feature toggles.
 agentic_rl:
 
-  # Whether to enable sticky session in agent loops.
-  # When True, all generation calls within a single trajectory are pinned to
-  # the same rollout instance (improves prefix-cache hit rate).
-  sticky_session: False
-
   # Error handling for terminations where TerminateReason.needs_manager_retry()
   # is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
   # (unclassified failure / zero turns produced). Timeouts and aborts are
@@ -41,6 +36,14 @@ agentic_rl:
   # False           : raise RuntimeError immediately, crashing the worker so the
   #                   failure is visible rather than silently stalling training.
   manager_retry_on_error: True
+
+  # Per-trajectory text dump written by all agent loops via TrajectoryWriter.
+  # Files land at <dir>/v{version}/{uid}.txt (one per rollout trajectory).
+  trajectory_output:
+    # Whether to write per-trajectory text files.
+    enable: True
+    # Output directory. Empty -> <psrl.logging_path>/trajectories.
+    dir: ""
 
   # TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml
 
@@ -330,8 +333,14 @@ routing_strategy:
   # Whether to enable multiple priority queues for routing requests
   enable_multi_priority_queue: False
 
-  # Whether to enable group sampling on multiple instances
-  enable_group_sampling_on_multi_instances: True
+  # Whether to enable group sticky routing: pin all rollout requests sharing a
+  # prompt_id to the same rollout instance so their KV-cache prefixes are reused.
+  enable_group_sticky: True
+
+  # Whether to enable trajectory sticky routing: pin all generation calls within
+  # a single trajectory (subsequent turns) to the same rollout instance that
+  # served the first turn, so the per-trajectory KV-cache prefix is reused.
+  enable_trajectory_sticky: True
 
   # Logging interval in milliseconds
   logging_interval_in_ms: 2000
@@ -608,6 +617,12 @@ lmcache:
   # RolloutCoordinator picks the actual port starting from this value
   # using find_available_port().
   controller_base_port: 9000
+
+  # Seconds to wait for the shared LMCache Controller HTTP API (GET /openapi.json)
+  # to become healthy before failing init. The controller imports torch+vLLM at
+  # startup (~30-40s standalone) and runs on the busy ps_manager node, so under
+  # cluster CPU/FS contention it can exceed the old 90s budget.
+  controller_health_timeout_s: 3000
 
   # Host where the LMCache Controller runs. Defaults to psrl.ps_manager_ip.
   # Both PSRL (HTTP) and LMCache workers (ZMQ) connect to this host.

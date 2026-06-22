@@ -348,7 +348,13 @@ class PSRL_AgentLoopWorker:
         request_ids = tu.get(batch, "uid")
 
         global_steps = tu.get(batch, "global_steps", -1)
-        validate = tu.get(batch, "validate", False)
+        # `validate` is stored as a NonTensorStack, so `tu.get` unwraps it to a
+        # Python list (e.g. [False]). A list is always truthy, which would make
+        # every train rollout look like a validation rollout downstream (notably
+        # in `notify_group_failed`, collapsing the train-retry path). Normalize
+        # to a scalar bool here.
+        _validate_raw = tu.get(batch, "validate", False)
+        validate = bool(_validate_raw[0]) if isinstance(_validate_raw, (list, tuple)) else bool(_validate_raw)
 
         with rollout_trace_attr(
             prompt_index=prompt_index,
@@ -428,7 +434,11 @@ class PSRL_AgentLoopWorker:
                 # Uses TerminateReason.needs_manager_retry() as the single
                 # classification point — no hardcoded enum lists here.
                 if terminate_reason.needs_manager_retry():
-                    is_validate = tu.get(batch, "validate", False)
+                    # Reuse the scalar `validate` (see normalization above); a raw
+                    # `tu.get(batch, "validate")` here would be a truthy list and
+                    # wrongly route train failures into the validation branch of
+                    # `notify_group_failed`, skipping the fresh-data refill.
+                    is_validate = validate
                     failed_uid = tu.get(batch, "uid")[0]
                     parent_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else failed_uid
                     if self.config.psrl.agentic_rl.get("manager_retry_on_error", True):
@@ -587,8 +597,97 @@ class PSRL_AgentLoopWorker:
                 field["parent_id"] = tu.get(batch, "parent_id")[0]
             field["trajectory_index"] = i
             field["trajectory_num"] = len(outputs)
+            # === PSRL DEBUG: token-level data inspection (remove after diagnosis) ===
+            try:
+                self._psrl_data_dump(out, uid, i, input_ids, position_ids, field, prompt_len, response_len)
+            except Exception as _e:
+                try:
+                    with open("/jizhicfs/lhy/psrl_smg/examples/mini_swe/data_debug.log", "a") as _f:
+                        _f.write(f"[PSRL_DATA] dump failed uid={uid}_{i}: {_e!r}\n")
+                except Exception:
+                    pass
+            # === END PSRL DEBUG ===
             fields.append(field)
         return keys, fields
+
+    def _psrl_data_dump(self, out, uid, i, input_ids, position_ids, field, prompt_len, response_len):
+        """PSRL DEBUG: token-level inspection of one training sample (remove after diagnosis)."""
+        import os as _os
+
+        _rm = field["response_mask"]
+        _rm_t = (_rm if torch.is_tensor(_rm) else torch.tensor(_rm)).to(torch.int64).flatten()
+        _resp = (
+            out.response_ids
+            if isinstance(out.response_ids, list)
+            else out.response_ids.flatten().tolist()
+        )
+        _lp = out.response_log_probs
+        _lp_list = None
+        if _lp is not None:
+            _lp_list = _lp if isinstance(_lp, list) else _lp.flatten().tolist()
+        _pos = position_ids.flatten() if position_ids.dim() <= 2 else position_ids[0]
+        _vocab = 152064
+        _mask_list = _rm_t.tolist()
+        _trans = sum(1 for k in range(1, len(_mask_list)) if _mask_list[k] != _mask_list[k - 1])
+
+        # --- shape-level summary (always written) ---
+        summary = (
+            f"[PSRL_DATA] uid={uid}_{i} stop={getattr(out, 'finish_reason', None) or getattr(out, 'stop_reason', '?')} "
+            f"prompt_len={prompt_len} response_len={response_len} seq_len={prompt_len + response_len} "
+            f"input_ids_len={input_ids.numel()} resp_ids_len={len(_resp)} "
+            f"mask_len={len(_mask_list)} mask_sum={int(_rm_t.sum().item())} "
+            f"logprob_len={(len(_lp_list) if _lp_list is not None else -1)} "
+            f"mask_transitions={_trans} "
+            f"tok_oob={int((input_ids >= _vocab).sum().item()) + int((input_ids < 0).sum().item())} "
+            f"pos_max={int(_pos.max().item())} pos_max_allowed=32768 "
+            f"pos_contig={bool((_pos[1:] - _pos[:-1] == 1).all().item()) if _pos.numel() > 1 else True}"
+        )
+        with open("/jizhicfs/lhy/psrl_smg/examples/mini_swe/data_debug.log", "a") as _f:
+            _f.write(summary + "\n")
+
+        # --- token-level dump: only first 2 trajectories per worker process ---
+        _cnt = getattr(self, "_psrl_dump_count", 0)
+        if _cnt >= 2:
+            return
+        self._psrl_dump_count = _cnt + 1
+
+        tok = self.tokenizer
+        path = f"/jizhicfs/lhy/psrl_smg/examples/mini_swe/data_debug_tok_pid{_os.getpid()}_uid{uid}_{i}.log"
+        with open(path, "w") as f:
+            f.write(summary + "\n")
+            f.write(f"prompt tail (last 8 ids): {field['prompts'].flatten().tolist()[-8:]}\n")
+            f.write("decoded prompt tail: " + repr(tok.decode(field["prompts"].flatten().tolist()[-30:])) + "\n\n")
+
+            # find segment boundaries in response (mask runs)
+            bounds = [0]
+            for k in range(1, len(_mask_list)):
+                if _mask_list[k] != _mask_list[k - 1]:
+                    bounds.append(k)
+            bounds.append(len(_mask_list))
+            f.write(f"num response segments={len(bounds) - 1}\n\n")
+
+            for s in range(len(bounds) - 1):
+                lo, hi = bounds[s], bounds[s + 1]
+                role = "ASSISTANT(mask=1)" if _mask_list[lo] == 1 else "OBSERV(mask=0)"
+                seg_ids = _resp[lo:hi]
+                seg_txt = tok.decode(seg_ids[:60])
+                # boundary token-level view: 6 tokens around the start of this segment
+                bstart = max(0, lo - 6)
+                bend = min(len(_resp), lo + 6)
+                btoks = []
+                for p in range(bstart, bend):
+                    mark = "|<-START" if p == lo else ""
+                    btoks.append(f"({_resp[p]}:{tok.decode([_resp[p]])!r}:m{_mask_list[p]}{mark})")
+                f.write(
+                    f"--- seg{s} {role} resp_idx=[{lo}:{hi}] len={hi - lo} "
+                    f"lp_at_start={(_lp_list[lo] if _lp_list is not None and lo < len(_lp_list) else None)} ---\n"
+                )
+                f.write("  boundary toks: " + " ".join(btoks) + "\n")
+                f.write("  seg head decoded: " + repr(seg_txt[:300]) + "\n")
+                if hi - lo > 60:
+                    f.write("  seg tail decoded: " + repr(tok.decode(seg_ids[-30:])) + "\n")
+                f.write("\n")
+
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""

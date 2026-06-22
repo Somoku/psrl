@@ -185,10 +185,32 @@ index c26380e6e..4e57d916a 100644
          """Shutdown engine manager under timeout and clean up resources."""
          if self._finalizer.detach() is not None:
 diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
-index 6855efd9f..c98612f1f 100644
+index 6855efd9f..8c81f52f8 100644
 --- a/vllm/v1/metrics/loggers.py
 +++ b/vllm/v1/metrics/loggers.py
-@@ -1318,11 +1318,14 @@ class StatLoggerManager:
+@@ -1153,8 +1153,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
+         # Labeled prompt token counters by source
+         pts = iteration_stats.prompt_token_stats
+         for source in PromptTokenStats.ALL_SOURCES:
++            # PSRL: when externally loaded KV blocks fail to load, the scheduler's
++            # _handle_invalid_blocks decrements request.num_external_computed_tokens
++            # (see scheduler.py). That can leave num_external_computed_tokens larger
++            # than num_cached_tokens for the iteration, so the per-source delta
++            # computed in PromptTokenStats.update_from_output goes negative. A
++            # Prometheus Counter rejects a negative inc() with ValueError, which
++            # otherwise crashes the whole EngineCore. Clamp to 0 to keep the metric
++            # monotonic and the engine alive; correctness is unaffected because the
++            # affected tokens are recomputed regardless.
++            source_tokens = pts.get_by_source(source)
++            if source_tokens < 0:
++                source_tokens = 0
+             self.counter_prompt_tokens_by_source[source][engine_idx].inc(
+-                pts.get_by_source(source)
++                source_tokens
+             )
+         self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
+         self.counter_generation_tokens[engine_idx].inc(
+@@ -1318,11 +1330,14 @@ class StatLoggerManager:
                      custom_prometheus_logger = True
              else:
                  # per engine logger
@@ -226,9 +248,40 @@ index a7a5fb7a2..303a0fe8a 100644
 +    # NOTE(lhy): LMCache backend chunk hash snapshot for push-based cache info.
 +    # Populated by RolloutScheduler.make_stats(), consumed by StatCollector.record().
 +    lmcache_backend_snapshot: dict | None = None
- 
+
      num_running_reqs: int = 0
- 
--- 
+
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index d51bf2284..c24f7b341 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -1369,6 +1369,26 @@ class GPUModelRunner(
+                 # Replace the existing block IDs with the new ones.
+                 req_state.block_ids = new_block_ids
+
++            # Resync block_ids to the scheduler's authoritative length. When a KV
++            # load failure rolls back num_computed_tokens without preemption (the
++            # scheduler's recompute policy keeps the request RUNNING, so the
++            # resumed_from_preemption replace path above is skipped), the scheduler
++            # frees the orphaned tail blocks but the runner only ever extends its
++            # own block_ids. Across repeated rollbacks the list drifts longer than
++            # the scheduler's req_to_blocks and can exceed the block_table row width
++            # (cdiv(max_model_len, block_size)), overflowing it on add_row. The
++            # surplus is always a dead tail (positions past max_model_len are never
++            # addressed), so clamp each group to its row capacity.
++            block_tables = self.input_batch.block_table.block_tables
++            if len(req_state.block_ids) == len(block_tables):
++                for g, group_block_ids in enumerate(req_state.block_ids):
++                    bt = block_tables[g]
++                    # block_ids are KV-manager blocks; the row width is in kernel
++                    # blocks, so convert back to the KV-block capacity.
++                    cap = bt.max_num_blocks_per_req // bt.blocks_per_kv_block
++                    if len(group_block_ids) > cap:
++                        del group_block_ids[cap:]
++
+             if req_index is None:
+                 # The request is not in the persistent batch.
+                 # The request was either preempted and resumed later, or was not
+--
 2.43.0
 

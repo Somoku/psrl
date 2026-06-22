@@ -1,6 +1,9 @@
 import argparse
+import logging
 from datetime import datetime, timezone
 from typing import Any
+
+psrl_logger = logging.getLogger(__name__)
 
 WORKERS_UPDATE_STATS_PATH = "/workers/update_stats"
 WORKERS_UPDATE_WEIGHT_VERSION_PATH = "/workers/update_weight_version"
@@ -23,14 +26,19 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
 
     routing_method = str(cfg_get(config, "psrl.routing_strategy.method", "request_num_balance"))
     request_budget = int(cfg_get(config, "psrl.routing_strategy.request_budget", 1024))
-    enable_group_sampling = bool(
-        cfg_get(config, "psrl.routing_strategy.enable_group_sampling_on_multi_instances", False)
-    )
+    enable_group_sticky = bool(cfg_get(config, "psrl.routing_strategy.enable_group_sticky", True))
 
     # KV-cache transfer on migration (only meaningful with cache_aware + migration).
     kv_transfer_enable = bool(cfg_get(config, "psrl.routing_strategy.kv_transfer.enable", False))
     kv_transfer_mode = str(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_mode", "async"))
     kv_transfer_timeout_ms = int(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_timeout_ms", 30000))
+
+    psrl_logger.info(
+        "[sticky] SMG router args: enable_group_sticky=%s, kv_transfer_enable=%s, kv_transfer_mode=%s",
+        enable_group_sticky,
+        kv_transfer_enable,
+        kv_transfer_mode,
+    )
 
     cli_args = argparse.Namespace(
         host=host,
@@ -71,7 +79,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         psrl_ps_manager_addr=ps_manager_addr,
         psrl_enable_mig_strategy=bool(cfg_get(config, "psrl.sync_and_mig_strategy.mig.enable", False)),
         psrl_candidate_sort_key=str(cfg_get(config, "psrl.routing_strategy.candidate_sort_indicator", "version")),
-        psrl_enable_group_sticky=not enable_group_sampling,
+        psrl_enable_group_sticky=enable_group_sticky,
         psrl_kv_transfer_enable=kv_transfer_enable,
         psrl_kv_transfer_mode=kv_transfer_mode,
         psrl_kv_transfer_timeout_ms=kv_transfer_timeout_ms,

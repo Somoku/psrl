@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_perf
-experiment_name=mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=vanilla_precision_mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -133,8 +133,8 @@ n_resp_per_prompt_val=8
 train_prompt_mini_bsz=16
 
 # --- Sampling ---
-temperature=1.4
-top_p=0.95
+temperature=1.0
+top_p=1.0
 top_k=-1
 val_top_p=0.7
 
@@ -177,7 +177,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
-    psrl.agentic_rl.sticky_session=False \
+    psrl.routing_strategy.enable_trajectory_sticky=True \
+    psrl.routing_strategy.enable_group_sticky=True \
     \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -235,6 +236,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${TRAIN_TP} \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${TRAIN_PP} \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=${TRAIN_CP} \
+    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=${DIST_CKPT_PATH} \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \

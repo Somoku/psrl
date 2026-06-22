@@ -100,7 +100,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.routing_strategy.method="throughput_optimal" \
     psrl.routing_strategy.candidate_sort_indicator=reserve_capability \
     psrl.routing_strategy.enable_multi_priority_queue=True \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.routing_strategy.enable_group_sticky=False \
     psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_7b.json \
     psrl.routing_strategy.delta_throughput_threshold=0.2 \
     psrl.routing_strategy.request_budget=1024 \

@@ -115,7 +115,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.partial_rollout.enable=True \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=False \
+    psrl.routing_strategy.enable_group_sticky=True \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \

@@ -133,16 +133,6 @@ psrl/environments/mini_swe_env.py                         # MiniSWEEnvironment
 
 ```bash
 # 1. Create conda environment and install PSRL (from repo root)
-conda create -n psrl python=3.11
-conda activate psrl
-
-bash scripts/install_basic.sh
-bash scripts/install_nixl.sh
-bash scripts/install_megatron.sh
-bash scripts/install_tms.sh
-bash scripts/install_lmcache.sh
-
-python -m pip install -e .
 
 # 2. mini-SWE-agent (used as a library)
 python -m pip install mini-swe-agent

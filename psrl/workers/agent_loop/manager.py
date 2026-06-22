@@ -367,19 +367,26 @@ class PSRL_AgentLoopManager:
     async def _retry_data(self, n_prompts: int = 1) -> int:
         """Retry exactly `n_prompts` prompts by sampling fresh data on demand.
 
+        Dispatches directly to workers via `_inner_dispatch_data` (NOT through
+        `train_data_queue`), so it is independent of the dispatch loop and its END
+        (None) signal. It deliberately does NOT check `stop_train_dispatch_task`:
+        a group that failed AFTER the dispatch loop stopped (the DataProcessor has
+        sent all planned prompts) must STILL be compensated by one fresh prompt,
+        otherwise the final buffer is left permanently short and the trainer hangs.
+        The collect task stays alive post-END, so the refill's results are still
+        accumulated into the waiting buffer.
+
         Args:
             n_prompts (int): Number of prompts to retry. Each prompt expands
                 to `rollout_n` children. Defaults to 1.
 
         Returns:
             int: Number of requests actually dispatched. `0` if the agent
-            loop is shutting down, `n_prompts <= 0`, or the dataloader was
+            loop is not running, `n_prompts <= 0`, or the dataloader was
             exhausted.
         """
-        if not (self.running_loop and not self.stop_train_dispatch_task):
-            psrl_logger.warning(
-                "Busy loop of the agent loop manager has stopped, the retry operation will be skipped."
-            )
+        if self.running_loop is None:
+            psrl_logger.warning("Agent loop manager has no running loop, the retry operation will be skipped.")
             return 0
         if n_prompts <= 0:
             return 0
@@ -527,24 +534,25 @@ class PSRL_AgentLoopManager:
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)
             else:
-                if self.stop_train_dispatch_task:
-                    psrl_logger.warning(
-                        "notify_group_failed (train): dispatch task stopped, skipping replacement for parent_id=%s.",
-                        parent_id,
-                    )
-                    return
-                if self.train_data_queue.empty():
-                    psrl_logger.warning(
-                        "notify_group_failed (train): train_data_queue is empty, "
-                        "no replacement available for parent_id=%s.",
-                        parent_id,
-                    )
-                    return
+                # Refill the vacated slot with ONE fresh prompt from the dataset,
+                # regardless of dispatch-loop state. A failed group must be
+                # compensated by one extra prompt to keep the dispatched-success
+                # count whole; popping the pre-dispatch queue (the old behavior)
+                # does NOT add a group, it only consumes a future one early, so the
+                # deficit is merely deferred to the final buffer, which then hangs.
+                # `_retry_data` dispatches directly to workers (bypassing the queue
+                # and its END signal), and the collect task stays alive post-END, so
+                # the refill's result is still accumulated into the waiting buffer.
+                # `sample_train_prompts` cycles epochs without bound (total_epochs is
+                # enforced only in the busy loop), so the only way this returns 0 in
+                # training is a full manager shutdown — there is no "dataset
+                # exhausted" deadlock to recover from here, unlike validation.
+                dispatched = await self._retry_data(n_prompts=1)
                 psrl_logger.info(
-                    "notify_group_failed (train): dispatching replacement group for parent_id=%s.",
+                    "notify_group_failed (train): dispatched %d fresh replacement request(s) for parent_id=%s.",
+                    dispatched,
                     parent_id,
                 )
-                await self._retry_data(n_prompts=1)
 
     def _get_expected_ps_version(self):
         """

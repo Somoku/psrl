@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -13,9 +14,11 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     request_raw,
 )
+from psrl.utils.logger import DualOutputHandler
 from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH
 
-psrl_logger = logging.getLogger(__name__)
+psrl_logger = logging.getLogger(__file__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 @dataclass(slots=True)

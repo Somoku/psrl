@@ -422,6 +422,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "compilation_config": compilation_config,
             # AGENT(VERL): thread runner/task through for pooling model support in PSRL
             "runner": self.config.get("runner", "generate"),
+            "no_async_scheduling": True,
             **engine_kwargs,
         }
 
@@ -869,12 +870,16 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # KV cache-aware routing labels: instance id lets SMG address this
         # instance as a migration transfer destination; the source instance
-        # resolves the peer URL from its own broadcast peer registry.
+        # resolves the actual per-rank peer URLs from its own broadcast peer
+        # registry. The single-string label here is a best-effort seed (rank 0)
+        # for SMG's dst_peer_url; the authoritative per-rank list is the registry.
         lmcache_instance_id = None
         lmcache_peer_url = None
         if self.kv_cache_manager is not None and self.kv_cache_manager.config.enable_p2p:
             lmcache_instance_id = self.kv_cache_manager.config.lmcache_instance_id
-            lmcache_peer_url = self.kv_cache_manager.peer_registry.get(lmcache_instance_id)
+            own_peer_urls = self.kv_cache_manager.peer_registry.get(lmcache_instance_id)
+            if own_peer_urls:
+                lmcache_peer_url = own_peer_urls[0]
 
         payload = build_worker_registration_payload(
             url=f"grpc://{self._server_address}:{self._server_port}",
@@ -1366,10 +1371,19 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
         return await kv_cache_manager.transfer_direct(tokens, src, dst, copy)
 
-    def kv_set_peer_registry(self, registry: dict[str, str], worker_zmq_url: str | None = None) -> None:
-        """Set peer registry for direct LMCache transfer bypass."""
+    def kv_set_peer_registry(
+        self,
+        registry: dict[str, list[str]],
+        worker_zmq_urls: list[str] | None = None,
+    ) -> None:
+        """Set peer registry for direct LMCache transfer bypass.
+
+        Args:
+            registry: Maps lmcache_instance_id → rank-sorted list of peer_init_url.
+            worker_zmq_urls: This replica's rank-sorted local LMCacheWorker ZMQ URLs.
+        """
         assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_url)
+        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
         """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""

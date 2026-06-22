@@ -141,16 +141,24 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
                 psrl_logger.error("mini-SWE-agent runner failed: %s.", result.get("error", "unknown error"))
                 return None, TerminateReason.ROLLOUT_ERROR
 
+            # A context-window overflow is not a fatal error: the turns produced
+            # before the overflow are valid training data. Recover them and treat
+            # the trajectory as a normal max-length termination so the group is
+            # not aborted.
+            context_exceeded = result.get("exit_status") == "context_exceeded"
+
             arrays = await self.get_training_arrays(session_id, request.get("trajectory_id", 0))
             if arrays["num_turns"] == 0:
                 return None, TerminateReason.UNKNOWN
             self.attach_training_arrays(agent_data, arrays, update_turn_counts=True)
             agent_data.set_patch(result.get("submission") or None)
+            if result.get("timing") is not None:
+                agent_data.set_timing(result["timing"])
             if result.get("grader_result") is not None:
                 agent_data.set_grader_result(result["grader_result"])
 
             terminate_reason = TerminateReason.FINISHED
-            if len(arrays["response_ids"]) >= int(self.rollout_config.response_length):
+            if context_exceeded or len(arrays["response_ids"]) >= int(self.rollout_config.response_length):
                 terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
             elif arrays["num_turns"] >= self.max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED

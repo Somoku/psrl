@@ -363,11 +363,11 @@ class RolloutRouter:
                     candidates,
                 )
 
-        # 3. If forbidden group sampling on multiple instances, only consider the
-        # instance that other requests in the same group are already routed to
+        # 3. If group sticky routing is enabled, only consider the instance that
+        # other requests in the same group are already routed to.
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-        enable_multi_instance_group = self.config.psrl.routing_strategy.enable_group_sampling_on_multi_instances
-        if not enable_multi_instance_group:
+        enable_group_sticky = self.config.psrl.routing_strategy.enable_group_sticky
+        if enable_group_sticky:
             group_request_instance_ids = [
                 instance_id
                 for incomplete_request_id, instance_id in self.incomplete_request_to_instance.items()

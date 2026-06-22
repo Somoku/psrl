@@ -24,7 +24,7 @@ echo "2. Install basic packages"
 python -m uv pip install "transformers==5.10.1" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
     "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko sortedcontainers \
     ray[default]==2.49.1 codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler blobfile xgrammar \
-    pytest py-spy pre-commit ruff meson ninja pynvml requests einops trl maturin puccinialin
+    pytest py-spy pre-commit ruff meson ninja pynvml requests einops trl maturin puccinialin protoc-wheel-0 nvidia-modelopt[torch]
 
 python -m uv pip uninstall -y pynvml nvidia-ml-py
 python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
@@ -62,6 +62,8 @@ echo "Building SMG from source..."
 pushd $THIRD_PARTY_PATH
 git clone https://github.com/Somoku/smg.git -b psrl-dev
 cd smg
+# Comment out the smg-tui workspace dependency (not needed for PSRL build)
+sed -i 's|^smg-tui = { version = "0.1.0", path = "tui" }|# smg-tui = { version = "0.1.0", path = "tui" }|' Cargo.toml
 # Build release binary with PSRL policies
 cargo build --release
 python -m uv pip install -e crates/grpc_client/python/

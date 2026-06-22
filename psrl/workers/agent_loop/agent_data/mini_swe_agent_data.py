@@ -34,6 +34,7 @@ class MiniSWEAgentData(ConversationAgentData):
         self.patch: str | None = None
         self.problem_statement = ""
         self.grader_result: dict = {}
+        self.timing: dict = {}
 
     def reset(self) -> None:
         """Reset trajectory and SWE-specific state."""
@@ -41,6 +42,7 @@ class MiniSWEAgentData(ConversationAgentData):
         self.patch = None
         self.problem_statement = ""
         self.grader_result = {}
+        self.timing = {}
 
     def init_trajectory(self, request: dict) -> None:
         """Initialize trajectory metadata and capture the problem statement."""
@@ -54,6 +56,10 @@ class MiniSWEAgentData(ConversationAgentData):
     def set_grader_result(self, result: dict) -> None:
         """Store the optional post-rollout grading result."""
         self.grader_result = result
+
+    def set_timing(self, timing: dict) -> None:
+        """Store per-trajectory wall-clock timing reported by the runner."""
+        self.timing = timing or {}
 
     async def encode_messages(
         self,
@@ -79,6 +85,7 @@ class MiniSWEAgentData(ConversationAgentData):
                 "alignment_failure_reason": "",
                 "grader_result": self.grader_result,
                 "acc": float(bool(self.grader_result.get("resolved", False))),
+                "timing": self.timing,
             }
         )
         return await super().finalize_output()

@@ -58,10 +58,11 @@ class MultiTurnCompletionAgentLoop(SessionAgentLoop):
                     break
 
                 try:
-                    env_step_output = await asyncio.wait_for(
-                        env.step(action),
-                        timeout=self.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout,
-                    )
+                    with self.timer.env():
+                        env_step_output = await asyncio.wait_for(
+                            env.step(action),
+                            timeout=self.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout,
+                        )
                 except asyncio.TimeoutError:
                     terminate_reason = TerminateReason.ENV_TIMEOUT
                     break

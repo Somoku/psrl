@@ -299,8 +299,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
-        if self.config.cudagraph_capture_sizes:
-            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
@@ -331,6 +329,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 dcp_size,
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
+        if self.config.cudagraph_capture_sizes:
+            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
         args = {
@@ -360,8 +360,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "compilation_config": compilation_config,
             # AGENT(VERL): thread runner/task through for pooling model support in PSRL
             "runner": self.config.get("runner", "generate"),
-            # NOTE(linsh): disable async scheduling for performance
-            "no_async_scheduling": True,
             **engine_kwargs,
         }
 

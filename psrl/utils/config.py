@@ -147,11 +147,7 @@ def validate_config(
         print(f"NOTICE: NIXL is enabled. Actor strategy used is {config.train_actor_rollout_ref.actor.strategy}")
 
     # Check validate mode
-    if config.psrl.colocate_validate_and_train:
-        assert config.psrl.tms.range == "train" or config.psrl.tms.range == "all", (
-            "TMS range must be 'train' or 'all' when using colocate_validate_and_train"
-        )
-    else:
+    if not config.psrl.colocate_validate_and_train:
         assert config.psrl.fuse_rollout_with_validate, (
             "fuse_rollout_with_validate must be enabled when not colocate_validate_and_train"
         )

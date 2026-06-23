@@ -418,6 +418,8 @@ class PSRL_BaseTrainWorker:
             self.nixl_pull_model()
             # ---- DEBUG: log train info AFTER pull ----
             self._debug_log_train_info(label=f"TRAIN_AFTER_PULL_R{self.worker_rank}")
+            # Reload the optimizer's fp32/bf16 copy from the model's current bf16 params
+            self.reload_optimizer_after_pull()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Restore non-persistent buffers (e.g. inv_freq) that are not transferred by NIXL pull.
@@ -484,6 +486,15 @@ class PSRL_BaseTrainWorker:
         if self.nixl_storage_client is not None:
             self.nixl_storage_client.log_shard_info(label=label)
         self._debug_log_train_model_info(label=label)
+
+    def reload_optimizer_after_pull(self):
+        """Reload optimizer's fp32/bf16 master params from the model's current bf16 params.
+
+        Must be called after NIXL pull updates the model weights, so that the optimizer's
+        internal fp32/bf16 copy reflects the pulled weights rather than the stale initialization values.
+        Subclasses should override if the optimizer provides a reload API.
+        """
+        pass
 
     def _debug_log_train_model_info(self, label: str):
         """Debug log the train model info."""

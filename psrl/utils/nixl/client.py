@@ -459,6 +459,7 @@ class NIXLStorageClient:
                     self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
                     local_pos = reregister_shard_pos_cache[key][shard_idx]
                     self.local_client_info.tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
+            self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
             return
 
         tms_ctx = torch_memory_saver.region(tag="nixl") if self.enable_tms_for_temp_buffers else nullcontext()
@@ -483,7 +484,7 @@ class NIXLStorageClient:
                 # Scan the state_dict and find all the tensors that are not contiguous
                 for key, tensor in state_dict.items():
                     assert key in sharding_dict, f"Key {key} not found in sharding_dict."
-                    if tensor.device == torch.device("meta"):
+                    if tensor.device == torch.device("meta") or tensor.untyped_storage().nbytes() == 0:
                         continue
                     sharding = sharding_dict[key]
                     shard_indices = sharding.shard_indices
@@ -537,6 +538,8 @@ class NIXLStorageClient:
                 entries: list[tuple[tuple[Any, Any], tuple[int, ...], torch.dtype]] = []
                 for key, tensor in state_dict.items():
                     assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                    if tensor.device != torch.device("meta") and tensor.untyped_storage().nbytes() == 0:
+                        tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
                     sharding = sharding_dict[key]
                     shard_indices = sharding.shard_indices
                     local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
@@ -807,6 +810,12 @@ class NIXLStorageClient:
 
             if binded_meta_tensor_mapping is None:
                 self._ensure_all_tensor_registered_high_level()
+
+            # Keep _all_temp_mappings in sync with the freshly built _temp_desc_bytes_mapping
+            # so that client_read() finds descriptors after re-registration (e.g. wake-up
+            # after an initial meta-only registration).
+            self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
+
             psrl_logger.info(f"{self.client_name} all local tensors are registered.")
 
     def deregister_local_tensors(self):

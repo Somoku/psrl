@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pprint import pprint
 from typing import Any
 
@@ -163,7 +163,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # Created before vLLM engine init so LMCache env vars and engine args
         # are visible to vLLM, then attached to the live engine in run_server().
         self.kv_cache_manager: KVCacheManager | None = None
-        self._kv_cache_hash_consumer_task: asyncio.Task | None = None
 
         # NOTE(linsh): determine at construction time whether this server runs a pooling model
         # (e.g., reward / embedding model) so that generate() can dispatch to encode() accordingly.
@@ -276,67 +275,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             f"(topic=kv@{instance_id}, +dp_rank per rank)"
         )
         return {"kv_events_config": kv_events_config}
-
-    async def _consume_kv_cache_hash_queue(self, kv_cache_hash_queue) -> None:
-        """Consume pushed GPU/LMCache cache snapshots into `KVCacheManager`."""
-        import queue as _queue
-
-        assert self.kv_cache_manager is not None, "kv_cache_manager must be initialized."
-
-        lmcache_log_count = 0
-        lmcache_hash_verified = False
-        while True:
-            try:
-                latest_snapshot = None
-                while True:
-                    try:
-                        latest_snapshot = kv_cache_hash_queue.get_nowait()
-                    except _queue.Empty:
-                        break
-
-                if latest_snapshot is not None:
-                    self.kv_cache_manager.update_gpu_cache_snapshot(latest_snapshot)
-                    lmcache_snapshot = latest_snapshot.get("lmcache")
-                    if lmcache_snapshot is not None:
-                        self.kv_cache_manager.update_lmcache_backend_snapshot(lmcache_snapshot)
-                        lmcache_log_count += 1
-                        if not lmcache_hash_verified and "hash_probe" in lmcache_snapshot:
-                            lmcache_hash_verified = True
-                            expected = lmcache_snapshot["hash_probe"]
-                            none_hash = lmcache_snapshot.get("none_hash", 0)
-                            local_fn = self.kv_cache_manager._get_lmcache_hash_fn()
-                            local_probe = local_fn((none_hash, (0, 1, 2, 3), ()))
-                            if local_probe != expected:
-                                psrl_logger.error(
-                                    "[KVCacheConsumer] Hash mismatch. "
-                                    f"EngineCore hash_probe={expected}, "
-                                    f"server hash_probe={local_probe}. "
-                                    "Set PYTHONHASHSEED=0 before launching Ray/Python."
-                                )
-                            else:
-                                psrl_logger.info(
-                                    "[KVCacheConsumer] Hash consistency verified "
-                                    f"(algo={lmcache_snapshot.get('hash_algo', 'N/A')})."
-                                )
-                        if lmcache_log_count <= 3 or lmcache_log_count % 100 == 0:
-                            psrl_logger.info(
-                                "[KVCacheConsumer] LMCache snapshot received "
-                                f"(count={lmcache_log_count}, "
-                                f"chunk_hash_set size={len(lmcache_snapshot.get('chunk_hash_set', []))}, "
-                                f"hash_algo={lmcache_snapshot.get('hash_algo', 'N/A')})."
-                            )
-                    elif lmcache_log_count == 0:
-                        lmcache_log_count = -1
-                        psrl_logger.warning(
-                            "[KVCacheConsumer] Snapshot received without lmcache key. "
-                            f"Keys: {list(latest_snapshot.keys())!r}."
-                        )
-                await asyncio.sleep(0.05)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                psrl_logger.warning(f"Error consuming kv_cache_hash_queue: {e!r}.")
-                await asyncio.sleep(0.5)
 
     async def launch_server(
         self, master_address: str | None = None, master_port: int | None = None, dp_rpc_port: int | None = None
@@ -602,11 +540,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             _endpoint = self.gen_interface.status_endpoint or ""
             self.status_queue = ZMQPushQueue(_endpoint)
             self.stat_collector.init_output_queue(self.status_queue)
-            if self.kv_cache_manager is not None:
-                import queue as _queue
-
-                self.kv_cache_hash_queue: _queue.SimpleQueue = _queue.SimpleQueue()
-                self.stat_collector.init_kv_cache_hash_queue(self.kv_cache_hash_queue)
             for data_parallel_rank in range(self.config.data_parallel_size):
                 self.stat_collector.record_model_version_update(0, data_parallel_rank)
             kwargs["stat_loggers"] = [self.stat_collector, self.psrl_preemption_logger]
@@ -629,10 +562,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.engine = engine_client
         assert self.kv_cache_manager is not None, "kv_cache_manager must be initialized before engine startup."
         self.kv_cache_manager.attach_engine(engine_client)
-        if hasattr(self, "kv_cache_hash_queue"):
-            self._kv_cache_hash_consumer_task = asyncio.ensure_future(
-                self._consume_kv_cache_hash_queue(self.kv_cache_hash_queue)
-            )
         psrl_logger.info("[KVCacheManager]: Engine attached after vLLM server initialization.")
 
         # self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
@@ -1301,13 +1230,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
         return self.kv_cache_manager
 
-    async def kv_get_cache_info(self, tokens: list[int]) -> dict:
-        """Query GPU prefix-cache and LMCache backend usage for the given tokens."""
-        kv_cache_manager = self._assert_kv_cache_manager()
-        assert tokens, "tokens must be a non-empty list."
-        info = await kv_cache_manager.get_cache_info(tokens)
-        return asdict(info)
-
     async def kv_pin(self, tokens: list[int], targets: list[str]) -> bool:
         """Pin the cached prefix blocks/chunks for `tokens`."""
         kv_cache_manager = self._assert_kv_cache_manager()
@@ -1327,33 +1249,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
         )
         return await kv_cache_manager.unpin(tokens, targets)
-
-    async def kv_clear_from_backend(self, tokens: list[int]) -> int:
-        """Remove the cached prefix chunks for `tokens` from the LMCache backend."""
-        kv_cache_manager = self._assert_kv_cache_manager()
-        assert tokens, "tokens must be a non-empty list."
-        return await kv_cache_manager.clear_from_backend(tokens)
-
-    async def kv_transfer(
-        self,
-        tokens: list[int],
-        src: tuple[str, str],
-        dst: tuple[str, str],
-        copy: bool = False,
-    ) -> bool:
-        """Transfer KV cache through the shared LMCache Controller."""
-        kv_cache_manager = self._assert_kv_cache_manager()
-        assert tokens, "tokens must be a non-empty list."
-        assert len(src) == 2, f"src must be a 2-tuple, got length {len(src)}."
-        assert len(dst) == 2, f"dst must be a 2-tuple, got length {len(dst)}."
-        result = await kv_cache_manager.transfer(tokens, src, dst, copy)
-        if not result:
-            err = getattr(kv_cache_manager, "_last_transfer_error", "unknown")
-            psrl_logger.warning(
-                "[KVTransfer] transfer() returned False: "
-                f"src={src!r}, dst={dst!r}, tokens_len={len(tokens)}, error={err!r}."
-            )
-        return result
 
     async def kv_transfer_direct(
         self,

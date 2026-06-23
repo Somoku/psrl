@@ -153,20 +153,6 @@ class DPLBStatCollector(StatLoggerBase):
         """
         self.output_queue = output_queue
 
-    def init_kv_cache_hash_queue(self, kv_cache_hash_queue) -> None:
-        """
-        Initialize the queue for pushing GPU prefix cache hash snapshots to the server actor.
-
-        The StatCollector pushes hash snapshots (received via SchedulerStats IPC from
-        the EngineCore process) to this queue. The server actor consumes the queue
-        and stores the hash set in its `KVCacheManager`, enabling fast local prefix-cache
-        hit computation without blocking on EngineCore RPC.
-
-        Args:
-            kv_cache_hash_queue: In-process queue for sending hash snapshots to the server actor.
-        """
-        self.kv_cache_hash_queue = kv_cache_hash_queue
-
     def record_model_version_update(self, model_version: int, engine_index: int):
         """
         Set the model version for this engine instance.
@@ -218,7 +204,6 @@ class DPLBStatCollector(StatLoggerBase):
         assert self.output_queue is not None, "Output queue is not initialized"
 
         curr_time = time.time()
-        raw_scheduler_stats = scheduler_stats
 
         if scheduler_stats is not None:
             scheduler_stats = {
@@ -361,24 +346,6 @@ class DPLBStatCollector(StatLoggerBase):
                     snapshot=snapshot,
                 )
             )
-            # Push GPU prefix cache hash snapshot to the server actor's `KVCacheManager`.
-            # The snapshot is produced by RolloutScheduler.make_stats() in the EngineCore
-            # process and arrives here via SchedulerStats IPC.
-            if hasattr(self, "kv_cache_hash_queue"):
-                assert raw_scheduler_stats is not None, (
-                    "raw_scheduler_stats is None. RolloutScheduler.make_stats() should provide stats "
-                    "when kv_cache_hash_queue is enabled."
-                )
-                assert raw_scheduler_stats.gpu_prefix_cache_snapshot is not None, (
-                    "gpu_prefix_cache_snapshot is None in SchedulerStats. "
-                    "RolloutScheduler.make_stats() should always populate this field."
-                )
-                snapshot_payload = raw_scheduler_stats.gpu_prefix_cache_snapshot
-                # Piggyback LMCache backend snapshot onto the same queue payload.
-                if raw_scheduler_stats.lmcache_backend_snapshot is not None:
-                    snapshot_payload = dict(snapshot_payload)  # shallow copy to avoid mutation
-                    snapshot_payload["lmcache"] = raw_scheduler_stats.lmcache_backend_snapshot
-                self.kv_cache_hash_queue.put_nowait(snapshot_payload)
             self.last_push_to_queue_time = curr_time
 
     def log_engine_initialized(self):

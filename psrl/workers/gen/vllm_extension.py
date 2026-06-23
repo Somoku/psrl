@@ -321,71 +321,6 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         # `process_tokens` returns `(start, end, key)` triples; extract the keys.
         return [key for _, _, key in triples]
 
-    def _get_lmcache_total_bytes(self) -> int:
-        """
-        Return the total byte capacity of the LMCache local CPU backend allocator.
-
-        Returns:
-            int: Total bytes, or 0 if the allocator does not expose `total_size`.
-        """
-        engine = self._get_lmcache_engine()
-        backend = engine.storage_manager.local_cpu_backend
-        allocator = backend.memory_allocator
-        # `MixedMemoryAllocator` / `PagedCpuGpuMemoryAllocator` expose `total_size`.
-        return int(getattr(allocator, "total_size", 0))
-
-    def lmcache_get_backend_cache_info(self, tokens: list[int]) -> dict:
-        """
-        Return LMCache backend usage statistics for `tokens`.
-
-        Only covers the LMCache backend side.  GPU prefix-cache statistics are
-        queried separately on `RolloutScheduler` via `call_utility_async` from
-        `KVCacheManager`.
-
-        The returned dict is merged with `psrl_get_gpu_cache_info` output in
-        `KVCacheManager.get_cache_info` to construct a `TrajectoryCacheInfo`.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            dict: Backend cache usage statistics plus `total_tokens`,
-                `gpu_pinned`, and `backend_pinned` sentinel fields.
-        """
-        assert tokens, "tokens must be a non-empty list."
-
-        # LMCache backend side
-        engine = self._get_lmcache_engine()
-        keys = self._get_lmcache_chunk_keys(tokens)
-        lmcache_hit_count, _ = engine.storage_manager.batched_contains(keys)
-        # Chunk size from LMCache config; fall back to 256 tokens.
-        chunk_size = getattr(engine.token_database, "chunk_size", 256)
-        lmcache_cached_tokens = lmcache_hit_count * chunk_size
-        # Estimate bytes: each full chunk occupies (chunk_size × hidden_dim × dtype_size).
-        # Use `get_full_chunk_size_bytes` if available on the backend.
-        backend = engine.storage_manager.local_cpu_backend
-        try:
-            chunk_bytes = backend.get_full_chunk_size_bytes()
-        except Exception as e:
-            psrl_logger.warning(f"[LMCache] get_full_chunk_size_bytes unavailable, bytes will be 0: {e!r}.")
-            chunk_bytes = 0
-        lmcache_bytes = lmcache_hit_count * chunk_bytes
-        lmcache_total_bytes = self._get_lmcache_total_bytes()
-        lmcache_usage_pct = lmcache_bytes / lmcache_total_bytes if lmcache_total_bytes > 0 else 0.0
-
-        return {
-            "total_tokens": len(tokens),
-            "lmcache_cached_chunks": lmcache_hit_count,
-            "lmcache_cached_tokens": lmcache_cached_tokens,
-            "lmcache_bytes": lmcache_bytes,
-            "lmcache_total_bytes": lmcache_total_bytes,
-            "lmcache_usage_pct": lmcache_usage_pct,
-            # NOTE(claude): PSRL pin state is tracked in `KVCacheManager`, not
-            # in the worker — returning False here is always correct.
-            "gpu_pinned": False,
-            "backend_pinned": False,
-        }
-
     def lmcache_pin_backend(self, tokens: list[int]) -> int:
         """
         Pin the cached backend chunks for `tokens` to prevent LRU eviction.
@@ -493,22 +428,6 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             memory_obj.ref_count_down()
             freed += 1
         return freed
-
-    def lmcache_clear_from_backend(self, tokens: list[int]) -> int:
-        """
-        Remove the cached prefix chunks for `tokens` from the LMCache backend.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            int: Number of chunks removed.
-        """
-        assert tokens, "tokens must be a non-empty list."
-        engine = self._get_lmcache_engine()
-        keys = self._get_lmcache_chunk_keys(tokens)
-        n = engine.storage_manager.batched_remove(keys)
-        return n
 
     def lmcache_clear_all_from_backend(self) -> None:
         """

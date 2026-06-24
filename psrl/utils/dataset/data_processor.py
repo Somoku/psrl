@@ -375,6 +375,7 @@ class DataProcessor:
         # you can find it by searching for `# save dataloader` in that file.
 
         for i, dataloader in enumerate(self.train_dataloaders):
+            os.makedirs(os.path.dirname(dataloader_local_paths[i]), exist_ok=True)
             torch.save(dataloader.state_dict(), dataloader_local_paths[i])
         psrl_logger.info(f"Train dataloader saved to {dataloader_local_paths}")
 

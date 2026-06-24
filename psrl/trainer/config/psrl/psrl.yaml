@@ -355,18 +355,6 @@ routing_strategy:
   # It is used to estimate the length of the response tokens
   request_budget: 1024
 
-  # [kv_cache_aware] Timeout in milliseconds for a single kv_get_cache_info RPC
-  # per candidate instance. Instances that exceed the timeout receive score 0
-  # (graceful degradation). Ignored by all other routing strategies.
-  #
-  # NOTE: kv_get_cache_info calls psrl_get_gpu_cache_info via call_utility_async,
-  # which is sent to the EngineCore's input queue and only processed AFTER the
-  # current GPU step (schedule + execute_model + update_from_output) completes.
-  # For long sequences (e.g., AIME), a single step can easily take 5–20 seconds.
-  # Set this high enough to cover the worst-case step duration; a timeout merely
-  # degrades routing quality (score 0) but does not affect correctness.
-  kv_query_timeout_ms: 30000
-
   # Snapshot staleness threshold in milliseconds
   # Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
   snapshot_staleness_threshold_in_ms: 1000

@@ -145,7 +145,6 @@ def build_worker_registration_payload(
     pp_size: int,
     kv_block_size: int | None = None,
     lmcache_instance_id: str | None = None,
-    lmcache_peer_url: str | None = None,
 ) -> dict[str, Any]:
     labels = {
         "max_model_len": str(max_model_len),
@@ -157,12 +156,13 @@ def build_worker_registration_payload(
     # before the first KV event arrives (kv_event_monitor falls back to this).
     if kv_block_size:
         labels["kv_block_size"] = str(kv_block_size)
-    # LMCache addressing for cross-instance KV transfer (consumed by SMG's
-    # KvTransferCoordinator to target this instance as a migration destination).
+    # LMCache instance id for cross-instance KV transfer: SMG's
+    # KvTransferCoordinator carries this id in TransferKv to target this instance
+    # as a migration destination. The source servicer resolves the actual
+    # per-rank peer URLs from its own broadcast registry, so no peer URL is sent
+    # at registration time.
     if lmcache_instance_id:
         labels["lmcache_instance_id"] = lmcache_instance_id
-    if lmcache_peer_url:
-        labels["lmcache_peer_url"] = lmcache_peer_url
     return {
         "url": url,
         "worker_type": "regular",

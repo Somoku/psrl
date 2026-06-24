@@ -12,9 +12,14 @@ from dataclasses import dataclass
 
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
+import litellm  # noqa: E402
 import ray  # noqa: E402
 from examples.mini_swe.config import MiniSWEAgentRuntimeConfig, build_runtime_config  # noqa: E402
 from litellm import ModelResponse  # noqa: E402
+
+# litellm prints a "Give Feedback / Get Help" banner via bare print() on every mapped
+# exception (e.g. vLLM 400 on overlong prompts, an expected case here). Silence it.
+litellm.suppress_debug_info = True
 from minisweagent.agents.default import DefaultAgent  # noqa: E402
 from minisweagent.environments.docker import DockerEnvironment  # noqa: E402
 from minisweagent.exceptions import FormatError, InterruptAgentFlow  # noqa: E402

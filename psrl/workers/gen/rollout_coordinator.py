@@ -1090,12 +1090,6 @@ class RolloutCoordinator(CommandExtension):
                     await self._publish_weight_version_updates(updates)
                     for instance_id in instance_ids:
                         self.instance_to_version_after_sync[instance_id] = self.ps_model_version
-                    await asyncio.gather(
-                        *[
-                            self.server_handles[replica_id].open_grpc_generate_admission.remote()
-                            for replica_id in replica_ids
-                        ]
-                    )
                     await self._set_routing_loop_running(True)
                     psrl_logger.info(
                         f"Published version {self.ps_model_version} and resumed routing for replicas {replica_ids}"

@@ -140,6 +140,11 @@ class PSRL_AgentLoopManager:
         # when multiple siblings in the same group fail concurrently.
         self._failed_group_ids: set[int] = set()
 
+        # Set when an entire validation round drains via failures (val_buffer_size
+        # reaches 0). Lets a waiter that registers after the last failure still
+        # observe the all-failed condition instead of blocking forever.
+        self._val_round_all_failed: bool = False
+
         # Build logger
         self.log_prefix = "AgentLoopManager"
         psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
@@ -200,6 +205,7 @@ class PSRL_AgentLoopManager:
         """Set the validation buffer size."""
         self.val_buffer_size = val_buffer_size
         self._failed_group_ids.clear()
+        self._val_round_all_failed = False
 
     def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
         """Set the reward manager for awaiting async reward completion."""
@@ -533,6 +539,28 @@ class PSRL_AgentLoopManager:
                             self.val_buffer_size,
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)
+
+                # When every group in this validation round fails, val_buffer_size
+                # shrinks to 0 while no accumulated buffer was ever created (occupy
+                # never succeeded, so accumulated sizes are always >= 1). The firing
+                # loop above then matches nothing and the trainer's waiter would block
+                # forever. Resolve any still-pending val waiter with an empty batch so
+                # validation completes with empty metrics instead of deadlocking.
+                if self.val_buffer_size <= 0:
+                    # Latch the all-failed state so a waiter registering after this
+                    # last failure (race) still observes it instead of blocking.
+                    self._val_round_all_failed = True
+                    empty_batch = KVBatchMeta(keys=[], tags=[], partition_id="val")
+                    for waiter_buffer_id in list(self._val_buffer_waiters.keys()):
+                        psrl_logger.warning(
+                            "notify_group_failed (val): all groups failed (val_buffer_size=0); "
+                            "waking waiter for buffer_id=%d with an empty batch to avoid deadlock.",
+                            waiter_buffer_id,
+                        )
+                        for fut in self._val_buffer_waiters[waiter_buffer_id]:
+                            if not fut.done():
+                                fut.set_result(empty_batch)
+                        del self._val_buffer_waiters[waiter_buffer_id]
             else:
                 # Refill the vacated slot with ONE fresh prompt from the dataset,
                 # regardless of dispatch-loop state. A failed group must be
@@ -1390,6 +1418,17 @@ class PSRL_AgentLoopManager:
             # If the buffer is ready, return immediately
             psrl_logger.info(f"Validate buffer {buffer_id} is ready, returning immediately.")
             return self.consume_buffer(buffer_id, is_validate=True)
+
+        # Race guard: the entire validation round may have already drained via
+        # failures before this waiter registered. In that case no buffer will
+        # ever be assembled, so return an empty batch instead of blocking.
+        if self._val_round_all_failed:
+            psrl_logger.warning(
+                "Validate buffer %d: all groups in this round already failed; "
+                "returning an empty batch to avoid deadlock.",
+                buffer_id,
+            )
+            return KVBatchMeta(keys=[], tags=[], partition_id="val")
 
         # TODO(lhy): support more consumption strategies, now only support waiting for the buffer to be ready
         # 1. Partial rollout if buffer status is STUCK

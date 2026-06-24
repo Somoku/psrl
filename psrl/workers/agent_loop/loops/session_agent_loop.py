@@ -78,14 +78,14 @@ class SessionAgentLoop(AgentLoopBase):
             headers=self.build_session_headers(request),
         )
         session_id = str(response["session_id"])
-        psrl_logger.info("Created TITO session %r.", session_id)
+        psrl_logger.debug("Created TITO session %r.", session_id)
         return session_id
 
     async def delete_session(self, session_id: str) -> None:
         """Delete one TITO session after its requests have drained."""
         try:
             response = await delete(f"{self.session_router_url}/sessions/{session_id}")
-            psrl_logger.info("Deleted TITO session %r with status %r.", session_id, response.status)
+            psrl_logger.debug("Deleted TITO session %r with status %r.", session_id, response.status)
         except Exception:
             psrl_logger.warning("Failed to delete TITO session %r.", session_id, exc_info=True)
 

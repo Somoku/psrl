@@ -30,8 +30,6 @@ from psrl.utils.converter import create_parameter_mapping
 if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
 
-from megatron.bridge.models.conversion.utils import unwrap_model
-
 try:
     from psrl.utils.converter.megatron_converter import convert_megatron_inplace  # noqa: E402
 except ImportError:
@@ -343,6 +341,22 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             raise NotImplementedError(
                 f"_restore_non_persistent_buffers_from_ps does not support strategy '{strategy}'."
             )
+
+    def pull_model(self, is_initial: bool = False):
+        """Pull weights from PS.
+
+        Args:
+            is_initial: If True, resync the optimizer's fp32 master params after
+                pulling. Must be set on the very first pull (empty-init path): the
+                optimizer is built before any weights arrive, so its fp32 master copy
+                holds garbage values until resynced from the freshly pulled model params.
+        """
+        super().pull_model()
+        if is_initial and self.config.actor.strategy == "megatron" and self._is_actor and self.actor is not None:
+            from psrl.utils.converter.megatron_optimizer import sync_master_params_from_model
+
+            sync_master_params_from_model(self.actor.engine)
+            psrl_logger.info(f"[pull_model] Resynced optimizer master params from model on R{self.rank}.")
 
     @deprecated("Reserved as a manual memory management example for FSDP. Use torch_memory_saver instead.")
     def _sleep_fsdp_model(self, model):

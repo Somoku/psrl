@@ -1082,6 +1082,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
                 self.replay_buffer.sample(test_result.keys, test_result.partition_id)
 
+            # An empty batch means every group in this validation round failed
+            # (e.g. all sandboxes failed to launch). There is nothing to score or
+            # log; skip it so validation completes with whatever metrics remain
+            # instead of crashing on empty-key TQ reads.
+            if len(test_result.keys) == 0:
+                psrl_logger.warning(
+                    "Validation batch %s is empty (all groups failed); skipping.",
+                    val_buffer_id,
+                )
+                continue
+
             # 3. Score the batch via TQ-native compute_score_for_validation.
             if self.config.reward.launch_reward_fn_async:
                 with log_dual_events("Wait for reward of validate", psrl_logger, event_type=EventType.WAIT):
@@ -2132,7 +2143,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 initial_pull_futures = []
                 initial_pull_futures.append(self.rollout_coordinator.initial_pull_from_ps.remote(initial_pull_tag))
                 if not self.is_rollout_mode_in_actor:
-                    initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model"))
+                    initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model", is_initial=True))
                 ray.get(initial_pull_futures)
 
         self.init_elastic_rm_runtime()
@@ -2938,30 +2949,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
-        # === PSRL DEBUG (remove after diagnosis) ===
-        try:
-            from verl.trainer.ppo.core_algos import _psrl_dbg as _pdbg
-
-            _olp = data["old_log_probs"]
-            _ov = _olp.values() if getattr(_olp, "is_nested", False) else _olp
-            _rl = data.get("rollout_log_probs", None)
-            _msg = (
-                f"_compute_old_log_prob done: old_lp_nested={getattr(_olp, 'is_nested', False)} "
-                f"old_lp_total={tuple(_ov.shape)} old_lp_mean={_ov.float().mean().item():.4f} "
-                f"old_lp_min={_ov.float().min().item():.4f} old_lp_max={_ov.float().max().item():.4f}"
-            )
-            if _rl is not None:
-                _rv = _rl.values() if getattr(_rl, "is_nested", False) else _rl
-                _msg += f" rollout_lp_mean={_rv.float().mean().item():.4f}"
-            _pdbg(_msg)
-        except Exception as _e:
-            try:
-                from verl.trainer.ppo.core_algos import _psrl_dbg as _pdbg
-
-                _pdbg(f"_compute_old_log_prob dbg failed: {_e!r}")
-            except Exception:
-                pass
-        # === END PSRL DEBUG ===
         if calculate_sum_pi_squared:
             data["sum_pi_squared"] = response_from_nested(data.pop("sum_pi_squared"), data["response_mask"])
         # old_log_prob_mfu = tu.get(data, "metrics")["mfu"]

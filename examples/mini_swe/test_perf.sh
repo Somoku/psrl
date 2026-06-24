@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_perf
-experiment_name=vanilla_precision_mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=free_mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 

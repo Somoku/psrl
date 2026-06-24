@@ -483,7 +483,7 @@ class PSRL_BaseTrainWorker:
         """Debug log the train info."""
         if self.nixl_storage_client is not None:
             self.nixl_storage_client.log_shard_info(label=label)
-        self._debug_log_train_model_info(label=label)
+        # self._debug_log_train_model_info(label=label)
 
     def _debug_log_train_model_info(self, label: str):
         """Debug log the train model info."""

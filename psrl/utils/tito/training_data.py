@@ -93,7 +93,7 @@ def build_training_arrays(
             all_response_mask.extend([0] * len(env_ids))
             all_logprobs.extend([0.0] * len(env_ids))
 
-            psrl_logger.info(
+            psrl_logger.debug(
                 "[TITO turn %d] env_ids: cursor=%d, prompt_len=%d, env_count=%d, env_ids[:5]=%s",
                 i,
                 cursor,
@@ -119,7 +119,7 @@ def build_training_arrays(
                     break
             trim_count = len(output_ids) - matched
 
-            psrl_logger.info(
+            psrl_logger.debug(
                 "[TITO turn %d] trim analysis: is_last=%s, matched=%d, "
                 "trim_count=%d, allowed=%d, prompt_len=%d, "
                 "output_len=%d, total_acc_len=%d",
@@ -150,7 +150,7 @@ def build_training_arrays(
             if trim_count > 0:
                 output_ids = output_ids[:matched]
                 output_logprobs = output_logprobs[:matched]
-                psrl_logger.info(
+                psrl_logger.debug(
                     "[TITO turn %d] trimmed %d tokens, remaining output_len=%d",
                     i,
                     trim_count,
@@ -168,7 +168,7 @@ def build_training_arrays(
     )
     routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
 
-    psrl_logger.info(
+    psrl_logger.debug(
         "[TITO build_training_arrays] prompt_len=%d tito_prompt_len=%d response_len=%d "
         "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d re_tokens=%s",
         len(prompt_ids),

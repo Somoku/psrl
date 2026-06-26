@@ -122,6 +122,8 @@ def _run_agent_on_swe_problem(
     from minisweagent.models import get_model
     from minisweagent.utils.serialize import recursive_merge
 
+    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
+
     image_name = get_swebench_image_name(swe_problem)
     problem = swe_problem.get("problem_statement", "")
 
@@ -184,6 +186,7 @@ def _run_agent_on_swe_problem(
     # `config=` kwarg, otherwise it gets treated as a string `input_model_name`
     # and downstream `.lower()` calls explode.
     model = get_model(config=cfg.get("model", {}))
+    ensure_overflow_handling(model)
     agent = DefaultAgent(model, env, **cfg.get("agent", {}))
 
     try:
@@ -194,6 +197,14 @@ def _run_agent_on_swe_problem(
             "n_turns": len([m for m in getattr(agent, "messages", []) if m.get("role") == "assistant"]),
             "exit_status": info.get("exit_status", ""),
             "error": None,
+        }
+    except PromptOverflowError as exc:
+        return {
+            "patch": "",
+            "messages": getattr(agent, "messages", []),
+            "n_turns": len([m for m in getattr(agent, "messages", []) if m.get("role") == "assistant"]),
+            "exit_status": "context_exceeded",
+            "error": str(exc),
         }
     except Exception as exc:
         return {

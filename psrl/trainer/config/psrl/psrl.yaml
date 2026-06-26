@@ -306,6 +306,12 @@ routing_strategy:
     # On timeout the transfer is abandoned and B falls back to re-prefill.
     transfer_timeout_ms: 5000
 
+    # Interval in seconds between periodic KV-transfer stats log lines on
+    # each source instance. Each instance's VllmEngineServicer prints a
+    # "[KVTransfer] instance=... stats: ..." summary at most once per this
+    # interval, triggered by transfer activity. 0 disables logging.
+    stats_log_interval_s: 30
+
   # [kv_cache_aware] Minimum cache-hit ratio for the approximate radix-tree path.
   # Only used by the (non event-driven) token-tree fallback; event-driven scoring
   # ignores it. Range 0.0-1.0.
@@ -649,3 +655,8 @@ rollout_gateway:
   # Number of HTTP POST actors to place on each alive Ray node when
   # use_distributed_post is enabled.
   post_actor_num_per_node: 8
+
+  # Per-module Rust log filter for the SMG gateway process (RUST_LOG syntax).
+  # Overrides the default log_level=warn when set. Use tracing directive syntax.
+  # Empty string "" means no override (use default warn level).
+  rust_log_filter: "warn,smg::routers::grpc::kv_transfer=warn,smg::routers::grpc::common::stages::worker_selector::psrl=warn"

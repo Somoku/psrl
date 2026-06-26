@@ -1137,7 +1137,8 @@ class PSRL_AgentLoopManager:
         Returns:
             List[EntryInfo]: List of extracted EntryInfo objects
         """
-        is_validate = tu.get_non_tensor_data(data, "validate", default=False)
+        _validate_raw = tu.get(data, "validate", False)
+        is_validate = bool(_validate_raw[0]) if isinstance(_validate_raw, (list, tuple)) else bool(_validate_raw)
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
         entry_infos_map: dict[int, EntryInfo] = {}
         if rollout_n > 1:

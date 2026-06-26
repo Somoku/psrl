@@ -193,6 +193,15 @@ class RewardLoopWorker:
         try:
             reward_data = await asyncio.get_event_loop().run_in_executor(None, self.pre_process, request)
             response_len = reward_data["responses"].shape[-1]
+            if response_len == 0:
+                psrl_logger.error(
+                    "reward_worker: response_len=0 for uid=%s keys=%s, "
+                    "prompts_shape=%s, responses_shape=%s",
+                    uid,
+                    request_keys,
+                    reward_data["prompts"].shape,
+                    reward_data["responses"].shape,
+                )
 
             result = await self._compute_score(reward_data)
             self.completed += 1

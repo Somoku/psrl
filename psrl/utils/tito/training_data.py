@@ -106,6 +106,25 @@ def build_training_arrays(
         output_ids = [int(pair[1]) for pair in raw_lps]
         output_logprobs = [float(pair[0]) for pair in raw_lps]
 
+        # Fallback: if output_logprobs was None but accumulated_token_ids has
+        # tokens beyond prompt_len, recover token IDs from the accumulated buffer.
+        # This happens when the session router did not record logprobs (e.g.
+        # top_logprobs=0 edge case). Logprobs are filled with 0.0.
+        if not output_ids and prompt_len < total_acc_len:
+            is_last = i == len(records) - 1
+            if is_last:
+                end = total_acc_len
+            else:
+                end = records[i + 1]["prompt_token_count"]
+            if end > prompt_len:
+                output_ids = list(accumulated_token_ids[prompt_len:end])
+                output_logprobs = [0.0] * len(output_ids)
+                psrl_logger.warning(
+                    "[TITO turn %d] output_logprobs missing, recovered %d tokens from accumulated_token_ids",
+                    i,
+                    len(output_ids),
+                )
+
         # Trailing trim for non-last turns: greedy match against accumulated.
         # The last turn never trims -- boundary tokens are part of the final output.
         is_last = i == len(records) - 1
@@ -180,6 +199,24 @@ def build_training_arrays(
         total_acc_len,
         None if routed_experts is None else routed_experts.shape[0],
     )
+
+    if not all_response_ids and records:
+        psrl_logger.error(
+            "[TITO] build_training_arrays: response_ids empty but num_turns=%d! "
+            "records=%s, accumulated_len=%d, prompt_len=%d",
+            len(records),
+            [
+                {
+                    "prompt_token_count": r.get("prompt_token_count"),
+                    "output_logprobs_len": len(r.get("output_logprobs") or []),
+                    "output_logprobs_type": type(r.get("output_logprobs")).__name__,
+                    "finish_reason": r.get("finish_reason"),
+                }
+                for r in records
+            ],
+            total_acc_len,
+            len(prompt_ids),
+        )
 
     return {
         "prompt_ids": prompt_ids,

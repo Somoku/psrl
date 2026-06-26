@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_perf
-experiment_name=free_mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -177,8 +177,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
-    psrl.routing_strategy.enable_trajectory_sticky=True \
-    psrl.routing_strategy.enable_group_sticky=True \
+    psrl.routing_strategy.enable_trajectory_sticky=False \
+    psrl.routing_strategy.enable_group_sticky=False \
     \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \

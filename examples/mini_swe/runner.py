@@ -10,6 +10,7 @@ from typing import Any
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
 psrl_logger = logging.getLogger(__name__)
+logging.getLogger("minisweagent.environment").setLevel(logging.WARNING)
 
 _PROXY_ENV_KEYS = [
     "http_proxy",
@@ -127,10 +128,11 @@ def _grade_patch(payload: dict[str, Any], patch: str) -> dict[str, Any] | None:
 
 def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     """Run one task through mini-SWE-agent's standard Python bindings."""
-    from examples.mini_swe.eval.xml_fc_model import PromptOverflowError
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.environments import get_environment
     from minisweagent.models import get_model
+
+    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
 
     class _TimedAgent(DefaultAgent):
         """DefaultAgent that accumulates wall-clock model vs environment time.
@@ -169,6 +171,7 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         environment = get_environment(_build_environment_config(payload))
         model = get_model(config=_build_model_config(payload))
+        ensure_overflow_handling(model)
         agent_config = dict(payload["runtime_config"]["agent"])
         agent_config["instance_template"] = agent_config.pop("problem_template")
         agent_config["step_limit"] = payload["max_turns"]

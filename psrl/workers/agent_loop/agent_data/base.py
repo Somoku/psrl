@@ -594,6 +594,18 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             trajectory.response_ids = trajectory.response_ids[:response_length]
             trajectory.response_mask = trajectory.response_mask[:response_length]
             trajectory.response_logprobs = trajectory.response_logprobs[:response_length]
+            if not trajectory.response_ids:
+                psrl_logger.error(
+                    "finalize_output: empty response_ids for uid=%s, "
+                    "prompt_ids_len=%d, response_length_cfg=%d, "
+                    "num_trajectories=%d, assistant_turns=%d, user_turns=%d",
+                    self.session_data.request_id,
+                    len(trajectory.prompt_ids),
+                    response_length,
+                    len(self.session_data.trajectories),
+                    self.session_data.assistant_turns,
+                    self.session_data.user_turns,
+                )
 
             multi_modal_data = None
             if trajectory.image_data is not None or trajectory.video_data is not None:

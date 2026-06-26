@@ -74,3 +74,164 @@ index 27c29c8d..c958e3bf 100644
  
              if self.async_loading:
                  # Cancel any ongoing async lookup and prefetch tasks on workers
+diff --git a/lmcache/v1/cache_engine.py b/lmcache/v1/cache_engine.py
+index b684a4ee..8171ce77 100644
+--- a/lmcache/v1/cache_engine.py
++++ b/lmcache/v1/cache_engine.py
+@@ -1207,41 +1207,56 @@ class LMCacheEngine:
+             logger.debug("Move is not performed as there are no tokens to move.")
+             return 0
+ 
+-        block_mapping = self.lookup_pins[event_id]
+-        assert len(block_mapping) == 1
+-        keys = block_mapping[old_position]
+-
+-        memory_objs = self.storage_manager.batched_get(
+-            keys=keys,
+-            location=old_position,
+-        )
+-        assert None not in memory_objs, "Failed to get memory objects to move"
+-        logger.debug(
+-            f"Trying to send {len(memory_objs)} memory objects to {new_position}"
+-        )
+-
+-        # TODO: reduce loops
+-        token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
+-        offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
+-
+-        transfer_spec = {
+-            "target_peer_init_url": new_position[0],
+-            "offsets": offsets,
+-        }
+-
+-        logger.info(self.storage_manager.storage_backends)
+-        p2p_backend = self.storage_manager.storage_backends["P2PBackend"]
++        memory_objs = None
++        try:
++            block_mapping = self.lookup_pins[event_id]
++            assert len(block_mapping) == 1
++            keys = block_mapping[old_position]
+ 
+-        future = asyncio.run_coroutine_threadsafe(
+-            p2p_backend.async_batched_submit_put_task(
+-                keys,
+-                memory_objs,  # type: ignore
+-                transfer_spec=transfer_spec,
+-            ),
+-            self.storage_manager.loop,
+-        )
++            memory_objs = self.storage_manager.batched_get(
++                keys=keys,
++                location=old_position,
++            )
++            assert None not in memory_objs, "Failed to get memory objects to move"
++            logger.debug(
++                f"Trying to send {len(memory_objs)} memory objects to {new_position}"
++            )
+ 
+-        future.result()
++            # TODO: reduce loops
++            token_dim = memory_objs[0].meta.fmt.token_dim()  # type: ignore
++            offsets = [m.meta.shape[token_dim] for m in memory_objs]  # type: ignore
++
++            transfer_spec = {
++                "target_peer_init_url": new_position[0],
++                "offsets": offsets,
++            }
++
++            logger.info(self.storage_manager.storage_backends)
++            p2p_backend = self.storage_manager.storage_backends["P2PBackend"]
++
++            future = asyncio.run_coroutine_threadsafe(
++                p2p_backend.async_batched_submit_put_task(
++                    keys,
++                    memory_objs,  # type: ignore
++                    transfer_spec=transfer_spec,
++                ),
++                self.storage_manager.loop,
++            )
++            future.result()
++        finally:
++            # Always release resources regardless of success/failure:
++            # 1. Unpin chunks pinned by lookup(pin=True) -- prevents pin leaks
++            #    even if an exception occurred after lookup succeeded. A leaked
++            #    pin keeps a chunk un-evictable; once the CPU pool fills, the
++            #    forced-eviction path indexes hot_cache by a key a concurrent op
++            #    already popped, raising a bare KeyError(CacheEngineKey).
++            self.lookup_unpin(event_id)
++            # 2. Release ref_count from batched_get (balances ref_count_up in
++            #    get_blocking).
++            if memory_objs is not None:
++                for mem_obj in memory_objs:
++                    if mem_obj is not None:
++                        mem_obj.ref_count_down()
+ 
+         if not do_copy:
+             self.storage_manager.batched_remove(keys, locations=[old_position])
+diff --git a/lmcache/v1/config.py b/lmcache/v1/config.py
+index 0b8d4591..62058188 100644
+--- a/lmcache/v1/config.py
++++ b/lmcache/v1/config.py
+@@ -137,7 +137,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
+     },
+     "blend_min_tokens": {"type": int, "default": 256, "env_converter": int},
+     "blend_special_str": {"type": str, "default": " # # ", "env_converter": str},
+-    "retrieve_locations": {"type": Optional[list[str]], "default": None},
++    "retrieve_locations": {
++        "type": Optional[list[str]],
++        "default": None,
++        "env_converter": _to_str_list,
++    },
+     "store_location": {"type": Optional[str], "default": None},
+     # P2P configurations
+     "enable_p2p": {
+diff --git a/lmcache/v1/storage_backend/local_cpu_backend.py b/lmcache/v1/storage_backend/local_cpu_backend.py
+index d35f3682..fa5508e9 100644
+--- a/lmcache/v1/storage_backend/local_cpu_backend.py
++++ b/lmcache/v1/storage_backend/local_cpu_backend.py
+@@ -135,7 +135,10 @@ class LocalCPUBackend(AllocatorBackendInterface):
+         # flip the order of the keys in the request
+         with self.cpu_lock:
+             for key in reversed(self.keys_in_request):
+-                self.cache_policy.update_on_hit(key, self.hot_cache)
++                # Guard: key may have been removed by a concurrent thread between
++                # contains(pin=True) and this touch_cache() call.
++                if key in self.hot_cache:
++                    self.cache_policy.update_on_hit(key, self.hot_cache)
+             self.keys_in_request = []
+ 
+     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
+diff --git a/lmcache/v1/storage_backend/p2p_backend.py b/lmcache/v1/storage_backend/p2p_backend.py
+index 7e928f8e..ef684585 100644
+--- a/lmcache/v1/storage_backend/p2p_backend.py
++++ b/lmcache/v1/storage_backend/p2p_backend.py
+@@ -471,6 +471,12 @@ class P2PBackend(StorageBackendInterface):
+                 local_mem_objs.append(local_mem_obj)
+                 keys_to_read.append(key)
+ 
++            # Every pushed chunk is already present locally: nothing to read.
++            # Skip the channel read -- async_batched_read indexes buffers[0] to
++            # detect the object type, so an empty batch raises IndexError.
++            if not local_mem_objs:
++                return BatchedLookupAndPutRetMsg(num_read_chunks=0)
++
+             channel_transfer_spec = {
+                 "sender_id": sender_id,
+                 "remote_indexes": r_mem_indexes_to_read,
+@@ -485,6 +491,16 @@ class P2PBackend(StorageBackendInterface):
+                 memory_objs=local_mem_objs,
+             )
+ 
++            # Release caller's reference -- allocate() returned each MemoryObj
++            # with ref_count=1, and batched_submit_put_task takes its own ref
++            # for hot_cache. Without dropping the caller ref here, every received
++            # chunk leaks one ref, so it is never freed normally; later eviction
++            # plus the object's own GC cleanup drive ref_count negative ("Double
++            # free occurred somewhere") and corrupt the pool. Matches
++            # storage_manager.py's ref_count_down-after-put convention.
++            for mem_obj in local_mem_objs:
++                mem_obj.ref_count_down()
++
+             return BatchedLookupAndPutRetMsg(num_read_chunks=len(local_mem_objs))
+         except Exception as e:
+             logger.error(

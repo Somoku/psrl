@@ -602,11 +602,15 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             - ``smg-grpc-servicer`` (``smg/grpc_servicer/``)
         """
         start_time = time.time()
+        kv_transfer_cfg = self.psrl_config.routing_strategy.get("kv_transfer", {})
         servicer = VllmEngineServicer(
             engine_client,
             start_time,
             preemption_queue=self.preemption_queue,
             kv_cache_manager=self.kv_cache_manager,
+            kv_transfer_stats_log_interval_s=float(
+                kv_transfer_cfg.get("stats_log_interval_s", 30)
+            ),
         )
         self.grpc_servicer = servicer
 
@@ -711,6 +715,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # arriving from now on will park instead of hitting the paused engine.
         self.grpc_servicer.pause_generation_admission()
         await self.close_grpc_generate_admission()
+        # KV cache clearing is deferred to pull_model() after weights are updated.
         await self.pause_generation(clear_cache=False)
         psrl_logger.info(f"Generation paused on replica {self.get_replica_idx()} for sync with PS")
 

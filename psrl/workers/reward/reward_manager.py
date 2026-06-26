@@ -690,8 +690,18 @@ class RewardLoopManager(CommandExtension):
             fields.append(reward)
             self.request_key_to_future.pop(request_key, None)
 
-        for f in fields:
-            response_len = f.pop("response_len", 1)
+        for i, f in enumerate(fields):
+            raw_response_len = f.pop("response_len", 1)
+            if raw_response_len <= 0:
+                psrl_logger.error(
+                    "wait_for_reward_of_requests: response_len=%d for key=%s, "
+                    "reward_score=%s, reward_keys=%s",
+                    raw_response_len,
+                    request_keys_to_put[i] if i < len(request_keys_to_put) else "?",
+                    f.get("reward_score"),
+                    list(f.keys()),
+                )
+            response_len = max(raw_response_len, 1)
             rm_score_tensor = torch.zeros(response_len, dtype=torch.float32)
             rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
             f["rm_scores"] = rm_score_tensor
@@ -744,7 +754,7 @@ class RewardLoopManager(CommandExtension):
             if reward is None:
                 reward = self._default_reward_result()
             f = reward.copy()
-            response_len = f.pop("response_len", 1)
+            response_len = max(f.pop("response_len", 1), 1)
             rm_score_tensor = torch.zeros(response_len, dtype=torch.float32)
             rm_score_tensor[-1] = float(f.get("reward_score", 0.0))
             f["rm_scores"] = rm_score_tensor

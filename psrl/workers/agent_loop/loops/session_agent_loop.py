@@ -106,7 +106,7 @@ class SessionAgentLoop(AgentLoopBase):
             "ignore_eos": self.rollout_config.get("ignore_eos", False),
             "max_tokens": int(self.rollout_config.response_length),
             "logprobs": True,
-            "top_logprobs": 0,
+            "top_logprobs": 1,
             "stream": False,
         }
         if request.get("seed") is not None:

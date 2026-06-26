@@ -113,6 +113,13 @@ class RolloutGateway:
 
         router_args = self._init_router_args()
 
+        # Set per-module Rust log filter for the SMG gateway subprocess.
+        # EnvFilter::try_from_default_env() in SMG's init_logging reads RUST_LOG
+        # before falling back to the configured log_level, so this takes precedence.
+        rust_log_filter = str(self._cfg_get("psrl.rollout_gateway.rust_log_filter", ""))
+        if rust_log_filter:
+            os.environ["RUST_LOG"] = rust_log_filter
+
         self.router_process = multiprocessing.Process(
             target=_run_smg,
             args=(router_args,),

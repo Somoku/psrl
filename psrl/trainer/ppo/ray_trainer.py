@@ -2143,7 +2143,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 initial_pull_futures = []
                 initial_pull_futures.append(self.rollout_coordinator.initial_pull_from_ps.remote(initial_pull_tag))
                 if not self.is_rollout_mode_in_actor:
-                    initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model", is_initial=True))
+                    initial_pull_futures.extend(self.actor_wg.execute_all_async("pull_model"))
                 ray.get(initial_pull_futures)
 
         self.init_elastic_rm_runtime()

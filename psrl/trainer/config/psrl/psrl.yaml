@@ -309,7 +309,9 @@ routing_strategy:
     # Interval in seconds between periodic KV-transfer stats log lines on
     # each source instance. Each instance's VllmEngineServicer prints a
     # "[KVTransfer] instance=... stats: ..." summary at most once per this
-    # interval, triggered by transfer activity. 0 disables logging.
+    # interval, triggered by transfer activity. Only used when kv_transfer.enable
+    # is True; otherwise logging is disabled regardless of this value. Set to 0
+    # to suppress stats even when transfer is enabled.
     stats_log_interval_s: 30
 
   # [kv_cache_aware] Minimum cache-hit ratio for the approximate radix-tree path.

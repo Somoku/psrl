@@ -44,7 +44,6 @@ from psrl.utils.logger import (  # noqa: E402
     DualOutputHandler,
     EventType,
     MemoryLogger,
-    deprecated,
     get_worker_info,
     gpu_memory_logger_decorator,
     log_dual_events,
@@ -258,6 +257,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 self._sleep_megatron_model(self.actor.engine.module)
             else:
                 raise NotImplementedError(f"sleep_model does not support strategy '{strategy}'.")
+            torch.cuda.empty_cache()
 
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"After TrainWorker_R{self.rank} sleep")
@@ -342,23 +342,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 f"_restore_non_persistent_buffers_from_ps does not support strategy '{strategy}'."
             )
 
-    def pull_model(self, is_initial: bool = False):
-        """Pull weights from PS.
-
-        Args:
-            is_initial: If True, resync the optimizer's fp32 master params after
-                pulling. Must be set on the very first pull (empty-init path): the
-                optimizer is built before any weights arrive, so its fp32 master copy
-                holds garbage values until resynced from the freshly pulled model params.
-        """
-        super().pull_model()
-        if is_initial and self.config.actor.strategy == "megatron" and self._is_actor and self.actor is not None:
-            from psrl.utils.converter.megatron_optimizer import sync_master_params_from_model
-
-            sync_master_params_from_model(self.actor.engine)
-            psrl_logger.info(f"[pull_model] Resynced optimizer master params from model on R{self.rank}.")
-
-    @deprecated("Reserved as a manual memory management example for FSDP. Use torch_memory_saver instead.")
     def _sleep_fsdp_model(self, model):
         """Release GPU memory for FSDP model by resizing local shard storage to 0."""
         from torch.distributed.tensor import DTensor as _DTensor
@@ -373,7 +356,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 buffer._sleep_storage_size = buffer.untyped_storage().size()
                 buffer.untyped_storage().resize_(0)
 
-    @deprecated("Reserved as a manual memory management example for FSDP. Use torch_memory_saver instead.")
     def _wake_up_fsdp_model(self, model):
         """Restore GPU memory allocation for FSDP model (no data copy)."""
         from torch.distributed.tensor import DTensor as _DTensor
@@ -386,9 +368,15 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if buffer is not None and hasattr(buffer, "_sleep_storage_size") and buffer.untyped_storage().size() == 0:
                 buffer.untyped_storage().resize_(buffer._sleep_storage_size)
 
-    @deprecated("Reserved as a manual memory management example for Megatron. Use torch_memory_saver instead.")
     def _sleep_megatron_model(self, models):
-        """Release GPU memory for Megatron model chunks by resizing buffers/params to 0."""
+        """Release GPU memory for Megatron model chunks by resizing DDP buffers to 0.
+
+        Megatron's DistributedDataParallel allocates all parameters and gradients into
+        large contiguous buffers (param_data and grad_data in _ParamAndGradBuffer).
+        Individual param.data tensors are views into these buffers, so resizing the
+        buffer storage to 0 releases the entire contiguous allocation in one operation
+        (typically 2 cudaFree calls per buffer group: one for params, one for grads).
+        """
         from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
 
         try:
@@ -400,11 +388,11 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if DDP is not None and isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
                     for buf in buffers:
-                        if buf.param_data.untyped_storage().size() > 0:
-                            buf.param_data_size = buf.param_data.untyped_storage().size()
+                        if buf.param_data is not None and buf.param_data.untyped_storage().size() > 0:
+                            buf._sleep_param_data_size = buf.param_data.untyped_storage().size()
                             buf.param_data.untyped_storage().resize_(0)
-                        if buf.grad_data.untyped_storage().size() > 0:
-                            buf.grad_data_size = buf.grad_data.untyped_storage().size()
+                        if buf.grad_data is not None and buf.grad_data.untyped_storage().size() > 0:
+                            buf._sleep_grad_data_size = buf.grad_data.untyped_storage().size()
                             buf.grad_data.untyped_storage().resize_(0)
             else:
                 unwrapped = unwrap_model(model_chunk)
@@ -416,9 +404,14 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                         param._sleep_grad_storage_size = param.grad.untyped_storage().size()
                         param.grad.untyped_storage().resize_(0)
 
-    @deprecated("Reserved as a manual memory management example for Megatron. Use torch_memory_saver instead.")
     def _wake_up_megatron_model(self, models):
-        """Restore GPU memory allocation for Megatron model chunks (no data copy)."""
+        """Restore GPU memory allocation for Megatron model chunks (no data copy).
+
+        Resizes DDP buffer storages back to their original sizes. The param.data views
+        remain valid because they reference the same storage object (only the backing
+        physical memory is reallocated by the caching allocator). NIXL pull fills the
+        actual weight data after this call.
+        """
         from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
 
         try:
@@ -430,10 +423,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if DDP is not None and isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
                     for buf in buffers:
-                        if hasattr(buf, "param_data_size") and buf.param_data.untyped_storage().size() == 0:
-                            buf.param_data.untyped_storage().resize_(buf.param_data_size)
-                        if hasattr(buf, "grad_data_size") and buf.grad_data.untyped_storage().size() == 0:
-                            buf.grad_data.untyped_storage().resize_(buf.grad_data_size)
+                        if hasattr(buf, "_sleep_param_data_size") and buf.param_data.untyped_storage().size() == 0:
+                            buf.param_data.untyped_storage().resize_(buf._sleep_param_data_size)
+                        if hasattr(buf, "_sleep_grad_data_size") and buf.grad_data.untyped_storage().size() == 0:
+                            buf.grad_data.untyped_storage().resize_(buf._sleep_grad_data_size)
                             buf.grad_data.zero_()
             else:
                 unwrapped = unwrap_model(model_chunk)
@@ -526,6 +519,19 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             with log_dual_events("Push model", psrl_logger, event_type=EventType.PUSH):
                 PSRL_BaseTrainWorker.push_model(self)
         return output
+
+    def reload_optimizer_after_pull(self):
+        """Reload optimizer's fp32/bf16 master params from the model's current bf16 params after NIXL pull."""
+        if not (self._is_actor and self.actor is not None):
+            return
+        engine = self.actor.engine
+        if engine.optimizer is None:
+            return
+        optimizer = engine.optimizer
+        # Megatron optimizers (Float16OptimizerWithFloat16Params, DistributedOptimizer,
+        # ChainedOptimizer) all support reload_model_params() which copies
+        # the model's current float16 params into the optimizer's fp32/bf16 master copy.
+        optimizer.reload_model_params()
 
     def _debug_log_train_model_info(self, label: str, max_elements: int = 10):
         """Log per-tensor statistics for debugging weight correctness."""

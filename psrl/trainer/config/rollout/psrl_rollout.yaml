@@ -23,6 +23,9 @@ name: vllm
 # Async mode in PSRL
 mode: psrl_async
 
+# logprobs mode for rollout logprobs
+logprobs_mode: raw_logprobs
+
 # Which loader to use for rollout model weights: dummy, hf, megatron, etc.
 # safetensors (for huge model, and set use_shm=True); dummy: randomly init model weight
 load_format: dummy

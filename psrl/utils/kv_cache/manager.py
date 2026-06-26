@@ -5,9 +5,7 @@ from collections import deque
 
 import msgspec
 
-from psrl.utils.common.http_utils import post
 from psrl.utils.kv_cache.config import LMCacheConfig
-from psrl.utils.kv_cache.types import KVCacheStatus
 
 psrl_logger = logging.getLogger(__file__)
 
@@ -21,10 +19,9 @@ class KVCacheManager:
     by `RolloutRouter`.
 
     Responsibilities:
-    - Orchestrate KV cache queries and operations via `collective_rpc`.
+    - Orchestrate KV cache operations via `collective_rpc` and EngineCore utilities.
     - Enforce a configurable GPU pin block budget (PSRL-side LRU eviction).
-    - Manage the LMCache Controller subprocess lifecycle for cross-instance
-      P2P transfer.
+    - Manage LMCache peer metadata for direct cross-instance P2P transfer.
     """
 
     def __init__(self, config: LMCacheConfig) -> None:
@@ -40,9 +37,8 @@ class KVCacheManager:
         self._gpu_pinned_order: deque[list[int]] = deque()
 
         self._inference_engine = None
-        # NOTE(lhy): Controller URL is no longer started locally per instance.
-        # It is started once by RolloutCoordinator and broadcast to all GenWorkers
-        # via set_controller_url(). Until that call, transfer() will assert-fail.
+        # The shared Controller is still used for LMCache worker registration and
+        # peer discovery. Data movement itself uses direct worker ZMQ messages.
         self._controller_url: str | None = None
 
         # Direct transfer bypass: peer registry maps lmcache_instance_id → per-rank
@@ -147,8 +143,6 @@ class KVCacheManager:
         `RolloutCoordinator.init_lmcache_p2p()` broadcasts the URL of the
         single shared Controller subprocess to all GenWorker instances.
 
-        Must be called before `transfer()` is used.
-
         Args:
             controller_url (str): Base URL of the shared Controller, e.g.
                 `"http://10.0.0.1:9042"`.
@@ -215,21 +209,6 @@ class KVCacheManager:
         """Whether to clear the LMCache KV cache on model weight updates from PS."""
         return self.config.enable and self.config.clear_on_weight_update
 
-    def get_status(self) -> KVCacheStatus:
-        """
-        Get the current KV cache offloading status.
-
-        Returns:
-            KVCacheStatus: Snapshot of the current offloading state.
-        """
-        if not self.enabled:
-            return KVCacheStatus(enabled=False)
-        return KVCacheStatus(
-            enabled=True,
-            backend=self.config.get_backend_enum(),
-            offload_size_gb=self.config.offload_size_gb,
-        )
-
     def apply_env_vars(self) -> None:
         """
         Set LMCache environment variables before vLLM engine initialization.
@@ -274,8 +253,6 @@ class KVCacheManager:
 
         `collective_rpc` returns a list with one result per TP rank. We take
         the first element (rank-0), which is canonical for aggregate results.
-
-        Used by `pin()`, `unpin()`, `clear_from_backend()`, and `transfer()`.
 
         Args:
             method (str): The `vllm_extension.py` method name to call.
@@ -366,87 +343,6 @@ class KVCacheManager:
         if "backend" in targets:
             await self._rpc("lmcache_unpin_backend", (tokens,))
         return ok
-
-    async def clear_from_backend(self, tokens: list[int]) -> int:
-        """
-        Remove the cached prefix chunks for a trajectory from the LMCache backend.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            int: Number of LMCache chunks removed.
-        """
-        self._assert_engine()
-        assert tokens, "tokens must be a non-empty list."
-        n: int = await self._rpc("lmcache_clear_from_backend", (tokens,))
-        psrl_logger.debug(f"[LMCache] Cleared {n} chunks from backend.")
-        return n
-
-    async def transfer(
-        self,
-        tokens: list[int],
-        src: tuple[str, str],
-        dst: tuple[str, str],
-        copy: bool = False,
-    ) -> bool:
-        """
-        Transfer the cached prefix of a trajectory to another (instance, backend).
-
-        Uses the LMCache Controller HTTP API (`/move`). The Controller subprocess
-        must have been started by `RolloutCoordinator.init_lmcache_p2p()` and its
-        URL must have been injected via `set_controller_url()`.  Both intra-machine
-        (same host, different GPU via UCX shared memory) and inter-machine (via NIXL
-        RDMA or TCP) transfers are supported through the same interface.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-            src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)` of
-                the source, e.g. `("psrl_instance_0", "LocalCPUBackend")`.
-            dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)` of
-                the destination.
-            copy (bool): If True, keep the data at `src` as well.
-
-        Returns:
-            bool: True if the Controller acknowledged the move request.
-        """
-        self._assert_engine()
-        assert tokens, "tokens must be a non-empty list."
-        if not self.config.enable_p2p:
-            psrl_logger.warning(
-                "[LMCache] transfer() called but enable_p2p is False. "
-                "Set LMCacheConfig.enable_p2p=True to enable cross-instance transfer."
-            )
-            return False
-        assert self._controller_url is not None, (
-            "KVCacheManager controller URL is not set. "
-            "Call set_controller_url() after RolloutCoordinator.init_lmcache_p2p() completes."
-        )
-
-        payload = {
-            "old_position": list(src),
-            "new_position": list(dst),
-            "tokens": tokens,
-            "copy": copy,
-        }
-        try:
-            resp = await post(f"{self._controller_url}/move", payload, max_retries=1)
-            psrl_logger.debug(f"[LMCache] Controller move ACK: {resp!r}.")
-            self._last_transfer_error = None
-            return True
-        except Exception as e:
-            # Include response body for HTTPStatusError (e.g., 500 from Controller).
-            detail = ""
-            if hasattr(e, "response") and hasattr(e.response, "text"):
-                detail = f" Response: {e.response.text[:500]}"
-            self._last_transfer_error = f"{type(e).__name__}: {e}{detail}"
-            msg = f"[LMCache] Controller /move request failed: {e}.{detail}"
-            psrl_logger.error(msg)
-            # Also print to ensure visibility (manager.py logger may lack handlers).
-            import sys
-
-            print(msg, file=sys.stderr, flush=True)
-            return False
 
     async def transfer_direct(
         self,
@@ -683,11 +579,9 @@ class KVCacheManager:
         """
         Pin GPU prefix-cache blocks for `tokens`, enforcing the budget.
 
-        Pins first (the actual count comes back from `psrl_pin_gpu`), then enforces
-        the budget post-hoc: if `_gpu_pin_budget > 0` and the total now exceeds it,
-        the oldest-pinned trajectories are evicted (PSRL-side LRU). If this single
-        trajectory alone exceeds the entire budget, it is unpinned again and the pin
-        is reported as skipped.
+        `psrl_pin_gpu` returns the number of blocks actually pinned by PSRL.
+        Budget enforcement uses that authoritative count, avoiding any separate
+        cache-info query path.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
@@ -696,14 +590,20 @@ class KVCacheManager:
             bool: True if the pin succeeded, False if the budget cannot accommodate it.
         """
         pinned: int = await self._utility("psrl_pin_gpu", tokens)
+        if pinned <= 0:
+            psrl_logger.debug("[LMCache] GPU pin: no matching prefix-cache blocks pinned.")
+            return True
+
         self._pinned_gpu_blocks += pinned
         self._gpu_pinned_order.append(tokens)
 
         if self._gpu_pin_budget > 0:
-            # Evict oldest-pinned trajectories (never the one just pinned) until
-            # within budget. `psrl_unpin_gpu` returns the real freed count.
-            while self._pinned_gpu_blocks > self._gpu_pin_budget and len(self._gpu_pinned_order) > 1:
+            # Evict oldest-pinned trajectories until the budget is satisfied.
+            newest_evicted = False
+            while self._pinned_gpu_blocks > self._gpu_pin_budget and self._gpu_pinned_order:
                 oldest_tokens = self._gpu_pinned_order.popleft()
+                if oldest_tokens is tokens:
+                    newest_evicted = True
                 freed: int = await self._utility("psrl_unpin_gpu", oldest_tokens)
                 self._pinned_gpu_blocks = max(0, self._pinned_gpu_blocks - freed)
                 psrl_logger.debug(
@@ -711,14 +611,11 @@ class KVCacheManager:
                     f"({freed} blocks freed, budget={self._gpu_pin_budget})."
                 )
 
-            # Single trajectory alone exceeds the entire budget: undo and skip.
-            if self._pinned_gpu_blocks > self._gpu_pin_budget:
-                freed = await self._utility("psrl_unpin_gpu", tokens)
-                self._pinned_gpu_blocks = max(0, self._pinned_gpu_blocks - freed)
-                self._gpu_pinned_order.pop()
+            # If the newest trajectory alone exceeds the budget, the eviction
+            # loop eventually unpins it. Report the budget miss to the caller.
+            if newest_evicted:
                 psrl_logger.warning(
-                    f"[LMCache] GPU pin budget exceeded: trajectory needs {pinned} blocks "
-                    f"(budget={self._gpu_pin_budget}). Unpinned and skipped."
+                    f"[LMCache] GPU pin budget exceeded after pinning {pinned} blocks (budget={self._gpu_pin_budget})."
                 )
                 return False
 

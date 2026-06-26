@@ -4,7 +4,7 @@ import os
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash, make_block_hash_with_group_id
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -15,7 +15,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-class RolloutScheduler(Scheduler):
+class RolloutScheduler(AsyncScheduler):
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -61,6 +61,10 @@ class RolloutScheduler(Scheduler):
     # (which dispatches to Worker processes) because `block_pool` state must only be
     # mutated from a single process.  `KVCacheManager` in the PSRL coordinator calls
     # these via `engine_core.call_utility_async("psrl_pin_gpu/psrl_unpin_gpu", tokens)`.
+    #
+    # NOTE(lhy): GPU prefix cache hit counts for routing are owned by SMG's
+    # event-driven cache-aware indexer. Only pin/unpin (which mutate block_pool
+    # ref_cnt) still require EngineCore RPC.
 
     def _psrl_get_caching_hash_fn(self):
         """

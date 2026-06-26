@@ -442,22 +442,6 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             freed += 1
         return freed
 
-    def lmcache_clear_from_backend(self, tokens: list[int]) -> int:
-        """
-        Remove the cached prefix chunks for `tokens` from the LMCache backend.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            int: Number of chunks removed.
-        """
-        assert tokens, "tokens must be a non-empty list."
-        engine = self._get_lmcache_engine()
-        keys = self._get_lmcache_chunk_keys(tokens)
-        n = engine.storage_manager.batched_remove(keys)
-        return n
-
     def lmcache_clear_all_from_backend(self) -> None:
         """
         Remove all cached KV chunks from the LMCache CPU backend.

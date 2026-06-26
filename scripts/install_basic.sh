@@ -20,6 +20,9 @@ echo "1. Install pytorch and tensordict"
 python -m uv pip install --no-cache-dir "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" --index-url https://download.pytorch.org/whl/cu128
 python -m uv pip install --no-cache-dir "triton==3.6.0" "tensordict==0.12.4" torchdata
 
+# For ncclCommSuspend/ncclCommResume support
+python -m uv pip install nvidia-nccl-cu12==2.29.7
+
 echo "2. Install basic packages"
 python -m uv pip install "transformers==5.10.1" accelerate datasets peft hf-transfer matplotlib flask click==8.2.1 \
     "numpy<2.0.0" "pyarrow>=19.0.1" pandas paramiko sortedcontainers \
@@ -30,15 +33,22 @@ python -m uv pip uninstall -y pynvml nvidia-ml-py
 python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
 
 echo "4. Install FlashAttention and FlashInfer"
-# Install flash-attn-2.8.1
-FLASH_ATTN_CUDA_ARCHS=128 \
+# Install FlashAttention 2 for packages that import `flash_attn`.
+FLASH_ATTN_CUDA_ARCHS=90 \
 FLASH_ATTENTION_FORCE_BUILD="TRUE" \
 FLASH_ATTENTION_FORCE_CXX11_ABI="FALSE" \
 FLASH_ATTENTION_SKIP_CUDA_BUILD="FALSE" \
 python -m uv pip install -U "flash-attn==2.8.1" --no-build-isolation --no-deps
 
-# Install flashinfer-python
-python -m uv pip install --no-cache-dir --no-build-isolation "flashinfer-python==0.5.3"
+# Install FlashAttention 3 beta from the Hopper source tree.
+git clone --depth 1 --branch v2.8.1 https://github.com/Dao-AILab/flash-attention.git flash_attn_src
+pushd flash_attn_src/hopper
+python setup.py install
+python_path=`python -c "import site; print(site.getsitepackages()[0])"`
+mkdir -p $python_path/flash_attn_3
+wget -P $python_path/flash_attn_3 https://raw.githubusercontent.com/Dao-AILab/flash-attention/7b0bfcc3d1f69786f0c4277c582ad58acdfb297d/hopper/flash_attn_interface.py
+popd
+rm -rf flash_attn_src
 
 echo "5. Install apex"
 mkdir -p apex_src
@@ -126,5 +136,17 @@ bash "$PSRL_PATH/patch/apply_patch.sh" transfer_queue
 
 echo "9. Install torch_memory_saver"
 python -m uv pip install git+https://github.com/fzyzcjy/torch_memory_saver.git@d64a6394d1e09c613fab90260054cecc2684586d --no-cache-dir --force-reinstall
+
+echo "10. Install flashinfer"
+mkdir -p flashinfer_src
+pushd flashinfer_src
+git clone https://github.com/flashinfer-ai/flashinfer.git --recursive --branch v0.6.11.post3
+cd flashinfer
+python -m uv pip install -v .
+cd flashinfer-cubin
+python -m build --no-isolation --wheel
+python -m uv pip install dist/*.whl
+popd
+rm -rf flashinfer_src
 
 echo "Successfully installed all basic packages"

@@ -299,8 +299,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         if self.config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": self.config.get("limit_images")}
-        if self.config.cudagraph_capture_sizes:
-            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         self._preprocess_engine_kwargs(engine_kwargs)
 
@@ -331,6 +329,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 dcp_size,
             )
             compilation_config["cudagraph_mode"] = "PIECEWISE"
+        if self.config.cudagraph_capture_sizes:
+            engine_kwargs["cuda_graph_sizes"] = self.config.cudagraph_capture_sizes
 
         compilation_config = json.dumps(compilation_config)
         args = {
@@ -522,7 +522,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # AGENT(VERL): apply stat logger patch for PSRL
         # NOTE(linsh): enable custom stat collection for PSRL
-        self.preemption_queue: asyncio.Queue = asyncio.Queue()
+        self.preemption_queue: asyncio.Queue = asyncio.Queue(maxsize=0)
         self.psrl_preemption_logger = PreemptionStatLogger(
             vllm_config,
             engine_index=0,
@@ -603,14 +603,18 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         """
         start_time = time.time()
         kv_transfer_cfg = self.psrl_config.routing_strategy.get("kv_transfer", {})
+        kv_transfer_enabled = bool(kv_transfer_cfg.get("enable", False))
+        stats_log_interval_s = (
+            float(kv_transfer_cfg.get("stats_log_interval_s", 30))
+            if kv_transfer_enabled
+            else 0.0
+        )
         servicer = VllmEngineServicer(
             engine_client,
             start_time,
             preemption_queue=self.preemption_queue,
             kv_cache_manager=self.kv_cache_manager,
-            kv_transfer_stats_log_interval_s=float(
-                kv_transfer_cfg.get("stats_log_interval_s", 30)
-            ),
+            kv_transfer_stats_log_interval_s=stats_log_interval_s,
         )
         self.grpc_servicer = servicer
 
@@ -1245,6 +1249,26 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
         return self.kv_cache_manager
 
+    async def kv_pin(self, tokens: list[int], targets: list[str]) -> bool:
+        """Pin the cached prefix blocks/chunks for `tokens`."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        assert targets, "targets must be a non-empty list."
+        assert all(target in ("gpu", "backend") for target in targets), (
+            f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+        )
+        return await kv_cache_manager.pin(tokens, targets)
+
+    async def kv_unpin(self, tokens: list[int], targets: list[str]) -> bool:
+        """Unpin the cached prefix blocks/chunks for `tokens`."""
+        kv_cache_manager = self._assert_kv_cache_manager()
+        assert tokens, "tokens must be a non-empty list."
+        assert targets, "targets must be a non-empty list."
+        assert all(target in ("gpu", "backend") for target in targets), (
+            f"Invalid targets: {targets!r}. Must be a subset of ['gpu', 'backend']."
+        )
+        return await kv_cache_manager.unpin(tokens, targets)
+
     def kv_set_peer_registry(
         self,
         registry: dict[str, list[str]],
@@ -1257,7 +1281,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             worker_zmq_urls: This replica's rank-sorted local LMCacheWorker ZMQ URLs.
         """
         assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)
+        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)    
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
         """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""

@@ -660,6 +660,22 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         resp.raise_for_status()
         result = resp.json() if resp.content else {}
         psrl_logger.warning(f"[GATEWAY-CONTROL] After {action} over {len(instance_ids)} instances, resp = {result}")
+
+        rejected_base_ids = set()
+        for item in result.get("results", []):
+            if item.get("status") == "rejected":
+                base_id = item.get("base_worker_id", item.get("worker_id", ""))
+                reason = item.get("reason", "unknown")
+                psrl_logger.warning(
+                    f"[GATEWAY-CONTROL] Worker {base_id} rejected by gateway: {reason}. "
+                    "Removing from future pause/resume calls."
+                )
+                rejected_base_ids.add(base_id)
+
+        if rejected_base_ids:
+            for tag, ids in self.tag_to_base_worker_ids.items():
+                self.tag_to_base_worker_ids[tag] = [wid for wid in ids if wid not in rejected_base_ids]
+
         return result
 
     def start_rollout_coordinator(self):

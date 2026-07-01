@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_perf
-experiment_name=mig_async_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -116,9 +116,9 @@ clip_ratio_high=0.28
 # --- Sequence lengths ---
 # SWE-Gym tasks are real-world bugs from 11 repos. Cap at 30 turns
 # which is sufficient for most resolvable instances.
-max_turns=100
+max_turns=30
 max_prompt_length=2048
-max_response_length=30000
+max_response_length=8192
 packing_length=$((max_prompt_length + max_response_length))
 
 # --- Training hyperparameters ---
@@ -159,7 +159,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.lmcache.enable=True \
     psrl.lmcache.enable_p2p=True \
-    psrl.routing_strategy.kv_transfer.enable=True \
+    psrl.lmcache.clear_on_weight_update=True \
+    psrl.lmcache.multi_version_kv=False \
+    psrl.routing_strategy.kv_transfer.enable=False \
+    psrl.routing_strategy.kv_transfer.transfer_mode=sync \
     psrl.sync_and_mig_strategy.mig.enable=True \
     psrl.sync_and_mig_strategy.mig.indicator=request_num \
     psrl.sync_and_mig_strategy.mig.threshold=1000 \
@@ -177,6 +180,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
+    psrl.routing_strategy.method=cache_aware \
     psrl.routing_strategy.enable_trajectory_sticky=False \
     psrl.routing_strategy.enable_group_sticky=False \
     \

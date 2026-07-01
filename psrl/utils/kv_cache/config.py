@@ -55,6 +55,14 @@ class LMCacheConfig:
     # Whether to clear the LMCache KV cache on model weight updates from PS.
     clear_on_weight_update: bool = True
 
+    # Whether to allow multiple model versions to coexist in the KV cache.
+    # When True, each stored entry is tagged with the model version that generated
+    # it, so version-N requests can never hit version-M KV entries (hash mismatch
+    # is structural). Requires clear_on_weight_update=False to retain old entries.
+    # Old-version entries are evicted naturally by LRU as new-version requests
+    # fill the cache.
+    multi_version_kv: bool = False
+
     # --- CPU backend ---
 
     # GiB of CPU memory to reserve and never use for KV offloading.

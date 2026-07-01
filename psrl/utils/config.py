@@ -153,10 +153,23 @@ def validate_config(
         )
 
     # Check routing strategy
-    if (
-        config.psrl.routing_strategy.method == "request_num_balance"
-        or config.psrl.routing_strategy.method == "throughput_balance"
-    ):
+    routing_method = config.psrl.routing_strategy.method
+    allowed_routing_methods = {
+        "random",
+        "round_robin",
+        "request_num_balance",
+        "throughput_optimal",
+        "throughput_optimal_with_budget",
+        "throughput_balance",
+        "cache_aware",
+        "cache_aware_v1",
+    }
+    assert routing_method in allowed_routing_methods, (
+        f"psrl.routing_strategy.method must be one of {sorted(allowed_routing_methods)}, "
+        f"got '{routing_method}'. Use 'cache_aware' instead of deprecated 'kv_cache_aware'."
+    )
+
+    if routing_method in ("request_num_balance", "throughput_balance"):
         assert config.psrl.status_collection.enable, (
             "status collection must be enabled when using request num balance or throughput balance routing strategy"
         )
@@ -195,6 +208,16 @@ def validate_config(
             "psrl.ps_mode must be nixl_cpu or nixl_gpu when psrl.lmcache.enable_p2p is True "
             "(NIXL infrastructure is required for P2P transfer)."
         )
+        '''
+        assert not lmcache_cfg.get("clear_on_weight_update", True), (
+            "psrl.lmcache.clear_on_weight_update must be False when psrl.lmcache.enable_p2p is True "
+            "(LMCache P2PBackend does not support clear; stale entries cannot be flushed on weight update)."
+        )
+        assert lmcache_cfg.get("multi_version_kv", False), (
+            "psrl.lmcache.multi_version_kv must be True when psrl.lmcache.enable_p2p is True "
+            "(version tagging is required because P2P KV cannot be cleared on weight sync)."
+        )
+        '''
 
     if lmcache_cfg.get("enable", False):
         assert config.gen_actor_rollout_ref.rollout.enable_prefix_caching, (

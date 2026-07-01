@@ -89,6 +89,19 @@ class EntryInfo:
             return self.model_version
 
 
+def _is_scalar_request_idx(request_idx) -> bool:
+    """Return True when *request_idx* is a single integer index, not a group list."""
+    return isinstance(request_idx, (int, np.integer)) and not isinstance(request_idx, bool)
+
+
+def _assert_scalar_request_idx(request_idx) -> None:
+    if not _is_scalar_request_idx(request_idx):
+        raise AssertionError(
+            "Request idx must be a list or a scalar integer, "
+            f"got {request_idx!r} (type={type(request_idx).__name__})"
+        )
+
+
 @dataclass
 class Entry:
     """
@@ -749,9 +762,7 @@ class StalenessInventory:
                 entry_info_to_update.model_version = [entry_info_to_update.model_version] * request_num
                 entry_info_to_update.model_version[request_idx_in_list] = new_version_tag
             else:
-                assert isinstance(entry_info_to_update.request_idx, np.int64), (
-                    "Request idx must be a list or an np.int64"
-                )
+                _assert_scalar_request_idx(entry_info_to_update.request_idx)
                 entry_info_to_update.model_version = new_version_tag
 
         psrl_logger.debug(
@@ -792,9 +803,7 @@ class StalenessInventory:
                 entry_info_to_update.rollout_instance_id = [entry_info_to_update.rollout_instance_id] * request_num
                 entry_info_to_update.rollout_instance_id[request_idx_in_list] = new_instance_id
             else:
-                assert isinstance(entry_info_to_update.request_idx, np.int64), (
-                    "Request idx must be a list or an np.int64"
-                )
+                _assert_scalar_request_idx(entry_info_to_update.request_idx)
                 entry_info_to_update.rollout_instance_id = new_instance_id
 
         psrl_logger.debug(
@@ -835,9 +844,7 @@ class StalenessInventory:
                 entry_info_to_update.n_trajectory = [entry_info_to_update.n_trajectory] * request_num
                 entry_info_to_update.n_trajectory[request_idx_in_list] = new_n_trajectory
             else:
-                assert isinstance(entry_info_to_update.request_idx, np.int64), (
-                    "Request idx must be a list or an np.int64"
-                )
+                _assert_scalar_request_idx(entry_info_to_update.request_idx)
                 entry_info_to_update.n_trajectory = new_n_trajectory
 
         psrl_logger.debug(

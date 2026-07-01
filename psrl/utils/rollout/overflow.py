@@ -19,21 +19,14 @@ from __future__ import annotations
 import functools
 from typing import TypeVar
 
+from psrl.utils.common.http_utils import PromptOverflowError  # re-export
+
 _T = TypeVar("_T")
 
 _VLLM_OVERFLOW_MARKERS = (
     "maximum model length",
     "decoder prompt",
 )
-
-
-class PromptOverflowError(Exception):
-    """The prompt for a turn exceeded the rollout engine's context window.
-
-    Turns produced before the overflow are valid training data; the agent loop
-    should recover them and treat the trajectory as a normal max-length
-    termination rather than a fatal rollout error.
-    """
 
 
 def _is_vllm_overflow(exc: Exception) -> bool:

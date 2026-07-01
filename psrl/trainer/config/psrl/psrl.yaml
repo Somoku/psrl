@@ -279,9 +279,41 @@ partial_rollout:
 routing_strategy:
 
   # Method for rollout routing
-  # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget", "kv_cache_aware"
-  # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget", you need to enable status collection.
+  # Available options: "random", "round_robin", "request_num_balance", "throughput_optimal",
+  # "throughput_optimal_with_budget", "cache_aware", "cache_aware_v1"
+  # If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget",
+  # you need to enable status collection.
   method: request_num_balance
+
+  # SMG cache-aware routing hyperparameters (used when method is cache_aware or cache_aware_v1).
+  cache_aware_policy:
+
+    # Minimum cache-hit ratio for the approximate radix-tree fallback path.
+    # Only used when KV events are unavailable; event-driven scoring ignores it. Range 0.0-1.0.
+    cache_threshold: 0.3
+
+    # Weights for event-driven multi-tier overlap scoring.
+    # score(worker) = gpu_overlap_weight * gpu_hit_blocks
+    #               + lmcache_overlap_weight * lmcache_hit_blocks
+    # A GPU hit costs ~zero reload; an LMCache (off-GPU) hit must be loaded back to
+    # the GPU, so it is cheaper than re-prefill but not free. Keep gpu >= lmcache.
+    gpu_overlap_weight: 1.0
+    lmcache_overlap_weight: 0.5
+
+    # Load-balancing trigger: shortest-queue when BOTH abs AND rel thresholds are met.
+    balance_abs_threshold: 16
+    balance_rel_threshold: 1.5
+
+    # KV-utilization triggers (>= 1.0 disables). Both cache_aware and cache_aware_v1
+    # read the backend engine token_usage snapshot for these triggers; the
+    # request-count spread (balance_abs/rel above) uses in-flight worker.load().
+    balance_token_usage_threshold: 0.75
+    overload_token_usage_threshold: 0.85
+
+    # Approximate tree maintenance (fallback when KV events unavailable).
+    eviction_interval_secs: 60
+    max_tree_size: 67108864  # 2**26
+    block_size: 16           # KV block size for event-driven routing
 
   # KV cache transfer: when re-routing a request to a different rollout instance,
   # transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)
@@ -313,19 +345,6 @@ routing_strategy:
     # is True; otherwise logging is disabled regardless of this value. Set to 0
     # to suppress stats even when transfer is enabled.
     stats_log_interval_s: 30
-
-  # [kv_cache_aware] Minimum cache-hit ratio for the approximate radix-tree path.
-  # Only used by the (non event-driven) token-tree fallback; event-driven scoring
-  # ignores it. Range 0.0-1.0.
-  cache_threshold: 0.3
-
-  # [kv_cache_aware] Weights for event-driven multi-tier overlap scoring.
-  # score(worker) = gpu_overlap_weight * gpu_hit_blocks
-  #               + lmcache_overlap_weight * lmcache_hit_blocks
-  # A GPU hit costs ~zero reload; an LMCache (off-GPU) hit must be loaded back to
-  # the GPU, so it is cheaper than re-prefill but not free. Keep gpu >= lmcache.
-  gpu_overlap_weight: 1.0
-  lmcache_overlap_weight: 0.5
 
   # Check interval in millisecond for rollout routing
   check_interval_in_ms: 500
@@ -559,6 +578,9 @@ lmcache:
   # Whether to clear stale KV cache after model weight pull from PS.
   clear_on_weight_update: True
 
+  # Whether to enable multi-version KV cache.
+  multi_version_kv: False
+
   # --- CPU backend ---
 
   # GiB of CPU memory to keep free and never use for KV offloading.
@@ -590,12 +612,15 @@ lmcache:
   cache_policy: LRU
 
   # Overlap KV cache retrieval with prefill computation to reduce TTFT.
-  enable_async_loading: True
+  # NOTE(lhy): This is buggy, do not use.
+  enable_async_loading: False
 
   # --- P2P cross-instance KV transfer ---
   # Required when routing_strategy.kv_transfer.enable is True.
 
-  # Enable P2P cross-instance KV transfer via LMCache Controller.
+  # Enable LMCache P2P backend + Controller for cross-instance KV transfer.
+  # Requires clear_on_weight_update=False and multi_version_kv=True (P2PBackend
+  # does not support clear on weight sync; version tags prevent stale KV hits).
   # A shared Controller process is started by RolloutCoordinator and its URL is
   # broadcast to all GenWorker instances at startup.
   # Each instance is automatically assigned lmcache_instance_id = psrl_instance_{id}.
@@ -661,4 +686,21 @@ rollout_gateway:
   # Per-module Rust log filter for the SMG gateway process (RUST_LOG syntax).
   # Overrides the default log_level=warn when set. Use tracing directive syntax.
   # Empty string "" means no override (use default warn level).
-  rust_log_filter: "warn,smg::routers::grpc::kv_transfer=warn,smg::routers::grpc::common::stages::worker_selector::psrl=warn"
+  rust_log_filter: "warn,smg::routers::grpc::kv_transfer=warn,smg::routers::grpc::common::stages::worker_selector::psrl=warn,route_trace=info"
+
+  # Wait for local VllmEngine.HealthCheck before POST /workers to SMG gateway.
+  grpc_registration_health_timeout_s: 300
+  grpc_registration_health_poll_interval_s: 1.0
+  grpc_registration_health_rpc_timeout_s: 5.0
+
+  # Serve SubscribeKvEvents through a buffering KvEventReplayHub so the gateway
+  # can replay missed sequences after a gap. When False (default), use the
+  # original per-subscription inline ZMQ loop with no buffering.
+  #
+  # Default is False: the gateway's KV-event monitor now tolerates seq gaps
+  # (monotonic acceptance, no reconnect/resync storm), so the hub's only purpose
+  # — replaying missed sequences to keep seq strictly contiguous — is no longer
+  # needed. The inline path is simpler, has no ingester-thread overhead, and was
+  # verified to give ~100% cache-overlap routing. The hub path is retained for
+  # opt-in use but currently exhibits a 0-overlap indexing bug under investigation.
+  enable_kv_event_replay: False

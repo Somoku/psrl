@@ -157,6 +157,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.lmcache.enable=True \
     psrl.lmcache.enable_p2p=True \
+    psrl.lmcache.clear_on_weight_update=False \
+    psrl.lmcache.multi_version_kv=True \
     psrl.lmcache.p2p_transfer_channel=nixl \
     psrl.lmcache.save_decode_cache=True \
     psrl.lmcache.enable_async_loading=True \

@@ -163,3 +163,74 @@ class TestStalenessInventoryStalenessWindow:
     def test_zero_staleness_inventory(self):
         inv = StalenessInventory(num_entries=4, ready_num_entries=4, staleness=0, rollout_n=1)
         assert inv.staleness == 0
+
+
+class TestUpdateRequestMetadata:
+    def test_update_request_instance_id_accepts_python_int_request_idx(self):
+        """SMG selection commit uses plain int request_idx from reserve_data()."""
+        from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID
+
+        rollout_n = 8
+        request_id = 227
+        inv = StalenessInventory(num_entries=5, ready_num_entries=3, staleness=2, rollout_n=rollout_n)
+        entry_info = EntryInfo(
+            rollout_instance_id=INVALID_ROLLOUT_INSTANCE_ID,
+            prompt_id=request_id // rollout_n,
+            request_idx=request_id % rollout_n,
+            model_version=0,
+            n_trajectory=1,
+        )
+        inv.reserve_data(entry_info=entry_info, max_staleness_buffer_id=2)
+
+        new_instance_id = ("019f0ec4-f2a9-7531-8939-5af9197513b8", 0)
+        inv.update_request_instance_id(request_id=request_id, new_instance_id=new_instance_id)
+
+        buffer_id, entry_id = inv.data_tracker[entry_info.prompt_id]
+        stored = inv.buffers[buffer_id].entries[entry_id].entry_info
+        assert stored.rollout_instance_id == new_instance_id
+
+    def test_update_request_instance_id_assert_includes_actual_value(self):
+        from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID
+
+        rollout_n = 8
+        request_id = 227
+        inv = StalenessInventory(num_entries=5, ready_num_entries=3, staleness=2, rollout_n=rollout_n)
+        entry_info = EntryInfo(
+            rollout_instance_id=INVALID_ROLLOUT_INSTANCE_ID,
+            prompt_id=request_id // rollout_n,
+            request_idx=request_id % rollout_n,
+            model_version=0,
+            n_trajectory=1,
+        )
+        buffer_id, entry_id = inv.reserve_data(entry_info=entry_info, max_staleness_buffer_id=2)
+        stored = inv.buffers[buffer_id].entries[entry_id].entry_info
+        stored.request_idx = "bad-type"
+
+        with pytest.raises(AssertionError, match=r"got 'bad-type' \(type=str\)"):
+            inv.update_request_instance_id(
+                request_id=request_id,
+                new_instance_id=("worker", 1),
+            )
+
+    def test_update_request_instance_id_reports_invalid_request_idx(self):
+        from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID
+
+        rollout_n = 8
+        request_id = 227
+        inv = StalenessInventory(num_entries=5, ready_num_entries=3, staleness=2, rollout_n=rollout_n)
+        entry_info = EntryInfo(
+            rollout_instance_id=INVALID_ROLLOUT_INSTANCE_ID,
+            prompt_id=request_id // rollout_n,
+            request_idx=request_id % rollout_n,
+            model_version=0,
+            n_trajectory=1,
+        )
+        buffer_id, entry_id = inv.reserve_data(entry_info=entry_info, max_staleness_buffer_id=2)
+        stored = inv.buffers[buffer_id].entries[entry_id].entry_info
+        stored.request_idx = "bad-type"
+
+        with pytest.raises(AssertionError, match=r"got <class 'str'>: 'bad-type'"):
+            inv.update_request_instance_id(
+                request_id=request_id,
+                new_instance_id=("worker", 1),
+            )

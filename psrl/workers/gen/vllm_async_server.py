@@ -65,7 +65,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen.smg_adapter import build_worker_registration_payload
+from psrl.workers.gen.smg_adapter import build_worker_registration_payload, is_cache_aware_method
 from psrl.workers.gen.stats_collector import DPLBStatCollector
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
 from psrl.workers.gen.zmq_queue import ZMQPushQueue
@@ -251,7 +251,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         ``dp_rank`` carried in the subscribe request.
         """
         routing_method = self.psrl_config.routing_strategy.method
-        if routing_method != "cache_aware":
+        if not is_cache_aware_method(routing_method):
             return {}
 
         # Allocate a free base port on this server's host (same PortScanner used
@@ -615,6 +615,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             preemption_queue=self.preemption_queue,
             kv_cache_manager=self.kv_cache_manager,
             kv_transfer_stats_log_interval_s=stats_log_interval_s,
+            enable_kv_event_replay=self.psrl_config.rollout_gateway.enable_kv_event_replay,
         )
         self.grpc_servicer = servicer
 
@@ -667,6 +668,72 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             self.node_rank,
         )
         return port
+
+    def _grpc_health_probe_target(self) -> str:
+        host = self._server_address
+        if host in ("0.0.0.0", "::", "[::]"):
+            host = "127.0.0.1"
+        return f"{host}:{self._server_port}"
+
+    async def _probe_grpc_health_once(self, rpc_timeout_s: float = 5.0) -> bool:
+        channel = grpc.aio.insecure_channel(
+            self._grpc_health_probe_target(),
+            options=[
+                ("grpc.max_send_message_length", -1),
+                ("grpc.max_receive_message_length", -1),
+            ],
+        )
+        try:
+            stub = vllm_engine_pb2_grpc.VllmEngineStub(channel)
+            response = await asyncio.wait_for(
+                stub.HealthCheck(vllm_engine_pb2.HealthCheckRequest()),
+                timeout=rpc_timeout_s,
+            )
+            return bool(response.healthy)
+        finally:
+            await channel.close()
+
+    async def _wait_for_grpc_servicer_ready(self) -> None:
+        rollout_gateway_cfg = self.psrl_config.rollout_gateway
+        timeout_s = float(getattr(rollout_gateway_cfg, "grpc_registration_health_timeout_s", 300))
+        poll_interval_s = float(getattr(rollout_gateway_cfg, "grpc_registration_health_poll_interval_s", 1.0))
+        rpc_timeout_s = float(getattr(rollout_gateway_cfg, "grpc_registration_health_rpc_timeout_s", 5.0))
+
+        if self.grpc_servicer is None or self._server_port is None:
+            raise RuntimeError("gRPC servicer is not initialized")
+
+        deadline = time.monotonic() + timeout_s
+        attempt = 0
+        last_error = "unknown"
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                if await self._probe_grpc_health_once(rpc_timeout_s=rpc_timeout_s):
+                    psrl_logger.info(
+                        "gRPC servicer ready for gateway registration: replica=%s target=%s attempt=%d",
+                        self.get_replica_idx(),
+                        self._grpc_health_probe_target(),
+                        attempt,
+                    )
+                    return
+                last_error = "HealthCheck returned healthy=false"
+            except Exception as exc:
+                last_error = str(exc)
+
+            psrl_logger.debug(
+                "Waiting for gRPC servicer before gateway registration: replica=%s target=%s "
+                "attempt=%d error=%s",
+                self.get_replica_idx(),
+                self._grpc_health_probe_target(),
+                attempt,
+                last_error,
+            )
+            await asyncio.sleep(poll_interval_s)
+
+        raise TimeoutError(
+            f"gRPC servicer not ready after {timeout_s:.0f}s "
+            f"(replica={self.get_replica_idx()}, target={self._grpc_health_probe_target()}): {last_error}"
+        )
 
     # AGENT(VERL): PSRL-specific async methods for server control and coordination.
     # We add `data_parallel_rank` parameters to these methods to support DP-aware control in PSRL.
@@ -806,6 +873,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def register_server_to_gateway(self, gateway_url: str) -> str | None:
         if self.node_rank != 0:
             return None
+        await self._wait_for_grpc_servicer_ready()
         max_model_len = await self.estimate_max_model_len()
         # Register to rollout gateway
         gateway_url = gateway_url.rstrip("/")
@@ -1290,6 +1358,20 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         init_http_client(server_concurrency=4, rollout_engine_num=1)
         self.kv_cache_manager.set_controller_url(controller_url)
+
+    def kv_set_current_version(self, version: int) -> None:
+        """
+        Set the current model version for KV cache tagging.
+
+        Called by `RolloutCoordinator._broadcast_kv_current_version()` after a
+        weight sync completes and before the router admission loop is reopened,
+        ensuring every new request after this point carries the updated version tag.
+
+        Args:
+            version (int): The new model version number.
+        """
+        if self.kv_cache_manager is not None:
+            self.kv_cache_manager.set_current_version(version)
 
     ###### Weights Update ######
 

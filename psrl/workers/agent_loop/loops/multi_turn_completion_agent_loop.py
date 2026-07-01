@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from psrl.environments.base import Environment
+from psrl.utils.common.http_utils import PromptOverflowError
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
@@ -45,13 +46,17 @@ class MultiTurnCompletionAgentLoop(SessionAgentLoop):
             done = False
             for _ in range(self.max_turns):
                 messages, tools = agent_data.prepare_chat_completion_request()
-                response = await self.chat_completion(
-                    session_id,
-                    messages,
-                    sampling_params,
-                    tools=tools,
-                    chat_template_kwargs=agent_data.apply_chat_template_kwargs,
-                )
+                try:
+                    response = await self.chat_completion(
+                        session_id,
+                        messages,
+                        sampling_params,
+                        tools=tools,
+                        chat_template_kwargs=agent_data.apply_chat_template_kwargs,
+                    )
+                except PromptOverflowError:
+                    terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
+                    break
                 action, overlong = await agent_data.update_from_model_chat_completion(response)
                 if overlong:
                     terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED

@@ -36,6 +36,8 @@ class KVCacheManager:
         self._pinned_gpu_blocks: int = 0
         self._gpu_pinned_order: deque[list[int]] = deque()
 
+        self.current_version: int = 0
+
         self._inference_engine = None
         # The shared Controller is still used for LMCache worker registration and
         # peer discovery. Data movement itself uses direct worker ZMQ messages.
@@ -191,6 +193,20 @@ class KVCacheManager:
             f"[LMCache] Peer registry updated ({len(registry)} entries this call, "
             f"{len(self.peer_registry)} total), worker_zmq_urls={self._worker_zmq_urls!r}."
         )
+
+    def set_current_version(self, version: int) -> None:
+        """
+        Set the current model version used to tag new KV cache entries.
+
+        Called by the gen server after the rollout coordinator broadcasts the
+        new version following a weight sync.  Affects all subsequent KV store
+        and P2P transfer operations on this instance.
+
+        Args:
+            version (int): The new model version number (monotonically increasing).
+        """
+        self.current_version = version
+        psrl_logger.info(f"[LMCache] current_version set to {version}.")
 
     @property
     def is_attached(self) -> bool:
@@ -350,6 +366,7 @@ class KVCacheManager:
         src: tuple[str, str],
         dst: tuple[str, str],
         copy: bool = False,
+        dst_model_version: int = -1,
     ) -> bool:
         """
         Transfer KV cache by sending MoveWorkerMsg directly to local LMCacheWorker.
@@ -373,6 +390,8 @@ class KVCacheManager:
             src (tuple[str, str]): Source `(lmcache_instance_id, backend_location)`.
             dst (tuple[str, str]): Destination `(lmcache_instance_id, backend_location)`.
             copy (bool): If True, keep the data at `src` as well.
+            dst_model_version (int): Model version to look up on the source when
+                multi_version_kv is enabled. -1 means version-agnostic (no tag).
 
         Returns:
             bool: True if every local rank moved >0 tokens.
@@ -411,6 +430,12 @@ class KVCacheManager:
             return False
 
         # Fan out one MoveWorkerMsg per local rank, each to its own LMCacheWorker.
+        request_configs: dict | None = (
+            {"lmcache.tag.model_version": str(dst_model_version)}
+            if dst_model_version >= 0
+            else None
+        )
+
         async def _move_rank(rank: int) -> int:
             dst_peer_init_url = dst_urls[rank]
             if not dst_peer_init_url:
@@ -425,6 +450,7 @@ class KVCacheManager:
                 old_position=src[1],  # backend location string
                 new_position=(dst_peer_init_url, dst[1]),
                 copy=copy,
+                request_configs=request_configs,
             )
 
         per_rank_tokens = await asyncio.gather(*[_move_rank(r) for r in range(num_ranks)])
@@ -449,6 +475,7 @@ class KVCacheManager:
         old_position: str,
         new_position: tuple[str, str],
         copy: bool,
+        request_configs: dict | None = None,
     ) -> int:
         """
         Construct and send MoveWorkerMsg directly to one local LMCacheWorker via ZMQ.
@@ -462,6 +489,9 @@ class KVCacheManager:
             old_position: Source backend location (e.g. "LocalCPUBackend").
             new_position: Tuple of (dst_peer_init_url, dst_backend_location).
             copy: Whether to keep data at source.
+            request_configs: Optional LMCache request config tags (e.g. model version
+                tag). Passed through to MoveWorkerMsg so the worker's lookup() uses
+                the matching version-specific key hash.
 
         Returns:
             int: Number of tokens transferred.
@@ -478,6 +508,7 @@ class KVCacheManager:
             new_position=new_position,
             tokens=tokens,
             copy=copy,
+            request_configs=request_configs,
         )
 
         serialized_msg = msgspec.msgpack.encode(msg)

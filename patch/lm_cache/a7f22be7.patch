@@ -1,3 +1,15 @@
+diff --git a/lmcache/integration/vllm/lmcache_mp_connector.py b/lmcache/integration/vllm/lmcache_mp_connector.py
+index 972d90cd..09cc41eb 100644
+--- a/lmcache/integration/vllm/lmcache_mp_connector.py
++++ b/lmcache/integration/vllm/lmcache_mp_connector.py
+@@ -5,7 +5,6 @@ from collections.abc import Iterable
+ from dataclasses import dataclass, field
+ from typing import TYPE_CHECKING, Any, Literal
+ import enum
+-
+ # Third Party
+ from vllm.config import VllmConfig
+ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 diff --git a/lmcache/integration/vllm/vllm_v1_adapter.py b/lmcache/integration/vllm/vllm_v1_adapter.py
 index 27c29c8d..c958e3bf 100644
 --- a/lmcache/integration/vllm/vllm_v1_adapter.py
@@ -74,11 +86,62 @@ index 27c29c8d..c958e3bf 100644
  
              if self.async_loading:
                  # Cancel any ongoing async lookup and prefetch tasks on workers
+diff --git a/lmcache/v1/cache_controller/executor.py b/lmcache/v1/cache_controller/executor.py
+index a78d1971..2f7ebaed 100644
+--- a/lmcache/v1/cache_controller/executor.py
++++ b/lmcache/v1/cache_controller/executor.py
+@@ -323,6 +323,7 @@ class LMCacheClusterExecutor:
+                     new_position=(dst_url, msg.new_position[1]),
+                     tokens=msg.tokens,
+                     copy=msg.copy,
++                    request_configs=getattr(msg, "request_configs", None),
+                 )
+             )
+             serialized_msgs.append(serialized_msg)
+diff --git a/lmcache/v1/cache_controller/message.py b/lmcache/v1/cache_controller/message.py
+index d4d68dc5..a33c06ce 100644
+--- a/lmcache/v1/cache_controller/message.py
++++ b/lmcache/v1/cache_controller/message.py
+@@ -422,6 +422,7 @@ class MoveWorkerMsg(ControlMsg):
+     new_position: Tuple[str, str]  # (target_url, location (storage backend name) )
+     tokens: Optional[list[int]] = None
+     copy: Optional[bool] = True
++    request_configs: Optional[dict] = None
+ 
+     def describe(self) -> str:
+         return (
+diff --git a/lmcache/v1/cache_controller/worker.py b/lmcache/v1/cache_controller/worker.py
+index a6632c2d..0e2e1f7c 100644
+--- a/lmcache/v1/cache_controller/worker.py
++++ b/lmcache/v1/cache_controller/worker.py
+@@ -566,6 +566,7 @@ class LMCacheWorker:
+                             new_position=new_position,
+                             event_id=worker_event_id,
+                             do_copy=do_copy,
++                            request_configs=getattr(request, "request_configs", None),
+                         )
+ 
+                     # TODO(Jiayi): LMCache needs to have an event tracking
 diff --git a/lmcache/v1/cache_engine.py b/lmcache/v1/cache_engine.py
-index b684a4ee..8171ce77 100644
+index b684a4ee..0ec8a79f 100644
 --- a/lmcache/v1/cache_engine.py
 +++ b/lmcache/v1/cache_engine.py
-@@ -1207,41 +1207,56 @@ class LMCacheEngine:
+@@ -1190,6 +1190,7 @@ class LMCacheEngine:
+         new_position: tuple[str, str],
+         event_id: str,
+         do_copy: bool = True,
++        request_configs: Optional[dict] = None,
+     ) -> int:
+         """
+         Perform cross-node move of the KV cache.
+@@ -1201,47 +1202,63 @@ class LMCacheEngine:
+             search_range=[old_position],
+             lookup_id=event_id,
+             pin=True,
++            request_configs=request_configs,
+         )
+ 
+         if not num_tokens:
              logger.debug("Move is not performed as there are no tokens to move.")
              return 0
  

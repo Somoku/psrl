@@ -322,11 +322,28 @@ class RequestAbortedByGatewayError(Exception):
         self.message = message
 
 
+_OVERLONG_MARKERS = (
+    "longer than the maximum model length",
+    "exceeds the model's maximum context length",
+)
+
+
+class PromptOverflowError(Exception):
+    """vLLM rejected a prompt that exceeds max_model_len.
+
+    Raised in two paths:
+    - SMG HTTP path: detected in _classify_http_error() by matching the 400 body.
+    - LiteLLM path: raised by overflow.py wrappers to abort the tenacity retry loop.
+    Callers should treat this as a deliberate termination and map it to
+    TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED.
+    """
+
+
 def _classify_http_error(
     exc: BaseException,
     request_headers: Mapping[str, str] | None = None,
 ) -> BaseException:
-    """Return a more specific exception when `exc` is an SMG `request_aborted` 400.
+    """Return a more specific exception when `exc` is a classifiable SMG 400.
 
     Otherwise returns `exc` unchanged. Callers should `raise` the returned
     exception; chained `__cause__` is preserved when a translation occurs.
@@ -345,12 +362,17 @@ def _classify_http_error(
             if key.lower() == "x-smg-error-code":
                 code = value
                 break
-    if code != "request_aborted":
-        return exc
-    request_id = (request_headers or {}).get("x-request-id", "")
-    translated = RequestAbortedByGatewayError(request_id=request_id, message=str(exc.message))
-    translated.__cause__ = exc
-    return translated
+    if code == "request_aborted":
+        request_id = (request_headers or {}).get("x-request-id", "")
+        translated = RequestAbortedByGatewayError(request_id=request_id, message=str(exc.message))
+        translated.__cause__ = exc
+        return translated
+    body_text = str(exc.message)
+    if any(marker in body_text for marker in _OVERLONG_MARKERS):
+        translated = PromptOverflowError(f"Prompt exceeds max_model_len: {body_text}")
+        translated.__cause__ = exc
+        return translated
+    return exc
 
 
 def _parse_body(body: bytes) -> tuple[Any, str | None]:
@@ -395,6 +417,8 @@ async def request_raw(
             # handle abort error
             translated = _classify_http_error(e, headers)
             if isinstance(translated, RequestAbortedByGatewayError):
+                raise translated from e
+            if isinstance(translated, PromptOverflowError):
                 raise translated from e
             retry_count += 1
             if retry_count >= attempts:
@@ -443,6 +467,8 @@ async def request_json(
             # handle abort error
             translated = _classify_http_error(e, headers)
             if isinstance(translated, RequestAbortedByGatewayError):
+                raise translated from e
+            if isinstance(translated, PromptOverflowError):
                 raise translated from e
             retry_count += 1
             psrl_logger.info(

@@ -12,7 +12,9 @@
 - name: mini_swe_agent
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop_v1.MiniSWEAgentLoopV1
   sandbox_config:
-    max_parallel_tasks_per_worker: 0
+    # Cap concurrent Docker rollouts per AgentLoopWorker. Unlimited (0) overloads
+    # the local docker daemon and causes `docker run` to hit pull_timeout.
+    max_parallel_tasks_per_worker: 8
     rollout_turn_timeout: 2400
     environment:
       image: "swebench-sentinel-override-per-instance"

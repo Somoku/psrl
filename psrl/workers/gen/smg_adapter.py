@@ -11,6 +11,15 @@ WORKERS_STATS_PATH = "/workers/stats"
 ROUTING_LOOP_STATUS_PATH = "/routing_loop/status"
 TITO_SESSIONS_PATH = "tito/sessions"
 
+CACHE_AWARE_METHODS = frozenset({"cache_aware", "cache_aware_v1"})
+
+# Legacy top-level routing_strategy keys kept for backward compatibility.
+_LEGACY_CACHE_AWARE_KEYS = frozenset({"cache_threshold", "gpu_overlap_weight", "lmcache_overlap_weight"})
+
+
+def is_cache_aware_method(method: str) -> bool:
+    return method in CACHE_AWARE_METHODS
+
 
 def cfg_get(config: Any, path: str, default: Any = None) -> Any:
     node = config
@@ -19,6 +28,17 @@ def cfg_get(config: Any, path: str, default: Any = None) -> Any:
             return default
         node = getattr(node, part)
     return node if node is not None else default
+
+
+def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
+    nested = cfg_get(config, f"psrl.routing_strategy.cache_aware_policy.{key}", None)
+    if nested is not None:
+        return nested
+    if key in _LEGACY_CACHE_AWARE_KEYS:
+        legacy = cfg_get(config, f"psrl.routing_strategy.{key}", None)
+        if legacy is not None:
+            return legacy
+    return default
 
 
 def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr: str):
@@ -52,9 +72,16 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         prefill_policy=None,
         decode_policy=None,
         disable_retries=True,
-        cache_threshold=float(cfg_get(config, "psrl.routing_strategy.cache_threshold", 0.3)),
-        gpu_overlap_weight=float(cfg_get(config, "psrl.routing_strategy.gpu_overlap_weight", 1.0)),
-        lmcache_overlap_weight=float(cfg_get(config, "psrl.routing_strategy.lmcache_overlap_weight", 0.5)),
+        cache_threshold=float(_cache_aware_cfg(config, "cache_threshold", 0.3)),
+        gpu_overlap_weight=float(_cache_aware_cfg(config, "gpu_overlap_weight", 1.0)),
+        lmcache_overlap_weight=float(_cache_aware_cfg(config, "lmcache_overlap_weight", 0.5)),
+        balance_abs_threshold=int(_cache_aware_cfg(config, "balance_abs_threshold", 64)),
+        balance_rel_threshold=float(_cache_aware_cfg(config, "balance_rel_threshold", 1.5)),
+        balance_token_usage_threshold=float(_cache_aware_cfg(config, "balance_token_usage_threshold", 1.0)),
+        overload_token_usage_threshold=float(_cache_aware_cfg(config, "overload_token_usage_threshold", 1.0)),
+        eviction_interval_secs=int(_cache_aware_cfg(config, "eviction_interval_secs", 60)),
+        max_tree_size=int(_cache_aware_cfg(config, "max_tree_size", 2**26)),
+        block_size=int(_cache_aware_cfg(config, "block_size", 16)),
         max_concurrent_seqs_per_instance=int(
             cfg_get(config, "psrl.routing_strategy.max_concurrent_seqs_per_instance", 1024)
         ),

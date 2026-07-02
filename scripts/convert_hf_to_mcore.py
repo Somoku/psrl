@@ -757,8 +757,7 @@ def convert_hf_to_mcore(
     elif "MixtralForCausalLM" in hf_config.architectures:
         convert_checkpoint_from_transformers_to_megatron_mixtral(hf_model, model[0].module, hf_config)
     elif use_cpu_initialization and any(
-        arch in hf_config.architectures
-        for arch in ("LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM")
+        arch in hf_config.architectures for arch in ("LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM")
     ):
         # CPU-only path for dense models (e.g. Llama-70B). The GPU-resident path
         # in ``load_state_dict_to_megatron_gptmodel`` would otherwise place the
@@ -766,8 +765,7 @@ def convert_hf_to_mcore(
         convert_checkpoint_from_transformers_to_megatron_dense(hf_model, model[0].module, hf_config)
     else:
         assert not use_cpu_initialization, (
-            "use_cpu_initialization for this architecture is not implemented yet; "
-            f"got {hf_config.architectures}"
+            f"use_cpu_initialization for this architecture is not implemented yet; got {hf_config.architectures}"
         )
         from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
 

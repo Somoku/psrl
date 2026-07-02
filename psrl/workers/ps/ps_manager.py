@@ -3,10 +3,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import ray
+import transfer_queue as tq
 from omegaconf import DictConfig
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
+from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import (
     EventType,
     deprecated,
@@ -17,9 +19,10 @@ from psrl.utils.logger import (
 )
 from psrl.utils.nixl import NIXLMetaServer
 from psrl.utils.ray import add_busy_polling_lock
+from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.broadcast import build_broadcast_plan
 from psrl.workers.ps.ps_worker_group import PSWorkerGroup
-from psrl.workers.ps.request_status_tracker import RequestStatusTracker
+from psrl.workers.ps.request_status_tracker import RequestStatusTracker, _state_locked
 from psrl.workers.ps.staleness_controller import (
     BufferStatus,
     EntryInfo,
@@ -68,6 +71,8 @@ class PSManager(RequestStatusTracker):
         """
         RequestStatusTracker.__init__(self, psrl_config)
 
+        tq.init()
+
         if self.psrl_config.redundant_rollout.enable:
             self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n
             self.alg_rollout_n = self.psrl_config.redundant_rollout.alg_rollout_n
@@ -78,7 +83,7 @@ class PSManager(RequestStatusTracker):
 
         # PS worker specific attributes
         self.rollout_instance_tracker: dict[
-            int, RolloutInstanceStatus
+            RolloutInstanceId, RolloutInstanceStatus
         ] = {}  # Maps rollout instance IDs to their corresponding info
         # NOTE(lhy): Initialized at version 0 (representing the loaded checkpoint before any
         # training step). This avoids a None check in pull_model_state_dict_nixl during the
@@ -132,13 +137,17 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_gen_storage_client_names: list[str] | None = None
         # NOTE(claude): Populated by bind_ps_worker_group; ordered by rank so that
         # _coordinate_broadcast_init can index workers directly by rank.
-        self._ps_worker_handles_by_rank: list = []
+        self.ps_worker_handles_by_rank: list = []
 
         # Lock state for push/pull operations
         # _exclusive_push_locked: True if a push operation is in progress (exclusive lock)
         # _shared_pull_count: Number of concurrent pull operations (shared lock)
         self._exclusive_push_locked = False
         self._shared_pull_count = 0
+
+        # PS Manager gRPC server state (for Rust routing loop)
+        self.grpc_state_server = None
+        self.grpc_state_port: int | None = None
 
         # The log is now merged with the request status tracker
         """    
@@ -148,21 +157,55 @@ class PSManager(RequestStatusTracker):
         """
         psrl_logger.info(f"PSManager initialized on {get_worker_info()}.")
 
+    # ------- GRPC STATE SERVER -------
+
+    def start_grpc_server(self) -> int:
+        """Start PS Manager gRPC server and return the bound port.
+
+        Returns:
+            int: gRPC server port number
+        """
+        if self.grpc_state_server is None:
+            from psrl.grpc.ps_manager_service import PSManagerGrpcServer
+
+            self.grpc_state_server = PSManagerGrpcServer(self)
+        port = find_available_port(base_port=8100)
+        self.grpc_state_port = self.grpc_state_server.start(port)
+        return self.grpc_state_port
+
+    def stop_grpc_server(self, grace: float = 1.0):
+        """Stop PS Manager gRPC server if it is running."""
+        if self.grpc_state_server is None:
+            return
+        self.grpc_state_server.stop(grace=grace)
+        self.grpc_state_port = None
+
+    def get_grpc_server_port(self) -> int | None:
+        """Get current PS Manager gRPC server port."""
+        return self.grpc_state_port
+
     @deprecated("It is too slow to get the PS handle by `ray.get_runtime_context()`")
     def get_ps_manager_handle(self):
         """Get the PS handle."""
         return ray.get_runtime_context().current_actor
 
-    def register_rollout_instance(self, rollout_instance_id: int):
+    @_state_locked
+    def register_rollout_instance(self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]):
         """Register a new rollout instance with the PS Manager.
 
         Args:
-            rollout_instance_id (int): Unique identifier for the rollout instance
+            rollout_instance_ids (RolloutInstanceId | list[RolloutInstanceId]):
+                Unique identifier for the rollout instance(s)
         """
-        self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(version_tag=0)
+        if not isinstance(rollout_instance_ids, list):
+            rollout_instance_ids = [rollout_instance_ids]
+
+        for rollout_instance_id in rollout_instance_ids:
+            self.rollout_instance_tracker[rollout_instance_id] = RolloutInstanceStatus(version_tag=0)
 
     # ------- STALENESS INVENTORY MANAGEMENT -------
 
+    @_state_locked
     def set_val_staleness_inventory_capacity(self, ready_num_entries: int, num_entries: int = None):
         """Set the capacity of the validation staleness inventory.
 
@@ -174,14 +217,17 @@ class PSManager(RequestStatusTracker):
             num_entries = ready_num_entries
         self.val_staleness_inventory.create_buffer_with_capacity(ready_num_entries, num_entries)
 
+    @_state_locked
     def ensure_train_buffer_exists(self, buffer_id: int):
         """Ensure a training buffer exists in the staleness inventory."""
         self.staleness_inventory.ensure_buffer_exists(buffer_id)
 
+    @_state_locked
     def ensure_validate_buffer_exists(self):
         """Ensure a validation buffer exists in the staleness inventory."""
         self.val_staleness_inventory.ensure_buffer_exists()
 
+    @_state_locked
     def get_max_reserve_num(self, model_version, is_validate: bool = False) -> int:
         """Get the maximum number of entries that can be reserved for a specific model version.
 
@@ -197,6 +243,7 @@ class PSManager(RequestStatusTracker):
 
     # Used when the model version on the rollout instance is ahead of the request version tag
     # (we allow a old version request to be routed to a new version instance)
+    @_state_locked
     def update_request_version_tag(
         self,
         request_id: int,
@@ -217,17 +264,18 @@ class PSManager(RequestStatusTracker):
         )
 
     # Used when the request is routed to a new rollout instance (partial rollout)
+    @_state_locked
     def update_request_instance_id(
         self,
         request_id: int,
-        new_instance_id: int,
+        new_instance_id: RolloutInstanceId,
         is_validate: bool = False,
     ):
         """Update the instance id of a specific request in the staleness inventory.
 
         Args:
             request_id (int): The unique identifier of the request
-            new_instance_id (int): The new rollout instance id to set for the request
+            new_instance_id (RolloutInstanceId): The new rollout instance id to set for the request
             is_validate (bool): Whether to use the validation staleness inventory
         """
         staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
@@ -236,14 +284,38 @@ class PSManager(RequestStatusTracker):
             new_instance_id=new_instance_id,
         )
 
+    @_state_locked
+    def update_request_n_trajectory(
+        self,
+        request_id: int,
+        n_trajectory: int,
+        is_validate: bool = False,
+    ):
+        """Update the number of trajectories of a specific request in the staleness inventory.
+
+        Args:
+            request_id (int): The unique identifier of the request
+            n_trajectory (int): The number of trajectories to set for the request
+            is_validate (bool): Whether to use the validation staleness inventory
+        """
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        staleness_inventory.update_request_n_trajectory(
+            request_id=request_id,
+            new_n_trajectory=n_trajectory,
+        )
+
+    @_state_locked
     def move_occupied_entries(
         self,
         prompt_ids: int | list[int],
         buffer_id: int,
+        is_validate: bool = False,
     ):
         """Move occupied entries to a specific buffer."""
-        self.staleness_inventory.move_occupied_entries(prompt_ids, buffer_id)
+        staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+        staleness_inventory.move_occupied_entries(prompt_ids, buffer_id)
 
+    @_state_locked
     def clear_occupied_entries(
         self,
         prompt_ids: int | list[int],
@@ -258,6 +330,7 @@ class PSManager(RequestStatusTracker):
         staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
         staleness_inventory.clear_occupied_entries(prompt_ids)
 
+    @_state_locked
     def clear_reserved_entries(
         self,
         prompt_ids: int | list[int],
@@ -274,6 +347,7 @@ class PSManager(RequestStatusTracker):
         staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
         staleness_inventory.clear_reserved_entries(prompt_ids, move_across_buffer)
 
+    @_state_locked
     def get_min_pending_buffer(self, is_validate: bool = False) -> int:
         """Get the minimum pending buffer id in the staleness inventory."""
         staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
@@ -307,6 +381,7 @@ class PSManager(RequestStatusTracker):
                 else:
                     break
 
+    @_state_locked
     def can_reserve_request(
         self,
         request_idx: int | list[int],
@@ -344,11 +419,10 @@ class PSManager(RequestStatusTracker):
             validate_per_request = is_validate
 
         multi_results = []
-        for i, request_id in enumerate(request_idx):
-            val_flag = validate_per_request[i]
+        for request_id, is_validate in zip(request_idx, validate_per_request):
             results = []
-            staleness_inventory = self.val_staleness_inventory if val_flag else self.staleness_inventory
-            rollout_n = self.val_rollout_n if val_flag else self.rollout_n
+            staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
+            rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             for model_version in model_versions:
                 assert model_version != -1, "Model version should not be -1 when checking if a request can be reserved"
                 assert request_id not in self._abort_request_ids, (
@@ -358,11 +432,12 @@ class PSManager(RequestStatusTracker):
                     results.append(False)
                     continue
                 entry_info = EntryInfo(
-                    rollout_instance_id=-1,  # Not important for this check
+                    rollout_instance_id=INVALID_ROLLOUT_INSTANCE_ID,  # Not important for this check
                     prompt_id=request_id // rollout_n,
                     request_idx=request_id % rollout_n,
                     model_version=model_version,
-                    is_validate=val_flag,
+                    n_trajectory=1,
+                    is_validate=is_validate,
                 )
                 if without_new_reserve_entry:
                     results.append(
@@ -377,6 +452,7 @@ class PSManager(RequestStatusTracker):
         else:
             return multi_results
 
+    @_state_locked
     def get_reserve_indicator(
         self,
         request_id: int,
@@ -408,10 +484,11 @@ class PSManager(RequestStatusTracker):
                 indicators.append(float("inf"))
                 continue
             entry_info = EntryInfo(
-                rollout_instance_id=-1,  # Not important for this check
+                rollout_instance_id=INVALID_ROLLOUT_INSTANCE_ID,  # Not important for this check
                 prompt_id=request_id // rollout_n,
                 request_idx=request_id % rollout_n,
                 model_version=model_version,
+                n_trajectory=1,
                 is_validate=is_validate,
             )
             if staleness_inventory.can_reserve_data_without_new_reserve_entry(entry_info, model_version):
@@ -425,9 +502,10 @@ class PSManager(RequestStatusTracker):
                 indicators.append(float("inf"))
         return indicators
 
+    @_state_locked
     def reserve_rollout_instance_requests(
         self,
-        rollout_instance_ids: int | list[int],
+        rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId],
         request_ids: int | list[int],
         model_versions: int | list[int],
         guarantee_not_aborted: bool = True,
@@ -442,7 +520,7 @@ class PSManager(RequestStatusTracker):
         Note that the request will be ignored if the group entries have been reserved.
 
         Args:
-            rollout_instance_ids (Union[int, List[int]]): The rollout instance ids
+            rollout_instance_ids (Union[RolloutInstanceId, List[RolloutInstanceId]]): The rollout instance ids
             request_ids (Union[int, List[int]]): The request ids
             model_versions (Union[int, List[int]]): The model versions
             guarantee_not_aborted (bool): Whether to guarantee that the requests are not aborted
@@ -461,9 +539,10 @@ class PSManager(RequestStatusTracker):
             model_versions = [model_versions]
 
         for rollout_instance_id in rollout_instance_ids:
-            assert rollout_instance_id == -1 or rollout_instance_id in self.rollout_instance_tracker, (
-                f"Rollout instance {rollout_instance_id} is not registered."
-            )
+            assert (
+                rollout_instance_id == INVALID_ROLLOUT_INSTANCE_ID
+                or rollout_instance_id in self.rollout_instance_tracker
+            ), f"Rollout instance {rollout_instance_id} is not registered."
 
         # Initialize the reserved entry and buffer ids
         entry_ids = []
@@ -493,6 +572,7 @@ class PSManager(RequestStatusTracker):
                 prompt_id=request_id // rollout_n,
                 request_idx=request_id % rollout_n,
                 model_version=model_version,
+                n_trajectory=1,
                 is_validate=is_validate,
             )
 
@@ -512,6 +592,7 @@ class PSManager(RequestStatusTracker):
 
         return buffer_ids, entry_ids
 
+    @_state_locked
     def abort_reserved_requests(self, buffer_id: int) -> tuple[int, list[int]]:
         """Abort the reserved requests for a specific buffer.
 
@@ -538,6 +619,7 @@ class PSManager(RequestStatusTracker):
         self.abort_requests(abort_request_ids)
         return len(reserved_entry_ids), abort_request_ids
 
+    @_state_locked
     def abort_requests(
         self,
         request_ids: list[int] | int,
@@ -582,6 +664,9 @@ class PSManager(RequestStatusTracker):
                     [prompt_id * self.rollout_n + idx for idx in abort_request_idxs],
                 )
                 continue
+            assert prompt_id in self.staleness_inventory.data_tracker, (
+                f"Prompt {prompt_id} must have existing mapping in data tracker."
+            )
             buffer_id, entry_id = self.staleness_inventory.data_tracker[prompt_id]
             entry_info = self.staleness_inventory.buffers[buffer_id].entries[entry_id].entry_info
             all_requests_of_entry = entry_info.get_all_request_relative_ids()
@@ -615,6 +700,7 @@ class PSManager(RequestStatusTracker):
         self._abort_requests(list(abort_request_ids), blocking)
         psrl_logger.debug(f"Abort requests done: {abort_request_ids=}, {clear_entries=}")
 
+    @_state_locked
     def check_aborted_model_versions(self, model_versions: int | list[int]) -> bool | list[bool]:
         """Check if the model versions are aborted.
 
@@ -627,6 +713,7 @@ class PSManager(RequestStatusTracker):
             return model_versions <= self.max_aborted_version
         return [model_version <= self.max_aborted_version for model_version in model_versions]
 
+    @_state_locked
     def check_aborted_requests(self, request_ids: int | list[int], remove: bool = False) -> bool | list[bool]:
         """Check if the requests are aborted and remove them from the abort set if needed.
 
@@ -730,6 +817,7 @@ class PSManager(RequestStatusTracker):
 
         return abort_request_ids
 
+    @_state_locked
     def handle_ready_buffer(self, buffer_id: int) -> set[int]:
         """
         Handle the ready buffer.
@@ -743,6 +831,7 @@ class PSManager(RequestStatusTracker):
         abort_request_ids = self._abort_after_buffer_ready(buffer_id)
         return abort_request_ids
 
+    @_state_locked
     def occupy_rollout_instance_request(
         self,
         prompt_id: int,
@@ -760,6 +849,7 @@ class PSManager(RequestStatusTracker):
             prompt_id (int): The prompt id of the request
             request_ids (Optional[Union[int, List[int]]]): The request ids to occupy
             is_validate (bool): Whether to use the validation staleness inventory
+
         Returns:
             Tuple[Optional[int], Optional[BufferStatus], EntryInfo]: A tuple containing:
                 - buffer_id (Optional[int]): The buffer id where the data is stored, or None if not occupied
@@ -796,22 +886,23 @@ class PSManager(RequestStatusTracker):
 
     # ------- MODEL VERSION MANAGEMENT -------
 
-    def get_all_rollout_instance_model_versions(self) -> dict[int, int]:
+    def get_all_rollout_instance_model_versions(self) -> dict[RolloutInstanceId, int]:
         """Get all rollout instance model versions.
 
         Returns:
-            Dict[int, int]: A dictionary mapping rollout instance IDs to their model versions
+            Dict[RolloutInstanceId, int]: A dictionary mapping rollout instance IDs to their model versions
         """
         return {
             instance_id: instance_status.version_tag
             for instance_id, instance_status in self.rollout_instance_tracker.items()
         }
 
-    def get_rollout_instance_model_version(self, rollout_instance_id: int) -> int:
+    @_state_locked
+    def get_rollout_instance_model_version(self, rollout_instance_id: RolloutInstanceId) -> int:
         """Get the model version for a specific rollout instance.
 
         Args:
-            rollout_instance_id (int): The rollout instance id
+            rollout_instance_id (RolloutInstanceId): The rollout instance id
 
         Returns:
             int: The model version for the specified rollout instance
@@ -829,27 +920,34 @@ class PSManager(RequestStatusTracker):
             return 0  # If no model is stored, return version 0
         return self.model_store.version_tag
 
-    def _update_rollout_instance_model_version_tag_to_latest(self, rollout_instance_id: int):
+    def _update_rollout_instance_model_version_tag_to_latest(
+        self,
+        rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId],
+    ):
         """Update the rollout instance model version to the latest model version."""
-        assert rollout_instance_id in self.rollout_instance_tracker, (
-            f"Rollout instance {rollout_instance_id} is not registered."
-        )
+        if not isinstance(rollout_instance_ids, list):
+            rollout_instance_ids = [rollout_instance_ids]
 
-        if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
-            # NOTE(lhy): rollout_coordinator is only used when the version actually changes.
-            # At init-time (version 0 → 0), this branch is skipped, so coordinator need not be bound yet.
-            assert self.rollout_coordinator is not None, (
-                "Rollout coordinator is not set. Please set it before updating rollout instance model version."
+        for rollout_instance_id in rollout_instance_ids:
+            assert rollout_instance_id in self.rollout_instance_tracker, (
+                f"Rollout instance {rollout_instance_id} is not registered."
             )
-            self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
-            # Sync the rollout instance model version in the rollout coordinator
-            self.rollout_coordinator.set_rollout_instance_model_version.remote(
-                rollout_instance_id=rollout_instance_id,
-                version_tag=self.model_store.version_tag,
-            )
-            psrl_logger.info(
-                f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}."
-            )
+
+            if self.rollout_instance_tracker[rollout_instance_id].version_tag != self.model_store.version_tag:
+                # NOTE(lhy): rollout_coordinator is only used when the version actually changes.
+                # At init-time (version 0 → 0), this branch is skipped, so coordinator need not be bound yet.
+                assert self.rollout_coordinator is not None, (
+                    "Rollout coordinator is not set. Please set it before updating rollout instance model version."
+                )
+                self.rollout_instance_tracker[rollout_instance_id].version_tag = self.model_store.version_tag
+                # Sync the rollout instance model version in the rollout coordinator
+                self.rollout_coordinator.set_rollout_instance_model_version.remote(
+                    rollout_instance_id=rollout_instance_id,
+                    version_tag=self.model_store.version_tag,
+                )
+                psrl_logger.info(
+                    f"Updated rollout instance {rollout_instance_id} model version to {self.model_store.version_tag}."
+                )
 
     # ------- PS NIXL CONTROL PLANE -------
 
@@ -908,6 +1006,16 @@ class PSManager(RequestStatusTracker):
         """
         self.nixl_meta_server.wait_for_update_infos(info_num)
 
+    def shutdown_nixl_server(self):
+        """Shutdown NIXL meta server cleanly.
+
+        This avoids leaving UCX endpoints active while Ray tears down actors.
+        """
+        if self.nixl_meta_server is None:
+            return
+        self.nixl_meta_server.shutdown()
+        self.nixl_meta_server = None
+
     def nixl_broadcast_update_client_infos(self, dst_agent_names: list[str], update_client_names: list[str]):
         """Broadcast updated client infos to specified NIXL clients.
 
@@ -939,7 +1047,7 @@ class PSManager(RequestStatusTracker):
         self.ps_nixl_gen_storage_client_names = ray.get(ps_nixl_gen_storage_client_name_futures)
         # NOTE(claude): _workers is ordered by rank (set during PSWorkerGroup construction),
         # so indexing by rank in _coordinate_broadcast_init is safe.
-        self._ps_worker_handles_by_rank = list(self.ps_worker_group._workers)
+        self.ps_worker_handles_by_rank = list(self.ps_worker_group._workers)
         psrl_logger.info(
             f"PS worker group initialized with NIXL agent names: {self.ps_nixl_agent_names}, "
             f"train storage client names: {self.ps_nixl_train_storage_client_names}, "
@@ -972,7 +1080,7 @@ class PSManager(RequestStatusTracker):
         children via NIXL, then waits (barrier) before proceeding to the next round.
         After all rounds complete, triggers transfer_train_to_gen on every worker.
         """
-        world_size = len(self._ps_worker_handles_by_rank)
+        world_size = len(self.ps_worker_handles_by_rank)
         plan = build_broadcast_plan(
             world_size=world_size,
             algorithm=self.psrl_config.broadcast_init.algorithm,
@@ -987,23 +1095,16 @@ class PSManager(RequestStatusTracker):
             senders = plan.senders_in_round(round_idx)
             if not senders:
                 continue
-            psrl_logger.info(
-                f"[_coordinate_broadcast_init] round {round_idx}: senders={senders}."
-            )
+            psrl_logger.info(f"[_coordinate_broadcast_init] round {round_idx}: senders={senders}.")
             futures = [
-                self._ps_worker_handles_by_rank[rank].broadcast_send_to_children.remote(
-                    round_idx, plan
-                )
+                self.ps_worker_handles_by_rank[rank].broadcast_send_to_children.remote(round_idx, plan)
                 for rank in senders
             ]
             ray.get(futures)  # round barrier: wait for all senders before next round
 
         # All workers now have their train buffers populated; copy train → gen if needed.
         psrl_logger.info("[_coordinate_broadcast_init] all rounds done; triggering transfer_train_to_gen.")
-        ray.get([
-            w.do_transfer_train_to_gen_after_broadcast.remote()
-            for w in self._ps_worker_handles_by_rank
-        ])
+        ray.get([w.do_transfer_train_to_gen_after_broadcast.remote() for w in self.ps_worker_handles_by_rank])
         psrl_logger.info("[_coordinate_broadcast_init] broadcast initialization complete.")
 
     def get_ps_worker_handle(self, client_name: str) -> ray.actor.ActorHandle:
@@ -1104,6 +1205,24 @@ class PSManager(RequestStatusTracker):
         assert self._shared_pull_count > 0, "Shared pull lock count is already 0"
         self._shared_pull_count -= 1
 
+    @_state_locked
+    def init_model_version_for_resume(self, version: int):
+        """
+        Initialize the PS model version for resume without triggering buffer deletion
+        or coordinator assertions.
+
+        This sets the model_store to the given version so that the next push_model call
+        from train workers will correctly compute next_version = version + 1.
+
+        Args:
+            version (int): The version to initialize to (typically checkpoint_step - 1).
+        """
+        self.model_store = ModelStore(version_tag=version)
+        if self.rollout_coordinator is not None:
+            self.rollout_coordinator.init_ps_model_version.remote(version)
+        psrl_logger.info(f"Initialized model version for resume: {version}")
+
+    @_state_locked
     def push_model_state_dict_cpu(self, version_tag: int, model_state_dict: Mapping[str, Tensor | DTensor] | None):
         """
         Push a model to the PS. In 'cpu' mode, store the real state dict. In 'cpu_ref' mode, this should not be called.
@@ -1130,6 +1249,7 @@ class PSManager(RequestStatusTracker):
     # ray will not recursively dereference all refs inside the container
     # Only the top-level task/actor arguments are expanded to real values,
     # and ray will not traverse all nested structures to find ObjectRefs.
+    @_state_locked
     def push_model_state_dict_cpu_ref_list(self, version_tag: int, model_state_dict_ref_list: list[ray.ObjectRef]):
         """
         Push a model to the PS by storing a ray object_ref. Only used in 'cpu_ref' mode.
@@ -1154,6 +1274,7 @@ class PSManager(RequestStatusTracker):
             event_type=EventType.PUSH,
         )
 
+    @_state_locked
     def push_model_state_dict_nixl(self, version_tag: int):
         """
         Record the version tag of the model state dict pushed to the PS via NIXL.
@@ -1171,13 +1292,16 @@ class PSManager(RequestStatusTracker):
             event_type=EventType.PUSH,
         )
 
-    def pull_model_state_dict_cpu(self, rollout_instance_id: int) -> Mapping[str, Tensor | DTensor] | None:
+    @_state_locked
+    def pull_model_state_dict_cpu(
+        self, rollout_instance_id: RolloutInstanceId
+    ) -> Mapping[str, Tensor | DTensor] | None:
         """
         Pull the latest model state dict from PS via CPU. Only used in 'cpu' mode.
         This will block until the state dict is transferred (potential bottleneck for large models).
 
         Args:
-            rollout_instance_id (int): The rollout instance id
+            rollout_instance_id (RolloutInstanceId): The rollout instance id
 
         Returns:
             Optional[Mapping[str, Union[Tensor, DTensor]]]: The model state dict
@@ -1185,22 +1309,27 @@ class PSManager(RequestStatusTracker):
         assert self.psrl_config.ps_mode == "cpu", "pull_model_state_dict_cpu should only be used in 'cpu' mode."
         assert self.model_store is not None, "Model instance is not initialized."
 
+        instance_ids = rollout_instance_id if isinstance(rollout_instance_id, list) else [rollout_instance_id]
+
         log_single_event(
             f"Rollout instance {rollout_instance_id} pulling latest model "
             f"with version tag {self.model_store.version_tag}",
             psrl_logger,
             event_type=EventType.PULL,
         )
-        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
+        self._update_rollout_instance_model_version_tag_to_latest(instance_ids)
         return self.model_store.model_state_dict
 
-    def pull_model_state_dict_cpu_ref(self, rollout_instance_id: int) -> ray.ObjectRef:
+    @_state_locked
+    def pull_model_state_dict_cpu_ref(
+        self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]
+    ) -> ray.ObjectRef:
         """
         Return the ray object_ref for the latest model state dict. Only used in 'cpu_ref' mode.
         This is a fast operation (no large data transfer here).
 
         Args:
-            rollout_instance_id (int): The rollout instance id
+            rollout_instance_ids (RolloutInstanceId | list[RolloutInstanceId]): The rollout instance id
 
         Returns:
             ray.ObjectRef: The ray object_ref for the latest model state dict
@@ -1208,16 +1337,20 @@ class PSManager(RequestStatusTracker):
         assert self.psrl_config.ps_mode == "cpu_ref", "get_model_state_dict_ref should only be used in 'cpu_ref' mode."
         assert self.model_store is not None, "Model instance is not initialized."
 
+        if not isinstance(rollout_instance_ids, list):
+            rollout_instance_ids = [rollout_instance_ids]
+
         log_single_event(
-            f"Rollout instance {rollout_instance_id} pulling latest model "
+            f"Rollout instance {rollout_instance_ids} pulling latest model "
             f"with version tag {self.model_store.version_tag} (ref)",
             psrl_logger,
             event_type=EventType.PULL,
         )
-        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
+        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_ids)
         return self.model_store.model_state_dict_ref
 
-    def pull_model_state_dict_nixl(self, rollout_instance_id: int):
+    @_state_locked
+    def pull_model_state_dict_nixl(self, rollout_instance_ids: RolloutInstanceId | list[RolloutInstanceId]):
         """
         Pull the latest model state dict from PS via NIXL. Only used in 'nixl_cpu' or 'nixl_gpu' mode.
         This only updates the version tag of the model state dict pulled from the PS.
@@ -1227,10 +1360,14 @@ class PSManager(RequestStatusTracker):
             "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         )
         assert self.model_store is not None, "Model instance is not initialized."
+
+        if not isinstance(rollout_instance_ids, list):
+            rollout_instance_ids = [rollout_instance_ids]
+
         log_single_event(
-            f"Rollout instance {rollout_instance_id} pulling latest model "
+            f"Rollout instance {rollout_instance_ids} pulling latest model "
             f"with version tag {self.model_store.version_tag} (nixl)",
             psrl_logger,
             event_type=EventType.PULL,
         )
-        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_id)
+        self._update_rollout_instance_model_version_tag_to_latest(rollout_instance_ids)

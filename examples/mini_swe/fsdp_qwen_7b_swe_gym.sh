@@ -165,8 +165,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
     \
-    gen_actor_rollout_ref.model.path="$MODEL_PATH" \
-    +gen_actor_rollout_ref.model.override_config.max_position_embeddings=32768 \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
@@ -234,9 +232,21 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     psrl.group_post_process.enable=${enable_dynamic_sampling_filter} \
     psrl.group_post_process.name=dynamic_sampling_filter \
-    algorithm.filter_groups.metric=score \
+    algorithm.filter_groups.metric=reward_score \
+    \
+    reward.active_managers='[dapo]' \
+    reward.managers.dapo.reward_fn.0.path=${PSRL_PATH}/examples/mini_swe/reward.py \
+    reward.managers.dapo.reward_fn.0.name=compute_score \
+    +reward.managers.dapo.reward_fn.0.reward_kwargs.reward_mode=${reward_mode} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.len=${overlong_buffer_len} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.penalty_factor=${overlong_penalty_factor} \
+    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.log=False \
+    reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files="$train_files" \
+    data.reward_model_dicts.0.reward_loop_type=dapo \
+    data.reward_model_dicts.0.reward_fn=compute_score \
     data.val_files="$test_files" \
     data.prompt_key=prompt \
     data.truncation='error' \
@@ -245,9 +255,6 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     data.train_batch_size=${train_prompt_bsz} \
     data.return_raw_chat=True \
     data.filter_overlong_prompts=True \
-    custom_reward_function.path=${PSRL_PATH}/examples/mini_swe/reward.py \
-    custom_reward_function.name=compute_score \
-    +custom_reward_function.reward_kwargs.reward_mode=${reward_mode} \
     algorithm.adv_estimator=${adv_estimator} \
     algorithm.use_kl_in_reward=${use_kl_in_reward} \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \

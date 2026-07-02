@@ -2,34 +2,22 @@ import logging
 import os
 import time
 
-import ray
 import torch
 from omegaconf import DictConfig
-
-try:
-    # for torch 2.5+
-    from torch.distributed.tensor import DTensor
-except ImportError:
-    from torch.distributed._tensor import DTensor
-
-# from vllm.v1.worker.gpu_worker import Worker
+from torch.distributed.tensor import DTensor
 from verl.utils.device import get_device_id
-
-# from vllm.config import get_current_vllm_config
-# from vllm.platforms import current_platform
-from verl.utils.fs import copy_to_local
-from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.v1.core.kv_cache_utils import estimate_max_model_len
+from vllm_patches.interfaces import supports_weight_layout
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
-from psrl.utils.common.worker_naming import gen_client_name, ps_agent_name
+from psrl.utils.common.worker_naming import gen_client_name
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.vllm_converter import convert_vllm_inplace
 from psrl.utils.nixl import (
     NIXLClientType,
-    NIXLInterface,
     NIXLStorageClient,
 )
 
@@ -37,34 +25,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-"""
-class NIXLWorker(Worker):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        
-        # We do the device initialization here before building the NIXL client 
-        self.device = torch.device(f"cuda:{self.local_rank}")
-        current_platform.set_device(self.device)
-        current_platform.check_if_supports_dtype(self.model_config.dtype)
-        
-        vllm_config = get_current_vllm_config()
-        assert vllm_config.additional_config is not None, "additional_config must be provided when using NIXL"
-        assert vllm_config.additional_config.get("nixl_config") is not None, \
-            "nixl_config must be provided when using NIXL"
-        assert vllm_config.additional_config.get("nixl_interface") is not None, \
-            "nixl_interface must be provided when using NIXL"
-        assert vllm_config.additional_config.get("instance_id") is not None, \
-            "instance_id must be provided when using NIXL"
-        self.nixl_config = vllm_config.additional_config.get("nixl_config")
-        self.nixl_interface = vllm_config.additional_config.get("nixl_interface")
-        self.instance_id = vllm_config.additional_config.get("instance_id")
-        
-        assert hasattr(self, "init_nixl_client"), "init_nixl_client must be provided when using NIXL"
-        self.init_nixl_client(self.nixl_config, self.nixl_interface, self.instance_id)
-"""
-
-
-class vLLMWorkerExtension:
+class vLLMWorkerExtension(vLLMColocateWorkerExtension):
     def load_weights(self, weights, blocking: bool = True):
         """
         Load weights into the vLLM model runner.
@@ -87,54 +48,32 @@ class vLLMWorkerExtension:
         Raises:
             Exception: If there is an error during the loading process.
         """
-        try:
 
-            def rebuild_weights_generator():
-                current_device = torch.cuda.current_device()
-                for name, handle in weights:
-                    func, args = handle
-                    list_args = list(args)
-                    # CPU bundle: (type(tensor), storage, metadata)
-                    if len(list_args) == 3:
-                        tensor = func(*list_args)
-                        tensor = tensor.to(current_device, non_blocking=True)
-                        if isinstance(tensor, DTensor):
-                            tensor = tensor.full_tensor()
-                    else:
-                        list_args[6] = get_device_id()
-                        tensor = func(*list_args)
-                        if isinstance(tensor, DTensor):
-                            tensor = tensor.full_tensor()
-                    yield (name, tensor)
+        def rebuild_weights_generator():
+            current_device = torch.cuda.current_device()
+            for name, handle in weights:
+                func, args = handle
+                list_args = list(args)
+                # CPU bundle: (type(tensor), storage, metadata)
+                if len(list_args) == 3:
+                    tensor = func(*list_args)
+                    tensor = tensor.to(current_device, non_blocking=True)
+                    if isinstance(tensor, DTensor):
+                        tensor = tensor.full_tensor()
+                else:
+                    list_args[6] = get_device_id()
+                    tensor = func(*list_args)
+                    if isinstance(tensor, DTensor):
+                        tensor = tensor.full_tensor()
+                yield (name, tensor)
 
-            rebuild_weights = rebuild_weights_generator()
+        rebuild_weights = rebuild_weights_generator()
+        torch.cuda.synchronize()
+        loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
+        if blocking:
+            # Ensure all operations are completed before returning
             torch.cuda.synchronize()
-            loaded_params = self.model_runner.model.load_weights(weights=rebuild_weights)
-            if blocking:
-                # Ensure all operations are completed before returning
-                torch.cuda.synchronize()
-        except Exception as e:
-            raise ValueError(f"Error in vLLMWorkerExtension.load_weights: {e}") from e
         return loaded_params
-
-    def cuda_synchronize(self):
-        """Synchronize the CUDA device."""
-        try:
-            torch.cuda.synchronize()
-        except Exception as e:
-            raise ValueError(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}") from e
-        return None
-
-    def patch_vllm_moe_model_weight_loader(self) -> None:
-        """Patch the vLLM model weight loader for MoE models."""
-        try:
-            vllm_model = self.model_runner.model
-            if isinstance(vllm_model, CUDAGraphWrapper):
-                vllm_model = vllm_model.unwrap()
-            patch_vllm_moe_model_weight_loader(vllm_model)
-        except Exception as e:
-            raise ValueError(f"Error in vLLMWorkerExtension.patch_vllm_moe_model_weight_loader: {e}") from e
-        return None
 
     # ----------------------------- NIXL Related -----------------------------
     # Because the model is on another process since vllm V1, we must call the nixl methods via rpc
@@ -148,69 +87,62 @@ class vLLMWorkerExtension:
 
         return get_tensor_model_parallel_rank()
 
-    def get_node_id(self) -> str:
-        """Get the node id of the vllm worker."""
-        if not hasattr(self, "node_id"):
-            self.node_id = None
+    def get_instance_local_ep_rank(self):
+        from vllm.distributed.parallel_state import get_ep_group
 
-        if self.node_id is not None:
-            return self.node_id
-        self.node_id = ray.get_runtime_context().get_node_id()
-        return self.node_id
+        try:
+            return get_ep_group().rank_in_group
+        except AssertionError:
+            # EP group not initialized (non-MoE model) — default to 0
+            return 0
 
     def init_nixl_client(
         self,
         nixl_config: DictConfig,
-        nixl_interface_after_rpc: dict | NIXLInterface,
-        instance_id: int,
+        replica_idx: int,
         logging_path: str | None = None,
     ):
-        # Reconstruct the nixl_interface (the RPC call serializes the nixl_interface to a dict)
-        if isinstance(nixl_interface_after_rpc, dict):
-            nixl_interface = NIXLInterface()
-        else:
-            nixl_interface = nixl_interface_after_rpc
         # NIXL attributes
         self.unified_state_dict = None
         self.unified_sharding_dict = None
         # Initialize the NIXL client
         self.nixl_storage_client = NIXLStorageClient(
-            client_name=gen_client_name(instance_id, self.get_instance_local_rank()),
+            client_name=gen_client_name(replica_idx, self.get_instance_local_rank()),
             server_name=NIXL_META_SERVER_NAME,
             use_gpu=True,
             client_type=NIXLClientType.PULL_SIDE,
             nixl_config=nixl_config,
-            nixl_interface=nixl_interface,
+            replica_idx=replica_idx,
+            worker_index=self.get_instance_local_rank(),
             # client_group_id=instance_id,
             logging_path=logging_path,
         )
         psrl_logger.info(f"NIXL client initialized on port {self.nixl_storage_client.client_port}.")
 
-    def nixl_convert_params(self, config: DictConfig):
+    def nixl_convert_params(self, model_config: DictConfig):
         """Convert the model parameters to unified format.
 
         Args:
             config (DictConfig): Configuration object containing training settings.
         """
-        from transformers import AutoConfig
-
         vllm_model = self.model_runner.model
         if isinstance(vllm_model, CUDAGraphWrapper):
             vllm_model = vllm_model.unwrap()
-        model_config = AutoConfig.from_pretrained(
-            copy_to_local(config.model.path),
-            trust_remote_code=config.model.get("trust_remote_code", False),
+        param_mapping = (
+            None if supports_weight_layout(vllm_model) else create_parameter_mapping(type(vllm_model), model_config)
         )
-        parameter_mapping = create_parameter_mapping(type(vllm_model), model_config)
         self.unified_state_dict, self.local_sharding_dict = convert_vllm_inplace(
-            parameter_mapping, vllm_model, tp_rank=self.get_instance_local_tp_rank()
+            vllm_model,
+            tp_rank=self.get_instance_local_tp_rank(),
+            ep_rank=self.get_instance_local_ep_rank(),
+            parameter_mapping=param_mapping,
         )
 
-    def nixl_protocol(self, config: DictConfig, mode: str = "full"):
+    def nixl_protocol(self, model_config: DictConfig, mode: str = "full"):
         """Run the NIXL server protocol.
 
         Args:
-            config (DictConfig): Configuration object containing training settings.
+            model_config (DictConfig): Configuration object containing training settings.
             mode (str): Mode of registration, either 'meta' or 'full'.
                 'meta' mode converts to meta tensors and skip registering their memory.
                 'full' mode converts to full tensors.
@@ -220,7 +152,7 @@ class vLLMWorkerExtension:
         # Register the state dict and sharding dict to the NIXL client
         meta_only = mode == "meta"
         if self.unified_state_dict is None or self.local_sharding_dict is None:
-            self.nixl_convert_params(config)
+            self.nixl_convert_params(model_config)
         psrl_logger.info("nixl client protocol step 1: connect_to_server")
         self.nixl_storage_client.connect_to_server()
         psrl_logger.info("nixl client protocol step 2: send_local_sharding")
@@ -267,15 +199,6 @@ class vLLMWorkerExtension:
         if isinstance(dst_agent_names, str):
             dst_agent_names = [dst_agent_names]
         self.nixl_storage_client.send_local_info_to(dst_agent_names)
-
-    def nixl_update_local_info_to_ps(self, ps_worker_node_id_to_idxs: dict):
-        """
-        Update local NIXL info to the PS worker on the same node with this worker and PS manager.
-        """
-        node_id = self.get_node_id()
-        dst_ps_worker_idx = ps_worker_node_id_to_idxs[node_id]
-        dst_agent_names = [ps_agent_name(dst_ps_worker_idx), NIXL_META_SERVER_NAME]
-        self.nixl_send_local_info_to(dst_agent_names)
 
     def nixl_wait_for_update_infos(self, info_num: int):
         """Wait for infos of updated clients for global synchronization.
@@ -348,6 +271,13 @@ class vLLMWorkerExtension:
         self.vllm_config.model_config.max_model_len = actual_max_model_len
         return estimated_max_model_len
 
+    def cuda_synchronize(self):
+        try:
+            torch.cuda.synchronize()
+        except Exception as e:
+            raise ValueError(f"Error in vLLMWorkerExtension.cuda_synchronize: {e}") from e
+        return None
+
     # --- LMCache KV cache management methods ---
     # Invoked via `collective_rpc` from `KVCacheManager`.
 
@@ -364,8 +294,7 @@ class vLLMWorkerExtension:
         """
         connector = get_kv_transfer_group()
         assert connector is not None, (
-            "KV transfer group is None. "
-            "Ensure kv_transfer_config is set during vLLM engine initialization."
+            "KV transfer group is None. Ensure kv_transfer_config is set during vLLM engine initialization."
         )
         assert hasattr(connector, "_lmcache_engine"), (
             f"Connector {type(connector).__name__} does not have _lmcache_engine attribute. "
@@ -404,62 +333,6 @@ class vLLMWorkerExtension:
         allocator = backend.memory_allocator
         # `MixedMemoryAllocator` / `PagedCpuGpuMemoryAllocator` expose `total_size`.
         return int(getattr(allocator, "total_size", 0))
-
-    def lmcache_get_backend_cache_info(self, tokens: list[int]) -> dict:
-        """
-        Return LMCache backend usage statistics for `tokens`.
-
-        Only covers the LMCache backend side.  GPU prefix-cache statistics are
-        queried separately on `RolloutScheduler` via `call_utility_async` from
-        `KVCacheManager`.
-
-        The returned dict is merged with `psrl_get_gpu_cache_info` output in
-        `KVCacheManager.get_cache_info` to construct a `TrajectoryCacheInfo`.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            dict: Backend cache usage statistics plus `total_tokens`,
-                `gpu_pinned`, and `backend_pinned` sentinel fields.
-        """
-        assert tokens, "tokens must be a non-empty list."
-
-        # LMCache backend side
-        engine = self._get_lmcache_engine()
-        keys = self._get_lmcache_chunk_keys(tokens)
-        lmcache_hit_count, _ = engine.storage_manager.batched_contains(keys)
-        # Chunk size from LMCache config; fall back to 256 tokens.
-        chunk_size = getattr(engine.token_database, "chunk_size", 256)
-        lmcache_cached_tokens = lmcache_hit_count * chunk_size
-        # Estimate bytes: each full chunk occupies (chunk_size × hidden_dim × dtype_size).
-        # Use `get_full_chunk_size_bytes` if available on the backend.
-        backend = engine.storage_manager.local_cpu_backend
-        try:
-            chunk_bytes = backend.get_full_chunk_size_bytes()
-        except Exception as e:
-            psrl_logger.warning(
-                f"[LMCache] get_full_chunk_size_bytes unavailable, bytes will be 0: {e!r}."
-            )
-            chunk_bytes = 0
-        lmcache_bytes = lmcache_hit_count * chunk_bytes
-        lmcache_total_bytes = self._get_lmcache_total_bytes()
-        lmcache_usage_pct = (
-            lmcache_bytes / lmcache_total_bytes if lmcache_total_bytes > 0 else 0.0
-        )
-
-        return {
-            "total_tokens": len(tokens),
-            "lmcache_cached_chunks": lmcache_hit_count,
-            "lmcache_cached_tokens": lmcache_cached_tokens,
-            "lmcache_bytes": lmcache_bytes,
-            "lmcache_total_bytes": lmcache_total_bytes,
-            "lmcache_usage_pct": lmcache_usage_pct,
-            # NOTE(claude): PSRL pin state is tracked in `KVCacheManager`, not
-            # in the worker — returning False here is always correct.
-            "gpu_pinned": False,
-            "backend_pinned": False,
-        }
 
     def lmcache_pin_backend(self, tokens: list[int]) -> int:
         """
@@ -569,22 +442,6 @@ class vLLMWorkerExtension:
             freed += 1
         return freed
 
-    def lmcache_clear_from_backend(self, tokens: list[int]) -> int:
-        """
-        Remove the cached prefix chunks for `tokens` from the LMCache backend.
-
-        Args:
-            tokens (list[int]): Full token sequence for the trajectory.
-
-        Returns:
-            int: Number of chunks removed.
-        """
-        assert tokens, "tokens must be a non-empty list."
-        engine = self._get_lmcache_engine()
-        keys = self._get_lmcache_chunk_keys(tokens)
-        n = engine.storage_manager.batched_remove(keys)
-        return n
-
     def lmcache_clear_all_from_backend(self) -> None:
         """
         Remove all cached KV chunks from the LMCache CPU backend.
@@ -599,4 +456,3 @@ class vLLMWorkerExtension:
         """
         engine = self._get_lmcache_engine()
         engine.clear()
-

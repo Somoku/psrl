@@ -21,5 +21,5 @@ bash "$SCRIPT_DIR/prefetch_images.sh" \
     --retries 10
 
 bash "$SCRIPT_DIR/load_all_nodes.sh" \
-    --hosts /jizhicfs/lhy/hosts/64GPUs \
+    --hosts /jizhicfs/lhy/hosts/48GPUs \
     --image-dir /jizhicfs/lhy/docker_images/swe_gym_subset

@@ -78,25 +78,11 @@ fi
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-git clone -b 0.10.1 https://github.com/ai-dynamo/nixl.git
+git clone -b v1.2.0 https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
 # Disable obj backend
 sed -i "s/subdir('obj')/# subdir('obj')/" "$THIRD_PARTY_PATH/nixl_src/nixl/src/plugins/meson.build"
-
-# Fix metadata_stream: acceptClient() and acceptClientsAsync() both spam ERROR
-# logs ("Cannot accept client connection: Bad file descriptor / Socket operation
-# on non-socket") after agent teardown, because the background listener thread
-# keeps calling accept() on an fd that has already been closed and potentially
-# reused by Ray or another process.
-# The underlying thread/fd lifecycle in nixl is complex to fix correctly without
-# larger refactoring. The pragmatic fix is to demote both NIXL_PERROR log lines
-# to NIXL_DEBUG: the noise disappears at the default log level (WARN), and the
-# messages remain visible when NIXL_LOG_LEVEL=DEBUG is set for debugging.
-STREAM_CPP="$THIRD_PARTY_PATH/nixl_src/nixl/src/utils/stream/metadata_stream.cpp"
-sed -i 's/NIXL_PERROR << "Cannot accept client connection"/NIXL_DEBUG << "Cannot accept client connection"/g' "$STREAM_CPP"
-echo "metadata_stream.cpp patched: demoted 'Cannot accept' log lines to DEBUG."
-
 # Disable err handling for ucp (will make NIXL READ slower 10x!)
 echo "Applying nixl patch..."
 meson setup build \

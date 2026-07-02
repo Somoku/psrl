@@ -29,9 +29,11 @@ rollout_tensor_model_parallel_size=1
 rollout_N=8
 nnodes=4
 
+GEN_DP=1
 GEN_TP=1
 GEN_PP=1
 
+VAL_DP=1
 VAL_TP=1
 VAL_PP=1
 
@@ -54,9 +56,9 @@ VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs pe
 # environment option2: use container docker://verlai/verl:vllm011.dev_qwenvl_cp
  
 
-python3 -m psrl.trainer.main_ppo --config-path=./config \
-    --config-name='ppo_megatron_trainer' \
+PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
     psrl.ps_manager_ip=${LOCAL_IP} \
+    psrl.reward_service_ip=${LOCAL_IP} \
     psrl.rollout_n=${rollout_N} \
     psrl.staleness=2 \
     psrl.staleness_buffer_entries=${train_batch_size} \
@@ -113,9 +115,11 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size=$tensor_model_parallel_size \
     train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=$pipeline_model_parallel_size \
     train_actor_rollout_ref.actor.megatron.context_parallel_size=1 \
+    train_actor_rollout_ref.actor.megatron.vanilla_mbridge=False \
     \
     train_actor_rollout_ref.rollout.val_kwargs.n=1 \
     train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    train_actor_rollout_ref.rollout.data_parallel_size=${VAL_DP} \
     train_actor_rollout_ref.rollout.tensor_model_parallel_size=${VAL_TP} \
     train_actor_rollout_ref.rollout.pipeline_model_parallel_size=${VAL_PP} \
     train_actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
@@ -123,11 +127,11 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     train_actor_rollout_ref.rollout.max_num_batched_tokens=40960 \
     \
-    gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.name=vllm \
+    gen_actor_rollout_ref.rollout.data_parallel_size=${GEN_DP} \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     gen_actor_rollout_ref.rollout.n=$rollout_N \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=40960 \
     \
@@ -139,7 +143,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
     psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.routing_strategy.enable_group_sticky=False \
     psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
@@ -149,7 +153,7 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     \
     psrl.colocate_validate_and_train=True \
     \
-    reward_model.launch_reward_fn_async=True \
+    reward.launch_reward_fn_async=True \
     \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \

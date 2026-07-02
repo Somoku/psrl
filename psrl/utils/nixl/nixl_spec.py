@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 
-import ray
 import torch
+
+from psrl.utils.common.http_utils import find_available_port
 
 # Fast dtype lookup used by NIXLShardMetaInfo.deserialize to avoid eval() / getattr overhead.
 _DTYPE_MAP: dict[str, torch.dtype] = {
@@ -561,10 +562,15 @@ class NIXLClientInfo:
         return pickle.loads(data)
 
 
-@dataclass
-class NIXLInterface:
-    # CommunicationPlanner instance,
-    # but import CommunicationPlanner here
-    # will cause circular import
-    # comm_planner: Optional[Any] = None
-    pass
+def find_free_port_with_scope(
+    replica_idx: int,
+    worker_index: int = 0,
+) -> int:
+    """Find an available port in a scoped range.
+
+    Port search space is partitioned by `(replica_idx, engine_index, worker_index)`
+    to reduce collisions under concurrent initialization on the same host.
+    """
+    base = 20000 + replica_idx * 128 + worker_index * 4
+    start_port = min(base, 59000)
+    return int(find_available_port(base_port=start_port))

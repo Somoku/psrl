@@ -6,6 +6,6 @@ __all__ = [
     "Environment",
     "ConversationType",
     "EnvStepOutput",
-    "MiniSWEEnvironment",
     "ToolEnvironment",
+    "MiniSWEEnvironment",
 ]

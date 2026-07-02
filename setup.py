@@ -6,7 +6,15 @@ setup(
     package_dir={"": "."},
     packages=find_packages(where="."),
     package_data={
-        "psrl": ["trainer/config/*.yaml"],
+        "psrl": [
+            "trainer/config/*.yaml",
+            "trainer/config/**/*.yaml",
+        ],
     },
     include_package_data=True,
+    entry_points={
+        "hydra.searchpath": [
+            "psrl = psrl.trainer.config.hydra_plugins.psrl_searchpath:PSRLSearchPathPlugin",
+        ],
+    },
 )

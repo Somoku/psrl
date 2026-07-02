@@ -18,7 +18,6 @@ Also provides ``XmlFcToolParser(ToolParser)`` for future structured-tool usage.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -34,9 +33,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 # ---------------------------------------------------------------------------
 
 # Submission command injected when the model calls <function=submit>.
-_SUBMIT_COMMAND = (
-    "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"
-)
+_SUBMIT_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"
 
 # Heredoc delimiter for file creation.  Chosen to be unlikely to appear in
 # source code.  If the file content contains this literal string, we append a
@@ -48,14 +45,10 @@ _HEREDOC_DELIM = "PSRL_EOF"
 # ---------------------------------------------------------------------------
 
 # Canonical: <function=NAME>\n...\n</function>
-_FN_PATTERN = re.compile(
-    r"<function=([^>]+)>\s*\n?(.*?)\s*</function>", re.DOTALL
-)
+_FN_PATTERN = re.compile(r"<function=([^>]+)>\s*\n?(.*?)\s*</function>", re.DOTALL)
 
 # Parameter extraction: <parameter=KEY>VALUE</parameter>
-_PARAM_PATTERN = re.compile(
-    r"<parameter=(\w+)>(.*?)</parameter>", re.DOTALL
-)
+_PARAM_PATTERN = re.compile(r"<parameter=(\w+)>(.*?)</parameter>", re.DOTALL)
 
 # Degraded patterns (fallback when the model doesn't produce canonical XML).
 _DEGRADED_PATTERNS = [
@@ -72,12 +65,10 @@ _DEGRADED_PATTERNS = [
 # Parameter extraction helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_params(fn_body: str) -> dict[str, str]:
     """Extract ``<parameter=KEY>VALUE</parameter>`` pairs from function body."""
-    return {
-        m.group(1): m.group(2)
-        for m in _PARAM_PATTERN.finditer(fn_body)
-    }
+    return {m.group(1): m.group(2) for m in _PARAM_PATTERN.finditer(fn_body)}
 
 
 # ---------------------------------------------------------------------------
@@ -86,25 +77,53 @@ def _extract_params(fn_body: str) -> dict[str, str]:
 
 # Sets of function name variants that map to canonical tools.
 # The model hallucinates many variants during RL exploration; we map them back.
-_BASH_NAMES = frozenset({
-    "bash", "execute_bash", "terminal", "shell", "run", "exec",
-})
+_BASH_NAMES = frozenset(
+    {
+        "bash",
+        "execute_bash",
+        "terminal",
+        "shell",
+        "run",
+        "exec",
+    }
+)
 
-_SUBMIT_NAMES = frozenset({
-    "submit", "finish", "done", "complete",
-})
+_SUBMIT_NAMES = frozenset(
+    {
+        "submit",
+        "finish",
+        "done",
+        "complete",
+    }
+)
 
-_STR_REPLACE_NAMES = frozenset({
-    "str_replace_editor", "str_replace", "edit", "editor",
-    "file_editor", "text_editor",
-})
+_STR_REPLACE_NAMES = frozenset(
+    {
+        "str_replace_editor",
+        "str_replace",
+        "edit",
+        "editor",
+        "file_editor",
+        "text_editor",
+    }
+)
 
 # Patterns for fuzzy matching degraded names.
 _STR_REPLACE_PREFIXES = ("str_replace", "str_edit", "str_write", "str_create", "str_view")
-_FILE_OP_NAMES = frozenset({
-    "file", "read_file", "read", "write", "open", "view",
-    "create_file", "create", "new_file", "write_file",
-})
+_FILE_OP_NAMES = frozenset(
+    {
+        "file",
+        "read_file",
+        "read",
+        "write",
+        "open",
+        "view",
+        "create_file",
+        "create",
+        "new_file",
+        "write_file",
+    }
+)
 
 
 def _classify_function_name(fn_name: str) -> str:
@@ -171,12 +190,14 @@ def _get_new_str(params: dict[str, str]) -> str:
 # str_replace_editor translation
 # ---------------------------------------------------------------------------
 
+
 def _translate_create(path: str, content: str) -> str:
     """Translate ``create`` command to a heredoc bash command."""
     # Choose a delimiter that doesn't appear in the content.
     delim = _HEREDOC_DELIM
     if delim in content:
         import hashlib
+
         suffix = hashlib.md5(content.encode()).hexdigest()[:8]
         delim = f"{_HEREDOC_DELIM}_{suffix}"
 
@@ -206,11 +227,7 @@ def _translate_view(path: str, params: dict[str, str]) -> str:
                 return f"sed -n '{start},{end}p' {path} | nl -ba -v {start}"
     # For directories: list files up to 2 levels deep (matches official SWE-agent).
     # For files: show with line numbers.
-    return (
-        f"if [ -d {path} ]; then "
-        f"find {path} -maxdepth 2 -not -path '*/\\.*' | head -100; "
-        f"else cat -n {path}; fi"
-    )
+    return f"if [ -d {path} ]; then find {path} -maxdepth 2 -not -path '*/\\.*' | head -100; else cat -n {path}; fi"
 
 
 def _translate_str_replace(path: str, old_str: str, new_str: str) -> str:
@@ -220,7 +237,7 @@ def _translate_str_replace(path: str, old_str: str, new_str: str) -> str:
     old_repr = repr(old_str)
     new_repr = repr(new_str)
     return (
-        f"python3 -c \"\n"
+        f'python3 -c "\n'
         f"import pathlib, sys\n"
         f"p = pathlib.Path({repr(path)})\n"
         f"content = p.read_text()\n"
@@ -230,7 +247,7 @@ def _translate_str_replace(path: str, old_str: str, new_str: str) -> str:
         f"    print('ERROR: old_str not found in file'); sys.exit(1)\n"
         f"p.write_text(content.replace(old, new, 1))\n"
         f"print('Successfully applied edit to ' + {repr(path)})\n"
-        f"\""
+        f'"'
     )
 
 
@@ -238,7 +255,7 @@ def _translate_insert(path: str, insert_line: str, new_str: str) -> str:
     """Translate ``insert`` command to a Python one-liner."""
     new_repr = repr(new_str)
     return (
-        f"python3 -c \"\n"
+        f'python3 -c "\n'
         f"import pathlib\n"
         f"p = pathlib.Path({repr(path)})\n"
         f"lines = p.read_text().splitlines(True)\n"
@@ -248,7 +265,7 @@ def _translate_insert(path: str, insert_line: str, new_str: str) -> str:
         f"lines.insert({insert_line}, new_text)\n"
         f"p.write_text(''.join(lines))\n"
         f"print('Inserted text after line {insert_line} in ' + {repr(path)})\n"
-        f"\""
+        f'"'
     )
 
 
@@ -331,6 +348,7 @@ def _translate_str_replace_editor(fn_body: str) -> str | None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
+
 def parse_xml_fc_to_bash(text: str) -> str | None:
     """
     Parse an XML function-calling model response and return a bash command.
@@ -386,7 +404,7 @@ def parse_xml_fc_to_bash(text: str) -> str | None:
             params = _extract_params(fn_body)
             # If it has a 'command' param that's a bash command, use it.
             cmd = params.get("command", "").strip()
-            if cmd and not cmd in ("create", "view", "str_replace", "insert", "undo_edit"):
+            if cmd and cmd not in ("create", "view", "str_replace", "insert", "undo_edit"):
                 return cmd
             # If it has file creation params, treat as create.
             path = _get_path(params)
@@ -417,6 +435,7 @@ def parse_xml_fc_to_bash(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 # ToolParser subclass (for structured tool pipeline integration)
 # ---------------------------------------------------------------------------
+
 
 @ToolParser.register("xml_fc")
 class XmlFcToolParser(ToolParser):

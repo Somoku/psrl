@@ -93,7 +93,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     critic.megatron.use_dist_checkpointing=True \
     critic.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
-    reward_model.launch_reward_fn_async=True \
+    reward.launch_reward_fn_async=True \
     \
     algorithm.rollout_correction.rollout_is=${rollout_is} \
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \

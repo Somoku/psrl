@@ -1,185 +1,1125 @@
 import asyncio
+import base64
+import io
 import logging
+import os
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 
 import numpy as np
 import ray
-from omegaconf import DictConfig
-from transformers import AutoTokenizer
-from verl import DataProto
+import torch
+from PIL import Image
+from tensordict import NonTensorData, NonTensorStack, TensorDict
+from transformers import AutoProcessor, AutoTokenizer
+from verl.utils import tensordict_utils as tu
+from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
+from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.utils.tokenizer import normalize_token_ids
 
-from psrl.utils.profiling.collector import TurnProfilingCollector
+from psrl.utils.common.http_io_thread import get_http_io_thread
+from psrl.utils.common.http_utils import (
+    RequestAbortedByGatewayError,
+    is_distributed_post_enabled,
+    request_json_maybe_distributed,
+)
+from psrl.utils.dataset.utils import _pre_process_inputs
+from psrl.utils.rollout.loop_timer import LoopTimer
 from psrl.utils.rollout.trajectory_writer import TrajectoryWriter
-from psrl.workers.agent_loop.loops.utils import DummyConfig, TerminateReason
+from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
+from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
+from psrl.workers.agent_loop.sticky_session import sticky_session
+from psrl.workers.gen.utils import TokenInput, TokenOutput
+from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
+psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class AgentLoopBase(ABC):
-    _class_initialized = False
-
     def __init__(
         self,
-        trainer_config: DummyConfig,
-        rollout_router: ray.actor.ActorHandle,
+        trainer_config: DictConfigWrap,
+        rollout_router: ray.actor.ActorHandle | str,
         reward_manager: ray.actor.ActorHandle,
         ps_manager_handle: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
+        processor: AutoProcessor,
+        dataset_cls: type[RLHFDataset],
+        data_config: DictConfigWrap,
         **kwargs,
     ):
         """Initialize agent loop instance.
         Base class for agent loops that process requests and interact with LLM servers.
 
         Args:
-            trainer_config (DummyConfig): Wrapper containing trainer configuration.
+            trainer_config (DictConfigWrap): Wrapper containing trainer configuration.
             rollout_router (ray.actor.ActorHandle): Router for distributing requests to LLM servers.
             ps_manager_handle (ray.actor.ActorHandle): Handle to parameter server manager.
             tokenizer (AutoTokenizer): Tokenizer for processing text messages.
             **kwargs: Additional keyword arguments.
         """
-        self.init_class(trainer_config.config, **kwargs)
         self.config = trainer_config.config
+        self.model_config = self.config.gen_actor_rollout_ref.model
+        self.rollout_config = self.config.gen_actor_rollout_ref.rollout
         self.rollout_router = rollout_router
+        self.use_rust_gateway = isinstance(rollout_router, str)
+        if self.use_rust_gateway:
+            self.gateway_addr = rollout_router
+        else:
+            self.gateway_addr = None
+
         self.reward_manager = reward_manager
         self.ps_manager_handle = ps_manager_handle
         self.tokenizer = tokenizer
-        self.loop = asyncio.get_running_loop()
+        self.processor = processor
         self.traj_writer = TrajectoryWriter.from_config(self.config)
+        self.timer = LoopTimer()
+        self.dataset_cls = dataset_cls
+        self.data_config = data_config.config
+        self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
+        self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
+        self.loop = asyncio.get_running_loop()
+        self.response_length = self.rollout_config.response_length
+        self.prompt_length = self.rollout_config.prompt_length
+        self.output_in_tq = False
 
-    @classmethod
-    def init_class(cls, config: DictConfig, **kwargs):
-        """Perform heavy initialization work shared across all instances.
+    async def process_vision_info(
+        self,
+        messages: list[dict],
+    ) -> tuple[list | None, list | None]:
+        """Extract images and videos from messages.
 
-        This method is called only once per class to avoid redundant initialization.
+        Delegates to ``dataset_cls.process_vision_info`` (the same path used by
+        ``AgentLoopBase.process_vision_info``), mirroring verl's design where a
+        single canonical extraction function is shared across the whole stack.
 
-        Args:
-            config (DictConfig): Configuration object containing training settings.
-            **kwargs: Additional keyword arguments from configuration.
-        """
-        if cls._class_initialized:
-            return
-        cls._class_initialized = True
-
-        cls.prompt_length = config.gen_actor_rollout_ref.rollout.prompt_length
-        cls.response_length = config.gen_actor_rollout_ref.rollout.response_length
-
-    def _post_process_and_merge_reward(self, reward_result: dict[int, dict], outputs: DataProto) -> DataProto:
-        """Merge the computed reward results back into the output DataProto.
-
-        This method updates the output data with the reward scores and any additional
-        information returned by the reward model.
+        When no processor is configured (text-only model) both return values are None.
 
         Args:
-            reward_result (Dict[int, dict]): Computed reward results indexed by data item.
-            outputs (DataProto): Original output data to be updated.
+            messages: Chat messages that may contain image/video content parts.
 
         Returns:
-            DataProto: Updated output data with reward information.
+            (images, videos):
+                images - list of PIL.Image.Image, or None if none found.
+                videos - list of (video_tensor, metadata) tuples, or None.
         """
-        if outputs.meta_info.get("validate", False):
-            return outputs  # Skip merging for validation data
+        if self.processor is None:
+            return None, None
 
-        filtered_request_ids = list(reward_result.keys())
-        filtered_request_idxs = [
-            idx for idx, uid in enumerate(outputs.non_tensor_batch["uid"].tolist()) if uid in filtered_request_ids
-        ]
-        outputs = outputs.select_idxs(filtered_request_idxs)
-        request_ids = outputs.non_tensor_batch["uid"].tolist()
+        image_processor = getattr(self.processor, "image_processor", None)
+        if image_processor is None:
+            psrl_logger.warning(
+                "AgentData.process_vision_info: processor %s has no image_processor attribute; "
+                "skipping vision extraction.",
+                type(self.processor).__name__,
+            )
+            return None, None
 
-        rewards = []
-        reward_extra_infos = []
-        for request_id in request_ids:
-            assert request_id in reward_result, f"Missing reward result for request ID: {request_id}"
-            result = reward_result[request_id]
-            rewards.append(result["reward_score"])
-            extra_info = result.get("reward_extra_info", {})
-            reward_extra_infos.append(extra_info)
-        outputs.non_tensor_batch["reward_scores"] = np.array(rewards)
-        outputs.non_tensor_batch["reward_extra_infos"] = np.array(reward_extra_infos, dtype=object)
+        if self.dataset_cls is None:
+            raise RuntimeError(
+                "AgentData.process_vision_info: dataset_cls is required when processor is set. "
+                "Pass dataset_cls= when constructing AgentData."
+            )
+
+        images, videos = await self.dataset_cls.process_vision_info(
+            messages,
+            image_patch_size=image_processor.patch_size,
+            config=self.config.data,
+        )
+        return (images if images else None), (videos if videos else None)
+
+    async def apply_chat_template(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        images: list[Image.Image] | None = None,
+        videos: list[tuple[torch.Tensor, dict]] | None = None,
+        remove_system_prompt: bool = False,
+    ):
+        """Apply chat template to messages with optional tools, images, and videos.
+
+        Args:
+            messages (list[dict]): Input messages.
+            tools (list[dict], optional): Tools schemas. Defaults to None.
+            images (list[Image.Image], optional): Input images. Defaults to None.
+            videos (list[tuple[torch.Tensor, dict]], optional): Input videos. Defaults to None.
+            remove_system_prompt (bool, optional): Whether to remove system prompt. Defaults to False.
+
+        Returns:
+            list[int]: Prompt token ids.
+        """
+        if self.processor is not None:
+            raw_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.processor,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+
+            # split the videos and according metadatas
+            if videos is not None:
+                videos, video_metadatas = zip(*videos, strict=False)
+                videos, video_metadatas = list(videos), list(video_metadatas)
+            else:
+                video_metadatas = None
+
+            model_inputs = self.processor(
+                text=[raw_prompt],
+                images=images,
+                videos=videos,
+                video_metadata=video_metadatas,
+                return_tensors="pt",
+                do_sample_frames=False,
+            )
+            prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+        else:
+            tokenized_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.tokenizer,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            prompt_ids = normalize_token_ids(tokenized_prompt)
+
+        if remove_system_prompt:
+            prompt_ids = prompt_ids[len(self.system_prompt) :]
+
+        return prompt_ids
+
+    async def compute_reward_score(
+        self,
+        outputs: TokenOutput | list[TokenOutput],
+        **kwargs,
+    ) -> TokenOutput | list[TokenOutput] | None:
+        """Compute reward score for the generated response and merge it into the output.
+
+        This function sends the generated response to the reward manager and waits for the
+        computed reward score. If reward computation succeeds, it merges the score into the
+        output. If the request is aborted during reward computation, it returns ``None``.
+
+        Args:
+            data (TokenOutput): The output data structure containing the generated response and associated metadata.
+        Returns:
+            TokenOutput | None: The output with reward score, or None if the request was aborted.
+        """
+        if not isinstance(outputs, list):
+            outputs = [outputs]
+        # NOTE(linsh): Only compute reward for the last trajectory.
+        final_output = outputs[-1]
+
+        # Build TensorDict: tensors in batch, metadata in non_tensor_batch/meta_info
+        tensor_dict = {
+            "prompts": torch.tensor(final_output.prompt_ids, dtype=torch.int64).unsqueeze(0),
+            "responses": torch.tensor(final_output.response_ids, dtype=torch.int64).unsqueeze(0),
+            "multi_modal_data": np.array([final_output.multi_modal_data], dtype=object),
+            "num_turns": np.array([final_output.num_turns]),
+            "tool_extra_fields": np.array([final_output.extra_fields], dtype=object),
+            "uid": np.array([kwargs.get("uid")]),
+            "n_trajectory": np.array([len(outputs)]),
+            "data_source": np.array([kwargs.get("data_source", "unknown")]),
+            "reward_model": np.array([kwargs.get("reward_model", {})], dtype=object),
+            "extra_info": np.array([kwargs.get("extra_info", {})], dtype=object),
+            "reward_model_dicts": np.array([kwargs.get("reward_model_dicts", [])], dtype=object),
+        }
+        if kwargs.get("parent_id") is not None:
+            tensor_dict["parent_id"] = np.array([kwargs.get("parent_id")])
+
+        reward_requests = tu.get_tensordict(
+            tensor_dict=tensor_dict,
+            non_tensor_dict={
+                "validate": kwargs.get("validate", False),
+            },
+        )
+
+        reward_result = await self.reward_manager.compute_score.remote(reward_requests)
+        if not self.config.reward.launch_reward_fn_async:
+            if not reward_result:
+                return None
+            # Broadcast to all trajectories
+            for output in outputs:
+                output.reward_score = reward_result["reward_score"]
+                output.extra_fields["reward_extra_info"] = reward_result["reward_extra_info"]
+                output.extra_fields["reward_metrics"] = reward_result.get("reward_metrics", {})
+
+        if len(outputs) == 1:
+            return outputs[0]
         return outputs
 
-    @abstractmethod
-    async def run(
+    async def generate_sequence(self, request: dict, is_sticky_session: bool = False) -> "TokenOutput":
+        request_input: TokenInput = await self.pre_process_inputs(request)
+        sampling_params = self._get_sampling_params(request_input)
+        if request_input.stop_token_ids:
+            sampling_params["stop_token_ids"] = list(
+                set((sampling_params.get("stop_token_ids") or []) + request_input.stop_token_ids)
+            )
+        with self.timer.generation():
+            if self.config.psrl.rollout_gateway.enable:
+                if not self.gateway_addr:
+                    raise RuntimeError("Rollout gateway is enabled but gateway address is empty.")
+
+                # Route multimodal requests to /v1/chat/completions (which has a full
+                # Rust-side vision preprocessing pipeline) and text-only requests to
+                # /generate (lower latency, returns output_ids directly).
+                mm_data = request_input.multi_modal_data
+                has_images = mm_data is not None and bool(mm_data.get("images"))
+                has_videos = mm_data is not None and bool(mm_data.get("videos"))
+
+                if has_videos:
+                    raise NotImplementedError(
+                        "Video input is not yet supported via the SMG gateway. "
+                        "Implement a /v1/chat/completions video path when ready."
+                    )
+
+                if has_images:
+                    return await self._generate_via_chat_completions(
+                        request_input, sampling_params, is_sticky_session, mm_data
+                    )
+
+                # ── Text-only: fast /generate path ──────────────────────────────
+                return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
+            else:
+                mm_data = request_input.multi_modal_data
+                if mm_data is not None and (mm_data.get("images") or mm_data.get("videos")):
+                    psrl_logger.warning(
+                        "request_id=%s: Multi-modal data (images/videos) is present but the "
+                        "Ray-actor rollout path does not support forwarding image data. "
+                        "Enable the Rust gateway (psrl.rollout_gateway.enable=true) for "
+                        "multimodal inference.",
+                        request_input.request_id,
+                    )
+                async with sticky_session(self.rollout_router, request) if is_sticky_session else nullcontext():
+                    # TODO(linsh): move sampling params as param of `route_generate`
+                    output = await self.rollout_router.route_generate.remote(
+                        request_input.input_ids,
+                        request_input.request_id,
+                        request_input.prompt_id,
+                        request_input.version_tag,
+                        request_input.rollout_instance_id,
+                        request_input.cu_response_len,
+                        request_input.is_validate,
+                        request_input.stop_token_ids,
+                    )
+            return output
+
+    async def _generate_via_generate_endpoint(
         self,
-        request: DataProto,
-        profiling_collector: TurnProfilingCollector | None = None,
-    ) -> tuple[DataProto | None, TerminateReason]:
+        request_input: "TokenInput",
+        sampling_params: dict,
+        is_sticky_session: bool,
+    ) -> "TokenOutput":
+        """Call SMG /generate (text-only, returns output_ids directly)."""
+        request_url = f"{self.gateway_addr.rstrip('/')}/generate"
+
+        payload_sampling_params = dict(sampling_params)
+        if hasattr(payload_sampling_params.get("output_kind"), "value"):
+            payload_sampling_params["output_kind"] = payload_sampling_params["output_kind"].value
+
+        req_headers = {
+            "x-request-id": str(request_input.request_id),
+            "x-prompt-id": str(request_input.prompt_id),
+            "x-version-tag": str(request_input.version_tag),
+            "x-is-validate": str(request_input.is_validate).lower(),
+        }
+        if request_input.rollout_instance_id is not None:
+            replica_id, dp_rank = request_input.rollout_instance_id
+            req_headers["x-base-worker-id"] = str(replica_id)
+            req_headers["x-target-dp-rank"] = str(dp_rank)
+
+        if is_sticky_session:
+            req_headers["x-is-sticky"] = "true"
+
+        payload = {
+            "model": self.model_config.path,
+            "request_id": str(request_input.request_id),
+            "input_ids": request_input.input_ids,
+            "sampling_params": payload_sampling_params,
+            "stream": False,
+            "return_logprob": sampling_params.get("logprobs") is not None,
+        }
+
+        # Multimodal payload
+        if request_input.multi_modal_data is not None:
+            images = request_input.multi_modal_data.get("images")
+            videos = request_input.multi_modal_data.get("videos")
+            if images:
+                payload["image_data"] = await serialize_image_inputs(images)
+            if videos:
+                payload["video_data"] = videos
+            if images or videos:
+                modalities = []
+                if images:
+                    modalities.append("multi-images" if len(images) > 1 else "image")
+                if videos:
+                    modalities.append("video")
+                payload["modalities"] = modalities
+
+        # Call SMG /generate directly via aiohttp so we can read both the
+        # response body (a JSON array) and the worker-instance headers in one pass.
+        gen_responses, base_worker_id, target_dp_rank = await self._post_generate(request_url, payload, req_headers)
+
+        if not gen_responses:
+            psrl_logger.error(
+                "Gateway /generate returned empty response for request_id=%s",
+                request_input.request_id,
+            )
+            return None
+
+        first = gen_responses[0]
+        meta_info = first.get("meta_info", {})
+
+        # rollout instance id
+        replica_id = base_worker_id
+        rollout_instance_id = (replica_id, int(target_dp_rank) if target_dp_rank is not None else 0)
+
+        # token ids
+        token_ids = first["output_ids"]
+
+        # logprobs: SMG returns output_token_logprobs as List[List[Optional[float]]].
+        # Each outer entry is one output token position; each inner list is top-k logprobs
+        # for that position. We take the first (top-1) entry at each position.
+        log_probs = None
+        if sampling_params.get("logprobs") is not None:
+            raw_logprobs = meta_info.get("output_token_logprobs")
+            if raw_logprobs is not None:
+                log_probs = [next((lp for lp in per_pos if lp is not None), 0.0) for per_pos in raw_logprobs]
+
+        # finish_reason: SMG returns {"type": "stop"} or {"type": "length", "length": N}
+        finish_reason_raw = meta_info.get("finish_reason", {})
+        if isinstance(finish_reason_raw, dict):
+            finish_reason = finish_reason_raw.get("type", "stop")
+        else:
+            finish_reason = str(finish_reason_raw)
+
+        # Determine interrupted based on finish_reason
+        interrupted = finish_reason == "abort"
+
+        # Routing replay: SMG returns routed_experts as a base64 .npy blob in
+        # meta_info (aligned to absolute positions [0, prompt_len + completion_len - 1)).
+        # Partial-rollout loopback is merged gateway-side.
+        routed_experts = None
+        if self.rollout_config.enable_rollout_routing_replay:
+            routed_experts = self._decode_routed_experts_payload(meta_info.get("routed_experts"))
+
+        return TokenOutput(
+            prompt_ids=request_input.input_ids,
+            response_ids=token_ids,
+            response_mask=[1] * len(token_ids),
+            response_log_probs=log_probs,
+            routed_experts=routed_experts,
+            multi_modal_data=request_input.multi_modal_data,
+            stop_reason=finish_reason,
+            interrupted=interrupted,
+            update_status=PSRL_RequestStatus.ROLLOUT_COMPLETED,
+            rollout_instance_id=rollout_instance_id,
+        )
+
+    async def _generate_via_chat_completions(
+        self,
+        request_input: "TokenInput",
+        sampling_params: dict,
+        is_sticky_session: bool,
+        mm_data: dict,
+    ) -> "TokenOutput":
+        """Call SMG /v1/chat/completions for multimodal requests.
+
+        SMG's chat route runs a full Rust-side vision preprocessing pipeline
+        (image fetch -> pixel preprocessing -> mm_inputs proto). When original
+        chat messages are still available, PSRL forwards them after normalizing
+        image parts to OpenAI ``image_url`` content. When only token IDs and
+        Python image objects remain, PSRL falls back to a synthetic user message
+        with base64 data URLs.
+
+        Token IDs are recovered by tokenizing the response text, because the
+        OpenAI chat-completion response does not carry raw output_ids.  Logprobs
+        are extracted from ``choices[0].logprobs.content`` when available.
+        """
+        if request_input.raw_prompt is not None:
+            messages = await self._normalize_messages(request_input.raw_prompt)
+        else:
+            image_data_urls = await serialize_image_inputs(mm_data.get("images", []))
+            prompt_text = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.decode(request_input.input_ids, skip_special_tokens=True),
+            )
+
+            content: list[dict] = [{"type": "image_url", "image_url": {"url": url}} for url in image_data_urls]
+            content.append({"type": "text", "text": prompt_text})
+            messages = [{"role": "user", "content": content}]
+
+        need_logprobs = sampling_params.get("logprobs") is not None
+        max_tokens = sampling_params.get("max_new_tokens", sampling_params.get("max_tokens", 1024))
+
+        chat_payload = {
+            "model": self.model_config.path,
+            "messages": messages,
+            "temperature": sampling_params.get("temperature", 1.0),
+            "top_p": sampling_params.get("top_p", 1.0),
+            "top_k": sampling_params.get("top_k", -1),
+            "repetition_penalty": sampling_params.get("repetition_penalty", 1.0),
+            "ignore_eos": sampling_params.get("ignore_eos", False),
+            "max_tokens": max_tokens,
+            "stream": False,
+            "logprobs": need_logprobs,
+            "top_logprobs": 1 if need_logprobs else None,
+            "detokenize": True,
+        }
+        # Remove None values
+        chat_payload = {k: v for k, v in chat_payload.items() if v is not None}
+
+        req_headers = {
+            "x-request-id": str(request_input.request_id),
+            "x-prompt-id": str(request_input.prompt_id),
+            "x-version-tag": str(request_input.version_tag),
+            "x-is-validate": str(request_input.is_validate).lower(),
+        }
+        if request_input.rollout_instance_id is not None:
+            replica_id, dp_rank = request_input.rollout_instance_id
+            req_headers["x-base-worker-id"] = str(replica_id)
+            req_headers["x-target-dp-rank"] = str(dp_rank)
+
+        if is_sticky_session:
+            req_headers["x-is-sticky"] = "true"
+
+        chat_url = f"{self.gateway_addr.rstrip('/')}/v1/chat/completions"
+
+        chat_resp, base_worker_id, target_dp_rank = await self._post_chat(chat_url, chat_payload, req_headers)
+        if chat_resp is None:
+            psrl_logger.error(
+                "Gateway /v1/chat/completions returned empty response for request_id=%s",
+                request_input.request_id,
+            )
+            return None
+
+        rollout_instance_id = (
+            base_worker_id,
+            int(target_dp_rank) if target_dp_rank is not None else 0,
+        )
+
+        choice = chat_resp["choices"][0]
+        response_text: str = choice["message"].get("content") or ""
+        finish_reason: str = choice.get("finish_reason") or "stop"
+        interrupted = finish_reason == "abort"
+
+        # Tokenize response text to recover token IDs.
+        token_ids: list[int] = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.encode(response_text, add_special_tokens=False),
+        )
+
+        # Extract per-token logprobs from ChatLogProbs content list.
+        log_probs: list[float] | None = None
+        if need_logprobs:
+            logprobs_field = choice.get("logprobs")
+            if logprobs_field and isinstance(logprobs_field, dict):
+                content_lps = logprobs_field.get("content")
+                if content_lps:
+                    log_probs = [entry["logprob"] for entry in content_lps]
+
+        return TokenOutput(
+            prompt_ids=request_input.input_ids,
+            response_ids=token_ids,
+            response_mask=[1] * len(token_ids),
+            response_log_probs=log_probs,
+            routed_experts=None,
+            multi_modal_data=mm_data,
+            stop_reason=finish_reason,
+            interrupted=interrupted,
+            update_status=PSRL_RequestStatus.ROLLOUT_COMPLETED,
+            rollout_instance_id=rollout_instance_id,
+        )
+
+    async def pre_process_inputs(self, request: dict) -> TokenInput:
+        version_tag = request["version_tag"]
+        is_validate = request.get("validate", False)
+        prompt_id = request.get("parent_id", request["uid"])
+        rollout_instance_id = request.get("rollout_instance_id", None)
+
+        multi_modal_data = None
+        messages = None
+        if "raw_prompt_ids" not in request:
+            if request.get("input_ids", None) is not None:
+                input_ids = request["input_ids"]
+                raw_prompt_ids = _pre_process_inputs(self.tokenizer.pad_token_id, input_ids)
+            elif "raw_prompt" in request:
+                messages = list(request["raw_prompt"])
+
+                # 1. extract images and videos from messages
+                images, videos = await self.process_vision_info(messages)
+                multi_modal_data = None
+                if images is not None or videos is not None:
+                    multi_modal_data = {"images": images, "videos": videos}
+
+                # 2. apply chat template and tokenize
+                raw_prompt_ids = await self.apply_chat_template(
+                    messages,
+                    images=images,
+                    videos=videos,
+                )
+                request["raw_prompt_ids"] = np.array(raw_prompt_ids)
+            else:
+                raise ValueError(
+                    "Request must contain 'raw_prompt_ids', 'raw_prompt', or 'input_ids' "
+                    "to build generation input. Got keys: "
+                    f"{request.keys()}"
+                )
+        else:
+            raw_prompt_ids = request["raw_prompt_ids"]
+            if isinstance(raw_prompt_ids, np.ndarray):
+                raw_prompt_ids = raw_prompt_ids.tolist()
+            if "raw_prompt" in request:
+                messages = list(request["raw_prompt"])
+
+        # Recover multi-modal data stored by prepare_generation_request().
+        if multi_modal_data is None:
+            multi_modal_data = request.get("multi_modal_data", None)
+
+        raw_response_ids = request.get("raw_response_ids", [])
+        if isinstance(raw_response_ids, np.ndarray):
+            raw_response_ids = raw_response_ids.tolist()
+
+        raw_prompt_ids.extend(raw_response_ids)
+
+        return TokenInput(
+            input_ids=raw_prompt_ids,
+            request_id=request["uid"],
+            prompt_id=prompt_id,
+            rollout_instance_id=rollout_instance_id,
+            version_tag=version_tag,
+            cu_response_len=len(raw_response_ids),
+            multi_modal_data=multi_modal_data,
+            raw_prompt=messages,
+            is_validate=is_validate,
+            stop_token_ids=request.get("stop_token_ids", None),
+        )
+
+    async def _normalize_messages(self, messages: list[dict]) -> list[dict]:
+        # Extract image refs
+        image_refs = []
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                image_ref = extract_image_ref(part)
+                if image_ref is None:
+                    continue
+                image_refs.append(image_ref)
+
+        encoded_refs = await serialize_image_inputs(image_refs)
+        encoded_iter = iter(encoded_refs)
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or extract_image_ref(part) is None:
+                    continue
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict) and isinstance(image_url.get("detail"), str):
+                    detail = image_url["detail"]
+                else:
+                    detail = part.get("detail", None)
+
+                part.clear()
+                image_url = {"url": next(encoded_iter)}
+                if detail is not None:
+                    image_url["detail"] = detail
+                part.update({"type": "image_url", "image_url": image_url})
+        return messages
+
+    def _get_sampling_params(self, request: TokenInput):
+        is_validate = request.is_validate
+        input_length = len(request.input_ids)
+
+        # When max_model_len is not configured (None), fall back to prompt_length + response_length
+        max_model_len = self.rollout_config.max_model_len
+        if max_model_len is None:
+            max_model_len = self.rollout_config.prompt_length + self.rollout_config.response_length
+        max_possible_tokens = max_model_len - input_length
+        if max_possible_tokens < 0:
+            raise ValueError(f"Input length {input_length} exceeds the maximum model length {max_model_len}")
+
+        max_tokens = self.rollout_config.response_length + self.rollout_config.prompt_length - input_length
+        max_tokens = max(0, min(max_tokens, max_possible_tokens))
+        assert max_tokens <= max_possible_tokens, (
+            f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
+        )
+
+        # NOTE: SMG Rust encodes top_k as uint32 (cannot represent negatives), so
+        # -1 is silently clamped to 0 via `val.max(0) as u32`. Both 0 and -1 mean
+        # "consider all tokens" in vLLM, but we normalize here to 0 to make the
+        # conversion explicit and keep the value consistent with what vLLM receives.
+        top_k = int(self.rollout_config.top_k)
+        if top_k < 0:
+            top_k = 0
+
+        sampling_params = dict(
+            n=1,
+            logprobs=0,  # return sampled-token logprob for importance-sampling weight computation
+            temperature=float(self.rollout_config.temperature),
+            top_p=float(self.rollout_config.top_p),
+            top_k=top_k,
+            repetition_penalty=float(self.rollout_config.get("repetition_penalty", 1.0)),
+            ignore_eos=self.rollout_config.get("ignore_eos", False),
+            detokenize=False,
+            max_new_tokens=max_tokens,
+        )
+
+        # override sampling params for validation
+        if is_validate:
+            val_config = self.config.train_actor_rollout_ref.rollout.val_kwargs
+            val_top_k = int(val_config.top_k)
+            if val_top_k < 0:
+                val_top_k = 0
+            sampling_params["top_k"] = val_top_k
+            sampling_params["top_p"] = float(val_config.top_p)
+            sampling_params["temperature"] = float(val_config.temperature)
+
+        return sampling_params
+
+    @staticmethod
+    def _decode_routed_experts_payload(routed_experts_b64: str | None) -> np.ndarray | None:
+        """Decode SMG's routed-experts payload into a numpy array.
+
+        SMG serializes ``routed_experts`` as a base64-encoded NumPy ``.npy``
+        v1.0 file (see ``smg/crates/protocols/src/npy.rs``), identical to vLLM's
+        own HTTP response format. The decoded array has shape
+        ``[num_tokens, num_layers, top_k]`` with dtype ``uint8``/``uint16``,
+
+        ``num_tokens == (prompt_len - routed_experts_prompt_start) + completion_len - 1``
+        """
+        if not routed_experts_b64:
+            return None
+
+        raw_bytes = base64.b64decode(routed_experts_b64)
+        return np.load(io.BytesIO(raw_bytes)).copy()
+
+    async def _post_generate(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict[str, str],
+        max_retries: int = 1,
+    ) -> tuple[list[dict], str | None, str | None]:
+        """POST to SMG /generate and return (responses, base_worker_id, target_dp_rank).
+
+        SMG's /generate returns a JSON array of GenerateResponse objects alongside the
+        worker-instance headers.  This helper reads both in a single aiohttp call so
+        that the caller never has to deal with the mismatch between http_utils._post()
+        (which assumes a JSON dict body) and the array response shape.
+
+        HTTP I/O is handled by a dedicated background thread so that socket callbacks
+        do not contend with the Ray actor's event loop.
+
+        Returns:
+            - responses: list of GenerateResponse dicts (may be empty on error)
+            - base_worker_id: value of x-base-worker-id response header, or None
+            - target_dp_rank: value of x-target-dp-rank response header, or None
+        """
+        if is_distributed_post_enabled():
+            response = await request_json_maybe_distributed(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        else:
+            io_thread = get_http_io_thread()
+            response = await io_thread.request_json(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        base_worker_id = response.headers.get("x-base-worker-id", None)
+        target_dp_rank = response.headers.get("x-target-dp-rank", None)
+
+        responses = response.data
+        # SMG /generate returns either a single dict or a list; normalise to list.
+        if isinstance(responses, dict):
+            responses = [responses]
+        elif not isinstance(responses, list):
+            psrl_logger.error(
+                "_post_generate: unexpected response type %s from %s.",
+                type(responses),
+                url,
+            )
+            responses = []
+
+        return responses, base_worker_id, target_dp_rank
+
+    async def _post_chat(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict[str, str],
+        max_retries: int = 1,
+    ) -> tuple[dict | None, str | None, str | None]:
+        """POST to SMG /v1/chat/completions and return (response_dict, base_worker_id, target_dp_rank).
+
+        HTTP I/O is handled by a dedicated background thread.
+
+        Returns:
+            - response: the parsed JSON dict (OpenAI ChatCompletionResponse), or None on error
+            - base_worker_id: value of x-base-worker-id response header, or None
+            - target_dp_rank: value of x-target-dp-rank response header, or None
+        """
+        if is_distributed_post_enabled():
+            response = await request_json_maybe_distributed(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        else:
+            io_thread = get_http_io_thread()
+            response = await io_thread.request_json(
+                "POST",
+                url,
+                payload=payload,
+                headers=headers,
+                max_retries=max_retries + 1,
+            )
+        base_worker_id = response.headers.get("x-base-worker-id", None)
+        target_dp_rank = response.headers.get("x-target-dp-rank", None)
+
+        if not isinstance(response.data, dict):
+            psrl_logger.error(
+                "_post_chat: unexpected response type %s from %s.",
+                type(response.data),
+                url,
+            )
+            return None, base_worker_id, target_dp_rank
+
+        return response.data, base_worker_id, target_dp_rank
+
+    @abstractmethod
+    async def run(self, request: dict) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
         """Execute the agent loop for the given request.
 
         Args:
-            request (DataProto): Input request to process.
-            profiling_collector: Per-trajectory profiling collector, or None if disabled.
+            request (dict): Input request to process.
 
         Returns:
-            Tuple of (output DataProto or None, TerminateReason).
+            Tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
+                A tuple containing the output data (if any) and the termination reason.
 
         Raises:
             NotImplementedError: Must be implemented by subclasses.
         """
         raise NotImplementedError
 
-    async def run_with_termination_handling(
-        self,
-        request: DataProto,
-        raise_on_error: bool = True,
-        profiling_collector: TurnProfilingCollector | None = None,
-    ) -> tuple[DataProto | None, TerminateReason]:
-        """Run ``self.run`` with whole-trajectory timeout + error classification.
-
-        Translates the three failure modes that ``run`` itself doesn't classify
-        into ``TerminateReason`` values:
-
-        - ``asyncio.TimeoutError`` from ``asyncio.wait_for`` -> ``TRAJECTORY_TIMEOUT``
-        - Any other exception in ``run``                     -> ``ROLLOUT_ERROR``
-          (re-raised when ``raise_on_error=True``).
-        - ``run`` returned ``(None, reason)`` without ``ABORTED`` -> ``UNKNOWN``
-          (or ``RuntimeError`` when ``raise_on_error=True``).
-
-        Successful runs (``run`` returned a ``DataProto``) are passed through
-        with their loop-specific reason. ``ABORTED`` short-circuits with no
-        re-notification so the worker drops the slot cleanly.
-
-        Args:
-            request: Input request to process.
-            raise_on_error: If True, exceptions / contract violations bubble
-                up to the caller; if False, they're swallowed into a
-                ``ROLLOUT_ERROR`` / ``UNKNOWN`` termination.
-            profiling_collector: Per-trajectory profiling collector, or ``None``.
+    def get_generate_fields(self) -> list[str]:
+        """Determine which fields to select from the key-value store for generation.
 
         Returns:
-            ``(output_or_None, TerminateReason)``.
+            list[str] | None: List of field names to select from the key-value store,
+                              or None to fetch all fields.
         """
-        uid = int(request.non_tensor_batch["uid"][0])
-        timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
+        fields = [
+            # dataset metadata
+            "data_source",
+            "reward_model",
+            "extra_info",
+            "reward_model_dicts",
+            # request metadata
+            "uid",
+            "parent_id",
+            "validate",
+            "rollout_instance_id",
+            # prompt
+            "raw_prompt_ids",
+            "raw_prompt",
+            "input_ids",
+            "raw_response_ids",
+            # multi-modal data
+            "multi_modal_data",
+        ]
+
+        return fields
+
+    async def run_with_termination_handling(
+        self, request: TensorDict, raise_on_error: bool = True
+    ) -> tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
+        """Run the agent loop with termination event handling.
+
+        This method wraps the run method to catch termination events and handle them appropriately.
+        It enables timeouts and error handling based on the provided configuration.
+
+        Args:
+            request (TensorDict): Input request to process.
+            raise_on_error (bool): Whether to raise exceptions on errors.
+
+        Returns:
+            Tuple[TokenOutput | list[TokenOutput] | None, TerminateReason]:
+                A tuple containing the output data (if any) and the termination reason.
+        """
+        request_ids = tu.get(request, "uid", "N/A")
         try:
-            try:
-                output, reason = await asyncio.wait_for(
-                    self.run(request, profiling_collector), timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                return None, TerminateReason.TRAJECTORY_TIMEOUT
-            except Exception:
-                if raise_on_error:
-                    raise
+            prompt = {}
+            for k, v in request.items():
+                if isinstance(v, torch.Tensor):
+                    prompt[k] = v[0]
+                elif isinstance(v, NonTensorStack):
+                    prompt[k] = v[0].data
+                elif isinstance(v, NonTensorData):
+                    prompt[k] = v.data
+                else:
+                    psrl_logger.exception(f"Unsupported type {type(v)} for key {k}")
+
+            timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
+            output, terminate_reason = await asyncio.wait_for(
+                self.run(prompt),
+                timeout=timeout,
+            )
+            if output is not None:
+                await self._resolve_version_for_dump(output, prompt)
+                self._attach_loop_timing(output)
+                self._dump_trajectory_text(prompt, output, terminate_reason)
+                return output, terminate_reason
+            elif output is None and terminate_reason.is_aborted:
+                return None, terminate_reason
+            elif output is None and terminate_reason.needs_worker_retry():
+                # Error-class terminate reasons: respect raise_on_error so that
+                # errors are surfaced instead of being silently swallowed.
+                if terminate_reason.is_error:
+                    if raise_on_error:
+                        raise RuntimeError(
+                            f"Agent loop run for request {request_ids} "
+                            f"terminated with error: {terminate_reason.value}."
+                        )
+                    psrl_logger.error(
+                        "Agent loop run for request %s terminated with "
+                        "error: %s (raise_on_error=False, returning for retry/abort).",
+                        request_ids,
+                        terminate_reason.value,
+                    )
+                return None, terminate_reason
+            elif not raise_on_error:
+                return None, TerminateReason.UNKNOWN
+            else:
+                raise RuntimeError("Agent loop run did not return a valid TokenOutput output.")
+        except RequestAbortedByGatewayError as e:
+            # PS Manager has already taken ownership of cleaning the request's data
+            # flow (TQ entry cleared, staleness inventory updated).
+            psrl_logger.info(
+                "Request %s aborted by PS Manager (gateway returned `request_aborted`); "
+                "ending data flow without retry.",
+                e.request_id or "N/A",
+            )
+            return None, TerminateReason.ABORTED
+        except asyncio.TimeoutError:
+            psrl_logger.error(
+                "Timeout in agent_loop.run for request %s (this can come from downstream calls, not only trajectory_timeout)",  # noqa: E501
+                request_ids,
+                exc_info=True,
+            )
+            return None, TerminateReason.TRAJECTORY_TIMEOUT
+        except Exception:
+            if not raise_on_error:
                 psrl_logger.error(
-                    f"Exception in agent_loop.run for uid={uid}", exc_info=True,
+                    f"Exception in agent_loop.run for request {request_ids}",
+                    exc_info=True,
                 )
                 return None, TerminateReason.ROLLOUT_ERROR
+            raise
 
-            # ``run`` returned normally; validate its contract.
-            if isinstance(output, DataProto):
-                return output, reason
-            if reason.is_aborted:
-                # Clean abort signalled by the agent loop (e.g. sibling
-                # trajectory already triggered notify_group_failed). Return
-                # directly so the worker drops the slot without re-notifying
-                # the manager.
-                return None, TerminateReason.ABORTED
-            if not raise_on_error:
-                return None, TerminateReason.UNKNOWN
-            raise RuntimeError(
-                f"Agent loop run did not return a valid DataProto output "
-                f"(uid={uid}, reason={reason.value})."
+    def _attach_loop_timing(self, output: "TokenOutput | list[TokenOutput]") -> None:
+        """Stamp the per-trajectory wall-clock timing onto each output.
+
+        Read directly from ``self.timer`` (one loop instance == one trajectory).
+        Stored under ``extra_fields['loop_timing']`` so it survives the trip back
+        to ``_dump_trajectory_text``. Never raises.
+        """
+        try:
+            timing = self.timer.as_dict()
+            for out in output if isinstance(output, list) else [output]:
+                out.extra_fields.setdefault("loop_timing", timing)
+        except Exception:
+            psrl_logger.debug("Failed to attach loop timing.", exc_info=True)
+
+    async def _resolve_version_for_dump(self, output: "TokenOutput | list[TokenOutput]", prompt: dict) -> None:
+        """Resolve the real served model version for trajectory bucketing.
+
+        Dispatch tags train requests with ``version_tag == -1``; the real version
+        is only resolved server-side and stored in the PS, so the prompt's
+        ``version_tag`` would otherwise land trajectories in ``v-1/``. Look up the
+        instance's current version via the PS manager and stash it under
+        ``extra_fields['resolved_version']``. Never raises: falls back to the
+        current PS version, then to 0.
+        """
+        prompt_version = prompt.get("version_tag", 0)
+        if prompt_version not in (None, -1):
+            return
+        if self.ps_manager_handle is None:
+            return
+        outs = output if isinstance(output, list) else [output]
+        for out in outs:
+            resolved: int | None = None
+            try:
+                if out.rollout_instance_id is not None:
+                    resolved = await self.ps_manager_handle.get_rollout_instance_model_version.remote(
+                        out.rollout_instance_id
+                    )
+                else:
+                    resolved = await self.ps_manager_handle.get_ps_model_version.remote(debug_info="trajectory_dump")
+            except Exception:
+                psrl_logger.debug(
+                    "Failed to resolve served version for uid=%s; falling back to 0.",
+                    prompt.get("uid", "N/A"),
+                    exc_info=True,
+                )
+            if resolved is not None:
+                out.extra_fields["resolved_version"] = int(resolved)
+
+    def _build_summary_text(
+        self,
+        out: "TokenOutput",
+        terminate_reason: "TerminateReason",
+    ) -> str:
+        """Build the ``=== Submission ===`` / ``=== Summary ===`` trailer for one trajectory."""
+        info = out.agent_reward_info or {}
+        patch = info.get("patch")
+
+        n_prompt = len(out.prompt_ids)
+        n_assistant = out.response_mask.count(1) if out.response_mask else 0
+        n_env = out.response_mask.count(0) if out.response_mask else 0
+        total_tokens = n_prompt + n_assistant + n_env
+
+        turns = info.get("num_turns")
+        if turns is None:
+            turns = out.num_turns if out.num_turns is not None else 0
+
+        # Prefer the loop's wall-clock timing; mini-swe carries finer timing under
+        # agent_reward_info['timing'] (assistant/env/prep/grading) measured in the runner.
+        loop_timing = (out.extra_fields or {}).get("loop_timing", {})
+        runner_timing = info.get("timing", {}) or {}
+        generation_s = runner_timing.get("assistant_s", loop_timing.get("generation_s", 0.0))
+        env_s = runner_timing.get("env_s", loop_timing.get("env_s", 0.0))
+        elapsed_s = runner_timing.get("elapsed_s", loop_timing.get("elapsed_s", 0.0))
+
+        breakdown = [f"generation: {generation_s:.1f}s", f"env: {env_s:.1f}s"]
+        if runner_timing.get("grading_s"):
+            breakdown.append(f"grading: {runner_timing['grading_s']:.1f}s")
+        if runner_timing.get("prep_s"):
+            breakdown.append(f"prep: {runner_timing['prep_s']:.1f}s")
+
+        text = ""
+        if patch:
+            text += f"=== Submission ===\n{patch}\n\n"
+        text += (
+            "=== Summary ===\n"
+            f"turns: {turns}, patch: {'yes' if patch else 'no'}, "
+            f"stop: {terminate_reason.value}, elapsed: {elapsed_s:.1f}s\n"
+            f"[Token Counts] prompt: {n_prompt} | assistant: {n_assistant} | "
+            f"env: {n_env} | total: {total_tokens}\n"
+            f"[Time Breakdown] {' | '.join(breakdown)}\n"
+        )
+        return text
+
+    def _dump_trajectory_text(
+        self,
+        prompt: dict,
+        output: "TokenOutput | list[TokenOutput]",
+        terminate_reason: "TerminateReason",
+    ) -> None:
+        """Write per-trajectory text for any agent loop via the shared writer.
+
+        Renders text uniformly from the returned ``TokenOutput`` (prompt + the
+        assistant/observation segments of ``response_ids``, split by
+        ``response_mask``), then appends a ``=== Summary ===`` block (turns, stop
+        reason, token counts, wall-clock timing) and, when a patch is present, a
+        ``=== Submission ===`` block. This is the single chokepoint all loops pass
+        through, so no per-loop wiring is needed. Never raises: a dump failure must
+        not break a rollout.
+
+        Args:
+            prompt (dict): The unwrapped request dict (carries ``uid`` and
+                ``version_tag``).
+            output (TokenOutput | list[TokenOutput]): The loop's generation
+                output(s).
+            terminate_reason (TerminateReason): Final termination classification,
+                surfaced as the ``stop:`` field of the summary.
+        """
+        if not getattr(self, "traj_writer", None) or not self.traj_writer.enable:
+            return
+        try:
+            outs = output if isinstance(output, list) else [output]
+            uid = prompt.get("uid", "N/A")
+            for idx, out in enumerate(outs):
+                version = int((out.extra_fields or {}).get("resolved_version", prompt.get("version_tag", 0)) or 0)
+                prompt_text = self.tokenizer.decode(out.prompt_ids, skip_special_tokens=False)
+                parts = [f"=== Prompt ===\n{prompt_text}\n\n"]
+                turn = 0
+                for role, text in self._segment_by_mask(out.response_ids, out.response_mask):
+                    if role == "assistant":
+                        turn += 1
+                        parts.append(f"=== Turn {turn} (assistant) ===\n{text}\n\n")
+                    else:
+                        parts.append(f"--- observation ---\n{text}\n\n")
+                parts.append(self._build_summary_text(out, terminate_reason))
+                traj_id = str(uid) if len(outs) == 1 else f"{uid}_{idx}"
+                self.traj_writer.write(version, traj_id, "".join(parts))
+        except Exception:
+            psrl_logger.warning(
+                "Failed to dump trajectory text for uid=%s.",
+                prompt.get("uid", "N/A"),
+                exc_info=True,
             )
-        finally:
-            await self.rollout_router.kv_unregister.remote(uid)
+
+    def _segment_by_mask(
+        self,
+        response_ids: list[int],
+        response_mask: list[int],
+    ) -> list[tuple[str, str]]:
+        """Split ``response_ids`` into ordered (role, text) runs by ``response_mask``.
+
+        Contiguous tokens with mask==1 are assistant-generated; mask==0 are
+        observation/tool tokens. Each run is decoded separately so turn
+        boundaries are preserved in the dumped text.
+
+        Args:
+            response_ids (list[int]): Response token ids.
+            response_mask (list[int]): Parallel mask (1=assistant, 0=observation).
+
+        Returns:
+            list[tuple[str, str]]: Ordered (role, decoded_text) segments.
+        """
+        segments: list[tuple[str, str]] = []
+        if not response_ids:
+            return segments
+        if not response_mask or len(response_mask) != len(response_ids):
+            # No usable mask: emit the whole response as a single assistant run.
+            return [("assistant", self.tokenizer.decode(response_ids, skip_special_tokens=False))]
+        run_ids: list[int] = []
+        run_mask: int | None = None
+        for tok, mask in zip(response_ids, response_mask, strict=False):
+            mask = int(bool(mask))
+            if run_mask is None:
+                run_mask = mask
+            if mask != run_mask:
+                role = "assistant" if run_mask == 1 else "observation"
+                segments.append((role, self.tokenizer.decode(run_ids, skip_special_tokens=False)))
+                run_ids = []
+                run_mask = mask
+            run_ids.append(tok)
+        if run_ids:
+            role = "assistant" if run_mask == 1 else "observation"
+            segments.append((role, self.tokenizer.decode(run_ids, skip_special_tokens=False)))
+        return segments

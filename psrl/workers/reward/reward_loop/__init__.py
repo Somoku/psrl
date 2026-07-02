@@ -1,20 +1,22 @@
 # Modified from verl/experimental/reward/reward_loop/__init__.py
-# isort: off
+from .dapo import DAPORewardManager
+from .gdpo import GDPORewardManager
+from .gen import GenRewardManager
+from .naive import NaiveRewardManager
+from .prime import PrimeRewardManager
 from .registry import (
-    get_reward_loop_manager_cls,
-    load_reward_loop_manager,
+    get_reward_manager_cls,
+    load_reward_manager,
     register,
 )
-from .dapo import DAPORewardLoopManager
-from .naive import NaiveRewardLoopManager
-from .prime import PrimeRewardLoopManager
-# isort: on
 
 __all__ = [
-    "DAPORewardLoopManager",
-    "NaiveRewardLoopManager",
-    "PrimeRewardLoopManager",
+    "DAPORewardManager",
+    "GDPORewardManager",
+    "NaiveRewardManager",
+    "PrimeRewardManager",
+    "GenRewardManager",
     "register",
-    "get_reward_loop_manager_cls",
-    "load_reward_loop_manager",
+    "get_reward_manager_cls",
+    "load_reward_manager",
 ]

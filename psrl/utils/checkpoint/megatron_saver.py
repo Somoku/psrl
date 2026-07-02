@@ -140,9 +140,7 @@ def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
 
     save_path = os.path.join(ckpt_path, f"rank_{rank}.pt")
     torch.save(plain_state_dict, save_path)
-    assert os.path.exists(save_path), (
-        f"torch.save appeared to succeed but {save_path!r} not found on disk"
-    )
+    assert os.path.exists(save_path), f"torch.save appeared to succeed but {save_path!r} not found on disk"
 
     if rank == 0:
         metadata = {
@@ -185,17 +183,14 @@ def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001  (sh
 
     metadata_path = os.path.join(ckpt_dir, _METADATA_FILE)
     assert os.path.exists(metadata_path), (
-        f"Metadata file not found: {metadata_path!r}.  "
-        f"Checkpoint directory may be corrupt or incomplete."
+        f"Metadata file not found: {metadata_path!r}.  Checkpoint directory may be corrupt or incomplete."
     )
 
     with open(metadata_path) as f:
         metadata = json.load(f)
 
     fmt = metadata.get("format")
-    assert fmt in _KNOWN_FORMATS, (
-        f"Unknown checkpoint format {fmt!r}; expected one of {sorted(_KNOWN_FORMATS)}"
-    )
+    assert fmt in _KNOWN_FORMATS, f"Unknown checkpoint format {fmt!r}; expected one of {sorted(_KNOWN_FORMATS)}"
 
     saved_ws = metadata.get("world_size")
     current_ws = torch.distributed.get_world_size()

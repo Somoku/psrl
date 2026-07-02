@@ -3,7 +3,7 @@ mini-SWE-agent Environment for PSRL.
 
 This environment adapts the mini-SWE-agent integration to PSRL's `Environment`
 interface. It handles:
-- `reset()`: Parse `DataProto` task data, build per-instance config, create workspace.
+- `reset()`: Parse task metadata, build per-instance config, create workspace.
 - `close()`: Clean up temporary directories and safety-net Docker container cleanup.
 
 It does NOT use `step()` because mini-swe-agent manages its own tool execution
@@ -18,8 +18,8 @@ import logging
 import os
 import time
 import uuid
-import numpy as np
 
+import numpy as np
 import ray
 from examples.mini_swe.config import (
     MiniSWEAgentRuntimeConfig,
@@ -27,7 +27,7 @@ from examples.mini_swe.config import (
     build_runtime_config,
 )
 from omegaconf import DictConfig
-from verl import DataProto
+from transformers import AutoProcessor, AutoTokenizer
 
 from psrl.environments.base import Environment, EnvStepOutput
 from psrl.utils.common.docker_utils import force_remove_containers_by_label
@@ -50,6 +50,9 @@ class MiniSWEEnvironment(Environment[dict, None]):
         self,
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
+        tokenizer: AutoTokenizer,
+        processor: AutoProcessor | None = None,
+        dataset_cls=None,
         runtime_config: MiniSWEAgentRuntimeConfig | None = None,
     ):
         """
@@ -61,17 +64,17 @@ class MiniSWEEnvironment(Environment[dict, None]):
             runtime_config (MiniSWEAgentRuntimeConfig | None): Pre-built runtime config
                 from the agent loop. If None, a default config is built from scratch.
         """
-        super().__init__(config, reward_manager)
+        super().__init__(config, reward_manager, tokenizer, processor, dataset_cls)
         self._base_runtime_config = runtime_config
         self._swe_task_id: str = ""
         self._runtime_config: MiniSWEAgentRuntimeConfig | None = None
 
-    async def reset(self, task: DataProto, **kwargs) -> tuple[dict, dict]:
+    async def reset(self, task: dict, **kwargs) -> tuple[dict, dict]:
         """
         Parse task data and prepare per-episode workspace.
 
         Args:
-            task (DataProto): `DataProto` containing the SWE task in `non_tensor_batch`.
+            task: Single request dict containing the SWE task metadata.
 
         Returns:
             Tuple of (observation_dict, info_dict).
@@ -79,12 +82,12 @@ class MiniSWEEnvironment(Environment[dict, None]):
         self.task = task
 
         # Log available keys for debugging data pipeline issues.
-        ntb_keys = list(task.non_tensor_batch.keys()) if task.non_tensor_batch else []
-        psrl_logger.debug(f"MiniSWEEnvironment reset: non_tensor_batch keys={ntb_keys}.")
+        task_keys = list(task.keys()) if isinstance(task, dict) else []
+        psrl_logger.debug(f"MiniSWEEnvironment reset: task keys={task_keys}.")
 
         # Extract extra_info if available (may be absent when the data pipeline
         # does not copy it to gen_batch — the reward_manager holds the original).
-        extra_info_raw = task.non_tensor_batch.get("extra_info", [{}])[0]
+        extra_info_raw = task.get("extra_info", {}) if isinstance(task, dict) else {}
         if isinstance(extra_info_raw, str):
             try:
                 extra_info = json.loads(extra_info_raw)
@@ -101,13 +104,13 @@ class MiniSWEEnvironment(Environment[dict, None]):
             f"extra_info keys={list(extra_info.keys()) if isinstance(extra_info, dict) else 'N/A'}, "
             f"swe_grader={extra_info.get('swe_grader', 'MISSING')!r}, "
             f"has_swe_problem_image={bool(extra_info.get('swe_problem_image', ''))}, "
-            f"ntb_keys={ntb_keys}."
+            f"task_keys={task_keys}."
         )
 
         # Fall back to raw_prompt for problem_statement if extra_info is empty.
         problem_statement = extra_info.get("problem_statement", "") or ""
         if not problem_statement:
-            raw_prompt = task.non_tensor_batch.get("raw_prompt", [None])[0]
+            raw_prompt = task.get("raw_prompt", None) if isinstance(task, dict) else None
             if raw_prompt is not None:
                 if isinstance(raw_prompt, (list, np.ndarray)) and len(raw_prompt) > 0:
                     first_msg = raw_prompt[0] if isinstance(raw_prompt[0], dict) else {}
@@ -134,8 +137,6 @@ class MiniSWEEnvironment(Environment[dict, None]):
             # as the uniqueness guarantee.
             self._swe_task_id = f"{task_uuid}-{swe_problem_id[:24]}"
 
-        sb = self._runtime_config.sandbox_config
-
         # Determine repo type and preexisting repo name.
         use_preexisting_repo = bool(sandbox_overrides.get("use_preexisting_repo", False))
         preexisting_repo_name = str(sandbox_overrides.get("preexisting_repo_name", "") or "")
@@ -146,20 +147,11 @@ class MiniSWEEnvironment(Environment[dict, None]):
         # fresh-container evaluation.  Empty string means no grading.
         # Support both current field names (swe_grader, swe_problem, ...) and
         # legacy field names (grader, instance, image_name) from old parquets.
-        swe_grader = str(
-            extra_info.get("swe_grader", "") or extra_info.get("grader", "") or ""
-        )
-        swe_problem = (
-            extra_info.get("swe_problem", None)
-            or extra_info.get("instance", None)
-            or {}
-        )
-        swe_problem_image = str(
-            extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or ""
-        )
+        swe_grader = str(extra_info.get("swe_grader", "") or extra_info.get("grader", "") or "")
+        swe_problem = extra_info.get("swe_problem", None) or extra_info.get("instance", None) or {}
+        swe_problem_image = str(extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or "")
         swe_restore_tests = bool(
-            extra_info.get("swe_restore_tests", False)
-            or extra_info.get("needs_head_minus_one", False)
+            extra_info.get("swe_restore_tests", False) or extra_info.get("needs_head_minus_one", False)
         )
 
         # Assert: after fallback, grading fields must be non-empty.

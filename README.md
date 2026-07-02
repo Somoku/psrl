@@ -9,13 +9,22 @@ PSRL is a post-training framework for LLMs that supports both synchronous and as
 **Requirements:**
 
 - GCC >= 9
-- Python 3.10+
+- Python >= 3.12
 - PyTorch 2.9.0
 - CUDA 12.8
+- Rust and Cargo
 
 ```bash
+# Rust prerequisite installation
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+# Verify installation
+rustc --version
+cargo --version
+
 # Use conda to manage the environment
-conda create -n psrl python=3.11
+conda create -n psrl python=3.12
 conda activate psrl
 
 # Install all dependencies (including NIXL and Megatron)
@@ -24,7 +33,6 @@ conda activate psrl
 bash scripts/install_basic.sh
 bash scripts/install_nixl.sh
 bash scripts/install_megatron.sh
-bash scripts/install_tms.sh
 bash scripts/install_lmcache.sh
 
 # Install PSRL

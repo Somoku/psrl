@@ -127,10 +127,7 @@ def repo_balanced_sample(
             result.append(pool.pop(0))
         i += 1
 
-    psrl_logger.info(
-        f"repo_balanced_sample: requested={total}, returned={len(result)}, "
-        f"repos={len(sorted_keys)}."
-    )
+    psrl_logger.info(f"repo_balanced_sample: requested={total}, returned={len(result)}, repos={len(sorted_keys)}.")
     return result
 
 
@@ -164,7 +161,5 @@ def filter_by_spec(
     # Regex spec: match against instance_id (the HF dataset field name).
     pattern = re.compile(spec)
     filtered = [prob for prob in swe_problems if pattern.search(prob["instance_id"])]
-    psrl_logger.info(
-        f"filter_by_spec regex={spec!r}: {len(swe_problems)} → {len(filtered)} SWE problems."
-    )
+    psrl_logger.info(f"filter_by_spec regex={spec!r}: {len(swe_problems)} → {len(filtered)} SWE problems.")
     return filtered

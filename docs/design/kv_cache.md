@@ -59,7 +59,7 @@ sequenceDiagram
 | `save_decode_cache` | bool | `True` | Also cache KV from decode steps (helps multi-turn reuse) |
 | `clear_on_weight_update` | bool | `True` | Invalidate stale KV after model weight sync |
 | `enable_async_loading` | bool | `True` | Overlap KV retrieval with prefill computation |
-| `eviction_policy` | str | `lru` | Cache eviction: `lru` (least recently used) or `fifo` |
+| `cache_policy` | str | `LRU` | Cache eviction: `LRU` or `FIFO` |
 | `backend` | str | `cpu` | Storage backend: `cpu` (default), `disk` |
 
 ```yaml
@@ -71,7 +71,7 @@ psrl:
     save_decode_cache: true
     clear_on_weight_update: true
     enable_async_loading: true
-    eviction_policy: lru
+    cache_policy: LRU
     backend: cpu
 ```
 
@@ -105,7 +105,10 @@ When the Router moves a request to a different rollout instance (due to load bal
 
 ### Architecture
 
-- **LMCache Controller**: A shared coordinator process started by the Rollout Coordinator. It maintains a registry of which KV chunks exist on which instances and coordinates transfers.
+- **LMCache Controller**: A shared process started by the Rollout Coordinator before
+  vLLM initialization. It maintains worker registration and fallback control.
+- **LMCache workers**: Source and destination workers perform the hot-path data move,
+  avoiding a controller bottleneck.
 - **Transport**: Transfer uses the NIXL library (same as PS weight transfer):
   - `nixl`: UCX transport: auto-selects shared memory (same node), IPC (same machine), or RDMA (cross-node).
   - `tcp`: Fallback TCP transport for environments without UCX/RDMA.
@@ -119,13 +122,10 @@ sequenceDiagram
     participant Ctrl as LMCache Controller
     participant Dst as Destination Instance
 
-    Router->>Ctrl: migrate_kv(request_id, src, dst)
-    Ctrl->>Src: export_chunks(request_id)
-    Src-->>Ctrl: chunk_metadata + handles
-    Ctrl->>Dst: import_chunks(metadata, handles)
-    Note over Src,Dst: RDMA transfer (data plane)
-    Dst-->>Ctrl: import_complete
-    Ctrl-->>Router: migration_done
+    Router->>Src: move(prefix, destination)
+    Src->>Dst: NIXL/TCP KV transfer
+    Dst-->>Src: transfer result
+    Src-->>Router: migration result
     Router->>Dst: resume_generation(request_id)
 ```
 
@@ -134,16 +134,18 @@ sequenceDiagram
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enable_p2p` | bool | `False` | Enable cross-instance KV transfer |
-| `p2p_transport` | str | `nixl` | Transport backend: `nixl` or `tcp` |
-| `controller_port` | int | `18080` | LMCache Controller listen port |
+| `p2p_transfer_channel` | str | `nixl` | Transport backend: `nixl` or `tcp` |
+| `controller_base_port` | int | `9000` | Base HTTP port for the LMCache Controller |
+| `controller_pull_port` | int | `8300` | ZMQ registration/heartbeat port |
+| `controller_reply_port` | int | `8400` | ZMQ task-dispatch port |
 
 ```yaml
 psrl:
   lmcache:
     enable: true
     enable_p2p: true
-    p2p_transport: nixl
-    controller_port: 18080
+    p2p_transfer_channel: nixl
+    controller_base_port: 9000
 ```
 
 ### Integration with Routing

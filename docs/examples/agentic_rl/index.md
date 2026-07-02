@@ -40,6 +40,17 @@ training pipeline. The design is **inspired by veRL's agent loop**: see
 [veRL Agentic RL Training](https://verl.readthedocs.io/en/latest/start/agentic_rl.html)
 for the architectural blueprint we built on.
 
+PSRL now supports two complementary integration modes:
+
+- **Native loops** use the generic `Environment` + `AgentData` interfaces and call
+  rollout generation directly.
+- **Session/TITO loops** give third-party agents a session-scoped OpenAI API through
+  SessionRouter. SMG preserves instance affinity and captures exact token IDs,
+  log-probabilities, and turn boundaries for training.
+
+Both modes write completed trajectories to TransferQueue; the trainer consumes
+metadata-only `KVBatchMeta` batches.
+
 ---
 
 ## Common Infrastructure
@@ -82,6 +93,9 @@ recipe-specific extras such as a tool-config or agent-config YAML).
 | `*.rollout.agent.env.name=<name>` | Picks the registered `Environment` (e.g. `tool_env`, `mini_swe_env`) |
 | `*.rollout.agent.data.name=<name>` | Picks the registered `AgentData` (e.g. `tool_agent_data`, `mini_swe_agent_data`) |
 | `data.return_raw_chat=True` | Keep raw chat messages so the agent loop can re-format them across turns |
+
+Session/TITO loops additionally require `psrl.rollout_gateway.enable=True` (the
+default). See {doc}`../../design/router_tito` for the request and training-data path.
 
 The `*` placeholder stands for **both** `gen_actor_rollout_ref` (training-time
 rollouts) **and** `train_actor_rollout_ref` (validation rollouts that run on the

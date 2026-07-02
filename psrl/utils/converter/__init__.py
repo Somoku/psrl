@@ -7,7 +7,7 @@ from .model_mappings import (
 
 # NOTE(linsh): converters of specified backends should be imported lazily to avoid unnecessary dependencies
 # Import all modeling modules to ensure all model mappings are registered
-from .modeling import fsdp_modeling, hf_modeling, megatron_modeling, vllm_modeling
+from .modeling import fsdp_modeling, hf_modeling, megatron_modeling
 
 __all__ = [
     "ParameterMapping",
@@ -17,5 +17,4 @@ __all__ = [
     "fsdp_modeling",
     "hf_modeling",
     "megatron_modeling",
-    "vllm_modeling",
 ]

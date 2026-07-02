@@ -130,9 +130,13 @@ def convert_fsdp_inplace(
             (converted_state_dict, sharding_dict).
     """
     if fsdp_strategy == "fsdp":
-        assert fsdp_version(model) == 1, "FSDP version 1 is expected for 'fsdp' strategy."
+        assert fsdp_version(model) == 1, (
+            f"FSDP version 1 is expected for 'fsdp' strategy, but got {fsdp_version(model)}"
+        )
     elif fsdp_strategy == "fsdp2":
-        assert fsdp_version(model) == 2, "FSDP version 2 is expected for 'fsdp2' strategy."
+        assert fsdp_version(model) == 2, (
+            f"FSDP version 2 is expected for 'fsdp2' strategy, but got {fsdp_version(model)}"
+        )
     else:
         raise ValueError(f"Unsupported FSDP strategy: {fsdp_strategy}")
     converter = FSDPConverter(fsdp_strategy, parameter_mapping)

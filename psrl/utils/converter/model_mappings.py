@@ -5,6 +5,8 @@ from typing import Any
 import torch
 from torch.nn import Parameter
 
+_MISSING = object()
+
 
 def make_slice_parameter(slice_data: torch.Tensor, param: Parameter) -> Parameter:
     """
@@ -28,6 +30,12 @@ _QKV_WEIGHT_SUFFIXES = (
     "v_proj.bias",
 )
 
+# Suffix patterns that identify Q projection weights in HF/FSDP state dicts.
+_Q_WEIGHT_SUFFIXES = (
+    "q_proj.weight",
+    "q_proj.bias",
+)
+
 
 def is_qkv_weight(param_name: str) -> bool:
     """
@@ -42,6 +50,19 @@ def is_qkv_weight(param_name: str) -> bool:
     return any(param_name.endswith(suffix) for suffix in _QKV_WEIGHT_SUFFIXES)
 
 
+def is_q_weight(param_name: str) -> bool:
+    """
+    Return True if param_name ends with a Q projection weight suffix.
+
+    Args:
+        param_name (str): Fully-qualified parameter name from a state dict.
+
+    Returns:
+        bool: True if the parameter is a Q projection weight or bias.
+    """
+    return any(param_name.endswith(suffix) for suffix in _Q_WEIGHT_SUFFIXES)
+
+
 def reshape_qkv_to_3d(
     param: Parameter,
     num_heads_local: int,
@@ -49,25 +70,20 @@ def reshape_qkv_to_3d(
     head_size: int,
 ) -> Parameter:
     """
-    Reshape a 1D or 2D Q/K/V weight or bias tensor into the 3D group-interleaved
-    layout used by slice_qkv_proj_megatron, so that all three sides
-    (Megatron/PS/vLLM) register the same shape with NIXL and can_xfer_to passes.
-
-    For 2D weights: (rows, hidden) -> (G, rows // G, hidden).
-    For 1D biases:  (rows,)       -> (G, rows // G, 1).
+    Reshape a 2D Q/K/V weight tensor into the 3D group-interleaved layout used by
+    slice_qkv_proj_megatron, so that all three sides (Megatron/PS/vLLM) register
+    the same shape with NIXL and can_xfer_to passes.
 
     Args:
-        param (Parameter): 1D tensor of shape (rows,) or 2D tensor of shape
-            (rows, hidden), where rows is num_heads_local * head_size (for Q)
-            or num_kv_heads_local * head_size (for K/V).
+        param (Parameter): 2D tensor of shape (rows, hidden) where rows is either
+            num_heads_local * head_size (for Q) or num_kv_heads_local * head_size (for K/V).
         num_heads_local (int): Number of Q heads on this TP rank.
         num_kv_heads_local (int): Number of KV heads on this TP rank.
         head_size (int): Dimension of each head.
 
     Returns:
         Parameter: View of shape (num_groups_local, heads_per_group * head_size, hidden)
-            where num_groups_local = gcd(num_heads_local, num_kv_heads_local)
-            and hidden is 1 for 1D bias inputs.
+            where num_groups_local = gcd(num_heads_local, num_kv_heads_local).
     """
     import math
 
@@ -76,6 +92,47 @@ def reshape_qkv_to_3d(
     hidden = param.shape[1] if param.ndim == 2 else 1
     assert rows % num_groups_local == 0, f"rows={rows} is not divisible by num_groups_local={num_groups_local}."
     new_shape = (num_groups_local, rows // num_groups_local, hidden)
+    # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
+    # fused split), so reshape produces a view, not a copy.
+    reshaped_data = param.data.reshape(new_shape)
+    return make_slice_parameter(reshaped_data, param)
+
+
+def reshape_visual_block_qkv(param):
+    """
+    For Qwen3.5, reshape qkv to support correct tp sharding (shard_dim=1)
+    """
+    rows = param.shape[0]
+    assert rows % 3 == 0, f"Expected rows={rows} to be divisible by 3 for visual block qkv weights."
+    reshaped_data = param.data.reshape(3, rows // 3, *param.shape[1:])
+    return make_slice_parameter(reshaped_data, param)
+
+
+def reshape_q_to_5d(
+    param: Parameter,
+    num_heads_local: int,
+    head_size: int,
+) -> Parameter:
+    """
+    Reshape a 3D Q weight tensor into the 5D group-interleaved layout used by
+    slice_qkv_proj_megatron, so that all three sides (Megatron/PS/vLLM) register
+    the same shape with NIXL and can_xfer_to passes.
+
+    Args:
+        param (Parameter): 3D tensor of shape (num_groups_local, heads_per_group * head_size, hidden)
+        num_heads_local (int): Number of Q heads on this TP rank.
+        head_size (int): Dimension of each head.
+
+    Returns:
+        Parameter: View of shape (num_groups_local, q_heads_per_group, 2, head_size, hidden)
+            where num_groups_local = gcd(num_heads_local, num_kv_heads_local).
+    """
+    num_groups_local, rows, hidden = param.shape
+    assert rows == num_heads_local // num_groups_local * head_size, (
+        f"Expected rows={num_heads_local * head_size} but got {rows}."
+    )
+    q_num_heads_per_group = num_heads_local // num_groups_local // 2
+    new_shape = (num_groups_local, q_num_heads_per_group, 2, head_size, hidden)
     # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
     # fused split), so reshape produces a view, not a copy.
     reshaped_data = param.data.reshape(new_shape)
@@ -199,6 +256,7 @@ def slice_qkv_proj_megatron(
     num_kv_heads: int,
     head_size: int,
     tp_size: int = 1,
+    attn_output_gate: bool = False,
     output_dim: int = 1,
 ) -> list[Parameter]:
     """
@@ -219,6 +277,9 @@ def slice_qkv_proj_megatron(
         Dimensionality of each head.
     tp_size : int, optional
         Tensor parallel size (default is 1).
+    attn_output_gate : bool, optional
+        Whether this is an attention output gate parameter,
+        which requires special handling for Q weights in Qwen3.5 (default is False).
     output_dim : int, optional
         Dimension along which to split (default is 0).
 
@@ -259,7 +320,7 @@ def slice_qkv_proj_megatron(
     ]
 
     qkv_params: list[Parameter] = []
-    for offset, size in offset_and_sizes:
+    for i, (offset, size) in enumerate(offset_and_sizes):
         # NOTE(lhy): Keep as a 3D non-contiguous view to share storage with fused_param.
         # Do NOT reshape to 2D here: reshape() on a non-contiguous tensor triggers an implicit
         # copy, producing an independent tensor whose storage is separate from fused_param.
@@ -268,8 +329,44 @@ def slice_qkv_proj_megatron(
         # The 3D non-contiguous path in NIXL handles this via a temp buffer and
         # original_tensor.data.copy_() after transfer, correctly updating fused_param.
         data = fused_param.data.narrow(output_dim, offset, size)
+        if attn_output_gate and i == 0:
+            # NOTE(zym) For Qwen3.5, megatron q_weights need special handling
+            q_num_heads_per_group = num_heads // num_split_heads // 2
+            data = data.view(num_split_heads // tp_size, 2, q_num_heads_per_group, head_size, -1).transpose(1, 2)
         qkv_params.append(make_slice_parameter(data, fused_param))
+
     return qkv_params
+
+
+def slice_attn_conv1d(
+    fused_param: Parameter,
+    num_k_heads: int,
+    num_v_heads: int,
+    k_head_size: int,
+    v_head_size: int,
+    tp_size: int = 1,
+    output_dim: int = 0,
+):
+    """
+    For Qwen3.5, slice attn_con1d weights to support correct tp sharding.
+    """
+    k_dim = num_k_heads * k_head_size // tp_size
+    v_dim = num_v_heads * v_head_size // tp_size
+    assert fused_param.data.shape[output_dim] == (k_dim * 2 + v_dim), (
+        f"Dim {output_dim} of fused parameter shape "
+        f"{fused_param.data.shape} must match the sum "
+        f"of k and v dims {[k_dim, v_dim]}"
+    )
+    offset_and_sizes = [
+        (0, k_dim),
+        (k_dim, k_dim),
+        (k_dim * 2, v_dim),
+    ]
+    params: list[Parameter] = []
+    for offset, size in offset_and_sizes:
+        data = fused_param.data.narrow(output_dim, offset, size)
+        params.append(make_slice_parameter(data, fused_param))
+    return params
 
 
 def slice_fused_moe_w13_weight(
@@ -298,12 +395,205 @@ def slice_fused_moe_w2_weight(
     return expert_params
 
 
+def slice_in_proj_qkvz(
+    fused_param: Parameter,
+    key_dim: int,
+    value_dim: int,
+    tp_size: int = 1,
+    output_dim: int = 0,
+) -> list[Parameter]:
+    """
+    Split Qwen3.5 GDN fused in_proj_qkvz into (in_proj_qkv, in_proj_z).
+
+    vLLM implements Qwen3.5 Gated DeltaNet (linear attention) with two fused
+    MergedColumnParallelLinear layers:
+      - in_proj_qkvz: output_sizes=[key_dim, key_dim, value_dim, value_dim]
+      - in_proj_ba:   output_sizes=[num_v_heads, num_v_heads]
+
+    The checkpoint provides in_proj_qkv (stack of K, K, V) and in_proj_z
+    separately, which correspond to the first three shards and the last shard
+    of the fused in_proj_qkvz parameter.
+
+    Args:
+        fused_param (Parameter): Fused parameter tensor.
+        key_dim (int): Global key projection dimension (linear_num_key_heads * linear_key_head_dim).
+        value_dim (int): Global value projection dimension (linear_num_value_heads * linear_value_head_dim).
+        tp_size (int): Tensor-parallel size.
+        output_dim (int): Dimension along which to split.
+
+    Returns:
+        list[Parameter]: [in_proj_qkv, in_proj_z] views sharing storage with fused_param.
+    """
+    assert tp_size >= 1, f"tp_size must be >= 1, got: {tp_size!r}."
+    qkv_size = 2 * key_dim + value_dim
+    z_size = value_dim
+    assert qkv_size % tp_size == 0, (
+        f"in_proj_qkv size must be divisible by tensor parallel size, got qkv_size={qkv_size} and tp_size={tp_size}."
+    )
+    assert z_size % tp_size == 0, (
+        f"in_proj_z size must be divisible by tensor parallel size, got z_size={z_size} and tp_size={tp_size}."
+    )
+    qkv_size_local = qkv_size // tp_size
+    z_size_local = z_size // tp_size
+    expected = qkv_size_local + z_size_local
+    assert fused_param.data.shape[output_dim] == expected, (
+        "Fused in_proj_qkvz has unexpected size on output_dim. "
+        f"Expected {expected}, got {fused_param.data.shape[output_dim]}."
+    )
+
+    qkv_data = fused_param.data.narrow(output_dim, 0, qkv_size_local)
+    z_data = fused_param.data.narrow(output_dim, qkv_size_local, z_size_local)
+    return [
+        make_slice_parameter(qkv_data, fused_param),
+        make_slice_parameter(z_data, fused_param),
+    ]
+
+
+def slice_in_proj_ba(
+    fused_param: Parameter,
+    num_v_heads: int,
+    tp_size: int = 1,
+    output_dim: int = 0,
+) -> list[Parameter]:
+    """
+    Split Qwen3.5 GDN fused in_proj_ba into (in_proj_b, in_proj_a).
+
+    Args:
+        fused_param (Parameter): Fused parameter tensor.
+        num_v_heads (int): Global number of value heads for linear attention.
+        tp_size (int): Tensor-parallel size.
+        output_dim (int): Dimension along which to split.
+
+    Returns:
+        list[Parameter]: [in_proj_b, in_proj_a] views sharing storage with fused_param.
+    """
+    assert tp_size >= 1, f"tp_size must be >= 1, got: {tp_size!r}."
+    assert num_v_heads % tp_size == 0, (
+        f"num_v_heads must be divisible by tensor parallel size, got num_v_heads={num_v_heads} and tp_size={tp_size}."
+    )
+    size_local = num_v_heads // tp_size
+    expected = 2 * size_local
+    assert fused_param.data.shape[output_dim] == expected, (
+        "Fused in_proj_ba has unexpected size on output_dim. "
+        f"Expected {expected}, got {fused_param.data.shape[output_dim]}."
+    )
+
+    b_data = fused_param.data.narrow(output_dim, 0, size_local)
+    a_data = fused_param.data.narrow(output_dim, size_local, size_local)
+    return [
+        make_slice_parameter(b_data, fused_param),
+        make_slice_parameter(a_data, fused_param),
+    ]
+
+
+def slice_qwen3_5_in_proj(
+    fused_param: Parameter,
+    key_dim: int,
+    value_dim: int,
+    num_v_heads: int,
+    tp_size: int = 1,
+    output_dim: int = 0,
+) -> list[Parameter]:
+    """
+    Split Megatron Qwen3.5 linear attention in_proj into 4 HF-like parameters.
+
+    Megatron-Bridge maps Megatron's single in_proj.weight into:
+      - linear_attn.in_proj_qkv.weight
+      - linear_attn.in_proj_z.weight
+      - linear_attn.in_proj_b.weight
+      - linear_attn.in_proj_a.weight
+
+    Args:
+        fused_param (Parameter): Fused parameter tensor.
+        key_dim (int): Global key projection dimension.
+        value_dim (int): Global value projection dimension.
+        num_v_heads (int): Global number of value heads.
+        tp_size (int): Tensor-parallel size.
+        output_dim (int): Dimension along which to split.
+
+    Returns:
+        list[Parameter]: [in_proj_qkv, in_proj_z, in_proj_b, in_proj_a] views.
+    """
+    assert tp_size >= 1, f"tp_size must be >= 1, got: {tp_size!r}."
+    qkv_size = 2 * key_dim + value_dim
+    z_size = value_dim
+    b_size = num_v_heads
+    a_size = num_v_heads
+    for name, size in (
+        ("in_proj_qkv", qkv_size),
+        ("in_proj_z", z_size),
+        ("in_proj_b", b_size),
+        ("in_proj_a", a_size),
+    ):
+        assert size % tp_size == 0, (
+            f"{name} size must be divisible by tensor parallel size, got size={size} and tp_size={tp_size}."
+        )
+
+    qkv_local = qkv_size // tp_size
+    z_local = z_size // tp_size
+    b_local = b_size // tp_size
+    a_local = a_size // tp_size
+    expected = qkv_local + z_local + b_local + a_local
+    assert fused_param.data.shape[output_dim] == expected, (
+        "Fused in_proj has unexpected size on output_dim. "
+        f"Expected {expected}, got {fused_param.data.shape[output_dim]}."
+    )
+
+    offset = 0
+    qkv_data = fused_param.data.narrow(output_dim, offset, qkv_local)
+    offset += qkv_local
+    z_data = fused_param.data.narrow(output_dim, offset, z_local)
+    offset += z_local
+    b_data = fused_param.data.narrow(output_dim, offset, b_local)
+    offset += b_local
+    a_data = fused_param.data.narrow(output_dim, offset, a_local)
+    return [
+        make_slice_parameter(qkv_data, fused_param),
+        make_slice_parameter(z_data, fused_param),
+        make_slice_parameter(b_data, fused_param),
+        make_slice_parameter(a_data, fused_param),
+    ]
+
+
+def slice_qwen3_5_in_proj_qkv(
+    fused_param: Parameter,
+    key_dim: int,
+    value_dim: int,
+    tp_size: int = 1,
+    output_dim: int = 0,
+) -> list[Parameter]:
+    """
+    For Qwen3.5, slice in_proj_qkv to support correct tp sharding.
+    """
+    q_local = key_dim // tp_size
+    k_local = key_dim // tp_size
+    v_local = value_dim // tp_size
+    expected = q_local + k_local + v_local
+    assert fused_param.data.shape[output_dim] == expected, (
+        "Fused in_proj_qkv has unexpected size on output_dim. "
+        f"Expected {expected}, got {fused_param.data.shape[output_dim]}."
+    )
+    offset = 0
+    q_data = fused_param.data.narrow(output_dim, offset, q_local)
+    offset += q_local
+    k_data = fused_param.data.narrow(output_dim, offset, k_local)
+    offset += k_local
+    v_data = fused_param.data.narrow(output_dim, offset, v_local)
+    return [
+        make_slice_parameter(q_data, fused_param),
+        make_slice_parameter(k_data, fused_param),
+        make_slice_parameter(v_data, fused_param),
+    ]
+
+
 class MappingType(Enum):
     """Enum for mapping prototypes."""
 
     DIRECT = "direct"
     QKV_SPLIT = "qkv_split"
     GATE_UP_PROJ_SPLIT = "gate_up_proj_split"
+    IN_PROJ_QKVZ_SPLIT = "in_proj_qkvz_split"
+    IN_PROJ_BA_SPLIT = "in_proj_ba_split"
     FUSED_MOE_W13_SPLIT = "fused_moe_w13_split"
     FUSED_MOE_W2_SPLIT = "fused_moe_w2_split"
 
@@ -330,15 +620,127 @@ class ParameterMapping(ABC):
         Subclasses that need extra fields (e.g. num_experts) should call
         super().get_model_info() and extend the returned dict.
         """
-        head_size = getattr(self.config, "head_dim", None)
+        cfg = self.config
+        text_cfg = getattr(cfg, "text_config", None)
+        if text_cfg is None:
+            text_cfg = cfg
+
+        def _get_attr(obj, name: str, default=_MISSING):
+            if isinstance(obj, dict):
+                if default is _MISSING:
+                    return obj[name]
+                return obj.get(name, default)
+            if default is _MISSING:
+                return getattr(obj, name)
+            return getattr(obj, name, default)
+
+        def _is_int(value) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        num_heads = _get_attr(text_cfg, "num_attention_heads")
+        hidden_size = _get_attr(text_cfg, "hidden_size")
+        intermediate_size = _get_attr(text_cfg, "intermediate_size", None)
+        num_kv_heads = _get_attr(text_cfg, "num_key_value_heads", num_heads)
+
+        attn_output_gate = _get_attr(text_cfg, "attn_output_gate", False)
+        if attn_output_gate:
+            num_heads *= 2
+
+        qk_nope_head_dim = _get_attr(text_cfg, "qk_nope_head_dim", None)
+        qk_rope_head_dim = _get_attr(text_cfg, "qk_rope_head_dim", None)
+        v_head_dim = _get_attr(text_cfg, "v_head_dim", None)
+        kv_lora_rank = _get_attr(text_cfg, "kv_lora_rank", None)
+        q_lora_rank = _get_attr(text_cfg, "q_lora_rank", None)
+
+        uses_mla_attention = (
+            _is_int(qk_nope_head_dim)
+            and _is_int(qk_rope_head_dim)
+            and _is_int(kv_lora_rank)
+            and (qk_nope_head_dim + qk_rope_head_dim) > 0
+        )
+
+        head_size = _get_attr(text_cfg, "head_dim", None)
+        if head_size is None and uses_mla_attention:
+            head_size = qk_nope_head_dim + qk_rope_head_dim
         if head_size is None:
-            head_size = self.config.hidden_size // self.config.num_attention_heads
-        return {
-            "num_heads": self.config.num_attention_heads,
-            "num_kv_heads": getattr(self.config, "num_key_value_heads", self.config.num_attention_heads),
+            head_size = hidden_size // num_heads
+
+        info: dict[str, Any] = {
+            "num_heads": num_heads,
+            "num_kv_heads": num_kv_heads,
             "head_size": head_size,
-            "intermediate_size": self.config.intermediate_size,
+            "intermediate_size": intermediate_size,
+            "attn_output_gate": attn_output_gate,
+            "uses_mla_attention": uses_mla_attention,
         }
+
+        if uses_mla_attention:
+            info.update(
+                {
+                    "qk_nope_head_dim": qk_nope_head_dim,
+                    "qk_rope_head_dim": qk_rope_head_dim,
+                    "qk_head_dim": qk_nope_head_dim + qk_rope_head_dim,
+                    "v_head_dim": v_head_dim,
+                    "kv_lora_rank": kv_lora_rank,
+                    "q_lora_rank": q_lora_rank,
+                }
+            )
+
+        num_experts = _get_attr(text_cfg, "num_experts", None)
+        if num_experts is None:
+            num_experts = _get_attr(text_cfg, "n_routed_experts", None)
+        moe_intermediate_size = _get_attr(text_cfg, "moe_intermediate_size", None)
+        n_shared_experts = _get_attr(text_cfg, "n_shared_experts", None)
+        shared_expert_intermediate_size = _get_attr(text_cfg, "shared_expert_intermediate_size", None)
+        if num_experts is not None:
+            info["num_experts"] = num_experts
+        if moe_intermediate_size is not None:
+            info["moe_intermediate_size"] = moe_intermediate_size
+        if n_shared_experts is not None:
+            info["n_shared_experts"] = n_shared_experts
+        if shared_expert_intermediate_size is not None:
+            info["shared_expert_intermediate_size"] = shared_expert_intermediate_size
+        elif moe_intermediate_size is not None and n_shared_experts is not None:
+            info["shared_expert_intermediate_size"] = moe_intermediate_size * n_shared_experts
+
+        linear_num_key_heads = _get_attr(text_cfg, "linear_num_key_heads", None)
+        linear_key_head_dim = _get_attr(text_cfg, "linear_key_head_dim", None)
+        linear_num_value_heads = _get_attr(text_cfg, "linear_num_value_heads", None)
+        linear_value_head_dim = _get_attr(text_cfg, "linear_value_head_dim", None)
+        if all(
+            x is not None
+            for x in (
+                linear_num_key_heads,
+                linear_key_head_dim,
+                linear_num_value_heads,
+                linear_value_head_dim,
+            )
+        ):
+            info.update(
+                {
+                    "linear_num_key_heads": linear_num_key_heads,
+                    "linear_key_head_dim": linear_key_head_dim,
+                    "linear_num_value_heads": linear_num_value_heads,
+                    "linear_value_head_dim": linear_value_head_dim,
+                    "linear_key_dim": linear_num_key_heads * linear_key_head_dim,
+                    "linear_value_dim": linear_num_value_heads * linear_value_head_dim,
+                }
+            )
+
+        vision_cfg = _get_attr(cfg, "vision_config", None)
+        if vision_cfg is not None:
+            vision_num_heads = _get_attr(vision_cfg, "num_heads", None)
+            vision_hidden_size = _get_attr(vision_cfg, "hidden_size", None)
+            vision_head_size = _get_attr(vision_cfg, "head_dim", None)
+            if vision_head_size is None and _is_int(vision_num_heads) and _is_int(vision_hidden_size):
+                vision_head_size = vision_hidden_size // vision_num_heads
+            if _is_int(vision_num_heads):
+                info["vision_num_heads"] = vision_num_heads
+                info["vision_num_kv_heads"] = _get_attr(vision_cfg, "num_key_value_heads", vision_num_heads)
+            if _is_int(vision_head_size):
+                info["vision_head_size"] = vision_head_size
+
+        return info
 
 
 class ModelRegistry:

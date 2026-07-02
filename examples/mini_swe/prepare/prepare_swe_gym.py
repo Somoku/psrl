@@ -54,7 +54,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 from examples.mini_swe.prepare.swebench_subsets import (
     repo_balanced_sample,
 )
@@ -233,8 +232,7 @@ def _build_row(
 
     # Store the complete SWE problem dict + eval_script for the grader.
     swe_problem_plain: dict[str, Any] = {
-        k: _ensure_list(v) if k in ("FAIL_TO_PASS", "PASS_TO_PASS") else v
-        for k, v in swe_problem.items()
+        k: _ensure_list(v) if k in ("FAIL_TO_PASS", "PASS_TO_PASS") else v for k, v in swe_problem.items()
     }
     # Attach eval_script into the swe_problem dict for grading.
     swe_problem_plain["eval_script"] = eval_script
@@ -295,10 +293,7 @@ def convert_dataset(
     from datasets import load_dataset  # local import — heavy dep
 
     hf_path = _DATASET_HF_MAP.get(dataset_key)
-    assert hf_path is not None, (
-        f"Unknown dataset key {dataset_key!r}. "
-        f"Valid keys: {sorted(_DATASET_HF_MAP.keys())}."
-    )
+    assert hf_path is not None, f"Unknown dataset key {dataset_key!r}. Valid keys: {sorted(_DATASET_HF_MAP.keys())}."
     if split is None:
         split = _DATASET_SPLIT_MAP[dataset_key]
 
@@ -312,10 +307,7 @@ def convert_dataset(
     n_before = len(swe_problems)
     swe_problems = [p for p in swe_problems if p.get("problem_statement", "")]
     if n_before - len(swe_problems):
-        print(
-            f"[prepare_swe_gym] Dropped {n_before - len(swe_problems)} instances "
-            f"with empty problem_statement."
-        )
+        print(f"[prepare_swe_gym] Dropped {n_before - len(swe_problems)} instances with empty problem_statement.")
 
     # Sampling.
     if total is not None and repo_balanced:
@@ -340,9 +332,7 @@ def convert_dataset(
             )
             skipped += 1
             continue
-        rows.append(
-            _build_row(prob, eval_script=eval_script, agent_name=agent_name)
-        )
+        rows.append(_build_row(prob, eval_script=eval_script, agent_name=agent_name))
         if (idx + 1) % 500 == 0:
             print(f"[prepare_swe_gym] Processed {idx + 1}/{len(swe_problems)}...")
 

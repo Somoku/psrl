@@ -15,9 +15,9 @@ Reward structure for mini_swe_agent data sources (toy / simple-test):
 Reward structure for swebench_verified / swe_smith_py data sources:
 
   +1.0  — all FAIL_TO_PASS pass AND all PASS_TO_PASS still pass (resolved)
-   0.0  — aborted (0 turns / Docker failure / no messages)   
+   0.0  — aborted (0 turns / Docker failure / no messages)
   -1.0  — all other cases: patch submitted but not resolved,
-           no patch submitted, policy violated                 
+           no patch submitted, policy violated
 
 ``outcome_reward = 1.0 if reward else -1.0``
   • reward=1  → resolved=True   → +1.0
@@ -81,9 +81,7 @@ def _extract_changed_lines(patch: str) -> set[str]:
         return lines
     for raw in patch.split("\n"):
         stripped = raw.strip()
-        if stripped.startswith(
-            ("+++", "---", "@@", "diff ", "index ", "similarity", "rename", "new file", "deleted")
-        ):
+        if stripped.startswith(("+++", "---", "@@", "diff ", "index ", "similarity", "rename", "new file", "deleted")):
             continue
         if stripped.startswith(("+", "-")):
             lines.add(stripped[1:].strip())
@@ -268,9 +266,7 @@ def _compute_swe_reward(
     f2p_ratio = f2p_pass / f2p_total
     if reward_mode == "test_ratio":
         score = f2p_ratio  # range [0, 1)  (1.0 would be resolved, handled above)
-        psrl_logger.debug(
-            f"[swe reward] score={score:.3f}, acc=0.0 (test_ratio: f2p={f2p_pass}/{f2p_total})."
-        )
+        psrl_logger.debug(f"[swe reward] score={score:.3f}, acc=0.0 (test_ratio: f2p={f2p_pass}/{f2p_total}).")
         return {"score": score, "acc": 0.0}
 
     # partial_credit / shaped: multi-level

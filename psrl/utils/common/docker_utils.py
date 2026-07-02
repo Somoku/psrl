@@ -62,7 +62,11 @@ async def cleanup_containers_by_label(
     """
     try:
         find_proc = await asyncio.create_subprocess_exec(
-            "docker", "ps", "-q", "--filter", f"label={label_key}={label_value}",
+            "docker",
+            "ps",
+            "-q",
+            "--filter",
+            f"label={label_key}={label_value}",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -70,36 +74,28 @@ async def cleanup_containers_by_label(
         container_ids = [cid for cid in stdout.decode().strip().split() if cid]
 
         if not container_ids:
-            psrl_logger.debug(
-                f"No containers found with label {label_key}={label_value!r}."
-            )
+            psrl_logger.debug(f"No containers found with label {label_key}={label_value!r}.")
             return []
 
-        psrl_logger.info(
-            f"Stopping {len(container_ids)} container(s) with label "
-            f"{label_key}={label_value!r}."
-        )
+        psrl_logger.info(f"Stopping {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
         stop_proc = await asyncio.create_subprocess_exec(
-            "docker", "stop", "-t", str(stop_timeout), *container_ids,
+            "docker",
+            "stop",
+            "-t",
+            str(stop_timeout),
+            *container_ids,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         await asyncio.wait_for(stop_proc.communicate(), timeout=30.0)
-        psrl_logger.info(
-            f"Stopped {len(container_ids)} container(s) with label "
-            f"{label_key}={label_value!r}."
-        )
+        psrl_logger.info(f"Stopped {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
         return container_ids
 
     except asyncio.TimeoutError:
-        psrl_logger.warning(
-            f"Timeout stopping containers with label {label_key}={label_value!r}."
-        )
+        psrl_logger.warning(f"Timeout stopping containers with label {label_key}={label_value!r}.")
         return []
     except Exception as e:
-        psrl_logger.warning(
-            f"Failed to cleanup containers with label {label_key}={label_value!r}: {e}."
-        )
+        psrl_logger.warning(f"Failed to cleanup containers with label {label_key}={label_value!r}: {e}.")
         return []
 
 
@@ -132,47 +128,30 @@ def force_remove_containers_by_label(
     try:
         find_out = subprocess.run(
             ["docker", "ps", "-aq", "--filter", f"label={label_key}={label_value}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=30,
         )
-        container_ids = [
-            cid for cid in find_out.stdout.decode().strip().split() if cid
-        ]
+        container_ids = [cid for cid in find_out.stdout.decode().strip().split() if cid]
 
         if not container_ids:
-            psrl_logger.debug(
-                f"No containers found with label {label_key}={label_value!r}."
-            )
+            psrl_logger.debug(f"No containers found with label {label_key}={label_value!r}.")
             return []
 
-        psrl_logger.info(
-            f"Force-removing {len(container_ids)} container(s) with label "
-            f"{label_key}={label_value!r}."
-        )
+        psrl_logger.info(f"Force-removing {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
         subprocess.run(
             ["docker", "rm", "-f", *container_ids],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=120,
         )
-        psrl_logger.info(
-            f"Force-removed {len(container_ids)} container(s) with label "
-            f"{label_key}={label_value!r}."
-        )
+        psrl_logger.info(f"Force-removed {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
         return container_ids
 
     except subprocess.TimeoutExpired:
-        psrl_logger.warning(
-            f"Timeout force-removing containers with label "
-            f"{label_key}={label_value!r}."
-        )
+        psrl_logger.warning(f"Timeout force-removing containers with label {label_key}={label_value!r}.")
         return []
     except Exception as e:
-        psrl_logger.warning(
-            f"Failed to force-remove containers with label "
-            f"{label_key}={label_value!r}: {e}."
-        )
+        psrl_logger.warning(f"Failed to force-remove containers with label {label_key}={label_value!r}: {e}.")
         return []
 
 
@@ -272,14 +251,9 @@ fi
     if log_dir:
         try:
             os.makedirs(log_dir, exist_ok=True)
-            log_fd: int | object = open(
-                os.path.join(log_dir, f"reaper_{actor_id}.log"), "ab"
-            )
+            log_fd: int | object = open(os.path.join(log_dir, f"reaper_{actor_id}.log"), "ab")
         except OSError as e:
-            psrl_logger.warning(
-                f"Could not open reaper log file under {log_dir!r}: {e}; "
-                f"discarding reaper output."
-            )
+            psrl_logger.warning(f"Could not open reaper log file under {log_dir!r}: {e}; discarding reaper output.")
             log_fd = subprocess.DEVNULL
     else:
         log_fd = subprocess.DEVNULL

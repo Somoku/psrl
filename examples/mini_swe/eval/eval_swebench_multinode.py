@@ -144,9 +144,7 @@ def _extract_instance_id(row: dict[str, Any]) -> str:
     iid = row.get("instance_id")
     if iid:
         return str(iid)
-    raise ValueError(
-        f"Row has no instance_id (keys={list(row.keys())!r}); cannot shard."
-    )
+    raise ValueError(f"Row has no instance_id (keys={list(row.keys())!r}); cannot shard.")
 
 
 def _hash_bucket(instance_id: str, n_shards: int) -> int:
@@ -251,9 +249,7 @@ def _build_remote_command(
     """
     env_prefix = ""
     if extra_env:
-        env_prefix = " ".join(
-            f"{k}={shlex.quote(v)}" for k, v in extra_env.items()
-        )
+        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in extra_env.items())
         env_prefix += " "
 
     eval_args = [
@@ -277,20 +273,24 @@ def _build_remote_command(
     parts = [f"cd {shlex.quote(repo_root)}"]
     if env_script:
         # set +u: env script may reference unset vars (e.g. no_proxy).
-        parts.append(
-            f"{{ set +u; source {shlex.quote(env_script)}; set -u; }}"
-        )
+        parts.append(f"{{ set +u; source {shlex.quote(env_script)}; set -u; }}")
     parts.append(" ".join(eval_args))
     return " && ".join(parts)
 
 
 _SSH_DEFAULT_OPTS: list[str] = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "LogLevel=ERROR",
-    "-o", "ServerAliveInterval=30",
-    "-o", "ServerAliveCountMax=240",
-    "-o", "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "LogLevel=ERROR",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=240",
+    "-o",
+    "BatchMode=yes",
 ]
 
 
@@ -506,9 +506,7 @@ def _merge_outputs(
     total = len(combined_results)
     resolved = sum(1 for r in combined_results if r.get("resolved"))
     rate = resolved / total if total else 0.0
-    avg_turns = (
-        sum(r.get("n_turns", 0) for r in combined_results) / total if total else 0.0
-    )
+    avg_turns = sum(r.get("n_turns", 0) for r in combined_results) / total if total else 0.0
     summary: dict[str, Any] = {
         "resolved": resolved,
         "total": total,
@@ -551,9 +549,7 @@ def _collect_forwarded_env(
             out[name] = val
     for spec in extras or []:
         if "=" not in spec:
-            raise ValueError(
-                f"--forward-env / --set-env value must be NAME=VALUE, got {spec!r}."
-            )
+            raise ValueError(f"--forward-env / --set-env value must be NAME=VALUE, got {spec!r}.")
         k, v = spec.split("=", 1)
         out[k] = v
     return out
@@ -604,6 +600,7 @@ def run_multinode(
     if api_base:
         try:
             from urllib.parse import urlparse
+
             api_host = urlparse(api_base).hostname
         except Exception:
             api_host = None
@@ -618,8 +615,7 @@ def run_multinode(
 
     if forwarded_env:
         forwarded_keys_preview = {
-            k: (v if k != "OPENAI_API_KEY" else "***redacted***")
-            for k, v in forwarded_env.items()
+            k: (v if k != "OPENAI_API_KEY" else "***redacted***") for k, v in forwarded_env.items()
         }
         psrl_logger.info(f"[multinode] Forwarding env to every host: {forwarded_keys_preview}")
 
@@ -716,8 +712,7 @@ def run_multinode(
 
     print("\n=== Multi-node evaluation complete ===")
     print(f"Hosts     : {n}  (failures: {len(failures)})")
-    print(f"Resolved  : {summary['resolved']}/{summary['total']} "
-          f"({summary['resolve_rate']:.1%})")
+    print(f"Resolved  : {summary['resolved']}/{summary['total']} ({summary['resolve_rate']:.1%})")
     print(f"Wall clock: {elapsed:.0f}s")
     print(f"Output    : {output_dir}")
     if failures:
@@ -786,10 +781,7 @@ def main() -> None:
     parser.add_argument(
         "--subset-spec",
         default="",
-        help=(
-            "Optional slice / regex filter applied on each host *after* "
-            "sharding.  Useful for quick smoke tests."
-        ),
+        help=("Optional slice / regex filter applied on each host *after* sharding.  Useful for quick smoke tests."),
     )
     parser.add_argument(
         "--repo-root",

@@ -7,16 +7,16 @@ import hydra
 import numpy as np
 import ray
 import torch
+import transfer_queue as tq
 from omegaconf import OmegaConf
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.ppo.utils import need_critic, need_reference_policy
+from verl.utils.device import auto_set_device, is_cuda_available
 
 from psrl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from psrl.trainer.ppo.utils import PSRL_Role
-from psrl.utils.post_processor import (
-    load_buffer_post_processor,
-    load_group_post_processor,
-)
+from psrl.utils.config import validate_config
+from psrl.workers.config.reward_model import resolve_active_managers
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -40,11 +40,23 @@ def seed_everything(seed: int):
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    run_ppo(config)
+    auto_set_device(config)
+
+    config.transfer_queue.enable = True
+
+    # validate config
+    validate_config(
+        config=config,
+        use_reference_policy=need_reference_policy(config),
+        use_critic=need_critic(config),
+    )
+
+    # AGENT(VERL): Skip migrate legacy reward impl
+    run_ppo(config, task_runner_class=TaskRunner)
 
 
 @ray.remote(num_gpus=1, num_cpus=0)
-class _GpuSlotReserver:
+class _GPUSlotReserver:
     """Lightweight Ray actor that holds a GPU slot without touching CUDA.
 
     Used to prevent Ray from scheduling job workers onto nodes that the job
@@ -61,14 +73,14 @@ def _reserve_excess_nodes(config) -> list:
 
     Reads psrl.deployment.total_nnodes from config. If null/None, does
     nothing. Otherwise, compares against the live cluster node count and
-    creates one _GpuSlotReserver actor per GPU on every excess node to
+    creates one _GPUSlotReserver actor per GPU on every excess node to
     prevent Ray from scheduling job workers there.
 
     Args:
         config: Hydra config with psrl.deployment fields.
 
     Returns:
-        list: The list of _GpuSlotReserver actor handles (kept alive by caller).
+        list: The list of _GPUSlotReserver actor handles (kept alive by caller).
     """
     total_nnodes = config.psrl.deployment.get("total_nnodes", None)
     if total_nnodes is None:
@@ -95,14 +107,14 @@ def _reserve_excess_nodes(config) -> list:
             f"(node_id={node_id}) to prevent stray worker placement."
         )
         for _ in range(n_gpus):
-            actor = _GpuSlotReserver.options(
+            actor = _GPUSlotReserver.options(
                 scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
             ).remote()
             reservers.append(actor)
 
     # Verify actors are ready before proceeding so placement is confirmed.
     ray.get([r.ping.remote() for r in reservers])
-    print(
+    psrl_logger.info(
         f"[PSRL] Reserved {len(reservers)} GPU slot(s) across "
         f"{len(excess_nodes)} excess node(s) "
         f"(cluster={cluster_nnodes}, job needs={total_nnodes})."
@@ -111,7 +123,15 @@ def _reserve_excess_nodes(config) -> list:
 
 
 # Define a function to run the PPO-like training process
-def run_ppo(config) -> None:
+def run_ppo(config, task_runner_class=None) -> None:
+    """Initialize Ray cluster and run distributed PPO training process.
+
+    Args:
+        config: Training configuration object containing all necessary parameters
+                for distributed PPO training including Ray initialization settings,
+                model paths, and training hyperparameters.
+        task_runner_class: For recipe to change TaskRunner.
+    """
     # Check if Ray is not initialized
     if not ray.is_initialized():
         # Initialize Ray with a local cluster configuration
@@ -119,22 +139,32 @@ def run_ppo(config) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
-        default_runtime_env["env_vars"]["PSRL_LOGGING_PATH"] = config.psrl.logging_path
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
+
+        if config.transfer_queue.enable:
+            # Add runtime environment variables for transfer queue
+            runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
+            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            runtime_env_kwargs["env_vars"] = runtime_env_vars
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        print(f"ray init kwargs: {ray_init_kwargs}")
+        psrl_logger.info(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     # NOTE(claude): keep the handle list alive for the entire job lifetime so Ray
     # does not garbage-collect the reservation actors before the job finishes.
     _slot_reservers = _reserve_excess_nodes(config)
 
+    if task_runner_class is None:
+        task_runner_class = ray.remote(num_cpus=1)(TaskRunner)  # please make sure main_task is not scheduled on head
+
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (
-        config.global_profiler.tool == "nsys"
+        is_cuda_available
+        and config.global_profiler.tool == "nsys"
         and config.global_profiler.get("steps") is not None
         and len(config.global_profiler.get("steps", [])) > 0
     ):
@@ -144,9 +174,9 @@ def run_ppo(config) -> None:
         nsight_options = OmegaConf.to_container(
             config.global_profiler.global_tool_config.nsys.controller_nsight_options
         )
-        runner = TaskRunner.options(runtime_env={"nsight": nsight_options}).remote()
+        runner = task_runner_class.options(runtime_env={"nsight": nsight_options}).remote()
     else:
-        runner = TaskRunner.remote()
+        runner = task_runner_class.remote()
     ray.get(runner.run.remote(config))
     ray.shutdown()
 
@@ -157,7 +187,7 @@ def run_ppo(config) -> None:
         ray.timeline(filename=timeline_json_file)
 
 
-@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+@ray.remote(num_cpus=1)
 class TaskRunner:
     """Ray remote class for executing distributed PPO training tasks.
 
@@ -174,52 +204,30 @@ class TaskRunner:
         self.mapping = {}
 
     def add_actor_rollout_worker(self, config):
-        """Add actor rollout worker based on the actor strategy."""
-        from verl.single_controller.ray import RayWorkerGroup
+        """Add actor rollout worker (backend selected via config.actor.strategy)."""
+        from psrl.workers.gen.vllm_rollout import PSRL_ServerAdapter
+        from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
 
-        from psrl.workers.gen.gen_worker import PSRL_GenWorker
-
-        if config.train_actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            assert config.critic.strategy in [
-                "fsdp",
-                "fsdp2",
-            ], "Critic strategy must be the same as actor strategy: 'fsdp' or 'fsdp2'."
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker
-
-            from psrl.workers.train.fsdp_train_worker import (
-                PSRL_FSDPTrainWorker as PSRL_TrainWorker,
-            )
-
-            actor_rollout_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = RayWorkerGroup
-        elif config.train_actor_rollout_ref.actor.strategy == "megatron":
-            assert config.train_actor_rollout_ref.actor.strategy == config.critic.strategy, (
-                "Critic strategy must be the same as actor strategy: 'megatron'."
-            )
-            from verl.workers.megatron_workers import ActorRolloutRefWorker
-
-            from psrl.workers.train.megatron_train_worker import (
-                PSRL_MegatronTrainWorker as PSRL_TrainWorker,
-            )
-
-            actor_rollout_cls = ActorRolloutRefWorker
-            ray_worker_group_cls = RayWorkerGroup
-        else:
-            raise NotImplementedError
-
-        self.role_worker_mapping[PSRL_Role.Rollout] = ray.remote(PSRL_GenWorker)
         self.role_worker_mapping[PSRL_Role.Actor] = ray.remote(PSRL_TrainWorker)
+        self.role_worker_mapping[PSRL_Role.Rollout] = ray.remote(PSRL_ServerAdapter)
         if config.psrl.colocate_validate_and_train:
-            self.role_worker_mapping[PSRL_Role.Validate] = ray.remote(PSRL_GenWorker)
+            self.role_worker_mapping[PSRL_Role.Validate] = ray.remote(PSRL_ServerAdapter)
+        self.mapping[PSRL_Role.Actor] = ["train_pool"]
 
-        return actor_rollout_cls, ray_worker_group_cls
+    def add_critic_worker(self, config):
+        """Add critic worker using the engine-based PSRL_TrainWorker."""
+        from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
+
+        if need_critic(config):
+            self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(PSRL_TrainWorker)
+            self.mapping[PSRL_Role.Critic] = ["train_pool"]
 
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
         deployment_config = config.psrl.deployment
+        # AGENT(VERL): use train_pool instead of global_pool
         train_pool_id = "train_pool"
         train_bundle_resource_num = 0.9 if config.psrl.colocate_validate_and_train else 1.0
-        rollout_pool_id_list = [f"rollout_pool_{i}" for i in range(deployment_config.n_rollout_instances)]
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
         }
@@ -232,17 +240,13 @@ class TaskRunner:
             train_pool_id: train_bundle_resource_num,
         }
 
-        # Reward model resource pool
-        if config.reward_model.enable_resource_pool:
-            if config.reward_model.n_gpus_per_node <= 0:
-                raise ValueError("config.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward_model.nnodes <= 0:
-                raise ValueError("config.reward_model.nnodes must be greater than 0")
-
-            reward_pool = [config.reward_model.n_gpus_per_node] * config.reward_model.nnodes
-            resource_pool_spec["reward_pool"] = reward_pool
-
         # Set the resource pool spec for each rollout instance.
+        total_rollout_gpus = 0
+        if deployment_config.elastic_rm.enable:
+            rollout_pool_id_list = ["shared_rollout_pool"]
+        else:
+            rollout_pool_id_list = [f"rollout_pool_{i}" for i in range(deployment_config.n_rollout_instances)]
+
         # If heterogeneous rollout is enabled, we will use the heterogeneous rollout configuration.
         if deployment_config.heterogeneous_rollout.enable:
             heterogeneous_deployment_config = deployment_config.heterogeneous_rollout
@@ -268,6 +272,22 @@ class TaskRunner:
                 resource_pool_spec[rollout_pool_id] = [
                     heterogeneous_deployment_config.rollout_ngpus_per_node_per_instance[i]
                 ] * heterogeneous_deployment_config.rollout_nnodes_per_instance[i]
+        elif deployment_config.elastic_rm.enable:
+            total_rollout_gpus = (
+                deployment_config.elastic_rm.shared_ngpus_per_node * deployment_config.elastic_rm.shared_nnodes
+            )
+            deployment_config.n_rollout_instances = total_rollout_gpus // (
+                config.gen_actor_rollout_ref.rollout.tensor_model_parallel_size
+                * config.gen_actor_rollout_ref.rollout.pipeline_model_parallel_size
+                * config.gen_actor_rollout_ref.rollout.data_parallel_size
+            )
+            psrl_logger.info(
+                f"[Elastic RM] Maximum number of rollout instances = {deployment_config.n_rollout_instances}"
+            )
+            resource_pool_spec["shared_rollout_pool"] = [
+                deployment_config.elastic_rm.shared_ngpus_per_node
+            ] * deployment_config.elastic_rm.shared_nnodes
+            rollout_pool_id_list = ["shared_rollout_pool"]
         else:
             for i in range(deployment_config.n_rollout_instances):
                 rollout_pool_id = rollout_pool_id_list[i]
@@ -286,9 +306,42 @@ class TaskRunner:
                 resource_num_per_bundle[validate_pool_id] = 1.0 - train_bundle_resource_num
             self.mapping[PSRL_Role.Validate] = val_pool_id_list
 
-        self.mapping[PSRL_Role.Actor] = [train_pool_id]
         self.mapping[PSRL_Role.Rollout] = rollout_pool_id_list
-        self.mapping[PSRL_Role.Critic] = [train_pool_id]
+
+        # Reward model resource pool
+        total_reward_pool_id_list = [] if not deployment_config.elastic_rm.enable else ["shared_rollout_pool"]
+        for reward_model in resolve_active_managers(config.reward):
+            if reward_model.reward_loop_type != "gen":
+                continue
+            if deployment_config.elastic_rm.enable:
+                reward_model.num_replicas = total_rollout_gpus // (
+                    reward_model.rollout.tensor_model_parallel_size
+                    * reward_model.rollout.pipeline_model_parallel_size
+                    * reward_model.rollout.data_parallel_size
+                )
+                psrl_logger.info(
+                    f"[Elastic RM] Maximum number of reward model"
+                    f"({reward_model.reward_model_name}) instances = {reward_model.num_replicas}"
+                )
+            elif reward_model.enable_resource_pool:
+                if reward_model.n_gpus_per_node <= 0:
+                    raise ValueError("reward_model.n_gpus_per_node must be greater than 0")
+                if reward_model.nnodes <= 0:
+                    raise ValueError("reward_model.nnodes must be greater than 0")
+
+                reward_model_instances = reward_model.get("num_replicas", 1)
+                reward_model_name = reward_model.get("reward_model_name", reward_model.model.path.split("/")[-1])
+                reward_pool_id_list = [f"reward_pool_{reward_model_name}_{i}" for i in range(reward_model_instances)]
+                for i in range(reward_model_instances):
+                    resource_pool_spec[reward_pool_id_list[i]] = [
+                        reward_model.rollout_ngpus_per_instance_per_node
+                    ] * reward_model.rollout_nnodes_per_instance
+                total_reward_pool_id_list.extend(reward_pool_id_list)
+            else:
+                raise ValueError("reward_model.enable_resource_pool must be True when elastic_rm.enable is False")
+
+        self.mapping[PSRL_Role.RewardModel] = total_reward_pool_id_list
+
         from psrl.trainer.ppo.utils import ResourcePoolManager
 
         resource_pool_manager = ResourcePoolManager(
@@ -301,38 +354,11 @@ class TaskRunner:
 
         return resource_pool_manager
 
-    def add_critic_worker(self, config):
-        """Add critic worker to role mapping."""
-        if config.critic.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import CriticWorker
-        elif config.critic.strategy == "megatron":
-            from verl.workers.megatron_workers import CriticWorker
-        else:
-            raise NotImplementedError
-
-        self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(CriticWorker)
-
     def add_reward_model_worker(self, config):
-        """Add reward model worker if enabled."""
-        if config.reward_model.enable:
-            if config.reward_model.strategy in {"fsdp", "fsdp2"}:
-                from verl.workers.fsdp_workers import RewardModelWorker
-            elif config.reward_model.strategy == "megatron":
-                from verl.workers.megatron_workers import RewardModelWorker
-            else:
-                raise NotImplementedError
+        """Add reward model worker."""
+        from psrl.workers.gen.vllm_rollout import PSRL_ServerAdapter
 
-            self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(RewardModelWorker)
-            if config.reward_model.enable_resource_pool:
-                self.mapping[PSRL_Role.RewardModel] = ["reward_pool"]
-            else:
-                self.mapping[PSRL_Role.RewardModel] = ["train_pool"]
-
-    def add_ref_policy_worker(self, config, ref_policy_cls):
-        """Add reference policy worker if KL loss or KL reward is used."""
-        if config.algorithm.use_kl_in_reward or config.train_actor_rollout_ref.actor.use_kl_loss:
-            self.role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ref_policy_cls)
-            self.mapping[PSRL_Role.RefPolicy] = ["train_pool"]
+        self.role_worker_mapping[PSRL_Role.RewardModel] = ray.remote(PSRL_ServerAdapter)
 
     def add_dummy_worker(self, config):
         from psrl.trainer.ppo.utils import PSRL_DummyWorker
@@ -354,89 +380,50 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
-        from verl.utils.fs import copy_to_local
 
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
-        pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+        pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
-        actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
-        self.add_critic_worker(config)
+        from concurrent.futures import ThreadPoolExecutor
 
-        # We should adopt a multi-source reward function here:
-        # - for rule-based rm, we directly call a reward score
-        # - for model-based rm, we call a model
-        # - for code related prompt, we send to a sandbox if there are test cases
-        # finally, we combine all the rewards together
-        # The reward type depends on the tag of the data
-        self.add_reward_model_worker(config)
+        # Overlap tq.init (network/storage I/O, ~38s) with add_workers (Python imports, ~79s)
+        # since they have no shared dependencies. This reduces total from ~117s to ~79s.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            tq_future = executor.submit(tq.init, config.transfer_queue)
+            self.add_actor_rollout_worker(config)
+            self.add_critic_worker(config)
 
-        # Add a reference policy worker if KL loss or KL reward is used.
-        self.add_ref_policy_worker(config, actor_rollout_cls)
+            # AGENT(VERL): PSRL use reward model worker.
+            self.add_reward_model_worker(config)
 
-        # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
-        self.add_dummy_worker(config)
+            # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
+            self.add_dummy_worker(config)
 
-        # Download the checkpoint from HDFS to the local machine.
-        # `use_shm` determines whether to use shared memory, which could lead to faster model loading if turned on
-        local_path = copy_to_local(
-            config.train_actor_rollout_ref.model.path,
-            use_shm=config.train_actor_rollout_ref.model.get("use_shm", False),
-        )
+            tq_future.result()
 
-        # Instantiate the tokenizer and processor.
-        from verl.utils import hf_processor, hf_tokenizer
+        trainer = None
+        try:
+            resource_pool_manager = self.init_resource_pool_mgr(config)
 
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+            # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
+            # during initialization of nixl modules.
+            from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
-        # Load the reward manager for training and validation.
-        reward_fn = load_reward_manager(
-            config,
-            tokenizer,
-            num_examine=0,
-            **config.reward_model.get("reward_kwargs", {}),
-        )
-        val_reward_fn = load_reward_manager(
-            config,
-            tokenizer,
-            num_examine=1,
-            **config.reward_model.get("reward_kwargs", {}),
-        )
-
-        resource_pool_manager = self.init_resource_pool_mgr(config)
-
-        # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
-        # during initialization of nixl modules.
-        from verl.utils.dataset.rl_dataset import collate_fn
-
-        from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
-
-        # Load post-processor from configuration
-        group_post_process_fn = load_group_post_processor(config)
-        buffer_post_process_fn = load_buffer_post_processor(config)
-
-        # Initialize the PPO trainer.
-        trainer = PSRL_RayPPOTrainer(
-            config=config,
-            tokenizer=tokenizer,
-            processor=processor,
-            role_worker_mapping=self.role_worker_mapping,
-            resource_pool_manager=resource_pool_manager,
-            ray_worker_group_cls=ray_worker_group_cls,
-            reward_fn=reward_fn,
-            val_reward_fn=val_reward_fn,
-            collate_fn=collate_fn,
-            group_post_process_fn=group_post_process_fn,
-            buffer_post_process_fn=buffer_post_process_fn,
-            device_name=config.trainer.device,
-        )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
-        # Start the training process.
-        trainer.fit()
+            # Initialize the PPO trainer.
+            trainer = PSRL_RayPPOTrainer(
+                config=config,
+                role_worker_mapping=self.role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+            )
+            # Initialize the workers of the trainer.
+            trainer.init_workers()
+            # Start the training process.
+            trainer.fit()
+        finally:
+            if trainer:
+                trainer.replay_buffer.close()
+            tq.close()
 
 
 if __name__ == "__main__":

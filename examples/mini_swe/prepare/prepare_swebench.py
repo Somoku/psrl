@@ -47,7 +47,6 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-
 from examples.mini_swe.prepare.swebench_subsets import (
     filter_by_spec,
     get_swebench_image_name,
@@ -171,8 +170,7 @@ def _build_row(
     # Store the complete SWE problem dict for the grader (make_test_spec needs it).
     # Convert to plain dict to avoid HF Arrow serialisation issues.
     swe_problem_plain: dict[str, Any] = {
-        k: _ensure_list(v) if k in ("FAIL_TO_PASS", "PASS_TO_PASS") else v
-        for k, v in swe_problem.items()
+        k: _ensure_list(v) if k in ("FAIL_TO_PASS", "PASS_TO_PASS") else v for k, v in swe_problem.items()
     }
 
     extra_info: dict[str, Any] = {
@@ -237,10 +235,7 @@ def convert_dataset(
     from datasets import load_dataset  # local import — heavy dep
 
     hf_path = _DATASET_HF_MAP.get(dataset_key)
-    assert hf_path is not None, (
-        f"Unknown dataset key {dataset_key!r}. "
-        f"Valid keys: {sorted(_DATASET_HF_MAP.keys())}."
-    )
+    assert hf_path is not None, f"Unknown dataset key {dataset_key!r}. Valid keys: {sorted(_DATASET_HF_MAP.keys())}."
     data_source = _DATA_SOURCE_MAP[dataset_key]
     needs_head_minus_one = _NEEDS_HEAD_MINUS_ONE[dataset_key]
 
@@ -260,13 +255,9 @@ def convert_dataset(
     n_dropped = n_before - len(swe_problems)
     if n_dropped:
         psrl_logger.info(
-            f"Dropped {n_dropped} instances with empty problem_statement "
-            f"({len(swe_problems)} remaining)."
+            f"Dropped {n_dropped} instances with empty problem_statement ({len(swe_problems)} remaining)."
         )
-        print(
-            f"[prepare_swebench] Dropped {n_dropped} / {n_before} instances "
-            f"with empty problem_statement."
-        )
+        print(f"[prepare_swebench] Dropped {n_dropped} / {n_before} instances with empty problem_statement.")
 
     # Sampling.
     if total is not None and repo_balanced:

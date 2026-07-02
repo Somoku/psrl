@@ -14,7 +14,6 @@ from nixl._api import nixl_agent, nixl_agent_config
 from omegaconf import DictConfig
 
 from psrl.utils.common.patch_utils import apply_tms_patch
-from psrl.utils.common.dynamic_import import lazy_import_to_globals
 from psrl.utils.logger import DualOutputHandler, deprecated, get_worker_info, log_tensor
 from psrl.utils.nixl.comm_plan import NIXLCommPlan
 from psrl.utils.nixl.meta_buffer import MetaBuffer
@@ -22,7 +21,6 @@ from psrl.utils.nixl.network_topology import get_local_gpu_id, get_local_ip
 from psrl.utils.nixl.nixl_spec import (
     NIXLClientInfo,
     NIXLClientType,
-    NIXLInterface,
     NIXLSharding,
     NIXLShardMetaInfo,
     NIXLTensorInfo,
@@ -31,7 +29,10 @@ from psrl.utils.nixl.nixl_spec import (
 if TYPE_CHECKING:
     from torch_memory_saver import torch_memory_saver
 else:
-    torch_memory_saver = None  # type: ignore
+    try:
+        from torch_memory_saver import torch_memory_saver
+    except ImportError:
+        torch_memory_saver = None  # type: ignore
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -67,7 +68,8 @@ class NIXLStorageClient:
         use_gpu: bool,
         client_type: NIXLClientType,
         nixl_config: DictConfig,
-        nixl_interface: NIXLInterface | None = None,
+        replica_idx: int = 0,
+        worker_index: int = 0,
         binded_agent: nixl_agent | None = None,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
@@ -85,13 +87,14 @@ class NIXLStorageClient:
         self.max_pinned_temp_memory_slots = (
             nixl_config.max_pinned_temp_memory_slots
         )  # None means no pinned temp memory
-        self.nixl_interface = nixl_interface if nixl_interface is not None else NIXLInterface()
         self.client_group_id = client_group_id
         self.enable_tms_for_temp_buffers = nixl_config.enable_tms_for_temp_buffers and use_gpu
 
         if self.enable_tms_for_temp_buffers:
-            lazy_import_to_globals("torch_memory_saver", "torch_memory_saver")
+            if torch_memory_saver is None:
+                raise ImportError("torch_memory_saver is required when nixl_config.enable_tms_for_temp_buffers=True")
             apply_tms_patch()
+
             psrl_logger.info(f"NIXLStorageClient {self.client_name} enabled TMS for temporary buffers.")
 
         # Initialize NIXL agent
@@ -384,8 +387,8 @@ class NIXLStorageClient:
     ):
         """
         Register local tensors with NIXL. Build key->desc mapping.
-        Currently only support all tensors are within binded_meta_tensor_mapping
-        or not within binded_meta_tensor_mapping.
+        Currently only support all tensors are within
+        binded_meta_tensor_mapping or not within binded_meta_tensor_mapping.
 
         Args:
             state_dict: {key: torch.Tensor}
@@ -456,6 +459,7 @@ class NIXLStorageClient:
                     self._temp_desc_bytes_mapping[(key, shard_idx)] = desc_bytes
                     local_pos = reregister_shard_pos_cache[key][shard_idx]
                     self.local_client_info.tensor_infos[key].temp_desc_bytes_list[local_pos] = desc_bytes
+            self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
             return
 
         tms_ctx = torch_memory_saver.region(tag="nixl") if self.enable_tms_for_temp_buffers else nullcontext()
@@ -480,7 +484,7 @@ class NIXLStorageClient:
                 # Scan the state_dict and find all the tensors that are not contiguous
                 for key, tensor in state_dict.items():
                     assert key in sharding_dict, f"Key {key} not found in sharding_dict."
-                    if tensor.device == torch.device("meta"):
+                    if tensor.device == torch.device("meta") or tensor.untyped_storage().nbytes() == 0:
                         continue
                     sharding = sharding_dict[key]
                     shard_indices = sharding.shard_indices
@@ -534,6 +538,8 @@ class NIXLStorageClient:
                 entries: list[tuple[tuple[Any, Any], tuple[int, ...], torch.dtype]] = []
                 for key, tensor in state_dict.items():
                     assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                    if tensor.device != torch.device("meta") and tensor.untyped_storage().nbytes() == 0:
+                        tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
                     sharding = sharding_dict[key]
                     shard_indices = sharding.shard_indices
                     local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
@@ -564,6 +570,7 @@ class NIXLStorageClient:
                 shard_meta_info_list = []
 
                 local_sharded_tensors = sharding.get_local_sharded_tensors(tensor)
+
                 for local_pos, tbd_local_sharded_tensor in enumerate(local_sharded_tensors):
                     # Store the original tensor mapping
                     # If the tensor is on meta device, allocate on-the-fly or binded from the external tensor
@@ -602,11 +609,6 @@ class NIXLStorageClient:
                     shard_meta_info_list.append(meta_info)
 
                     # Check if the shard is contiguous
-                    # psrl_logger.info(
-                    #     f"{self.client_name} key {key} shard {shard_indices[local_pos]} "
-                    #     f"register local tensor with shape {local_sharded_tensor.shape} and "
-                    #     f"dtype {local_sharded_tensor.dtype}, is_contiguous = {is_contiguous}"
-                    # )
                     if not meta_only:
                         if is_contiguous:
                             # Contiguous shard: batch register
@@ -725,8 +727,8 @@ class NIXLStorageClient:
                         continue
                     # NOTE(lhy): do not call _merge_contiguous_regions here.
                     # See the docstring of _merge_contiguous_regions for more details.
-                    # reg_list = self._merge_contiguous_regions(reg_list)
-                    # self._mtype_to_reg_region_lists[mem_type] = reg_list
+                    # registered separately, causing NIXL errors. Deduplication via
+                    # _record_region_registration is the only safe batching.
                     reg_descs = self._register_memory(mem_type, reg_list)
                     self._track_registered_desc(reg_descs)
 
@@ -758,7 +760,6 @@ class NIXLStorageClient:
                     )
                     desc_type = xfer_descs.getType()
                     for i, (key, shard_idx, _, _, _) in enumerate(entries):
-                        # Re-wrap as a single-element list, then serialize
                         single = nixlBind.nixlXferDList(desc_type, [xfer_descs[i]])
                         desc_bytes = self.agent.get_serialized_descs(single)
                         local_pos = shard_pos_cache[key][shard_idx]
@@ -809,6 +810,12 @@ class NIXLStorageClient:
 
             if binded_meta_tensor_mapping is None:
                 self._ensure_all_tensor_registered_high_level()
+
+            # Keep _all_temp_mappings in sync with the freshly built _temp_desc_bytes_mapping
+            # so that client_read() finds descriptors after re-registration (e.g. wake-up
+            # after an initial meta-only registration).
+            self._all_temp_mappings[self.client_name] = self._temp_desc_bytes_mapping
+
             psrl_logger.info(f"{self.client_name} all local tensors are registered.")
 
     def deregister_local_tensors(self):
@@ -859,6 +866,8 @@ class NIXLStorageClient:
     def send_local_info(self):
         """
         Send local client info to the server.
+        For storage_server mode, notify the server that the client is ready.
+        For meta_server mode, send the local client info to the server.
         """
         assert self._is_connected, "Not connected to server"
         if self.local_client_info is None:
@@ -876,7 +885,7 @@ class NIXLStorageClient:
             pickle.dumps({self.client_name: self._temp_desc_bytes_mapping}),
         )
 
-    def wait_for_server_sharding(self, timeout: float = 600.0):
+    def wait_for_server_sharding(self, timeout: float = 1200.0):
         """
         Wait for the server sharding to be fetched.
         """
@@ -902,6 +911,8 @@ class NIXLStorageClient:
     def wait_for_server_info(self, timeout: float = 1200.0):
         """
         Wait for the server info to be fetched.
+        For storage_server mode, wait for the storage server info to be fetched.
+        For meta_server mode, wait for all client infos (stored in the server) to be fetched.
         """
         assert self._is_connected, "Not connected to server"
         # Wait for all client infos (stored in the server) to be fetched
@@ -1420,7 +1431,7 @@ class NIXLStorageClient:
 
     # NOTE(lhy): This use low-level NIXL API to merge fragmented transfers into a single transfer,
     # which is more efficient than finishing each transfer individually.
-    def merge_and_finish_cached_xfer(self, timeout: float = 600.0):
+    def merge_and_finish_cached_xfer(self, timeout: float = 1200.0):
         """Merge and finish cached transfers."""
         if hasattr(self, "_cached_xfer_descs"):
             _cached_xfer_descs_by_op_type = {}
@@ -1586,6 +1597,7 @@ class NIXLStorageClient:
         """
         Wait for a transfer to be completed.
         """
+        # Shard tag, wait for all shards
         info = self.local_client_info.get_tensor_info(key)
         waiting_shard_indices = [shard_idx] if shard_idx is not None else info.sharding.shard_indices
         for shard_idx in waiting_shard_indices:
@@ -1629,11 +1641,7 @@ class NIXLStorageClient:
                                 raise RuntimeError(
                                     f"No temporary tensor mapping found for key {key} shard {shard_idx}"
                                 )
-                            # Copy data from temporary contiguous tensor back to original non-contiguous tensor.
-                            # Use `.data.copy_()` to bypass autograd's restriction on in-place modification
-                            # of views produced by multi-output functions (e.g. torch.chunk / torch.split).
-                            # This is purely a weight-transfer operation and must not be tracked by autograd.
-                            # Consistent with the WRITE path at client_write which uses `.detach()` on the source.
+                            # Copy data from temporary contiguous tensor back to original non-contiguous tensor
                             self._read_contiguous_event_cache[(key, shard_idx)] = torch.cuda.Event()
                             original_tensor.data.copy_(contiguous_tensor)
                             self._read_contiguous_event_cache[(key, shard_idx)].record()
@@ -1691,7 +1699,6 @@ class NIXLStorageClient:
         )
 
         tensor_infos = self.local_client_info.tensor_infos
-
         for key, src_tensor in state_dict.items():
             if key not in tensor_infos:
                 # This key is not held by this PS worker — skip silently.
@@ -1842,7 +1849,8 @@ class NIXLMultiStorageClients:
         use_gpu: bool,
         multi_client_types: list[NIXLClientType],
         nixl_config: DictConfig,
-        nixl_interface: NIXLInterface | None = None,
+        replica_idx: int = 0,
+        worker_index: int = 0,
         client_group_id: int = -1,  # -1 is the default client group
         logging_path: str | None = None,
     ):
@@ -1854,8 +1862,6 @@ class NIXLMultiStorageClients:
         self.device = torch.device("cuda:0" if use_gpu else "cpu")
         self.server_ip = nixl_config.server_ip
         self.server_port = nixl_config.server_port
-        self.nixl_interface = nixl_interface if nixl_interface is not None else NIXLInterface()
-
         # Initialize NIXL agent
         from psrl.utils.nixl.port_scanner import get_port_scanner
 
@@ -1874,7 +1880,8 @@ class NIXLMultiStorageClients:
                     use_gpu,
                     client_type,
                     nixl_config,
-                    nixl_interface,
+                    replica_idx=replica_idx,
+                    worker_index=worker_index,
                     binded_agent=self.agent,
                     client_group_id=client_group_id,
                     logging_path=logging_path,

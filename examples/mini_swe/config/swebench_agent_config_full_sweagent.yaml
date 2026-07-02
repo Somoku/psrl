@@ -10,11 +10,10 @@
 # Key design: we do NOT restrict the model to bash-only. The str_replace_editor
 # tool calls are translated transparently into equivalent bash/python commands.
 - name: mini_swe_agent
-  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop.MiniSWEAgentLoop
+  _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop_v1.MiniSWEAgentLoopV1
   sandbox_config:
     max_parallel_tasks_per_worker: 0
     rollout_turn_timeout: 1800
-    query_timeout: 2400
     environment:
       image: "swebench-sentinel-override-per-instance"
       cwd: "/testbed"
@@ -108,7 +107,8 @@
       5. Think about edgecases and make sure your fix handles them as well
       Your thinking should be thorough and so it's fine if it's very long.
   model:
-    # Sentinel value: triggers xml_fc_tool_parser bridge in _PSRLModel._parse_actions.
+    model_class: "examples.mini_swe.eval.xml_fc_model.XmlFcModel"
+    # Sentinel value consumed by XmlFcModel._parse_actions.
     action_regex: "__XML_FUNCTION_CALLING__"
     # Observation template: matches swesmith training ("OBSERVATION:\n{{observation}}").
     observation_template: |

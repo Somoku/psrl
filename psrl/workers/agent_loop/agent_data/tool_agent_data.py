@@ -1,22 +1,14 @@
-"""
-ToolAgentData — agent data for tool-calling interactions.
-
-Extends `ConversationAgentData` with two overrides:
-- `encode_observation` injects `tools=tool_schemas` on the initial turn.
-- `decode_action_from_token_ids` parses tool calls from generated token IDs.
-
-All other behaviour (trajectory building, masking, `update_from_env`,
-`update_from_model_token_ids`, `init_trajectory`, `reset`) is inherited
-from `ConversationAgentData` unchanged.
-"""
-
+import copy
 import json
 import logging
 import os
+import uuid
 
 import ray
+import torch
 from omegaconf import DictConfig
-from transformers import AutoTokenizer
+from PIL import Image
+from verl.utils.tokenizer import normalize_token_ids
 
 from psrl.environments.base import ConversationType, Environment
 from psrl.environments.tool_env import ToolAction
@@ -24,118 +16,237 @@ from psrl.tools.tool_parser.base import ToolParser
 from psrl.workers.agent_loop.agent_data.base import AgentData
 from psrl.workers.agent_loop.agent_data.conversation_agent_data import ConversationAgentData
 
-psrl_logger = logging.getLogger(__file__)
+psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+def sort_tool_schema_keys(value):
+    """Return a copy of a tool schema value with all dict keys sorted recursively."""
+    if isinstance(value, dict):
+        return {key: sort_tool_schema_keys(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [sort_tool_schema_keys(item) for item in value]
+    return copy.deepcopy(value)
 
 
 @AgentData.register("tool_agent_data")
 class ToolAgentData(ConversationAgentData):
     """
-    Agent data for tool-calling interactions.
+    Agent data implementation for tool-based interactions.
 
-    Overrides `encode_observation` to inject `tools=tool_schemas` on the first
-    turn so the model receives the tool-schema section in its system prompt.
-    Overrides `decode_action_from_token_ids` to parse tool calls via the
-    configured `ToolParser`.
+    This class manages trajectories where the agent can invoke tools during
+    multi-turn conversations. It handles parsing tool calls from model outputs,
+    updating conversation history with tool responses, and computing rewards.
 
-    Both `update_from_env` and `update_from_model_token_ids` are inherited
-    from `ConversationAgentData` and require no modification.
+    The class supports both synchronous and asynchronous tool execution and
+    integrates with chat templates for proper formatting.
     """
-
-    @classmethod
-    def init_class(cls, config: DictConfig, tokenizer: AutoTokenizer, **kwargs):
-        """
-        Initialize class-level shared resources (once per class).
-
-        Args:
-            config (DictConfig): Trainer configuration.
-            tokenizer (AutoTokenizer): Tokenizer shared across instances.
-            **kwargs: Additional keyword arguments.
-        """
-        if cls._class_initialized:
-            return
-        cls._class_initialized = True
-        cls.tokenizer = tokenizer
-        cls.tool_parser = ToolParser.get_tool_parser(
-            config.gen_actor_rollout_ref.rollout.multi_turn.format, tokenizer,
-        )
 
     def __init__(
         self,
         config: DictConfig,
         reward_manager: ray.actor.ActorHandle,
-        tokenizer: AutoTokenizer,
         env: Environment,
         **kwargs,
     ):
-        """
-        Initialize ToolAgentData.
+        """Initialize ToolAgentData instance.
 
         Args:
-            config (DictConfig): Trainer configuration.
-            reward_manager: Ray actor handle for computing rewards.
-            tokenizer (AutoTokenizer): Tokenizer for text-to-token conversion.
-            env (Environment): Environment instance; must expose `get_tool_schemas`.
-            **kwargs: Additional keyword arguments.
+            config: Configuration object containing training settings
+            reward_manager: Ray actor handle for computing rewards
+            env: Environment instance with ``get_tool_schemas()`` method
+            tokenizer: Tokenizer for converting between text and tokens
+            processor: Optional multimodal processor (e.g. Qwen2VLProcessor).
+            **kwargs: Additional keyword arguments from configuration
         """
-        assert hasattr(env, "get_tool_schemas"), (
-            "Environment must implement get_tool_schemas method."
-        )
-        self.init_class(config=config, tokenizer=tokenizer, **kwargs)
-        super().__init__(config, reward_manager, tokenizer, env)
-        self.tool_schemas = self.env.get_tool_schemas()
+        assert hasattr(env, "get_tool_schemas"), "Environment must implement get_tool_schemas method."
 
-    def encode_observation(
+        super().__init__(config, reward_manager, env)
+        self.tool_schemas = sort_tool_schema_keys(self.env.get_tool_schemas())
+        self.apply_chat_template_kwargs = config.data.get("apply_chat_template_kwargs", {})
+        self.tool_parser_name = self.config.gen_actor_rollout_ref.rollout.multi_turn.format
+        self.tool_parser = ToolParser.get_tool_parser(self.tool_parser_name, self.tokenizer)
+        self.tool_call_names: list[str] = []
+
+    def _get_chat_template_tools(self, is_init: bool) -> list[dict] | None:
+        """Include tool schemas in the initial prompt only."""
+        return self.tool_schemas if is_init else None
+
+    async def encode_observation(
         self,
         observation: ConversationType,
-        *,
-        is_init: bool,
+        images: list[Image.Image] | None = None,
+        videos: list[tuple[torch.Tensor, dict]] | None = None,
+        is_init: bool = False,
     ) -> tuple[list[int], bool]:
-        """
-        Encode the initial observation with tool schemas injected.
+        """Encode tool-env conversation messages into token ids (async).
 
-        On `is_init=True`, calls `_apply_chat_template_ids` with
-        `tools=self.tool_schemas` so the tokenizer inserts the tool-schema
-        block into the system prompt. On subsequent turns, delegates to the
-        inherited fixed-base delta (no tool schemas needed).
+        For the first observation we include tool schemas and treat the result as
+        prompt ids.  For subsequent observations we re-encode incrementally,
+        stripping the system-prompt prefix, and treat the result as user-side
+        tokens (masked to 0 during training).
 
-        Args:
-            observation (ConversationType): List of OpenAI-format message dicts.
-            is_init (bool): Whether this is the first turn.
+        When a multimodal *processor* is configured (VLM path), the initial
+        observation is processed via ``processor(text=..., images=..., ...)`` so
+        that vision tokens are embedded correctly.  Subsequent incremental turns
+        are still text-only (tool responses are text) and use the tokenizer path.
+
+        All blocking CPU work is offloaded to the default thread-pool executor.
 
         Returns:
-            tuple[list[int], bool]: (token_ids, is_prompt).
+            (token_ids, is_prompt) where is_prompt is True only for the initial
+            observation (which becomes part of the padded prompt tensor).
         """
-        if is_init:
-            if not observation:
-                return [], True
-            return (
-                self._apply_chat_template_ids(
-                    observation,
-                    add_generation_prompt=True,
-                    tools=self.tool_schemas,
-                ),
-                True,
+        if not is_init and self.tool_parser_name in {"gpt-oss", "gemma4"}:
+            if images or videos:
+                raise NotImplementedError(
+                    f"Tool parser {self.tool_parser_name!r} does not support multimodal tool responses."
+                )
+            if self.tool_parser_name == "gpt-oss":
+                response_text = self._format_gpt_oss_tool_response(observation)
+            else:
+                response_text = self._format_gemma4_tool_response(observation)
+            token_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.tokenizer.encode(response_text, add_special_tokens=False),
             )
-        return super().encode_observation(observation, is_init=is_init)
+            return normalize_token_ids(token_ids), False
+        return await super().encode_observation(
+            observation,
+            images=images,
+            videos=videos,
+            is_init=is_init,
+        )
 
     def decode_action_from_token_ids(self, token_ids: list[int]) -> ToolAction:
+        """Decode model generated token ids into ToolAction.
+
+        Returns a list of OpenAI-function-call style dicts:
+        [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
         """
-        Parse tool calls from generated token IDs.
+        _, tool_calls = self.tool_parser.extract_tool_calls_from_token_ids(token_ids, tools=self.tool_schemas)
+        tool_calls_dict = [
+            {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": tool_call.to_dict(),
+            }
+            for tool_call in tool_calls
+        ]
+        # Ensure tool call arguments are JSON strings (required by chat template)
+        for i, call in enumerate(tool_calls_dict):
+            if isinstance(call.get("function", {}).get("arguments"), dict):
+                tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        self.tool_call_names = [
+            call["function"]["name"]
+            for call in tool_calls_dict
+            if isinstance(call, dict) and isinstance(call.get("function"), dict)
+        ]
+        return tool_calls_dict
+
+    def decode_action_from_response_str(self, response_str: str) -> ToolAction:
+        """Decode model generated response string into ToolAction.
+
+        Returns a list of OpenAI-function-call style dicts:
+        [{"type": "function", "function": {"name": ..., "arguments": "..."}}]
+        """
+        _, tool_calls = self.tool_parser.extract_tool_calls_from_str(response_str, tools=self.tool_schemas)
+        tool_calls_dict = [
+            {
+                "id": f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": tool_call.to_dict(),
+            }
+            for tool_call in tool_calls
+        ]
+        # Ensure tool call arguments are JSON strings (required by chat template)
+        for i, call in enumerate(tool_calls_dict):
+            if isinstance(call.get("function", {}).get("arguments"), dict):
+                tool_calls_dict[i]["function"]["arguments"] = json.dumps(call["function"]["arguments"])
+        self.tool_call_names = [
+            call["function"]["name"]
+            for call in tool_calls_dict
+            if isinstance(call, dict) and isinstance(call.get("function"), dict)
+        ]
+        return tool_calls_dict
+
+    def _tool_message_text(self, message: dict) -> str:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            return "".join(
+                str(item.get("text", "")) for item in content if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return "" if content is None else str(content)
+
+    def _format_gpt_oss_tool_response(self, observation: ConversationType) -> str:
+        parts = []
+        for message, tool_name in zip(observation, self.tool_call_names, strict=False):
+            content = self._tool_message_text(message)
+            parts.append(
+                f"<|start|>functions.{tool_name} to=assistant<|channel|>commentary<|message|>{content}<|end|>"
+            )
+        return "".join(parts) + "<|start|>assistant"
+
+    def _format_gemma4_tool_response(self, observation: ConversationType) -> str:
+        parts = []
+        for message, tool_name in zip(observation, self.tool_call_names, strict=False):
+            content = self._tool_message_text(message)
+            parts.append(f'<|tool_response>response:{tool_name}{{value:<|"|>{content}<|"|>}}<tool_response|>')
+        return "".join(parts)
+
+    def prepare_generation_request(self, request: dict) -> dict:
+        request = super().prepare_generation_request(request)
+        if self.tool_parser.stop_token_ids:
+            request["stop_token_ids"] = self.tool_parser.stop_token_ids
+        return request
+
+    def prepare_chat_completion_request(self) -> tuple[list[dict], list[dict] | None]:
+        """Build messages and tools from current trajectory state."""
+        messages = []
+        for step in self.session_data.trajectories[-1].steps:
+            messages.extend(step.chat_completions)
+        tools = self.tool_schemas
+        return messages, tools
+
+    def _parse_tool_calls(self, tool_calls: list[dict]):
+        """Extract tool call actions from OpenAI format tool_calls."""
+        # Return the tool_calls list directly — the environment handles the format
+        return tool_calls
+
+    async def update_from_model_chat_completion(self, output: dict, **kwargs) -> tuple:
+        """Parse chat completion response and update trajectory.
 
         Args:
-            token_ids (list[int]): Generated response token IDs.
+            output: Raw chat completion response dict from SMG.
 
         Returns:
-            ToolAction: List of OpenAI-function-call style dicts, possibly empty.
+            Tuple of (action, overlong_terminate).
         """
-        _, tool_calls = self.tool_parser.extract_tool_calls(token_ids)
-        result = [
-            {"type": "function", "function": tc.to_dict()}
-            for tc in tool_calls
-        ]
-        for item in result:
-            args = item.get("function", {}).get("arguments")
-            if isinstance(args, dict):
-                item["function"]["arguments"] = json.dumps(args)
-        return result
+        choice = output["choices"][0]
+        assistant_msg = choice["message"]
+
+        # Update step
+        self.session_data.assistant_turns += 1
+        self.session_data.trajectories[-1].assistant_turns += 1
+        model_response = assistant_msg.get("content", "") or ""
+
+        try:
+            tool_calls_dict = self.decode_action_from_response_str(model_response)
+        except Exception as e:
+            psrl_logger.error("Failed to parse tool calls: %s", e)
+            tool_calls_dict = []
+
+        # Update current step with assistant response
+        self.add_step_chat_message(assistant_msg)
+        self.set_step_model_response(model_response)
+        self.set_step_action(tool_calls_dict)
+
+        # Check length limit
+        usage = output.get("usage", {})
+        total_tokens = usage.get("total_tokens", 0)
+        overlong = total_tokens > (
+            self.config.gen_actor_rollout_ref.rollout.prompt_length
+            + self.config.gen_actor_rollout_ref.rollout.response_length
+        )
+
+        return tool_calls_dict, overlong

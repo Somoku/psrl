@@ -58,11 +58,9 @@ Output artefacts::
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import logging
 import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -118,13 +116,13 @@ def _run_agent_on_swe_problem(
         dict[str, Any]: Result containing ``patch``, ``messages``, ``n_turns``,
             ``exit_status``, and ``error``.
     """
+    from examples.mini_swe.prepare.swebench_subsets import get_swebench_image_name
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.config import get_config_from_spec
     from minisweagent.models import get_model
     from minisweagent.utils.serialize import recursive_merge
 
-    from examples.mini_swe.prepare.swebench_subsets import get_swebench_image_name
-    from examples.mini_swe.swebench_grader import _get_smith_eval_script
+    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
 
     image_name = get_swebench_image_name(swe_problem)
     problem = swe_problem.get("problem_statement", "")
@@ -188,6 +186,7 @@ def _run_agent_on_swe_problem(
     # `config=` kwarg, otherwise it gets treated as a string `input_model_name`
     # and downstream `.lower()` calls explode.
     model = get_model(config=cfg.get("model", {}))
+    ensure_overflow_handling(model)
     agent = DefaultAgent(model, env, **cfg.get("agent", {}))
 
     try:
@@ -198,6 +197,14 @@ def _run_agent_on_swe_problem(
             "n_turns": len([m for m in getattr(agent, "messages", []) if m.get("role") == "assistant"]),
             "exit_status": info.get("exit_status", ""),
             "error": None,
+        }
+    except PromptOverflowError as exc:
+        return {
+            "patch": "",
+            "messages": getattr(agent, "messages", []),
+            "n_turns": len([m for m in getattr(agent, "messages", []) if m.get("role") == "assistant"]),
+            "exit_status": "context_exceeded",
+            "error": str(exc),
         }
     except Exception as exc:
         return {
@@ -340,8 +347,7 @@ def _evaluate_swe_problem(
     }
 
     psrl_logger.info(
-        f"[eval] {swe_problem_id}: resolved={result['resolved']}, "
-        f"turns={n_turns}, elapsed={elapsed:.0f}s."
+        f"[eval] {swe_problem_id}: resolved={result['resolved']}, turns={n_turns}, elapsed={elapsed:.0f}s."
     )
     return result
 
@@ -442,10 +448,7 @@ def _load_swe_problems_from_path(path: str) -> list[dict[str, Any]]:
             data = json.load(f)
         rows = data if isinstance(data, list) else [data]
     else:
-        raise ValueError(
-            f"Unsupported dataset file extension: {path!r}. "
-            f"Expected .parquet, .json, or .jsonl."
-        )
+        raise ValueError(f"Unsupported dataset file extension: {path!r}. Expected .parquet, .json, or .jsonl.")
 
     # PSRL-prepared rows nest the HF row inside extra_info; unwrap.  Support
     # both the current schema (``extra_info.swe_problem``) and the older one
@@ -454,9 +457,7 @@ def _load_swe_problems_from_path(path: str) -> list[dict[str, Any]]:
     swe_problems: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
-            raise ValueError(
-                f"Row in {path!r} is not a dict (type={type(row).__name__})."
-            )
+            raise ValueError(f"Row in {path!r} is not a dict (type={type(row).__name__}).")
         extra = row.get("extra_info")
         nested: dict[str, Any] | None = None
         if isinstance(extra, dict):
@@ -524,7 +525,6 @@ def run_eval(
         swe_problems: list[dict[str, Any]] = _load_swe_problems_from_path(dataset)
     else:
         from datasets import load_dataset
-
         from examples.mini_swe.prepare.prepare_swebench import _DATASET_HF_MAP
 
         hf_path = _DATASET_HF_MAP.get(dataset, dataset)
@@ -570,11 +570,13 @@ def run_eval(
                 # bugs are visible immediately rather than hidden behind a
                 # single-line "X raised: <msg>" summary.
                 psrl_logger.exception(f"[eval] {swe_problem_id} raised:")
-                results.append({
-                    "instance_id": swe_problem_id,
-                    "resolved": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
+                results.append(
+                    {
+                        "instance_id": swe_problem_id,
+                        "resolved": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
 
     # --- Write preds.json (leaderboard-compatible) ---
     preds: dict[str, Any] = {}
@@ -613,7 +615,7 @@ def run_eval(
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"\n=== Evaluation complete ===")
+    print("\n=== Evaluation complete ===")
     print(f"Resolved : {resolved}/{total} ({resolve_rate:.1%})")
     print(f"Avg turns: {avg_turns:.1f}")
     print(f"Elapsed  : {elapsed:.0f}s")
@@ -650,7 +652,11 @@ def main() -> None:
             "has been pre-fetched locally."
         ),
     )
-    parser.add_argument("--split", default="", help="HF split (default: test for Verified, train for smith). Ignored when --dataset is a path.")
+    parser.add_argument(
+        "--split",
+        default="",
+        help="HF split (default: test for Verified, train for smith). Ignored when --dataset is a path.",
+    )
     parser.add_argument("--subset-spec", default="", help="Slice or regex filter.")
     parser.add_argument("--output-dir", required=True, help="Output directory.")
     parser.add_argument(

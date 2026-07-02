@@ -55,6 +55,14 @@ class LMCacheConfig:
     # Whether to clear the LMCache KV cache on model weight updates from PS.
     clear_on_weight_update: bool = True
 
+    # Whether to allow multiple model versions to coexist in the KV cache.
+    # When True, each stored entry is tagged with the model version that generated
+    # it, so version-N requests can never hit version-M KV entries (hash mismatch
+    # is structural). Requires clear_on_weight_update=False to retain old entries.
+    # Old-version entries are evicted naturally by LRU as new-version requests
+    # fill the cache.
+    multi_version_kv: bool = False
+
     # --- CPU backend ---
 
     # GiB of CPU memory to reserve and never use for KV offloading.
@@ -89,6 +97,13 @@ class LMCacheConfig:
     # Base port for the LMCache Controller subprocess.
     # `find_available_port()` picks the actual port at runtime.
     controller_base_port: int = 9000
+
+    # Seconds RolloutCoordinator waits for the Controller HTTP API to become
+    # healthy before failing init. The controller imports torch+vLLM at startup
+    # (~30-40s standalone) and runs on the busy ps_manager node, so under cluster
+    # contention it can exceed the old hard-coded 90s budget. Read by
+    # RolloutCoordinator._start_lmcache_controller(); not exported as an env var.
+    controller_health_timeout_s: int = 300
 
     # Host where the LMCache Controller runs (defaults to ps_manager_ip).
     # Set by PSRL before engine init so LMCache workers know where to connect.
@@ -202,9 +217,7 @@ class LMCacheConfig:
             env_vars["LMCACHE_LOCAL_CPU"] = "True"
             # reserve_local_cpu_size: keep some CPU memory free for other processes.
             if self.reserve_local_cpu_size > 0.0:
-                env_vars["LMCACHE_RESERVE_LOCAL_CPU_SIZE"] = str(
-                    self.reserve_local_cpu_size
-                )
+                env_vars["LMCACHE_RESERVE_LOCAL_CPU_SIZE"] = str(self.reserve_local_cpu_size)
 
         # Disk backend.
         if self.backend == "disk" and self.disk_path:
@@ -237,12 +250,8 @@ class LMCacheConfig:
             env_vars["LMCACHE_RETRIEVE_LOCATIONS"] = "LocalCPUBackend"
             # Controller ZMQ endpoints (host:port).
             controller_host = self.controller_host or "127.0.0.1"
-            env_vars["LMCACHE_CONTROLLER_PULL_URL"] = (
-                f"{controller_host}:{self.controller_pull_port}"
-            )
-            env_vars["LMCACHE_CONTROLLER_REPLY_URL"] = (
-                f"{controller_host}:{self.controller_reply_port}"
-            )
+            env_vars["LMCACHE_CONTROLLER_PULL_URL"] = f"{controller_host}:{self.controller_pull_port}"
+            env_vars["LMCACHE_CONTROLLER_REPLY_URL"] = f"{controller_host}:{self.controller_reply_port}"
             if self.p2p_transfer_channel:
                 env_vars["LMCACHE_TRANSFER_CHANNEL"] = self.p2p_transfer_channel
 
@@ -252,9 +261,7 @@ class LMCacheConfig:
                 f"but num_kv_workers={self.num_kv_workers}. "
                 "Call vllm_rollout.py port allocation before apply_env_vars()."
             )
-            env_vars["LMCACHE_LMCACHE_WORKER_PORTS"] = ",".join(
-                str(p) for p in self.allocated_worker_ports
-            )
+            env_vars["LMCACHE_LMCACHE_WORKER_PORTS"] = ",".join(str(p) for p in self.allocated_worker_ports)
 
             # P2P backend ports.
             env_vars["LMCACHE_ENABLE_P2P"] = "True"
@@ -263,15 +270,11 @@ class LMCacheConfig:
                 f"allocated_p2p_init_ports has {len(self.allocated_p2p_init_ports)} entries "
                 f"but num_kv_workers={self.num_kv_workers}."
             )
-            env_vars["LMCACHE_P2P_INIT_PORTS"] = ",".join(
-                str(p) for p in self.allocated_p2p_init_ports
-            )
+            env_vars["LMCACHE_P2P_INIT_PORTS"] = ",".join(str(p) for p in self.allocated_p2p_init_ports)
             assert len(self.allocated_p2p_lookup_ports) == self.num_kv_workers, (
                 f"allocated_p2p_lookup_ports has {len(self.allocated_p2p_lookup_ports)} entries "
                 f"but num_kv_workers={self.num_kv_workers}."
             )
-            env_vars["LMCACHE_P2P_LOOKUP_PORTS"] = ",".join(
-                str(p) for p in self.allocated_p2p_lookup_ports
-            )
+            env_vars["LMCACHE_P2P_LOOKUP_PORTS"] = ",".join(str(p) for p in self.allocated_p2p_lookup_ports)
 
         return env_vars

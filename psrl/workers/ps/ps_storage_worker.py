@@ -8,22 +8,35 @@ import torch
 from accelerate import init_empty_weights
 from omegaconf import DictConfig
 from safetensors import safe_open
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForVision2Seq
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText
 from verl.utils.fs import copy_to_local
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
 from psrl.utils.common.worker_naming import ps_agent_name, ps_client_pull_name, ps_client_push_name
 from psrl.utils.converter import create_parameter_mapping
-from psrl.utils.converter.hf_converter import convert_hf_inplace
+from psrl.utils.converter.hf_converter import (
+    convert_hf_inplace,
+    maybe_convert_to_smaller_parts,
+)
 from psrl.utils.logger import get_ps_logger, get_worker_info, setup_ps_logger
 from psrl.utils.nixl import (
     NIXLClientType,
-    NIXLInterface,
     NIXLMultiStorageClients,
 )
 
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
+
+
+# PSRL-maintained fallback fp32 patterns for models whose HuggingFace definitions
+# do not (yet) declare _keep_in_fp32_modules_strict. Keyed by substrings of the
+# model class name; matched against any module class in the model hierarchy.
+FP32_PATTERNS: dict[str, list[str]] = {
+    # Qwen3.5 / Qwen3-Next GDN (Gated DeltaNet) parameters:
+    # A_log is a logarithmic decay term in the recurrence that vLLM explicitly
+    # stores in float32 for numerical stability.
+    "Qwen3_5": ["A_log"],
+}
 
 
 # TODO(lhy): Implement the PSStoragePlan
@@ -55,12 +68,10 @@ class PSStorageWorker:
         storage_plan: PSStoragePlan,
         model_config: DictConfig,
         psrl_config: DictConfig,
-        nixl_interface: NIXLInterface,
     ) -> None:
         self.storage_plan = storage_plan
         self.model_config = model_config
         self.psrl_config = psrl_config
-        self.nixl_interface = nixl_interface
         self.train_meta_hf_model: torch.nn.Module | None = None
         self.gen_meta_hf_model: torch.nn.Module | None = None
 
@@ -119,8 +130,9 @@ class PSStorageWorker:
                 NIXLClientType.PS_FOR_PULL,
             ],
             nixl_config=self.psrl_config.nixl,
-            nixl_interface=self.nixl_interface,
-            # client_group_id=self.get_replica_id(),
+            replica_idx=self.get_replica_id(),
+            worker_index=self.rank,
+            # client_group_id=self.get_replica_id()
             logging_path=self.psrl_config.logging_path,
         )
         psrl_logger.info(
@@ -287,8 +299,8 @@ class PSStorageWorker:
             local_path,
             trust_remote_code=self.model_config.get("trust_remote_code", False),
         )
-        if type(model_config) in AutoModelForVision2Seq._model_mapping.keys():
-            model_class = AutoModelForVision2Seq
+        if type(model_config) in AutoModelForImageTextToText._model_mapping.keys():
+            model_class = AutoModelForImageTextToText
         else:
             model_class = AutoModelForCausalLM
 
@@ -307,6 +319,12 @@ class PSStorageWorker:
                         torch_dtype=self.storage_plan.gen_model_dtype,
                         trust_remote_code=self.model_config.get("trust_remote_code", False),
                     )
+            # Fix per-parameter dtypes: from_config(torch_dtype=X) uniformly casts all
+            # parameters, but some (e.g., router bias in DeepSeekV3) must stay float32.
+            # Use HF model's _keep_in_fp32_modules_strict / _keep_in_fp32_modules to identify them.
+            self._fix_meta_model_dtypes(self.train_meta_hf_model)
+            if not self.storage_plan.train_gen_model_share():
+                self._fix_meta_model_dtypes(self.gen_meta_hf_model)
         else:
             raise ValueError(f"Invalid PS mode: {self.psrl_config.ps_mode}")
 
@@ -315,6 +333,10 @@ class PSStorageWorker:
         self._tied_weights_alias_map = self._build_tied_weights_alias_map(self.train_meta_hf_model, local_path)
         if self._tied_weights_alias_map:
             psrl_logger.info(f"init_model: detected tied-weight aliases: {self._tied_weights_alias_map}")
+
+        # Save model info
+        self.model_info = create_parameter_mapping("HuggingFace", self.train_meta_hf_model.config).get_model_info()
+
         psrl_logger.info(f"init_model (meta-only) done on {get_worker_info()}.")
 
     @staticmethod
@@ -338,6 +360,10 @@ class PSStorageWorker:
         # If lm_head.weight is already in the checkpoint, no alias mapping needed.
         if alias in ckpt_keys:
             return {}
+
+        if canonical not in ckpt_keys:
+            # NOTE(zym) For Qwen3_5ForConditionalGeneration
+            canonical = "model.language_model.embed_tokens.weight"
 
         assert canonical in ckpt_keys, (
             f"_build_tied_weights_alias_map: tie_word_embeddings=True but "
@@ -368,6 +394,97 @@ class PSStorageWorker:
 
         raise FileNotFoundError(f"No safetensors checkpoint found under '{local_path}' for key scanning.")
 
+    @staticmethod
+    def _fix_meta_model_dtypes(meta_model: torch.nn.Module) -> None:
+        """Correct per-parameter dtypes on the meta model for architecturally-constrained params.
+
+        ``from_config(torch_dtype=X)`` uniformly casts all parameters to dtype X.
+        However, some parameters are architecturally constrained to float32 (e.g.,
+        DeepSeekV3's ``e_score_correction_bias`` for router scoring precision).
+
+        This method uses the same mechanism as HuggingFace Transformers:
+        - ``_keep_in_fp32_modules_strict``: parameter name substrings that must always
+          stay in float32, regardless of the user-specified dtype (bf16 or fp16).
+        - ``_keep_in_fp32_modules``: parameter name substrings that must stay in float32
+          only when the user-specified dtype is fp16 (not bf16).
+
+        These attributes are read directly from the HuggingFace model class (e.g.,
+        ``DeepseekV3ForCausalLM._keep_in_fp32_modules_strict = ["e_score_correction_bias"]``).
+        """
+        # Collect fp32 module patterns from the model class hierarchy (same as transformers)
+        keep_in_fp32_strict: set[str] = set()
+        keep_in_fp32: set[str] = set()
+
+        for module in meta_model.modules():
+            if patterns := getattr(module, "_keep_in_fp32_modules_strict", None):
+                keep_in_fp32_strict.update(patterns)
+            if patterns := getattr(module, "_keep_in_fp32_modules", None):
+                keep_in_fp32.update(patterns)
+
+        # PSRL fallback: supplement with patterns for models that don't define
+        # _keep_in_fp32_modules_strict in their HuggingFace class definition.
+        for module in meta_model.modules():
+            cls_name = type(module).__name__
+            for key, patterns in FP32_PATTERNS.items():
+                if key in cls_name:
+                    keep_in_fp32_strict.update(patterns)
+
+        if not keep_in_fp32_strict and not keep_in_fp32:
+            return
+
+        # Determine which patterns apply based on the model's current dtype
+        # (which is the user-specified torch_dtype from from_config)
+        sample_param = next(meta_model.parameters(), None)
+        if sample_param is None:
+            return
+        current_dtype = sample_param.dtype
+
+        patterns_to_fix: set[str] = set()
+        # _keep_in_fp32_modules_strict: always upcast to fp32 for both fp16 and bf16
+        if current_dtype in (torch.float16, torch.bfloat16):
+            patterns_to_fix.update(keep_in_fp32_strict)
+        # _keep_in_fp32_modules: only upcast to fp32 for fp16 (not bf16)
+        if current_dtype == torch.float16:
+            patterns_to_fix.update(keep_in_fp32)
+
+        if not patterns_to_fix:
+            return
+
+        # Fix matching parameters and buffers
+        fixed_count = 0
+
+        # Fix parameters
+        for param_name, param in meta_model.named_parameters():
+            if param.dtype == torch.float32:
+                continue
+            if any(pattern in param_name for pattern in patterns_to_fix):
+                new_data = torch.empty(param.shape, dtype=torch.float32, device=param.device)
+                param.data = new_data
+                fixed_count += 1
+
+        # Fix buffers (e.g., e_score_correction_bias is a buffer in HF DeepseekV3)
+        for buf_name, buf in meta_model.named_buffers():
+            if buf is None or buf.dtype == torch.float32:
+                continue
+            if any(pattern in buf_name for pattern in patterns_to_fix):
+                # For buffers, we need to re-register on the owning module
+                parts = buf_name.rsplit(".", 1)
+                if len(parts) == 2:
+                    parent_path, attr_name = parts
+                    parent_module = meta_model.get_submodule(parent_path)
+                else:
+                    attr_name = parts[0]
+                    parent_module = meta_model
+                new_buf = torch.empty(buf.shape, dtype=torch.float32, device=buf.device)
+                parent_module.register_buffer(attr_name, new_buf)
+                fixed_count += 1
+
+        if fixed_count > 0:
+            psrl_logger.info(
+                f"_fix_meta_model_dtypes: corrected {fixed_count} parameter(s) to float32 "
+                f"(patterns: {patterns_to_fix})."
+            )
+
     # ------------------------------------------------------------------
     # Post-protocol weight loading
     # ------------------------------------------------------------------
@@ -389,13 +506,11 @@ class PSStorageWorker:
         write_checkpoint_to_registered_tensors().
         """
         if self.psrl_config.broadcast_init.enabled and self.rank != 0:
-            psrl_logger.info(
-                f"[preload_checkpoint_to_cpu] broadcast_init enabled, rank {self.rank} skips disk read."
-            )
+            psrl_logger.info(f"[preload_checkpoint_to_cpu] broadcast_init enabled, rank {self.rank} skips disk read.")
             return
 
-        assert hasattr(self, "_tied_weights_alias_map"), (
-            "preload_checkpoint_to_cpu: _tied_weights_alias_map not found — "
+        assert hasattr(self, "_tied_weights_alias_map") and hasattr(self, "model_info"), (
+            "preload_checkpoint_to_cpu: _tied_weights_alias_map / model_info not found — "
             "init_model() must be called before this method."
         )
 
@@ -409,7 +524,10 @@ class PSStorageWorker:
             psrl_logger.debug(f"[preload_checkpoint_to_cpu] Opening shard {shard_file}.")
             with safe_open(shard_file, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    cache[key] = f.get_tensor(key)
+                    for split_key, split_tensor in maybe_convert_to_smaller_parts(
+                        self.model_info, key, f.get_tensor(key)
+                    ).items():
+                        cache[split_key] = split_tensor
 
         # Expand tied-weight aliases so phase 2 can do a direct key lookup.
         alias_count = 0
@@ -671,9 +789,7 @@ class PSStorageWorker:
                 train_client.wait(key, "ps_broadcast_init", "WRITE", target_client=child_client)
         train_client.clear_intermediate_cached_data()
 
-        psrl_logger.info(
-            f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: all transfers done."
-        )
+        psrl_logger.info(f"[broadcast_send_to_children] rank {self.rank} round {round_idx}: all transfers done.")
 
     def do_transfer_train_to_gen_after_broadcast(self) -> None:
         """
@@ -699,9 +815,7 @@ class PSStorageWorker:
             self.transfer_train_to_gen(key=key, sync=False)
         if self.use_gpu:
             torch.cuda.synchronize()
-        psrl_logger.info(
-            f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: transfer done."
-        )
+        psrl_logger.info(f"[do_transfer_train_to_gen_after_broadcast] rank {self.rank}: transfer done.")
 
     def shutdown(self):
         self.nixl_multi_storage_clients.shutdown()

@@ -28,6 +28,13 @@ Training is "all-or-nothing" because mainstream parallelism backends (FSDP, Mega
 
 PSRL uses [torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) (TMS) as its underlying primitive for dynamic GPU memory management when multiple workloads are colocated on the same GPUs.
 
+:::{important}
+The current TransferQueue-based trainer does not implement `psrl.colocate=True` and
+raises `NotImplementedError` in that branch. TMS is still used for supported worker
+sleep/wake and memory-management paths, but do not interpret `tms.range=all` as
+making the unsupported train/rollout colocate mode available.
+:::
+
 TMS operates in two phases:
 
 1. **Pause**: when a workload is idle, its GPU memory is released (or offloaded to CPU).
@@ -59,7 +66,7 @@ psrl:
 |---------|----------|
 | `null` | TMS disabled. Training and generation must run on separate GPU allocations. |
 | `train` | Only the training worker's memory is managed by TMS. While generation is active, training tensors are offloaded. |
-| `all` | Both rollout and training workers' GPU memory is managed by TMS, enabling seamless colocated execution without OOM. |
+| `all` | Manage both rollout and training worker memory on supported lifecycle paths. |
 
 :::{note}
 The `range` interface currently covers **training, generation, and evaluation** workers. It will be extended to also cover the **reward worker** once reward-side elasticity lands, so that reward models can be colocated and TMS-managed on the same shared GPUs.

@@ -20,6 +20,8 @@ from minisweagent.models.litellm_textbased_model import (
     LitellmTextbasedModelConfig,
 )
 
+from psrl.utils.rollout.overflow import PromptOverflowError, handle_prompt_overflow  # noqa: F401
+
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
@@ -41,6 +43,7 @@ class XmlFcModelConfig(LitellmTextbasedModelConfig):
     )
 
 
+@handle_prompt_overflow
 class XmlFcModel(LitellmTextbasedModel):
     """
     LitellmTextbasedModel subclass that parses SWE-agent-LM XML function calls.

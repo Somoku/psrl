@@ -3,6 +3,10 @@ set -e
 set -o pipefail
 trap 'echo "[ERROR] Failed at line $LINENO: $BASH_COMMAND" >&2; exit 1' ERR
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PSRL_PATH="$(dirname "$SCRIPT_DIR")"
+THIRD_PARTY_PATH="$PSRL_PATH/third_party"
+
 # Function: Install cuDNN and set CUDNN_PATH if not already installed or version is too low
 install_cudnn() {
     local required_version="9.8.0.87"
@@ -55,9 +59,18 @@ echo "Notice: TransformerEngine installation can take a long time, please be pat
 NVTE_FRAMEWORK=pytorch python -m pip install --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/TransformerEngine.git@v2.7
 
 echo "3. Install Megatron"
-python -m pip install --no-deps --no-cache-dir --no-build-isolation git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.15.0
+python -m pip install git+https://github.com/NVIDIA/Megatron-LM.git@c049020 --no-deps --no-build-isolation
 
-echo "4. Install mbridge"
-python -m pip install --no-cache-dir mbridge==v0.15.1
+echo "4. Install Megatron-Bridge"
+pushd $THIRD_PARTY_PATH
+git clone https://github.com/NVIDIA-NeMo/Megatron-Bridge.git
+cd Megatron-Bridge
+git checkout 94d1870
+# Comment out the local megatron-core source (we install Megatron-LM separately above)
+sed -i 's|^megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }|# megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }|' pyproject.toml
+python -m uv pip install -e .
+popd
+
+bash "$PSRL_PATH/patch/apply_patch.sh" megatron_bridge
 
 echo "Successfully installed all packages for Megatron"

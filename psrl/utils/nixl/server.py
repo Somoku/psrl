@@ -18,7 +18,6 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
 
 class NIXLMetaServer:
-
     def __init__(self, server_name: str, nixl_config: DictConfig, broadcast_init_enabled: bool = False):
         self.server_name = server_name
         self.server_ip = nixl_config.server_ip
@@ -197,7 +196,11 @@ class NIXLMetaServer:
 
         psrl_logger.info("Making communication plan...")
         start = time.time()
-        self.comm_plan = CommunicationPlanner().make_comm_plan(self.client_infos)
+        try:
+            self.comm_plan = CommunicationPlanner().make_comm_plan(self.client_infos)
+        except Exception as e:
+            psrl_logger.error(f"Failed to make communication plan: {e}")
+            raise e
         psrl_logger.info(f"Communication plan made after {time.time() - start} seconds.")
 
     def notify_all_client_shardings(self):
@@ -322,7 +325,7 @@ class NIXLMetaServer:
                         raise
             if time.time() - start > timeout:
                 raise TimeoutError("Timeout waiting for agents.")
-            time.sleep(0.1)
+            time.sleep(0.01)
 
         psrl_logger.info(
             f"{self.server_name}: Successfully received all {len(already_recved_agents)}/{expected_agents} "

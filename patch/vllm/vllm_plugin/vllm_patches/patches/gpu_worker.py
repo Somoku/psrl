@@ -4,6 +4,7 @@ from contextlib import AbstractContextManager, nullcontext
 
 import torch
 from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+from vllm.tracing import instrument
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu_worker import Worker
@@ -14,13 +15,13 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.18.1")
+@min_vllm_version("0.22.0")
 class TMSWorkerPatch(vLLMPatch[Worker]):
     """
     Replace cuMemAllocator with torch_memory_saver
     for better memory management.
 
-    Compatible with vLLM 0.18.1+
+    Compatible with vLLM 0.22.0+
     """
 
     def sleep(self, level: int = 1) -> None:
@@ -34,15 +35,10 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
             model = self.model_runner.model
             self._sleep_saved_buffers = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
 
-        if level == 1:
-            raise NotImplementedError(
-                "Level 1 sleep is not implemented for TMS because we always need to save kv cache."
-            )
-        else:
-            torch_memory_saver.pause("weights")
-            torch_memory_saver.pause("kv_cache")
-            if os.environ.get("PSRL_VLLM_PATCHES", "") == "TMS:GRAPH":
-                torch_memory_saver.pause("graph")
+        torch_memory_saver.pause("weights")
+        torch_memory_saver.pause("kv_cache")
+        if os.environ.get("PSRL_VLLM_PATCHES", "") == "TMS:GRAPH":
+            torch_memory_saver.pause("graph")
 
         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
@@ -71,15 +67,8 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
 
-        # If the KV cache has just been woken up,
-        # the internal state of cache_engine must be reset,
-        # especially the FP8 scaling factor.
-        if (
-            (tags is None or "kv_cache" in tags)
-            and self.cache_config.cache_dtype.startswith("fp8")
-            and hasattr(self.model_runner, "init_fp8_kv_scales")
-        ):
-            self.model_runner.init_fp8_kv_scales()
+        if tags is None or "kv_cache" in tags:
+            self.model_runner.post_kv_cache_wake_up()
 
         free_bytes_after_wake_up, total = torch.cuda.mem_get_info()
         increased_bytes = free_bytes_before_wake_up - free_bytes_after_wake_up
@@ -93,13 +82,18 @@ class TMSWorkerPatch(vLLMPatch[Worker]):
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
         """Get the memory pool context manager if sleep mode is enabled."""
-        if self.vllm_config.model_config.enable_sleep_mode:
-            from torch_memory_saver import torch_memory_saver
-
-            return torch_memory_saver.region(tag=tag)
-        else:
+        if not self.vllm_config.model_config.enable_sleep_mode:
             return nullcontext()
 
+        from torch_memory_saver import torch_memory_saver
+
+        enable_weights_cpu_backup = self.vllm_config.additional_config.get("enable_weights_cpu_backup", False)
+        return torch_memory_saver.region(
+            tag=tag,
+            enable_cpu_backup=enable_weights_cpu_backup,
+        )
+
+    @instrument(span_name="Allocate KV cache")
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 

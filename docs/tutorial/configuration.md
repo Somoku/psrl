@@ -20,21 +20,23 @@ groups via Hydra defaults:
 | Group | Config Key | Config Path | Description |
 |---|---|---|---|
 | `psrl` | `psrl` | `psrl/psrl.yaml` | PSRL-specific settings (staleness, deployment, routing) |
-| `actor` | `train_actor_rollout_ref.actor` | `actor/dp_actor.yaml` | Actor model training config |
-| `rollout` (train) | `train_actor_rollout_ref.rollout` | `rollout/rollout.yaml` | Rollout config used by training workers |
-| `rollout` (gen) | `gen_actor_rollout_ref.rollout` | `rollout/rollout.yaml` | Rollout config used by generation workers |
+| `model_engine` | Hydra selection | `dp` by default | Selects DP/FSDP-compatible or Megatron component groups |
+| `actor` | `train_actor_rollout_ref.actor` | inherited `${model_engine}_actor` group | Actor model training config |
+| `rollout` (train) | `train_actor_rollout_ref.rollout` | `rollout/psrl_rollout.yaml` | PSRL-extended validation/training-side rollout config |
+| `rollout` (gen) | `gen_actor_rollout_ref.rollout` | `rollout/psrl_rollout.yaml` | PSRL-extended generation-cluster rollout config |
 | `data` | `data` | `data/data.yaml` | Dataset and dataloader config |
 | `ref` | `train_actor_rollout_ref.ref` | `ref/dp_ref.yaml` | Reference model config |
 | `model` (train) | `train_actor_rollout_ref.model` | `model/hf_model.yaml` | HuggingFace model loading config (trainer) |
 | `model` (gen) | `gen_actor_rollout_ref.model` | `model/hf_model.yaml` | HuggingFace model loading config (gen worker) |
 | `critic` | `critic` | `critic/dp_critic.yaml` | Critic model config |
-| `reward_model` | `reward_model` | `reward_model/dp_reward_model.yaml` | Reward model config |
-| `reward_manager` | `reward_manager` | `reward_manager.yaml` | Rule-based reward function config |
+| `reward` | `reward` | `reward/reward.yaml` | Reward model and reward-manager config |
 | `algorithm` | `algorithm` | `algorithm/rollout_correction.yaml` | Algorithm hyperparameters (PPO/GRPO/DAPO) |
 | `trainer` | `trainer` | *(inline in ppo_trainer.yaml)* | Training loop settings (epochs, logging, checkpoints) |
+| `transfer_queue` | `transfer_queue` | *(inline in ppo_trainer.yaml)* | Sample storage and transport backend |
 
-For Megatron-LM training, use `ppo_megatron_trainer.yaml` instead, which
-selects Megatron-specific actor, critic, and model configs with TP/PP/CP/EP support.
+Several actor/model/ref/critic groups are supplied by the installed veRL package
+through Hydra's search path rather than duplicated in this repository. For
+Megatron-LM training, use `ppo_megatron_trainer.yaml`.
 
 ## veRL-Managed Configuration
 
@@ -66,8 +68,9 @@ categorized reference of all parameter groups.
 
 `colocate`
 : Whether to colocate rollout and training workers on the same nodes/GPUs. When `True`,
-  training and generation share the same GPU set, TMS is used to swap memory between
-  phases.
+  training and generation share the same GPU set. The current TransferQueue-based
+  training loop does **not** implement this path and raises `NotImplementedError`;
+  keep it `False`.
   **Default:** `False`
 
 `ps_manager_ip`
@@ -163,6 +166,16 @@ Resource allocation for training and rollout clusters.
   | `tensor_model_parallel_size_per_instance` | List of per-instance TP sizes |
   | `pipeline_model_parallel_size_per_instance` | List of per-instance PP sizes |
 
+`deployment.elastic_rm`
+: Policy-driven resource sharing between rollout and named generative reward-model
+  instances. Important sub-fields include `enable`, `shared_nnodes`,
+  `shared_ngpus_per_node`, policy thresholds (`theta_low`, `theta_max`,
+  `hysteresis`), command/monitor timeouts, minimum awake instances, and optional
+  throughput profile paths.
+
+  This subsystem is independent from `psrl.colocate`; it sleeps and wakes whole
+  inference instances through their coordinators.
+
 ### Colocate & Fuse Settings
 
 `colocate_validate_and_train`
@@ -200,6 +213,10 @@ and sync decisions.
 : File logging flush interval (ms).
   **Default:** `500`
 
+`status_collection.stats_recorder`
+: Periodically writes per-replica JSONL snapshots to `psrl.logging_path`.
+  `enable=True` and `interval_in_s=1.0` by default.
+
 ### Partial Rollout
 
 Allows generation to be interrupted and resumed, preventing long sequences from
@@ -211,8 +228,8 @@ blocking the training pipeline.
 
 `partial_rollout.interrupt_as_prompt`
 : If `True`, interrupted trajectories are treated as new prompts (the partial
-  generation becomes part of the next prompt). If `False`, they are retried from
-  scratch.
+  generation becomes part of the next prompt). If `False`, the SMG path keeps the
+  request active and continues it through partial-rollout routing loopback.
   **Default:** `False`
 
 ```{seealso}
@@ -256,9 +273,9 @@ Controls how generation requests are dispatched across rollout instances.
   - `request_num_balance`: route to the instance with fewest active requests
   - `throughput_optimal`: maximize global throughput using a cost model
   - `throughput_optimal_with_budget`: throughput-optimal with per-request token budget
-  - `kv_cache_aware`: route based on KV cache utilization and prefix overlap
+  - `cache_aware`: SMG event-driven, multi-tier prefix-cache-aware routing
 
-  **Default:** `request_num_balance`
+  **Default:** `round_robin`
 
 `routing_strategy.kv_transfer`
 : When re-routing a request to a different instance, optionally transfer its
@@ -305,9 +322,15 @@ Controls how generation requests are dispatched across rollout instances.
 
 `routing_strategy.kv_query_timeout_ms`
 : Timeout (ms) for querying KV cache info from each candidate instance in
-  `kv_cache_aware` mode. Instances that time out receive score 0 (graceful
-  degradation), does not affect correctness.
+  the legacy Ray router's query-based cache-aware mode. The SMG `cache_aware` path
+  primarily uses subscribed KV events and its tiered index.
   **Default:** `30000`
+
+:::{important}
+Use `routing_strategy.method=cache_aware` with the default SMG gateway. Older configs
+may use `kv_cache_aware`, but that string is not accepted by the current SMG Python
+binding and does not enable PSRL's vLLM KV-event publisher.
+:::
 
 `routing_strategy.check_interval_in_ms`
 : Polling interval for the routing loop (ms).
@@ -431,7 +454,7 @@ Megatron-LM training backend.
 `checkpoint.use_dcp_save`
 : Whether to use verl's default DCP (Distributed Checkpointing) for save/load.
 
-  - **`False` (default)**: Use PSRL's per-rank `torch.save` (saves `rank_N.pt` +
+  - **`False`**: Use PSRL's per-rank `torch.save` (saves `rank_N.pt` +
     `parallel_config.json` per rank). This path is UCX-safe: it avoids DCP's
     `FullyParallelSaveStrategyWrapper` which calls `all_gather_object` on all shard
     metadata, causing a large temporary allocation that can corrupt NIXL's UCX
@@ -439,7 +462,7 @@ Megatron-LM training backend.
     `addr_version assertion` SIGABRT). The NIXL background UCX progress thread
     (`enable_prog_thread`) is kept **enabled** in this mode.
 
-  - **`True`**: Use verl's DCP path. Two patches are applied automatically:
+  - **`True` (default)**: Use verl's DCP path. Two patches are applied automatically:
     1. **NCCL no-fork patch**: DCP's async writer normally forks child processes
        that inherit NCCL communicators; when the child exits, `ncclCommAbort`
        corrupts the parent's NCCL state → 600-second timeout → SIGABRT. The patch
@@ -448,7 +471,7 @@ Megatron-LM training backend.
        NIXL agent to prevent the UCX background thread from racing with DCP's
        `all_gather_object` memory activity.
 
-  **Default:** `False`
+  **Default:** `True`
 
 ### LMCache
 
@@ -580,15 +603,6 @@ Settings for multi-turn agent training loops (tool-use, code generation, SWE-age
   Improves prefix-cache hit rate for multi-turn conversations.
   **Default:** `False`
 
-`agentic_rl.trajectory_output.enable`
-: Write per-trajectory `.txt` files to disk for debugging and analysis.
-  **Default:** `True`
-
-`agentic_rl.trajectory_output.dir`
-: Output directory for trajectory files. When empty, defaults to
-  `${psrl.logging_path}/trajectories`.
-  **Default:** `""` (auto)
-
 `agentic_rl.manager_retry_on_error`
 : On rollout errors, retry via the manager instead of crashing the worker. On
   validation failure, manager shrinks `val_buffer_size` so the waiter is unblocked.
@@ -660,6 +674,70 @@ serving agent loops from non-PSRL clients).
 : Max concurrent HTTP connections per rollout server.
   **Default:** `64`
 
+### Rollout Gateway (SMG)
+
+The rollout gateway is the default online request path. A Ray `RolloutGateway` actor
+starts SMG and SessionRouter subprocesses; rollout replicas register as gRPC workers.
+
+`rollout_gateway.enable`
+: Enable the SMG rollout gateway. Disable only to use the legacy Ray
+  `RolloutRouter`.
+  **Default:** `True`
+
+`rollout_gateway.server_max_concurrency`
+: Maximum HTTP generation concurrency per active rollout server. The shared client
+  budget is this value multiplied by active rollout and colocated validation
+  instances.
+  **Default:** `256`
+
+`rollout_gateway.use_distributed_post`
+: Route AgentLoopWorker POST requests through a round-robin Ray actor pool to spread
+  HTTP client work across nodes.
+  **Default:** `False`
+
+`rollout_gateway.post_actor_num_per_node`
+: Number of distributed POST actors placed on each alive Ray node when the pool is
+  enabled.
+  **Default:** `8`
+
+SMG always uses `worker_selection_strategy=psrl`, gRPC worker connections, the
+routing loop, and TITO on this path. See {doc}`../design/router_tito`.
+
+### TransferQueue
+
+TransferQueue configuration is a top-level block in `ppo_trainer.yaml`, not under
+`psrl`.
+
+`transfer_queue.enable`
+: Runtime integration flag. `main_ppo.py` enables it for the current PSRL training
+  flow.
+  **Default in YAML:** `False`
+
+`transfer_queue.controller.sampler`
+: Metadata sampling strategy.
+  **Default:** `SequentialSampler`
+
+`transfer_queue.controller.polling_mode`
+: Enable polling-mode controller behavior.
+  **Default:** `False`
+
+`transfer_queue.backend.storage_backend`
+: Storage implementation: `SimpleStorage` or experimental `MooncakeStore`.
+  **Default:** `SimpleStorage`
+
+`transfer_queue.backend.SimpleStorage.total_storage_size`
+: Maximum number of experience samples across storage units.
+  **Default:** `100000`
+
+`transfer_queue.backend.SimpleStorage.num_data_storage_units`
+: Distributed storage-unit count. Use at least twice the node count for larger
+  deployments.
+  **Default:** `8`
+
+`transfer_queue.backend.MooncakeStore.*`
+: Experimental Mooncake metadata/master addresses, local host, TCP/RDMA protocol,
+  memory sizes, and NIC selection. See {doc}`../design/transfer_queue`.
+
 ### Memory Logger
 
 `memory_logger.enable`
@@ -681,7 +759,8 @@ python -m psrl.trainer.main_ppo \
     +psrl.staleness=3 \
     psrl.routing_strategy.method=throughput_optimal \
     psrl.deployment.n_rollout_instances=4 \
-    psrl.lmcache.enable=True
+    psrl.lmcache.enable=True \
+    transfer_queue.backend.storage_backend=SimpleStorage
 ```
 
 Key syntax rules:
@@ -733,4 +812,6 @@ python -m psrl.trainer.main_ppo \
 - {doc}`../design/staleness_control`: Staleness control design
 - {doc}`../design/flexible_rollout`: Routing and rollout coordination
 - {doc}`../design/kv_cache`: KV cache management
+- {doc}`../design/router_tito`: SMG, SessionRouter, and TITO
+- {doc}`../design/transfer_queue`: sample data plane
 ```

@@ -4,8 +4,7 @@ import os
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash, make_block_hash_with_group_id
-from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -16,7 +15,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-class RolloutScheduler(Scheduler):
+class RolloutScheduler(AsyncScheduler):
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -37,89 +36,16 @@ class RolloutScheduler(Scheduler):
         connector_stats_payload = kv_connector_stats.data if kv_connector_stats else None
         req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
         req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
-        # Snapshot the GPU prefix cache hash table for push-based KV cache info.
-        # This is sent to the main process via SchedulerStats IPC, then consumed
-        # by StatCollector.record() and pushed to GenWorker's KVCacheManager.
-        block_pool = self.kv_cache_manager.block_pool
-        gpu_prefix_cache_snapshot = {
-            "hash_set": set(block_pool.cached_block_hash_to_block._cache.keys()),
-            "block_size": block_pool.hash_block_size,
-            "total_blocks": block_pool.num_gpu_blocks,
-        }
-        # Snapshot the LMCache backend chunk hash set for push-based cache info.
-        # For TP=1 (UniProcExecutor), the Worker and EngineCore share the same
-        # process, so get_kv_transfer_group() returns the active LMCache connector.
-        lmcache_backend_snapshot = None
-        try:
-            from vllm.distributed.kv_transfer import has_kv_transfer_group, get_kv_transfer_group
-            if has_kv_transfer_group():
-                connector = get_kv_transfer_group()
-                if hasattr(connector, "_lmcache_engine") and connector._lmcache_engine is not None:
-                    lmcache_engine = connector._lmcache_engine.lmcache_engine
-                    if lmcache_engine is not None:
-                        backend = lmcache_engine.storage_manager.local_cpu_backend
-                        hot_cache = backend.hot_cache
-                        chunk_size = getattr(lmcache_engine.token_database, "chunk_size", 256)
-                        # Snapshot: set of chunk_hash integers from all cached keys.
-                        # Must hold cpu_lock to avoid OrderedDict mutation during iteration.
-                        chunk_hash_set = set()
-                        with backend.cpu_lock:
-                            for key in hot_cache.keys():
-                                chunk_hash_set.add(key.chunk_hash)
-                        # Metadata for local query.
-                        allocator = backend.memory_allocator
-                        total_bytes = int(getattr(allocator, "total_size", 0))
-                        try:
-                            chunk_bytes = backend.get_full_chunk_size_bytes()
-                        except Exception:
-                            chunk_bytes = 0
-                        lmcache_backend_snapshot = {
-                            "chunk_hash_set": chunk_hash_set,
-                            "chunk_size": chunk_size,
-                            "total_bytes": total_bytes,
-                            "chunk_bytes": chunk_bytes,
-                        }
-                        # Include NONE_HASH and hash_algo for GenWorker local computation.
-                        # NOTE: hash_fn (function object) is NOT serializable through
-                        # zmq/msgspec, so we pass the algorithm name and none_hash value.
-                        from lmcache.v1.token_database import NONE_HASH as _LM_NONE_HASH
-                        lmcache_backend_snapshot["none_hash"] = _LM_NONE_HASH
-                        # Pass the hash algorithm name so GenWorker loads the SAME function.
-                        # LMCache uses config.pre_caching_hash_algorithm (default: "builtin"),
-                        # which may differ from vLLM's prefix_caching_hash_algo (default: "sha256").
-                        lmcache_backend_snapshot["hash_algo"] = getattr(
-                            lmcache_engine.token_database, "_hash_algo_name",
-                            getattr(lmcache_engine.token_database.config, "pre_caching_hash_algorithm", "builtin")
-                            if lmcache_engine.token_database.config is not None else "builtin"
-                        )
-                        # Hash consistency probe: GenWorker uses this to verify cross-process
-                        # hash() determinism. If mismatch → PYTHONHASHSEED not set properly.
-                        _hash_fn = lmcache_engine.token_database.hash_func
-                        lmcache_backend_snapshot["hash_probe"] = _hash_fn(
-                            (_LM_NONE_HASH, (0, 1, 2, 3), ())
-                        )
-        except Exception as exc:
-            # Non-fatal: if snapshot fails, router falls back to collective_rpc.
-            import logging as _logging
-            _logging.getLogger(__name__).warning(
-                "LMCache backend snapshot failed: %r", exc, exc_info=True
-            )
         # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
-        # 1. `need_to_abort_reqs` field. This is a set of request IDs that need to be aborted.
-        # 2. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
-        # 3. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
-        # 4. `gpu_prefix_cache_snapshot` field. Push-based GPU prefix cache hash snapshot.
-        # 5. `lmcache_backend_snapshot` field. Push-based LMCache backend chunk hash snapshot.
+        # 1. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
+        # 2. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
         return SchedulerStats(
-            need_to_abort_reqs=self.need_to_abort_reqs,
             req_id_to_prompt_token_num=req_id_to_prompt_token_num,
             req_id_to_response_token_num=req_id_to_response_token_num,
-            gpu_prefix_cache_snapshot=gpu_prefix_cache_snapshot,
-            lmcache_backend_snapshot=lmcache_backend_snapshot,
             num_running_reqs=len(self.running),
-            num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
+            num_waiting_reqs=len(self.waiting),
+            num_skipped_waiting_reqs=len(self.skipped_waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
-            encoder_cache_usage=self._get_encoder_cache_usage(),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
@@ -136,10 +62,9 @@ class RolloutScheduler(Scheduler):
     # mutated from a single process.  `KVCacheManager` in the PSRL coordinator calls
     # these via `engine_core.call_utility_async("psrl_pin_gpu/psrl_unpin_gpu", tokens)`.
     #
-    # NOTE(lhy): GPU prefix cache *read* queries (hit counts for routing) no longer
-    # go through call_utility_async — they use the push-based hash snapshot in
-    # KVCacheManager.get_gpu_cache_info_local(). Only pin/unpin (which mutate
-    # block_pool ref_cnt) still require EngineCore RPC.
+    # NOTE(lhy): GPU prefix cache hit counts for routing are owned by SMG's
+    # event-driven cache-aware indexer. Only pin/unpin (which mutate block_pool
+    # ref_cnt) still require EngineCore RPC.
 
     def _psrl_get_caching_hash_fn(self):
         """
@@ -223,8 +148,7 @@ class RolloutScheduler(Scheduler):
                     f"Block {block.block_id} ref_cnt is {block.ref_cnt} after touch(). Expected > 0."
                 )
         psrl_logger.debug(
-            f"[LMCache] GPU pin (scheduler): {pinned} blocks pinned for token sequence "
-            f"of length {len(tokens)}."
+            f"[LMCache] GPU pin (scheduler): {pinned} blocks pinned for token sequence of length {len(tokens)}."
         )
         return pinned
 
@@ -257,16 +181,11 @@ class RolloutScheduler(Scheduler):
                 self._psrl_pinned_block_ids.discard(block.block_id)
                 freed += 1
         psrl_logger.debug(
-            f"[LMCache] GPU unpin (scheduler): {freed} blocks released for token sequence "
-            f"of length {len(tokens)}."
+            f"[LMCache] GPU unpin (scheduler): {freed} blocks released for token sequence of length {len(tokens)}."
         )
         return freed
 
-    def _preempt_request(
-        self,
-        request: Request,
-        timestamp: float,
-    ) -> None:
+    def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
 
         NOTE: The request should be popped from the running queue outside of this
@@ -299,28 +218,10 @@ class RolloutScheduler(Scheduler):
         # `_output_token_ids` is not cleared on preemption.
         request._psrl_cycle_output_token_baseline = request.num_output_tokens
 
-        # NOTE(lhy): We examine the number of waiting requests to
-        # determine whether to abort the preempted request.
-        # Once aborted, the preempted request will be put back to
-        # the rollout router to be scheduled again.
-        max_num_waiting_reqs_after_preemption = self.vllm_config.additional_config.get(
-            "max_num_waiting_reqs_after_preemption", 0
-        )
-        if len(self.waiting) > max_num_waiting_reqs_after_preemption:
-            # NOTE(lhy): the `need_to_abort_reqs` is set and put
-            # into the scheduler stats. Afterwards inside vllm
-            # rollout, the abortion will be performed.
-            print(
-                f"Preempted request {request.request_id} is "
-                f"aborted because of "
-                f"max_num_waiting_reqs_after_preemption is "
-                f"{max_num_waiting_reqs_after_preemption}"
-            )
-            self.need_to_abort_reqs.append(request.request_id)
-
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
-
-    def schedule(self) -> SchedulerOutput:
-        self.need_to_abort_reqs: list[str] = list()
-        return super().schedule()
+        # Notify external gateway if threshold is configured and waiting queue
+        # is already congested — local re-queuing would only worsen the load.
+        threshold = self.scheduler_config.preemption_notification_threshold
+        if self.log_stats and threshold is not None and len(self.waiting) > threshold:
+            self.preemption_req_ids.append(request.request_id)

@@ -1,12 +1,26 @@
 import enum
 from dataclasses import dataclass
+from functools import wraps
 
 import numpy as np
 
 from psrl.utils.logger import get_ps_logger
+from psrl.workers.gen.utils import RolloutInstanceId
 
 # Use the unified PS logger
 psrl_logger = get_ps_logger()
+
+
+def _state_locked(func):
+    """Protect request metadata maps shared across Ray actor and gRPC threads."""
+
+    @wraps(func)
+    def _wrapped(self, *args, **kwargs):
+        lock = self._state_lock
+        with lock:
+            return func(self, *args, **kwargs)
+
+    return _wrapped
 
 
 class EntryCategory(enum.Enum):
@@ -31,18 +45,20 @@ class EntryInfo:
     including the rollout instance ID, request ID, and model version.
 
     Args:
-        rollout_instance_id (Union[int, List[int]]): The ID(s) of the rollout instance this entry belongs to.
+        rollout_instance_id (RolloutInstanceId | list[RolloutInstanceId]):
+            The ID(s) of the rollout instance this entry belongs to.
         prompt_id (int): The global unique prompt ID.
-        request_idx (Union[int, List[int]]): The relative request ID(s) inside a group.
-        model_version (Union[int, List[int]]): The model version(s) when generating this entry.
+        request_idx (int | list[int]): The relative request ID(s) inside a group.
+        model_version (int | list[int]): The model version(s) when generating this entry.
     """
 
-    rollout_instance_id: int | list[int]
+    rollout_instance_id: RolloutInstanceId | list[RolloutInstanceId]
     prompt_id: int
     # The model version when generating this entry, which should be within staleness control
     # (i.e., higher than the final occupied buffer ID minus the staleness limit)
     request_idx: int | list[int]
     model_version: int | list[int]
+    n_trajectory: int | list[int]
     is_validate: bool = False
 
     def __hash__(self):
@@ -73,6 +89,19 @@ class EntryInfo:
             return self.model_version
 
 
+def _is_scalar_request_idx(request_idx) -> bool:
+    """Return True when *request_idx* is a single integer index, not a group list."""
+    return isinstance(request_idx, (int, np.integer)) and not isinstance(request_idx, bool)
+
+
+def _assert_scalar_request_idx(request_idx) -> None:
+    if not _is_scalar_request_idx(request_idx):
+        raise AssertionError(
+            "Request idx must be a list or a scalar integer, "
+            f"got {request_idx!r} (type={type(request_idx).__name__})"
+        )
+
+
 @dataclass
 class Entry:
     """
@@ -83,7 +112,6 @@ class Entry:
 
     Args:
         category (EntryCategory): The category of the entry (EMPTY, RESERVED, OCCUPIED).
-        data (Optional[DataProto]): The data associated with the entry.
         entry_info (Optional[EntryInfo]): The metadata of the entry.
     """
 
@@ -324,7 +352,7 @@ class StalenessInventory:
 
         buffer = StalenessBuffer(self.num_entries, self.ready_num_entries, self.staleness)
         self.buffers[buffer_id] = buffer
-        psrl_logger.debug(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
+        psrl_logger.info(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
         self._update_buffer_status(buffer_id)
         self.buffer_id += 1
 
@@ -602,9 +630,14 @@ class StalenessInventory:
             if not isinstance(tracked_entry_info.request_idx, list):
                 tracked_entry_info.request_idx = [tracked_entry_info.request_idx]
             entry_request_idx = entry_info.request_idx
-            assert entry_request_idx not in tracked_entry_info.request_idx, (
-                f"Entry info {entry_info} already reserved in (buffer {buffer_id}, entry {entry_id})"
-            )
+            if entry_request_idx in tracked_entry_info.request_idx:
+                # Idempotent: this request_idx is already reserved (e.g. due to RolloutGateway retry).
+                # Return the existing reservation instead of asserting.
+                psrl_logger.warning(
+                    f"Entry info {entry_info} is already reserved in (buffer {buffer_id}, entry {entry_id}). "
+                    f"Returning existing reservation (idempotent)."
+                )
+                return buffer_id, entry_id
             tracked_entry_info.request_idx.append(entry_request_idx)
 
             # Update model version
@@ -631,6 +664,18 @@ class StalenessInventory:
             elif isinstance(tracked_entry_info.rollout_instance_id, list):
                 tracked_entry_info.rollout_instance_id.append(entry_info.rollout_instance_id)
 
+            # Update trajectory num
+            if (
+                not isinstance(tracked_entry_info.n_trajectory, list)
+                and tracked_entry_info.n_trajectory != entry_info.n_trajectory
+            ):
+                tracked_entry_info.n_trajectory = [tracked_entry_info.n_trajectory] * (
+                    len(tracked_entry_info.request_idx) - 1
+                )
+                tracked_entry_info.n_trajectory.append(entry_info.n_trajectory)
+            elif isinstance(tracked_entry_info.n_trajectory, list):
+                tracked_entry_info.n_trajectory.append(entry_info.n_trajectory)
+
             self.buffers[buffer_id].entries[entry_id].entry_info = tracked_entry_info
             return buffer_id, entry_id
 
@@ -644,14 +689,12 @@ class StalenessInventory:
         # Get all PENDING buffers within the staleness limit
         pending_buffers = self.get_buffers_with_capacity()
         if not max_staleness_buffer_id:
-            # Validation
             assert len(pending_buffers) == 1, (
                 f"Only one PENDING buffer should exist when max_staleness_buffer_id is None, "
                 f"but got {pending_buffers}, and current buffers are {self.buffers.keys()}."
             )
             candidate_ids = list(pending_buffers)
         else:
-            # Training
             candidate_ids = [
                 bid
                 for bid in pending_buffers
@@ -719,9 +762,7 @@ class StalenessInventory:
                 entry_info_to_update.model_version = [entry_info_to_update.model_version] * request_num
                 entry_info_to_update.model_version[request_idx_in_list] = new_version_tag
             else:
-                assert isinstance(entry_info_to_update.request_idx, np.int64), (
-                    "Request idx must be a list or an np.int64"
-                )
+                _assert_scalar_request_idx(entry_info_to_update.request_idx)
                 entry_info_to_update.model_version = new_version_tag
 
         psrl_logger.debug(
@@ -733,14 +774,14 @@ class StalenessInventory:
     def update_request_instance_id(
         self,
         request_id: int,
-        new_instance_id: int,
+        new_instance_id: RolloutInstanceId,
     ):
         """
         Update the instance id of a specific request in the data tracker and buffer.
 
         Args:
             request_id (int): The global unique request ID to update.
-            new_instance_id (int): The new instance id to set.
+            new_instance_id (RolloutInstanceId): The new instance id to set.
         Raises:
             AssertionError: If the request ID is not found or the new instance id is out of bounds.
         """
@@ -762,15 +803,54 @@ class StalenessInventory:
                 entry_info_to_update.rollout_instance_id = [entry_info_to_update.rollout_instance_id] * request_num
                 entry_info_to_update.rollout_instance_id[request_idx_in_list] = new_instance_id
             else:
-                assert isinstance(entry_info_to_update.request_idx, np.int64), (
-                    "Request idx must be a list or an np.int64"
-                )
+                _assert_scalar_request_idx(entry_info_to_update.request_idx)
                 entry_info_to_update.rollout_instance_id = new_instance_id
 
         psrl_logger.debug(
             f"[Entry Update]: request idx {request_idx} entry in "
             f"(buffer {buffer_id}, entry {entry_id}) is updated to {entry_info_to_update} "
             f"(instance id is updated to {new_instance_id})"
+        )
+
+    def update_request_n_trajectory(
+        self,
+        request_id: int,
+        new_n_trajectory: int,
+    ):
+        """
+        Update the number of trajectories for a specific request in the data tracker and buffer.
+
+        Args:
+            request_id (int): The global unique request ID to update.
+            n_trajectory (int): The new number of trajectories to set.
+        Raises:
+            AssertionError: If the request ID is not found or the new number of trajectories is invalid.
+        """
+        prompt_id = request_id // self.rollout_n
+        request_idx = request_id % self.rollout_n
+        if prompt_id not in self.data_tracker:
+            raise AssertionError(f"Prompt ID {prompt_id} not found in data tracker")
+
+        buffer_id, entry_id = self.data_tracker[prompt_id]
+        entry_info_to_update = self.buffers[buffer_id].entries[entry_id].entry_info
+
+        if isinstance(entry_info_to_update.n_trajectory, list):
+            request_idx_in_list = entry_info_to_update.request_idx.index(request_idx)
+            entry_info_to_update.n_trajectory[request_idx_in_list] = new_n_trajectory
+        elif entry_info_to_update.n_trajectory != new_n_trajectory:
+            if isinstance(entry_info_to_update.request_idx, list):
+                request_num = len(entry_info_to_update.request_idx)
+                request_idx_in_list = entry_info_to_update.request_idx.index(request_idx)
+                entry_info_to_update.n_trajectory = [entry_info_to_update.n_trajectory] * request_num
+                entry_info_to_update.n_trajectory[request_idx_in_list] = new_n_trajectory
+            else:
+                _assert_scalar_request_idx(entry_info_to_update.request_idx)
+                entry_info_to_update.n_trajectory = new_n_trajectory
+
+        psrl_logger.debug(
+            f"[Entry Update]: request idx {request_idx} entry in "
+            f"(buffer {buffer_id}, entry {entry_id}) is updated to {entry_info_to_update} "
+            f"(n_trajectory is updated to {new_n_trajectory})"
         )
 
     def clear_buffer(
@@ -798,8 +878,8 @@ class StalenessInventory:
         """
         Move occupied entries to a specific buffer.
 
-        During moving, clear the occupied entries from the
-        current buffer and re-occupy them in the earliest available buffer.
+        During moving, clear the occupied entries from the current buffer
+        and re-occupy them in the earliest available buffer.
         NOTE(lhy): The buffer id is not used for moving, but only for assertion.
 
         Args:
@@ -811,7 +891,7 @@ class StalenessInventory:
         prompt_ids = [entry_info.prompt_id for entry_info in entry_infos]
         self.clear_occupied_entries(prompt_ids)
         for entry_info in entry_infos:
-            occupied_buffer_id, occupied_entry_id, occupy_num = self.occupy_data_without_reserve(entry_info)
+            occupied_buffer_id, _, _ = self.occupy_data_without_reserve(entry_info)
             assert occupied_buffer_id == buffer_id, (
                 f"Occupied buffer ID {occupied_buffer_id} must be the same as the target buffer ID {buffer_id}"
             )
@@ -1072,8 +1152,7 @@ class StalenessInventory:
         Move data to the first non-occupied entry in an appropriate buffer, occupying it.
 
         Args:
-            entry_info (EntryInfo): The entry metadata to occupy.
-            data (Optional[DataProto]): The data to occupy with. If None, will use data from data_pool.
+            prompt_id (int): The prompt ID to occupy.
         Returns:
             Tuple[Optional[int], Optional[int], Optional[int]]:
                 The buffer ID, entry ID, and occupy number after occupying,
@@ -1085,6 +1164,7 @@ class StalenessInventory:
 
         old_buffer_id, old_entry_id = self.data_tracker[prompt_id]
         entry_info = self.buffers[old_buffer_id].entries[old_entry_id].entry_info
+        # psrl_logger.info(f"Entry Info of {prompt_id} ({old_buffer_id}, {old_entry_id}) is {entry_info}, with {self.buffers[old_buffer_id].entries[old_entry_id].category}")  # noqa: E501
 
         model_version = entry_info.get_entry_version()
         if self.is_validate:
@@ -1113,7 +1193,6 @@ class StalenessInventory:
         # Clean up old entry (may cause entry movement)
         self.clear_reserved_entries(prompt_id, move_across_buffer=(not self.is_validate))
 
-        # ---------------------------------- No redundant rollout ----------------------------------
         if old_entry_id < self.buffers[old_buffer_id].ready_num_entries:
             # It is not a redundant rollout
             # Get all PENDING buffers within the staleness limit
@@ -1163,7 +1242,6 @@ class StalenessInventory:
             # need to check
             return buffer_id, entry_id, occupy_num
 
-        # ---------------------------------- Redundant rollout ----------------------------------
         else:
             # It is a redundant rollout but not aborted
             # Meaning it may be occupied in a buffer id that is larger than the originally reserved one

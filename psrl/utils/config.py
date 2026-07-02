@@ -208,7 +208,6 @@ def validate_config(
             "psrl.ps_mode must be nixl_cpu or nixl_gpu when psrl.lmcache.enable_p2p is True "
             "(NIXL infrastructure is required for P2P transfer)."
         )
-        '''
         assert not lmcache_cfg.get("clear_on_weight_update", True), (
             "psrl.lmcache.clear_on_weight_update must be False when psrl.lmcache.enable_p2p is True "
             "(LMCache P2PBackend does not support clear; stale entries cannot be flushed on weight update)."
@@ -217,7 +216,6 @@ def validate_config(
             "psrl.lmcache.multi_version_kv must be True when psrl.lmcache.enable_p2p is True "
             "(version tagging is required because P2P KV cannot be cleared on weight sync)."
         )
-        '''
 
     if lmcache_cfg.get("enable", False):
         assert config.gen_actor_rollout_ref.rollout.enable_prefix_caching, (

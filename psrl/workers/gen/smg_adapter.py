@@ -173,6 +173,7 @@ def build_worker_registration_payload(
     pp_size: int,
     kv_block_size: int | None = None,
     lmcache_instance_id: str | None = None,
+    worker_id: str | None = None,
 ) -> dict[str, Any]:
     labels = {
         "max_model_len": str(max_model_len),
@@ -191,7 +192,7 @@ def build_worker_registration_payload(
     # at registration time.
     if lmcache_instance_id:
         labels["lmcache_instance_id"] = lmcache_instance_id
-    return {
+    payload = {
         "url": url,
         "worker_type": "regular",
         "connection_mode": "grpc",
@@ -199,6 +200,12 @@ def build_worker_registration_payload(
         "models": [{"id": model_id}],
         "labels": labels,
     }
+    # A stable, human-readable worker id (e.g. the rollout replica index) keeps
+    # SMG's route_trace `instance=...` aligned with the local stats files
+    # (`stats_r{replica_idx}_dp{dp_rank}.jsonl`) instead of an opaque UUID.
+    if worker_id is not None:
+        payload["id"] = worker_id
+    return payload
 
 
 def build_pause_resume_payload(instance_ids: list[Any]) -> list[dict[str, Any]]:

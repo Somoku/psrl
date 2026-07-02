@@ -41,7 +41,7 @@ async def mock_chat(request: Request):
     return FastAPIResponse(
         content=response_body,
         media_type="application/json",
-        headers={"x-base-worker-id": "worker-a", "x-target-dp-rank": "2"},
+        headers={"x-base-worker-id": "worker-a", "x-target-dp-rank": "2", "x-version-tag": "3"},
     )
 
 
@@ -161,3 +161,22 @@ async def test_chat_completions_pins_worker_for_session(client):
     resp = await client.get("/sessions/sid-sticky")
     assert resp.headers["x-base-worker-id"] == "worker-a"
     assert resp.headers["x-target-dp-rank"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_chat_completions_pins_version_tag_for_session(client):
+    payload = {"model": "m", "messages": []}
+    # First turn arrives unversioned; SMG echoes the pinned version in the
+    # response headers, which the SessionRouter records on the session.
+    await client.post(
+        "/sessions/sid-ver/v1/chat/completions",
+        json=payload,
+        headers={"x-version-tag": "-1"},
+    )
+    # Second turn should carry the pinned version instead of the original -1.
+    await client.post(
+        "/sessions/sid-ver/v1/chat/completions",
+        json=payload,
+        headers={"x-version-tag": "-1"},
+    )
+    assert captured["chat_headers"]["x-version-tag"] == "3"

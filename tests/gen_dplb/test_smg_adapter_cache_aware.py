@@ -6,6 +6,7 @@ from psrl.workers.gen.smg_adapter import (
     CACHE_AWARE_METHODS,
     _cache_aware_cfg,
     build_rollout_router_args,
+    build_worker_registration_payload,
     is_cache_aware_method,
 )
 
@@ -126,6 +127,33 @@ def test_build_rollout_router_args_cache_aware_v1():
     )
     router_args = build_rollout_router_args(config, "127.0.0.1", 30000, "127.0.0.1:8000")
     assert router_args.policy == "cache_aware_v1"
+
+
+@pytest.mark.unit
+def test_worker_registration_payload_includes_worker_id():
+    payload = build_worker_registration_payload(
+        url="grpc://127.0.0.1:30000",
+        model_id="my-model",
+        max_model_len=4096,
+        dp_size=1,
+        tp_size=1,
+        pp_size=1,
+        worker_id="2",
+    )
+    assert payload["id"] == "2"
+
+
+@pytest.mark.unit
+def test_worker_registration_payload_omits_worker_id_when_absent():
+    payload = build_worker_registration_payload(
+        url="grpc://127.0.0.1:30000",
+        model_id="my-model",
+        max_model_len=4096,
+        dp_size=1,
+        tp_size=1,
+        pp_size=1,
+    )
+    assert "id" not in payload
 
 
 @pytest.mark.unit

@@ -34,6 +34,10 @@ class SessionState:
     trajectory_turns: dict[int, int] = field(default_factory=dict)
     base_worker_id: str | None = None
     target_dp_rank: str | None = None
+    # Version tag pinned by SMG on the first routed turn. Once set (non-`-1`),
+    # it is carried into every subsequent turn so re-routes filter on a version
+    # at least as fresh as the instance that first served this trajectory.
+    version_tag: str | None = None
 
     def __post_init__(self) -> None:
         if self.inflight == 0:
@@ -130,6 +134,7 @@ class SessionRouter:
             session_headers = state.headers
             base_worker_id = state.base_worker_id
             target_dp_rank = state.target_dp_rank
+            version_tag = state.version_tag
             state.inflight += 1
             state.drained.clear()
 
@@ -138,6 +143,8 @@ class SessionRouter:
             headers["x-base-worker-id"] = base_worker_id
         if target_dp_rank is not None:
             headers["x-target-dp-rank"] = target_dp_rank
+        if version_tag is not None:
+            headers["x-version-tag"] = version_tag
         result: HttpResponse | None = None
         try:
             result = await self._request_upstream(
@@ -159,6 +166,9 @@ class SessionRouter:
                     if base_worker_id is not None and target_dp_rank is not None:
                         state.base_worker_id = base_worker_id
                         state.target_dp_rank = target_dp_rank
+                    version_tag = result.headers.get("x-version-tag")
+                    if version_tag is not None:
+                        state.version_tag = version_tag
 
                     # Check for out-of-order response arrival
                     current_turn = state.get_trajectory_turn(trajectory_id)

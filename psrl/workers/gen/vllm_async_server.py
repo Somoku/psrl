@@ -904,6 +904,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             tp_size=self.config.tensor_model_parallel_size,
             pp_size=self.config.pipeline_model_parallel_size,
             lmcache_instance_id=lmcache_instance_id,
+            worker_id=str(self.get_replica_idx()),
         )
 
         try:

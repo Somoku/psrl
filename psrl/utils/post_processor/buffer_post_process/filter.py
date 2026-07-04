@@ -47,9 +47,9 @@ class DynamicSamplingFilterProcessor(BaseBufferPostProcessor):
         """
         super().__init__(config)
 
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n

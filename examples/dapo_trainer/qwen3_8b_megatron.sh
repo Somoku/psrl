@@ -142,14 +142,14 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     train_actor_rollout_ref.actor.megatron.use_dist_checkpointing=True \
     train_actor_rollout_ref.actor.megatron.dist_checkpointing_path=$DIST_CKPT_PATH \
     \
-    psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sticky=False \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
+    psrl.rollout_coordination.routing_strategy.method="request_num_balance" \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
+    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
+    psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
-    psrl.sync_and_mig_strategy.method="greedy" \
+    psrl.rollout_coordination.sync_and_mig_strategy.method="greedy" \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.rollout_coordination.partial_rollout.enable=True \
     \
     psrl.colocate_validate_and_train=True \
     \

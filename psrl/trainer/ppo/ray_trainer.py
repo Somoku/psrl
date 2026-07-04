@@ -87,7 +87,7 @@ from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.config.reward_model import resolve_active_managers
-from psrl.workers.gen.rollout_coordinator import RolloutCoordinator
+from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway
 from psrl.workers.gen.smg_adapter import build_pause_resume_payload
 from psrl.workers.gen.vllm_async_server import GenInterface, PSRL_vLLMReplica
@@ -340,10 +340,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
 
         self._initialize_queue_buffers()
-        if self.config.psrl.redundant_rollout.enable:
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
             self.max_concurrency = (
-                self.config.psrl.redundant_rollout.redundant_rollout_n
-                * self.config.psrl.redundant_rollout.redundant_global_batch_size
+                self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+                * self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
                 * (self.config.psrl.staleness + 1)
             )
         else:
@@ -404,9 +404,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
 
     def _initialize_queue_buffers(self):
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
@@ -601,6 +601,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self.config,
                 self.ps_manager_handle,
                 self.rollout_gateway_url if self.config.psrl.rollout_gateway.enable else self.rollout_router,
+                self.session_router_url,
             )
         )
 

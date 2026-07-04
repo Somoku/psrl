@@ -61,7 +61,7 @@ class SessionAgentLoop(AgentLoopBase):
             "x-prompt-id": str(request.get("parent_id", request_id)),
             "x-version-tag": str(request.get("version_tag", 0)),
             "x-is-validate": str(request.get("validate", False)).lower(),
-            "x-is-sticky": str(bool(self.config.psrl.routing_strategy.enable_trajectory_sticky)).lower(),
+            "x-is-sticky": str(bool(self.config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky)).lower(),
             "x-smg-tito-trajectory-id": str(request.get("trajectory_id", 0)),
         }
         rollout_instance_id = request.get("rollout_instance_id")

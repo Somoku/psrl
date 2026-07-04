@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 staleness=${1:-1}
-project_name=psrl_swe_gym_perf
+project_name=psrl_swe_gym_low_gpu_perf
 experiment_name=kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
@@ -118,7 +118,7 @@ clip_ratio_high=0.28
 # which is sufficient for most resolvable instances.
 max_turns=30
 max_prompt_length=2048
-max_response_length=8192
+max_response_length=30000
 packing_length=$((max_prompt_length + max_response_length))
 
 # --- Training hyperparameters ---
@@ -159,15 +159,14 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.ps_mode=nixl_cpu \
     psrl.lmcache.enable=True \
     psrl.lmcache.enable_p2p=True \
-    psrl.lmcache.clear_on_weight_update=True \
-    psrl.lmcache.multi_version_kv=False \
-    psrl.routing_strategy.kv_transfer.enable=False \
-    psrl.routing_strategy.kv_transfer.transfer_mode=sync \
-    psrl.sync_and_mig_strategy.mig.enable=True \
-    psrl.sync_and_mig_strategy.mig.indicator=request_num \
-    psrl.sync_and_mig_strategy.mig.threshold=1000 \
-    psrl.sync_and_mig_strategy.mig.stop_indicator=request_num \
-    psrl.sync_and_mig_strategy.mig.stop_threshold=1000 \
+    psrl.rollout_coordination.routing_strategy.kv_transfer.enable=True \
+    psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode=async \
+    psrl.rollout_coordination.session_strategy.thunder_agent.enable=False \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.enable=True \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator=request_num \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.threshold=1000 \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_indicator=request_num \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_threshold=1000 \
     psrl.logging_path=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
@@ -180,11 +179,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
-    psrl.routing_strategy.method=cache_aware \
-    psrl.routing_strategy.enable_trajectory_sticky=False \
-    psrl.routing_strategy.enable_group_sticky=False \
+    psrl.rollout_coordination.routing_strategy.method=cache_aware \
+    psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky=False \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
     \
-    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \
     gen_actor_rollout_ref.rollout.enable_chunked_prefill=True \
@@ -227,7 +226,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=5 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=3 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -290,4 +289,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=100 \
     trainer.save_freq=50 \
     trainer.total_epochs=100 \
-    trainer.total_training_steps=10 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=5 2>&1 | tee ${experiment_name}.log

@@ -51,9 +51,9 @@ class RolloutRouter:
         self.instance_ids = set()
         self.val_instance_ids = set()
 
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
@@ -63,15 +63,15 @@ class RolloutRouter:
         self.tokenizer = tokenizer
 
         # Routing related attributes
-        if self.config.psrl.routing_strategy.enable_multi_priority_queue:
+        if self.config.psrl.rollout_coordination.routing_strategy.enable_multi_priority_queue:
             self.requests_to_route = MultiPriorityRequestQueue(
                 self.staleness,
-                request_sort_indicator=RequestSortIndicator(self.config.psrl.routing_strategy.request_sort_indicator),
+                request_sort_indicator=RequestSortIndicator(self.config.psrl.rollout_coordination.routing_strategy.request_sort_indicator),
             )
         else:
             self.requests_to_route = PriorityRequestQueue(
                 self.staleness,
-                request_sort_indicator=RequestSortIndicator(self.config.psrl.routing_strategy.request_sort_indicator),
+                request_sort_indicator=RequestSortIndicator(self.config.psrl.rollout_coordination.routing_strategy.request_sort_indicator),
             )
         self._is_routing = False
         self._pause_routing = False
@@ -113,33 +113,33 @@ class RolloutRouter:
     def _init_route_strategy(self, **kwargs):
         """Initialize the route strategy for the router."""
         if (
-            self.config.psrl.routing_strategy.method == "request_num_balance"
-            or self.config.psrl.routing_strategy.method == "throughput_optimal"
+            self.config.psrl.rollout_coordination.routing_strategy.method == "request_num_balance"
+            or self.config.psrl.rollout_coordination.routing_strategy.method == "throughput_optimal"
         ):
             assert self.config.psrl.status_collection.enable, (
                 "Status collection must be enabled when using request num "
                 "balance or throughput optimal routing strategy"
             )
         strategy_kwargs = {
-            "logging_interval_in_ms": self.config.psrl.routing_strategy.logging_interval_in_ms,
-            "cost_model_path": self.config.psrl.routing_strategy.cost_model_path,
+            "logging_interval_in_ms": self.config.psrl.rollout_coordination.routing_strategy.logging_interval_in_ms,
+            "cost_model_path": self.config.psrl.rollout_coordination.routing_strategy.cost_model_path,
             "max_num_waiting_reqs_after_preemption": (
-                self.config.psrl.routing_strategy.max_num_waiting_reqs_after_preemption
+                self.config.psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption
             ),
-            "max_concurrent_seqs_per_instance": (self.config.psrl.routing_strategy.max_concurrent_seqs_per_instance),
-            "delta_throughput_threshold": self.config.psrl.routing_strategy.delta_throughput_threshold,
+            "max_concurrent_seqs_per_instance": (self.config.psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance),
+            "delta_throughput_threshold": self.config.psrl.rollout_coordination.routing_strategy.delta_throughput_threshold,
             "max_prompt_length": self.config.data.max_prompt_length,
-            "request_budget": self.config.psrl.routing_strategy.request_budget,
-            "snapshot_staleness_threshold_in_ms": self.config.psrl.routing_strategy.snapshot_staleness_threshold_in_ms,
+            "request_budget": self.config.psrl.rollout_coordination.routing_strategy.request_budget,
+            "snapshot_staleness_threshold_in_ms": self.config.psrl.rollout_coordination.routing_strategy.snapshot_staleness_threshold_in_ms,
             "logger": psrl_logger,
             **kwargs,
         }
 
         # Init without instance num first, will be updated during `add_worker`
         try:
-            route_strategy_class = get_route_strategy_class(self.config.psrl.routing_strategy.method)
+            route_strategy_class = get_route_strategy_class(self.config.psrl.rollout_coordination.routing_strategy.method)
             self.route_strategy: RouteStrategyBase = route_strategy_class(strategy_kwargs)
-            psrl_logger.info(f"Initialized route strategy: {self.config.psrl.routing_strategy.method}")
+            psrl_logger.info(f"Initialized route strategy: {self.config.psrl.rollout_coordination.routing_strategy.method}")
         except Exception as e:
             psrl_logger.warning(f"Route strategy error: {e}")
             psrl_logger.warning("Falling back to 'round_robin' strategy")
@@ -172,7 +172,7 @@ class RolloutRouter:
         # own event loop). Poll _is_routing instead because a plain bool read/write is safe
         # across threads under CPython's GIL.
         while self._is_routing:
-            await asyncio.sleep(self.config.psrl.routing_strategy.check_interval_in_ms / 1000)
+            await asyncio.sleep(self.config.psrl.rollout_coordination.routing_strategy.check_interval_in_ms / 1000)
         psrl_logger.info("Pausing routing")
 
     @ray.method(concurrency_group="control")
@@ -222,9 +222,9 @@ class RolloutRouter:
             self.instance_to_inflight_request_ids.setdefault(new_instance_id, [])
         self.n_rollout_instances += data_parallel_size
 
-        if self.config.psrl.redundant_rollout.enable:
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
             balanced_concurrent_seqs_per_instance = (
-                self.config.psrl.redundant_rollout.redundant_global_batch_size
+                self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
                 * self.rollout_n
                 // self.n_rollout_instances
             )
@@ -340,14 +340,10 @@ class RolloutRouter:
             f"instance_to_version: {self.instance_to_version_after_sync}"
         )
 
-        # 2. If forbidden global migration and the request is a partial rollout request,
-        # only consider the specific instance for routing.
-        # If request is in sticky session, keep the existing instance.
-        if rollout_instance_id is not None and (
-            not self.config.psrl.sync_and_mig_strategy.mig.enable
-            or self.sticky_session_requests.get(request_id, False)
-        ):
-            # TODO: implement similar skip logic for Rust gateway
+        # 2. Trajectory sticky: pin to the previous instance. Non-sticky requests
+        # (including partial-rollout loopbacks) are free to land on any eligible
+        # instance; coordinator-side imbalance migration is independent of routing.
+        if rollout_instance_id is not None and self.sticky_session_requests.get(request_id, False):
             if rollout_instance_id in candidates:
                 candidates = [rollout_instance_id]
             else:
@@ -366,7 +362,7 @@ class RolloutRouter:
         # 3. If group sticky routing is enabled, only consider the instance that
         # other requests in the same group are already routed to.
         rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-        enable_group_sticky = self.config.psrl.routing_strategy.enable_group_sticky
+        enable_group_sticky = self.config.psrl.rollout_coordination.routing_strategy.enable_group_sticky
         if enable_group_sticky:
             group_request_instance_ids = [
                 instance_id
@@ -407,7 +403,7 @@ class RolloutRouter:
 
         # 5. Provide the indicator list to sort candidates for the route strategy
         candidate_indicator_list = []
-        if self.config.psrl.routing_strategy.candidate_sort_indicator == "version":
+        if self.config.psrl.rollout_coordination.routing_strategy.candidate_sort_indicator == "version":
             for candidate in candidates:
                 version = self.instance_to_version_after_sync[candidate]
                 # New request: sort by version in descending order
@@ -417,7 +413,7 @@ class RolloutRouter:
                 else:
                     version_indicator = version
                 candidate_indicator_list.append(version_indicator)
-        elif self.config.psrl.routing_strategy.candidate_sort_indicator == "reserve_capability":
+        elif self.config.psrl.rollout_coordination.routing_strategy.candidate_sort_indicator == "reserve_capability":
             # Use the (reserve_indicator, version) pair as the final indicator
             all_candidate_model_versions = list(
                 set([self.instance_to_version_after_sync[candidate] for candidate in candidates])
@@ -435,7 +431,7 @@ class RolloutRouter:
                 candidate_indicator_list.append((reserve_indicator, version_indicator))
         else:
             raise ValueError(
-                f"Invalid candidate sort indicator: {self.config.psrl.routing_strategy.candidate_sort_indicator}"
+                f"Invalid candidate sort indicator: {self.config.psrl.rollout_coordination.routing_strategy.candidate_sort_indicator}"
             )
         route_kwargs = {"candidate_indicator_list": candidate_indicator_list}
 
@@ -491,7 +487,7 @@ class RolloutRouter:
             TokenOutput or None: Generated result or None if request is invalid.
         """
         if self.scheduler_task is None:
-            if self.config.psrl.routing_strategy.enable_multi_priority_queue:
+            if self.config.psrl.rollout_coordination.routing_strategy.enable_multi_priority_queue:
                 task_coro = self._multi_priority_queue_routing_loop()
                 self.scheduler_task = asyncio.create_task(task_coro)
             else:
@@ -601,7 +597,7 @@ class RolloutRouter:
                 await asyncio.sleep(0)
             """
             self._is_routing = False
-            sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
+            sleep_time = self.config.psrl.rollout_coordination.routing_strategy.check_interval_in_ms / 1000
             await asyncio.sleep(sleep_time)
 
     async def _multi_priority_queue_routing_loop(self):
@@ -657,7 +653,7 @@ class RolloutRouter:
                     for request in remain_requests:
                         request_queue.put(request)
             self._is_routing = False
-            sleep_time = self.config.psrl.routing_strategy.check_interval_in_ms / 1000
+            sleep_time = self.config.psrl.rollout_coordination.routing_strategy.check_interval_in_ms / 1000
             if route_num > 0:
                 psrl_logger.debug(
                     f"Routing {route_num} requests in multi priority queue "
@@ -907,21 +903,21 @@ class RolloutRouter:
                 ):
                     continue
 
-                if self.config.psrl.sync_and_mig_strategy.mig.indicator == "request_num":
+                if self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator == "request_num":
                     request_num = instance_to_status[instance_id].get_waiting_and_running_queue_size()
                     starved_request_num = instance_to_status[starved_instance_id].get_waiting_and_running_queue_size()
                     if starved_request_num == 0:
                         ratio = float("inf") if request_num > 0 else 1
                     else:
                         ratio = request_num / starved_request_num
-                elif self.config.psrl.sync_and_mig_strategy.mig.indicator == "throughput":
+                elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator == "throughput":
                     throughput = instance_to_status[instance_id].get_generation_throughput()
                     starved_throughput = instance_to_status[starved_instance_id].get_generation_throughput()
                     if starved_throughput == 0:
                         ratio = float("inf") if throughput > 0 else 1
                     else:
                         ratio = throughput / starved_throughput
-                elif self.config.psrl.sync_and_mig_strategy.mig.indicator == "kv_cache":
+                elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator == "kv_cache":
                     kv_cache_utilization = instance_to_status[instance_id].get_kv_cache_utilization()
                     starved_kv_cache_utilization = instance_to_status[starved_instance_id].get_kv_cache_utilization()
                     if starved_kv_cache_utilization == 0:
@@ -930,10 +926,10 @@ class RolloutRouter:
                         ratio = kv_cache_utilization / starved_kv_cache_utilization
                 else:
                     raise ValueError(
-                        f"Unknown migrate indicator: {self.config.psrl.sync_and_mig_strategy.mig.indicator}"
+                        f"Unknown migrate indicator: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator}"
                     )
 
-                if ratio > self.config.psrl.sync_and_mig_strategy.mig.threshold:
+                if ratio > self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.threshold:
                     # psrl_logger.info(
                     #     f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
                     #     f"has a ratio of {ratio} for migrating to instance {starved_instance_id} "
@@ -948,21 +944,21 @@ class RolloutRouter:
         if len(candidate_migrate_instance_ids) > 0:
             candidate_migrate_instance_ids.sort(key=lambda x: x[1], reverse=True)
             migrate_instance_id = candidate_migrate_instance_ids[0][0]
-            if self.config.psrl.sync_and_mig_strategy.mig.stop_indicator == "request_num":
+            if self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_indicator == "request_num":
                 request_num = instance_to_status[migrate_instance_id].get_waiting_and_running_queue_size()
-                if request_num < self.config.psrl.sync_and_mig_strategy.mig.stop_threshold:
+                if request_num < self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_threshold:
                     return []
-            elif self.config.psrl.sync_and_mig_strategy.mig.stop_indicator == "throughput":
+            elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_indicator == "throughput":
                 throughput = instance_to_status[migrate_instance_id].get_generation_throughput()
-                if throughput < self.config.psrl.sync_and_mig_strategy.mig.stop_threshold:
+                if throughput < self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_threshold:
                     return []
-            elif self.config.psrl.sync_and_mig_strategy.mig.stop_indicator == "kv_cache":
+            elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_indicator == "kv_cache":
                 kv_cache_utilization = instance_to_status[migrate_instance_id].get_kv_cache_utilization()
-                if kv_cache_utilization < self.config.psrl.sync_and_mig_strategy.mig.stop_threshold:
+                if kv_cache_utilization < self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_threshold:
                     return []
             else:
                 raise ValueError(
-                    f"Unknown stop indicator: {self.config.psrl.sync_and_mig_strategy.mig.stop_indicator}"
+                    f"Unknown stop indicator: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_indicator}"
                 )
             return [migrate_instance_id]
         return []
@@ -1024,41 +1020,41 @@ class RolloutRouter:
         # If there are requests that can still be routed to the instance
         # before synchronization without new reserve entry
         # we will not attempt to synchronize with PS
-        if len(filtered_request_ids) > 0 and self.config.psrl.sync_and_mig_strategy.sync.check_req_before_sync:
+        if len(filtered_request_ids) > 0 and self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.check_req_before_sync:
             return False
 
         # 3. Check indicator to determine whether to synchronize with PS
-        if self.config.psrl.sync_and_mig_strategy.sync.indicator == "request_num":
+        if self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.indicator == "request_num":
             # Check whether request num is above threshold
             request_num = instance_status.get_waiting_and_running_queue_size()
             psrl_logger.debug(
                 f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
                 f"request_num: {request_num}, "
-                f"threshold: {self.config.psrl.sync_and_mig_strategy.sync.threshold}"
+                f"threshold: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}"
             )
-            if request_num > self.config.psrl.sync_and_mig_strategy.sync.threshold:
+            if request_num > self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold:
                 return False
-        elif self.config.psrl.sync_and_mig_strategy.sync.indicator == "throughput":
+        elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.indicator == "throughput":
             # Check whether throughput is above threshold
             throughput = self.route_strategy.instance_to_engine_status[instance_id].get_generation_throughput()
             psrl_logger.debug(
                 f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
                 f"throughput: {throughput}, "
-                f"threshold: {self.config.psrl.sync_and_mig_strategy.sync.threshold}"
+                f"threshold: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}"
             )
-            if throughput > self.config.psrl.sync_and_mig_strategy.sync.threshold:
+            if throughput > self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold:
                 return False
-        elif self.config.psrl.sync_and_mig_strategy.sync.indicator == "kv_cache":
+        elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.indicator == "kv_cache":
             # Check whether KV Cache is above threshold
             kv_cache_utilization = instance_status.get_kv_cache_utilization()
             psrl_logger.debug(
                 f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
                 f"kv_cache_utilization: {kv_cache_utilization}, "
-                f"threshold: {self.config.psrl.sync_and_mig_strategy.sync.threshold}"
+                f"threshold: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}"
             )
-            if kv_cache_utilization > self.config.psrl.sync_and_mig_strategy.sync.threshold:
+            if kv_cache_utilization > self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold:
                 return False
-        elif self.config.psrl.sync_and_mig_strategy.sync.indicator == "hypothesis_test":
+        elif self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.indicator == "hypothesis_test":
             # TODO(lhy): Implement hypothesis test after refactor
             # We attempt to synchronize with PS and check if there is any
             # benefit from synchronization
@@ -1092,7 +1088,7 @@ class RolloutRouter:
             # {instance_id} after synchronization
             """
         else:
-            raise ValueError(f"Unknown sync indicator: {self.config.psrl.sync_and_mig_strategy.sync.indicator}")
+            raise ValueError(f"Unknown sync indicator: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.indicator}")
 
         return True
 

@@ -83,9 +83,9 @@ class DataProcessor:
         self.ps_manager_handle = ps_manager_handle
         self.reward_manager_handle = None  # Will be set by the ray trainer
 
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
@@ -254,8 +254,8 @@ class DataProcessor:
             "The number of train datasets and train datasets ratios must be the same."
         )
 
-        if self.config.psrl.redundant_rollout.enable:
-            total_batch_size = self.config.psrl.redundant_rollout.redundant_global_batch_size
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            total_batch_size = self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
         else:
             total_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
 

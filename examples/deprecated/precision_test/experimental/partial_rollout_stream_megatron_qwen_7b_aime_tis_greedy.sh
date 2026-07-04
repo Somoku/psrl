@@ -108,18 +108,18 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
-    psrl.redundant_rollout.enable=False \
-    psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
-    psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
+    psrl.rollout_coordination.redundant_rollout.enable=False \
+    psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
+    psrl.rollout_coordination.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.rollout_coordination.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.method="request_num_balance" \
-    psrl.routing_strategy.enable_group_sticky=True \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
+    psrl.rollout_coordination.routing_strategy.method="request_num_balance" \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=True \
+    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
+    psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
-    psrl.sync_and_mig_strategy.method="greedy" \
+    psrl.rollout_coordination.sync_and_mig_strategy.method="greedy" \
     \
     gen_actor_rollout_ref.model.path="$HF_MODEL_PATH" \
     gen_actor_rollout_ref.rollout.mode=psrl_async \

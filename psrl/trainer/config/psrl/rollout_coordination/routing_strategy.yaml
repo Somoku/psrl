@@ -1,0 +1,119 @@
+# Method for rollout routing
+# Available options: "random", "round_robin", "request_num_balance", "throughput_optimal",
+# "throughput_optimal_with_budget", "cache_aware", "cache_aware_v1"
+# If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget",
+# you need to enable status collection.
+method: request_num_balance
+
+# SMG cache-aware routing hyperparameters (used when method is cache_aware or cache_aware_v1).
+cache_aware_policy:
+
+  # Minimum cache-hit ratio for the approximate radix-tree fallback path.
+  # Only used when KV events are unavailable; event-driven scoring ignores it. Range 0.0-1.0.
+  cache_threshold: 0.3
+
+  # Weights for event-driven multi-tier overlap scoring.
+  # score(worker) = gpu_overlap_weight * gpu_hit_blocks
+  #               + lmcache_overlap_weight * lmcache_hit_blocks
+  # A GPU hit costs ~zero reload; an LMCache (off-GPU) hit must be loaded back to
+  # the GPU, so it is cheaper than re-prefill but not free. Keep gpu >= lmcache.
+  gpu_overlap_weight: 1.0
+  lmcache_overlap_weight: 0.5
+
+  # Load-balancing trigger: shortest-queue when BOTH abs AND rel thresholds are met.
+  balance_abs_threshold: 16
+  balance_rel_threshold: 1.5
+
+  # KV-utilization triggers (>= 1.0 disables). Both cache_aware and cache_aware_v1
+  # read the backend engine token_usage snapshot for these triggers; the
+  # request-count spread (balance_abs/rel above) uses in-flight worker.load().
+  balance_token_usage_threshold: 0.75
+  overload_token_usage_threshold: 0.85
+
+  # Approximate tree maintenance (fallback when KV events unavailable).
+  eviction_interval_secs: 60
+  max_tree_size: 67108864  # 2**26
+  block_size: 16           # KV block size for event-driven routing
+
+# KV cache transfer: when a request is re-routed to a different rollout instance
+# (hint != selected; e.g. non-sticky partial loopback or coordinator-side mig),
+# transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)
+# so instance B can skip re-prefill. Independent of sync_and_mig_strategy.mig.enable.
+# Requires lmcache.enable and lmcache.enable_p2p.
+kv_transfer:
+
+  # Master switch for KV cache transfer.
+  enable: False
+
+  # Transfer timing mode.
+  # "async"    -- (default) fire-and-forget: dispatch to B immediately while
+  #              transfer runs in background.  Lowest routing latency.
+  # "sync"     -- await transfer completion, NO pin.  If LRU evicts during
+  #              transfer, it fails gracefully and B re-prefills.  Moderate
+  #              latency, no CPU backend memory pressure from pinning.
+  # "pin_sync" -- pin → await transfer → unpin.  Strongest guarantee: prevents
+  #              LRU eviction during transfer.  Highest latency; risks CPU
+  #              backend pressure under high concurrency.
+  transfer_mode: async
+
+  # Timeout in milliseconds for "sync" and "pin_sync" modes.
+  # On timeout the transfer is abandoned and B falls back to re-prefill.
+  transfer_timeout_ms: 5000
+
+  # Interval in seconds between periodic KV-transfer stats log lines on
+  # each source instance. Each instance's VllmEngineServicer prints a
+  # "[KVTransfer] instance=... stats: ..." summary at most once per this
+  # interval, triggered by transfer activity. Only used when kv_transfer.enable
+  # is True; otherwise logging is disabled regardless of this value. Set to 0
+  # to suppress stats even when transfer is enabled.
+  stats_log_interval_s: 30
+
+# Check interval in millisecond for rollout routing
+check_interval_in_ms: 500
+
+# Whether to prioritize short requests
+# Available options: "short_length", "long_length", "small_id"
+request_sort_indicator: small_id
+
+# Whether to sort the candidates by indicator
+# Available options: "version", "reserve_capability"
+candidate_sort_indicator: version
+
+# Whether to enable multiple priority queues for routing requests
+enable_multi_priority_queue: False
+
+# Whether to enable group sticky routing: pin all rollout requests sharing a
+# prompt_id to the same rollout instance so their KV-cache prefixes are reused.
+enable_group_sticky: True
+
+# Whether to enable trajectory sticky routing: pin all generation calls within
+# a single trajectory (subsequent turns) to the same rollout instance that
+# served the first turn, so the per-trajectory KV-cache prefix is reused.
+enable_trajectory_sticky: True
+
+# Logging interval in milliseconds
+logging_interval_in_ms: 2000
+
+# Path to the cost model (a json file)
+cost_model_path: null
+
+# Delta throughput threshold to stop request routing to an instance
+delta_throughput_threshold: 0.5
+
+# Request budget in tokens for each request
+# It is used to estimate the length of the response tokens
+request_budget: 1024
+
+# Snapshot staleness threshold in milliseconds
+# Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
+snapshot_staleness_threshold_in_ms: 1000
+
+# Max number of waiting requests per instance after preemption
+max_num_waiting_reqs_after_preemption: 1000
+
+# Max estimated concurrent sequences per instance
+# No need to tune this value, it is only used to estimate the max sequence length that can saturate the KV Cache
+max_estimated_concurrent_seqs_per_instance: 32768
+
+# The actual max number of concurrent sequences per instance
+max_concurrent_seqs_per_instance: 1024

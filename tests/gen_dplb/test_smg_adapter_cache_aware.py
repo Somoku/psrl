@@ -30,7 +30,6 @@ def _make_config(**routing_strategy_overrides):
     return SimpleNamespace(
         psrl=SimpleNamespace(
             routing_strategy=SimpleNamespace(**routing_strategy),
-            sync_and_mig_strategy=SimpleNamespace(mig=SimpleNamespace(enable=False)),
             rollout_gateway=SimpleNamespace(tito_debug=False, tito_gc_threshold=None),
             logging_path=None,
         ),

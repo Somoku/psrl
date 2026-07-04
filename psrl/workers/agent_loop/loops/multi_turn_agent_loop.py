@@ -112,7 +112,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
             # check redundant padding in single-request case
             output = await self.generate_sequence(
                 self.agent_data.prepare_generation_request(request),
-                is_sticky_session=self.config.psrl.routing_strategy.enable_trajectory_sticky,
+                is_sticky_session=self.config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky,
             )
 
             if output is None:

@@ -153,7 +153,7 @@ def validate_config(
         )
 
     # Check routing strategy
-    routing_method = config.psrl.routing_strategy.method
+    routing_method = config.psrl.rollout_coordination.routing_strategy.method
     allowed_routing_methods = {
         "random",
         "round_robin",
@@ -165,7 +165,7 @@ def validate_config(
         "cache_aware_v1",
     }
     assert routing_method in allowed_routing_methods, (
-        f"psrl.routing_strategy.method must be one of {sorted(allowed_routing_methods)}, "
+        f"psrl.rollout_coordination.routing_strategy.method must be one of {sorted(allowed_routing_methods)}, "
         f"got '{routing_method}'. Use 'cache_aware' instead of deprecated 'kv_cache_aware'."
     )
 
@@ -187,17 +187,17 @@ def validate_config(
 
     # Check LMCache and KV transfer configuration
     lmcache_cfg = config.psrl.get("lmcache", {})
-    kv_transfer_cfg = config.psrl.routing_strategy.get("kv_transfer", {})
+    kv_transfer_cfg = config.psrl.rollout_coordination.routing_strategy.get("kv_transfer", {})
 
     if kv_transfer_cfg.get("enable", False):
         assert lmcache_cfg.get("enable", False), (
-            "psrl.lmcache.enable must be True when psrl.routing_strategy.kv_transfer.enable is True."
+            "psrl.lmcache.enable must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
         )
         assert lmcache_cfg.get("enable_p2p", False), (
-            "psrl.lmcache.enable_p2p must be True when psrl.routing_strategy.kv_transfer.enable is True."
+            "psrl.lmcache.enable_p2p must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
         )
-        assert config.psrl.partial_rollout.enable, (
-            "psrl.partial_rollout.enable must be True when psrl.routing_strategy.kv_transfer.enable is True."
+        assert config.psrl.rollout_coordination.partial_rollout.enable, (
+            "psrl.rollout_coordination.partial_rollout.enable must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
         )
 
     if lmcache_cfg.get("enable_p2p", False):

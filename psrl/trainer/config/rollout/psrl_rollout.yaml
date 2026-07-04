@@ -1,14 +1,14 @@
 # PSRL rollout config — incremental extension of veRL's rollout.yaml.
 #
 # Hydra inheritance pattern (mirrors how veRL's megatron_actor.yaml extends actor.yaml):
-#   verl_rollout.yaml  →  symlink to verl/trainer/config/rollout/rollout.yaml
-#   rollout.yaml       →  this file; inherits verl_rollout, then applies PSRL overrides
+#   rollout.yaml  →  symlink to verl/trainer/config/rollout/rollout.yaml
+#   psrl_rollout.yaml  →  this file; inherits rollout, then applies PSRL overrides
 #
-# Only PSRL-specific fields live here. All veRL base fields are inherited from verl_rollout.
+# Only PSRL-specific fields live here. All veRL base fields are inherited from verl's rollout.
 
 defaults:
 
-  # Load veRL's canonical rollout config first (via the sibling symlink verl_rollout.yaml).
+  # Load veRL's canonical rollout config first (via the sibling symlink verl's rollout.yaml).
   - rollout
 
   # Apply PSRL overrides/extensions last.
@@ -37,7 +37,7 @@ disable_attn: ${oc.select:psrl.profile.disable_attn,False}
 disable_log_stats: False
 
 # Max length of sequences.
-max_num_seqs: ${oc.select:psrl.routing_strategy.max_concurrent_seqs_per_instance,1024}
+max_num_seqs: ${oc.select:psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance,1024}
 
 # vLLM runner type: 'generate' for autoregressive LLMs, 'pooling' for
 # embedding / reward / classification models.

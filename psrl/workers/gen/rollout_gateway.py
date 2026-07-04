@@ -75,8 +75,8 @@ class RolloutGateway:
         n_rollout_instances = int(self._cfg_get("psrl.deployment.n_rollout_instances", 1))
         n_rollout_instances = max(1, n_rollout_instances)
 
-        if bool(self._cfg_get("psrl.redundant_rollout.enable", False)):
-            redundant_global_batch_size = self._cfg_get("psrl.redundant_rollout.redundant_global_batch_size", None)
+        if bool(self._cfg_get("psrl.rollout_coordination.redundant_rollout.enable", False)):
+            redundant_global_batch_size = self._cfg_get("psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size", None)
             if redundant_global_batch_size is not None:
                 return max(
                     1,

@@ -1,4 +1,4 @@
-from .rollout_coordinator import RolloutCoordinator
+from .rollout_coordination import RolloutCoordinator
 
 __all__ = [
     "RolloutCoordinator",

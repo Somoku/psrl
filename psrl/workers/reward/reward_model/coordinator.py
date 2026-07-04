@@ -4,7 +4,7 @@ import os
 
 import ray
 
-from psrl.workers.gen.rollout_coordinator import RolloutCoordinator
+from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

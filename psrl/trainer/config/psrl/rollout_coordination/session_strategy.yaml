@@ -1,0 +1,19 @@
+# Session hang/continue scheduling (ThunderAgent port).
+# When enabled, the RolloutCoordinator periodically hangs whole TITO sessions on
+# instances that are over KV-cache capacity (blocking their next turn at the
+# SessionRouter without aborting in-flight work) and continues them once the
+# pinned instance frees capacity.
+thunder_agent:
+
+  # Master switch for session hang/continue.
+  enable: False
+
+  # Scheduler tick interval in milliseconds.
+  check_interval_in_ms: 1000
+
+  # Weight of env-status session tokens in capacity_used. Lower values assume an
+  # env-status session's KV cache is likely evicted before it returns.
+  env_token_weight: 1.0
+
+  # Decode headroom (tokens) reserved per running session.
+  buffer_per_session: 100

@@ -91,9 +91,9 @@ class RequestStatusTracker:
         self._abort_request_ids = set()  # Set of request IDs that are marked for abortion
         self._running_min_version = 0  # Minimum version of requests that are currently running
 
-        if self.psrl_config.redundant_rollout.enable:
-            self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.psrl_config.redundant_rollout.alg_rollout_n
+        if self.psrl_config.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.psrl_config.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.psrl_config.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n

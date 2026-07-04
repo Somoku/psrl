@@ -73,9 +73,9 @@ class PSManager(RequestStatusTracker):
 
         tq.init()
 
-        if self.psrl_config.redundant_rollout.enable:
-            self.rollout_n = self.psrl_config.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.psrl_config.redundant_rollout.alg_rollout_n
+        if self.psrl_config.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.psrl_config.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.psrl_config.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.psrl_config.rollout_n
             self.alg_rollout_n = self.rollout_n
@@ -106,9 +106,9 @@ class PSManager(RequestStatusTracker):
         self.max_aborted_version = -1
 
         # Initialize the staleness inventory
-        if self.psrl_config.redundant_rollout.enable:
-            entries_per_buffer = self.psrl_config.redundant_rollout.redundant_global_batch_size
-            ready_entries_per_buffer = self.psrl_config.redundant_rollout.alg_global_batch_size
+        if self.psrl_config.rollout_coordination.redundant_rollout.enable:
+            entries_per_buffer = self.psrl_config.rollout_coordination.redundant_rollout.redundant_global_batch_size
+            ready_entries_per_buffer = self.psrl_config.rollout_coordination.redundant_rollout.alg_global_batch_size
         else:
             entries_per_buffer = self.psrl_config.staleness_buffer_entries
             ready_entries_per_buffer = entries_per_buffer

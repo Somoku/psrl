@@ -177,10 +177,10 @@ class PSRL_GenWorker(Worker):
         self.nixl_interface = nixl_interface
         self.instance_dist_group = None
 
-        if self.psrl_config.redundant_rollout.enable:
+        if self.psrl_config.rollout_coordination.redundant_rollout.enable:
             self.avg_max_active_tasks_len = (
-                self.psrl_config.redundant_rollout.redundant_global_batch_size
-                * self.psrl_config.redundant_rollout.redundant_rollout_n
+                self.psrl_config.rollout_coordination.redundant_rollout.redundant_global_batch_size
+                * self.psrl_config.rollout_coordination.redundant_rollout.redundant_rollout_n
                 // self.psrl_config.deployment.n_rollout_instances
             )
         else:

@@ -1,0 +1,55 @@
+# Method for model synchronization and rollout migration
+# Available options: "status_based" or "greedy"
+method: greedy
+
+# Check interval in millisecond for model synchronization and rollout migration
+check_interval_in_ms: 100
+
+# Model synchronization config
+sync:
+  # Indicator for model synchronization
+  # Available options: "request_num", "throughput", "kv_cache", "hypothesis_test"
+  # request_num: we check if the number of requests is lower than the threshold
+  # throughput: we check if the throughput is lower than the threshold
+  # kv_cache: we check if the KV Cache is saturated
+  # hypothesis_test (TODO): we check if there are any benefits from synchronization
+  indicator: request_num
+
+  # Workload threshold to trigger model synchronization
+  # When indicator is "request_num", threshold is the number of requests.
+  # When indicator is "throughput", threshold is the throughput.
+  # When indicator is "kv_cache", threshold is the KV Cache utilization.
+  # When indicator is "hypothesis_test", threshold is not used.
+  threshold: null
+
+  # Whether to check the request that can be routed to the instance before synchronization
+  check_req_before_sync: True
+
+  # All versions in [0, seamless_train_version] satisfy that:
+  # - After pulling the model from the PS, the next buffer is already ready, so the training can be continued seamlessly without waiting for rollout
+  seamless_train_version: 0
+
+# Rollout migration config (coordinator-side only).
+# When enabled, the rollout coordinator aborts requests on overloaded instances
+# so they loop back to the router. Routing itself does not consult this flag:
+# trajectory sticky pins via is_sticky; otherwise free routing + optional
+# kv_transfer when the selected instance differs from the previous one.
+mig:
+  # Whether to enable coordinator-side imbalance migration
+  enable: False
+
+  # Indicator for rollout migration
+  # Available options: "request_num", "throughput", "kv_cache"
+  indicator: request_num
+
+  # Relative threshold for rollout migration
+  # When the indicator of the instance with the max indicator value divided by the indicator of the instance with the min indicator value is greater than the threshold,
+  # the rollout coordinator will abort all rollout requests of the instance with the max indicator value (the requests will loop back to the router).
+  threshold: null
+
+  # Stop migration when the indicator is less than the threshold
+  # Available options: "request_num", "throughput", "kv_cache"
+  stop_indicator: request_num
+
+  # Threshold for stopping migration
+  stop_threshold: null

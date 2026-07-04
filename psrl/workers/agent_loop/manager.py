@@ -67,17 +67,17 @@ class PSRL_AgentLoopManager:
         self.staleness = self.config.psrl.staleness
         self.group_post_process_fn = group_post_process_fn
         self.buffer_post_process_fn = buffer_post_process_fn
-        if self.config.psrl.redundant_rollout.enable:
-            self.rollout_n = self.config.psrl.redundant_rollout.redundant_rollout_n
-            self.alg_rollout_n = self.config.psrl.redundant_rollout.alg_rollout_n
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            self.rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+            self.alg_rollout_n = self.config.psrl.rollout_coordination.redundant_rollout.alg_rollout_n
         else:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
         self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
 
-        if self.config.psrl.redundant_rollout.enable:
-            self.entries_per_buffer = self.config.psrl.redundant_rollout.redundant_global_batch_size
-            self.ready_entries_per_buffer = self.config.psrl.redundant_rollout.alg_global_batch_size
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            self.entries_per_buffer = self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
+            self.ready_entries_per_buffer = self.config.psrl.rollout_coordination.redundant_rollout.alg_global_batch_size
         else:
             self.entries_per_buffer = self.config.psrl.staleness_buffer_entries
             self.ready_entries_per_buffer = self.config.psrl.staleness_buffer_entries
@@ -398,8 +398,8 @@ class PSRL_AgentLoopManager:
             return 0
 
         rollout_n = (
-            self.config.psrl.redundant_rollout.redundant_rollout_n
-            if self.config.psrl.redundant_rollout.enable
+            self.config.psrl.rollout_coordination.redundant_rollout.redundant_rollout_n
+            if self.config.psrl.rollout_coordination.redundant_rollout.enable
             else self.rollout_n
         )
 
@@ -586,8 +586,8 @@ class PSRL_AgentLoopManager:
         """
         Get the expected PS version tag based on the current staleness and request counter.
         """
-        if self.config.psrl.redundant_rollout.enable:
-            buffer_size = self.config.psrl.redundant_rollout.redundant_global_batch_size * self.rollout_n
+        if self.config.psrl.rollout_coordination.redundant_rollout.enable:
+            buffer_size = self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size * self.rollout_n
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
@@ -1271,14 +1271,14 @@ class PSRL_AgentLoopManager:
     async def handle_waiting_buffer(self, buffer_id: int):
         """Handle the waiting buffer."""
         # WIP(lhy): Implement the retry and truncate strategy
-        if self.config.psrl.proactive_filter_strategy.method is None:
+        if self.config.psrl.rollout_coordination.proactive_filter_strategy.method is None:
             return
-        if self.config.psrl.proactive_filter_strategy.method == "retry":
+        if self.config.psrl.rollout_coordination.proactive_filter_strategy.method == "retry":
             gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
             if gap == 0:
                 return
             assert gap > 0, f"Gap should be greater than 0, but got {gap}"
-            if gap <= self.config.psrl.proactive_filter_strategy.threshold:
+            if gap <= self.config.psrl.rollout_coordination.proactive_filter_strategy.threshold:
                 psrl_logger.info(
                     f"Trying to abort the rest {gap} entries in buffer {buffer_id} "
                     f"and move some occupied entries from other buffers to make it ready."
@@ -1364,7 +1364,7 @@ class PSRL_AgentLoopManager:
                 await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
                 # Override the counter so the caller's equality check sees the buffer as full.
                 self.train_accumulated_buffer_size[buffer_id] = self.ready_entries_per_buffer
-        elif self.config.psrl.proactive_filter_strategy.method == "truncate":
+        elif self.config.psrl.rollout_coordination.proactive_filter_strategy.method == "truncate":
             raise NotImplementedError("Truncate strategy is not implemented yet.")
 
     async def wait_for_training_batch(self, buffer_id: int) -> KVBatchMeta:

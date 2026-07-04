@@ -162,8 +162,8 @@ class TestRouterKVScoreQuery:
         used by the step-6 code path.
         """
         router = MagicMock()
-        router.config.psrl.routing_strategy.method = method
-        router.config.psrl.routing_strategy.kv_query_timeout_ms = timeout_ms
+        router.config.psrl.rollout_coordination.routing_strategy.method = method
+        router.config.psrl.rollout_coordination.routing_strategy.kv_query_timeout_ms = timeout_ms
         router.request_to_tokens = {}
         # Two fake worker group handles.
         wg0 = MagicMock()

@@ -31,11 +31,11 @@ def cfg_get(config: Any, path: str, default: Any = None) -> Any:
 
 
 def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
-    nested = cfg_get(config, f"psrl.routing_strategy.cache_aware_policy.{key}", None)
+    nested = cfg_get(config, f"psrl.rollout_coordination.routing_strategy.cache_aware_policy.{key}", None)
     if nested is not None:
         return nested
     if key in _LEGACY_CACHE_AWARE_KEYS:
-        legacy = cfg_get(config, f"psrl.routing_strategy.{key}", None)
+        legacy = cfg_get(config, f"psrl.rollout_coordination.routing_strategy.{key}", None)
         if legacy is not None:
             return legacy
     return default
@@ -44,14 +44,15 @@ def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
 def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr: str):
     from smg.launch_router import RouterArgs
 
-    routing_method = str(cfg_get(config, "psrl.routing_strategy.method", "request_num_balance"))
-    request_budget = int(cfg_get(config, "psrl.routing_strategy.request_budget", 1024))
-    enable_group_sticky = bool(cfg_get(config, "psrl.routing_strategy.enable_group_sticky", True))
+    routing_method = str(cfg_get(config, "psrl.rollout_coordination.routing_strategy.method", "request_num_balance"))
+    request_budget = int(cfg_get(config, "psrl.rollout_coordination.routing_strategy.request_budget", 1024))
+    enable_group_sticky = bool(cfg_get(config, "psrl.rollout_coordination.routing_strategy.enable_group_sticky", True))
 
-    # KV-cache transfer on migration (only meaningful with cache_aware + migration).
-    kv_transfer_enable = bool(cfg_get(config, "psrl.routing_strategy.kv_transfer.enable", False))
-    kv_transfer_mode = str(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_mode", "async"))
-    kv_transfer_timeout_ms = int(cfg_get(config, "psrl.routing_strategy.kv_transfer.transfer_timeout_ms", 30000))
+    # KV-cache transfer when a request is re-routed to a different instance
+    # (hint != selected). Independent of coordinator-side imbalance migration.
+    kv_transfer_enable = bool(cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.enable", False))
+    kv_transfer_mode = str(cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode", "async"))
+    kv_transfer_timeout_ms = int(cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_timeout_ms", 30000))
 
     psrl_logger.info(
         "[sticky] SMG router args: enable_group_sticky=%s, kv_transfer_enable=%s, kv_transfer_mode=%s",
@@ -83,30 +84,29 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         max_tree_size=int(_cache_aware_cfg(config, "max_tree_size", 2**26)),
         block_size=int(_cache_aware_cfg(config, "block_size", 16)),
         max_concurrent_seqs_per_instance=int(
-            cfg_get(config, "psrl.routing_strategy.max_concurrent_seqs_per_instance", 1024)
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance", 1024)
         ),
-        cost_model_path=cfg_get(config, "psrl.routing_strategy.cost_model_path", None),
+        cost_model_path=cfg_get(config, "psrl.rollout_coordination.routing_strategy.cost_model_path", None),
         max_num_waiting_reqs_after_preemption=int(
-            cfg_get(config, "psrl.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
         ),
-        delta_throughput_threshold=float(cfg_get(config, "psrl.routing_strategy.delta_throughput_threshold", 0.5)),
+        delta_throughput_threshold=float(cfg_get(config, "psrl.rollout_coordination.routing_strategy.delta_throughput_threshold", 0.5)),
         max_prompt_length=int(
             cfg_get(config, "data.max_prompt_length", cfg_get(config, "rollout.prompt_length", 8192))
         ),
         request_budget=request_budget,
         enable_routing_loop=True,
-        routing_loop_check_interval_ms=int(cfg_get(config, "psrl.routing_strategy.check_interval_in_ms", 10)),
+        routing_loop_check_interval_ms=int(cfg_get(config, "psrl.rollout_coordination.routing_strategy.check_interval_in_ms", 10)),
         routing_loop_request_sort_key=str(
-            cfg_get(config, "psrl.routing_strategy.request_sort_indicator", "short_length")
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.request_sort_indicator", "short_length")
         ),
         routing_loop_multi_priority_queue=bool(
-            cfg_get(config, "psrl.routing_strategy.enable_multi_priority_queue", False)
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.enable_multi_priority_queue", False)
         ),
         routing_loop_dispatch_batch_size=1,
         worker_selection_strategy="psrl",
         psrl_ps_manager_addr=ps_manager_addr,
-        psrl_enable_mig_strategy=bool(cfg_get(config, "psrl.sync_and_mig_strategy.mig.enable", False)),
-        psrl_candidate_sort_key=str(cfg_get(config, "psrl.routing_strategy.candidate_sort_indicator", "version")),
+        psrl_candidate_sort_key=str(cfg_get(config, "psrl.rollout_coordination.routing_strategy.candidate_sort_indicator", "version")),
         psrl_enable_group_sticky=enable_group_sticky,
         psrl_kv_transfer_enable=kv_transfer_enable,
         psrl_kv_transfer_mode=kv_transfer_mode,
@@ -141,13 +141,13 @@ def build_reward_router_args(config: Any, host: str, port: int, prometheus_port:
         decode_policy=None,
         disable_retries=True,
         max_concurrent_seqs_per_instance=int(
-            cfg_get(config, "psrl.routing_strategy.max_concurrent_seqs_per_instance", 1024)
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance", 1024)
         ),
         cost_model_path=None,
         max_num_waiting_reqs_after_preemption=int(
-            cfg_get(config, "psrl.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
         ),
-        delta_throughput_threshold=float(cfg_get(config, "psrl.routing_strategy.delta_throughput_threshold", 0.5)),
+        delta_throughput_threshold=float(cfg_get(config, "psrl.rollout_coordination.routing_strategy.delta_throughput_threshold", 0.5)),
         max_prompt_length=32768,
         request_budget=1024,
         enable_routing_loop=False,
@@ -187,7 +187,7 @@ def build_worker_registration_payload(
         labels["kv_block_size"] = str(kv_block_size)
     # LMCache instance id for cross-instance KV transfer: SMG's
     # KvTransferCoordinator carries this id in TransferKv to target this instance
-    # as a migration destination. The source servicer resolves the actual
+    # as the re-route destination. The source servicer resolves the actual
     # per-rank peer URLs from its own broadcast registry, so no peer URL is sent
     # at registration time.
     if lmcache_instance_id:

@@ -124,10 +124,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.stat_collector = None
         self.curr_rollout_instance_model_version = None
 
-        if self.psrl_config.redundant_rollout.enable:
+        if self.psrl_config.rollout_coordination.redundant_rollout.enable:
             self.avg_max_active_tasks_len = (
-                self.psrl_config.redundant_rollout.redundant_global_batch_size
-                * self.psrl_config.redundant_rollout.redundant_rollout_n
+                self.psrl_config.rollout_coordination.redundant_rollout.redundant_global_batch_size
+                * self.psrl_config.rollout_coordination.redundant_rollout.redundant_rollout_n
                 // self.psrl_config.deployment.n_rollout_instances
             )
         else:
@@ -250,7 +250,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         bridge connects to ``127.0.0.1:<base_port + dp_rank>`` per the
         ``dp_rank`` carried in the subscribe request.
         """
-        routing_method = self.psrl_config.routing_strategy.method
+        routing_method = self.psrl_config.rollout_coordination.routing_strategy.method
         if not is_cache_aware_method(routing_method):
             return {}
 
@@ -462,7 +462,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         args["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
         args["additional_config"] = {
             "max_model_len_used_in_estimation": self.config.max_model_len
-            * self.psrl_config.routing_strategy.max_estimated_concurrent_seqs_per_instance,
+            * self.psrl_config.rollout_coordination.routing_strategy.max_estimated_concurrent_seqs_per_instance,
             "enable_weights_cpu_backup": self.config.enable_weights_cpu_backup,
         }
 
@@ -510,7 +510,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # This replaces the old additional_config["max_num_waiting_reqs_after_preemption"] mechanism
         # and enables gateway_preemption_req_ids in SchedulerStats, consumed by PSRLPreemptionStatLogger.
         vllm_config.scheduler_config.preemption_notification_threshold = (
-            self.psrl_config.routing_strategy.max_num_waiting_reqs_after_preemption
+            self.psrl_config.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption
         )
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
@@ -602,7 +602,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             - ``smg-grpc-servicer`` (``smg/grpc_servicer/``)
         """
         start_time = time.time()
-        kv_transfer_cfg = self.psrl_config.routing_strategy.get("kv_transfer", {})
+        kv_transfer_cfg = self.psrl_config.rollout_coordination.routing_strategy.get("kv_transfer", {})
         kv_transfer_enabled = bool(kv_transfer_cfg.get("enable", False))
         stats_log_interval_s = (
             float(kv_transfer_cfg.get("stats_log_interval_s", 30))
@@ -1499,10 +1499,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def estimate_max_model_len(self) -> int:
         await self._is_init_model.wait()
-        max_model_len = await self.collective_rpc(
-            method="estimate_max_model_len",
-        )
-        return max_model_len
+        # engine.collective_rpc returns a per-worker list; all ranks return the
+        # same estimate. The shared collective_rpc wrapper discards its result,
+        # so call the engine directly and unwrap.
+        results = await self.engine.collective_rpc(method="estimate_max_model_len")
+        if not results:
+            raise RuntimeError("estimate_max_model_len collective_rpc returned no results")
+        return int(results[0])
 
 
 class PSRL_vLLMReplica(vLLMReplica):

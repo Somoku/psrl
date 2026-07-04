@@ -95,31 +95,31 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.group_post_process.enable=False \
     psrl.group_post_process.name=dynamic_sampling_filter \
     \
-    psrl.redundant_rollout.enable=True \
-    psrl.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
-    psrl.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
+    psrl.rollout_coordination.redundant_rollout.enable=True \
+    psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size=${redundant_train_prompt_bsz} \
+    psrl.rollout_coordination.redundant_rollout.redundant_rollout_n=${redundant_n_resp_per_prompt} \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.rollout_coordination.partial_rollout.enable=True \
     \
-    psrl.routing_strategy.method="throughput_optimal" \
-    psrl.routing_strategy.candidate_sort_indicator=reserve_capability \
-    psrl.routing_strategy.enable_multi_priority_queue=True \
-    psrl.routing_strategy.enable_group_sticky=False \
-    psrl.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_moe_30b.json \
-    psrl.routing_strategy.delta_throughput_threshold=0.2 \
-    psrl.routing_strategy.request_budget=1024 \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=512 \
+    psrl.rollout_coordination.routing_strategy.method="throughput_optimal" \
+    psrl.rollout_coordination.routing_strategy.candidate_sort_indicator=reserve_capability \
+    psrl.rollout_coordination.routing_strategy.enable_multi_priority_queue=True \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
+    psrl.rollout_coordination.routing_strategy.cost_model_path=${PSRL_PATH}/psrl/trainer/config/cost_model/qwen_moe_30b.json \
+    psrl.rollout_coordination.routing_strategy.delta_throughput_threshold=0.2 \
+    psrl.rollout_coordination.routing_strategy.request_budget=1024 \
+    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=3 \
+    psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=512 \
     \
-    psrl.sync_and_mig_strategy.method="status_based" \
-    psrl.sync_and_mig_strategy.sync.indicator="kv_cache" \
-    psrl.sync_and_mig_strategy.sync.threshold=0.6 \
-    psrl.sync_and_mig_strategy.sync.check_req_before_sync=False \
-    psrl.sync_and_mig_strategy.mig.enable=True \
-    psrl.sync_and_mig_strategy.mig.indicator="throughput" \
-    psrl.sync_and_mig_strategy.mig.threshold=5 \
-    psrl.sync_and_mig_strategy.mig.stop_indicator="request_num" \
-    psrl.sync_and_mig_strategy.mig.stop_threshold=10 \
+    psrl.rollout_coordination.sync_and_mig_strategy.method="status_based" \
+    psrl.rollout_coordination.sync_and_mig_strategy.sync.indicator="kv_cache" \
+    psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold=0.6 \
+    psrl.rollout_coordination.sync_and_mig_strategy.sync.check_req_before_sync=False \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.enable=True \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator="throughput" \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.threshold=5 \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_indicator="request_num" \
+    psrl.rollout_coordination.sync_and_mig_strategy.mig.stop_threshold=10 \
     \
     psrl.abort_and_truncate_strategy.method="abort" \
     psrl.abort_and_truncate_strategy.threshold=4 \

@@ -20,6 +20,15 @@ from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+# Hang-state values (see SessionState.hang_state).
+SESSION_RUNNING = "running"
+SESSION_HUNG = "hung"
+
+# Session status values, derived from inflight: a trajectory is either inferring
+# on vLLM/SMG (generate) or between turns / calling the environment (env).
+STATUS_GENERATE = "generate"
+STATUS_ENV = "env"
+
 
 @dataclass(slots=True)
 class SessionState:
@@ -38,12 +47,30 @@ class SessionState:
     # it is carried into every subsequent turn so re-routes filter on a version
     # at least as fresh as the instance that first served this trajectory.
     version_tag: str | None = None
+    # --- Hang/continue scheduling (ThunderAgent port) ---
+    # Accumulated token footprint of the session (max prompt+completion observed).
+    total_tokens: int = 0
+    # "running" | "hung": whether the coordinator has hung this session.
+    hang_state: str = SESSION_RUNNING
+    # Set by the coordinator when a hang is requested while a turn is in flight;
+    # converted to hung at the next turn boundary (deferred hang for generate).
+    marked_for_hang: bool = False
+    # Set means "may proceed". A hung session blocks at the next turn entry until
+    # the coordinator continues it (sets the event). Initialized set in __post_init__.
+    continue_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def __post_init__(self) -> None:
         if self.inflight == 0:
             self.drained.set()
         else:
             self.drained.clear()
+        # A fresh session is running: allow it to proceed.
+        self.continue_event.set()
+
+    @property
+    def status(self) -> str:
+        """generate while a turn is in flight, else env (between turns)."""
+        return STATUS_GENERATE if self.inflight > 0 else STATUS_ENV
 
     def get_trajectory_turn(self, trajectory_id: int) -> int:
         """Get the current turn for a trajectory, initializing to 0 if new."""
@@ -75,6 +102,10 @@ class SessionRouter:
         self.app.get("/sessions/{sid}")(self.get_session)
         self.app.delete("/sessions/{sid}")(self.delete_session)
         self.app.post("/sessions/{sid}/v1/chat/completions")(self.session_chat_completions)
+        # Coordinator-facing hang/continue control plane.
+        self.app.get("/control/sessions")(self.control_list_sessions)
+        self.app.post("/control/hang")(self.control_hang)
+        self.app.post("/control/continue")(self.control_continue)
         self.app.api_route(
             "/sessions/{sid}/{path:path}",
             methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -110,6 +141,11 @@ class SessionRouter:
         state = await self._ensure_state(sid)
         async with state.lock:
             state.closing = True
+            # Unblock any turn hung at the hang point so the session can drain
+            # and be torn down instead of deadlocking on continue_event.
+            state.hang_state = SESSION_RUNNING
+            state.marked_for_hang = False
+            state.continue_event.set()
 
         await state.drained.wait()
 
@@ -126,6 +162,20 @@ class SessionRouter:
 
         # Extract trajectory_id from request headers (set in add_session_headers)
         trajectory_id = self._extract_trajectory_id(request)
+
+        # Hang point: block at the entry of the next turn while the session is
+        # hung. Any in-flight turn (generate on SMG or an env step between turns)
+        # has already returned, so the whole session quiesces here without
+        # aborting in-flight work. Await the event OUTSIDE the lock so the
+        # coordinator can flip hang_state/continue_event concurrently.
+        while True:
+            async with state.lock:
+                if state.closing:
+                    return JSONResponse(status_code=409, content={"error": "session is closing"})
+                if state.hang_state != SESSION_HUNG:
+                    break
+                continue_event = state.continue_event
+            await continue_event.wait()
 
         async with state.lock:
             if state.closing:
@@ -170,6 +220,11 @@ class SessionRouter:
                     if version_tag is not None:
                         state.version_tag = version_tag
 
+                    # Update the session token footprint from the usage block.
+                    # usage.prompt_tokens already includes the full accumulated
+                    # TITO context, so prompt+completion is the live footprint.
+                    self._update_total_tokens(state, result)
+
                     # Check for out-of-order response arrival
                     current_turn = state.get_trajectory_turn(trajectory_id)
                     if current_turn != expected_turn:
@@ -188,6 +243,13 @@ class SessionRouter:
 
                     state.advance_trajectory_turn(trajectory_id)
 
+                # Deferred-hang conversion: a hang requested mid-turn takes effect
+                # now that this trajectory has returned and the session is idle.
+                if state.marked_for_hang and state.inflight == 0:
+                    state.marked_for_hang = False
+                    state.hang_state = SESSION_HUNG
+                    state.continue_event.clear()
+
         return self.build_response(result)
 
     async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
@@ -202,6 +264,118 @@ class SessionRouter:
             headers=headers,
         )
         return self.build_response(result)
+
+    # -------------------------------------------------------------------------
+    # Hang/continue control plane (coordinator-facing)
+    # -------------------------------------------------------------------------
+
+    async def control_list_sessions(self) -> Response:
+        """Return a snapshot of every live session for the coordinator scheduler."""
+        # Snapshot the states dict first so we don't hold states_lock while
+        # acquiring per-session locks.
+        items = list(self.states.items())
+        sessions = []
+        for sid, state in items:
+            async with state.lock:
+                sessions.append(
+                    {
+                        "session_id": sid,
+                        "base_worker_id": state.base_worker_id,
+                        "target_dp_rank": state.target_dp_rank,
+                        "status": state.status,
+                        "hang_state": state.hang_state,
+                        "inflight": state.inflight,
+                        "total_tokens": state.total_tokens,
+                        "marked_for_hang": state.marked_for_hang,
+                        "closing": state.closing,
+                    }
+                )
+        return JSONResponse(content={"sessions": sessions})
+
+    async def control_hang(self, request: Request) -> Response:
+        """Hang the given sessions.
+
+        Body: ``[{"session_id": ...}, ...]``. If a session is idle (env, no
+        in-flight turn) it is hung immediately; if a turn is in flight
+        (generate) the hang is deferred and applied at the next turn boundary.
+        """
+        payload = await self._read_control_ids(request)
+        applied, deferred, missing = [], [], []
+        for sid in payload:
+            state = self.states.get(sid)
+            if state is None:
+                missing.append(sid)
+                continue
+            async with state.lock:
+                if state.closing:
+                    missing.append(sid)
+                    continue
+                if state.inflight == 0:
+                    state.hang_state = SESSION_HUNG
+                    state.marked_for_hang = False
+                    state.continue_event.clear()
+                    applied.append(sid)
+                else:
+                    state.marked_for_hang = True
+                    deferred.append(sid)
+        return JSONResponse(
+            content={"hung": applied, "deferred": deferred, "missing": missing}
+        )
+
+    async def control_continue(self, request: Request) -> Response:
+        """Continue (un-hang) the given sessions.
+
+        Body: ``[{"session_id": ...}, ...]``.
+        """
+        payload = await self._read_control_ids(request)
+        applied, missing = [], []
+        for sid in payload:
+            state = self.states.get(sid)
+            if state is None:
+                missing.append(sid)
+                continue
+            async with state.lock:
+                state.marked_for_hang = False
+                state.hang_state = SESSION_RUNNING
+                state.continue_event.set()
+                applied.append(sid)
+        return JSONResponse(content={"continued": applied, "missing": missing})
+
+    @staticmethod
+    async def _read_control_ids(request: Request) -> list[str]:
+        """Parse a control request body into a list of session ids.
+
+        Accepts ``[{"session_id": ...}, ...]``, ``["sid", ...]``, or
+        ``{"sessions": [...]}``.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return []
+        if isinstance(body, dict):
+            body = body.get("sessions", [])
+        ids: list[str] = []
+        for item in body or []:
+            if isinstance(item, dict):
+                sid = item.get("session_id")
+            else:
+                sid = item
+            if sid is not None:
+                ids.append(str(sid))
+        return ids
+
+    @staticmethod
+    def _update_total_tokens(state: SessionState, result: HttpResponse) -> None:
+        """Update state.total_tokens from a chat-completion response's usage block."""
+        try:
+            usage = result.json().get("usage") or {}
+            prompt = int(usage.get("prompt_tokens", 0))
+            completion = int(usage.get("completion_tokens", 0))
+        except Exception:
+            return
+        footprint = prompt + completion
+        if footprint > state.total_tokens:
+            state.total_tokens = footprint
 
     async def _ensure_state(self, sid: str) -> SessionState:
         state = self.states.get(sid)

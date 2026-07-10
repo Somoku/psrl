@@ -18,9 +18,7 @@ def import_class_from_string(class_string: str) -> type:
         ValueError: If the string format is invalid
     """
     if ":" not in class_string:
-        raise ValueError(
-            f"Class string must be in format 'module.path:ClassName', got: {class_string}"
-        )
+        raise ValueError(f"Class string must be in format 'module.path:ClassName', got: {class_string}")
 
     module_path, class_name = class_string.split(":", 1)
 
@@ -31,9 +29,7 @@ def import_class_from_string(class_string: str) -> type:
     except ImportError as e:
         raise ImportError(f"Could not import module '{module_path}': {e}") from e
     except AttributeError as e:
-        raise ImportError(
-            f"Could not find class '{class_name}' in module '{module_path}': {e}"
-        ) from e
+        raise ImportError(f"Could not find class '{class_name}' in module '{module_path}': {e}") from e
 
 
 def lazy_import_to_globals(

@@ -98,8 +98,7 @@ def _is_scalar_request_idx(request_idx) -> bool:
 def _assert_scalar_request_idx(request_idx) -> None:
     if not _is_scalar_request_idx(request_idx):
         raise AssertionError(
-            "Request idx must be a list or a scalar integer, "
-            f"got {request_idx!r} (type={type(request_idx).__name__})"
+            f"Request idx must be a list or a scalar integer, got {request_idx!r} (type={type(request_idx).__name__})"
         )
 
 

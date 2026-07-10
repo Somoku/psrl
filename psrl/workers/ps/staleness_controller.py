@@ -50,6 +50,7 @@ class EntryInfo:
         prompt_id (int): The global unique prompt ID.
         request_idx (int | list[int]): The relative request ID(s) inside a group.
         model_version (int | list[int]): The model version(s) when generating this entry.
+        n_trajectory (int | list[int]): Number of trajectories represented by this entry.
     """
 
     rollout_instance_id: RolloutInstanceId | list[RolloutInstanceId]
@@ -58,7 +59,7 @@ class EntryInfo:
     # (i.e., higher than the final occupied buffer ID minus the staleness limit)
     request_idx: int | list[int]
     model_version: int | list[int]
-    n_trajectory: int | list[int]
+    n_trajectory: int | list[int] = 1
     is_validate: bool = False
 
     def __hash__(self):

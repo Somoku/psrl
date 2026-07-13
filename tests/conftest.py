@@ -2,11 +2,10 @@
 import importlib.util
 import os
 import sys
+import types
 from unittest.mock import MagicMock
 
 import pytest
-from psrl.workers.gen.utils import RolloutInstanceId  # = tuple[str, int]
-from psrl.workers.ps.staleness_controller import EntryInfo
 
 # ---------------------------------------------------------------------------
 # Load ray-dependent modules without triggering package __init__.py files.
@@ -25,6 +24,17 @@ def _load_module_direct(dotted_name: str, file_path: str) -> object:
     return mod
 
 
+def _fake_module(dotted_name: str, **attrs) -> object:
+    """Register a minimal module stub for CPU-only test collection."""
+    if dotted_name in sys.modules:
+        return sys.modules[dotted_name]
+    mod = types.ModuleType(dotted_name)
+    for name, value in attrs.items():
+        setattr(mod, name, value)
+    sys.modules[dotted_name] = mod
+    return mod
+
+
 _HERE = os.path.dirname(__file__)
 _PSRL = os.path.join(_HERE, "../psrl")
 
@@ -32,19 +42,23 @@ _PSRL = os.path.join(_HERE, "../psrl")
 if "psrl.utils.logger" not in sys.modules:
     sys.modules["psrl.utils.logger"] = MagicMock()
 
-# Load gen.utils directly (avoids ray via gen/__init__.py)
-_load_module_direct(
+# Provide only the names needed by staleness_controller without importing
+# gen.utils, which imports torch at module load time.
+_gen_utils = _fake_module(
     "psrl.workers.gen.utils",
-    os.path.join(_PSRL, "workers/gen/utils.py"),
+    RolloutInstanceId=tuple[str, int],
+    INVALID_ROLLOUT_INSTANCE_ID=("", -1),
 )
+RolloutInstanceId = _gen_utils.RolloutInstanceId
 
 # Load staleness_controller directly (avoids ray via ps/__init__.py)
-_load_module_direct(
+_staleness_controller = _load_module_direct(
     "psrl.workers.ps.staleness_controller",
     os.path.join(_PSRL, "workers/ps/staleness_controller.py"),
 )
+EntryInfo = _staleness_controller.EntryInfo
 
-# ── Ray cluster fixtures (used by integration tests only) ────────────────────
+# Ray cluster fixtures (used by integration tests only)
 
 
 @pytest.fixture(scope="session")
@@ -80,7 +94,7 @@ def ray_cluster_fn(ray_cluster):
             warnings.warn(f"Failed to kill Ray actor {actor_info.get('name', '?')}: {e}", stacklevel=2)
 
 
-# ── Shared data helpers (cpu_test safe) ─────────────────────────────────────
+# Shared data helpers (cpu_test safe)
 
 
 @pytest.fixture

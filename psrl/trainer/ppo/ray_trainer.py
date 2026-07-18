@@ -85,7 +85,6 @@ from psrl.utils.post_processor import (
 from psrl.utils.server.command import Command, CommandType
 from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
-from psrl.workers.agent_loop.router import RolloutRouter
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway
@@ -294,8 +293,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self.replay_buffer = ReplayBuffer(poll_interval=0.1)
 
-        # Rollout gateway handle
-        self.rollout_gateway = None
+        # Rollout gateway lifecycle and endpoints.
+        self.rollout_gateway_url: str | None = None
+        self.session_router_url: str | None = None
 
         # HTTP session for rollout gateway control
         self._gateway_http_session = requests.Session()
@@ -371,15 +371,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         self._init_ps_manager()
 
-        # NOTE(linsh): Create the rollout router/gateway early so it can boot
+        # NOTE(linsh): Create the rollout gateway early so it can boot
         # during the remaining __init__ work (tokenizer, data processor, etc.).
         # This overlaps gateway cold-boot with other initialization,
         # reducing router wait in init_workers.
-        self.init_rollout_router()
-        if self.config.psrl.rollout_gateway.enable:
-            self._launch_router_future = self.rollout_router.launch_router.remote()
-        else:
-            self._launch_router_future = None
+        self.rollout_gateway = self.init_rollout_gateway()
+        self._launch_gateway_future = self.rollout_gateway.launch_router.remote()
 
         # initialize data processor
         # NOTE(lhy): data processor must be initialized before initializing other workers
@@ -570,25 +567,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             psrl_logger.warning("Agent loop manager is not initialized, skipping stop operation.")
 
-    def init_rollout_router(self):
-        if self.config.psrl.rollout_gateway.enable:
-            self.rollout_router = RolloutGateway.remote(
-                self.config,
-                self.config.psrl.ps_manager_ip,
-                self.ps_manager_grpc_port,
-            )
-        else:
-            self.rollout_router = RolloutRouter.options(max_concurrency=self.max_concurrency).remote(
-                self.config,
-                self.ps_manager_handle,
-                self.tokenizer,
-            )
-            self.rollout_gateway_url = None
-            self.session_router_url = None
+    def init_rollout_gateway(self) -> ray.actor.ActorHandle:
+        return RolloutGateway.remote(
+            self.config,
+            self.config.psrl.ps_manager_ip,
+            self.ps_manager_grpc_port,
+        )
 
     def init_rollout_coordinator(self):
-        assert self.rollout_router is not None, (
-            "Rollout router must be initialized before initializing rollout coordinator."
+        assert self.rollout_gateway_url is not None, (
+            "Rollout gateway URL must be initialized before initializing rollout coordinator."
         )
         self.rollout_coordinator = (
             ray.remote(RolloutCoordinator)
@@ -600,7 +588,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             .remote(
                 self.config,
                 self.ps_manager_handle,
-                self.rollout_gateway_url if self.config.psrl.rollout_gateway.enable else self.rollout_router,
+                self.rollout_gateway_url,
                 self.session_router_url,
             )
         )
@@ -1325,22 +1313,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         asyncio.run(run_all())
 
     def register_rollout_servers(self, rollout_replicas: list[PSRL_vLLMReplica]):
+        assert self.rollout_gateway_url is not None, "Rollout gateway URL is not initialized."
         futures = []
-        # 1. register to rollout router
+        # Register servers with the SMG rollout gateway.
         for replica in rollout_replicas:
-            if self.config.psrl.rollout_gateway.enable:
-                futures.append(replica.servers[0].register_server_to_gateway.remote(self.rollout_gateway_url))
-            else:
-                futures.append(
-                    self.rollout_router.add_worker.remote(
-                        replica.servers[0],
-                        str(replica.get_replica_id()),
-                        replica.data_parallel_size,
-                        replica.tensor_parallel_size,
-                        replica.pipeline_parallel_size,
-                        is_validate=False if replica.tag == "rollout" else True,
-                    )
-                )
+            futures.append(replica.servers[0].register_server_to_gateway.remote(self.rollout_gateway_url))
         results = ray.get(futures)
 
         # 2. register to ps manager
@@ -1812,14 +1789,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             actor_nixl_futures = None
 
-        if self.config.psrl.rollout_gateway.enable:
-            self.rollout_gateway_url = ray.get(self._launch_router_future)
-            self.session_router_url = ray.get(self.rollout_router.launch_session_router.remote())
-            psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}")
-            psrl_logger.info(f"Session router launched at {self.session_router_url}")
+        self.rollout_gateway_url = ray.get(self._launch_gateway_future)
+        self.session_router_url = ray.get(self.rollout_gateway.launch_session_router.remote())
+        psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}.")
+        psrl_logger.info(f"Session router launched at {self.session_router_url}.")
 
         # create agent loop workers
-        rollout_router = self.rollout_gateway_url if self.config.psrl.rollout_gateway.enable else self.rollout_router
         self.agent_loop_workers = []
         num_agent_workers = self.config.gen_actor_rollout_ref.rollout.agent.num_workers
         max_concurrency_per_worker = max(1, self.max_concurrency // num_agent_workers)
@@ -1836,7 +1811,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
-                    rollout_router,
+                    self.rollout_gateway_url,
                     self.session_router_url,
                     worker_id=i,
                     worker_num=num_agent_workers,
@@ -2058,23 +2033,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ray.get(self.rollout_coordinator.sleep.remote("validate"))
             # Pause validate instances in the router before sleeping them, so that the router
             # does not route rollout requests to validate instances that are in sleep state.
-            if self.config.psrl.rollout_gateway.enable:
-                paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
+            paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
+            psrl_logger.warning(f"[INIT-PAUSE] Paused base worker IDs: {paused_base_worker_ids!r}.")
+            if paused_base_worker_ids:
                 psrl_logger.warning(
-                    f"[INIT-PAUSE] rollout_gateway.enable=True, paused_base_worker_ids={paused_base_worker_ids}"
+                    f"[INIT-PAUSE] Pausing {len(paused_base_worker_ids)} validate instances "
+                    f"in the gateway after sleep: {paused_base_worker_ids!r}."
                 )
-                if paused_base_worker_ids:
-                    psrl_logger.warning(
-                        f"[INIT-PAUSE] Pausing {len(paused_base_worker_ids)} validate instances "
-                        f"in gateway after sleep: {paused_base_worker_ids}"
-                    )
-                    self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
-                    psrl_logger.warning("[INIT-PAUSE] Pause call completed successfully")
-            else:
-                init_paused_instance_ids = list(
-                    range(self.n_rollout_instances, self.n_rollout_instances + self.n_validate_instances)
-                )
-                ray.get(self.rollout_router.pause_instances.remote(init_paused_instance_ids))
+                self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
+                psrl_logger.warning("[INIT-PAUSE] Pause call completed successfully.")
 
             psrl_logger.info("Initializing actor model")
             self.actor_wg = all_wg["actor"]
@@ -2234,11 +2201,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("Step 6 - Resuming validation instances...")
         # resume validation instances in router and coordinator
-        if self.config.psrl.rollout_gateway.enable:
-            resumed_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-            self._post_gateway_worker_routing_control("resume", resumed_base_worker_ids)
-        else:
-            ray.get(self.rollout_router.resume_instances.remote(resumed_instance_ids))
+        resumed_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
+        self._post_gateway_worker_routing_control("resume", resumed_base_worker_ids)
 
         self.is_rollout_mode_in_actor = True
 
@@ -2268,16 +2232,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         psrl_logger.info("Step 1 - Pausing validation instances...")
         # pause validation instances in router and coordinator
-        paused_instance_ids = []
-        validate_dp_size = self.config.train_actor_rollout_ref.rollout.data_parallel_size
-        for base_worker_id in self.tag_to_base_worker_ids.get("validate", []):
-            paused_instance_ids.extend((base_worker_id, i) for i in range(validate_dp_size))
-
-        if self.config.psrl.rollout_gateway.enable:
-            paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-            self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
-        else:
-            ray.get(self.rollout_router.pause_instances.remote(paused_instance_ids))
+        paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
+        self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
 
         psrl_logger.info("Step 2 - Interrupting generation of validation instances...")
         # interrupt generation and sleep
@@ -2337,11 +2293,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # The workers/update_weight_version update (Step 5-6) goes through UpdateWorkerPropertiesStep
         # which replaces worker objects, resetting their paused state to False.
         # We must re-pause here to ensure validate workers don't receive rollout requests.
-        if self.config.psrl.rollout_gateway.enable:
-            psrl_logger.info("Step 7.5 - Re-pausing validation instances in gateway after version sync...")
-            paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
-            if paused_base_worker_ids:
-                self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
+        psrl_logger.info("Step 7.5 - Re-pausing validation instances in gateway after version sync...")
+        paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
+        if paused_base_worker_ids:
+            self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
 
         self.is_rollout_mode_in_actor = False
 

@@ -33,7 +33,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
     def __init__(
         self,
         trainer_config: DictConfigWrap,
-        rollout_router: ray.actor.ActorHandle | str,
+        rollout_gateway_url: str,
         reward_manager: ray.actor.ActorHandle,
         ps_manager_handle: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
@@ -44,7 +44,7 @@ class MultiTurnAgentLoop(AgentLoopBase):
     ):
         super().__init__(
             trainer_config=trainer_config,
-            rollout_router=rollout_router,
+            rollout_gateway_url=rollout_gateway_url,
             reward_manager=reward_manager,
             ps_manager_handle=ps_manager_handle,
             tokenizer=tokenizer,

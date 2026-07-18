@@ -18,7 +18,7 @@ class CommandHandlerMixin:
     """Provides ``_command_handler_loop`` for RolloutCoordinator.
 
     Expects ``self`` to carry: ``command_queue``, ``stop_command_handler``,
-    ``server_handles``, ``use_rust_gateway``, ``rollout_router``, and the
+    ``server_handles`` and the
     ``_set_routing_loop_running`` / ``_do_sleep_instance`` / ``_do_wake_up_instance``
     methods provided by ``CoordinatorBase`` / ``RolloutCoordinator``.
     """
@@ -157,10 +157,7 @@ class CommandHandlerMixin:
 
                     # Pause routing to prevent new requests from being dispatched
                     # to the instances that are going to sleep
-                    if self.use_rust_gateway:
-                        await self._set_routing_loop_running(False)
-                    else:
-                        await self.rollout_router.pause_routing.remote()
+                    await self._set_routing_loop_running(False)
 
                     sleep_futures = []
                     for instance_id in instance_ids:
@@ -185,10 +182,7 @@ class CommandHandlerMixin:
                     await asyncio.gather(*wake_up_futures)
 
                     # Resume routing after the instances have woken up
-                    if self.use_rust_gateway:
-                        await self._set_routing_loop_running(True)
-                    else:
-                        await self.rollout_router.resume_routing.remote()
+                    await self._set_routing_loop_running(True)
 
                     self._complete_command(command_id, None)
                 else:

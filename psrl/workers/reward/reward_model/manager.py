@@ -61,7 +61,7 @@ class RewardModelManager:
         self.reward_model_coordinator = ray.remote(RewardModelCoordinator).remote(
             config,
             reward_model_config,
-            rollout_router=self.gateway_url,
+            rollout_gateway_url=self.gateway_url,
         )
 
         # ── Replicas ─────────────────────────────────────────────────────────
@@ -72,7 +72,6 @@ class RewardModelManager:
         self._register_reward_servers(self.replicas)
 
         ray.get(self.reward_model_coordinator.start_busy_loop.remote())
-        ray.get(self.reward_model_coordinator.set_gateway_url.remote(gateway_url))
 
         psrl_logger.info(
             "RewardModelManager for '%s' initialized with %d replica(s).",

@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from psrl.workers.gen.smg_adapter import (
     CACHE_AWARE_METHODS,
     _cache_aware_cfg,
@@ -29,7 +28,9 @@ def _make_config(**routing_strategy_overrides):
     }
     return SimpleNamespace(
         psrl=SimpleNamespace(
-            routing_strategy=SimpleNamespace(**routing_strategy),
+            rollout_coordination=SimpleNamespace(
+                routing_strategy=SimpleNamespace(**routing_strategy),
+            ),
             rollout_gateway=SimpleNamespace(tito_debug=False, tito_gc_threshold=None),
             logging_path=None,
         ),

@@ -604,11 +604,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         start_time = time.time()
         kv_transfer_cfg = self.psrl_config.rollout_coordination.routing_strategy.get("kv_transfer", {})
         kv_transfer_enabled = bool(kv_transfer_cfg.get("enable", False))
-        stats_log_interval_s = (
-            float(kv_transfer_cfg.get("stats_log_interval_s", 30))
-            if kv_transfer_enabled
-            else 0.0
-        )
+        stats_log_interval_s = float(kv_transfer_cfg.get("stats_log_interval_s", 30)) if kv_transfer_enabled else 0.0
         servicer = VllmEngineServicer(
             engine_client,
             start_time,
@@ -721,8 +717,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 last_error = str(exc)
 
             psrl_logger.debug(
-                "Waiting for gRPC servicer before gateway registration: replica=%s target=%s "
-                "attempt=%d error=%s",
+                "Waiting for gRPC servicer before gateway registration: replica=%s target=%s attempt=%d error=%s",
                 self.get_replica_idx(),
                 self._grpc_health_probe_target(),
                 attempt,
@@ -863,8 +858,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             return  # reward model: no PS instance registration
         if hasattr(self, "_is_rollout_instance_registered"):
             return
-        if not self.psrl_config.rollout_gateway.enable:
-            self.base_worker_id = str(self.get_replica_idx())
         rollout_instance_ids = [(self.base_worker_id, i) for i in range(self.get_instance_num())]
         await self.gen_interface.ps_manager_handle.register_rollout_instance.remote(rollout_instance_ids)
         self.curr_rollout_instance_model_version = [0] * self.get_instance_num()
@@ -1350,7 +1343,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             worker_zmq_urls: This replica's rank-sorted local LMCacheWorker ZMQ URLs.
         """
         assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)    
+        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
         """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""

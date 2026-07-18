@@ -460,10 +460,6 @@ lmcache:
   gpu_pin_block_budget: 0
 
 rollout_gateway:
-
-  # Whether to enable rollout gateway
-  enable: True
-
   # Max HTTP generation concurrency per rollout server.
   # The global HTTP budget is
   # server_max_concurrency * number_of_active_rollout_servers.

@@ -45,7 +45,7 @@ class PSRL_AgentLoopWorker:
         self,
         config: DictConfig,
         ps_manager_handle: ray.actor.ActorHandle,
-        rollout_router: ray.actor.ActorHandle | str,
+        rollout_gateway_url: str,
         session_router_url: str,
         worker_id: int = 0,
         worker_num: int = 1,
@@ -55,7 +55,7 @@ class PSRL_AgentLoopWorker:
         Args:
             config (DictConfig): Configuration containing model and rollout settings.
             ps_manager_handle (ray.actor.ActorHandle): Handle to the parameter server manager.
-            rollout_router (ray.actor.ActorHandle | str): Handle to the rollout router actor.
+            rollout_gateway_url (str): HTTP base URL of the SMG rollout gateway.
             session_router_url (str): URL of the session router.
             worker_id (int): Unique identifier for this worker instance.
             worker_num (int): Total number of worker instances.
@@ -103,7 +103,7 @@ class PSRL_AgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
 
-        self.rollout_router = rollout_router
+        self.rollout_gateway_url = rollout_gateway_url
         self.session_router_url = session_router_url
         self.ps_manager_handle = ps_manager_handle
         self.agent_loop_manager = None
@@ -371,7 +371,7 @@ class PSRL_AgentLoopWorker:
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
-                rollout_router=self.rollout_router,
+                rollout_gateway_url=self.rollout_gateway_url,
                 reward_manager=self.reward_manager,
                 ps_manager_handle=self.ps_manager_handle,
                 tokenizer=self.tokenizer,

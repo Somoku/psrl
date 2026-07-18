@@ -25,7 +25,7 @@ class SessionAgentLoop(AgentLoopBase):
     def __init__(
         self,
         trainer_config: DictConfigWrap,
-        rollout_router: ray.actor.ActorHandle | str,
+        rollout_gateway_url: str,
         reward_manager: ray.actor.ActorHandle,
         ps_manager_handle: ray.actor.ActorHandle,
         tokenizer: AutoTokenizer,
@@ -36,7 +36,7 @@ class SessionAgentLoop(AgentLoopBase):
     ):
         super().__init__(
             trainer_config=trainer_config,
-            rollout_router=rollout_router,
+            rollout_gateway_url=rollout_gateway_url,
             reward_manager=reward_manager,
             ps_manager_handle=ps_manager_handle,
             tokenizer=tokenizer,
@@ -61,7 +61,9 @@ class SessionAgentLoop(AgentLoopBase):
             "x-prompt-id": str(request.get("parent_id", request_id)),
             "x-version-tag": str(request.get("version_tag", 0)),
             "x-is-validate": str(request.get("validate", False)).lower(),
-            "x-is-sticky": str(bool(self.config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky)).lower(),
+            "x-is-sticky": str(
+                bool(self.config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky)
+            ).lower(),
             "x-smg-tito-trajectory-id": str(request.get("trajectory_id", 0)),
         }
         rollout_instance_id = request.get("rollout_instance_id")

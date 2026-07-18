@@ -1355,11 +1355,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     def kv_set_current_version(self, version: int) -> None:
         """
-        Set the current model version for KV cache tagging.
+        Commit this replica's actual model version for KV cache tagging.
 
-        Called by `RolloutCoordinator._broadcast_kv_current_version()` after a
-        weight sync completes and before the router admission loop is reopened,
-        ensuring every new request after this point carries the updated version tag.
+        The version is written locally only after this replica has completed its
+        weight pull. This keeps LMCache tags aligned with the weights that produced
+        the KV tensors and avoids advancing unrelated replicas.
 
         Args:
             version (int): The new model version number.
@@ -1374,7 +1374,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         data_parallel_rank = 0  # take dp 0 as representative for the replica
 
         if self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version:
-            return self.curr_rollout_instance_model_version[data_parallel_rank]
+            curr_model_version = self.curr_rollout_instance_model_version[data_parallel_rank]
+            self.kv_set_current_version(curr_model_version)
+            return curr_model_version
 
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
             with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
@@ -1383,18 +1385,19 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         curr_model_version = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(
             (self.base_worker_id, data_parallel_rank)
         )
+        assert curr_model_version >= ps_version, (
+            f"Current rollout instance model version should not be less than the required PS version, "
+            f"but got {curr_model_version} vs. {ps_version}."
+        )
         for dp_rank in data_parallel_ranks:
             self.curr_rollout_instance_model_version[dp_rank] = curr_model_version
+        self.kv_set_current_version(curr_model_version)
 
-        assert self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version, (
-            f"Current rollout instance model version should not be less than the required PS version, "
-            f"but got {self.curr_rollout_instance_model_version[data_parallel_rank]} vs. {ps_version}"
-        )
-        if self.curr_rollout_instance_model_version[data_parallel_rank] > ps_version:
+        if curr_model_version > ps_version:
             psrl_logger.warning(
                 f"Actual model version after pull (partial rollout) is "
-                f"{self.curr_rollout_instance_model_version[data_parallel_rank]}, "
-                f"which is higher than the required PS version {ps_version}"
+                f"{curr_model_version}, "
+                f"which is higher than the required PS version {ps_version}."
             )
         if self.stat_collector is not None:
             for dp_rank in data_parallel_ranks:

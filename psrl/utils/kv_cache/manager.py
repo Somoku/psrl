@@ -198,9 +198,9 @@ class KVCacheManager:
         """
         Set the current model version used to tag new KV cache entries.
 
-        Called by the gen server after the rollout coordinator broadcasts the
-        new version following a weight sync.  Affects all subsequent KV store
-        and P2P transfer operations on this instance.
+        Called locally by the gen server after this replica completes a weight
+        pull and reads back its actual model version. Affects all subsequent KV
+        store and P2P transfer operations on this instance.
 
         Args:
             version (int): The new model version number (monotonically increasing).

@@ -634,20 +634,6 @@ class RolloutCoordinator(
             f"({total_ranks} ranks total): {len(peer_registry)} instances with peers."
         )
 
-    async def _broadcast_kv_current_version(self, version: int) -> None:
-        """
-        Broadcast the current model version to all gen-server actors so that
-        subsequent KV store/retrieve calls tag entries with this version.
-
-        Must be called after all in-flight requests have looped back and before
-        the router admission loop is re-opened, so the first new request after
-        router re-open uses the updated version tag.
-        """
-        server_items = self._get_ordered_server_items("all")
-        futures = [server_handle.kv_set_current_version.remote(version) for _, _, server_handle in server_items]
-        await asyncio.gather(*futures)
-        psrl_logger.info(f"[LMCache] Broadcast kv_current_version={version} to {len(server_items)} replicas.")
-
     def start_lmcache_controller(self) -> str:
         """
         Start the LMCache Controller subprocess (synchronous, non-async).

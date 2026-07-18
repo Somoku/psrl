@@ -27,8 +27,8 @@ class SyncAndMigrateMixin:
     ``instance_to_version_after_sync``, ``model_sync_tasks``, ``replica_sync_tasks``,
     ``ps_model_version``, ``ps_manager``,
     ``config``, ``command_queue``, and the ``_gateway_post/get_json``,
-    ``_set_routing_loop_running``, ``exec_command``, ``set_rollout_instance_model_version``,
-    ``_broadcast_kv_current_version`` methods.
+    ``_set_routing_loop_running``, ``exec_command``, and
+    ``set_rollout_instance_model_version`` methods.
     """
 
     def _expand_replica_instance_ids(self, instance_ids: list[RolloutInstanceId]) -> list[RolloutInstanceId]:
@@ -167,9 +167,6 @@ class SyncAndMigrateMixin:
                     and self.config.psrl.rollout_coordination.partial_rollout.enable
                 ):
                     await self._wait_interrupted_partial_requests_loop_back(instance_ids)
-
-                if self.config.psrl.lmcache.multi_version_kv:
-                    await self._broadcast_kv_current_version(self.ps_model_version)
 
                 pull_futures = [
                     self.server_handles[replica_id].pull_model_for_sync.remote(self.ps_model_version)

@@ -63,7 +63,11 @@ psrl/
 │   ├── main_ppo.py               # Hydra entry: TransferQueue init → TaskRunner → trainer.fit()
 │   ├── constants_ppo.py          # Env vars, Ray runtime config, resource names
 │   ├── ppo/
-│   │   ├── ray_trainer.py        # PSRL_RayPPOTrainer — main training loop (~3476 lines)
+│   │   ├── ray_trainer.py        # PSRL_RayPPOTrainer — main training loop
+│   │   ├── strategies/           # ★ Pluggable training step orchestration
+│   │   │   ├── base.py           # StepStrategy(ABC), STAGE_META, build_step_strategy
+│   │   │   ├── full_batch.py     # FullBatchStepStrategy — default full-batch step
+│   │   │   └── fine_grain_overlap.py  # FineGrainOverlapStrategy — chunk-pipelined step
 │   │   └── utils.py              # Helpers + PSRL_Role enum (moved here)
 │   └── config/                   # ★ Configuration system (see §4)
 │       ├── __init__.py           # Re-exports ALL veRL trainer configs (AlgoConfig etc. come from veRL)
@@ -312,7 +316,8 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 
 | Class | File | Role |
 |-------|------|------|
-| `PSRL_RayPPOTrainer` | `trainer/ppo/ray_trainer.py` | Main training loop orchestrator (~3476 lines) |
+| `PSRL_RayPPOTrainer` | `trainer/ppo/ray_trainer.py` | Main training loop orchestrator |
+| `StepStrategy` | `trainer/ppo/strategies/base.py` | ABC for training step; `FullBatchStepStrategy` (default) and `FineGrainOverlapStrategy` (chunk-pipelined) are the concrete implementations |
 | `TaskRunner` | `trainer/main_ppo.py` | Ray driver: builds worker groups, inits TransferQueue, elastic_rm/reward pools |
 | `DataProcessor` | `utils/dataset/data_processor.py` | Ray actor: dataset loading, batching, TransferQueue producer |
 
@@ -539,6 +544,7 @@ Run with pytest under the psrl conda env.
 | File | Lines | Why it matters |
 |------|-------|---------------|
 | `trainer/ppo/ray_trainer.py` | ~3476 | THE main training loop — start here for any training question |
+| `trainer/ppo/strategies/` | — | Step orchestration: `base.py` (StepStrategy ABC), `full_batch.py`, `fine_grain_overlap.py` |
 | `workers/ps/ps_manager.py` | ~1373 | Central coordination point for all workers (also gRPC-served) |
 | `workers/gen/gen_worker.py` | ~1373 | vLLM generation + model pull logic |
 | `workers/ps/staleness_controller.py` | ~1365 | THE staleness system — core async innovation |
@@ -574,6 +580,7 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | I want to... | Go to |
 |--------------|-------|
 | Understand the training loop | `trainer/ppo/ray_trainer.py::fit()` |
+| Understand / extend the step pipeline | `trainer/ppo/strategies/` — `base.py` for the ABC, `full_batch.py` for the default path, `fine_grain_overlap.py` for chunk-overlap |
 | Change PPO hyperparameters | veRL configs (re-exported) + `psrl/trainer/config/psrl/psrl.yaml` |
 | Understand rollout routing / SMG | `docs/design/router_tito.md`, `workers/gen/smg_adapter.py`, `rollout_gateway.py` |
 | Change weight-sync / request migration | `workers/gen/rollout_coordination/sync_and_migrate/` + `sync_and_mig_strategy.yaml` |

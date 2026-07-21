@@ -89,6 +89,9 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         enable_kv_admission_control=bool(
             cfg_get(config, "psrl.rollout_coordination.routing_strategy.admission_reject_on_waiting", False)
         ),
+        kv_capacity_threshold=float(
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_capacity_threshold", 1.0)
+        ),
         eviction_interval_secs=int(_cache_aware_cfg(config, "eviction_interval_secs", 60)),
         max_tree_size=int(_cache_aware_cfg(config, "max_tree_size", 2**26)),
         block_size=int(_cache_aware_cfg(config, "block_size", 16)),

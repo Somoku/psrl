@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_low_gpu_perf
-experiment_name=max_waiting_zero_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=max_waiting_1_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -158,7 +158,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.staleness_buffer_entries=${train_prompt_bsz} \
     psrl.ps_mode=nixl_cpu \
     psrl.lmcache.enable=True \
-    psrl.lmcache.enable_p2p=True \
+    psrl.lmcache.enable_p2p=False \
     psrl.rollout_coordination.routing_strategy.kv_transfer.enable=False \
     psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode=async \
     psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=0 \

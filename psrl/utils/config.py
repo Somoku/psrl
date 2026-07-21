@@ -2,6 +2,97 @@ from omegaconf import DictConfig
 from verl.utils.config import omega_conf_to_dataclass
 
 
+def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
+    """
+    Resolve the effective granularity and chunk size (in prompt-groups) for `fine_grain_overlap`.
+
+    A "prompt-group" is one prompt with all its `rollout_n` trajectories.
+    `chunk_groups` = number of prompt-groups per chunk.
+
+    Clamping rules:
+    - `micro_batch * multiplier > mini_batch` => clamp to `mini_batch`.
+    - `mini_batch * multiplier > full_batch` => clamp to `none` (full batch).
+
+    Args:
+        config: OmegaConf DictConfig with `psrl`, `data`, `gen_actor_rollout_ref`,
+            and `train_actor_rollout_ref` keys.
+        dp_size (int): Data-parallel size for the training actor.
+
+    Returns:
+        tuple[str, int]: Effective granularity string and `chunk_groups` count.
+
+    Raises:
+        ValueError: If `multiplier < 1`, granularity is unknown, required fields are
+            missing, or the resolved chunk is not divisible by `rollout_n` or `dp_size`.
+    """
+    fgo = config.psrl.get("fine_grain_overlap", None)
+    if fgo is None:
+        granularity = "none"
+    else:
+        granularity = str(fgo.get("granularity", "none"))
+    multiplier = int(fgo.get("multiplier", 1)) if fgo is not None else 1
+
+    if multiplier < 1:
+        raise ValueError(
+            f"psrl.fine_grain_overlap.multiplier must be >= 1, got {multiplier}"
+        )
+
+    rollout_n = config.gen_actor_rollout_ref.rollout.n
+    full_batch_samples = config.data.train_batch_size * rollout_n
+    full_batch_groups = config.data.train_batch_size  # train_batch_size is already in prompts
+
+    if granularity == "none":
+        return "none", full_batch_groups
+
+    mini_samples = config.train_actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
+
+    if granularity == "micro_batch":
+        if config.train_actor_rollout_ref.actor.get("use_dynamic_bsz", False):
+            raise ValueError(
+                "psrl.fine_grain_overlap.granularity=micro_batch is not compatible with "
+                "use_dynamic_bsz=True (micro_batch granularity requires a static "
+                "ppo_micro_batch_size_per_gpu)."
+            )
+        micro_per_gpu = config.train_actor_rollout_ref.actor.get("ppo_micro_batch_size_per_gpu")
+        if micro_per_gpu is None:
+            raise ValueError(
+                "psrl.fine_grain_overlap.granularity=micro_batch requires "
+                "train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu to be set"
+            )
+        base_samples = micro_per_gpu * dp_size
+        chunk_samples = base_samples * multiplier
+        if chunk_samples > mini_samples:
+            granularity = "mini_batch"
+            chunk_samples = mini_samples
+    elif granularity == "mini_batch":
+        chunk_samples = mini_samples * multiplier
+    else:
+        raise ValueError(
+            f"psrl.fine_grain_overlap.granularity must be one of "
+            f"'none', 'mini_batch', 'micro_batch'; got '{granularity}'"
+        )
+
+    if chunk_samples > full_batch_samples:
+        granularity = "none"
+        chunk_samples = full_batch_samples
+
+    if chunk_samples % rollout_n != 0:
+        raise ValueError(
+            f"Resolved chunk_samples ({chunk_samples}) is not divisible by rollout_n ({rollout_n}). "
+            "Chunks must be prompt-group-aligned. Adjust ppo_mini_batch_size or multiplier."
+        )
+
+    chunk_groups = chunk_samples // rollout_n
+
+    if chunk_groups % dp_size != 0:
+        raise ValueError(
+            f"chunk_groups ({chunk_groups}) must be divisible by dp_size ({dp_size}) "
+            "for balance packing. Adjust ppo_mini_batch_size, multiplier, or dp_size."
+        )
+
+    return granularity, chunk_groups
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -241,5 +332,66 @@ def validate_config(
             "is True (sticky sessions re-route to their current instance; global continue would "
             "mismatch)."
         )
+
+    # ---- fine_grain_overlap validation ----
+    fgo = config.psrl.get("fine_grain_overlap", None)
+    if fgo is not None and str(fgo.get("granularity", "none")) != "none":
+        train_n_gpus_fgo = (
+            config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
+        )
+        actor_strategy = config.train_actor_rollout_ref.actor.strategy
+        dp_size_fgo = train_n_gpus_fgo  # FSDP dp_size == train_n_gpus (no model parallelism for FSDP)
+        if actor_strategy == "megatron":
+            mp = (
+                config.train_actor_rollout_ref.actor.megatron.tensor_model_parallel_size
+                * config.train_actor_rollout_ref.actor.megatron.pipeline_model_parallel_size
+            )
+            dp_size_fgo = train_n_gpus_fgo // (
+                mp * config.train_actor_rollout_ref.actor.megatron.context_parallel_size
+            )
+
+        overlap_scope = str(fgo.get("overlap_scope", "recompute"))
+        granularity = str(fgo.get("granularity", "none"))
+        multiplier = int(fgo.get("multiplier", 1))
+
+        if multiplier < 1:
+            raise ValueError("psrl.fine_grain_overlap.multiplier must be >= 1.")
+
+        if config.psrl.colocate:
+            raise ValueError("psrl.fine_grain_overlap is not supported with psrl.colocate=True.")
+
+        effective_gran, chunk_groups = resolve_fine_grain_chunk_size(config, dp_size_fgo)
+
+        ppo_epochs = config.train_actor_rollout_ref.actor.get("ppo_epochs", 1)
+        if overlap_scope == "pre_step" and ppo_epochs > 1:
+            raise ValueError(
+                "psrl.fine_grain_overlap.overlap_scope=pre_step is not compatible with "
+                f"ppo_epochs={ppo_epochs} > 1 (streaming accumulation cannot revisit chunks). "
+                "Set ppo_epochs=1 or use overlap_scope=recompute."
+            )
+
+        if granularity == "micro_batch" and overlap_scope == "pre_step":
+            if actor_strategy == "megatron":
+                raise ValueError(
+                    "micro_batch + pre_step is not supported for actor.strategy=megatron. "
+                    "Use fsdp2 or set overlap_scope=recompute."
+                )
+
+        adv_estimator = str(config.algorithm.get("adv_estimator", "gae"))
+        if overlap_scope == "pre_step" and adv_estimator not in ("grpo", "grpo_vectorized", "grpo_passk"):
+            print(
+                f"WARNING: psrl.fine_grain_overlap.overlap_scope=pre_step with "
+                f"adv_estimator={adv_estimator}: per-chunk advantage normalization "
+                "differs from full-batch normalization (masked_whiten scope changes). "
+                "Use adv_estimator=grpo for exact equivalence."
+            )
+
+        reward_norm_mode = config.psrl.get("reward_normalization", "group")
+        if str(reward_norm_mode) == "batch" and str(fgo.get("granularity", "none")) != "none":
+            print(
+                "WARNING: psrl.fine_grain_overlap with reward_normalization='batch': "
+                "per-chunk reward normalization uses chunk-level statistics, not full-batch statistics. "
+                "Use reward_normalization='group' for exact equivalence with the full-batch path."
+            )
 
     print("[validate_config] All configuration checks passed successfully!")

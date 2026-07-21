@@ -22,6 +22,17 @@ staleness: 0
 # Size of each staleness buffer (i.e. training batch)
 staleness_buffer_entries: 512
 
+# Fine-grained overlap between rollout and training.
+# Allows starting training stages before the full batch is collected.
+# granularity: none (default, full batch) | mini_batch | micro_batch
+# multiplier:  int >= 1; chunk_size = base_unit * multiplier, clamped to full batch
+# overlap_scope: recompute (forward stages only, math identical to none)
+#              | pre_step  (also do advantage+update per chunk; GRPO recommended)
+fine_grain_overlap:
+  granularity: none
+  multiplier: 1
+  overlap_scope: recompute
+
 # number of responses (i.e. num sample times). > 1 for grpo
 rollout_n: 1
 

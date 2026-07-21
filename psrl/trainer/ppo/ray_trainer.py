@@ -317,6 +317,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.ps_manager_handle = None
         self.ps_manager_grpc_port = None
 
+        # Last validation metrics (set by FullBatchStepStrategy at the final step).
+        # Initialised to None so callers never get AttributeError when no validation ran.
+        self._last_val_metrics = None
+
         # Async rollout mode for training worker
         self.async_rollout_mode = False
 
@@ -3234,7 +3238,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
-        last_val_metrics = None
+        from psrl.trainer.ppo.strategies import build_step_strategy
+        self._step_strategy = build_step_strategy(
+            self.config.psrl.get("fine_grain_overlap", None),
+            trainer=self,
+        )
         self.max_steps_duration = 0
 
         prev_step_profile = False
@@ -3256,36 +3264,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             is_last_step = self.global_steps == self.total_training_steps
 
             with marked_timer("step", timing_raw):
-                # Wait for the training batch to be ready
-                # AGENT(VERL): wait for train batch first in PSRL's async RL.
-                # verl will handle gen batch processing and generation here.
-                with marked_timer("wait_for_gen", timing_raw, color="gray"):
-                    if not self.config.psrl.colocate:
-                        buffer_id = self.global_steps - 1
-                        # will block until the training batch is ready
-                        psrl_logger.debug("Waiting for training batch with buffer_id %d", buffer_id)
-                        with log_dual_events(
-                            f"Wait for training batch {buffer_id}",
-                            psrl_logger,
-                            event_type=EventType.WAIT,
-                        ):
-                            batch: KVBatchMeta = ray.get(
-                                self.agent_loop_manager.wait_for_training_batch.remote(buffer_id)
-                            )
-                            self.replay_buffer.sample(batch.keys, batch.partition_id)
-                        with log_dual_events("Switch to trainer mode", psrl_logger, event_type=EventType.SWITCH):
-                            self.switch_to_trainer_mode()
-                    else:
-                        # NOTE(linsh): this code snippet is not actively maintained and is
-                        # incompatible with the TransferQueue-based data flow.  The colocate
-                        # path still expects a DataProto (`.pop(batch_keys=...)`, `.union()`),
-                        # but `batch` is now a KVBatchMeta.  Raise explicitly rather than
-                        # crash with an obscure AttributeError.
-                        raise NotImplementedError(
-                            "The colocate training path (psrl.colocate=True) is not supported "
-                            "with the TransferQueue-based data flow.  Set psrl.colocate=False "
-                            "or re-implement this branch using KVBatchMeta / TQ APIs."
-                        )
+                # AGENT(VERL): in PSRL's async RL the strategy owns batch acquisition.
+                # FullBatchStepStrategy blocks on wait_for_training_batch (timed under
+                # "wait_for_gen"). FineGrainOverlapStrategy switches to trainer mode
+                # immediately and pulls chunks as rollout progresses.
+                if self.config.psrl.colocate:
+                    # NOTE(linsh): the colocate path is not maintained and is incompatible
+                    # with the TransferQueue-based data flow.
+                    raise NotImplementedError(
+                        "The colocate training path (psrl.colocate=True) is not supported "
+                        "with the TransferQueue-based data flow.  Set psrl.colocate=False "
+                        "or re-implement this branch using KVBatchMeta / TQ APIs."
+                    )
+                buffer_id = self.global_steps - 1
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -3294,120 +3285,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         else curr_step_profile
                     )
 
-                # Balance the number of valid tokens across DP ranks.
-                # NOTE: This usually changes the order of data in the `batch`,
-                # which won't affect the advantage calculation (since it's based on uid),
-                # but might affect the loss calculation (due to the change of mini-batching).
-                if self.config.trainer.balance_batch:
-                    batch = self._balance_batch(batch, metrics=metrics)
-
-                # compute global_valid tokens
-                batch.extra_info["temperature"] = self.config.gen_actor_rollout_ref.rollout.temperature
-                batch.extra_info["global_steps"] = self.global_steps
-                # compute old_log_prob
-                with marked_timer("old_log_prob", timing_raw, color="orange"):
-                    with log_dual_events(
-                        "Recompute log_prob on training side",
-                        psrl_logger,
-                        event_type=EventType.OTHER,
-                    ):
-                        batch = self._compute_old_log_prob(batch, metrics=metrics)
-
-                if self.use_reference_policy:
-                    # compute reference log_prob
-                    with marked_timer("ref", timing_raw, color="olive"):
-                        with log_dual_events(
-                            "Compute reference log_prob",
-                            psrl_logger,
-                            event_type=EventType.OTHER,
-                        ):
-                            batch = self._compute_ref_log_prob(batch, metrics=metrics)
-
-                # compute values
-                if self.use_critic:
-                    with marked_timer("values", timing_raw, color="cyan"):
-                        with log_dual_events(
-                            "Compute critic values",
-                            psrl_logger,
-                            event_type=EventType.OTHER,
-                        ):
-                            batch = self._compute_values(batch, metrics=metrics)
-
-                if self.config.reward.launch_reward_fn_async:
-                    # Overlap reward computation with log_prob computation in trainer.
-                    with marked_timer("async_reward_get", timing_raw, color="yellow"):
-                        with log_dual_events(
-                            "Wait for async reward model score",
-                            psrl_logger,
-                            event_type=EventType.OTHER,
-                        ):
-                            batch = ray.get(self.reward_manager.wait_for_reward_of_requests.remote(batch))
-                else:
-                    with log_dual_events(
-                        "Normalize reward",
-                        psrl_logger,
-                        event_type=EventType.OTHER,
-                    ):
-                        batch = ray.get(self.reward_manager.normalize_reward.remote(batch))
-
-                with marked_timer("adv", timing_raw, color="brown"):
-                    with log_dual_events("Compute advantage", psrl_logger, event_type=EventType.OTHER):
-                        batch = self._compute_advantage(batch, metrics=metrics)
-                        # AGENT(VERL): reward combine is moved.
-
-                # update critic
-                if self.use_critic:
-                    with marked_timer("update_critic", timing_raw, color="pink"):
-                        with log_dual_events("Update critic", psrl_logger, event_type=EventType.TRAIN):
-                            batch = self._update_critic(batch, metrics=metrics)
-
-                # implement critic warmup
-                if self.config.trainer.critic_warmup <= self.global_steps:
-                    # update actor
-                    with marked_timer("update_actor", timing_raw, color="red"):
-                        with log_dual_events("Update actor", psrl_logger, event_type=EventType.TRAIN):
-                            batch = self._update_actor(batch, metrics=metrics)
-
-                    # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
-                    esi_close_to_expiration = should_save_ckpt_esi(
-                        max_steps_duration=self.max_steps_duration,
-                        redundant_time=self.config.trainer.esi_redundant_time,
-                    )
-                    # Check if the conditions for saving a checkpoint are met.
-                    # The conditions include a mandatory condition (1) and
-                    # one of the following optional conditions (2/3/4):
-                    # 1. The save frequency is set to a positive value.
-                    # 2. It's the last training step.
-                    # 3. The current step number is a multiple of the save frequency.
-                    # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                    if self.config.trainer.save_freq > 0 and (
-                        is_last_step
-                        or self.global_steps % self.config.trainer.save_freq == 0
-                        or esi_close_to_expiration
-                    ):
-                        if esi_close_to_expiration:
-                            print("Force saving checkpoint: ESI instance expiration approaching.")
-                        with marked_timer("save_checkpoint", timing_raw, color="green"):
-                            with log_dual_events("Save checkpoint", psrl_logger, event_type=EventType.OTHER):
-                                self._save_checkpoint()
-
-                    # AGENT(VERL): Skip checkpoint manager in PSRL.
-
-                # Log rollout generations if enabled
-                rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                if rollout_data_dir:
-                    self._log_rollout_data(batch, timing_raw, rollout_data_dir)
-
-                # validate
-                if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
-                ):
-                    with marked_timer("testing", timing_raw, color="green"):
-                        with log_dual_events("Validate", psrl_logger, event_type=EventType.VAL):
-                            val_metrics: dict = self._validate()
-                            if is_last_step:
-                                last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
+                batch = self._step_strategy.run_step(buffer_id, metrics, timing_raw)
 
             with marked_timer("stop_profile", timing_raw):
                 next_step_profile = (
@@ -3452,7 +3330,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 if hasattr(self.actor_wg, "async_calls_finalize_fn_exec"):
                     self.actor_wg.async_calls_finalize_fn_exec(blocking=True)
                 self._shutdown_dump_executor()
-                psrl_logger.info(f"Final validation metrics: {last_val_metrics}")
+                psrl_logger.info(f"Final validation metrics: {self._last_val_metrics}")
                 progress_bar.close()
                 break
 

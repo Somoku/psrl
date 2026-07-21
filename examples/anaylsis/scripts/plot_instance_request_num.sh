@@ -42,10 +42,10 @@ python plot.py /jizhicfs/lhy/verl/lhy_exp/ablation_new \
 --processor instance_request_num_indexed_by_time
 '''
 
-python plot.py /jizhicfs/lhy/psrl_smg/examples/mini_swe/megatron_psrl_log/kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_1 \
+python plot.py /apdcephfs_zwfy10/share_303541817/lhy/psrl/examples/mini_swe/megatron_psrl_log/max_waiting_zero_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_1 \
 --substring stats_r \
 --xlabel "time(s)" \
 --ylabel "instance request num" \
---out kv_aware_request_num.png \
+--out max_waiting_zero_kv_aware_request_num.png \
 --mode subplot \
 --processor instance_request_num_indexed_by_time_smg

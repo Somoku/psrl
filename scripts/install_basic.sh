@@ -31,6 +31,12 @@ python -m uv pip install "transformers==5.10.1" accelerate datasets peft hf-tran
 
 python -m uv pip uninstall -y pynvml nvidia-ml-py
 python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
+# Pin grpcio-tools so the protoc bundled with it stamps protobuf gencode 6.x,
+# matching the protobuf 6.33 runtime pinned by vllm/ray/wandb. grpcio-tools >= 1.81
+# ships a protoc that stamps gencode 7.35, which the 6.33 runtime refuses to load.
+# The SMG proto packages are installed with --no-build-isolation below so they use
+# this pinned generator instead of pulling a newer one in an isolated build env.
+python -m uv pip install --no-cache-dir "grpcio-tools==1.78.0"
 
 echo "4. Install FlashAttention and FlashInfer"
 # Install FlashAttention 2 for packages that import `flash_attn`.
@@ -76,8 +82,11 @@ cd smg
 sed -i 's|^smg-tui = { version = "0.1.0", path = "tui" }|# smg-tui = { version = "0.1.0", path = "tui" }|' Cargo.toml
 # Build release binary with PSRL policies
 cargo build --release
-python -m uv pip install -e crates/grpc_client/python/
-python -m uv pip install -e crates/psrl_state/python/
+# --no-build-isolation: use the ambient grpcio-tools==1.78.0 (installed above) to
+# generate protobuf stubs, so the gencode stamp stays 6.x-compatible with the
+# protobuf 6.33 runtime instead of pulling grpcio-tools >= 1.81 (gencode 7.35).
+python -m uv pip install --no-build-isolation -e crates/grpc_client/python/
+python -m uv pip install --no-build-isolation -e crates/psrl_state/python/
 python -m uv pip install -e grpc_servicer/
 
 echo "Build python binding of smg..."

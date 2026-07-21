@@ -943,3 +943,38 @@ index bf379b49..882e9f0b 100644
  
          # 1. build reference model
          if "ref" in self.role:
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index ae91290f..fdbb149f 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -47,6 +47,9 @@ from verl.utils.model import normalize_model_name
+ from verl.utils.torch_dtypes import PrecisionType
+ from verl.workers.config import HFModelConfig, McoreEngineConfig
+ 
++# Megatron-LM@c049020 removed encoder_and_decoder; keep compat with older enum names.
++_MODEL_TYPE_ENCODER_AND_DECODER = getattr(ModelType, "encoder_and_decoder", None)
++
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+@@ -69,7 +72,7 @@ def get_model(
+         mpu.get_pipeline_model_parallel_world_size() > 1
+         and mpu.get_virtual_pipeline_model_parallel_world_size() is not None
+     ):
+-        assert model_type != ModelType.encoder_and_decoder, (
++        assert model_type != _MODEL_TYPE_ENCODER_AND_DECODER, (
+             "Interleaved schedule not supported for model with both encoder and decoder"
+         )
+         model = []
+@@ -89,8 +92,8 @@ def get_model(
+         post_process = mpu.is_pipeline_last_stage()
+         add_encoder = True
+         add_decoder = True
+-        assert model_type != ModelType.encoder_and_decoder, "Model type encoder_and_decoder is not supported"
+-        if model_type == ModelType.encoder_and_decoder:
++        assert model_type != _MODEL_TYPE_ENCODER_AND_DECODER, "Model type encoder_and_decoder is not supported"
++        if model_type == _MODEL_TYPE_ENCODER_AND_DECODER:
+             if mpu.get_pipeline_model_parallel_world_size() > 1:
+                 assert mpu.get_pipeline_model_parallel_split_rank() is not None, (
+                     "Split rank needs to be specified for model with both encoder and decoder"
+

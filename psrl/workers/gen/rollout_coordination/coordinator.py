@@ -25,14 +25,43 @@ from psrl.workers.gen.stats_collector import EngineStats
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, RolloutInstanceId
 from psrl.workers.gen.zmq_queue import ZMQPullQueue
 
+from . import base as base_module
+from . import command_loop as command_loop_module
+from . import status_loop as status_loop_module
 from .base import CoordinatorBase
 from .command_loop import CommandHandlerMixin
+from .session import thunder_agent as thunder_agent_module
 from .session.thunder_agent import ThunderAgentSessionMixin
 from .status_loop import StatusMixin
 from .sync_and_migrate import GreedySyncMixin, StatusBasedSyncMixin, SyncAndMigrateMixin
+from .sync_and_migrate import greedy as greedy_module
+from .sync_and_migrate import status_based as status_based_module
+from .sync_and_migrate import sync_and_migrate_mixin as sync_and_migrate_module
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+# Per-loop log routing: each RolloutCoordinator loop lives in its own module with
+# its own module-level ``psrl_logger`` (named by ``__file__``, so they are all
+# distinct loggers with no parent-child relationship and no shared handler). To
+# make their records land on disk we attach a DualOutputHandler per target file
+# below. Modules mapped to the same file share ONE handler instance, because two
+# FileHandlers opened with mode="w" on the same path would truncate each other.
+#
+#   RolloutCoordinator.log : main lifecycle + command handling
+#   SyncAndMigStrategy.log : model-sync / rollout-migration loop
+#   Status.log             : engine-status queue + router-sync + stats recorder
+#   SessionStrategy.log    : session hang/continue scheduling (ThunderAgent port)
+_LOG_FILE_TO_MODULE_LOGGERS = {
+    "RolloutCoordinator": [command_loop_module.psrl_logger, base_module.psrl_logger],
+    "SyncAndMigStrategy": [
+        sync_and_migrate_module.psrl_logger,
+        greedy_module.psrl_logger,
+        status_based_module.psrl_logger,
+    ],
+    "Status": [status_loop_module.psrl_logger],
+    "SessionStrategy": [thunder_agent_module.psrl_logger],
+}
 
 
 class RolloutCoordinator(
@@ -166,9 +195,12 @@ class RolloutCoordinator(
         self._lmcache_controller_proc: subprocess.Popen | None = None
         self._lmcache_controller_url: str | None = None
 
-        # Build logger
+        # Build loggers. Each loop's module-level logger is routed to a dedicated
+        # per-loop file (see _LOG_FILE_TO_MODULE_LOGGERS) so hang/continue, sync,
+        # and status traces no longer all pile into one file. coordinator.py's own
+        # logger shares RolloutCoordinator.log with base/command_loop.
         self.log_prefix = "RolloutCoordinator"
-        psrl_logger.addHandler(DualOutputHandler(self.config.psrl.logging_path, self.log_prefix))
+        self._attach_loop_log_handlers()
         psrl_logger.info("Initialized RolloutCoordinator")
 
         # Stats recorder (opt-in)
@@ -184,6 +216,41 @@ class RolloutCoordinator(
                 routing_strategy=self.config.psrl.rollout_coordination.routing_strategy.method,
                 partial_rollout=self.config.psrl.rollout_coordination.partial_rollout.enable,
             )
+
+    def _attach_loop_log_handlers(self) -> None:
+        """Route each loop module's logger to its per-loop log file.
+
+        coordinator.py, base.py, and command_loop.py share RolloutCoordinator.log;
+        the sync, status, and session loops each get their own file. A single
+        DualOutputHandler instance is reused for all loggers mapped to the same
+        file (two mode="w" FileHandlers on one path would truncate each other),
+        and re-attachment is guarded so a second RolloutCoordinator in-process
+        does not stack duplicate handlers.
+        """
+        logging_path = self.config.psrl.logging_path
+
+        # coordinator.py's own logger shares RolloutCoordinator.log with the
+        # command/base loggers, so create that file's handler first and reuse it.
+        coordinator_handler = self._ensure_dual_handler(psrl_logger, logging_path, "RolloutCoordinator")
+        for log_prefix, module_loggers in _LOG_FILE_TO_MODULE_LOGGERS.items():
+            shared_handler = coordinator_handler if log_prefix == "RolloutCoordinator" else None
+            for module_logger in module_loggers:
+                shared_handler = self._ensure_dual_handler(
+                    module_logger, logging_path, log_prefix, handler=shared_handler
+                )
+
+    @staticmethod
+    def _ensure_dual_handler(target_logger, logging_path, log_prefix, handler=None):
+        """Attach ``handler`` (or a fresh DualOutputHandler for ``log_prefix``) to
+        ``target_logger`` unless a DualOutputHandler is already present, and return
+        the handler so callers can reuse it across loggers sharing one file."""
+        existing = next((h for h in target_logger.handlers if isinstance(h, DualOutputHandler)), None)
+        if existing is not None:
+            return existing
+        if handler is None:
+            handler = DualOutputHandler(logging_path, log_prefix)
+        target_logger.addHandler(handler)
+        return handler
 
     def add_worker(
         self,

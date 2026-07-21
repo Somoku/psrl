@@ -80,6 +80,15 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         balance_rel_threshold=float(_cache_aware_cfg(config, "balance_rel_threshold", 1.5)),
         balance_token_usage_threshold=float(_cache_aware_cfg(config, "balance_token_usage_threshold", 1.0)),
         overload_token_usage_threshold=float(_cache_aware_cfg(config, "overload_token_usage_threshold", 1.0)),
+        # Admission gate is ALWAYS ON now (no master switch). The legacy
+        # `enable_kv_admission_control` RouterArgs field is repurposed to carry the
+        # strict "reject-on-waiting" switch: when True the gate only admits to an
+        # instance whose engine waiting queue is empty. This is SEPARATE from
+        # `max_num_waiting_reqs_after_preemption` (which is purely the vLLM-side
+        # preemption *notification* threshold, not an admission signal).
+        enable_kv_admission_control=bool(
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.admission_reject_on_waiting", False)
+        ),
         eviction_interval_secs=int(_cache_aware_cfg(config, "eviction_interval_secs", 60)),
         max_tree_size=int(_cache_aware_cfg(config, "max_tree_size", 2**26)),
         block_size=int(_cache_aware_cfg(config, "block_size", 16)),

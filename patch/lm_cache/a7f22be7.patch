@@ -18,7 +18,7 @@ index 27c29c8d..c958e3bf 100644
          force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
  
          meta = LMCacheConnectorMetadata()
-+        
++
 +        # NOTE(psrl): Build the set of req_ids being newly scheduled this step
 +        # before evicting finished entries. PSRL recycles integer UIDs across
 +        # partial-rollout re-submissions, so the same ID can appear in both

@@ -223,4 +223,23 @@ def validate_config(
             "when psrl.lmcache.enable is True (LMCache requires prefix caching)."
         )
 
+    # Session hang/continue (ThunderAgent) switches.
+    thunder_agent_cfg = config.psrl.rollout_coordination.session_strategy.get("thunder_agent", {})
+    if thunder_agent_cfg.get("enable", False):
+        continue_scope = str(thunder_agent_cfg.get("continue_scope", "bucketed"))
+        assert continue_scope in ("bucketed", "global"), (
+            f"psrl.rollout_coordination.session_strategy.thunder_agent.continue_scope must be "
+            f"'bucketed' or 'global', got {continue_scope!r}."
+        )
+        # Under trajectory sticky, a session always re-routes to the instance it
+        # already occupies, so global (relocating) continue would disagree with
+        # actual routing. Require bucketed in that case.
+        sticky_enabled = bool(config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky)
+        assert not (sticky_enabled and continue_scope == "global"), (
+            "psrl.rollout_coordination.session_strategy.thunder_agent.continue_scope must be "
+            "'bucketed' when psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky "
+            "is True (sticky sessions re-route to their current instance; global continue would "
+            "mismatch)."
+        )
+
     print("[validate_config] All configuration checks passed successfully!")

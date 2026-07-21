@@ -68,9 +68,12 @@ cd Megatron-Bridge
 git checkout 94d1870
 # Comment out the local megatron-core source (we install Megatron-LM separately above)
 sed -i 's|^megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }|# megatron-core = { path = "3rdparty/Megatron-LM/", editable = true }|' pyproject.toml
-python -m uv pip install -e .
+python -m uv pip install -e . --no-build-isolation --no-cache-dir --no-deps
 popd
 
 bash "$PSRL_PATH/patch/apply_patch.sh" megatron_bridge
+
+echo "5. Apply TransformerEngine patch (flash-attn-3 + context parallel compat)"
+bash "$PSRL_PATH/patch/apply_patch.sh" transformer_engine --force || true
 
 echo "Successfully installed all packages for Megatron"

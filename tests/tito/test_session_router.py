@@ -180,3 +180,46 @@ async def test_chat_completions_pins_version_tag_for_session(client):
         headers={"x-version-tag": "-1"},
     )
     assert captured["chat_headers"]["x-version-tag"] == "3"
+
+
+@pytest.mark.asyncio
+async def test_control_continue_force_pins_next_turn(client, router):
+    """continue with an instance force-pins ONLY the next turn (one-shot)."""
+    payload = {"model": "m", "messages": []}
+    # Establish the session, then hang it.
+    await client.post("/sessions/sid-pin/v1/chat/completions", json=payload)
+    await client.post("/control/hang", json=[{"session_id": "sid-pin"}])
+    assert router.states["sid-pin"].hang_state == "hung"
+
+    # Continue onto a specific instance.
+    resp = await client.post(
+        "/control/continue",
+        json=[{"session_id": "sid-pin", "base_worker_id": "worker-z", "target_dp_rank": "5"}],
+    )
+    assert resp.json()["continued"] == ["sid-pin"]
+    assert router.states["sid-pin"].pin_once_instance == ("worker-z", "5")
+
+    # Next turn carries the force-pin header + hinted instance...
+    await client.post("/sessions/sid-pin/v1/chat/completions", json=payload)
+    assert captured["chat_headers"]["x-force-pin-once"] == "true"
+    assert captured["chat_headers"]["x-base-worker-id"] == "worker-z"
+    assert captured["chat_headers"]["x-target-dp-rank"] == "5"
+    # ...and the one-shot pin is consumed.
+    assert router.states["sid-pin"].pin_once_instance is None
+
+    # The turn after that no longer force-pins (SMG response re-set worker-a).
+    await client.post("/sessions/sid-pin/v1/chat/completions", json=payload)
+    assert "x-force-pin-once" not in captured["chat_headers"]
+
+
+@pytest.mark.asyncio
+async def test_control_continue_without_instance_does_not_pin(client, router):
+    """continue without an instance leaves routing to SMG (no force-pin)."""
+    payload = {"model": "m", "messages": []}
+    await client.post("/sessions/sid-nopin/v1/chat/completions", json=payload)
+    await client.post("/control/hang", json=[{"session_id": "sid-nopin"}])
+    await client.post("/control/continue", json=[{"session_id": "sid-nopin"}])
+    assert router.states["sid-nopin"].pin_once_instance is None
+
+    await client.post("/sessions/sid-nopin/v1/chat/completions", json=payload)
+    assert "x-force-pin-once" not in captured["chat_headers"]

@@ -14,7 +14,6 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     request_raw,
 )
-from psrl.utils.logger import DualOutputHandler
 from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH
 
 psrl_logger = logging.getLogger(__file__)
@@ -58,6 +57,11 @@ class SessionState:
     # Set means "may proceed". A hung session blocks at the next turn entry until
     # the coordinator continues it (sets the event). Initialized set in __post_init__.
     continue_event: asyncio.Event = field(default_factory=asyncio.Event)
+    # One-shot pin target set by /control/continue: (base_worker_id, target_dp_rank).
+    # When set, the session's NEXT turn is force-pinned to this instance (via the
+    # x-force-pin-once header) and the field is cleared immediately after injection,
+    # so only the first turn after continue is pinned. None means "let SMG route".
+    pin_once_instance: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.inflight == 0:
@@ -175,6 +179,10 @@ class SessionRouter:
                 if state.hang_state != SESSION_HUNG:
                     break
                 continue_event = state.continue_event
+            psrl_logger.debug(
+                f"Session {sid!r} trajectory {trajectory_id} blocked at hang point, "
+                f"awaiting continue."
+            )
             await continue_event.wait()
 
         async with state.lock:
@@ -185,6 +193,9 @@ class SessionRouter:
             base_worker_id = state.base_worker_id
             target_dp_rank = state.target_dp_rank
             version_tag = state.version_tag
+            # Consume the one-shot pin (if any) so only this turn is force-pinned.
+            pin_once_instance = state.pin_once_instance
+            state.pin_once_instance = None
             state.inflight += 1
             state.drained.clear()
 
@@ -195,6 +206,17 @@ class SessionRouter:
             headers["x-target-dp-rank"] = target_dp_rank
         if version_tag is not None:
             headers["x-version-tag"] = version_tag
+        # Force-pin this turn's first worker selection to the continue target.
+        # SMG clears x-force-pin-once on the first loopback, so partial-rollout /
+        # preemption re-dispatch within this turn falls back to free routing.
+        if pin_once_instance is not None:
+            headers["x-base-worker-id"] = pin_once_instance[0]
+            headers["x-target-dp-rank"] = pin_once_instance[1]
+            headers["x-force-pin-once"] = "true"
+            psrl_logger.debug(
+                f"Session {sid!r} turn force-pinned to instance {pin_once_instance!r} "
+                f"(one-shot)."
+            )
         result: HttpResponse | None = None
         try:
             result = await self._request_upstream(
@@ -249,6 +271,10 @@ class SessionRouter:
                     state.marked_for_hang = False
                     state.hang_state = SESSION_HUNG
                     state.continue_event.clear()
+                    psrl_logger.debug(
+                        f"Session {sid!r} deferred hang applied at turn boundary "
+                        f"(trajectory {trajectory_id})."
+                    )
 
         return self.build_response(result)
 
@@ -318,6 +344,10 @@ class SessionRouter:
                 else:
                     state.marked_for_hang = True
                     deferred.append(sid)
+        if applied or deferred or missing:
+            psrl_logger.info(
+                f"control_hang: hung={applied} deferred={deferred} missing={missing}."
+            )
         return JSONResponse(
             content={"hung": applied, "deferred": deferred, "missing": missing}
         )
@@ -325,11 +355,14 @@ class SessionRouter:
     async def control_continue(self, request: Request) -> Response:
         """Continue (un-hang) the given sessions.
 
-        Body: ``[{"session_id": ...}, ...]``.
+        Body: ``[{"session_id": ..., "base_worker_id": ..., "target_dp_rank": ...}, ...]``.
+        The two worker-id fields are optional: when present, the session's next
+        turn is force-pinned to that instance (one-shot); when absent, the next
+        turn is routed normally by SMG.
         """
-        payload = await self._read_control_ids(request)
+        pins = await self._read_control_pins(request)
         applied, missing = [], []
-        for sid in payload:
+        for sid, instance in pins.items():
             state = self.states.get(sid)
             if state is None:
                 missing.append(sid)
@@ -337,8 +370,19 @@ class SessionRouter:
             async with state.lock:
                 state.marked_for_hang = False
                 state.hang_state = SESSION_RUNNING
+                if instance is not None:
+                    # Update the routing hint and arm the one-shot pin for the
+                    # next turn (consumed in session_chat_completions).
+                    state.base_worker_id = instance[0]
+                    state.target_dp_rank = instance[1]
+                    state.pin_once_instance = instance
                 state.continue_event.set()
                 applied.append(sid)
+        if applied or missing:
+            pinned = {sid: inst for sid, inst in pins.items() if inst is not None}
+            psrl_logger.info(
+                f"control_continue: continued={applied} missing={missing} pinned={pinned}."
+            )
         return JSONResponse(content={"continued": applied, "missing": missing})
 
     @staticmethod
@@ -363,6 +407,37 @@ class SessionRouter:
             if sid is not None:
                 ids.append(str(sid))
         return ids
+
+    @staticmethod
+    async def _read_control_pins(request: Request) -> dict[str, tuple[str, str] | None]:
+        """Parse a continue request body into ``{session_id: instance | None}``.
+
+        Accepts ``[{"session_id": ..., "base_worker_id": ..., "target_dp_rank": ...}, ...]``
+        or ``{"sessions": [...]}``. ``instance`` is ``(base_worker_id, target_dp_rank)``
+        when both are supplied, else ``None`` (route normally). Bare-string items
+        (``["sid", ...]``) are accepted and map to ``None``.
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return {}
+        if isinstance(body, dict):
+            body = body.get("sessions", [])
+        pins: dict[str, tuple[str, str] | None] = {}
+        for item in body or []:
+            if isinstance(item, dict):
+                sid = item.get("session_id")
+                base_worker_id = item.get("base_worker_id")
+                target_dp_rank = item.get("target_dp_rank")
+                instance = None
+                if base_worker_id is not None and target_dp_rank is not None:
+                    instance = (str(base_worker_id), str(target_dp_rank))
+            else:
+                sid = item
+                instance = None
+            if sid is not None:
+                pins[str(sid)] = instance
+        return pins
 
     @staticmethod
     def _update_total_tokens(state: SessionState, result: HttpResponse) -> None:

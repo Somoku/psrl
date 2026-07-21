@@ -53,8 +53,13 @@ class SessionScheduler(ABC):
         self,
         instances: list[InstanceCapacity],
         sessions: list[SessionInfo],
-    ) -> tuple[list[str], list[str]]:
-        """Return ``(session_ids_to_hang, session_ids_to_continue)``."""
+    ) -> tuple[list[str], list[tuple[str, RolloutInstanceId]]]:
+        """Return ``(session_ids_to_hang, [(session_id, continue_instance), ...])``.
+
+        The continue list pairs each readmitted session with the instance it
+        should be routed to; ``None`` instances are not permitted here (a
+        strategy that defers routing to SMG should simply not emit the pair).
+        """
 
 
 class SessionSchedulingBase:

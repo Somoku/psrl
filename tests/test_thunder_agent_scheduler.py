@@ -1,6 +1,5 @@
 # tests/test_thunder_agent_scheduler.py
 import pytest
-
 from psrl.workers.gen.rollout_coordination.session.base import (
     SESSION_HUNG,
     SESSION_RUNNING,
@@ -20,11 +19,12 @@ I0 = ("w0", 0)
 I1 = ("w1", 0)
 
 
-def _sched(env_token_weight=1.0, buffer_per_session=0):
+def _sched(env_token_weight=1.0, buffer_per_session=0, global_scope=False):
     # buffer_per_session=0 by default keeps the arithmetic easy to reason about.
     return ThunderAgentScheduler(
         env_token_weight=env_token_weight,
         buffer_per_session=buffer_per_session,
+        global_scope=global_scope,
     )
 
 
@@ -89,16 +89,17 @@ class TestHang:
         # used = 1200 > 1000. Evict smallest (300) → 900 ≤ 1000 done.
         assert to_hang == ["env_c"]
 
-    def test_env_token_weight_reduces_pressure(self):
-        # env tokens weighted 0.5: attributed = 600 + 0.5*600 = 900 ≤ 1000 → no hang.
-        sched = _sched(env_token_weight=0.5)
-        instances = [InstanceCapacity(I0, total_kv_tokens=1000, used_tokens=100_000)]
+    def test_env_token_weight_reserves_less_for_env(self):
+        # Two env sessions (600 each), nothing resident (used_tokens=0, env KV
+        # freed). shared = 0. With weight 1.0: active = 1200 > 1000 → hang.
+        # With weight 0.5: active = 0.5*1200 = 600 ≤ 1000 → no hang.
+        instances = [InstanceCapacity(I0, total_kv_tokens=1000, used_tokens=0)]
         sessions = [
-            _session("g", I0, STATUS_GENERATE, 600),
-            _session("e", I0, STATUS_ENV, 600),
+            _session("e1", I0, STATUS_ENV, 600),
+            _session("e2", I0, STATUS_ENV, 600),
         ]
-        to_hang, _ = sched.decide(instances, sessions)
-        assert to_hang == []
+        assert _sched(env_token_weight=1.0).decide(instances, sessions)[0] == ["e1"]
+        assert _sched(env_token_weight=0.5).decide(instances, sessions)[0] == []
 
 
 class TestContinue:
@@ -112,7 +113,7 @@ class TestContinue:
         ]
         to_hang, to_continue = sched.decide(instances, sessions)
         assert to_hang == []
-        assert to_continue == ["hung"]
+        assert to_continue == [("hung", I0)]
 
     def test_no_continue_when_still_full(self):
         sched = _sched()
@@ -134,11 +135,12 @@ class TestContinue:
             _session("hung_small", I0, STATUS_ENV, 200, hang_state=SESSION_HUNG),
         ]
         _, to_continue = sched.decide(instances, sessions)
-        assert to_continue == ["hung_small"]
+        assert to_continue == [("hung_small", I0)]
 
     def test_hung_only_continues_on_its_pinned_instance(self):
         sched = _sched()
-        # I0 is full; I1 has room. A session hung on I0 must NOT continue via I1.
+        # I0 is full; I1 has room. A session hung on I0 must NOT continue via I1
+        # in bucketed scope (per-instance readmission, the default).
         instances = [
             InstanceCapacity(I0, total_kv_tokens=100, used_tokens=100_000),
             InstanceCapacity(I1, total_kv_tokens=10_000, used_tokens=0),
@@ -146,6 +148,54 @@ class TestContinue:
         sessions = [_session("hung", I0, STATUS_ENV, 300, hang_state=SESSION_HUNG)]
         _, to_continue = sched.decide(instances, sessions)
         assert to_continue == []
+
+
+class TestContinueGlobalBfd:
+    """Global scope: continue uses global BFD and may relocate the session."""
+
+    def test_hung_relocates_to_emptiest_instance(self):
+        # I0 (session's current instance) is full; I1 has room. In global scope
+        # the session is readmitted onto I1 and pinned there.
+        sched = _sched(global_scope=True)
+        instances = [
+            InstanceCapacity(I0, total_kv_tokens=100, used_tokens=100_000),
+            InstanceCapacity(I1, total_kv_tokens=10_000, used_tokens=0),
+        ]
+        sessions = [_session("hung", I0, STATUS_ENV, 300, hang_state=SESSION_HUNG)]
+        _, to_continue = sched.decide(instances, sessions)
+        assert to_continue == [("hung", I1)]
+
+    def test_bfd_largest_to_emptiest(self):
+        # Two hung sessions, two instances with different room. BFD places the
+        # largest onto the emptiest instance first.
+        sched = _sched(global_scope=True)
+        instances = [
+            InstanceCapacity(I0, total_kv_tokens=400, used_tokens=0),
+            InstanceCapacity(I1, total_kv_tokens=1000, used_tokens=0),
+        ]
+        sessions = [
+            _session("big", I0, STATUS_ENV, 500, hang_state=SESSION_HUNG),
+            _session("small", I0, STATUS_ENV, 300, hang_state=SESSION_HUNG),
+        ]
+        _, to_continue = sched.decide(instances, sessions)
+        # total capacity = 1400 ≥ 500+300. big(500) → I1 (emptiest, 1000);
+        # I1 now 500. small(300) → max(I0=400, I1=500)=I1.
+        assert ("big", I1) in to_continue
+        assert ("small", I1) in to_continue
+        assert len(to_continue) == 2
+
+    def test_selects_smallest_first_when_capacity_limited(self):
+        # Hung sessions are always env-status (hang only happens at idle turn
+        # boundaries), so selection is purely smallest-tokens-first. Room for one
+        # (need 300, capacity 350): the smaller session is chosen.
+        sched = _sched(global_scope=True)
+        instances = [InstanceCapacity(I0, total_kv_tokens=350, used_tokens=0)]
+        sessions = [
+            _session("big", I0, STATUS_ENV, 300, hang_state=SESSION_HUNG),
+            _session("small", I0, STATUS_ENV, 200, hang_state=SESSION_HUNG),
+        ]
+        _, to_continue = sched.decide(instances, sessions)
+        assert to_continue == [("small", I0)]
 
 
 class TestPinningAndBuffer:

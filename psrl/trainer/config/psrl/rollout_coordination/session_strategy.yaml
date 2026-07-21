@@ -1,8 +1,12 @@
 # Session hang/continue scheduling (ThunderAgent port).
 # When enabled, the RolloutCoordinator periodically hangs whole TITO sessions on
 # instances that are over KV-cache capacity (blocking their next turn at the
-# SessionRouter without aborting in-flight work) and continues them once the
-# pinned instance frees capacity.
+# SessionRouter without aborting in-flight work) and continues them once there is
+# room again.
+#
+# Continue behavior is controlled by two INDEPENDENT switches below
+# (continue_scope, continue_force_pin), giving four combinations. The original
+# ThunderAgent-port behavior is continue_scope=bucketed + continue_force_pin=False.
 thunder_agent:
 
   # Master switch for session hang/continue.
@@ -11,9 +15,27 @@ thunder_agent:
   # Scheduler tick interval in milliseconds.
   check_interval_in_ms: 1000
 
-  # Weight of env-status session tokens in capacity_used. Lower values assume an
-  # env-status session's KV cache is likely evicted before it returns.
+  # Reservation coefficient for env-status (between-turns) session tokens. An env
+  # session's KV has been freed from the engine pool (its last turn finished), so
+  # it is absent from the measured used_tokens; this coefficient adds it back as a
+  # predictive reservation for when the session returns from the environment.
+  # < 1.0 assumes not all env sessions return simultaneously.
   env_token_weight: 1.0
 
   # Decode headroom (tokens) reserved per running session.
   buffer_per_session: 100
+
+  # Continue-instance selection scope. Independent of routing_strategy sticky.
+  #   "bucketed" (default): readmit each hung session on the instance it already
+  #     occupies (original behavior; the only valid choice under trajectory
+  #     sticky, enforced in validate_config).
+  #   "global": global Best-Fit-Decreasing across all instances; may relocate a
+  #     session onto an emptier instance (faithful to ThunderAgent _greedy_resume).
+  continue_scope: bucketed
+
+  # Whether to force-pin the chosen continue instance for the readmitted session's
+  # next turn (one-shot x-force-pin-once, cleared by SMG on the first loopback).
+  # When False, only the session id is sent on continue and SMG routes the next
+  # turn normally.
+  continue_force_pin: False
+

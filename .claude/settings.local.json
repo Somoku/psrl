@@ -2,11 +2,15 @@
   "permissions": {
     "allow": [
       "Read(//**)",
+      "Bash",
       "Bash(python3:*)",
       "WebSearch",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:lmcache.github.io)",
       "WebFetch(domain:docs.vllm.ai)"
+    ],
+    "ask": [
+      "Bash(git:*)"
     ],
     "deny": [
       "Bash(git reset --hard:*)"

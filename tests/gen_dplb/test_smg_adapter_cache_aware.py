@@ -6,6 +6,7 @@ from psrl.workers.gen.smg_adapter import (
     _cache_aware_cfg,
     build_rollout_router_args,
     build_worker_registration_payload,
+    get_trajectory_id_strategy,
     is_cache_aware_method,
 )
 
@@ -45,6 +46,34 @@ def test_is_cache_aware_method():
     assert is_cache_aware_method("cache_aware_v1")
     assert not is_cache_aware_method("request_num_balance")
     assert CACHE_AWARE_METHODS == frozenset({"cache_aware", "cache_aware_v1"})
+
+
+@pytest.mark.unit
+def test_trajectory_id_strategy_defaults_validates_and_forwards():
+    config = _make_config()
+    assert get_trajectory_id_strategy(config) == "manual"
+
+    config.psrl.rollout_gateway.trajectory_id_strategy = "auto"
+    assert get_trajectory_id_strategy(config) == "auto"
+    assert build_rollout_router_args(config, "127.0.0.1", 30000, "127.0.0.1:8000").trajectory_id_strategy == "auto"
+
+    config.psrl.rollout_gateway.trajectory_id_strategy = "invalid"
+    with pytest.raises(ValueError, match="trajectory_id_strategy"):
+        get_trajectory_id_strategy(config)
+
+
+@pytest.mark.unit
+def test_multimodal_transport_defaults_to_safe_shm_auto_and_forwards_overrides():
+    config = _make_config()
+    router_args = build_rollout_router_args(config, "127.0.0.1", 30000, "127.0.0.1:8000")
+    assert router_args.multimodal_tensor_transport == "auto"
+    assert router_args.multimodal_shm_min_bytes == 64 * 1024
+
+    config.psrl.rollout_gateway.multimodal_tensor_transport = "inline"
+    config.psrl.rollout_gateway.multimodal_shm_min_bytes = 128 * 1024
+    router_args = build_rollout_router_args(config, "127.0.0.1", 30000, "127.0.0.1:8000")
+    assert router_args.multimodal_tensor_transport == "inline"
+    assert router_args.multimodal_shm_min_bytes == 128 * 1024
 
 
 @pytest.mark.unit

@@ -1,7 +1,7 @@
 """Tests for TITO training data builder."""
 
 import pytest
-from psrl.utils.tito.training_data import build_training_arrays
+from psrl.utils.tito.training_data import build_training_data
 
 
 def test_single_turn_no_trim():
@@ -14,7 +14,7 @@ def test_single_turn_no_trim():
             "finish_reason": "stop",
         }
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records)
     assert result["prompt_ids"] == [1, 2, 3]
     assert result["response_ids"] == [10, 11, 12]
     assert result["response_mask"] == [1, 1, 1]
@@ -36,7 +36,7 @@ def test_two_turns_with_env_tokens():
             "finish_reason": "stop",
         },
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records)
     assert result["prompt_ids"] == [1, 2, 3]
     assert result["response_ids"] == [10, 11, 20, 21, 30, 31]
     assert result["response_mask"] == [1, 1, 0, 0, 1, 1]
@@ -58,21 +58,21 @@ def test_trailing_trim():
             "finish_reason": "stop",
         },
     ]
-    result = build_training_arrays(accumulated, records, max_trim_tokens=1)
+    result = build_training_data(accumulated, records, max_trim_tokens=1)
     assert result["response_ids"] == [10, 11, 20, 30, 31]
     assert result["response_mask"] == [1, 1, 0, 1, 1]
     assert result["logprobs"] == [-0.5, -0.3, 0.0, -0.2, -0.1]
 
 
 def test_empty_records():
-    result = build_training_arrays([], [])
+    result = build_training_data([], [])
     assert result["prompt_ids"] == []
     assert result["response_ids"] == []
     assert result["num_turns"] == 0
 
 
 def test_no_logprobs():
-    """Records without logprobs should still work."""
+    """Records without logprobs recover token IDs and use neutral logprobs."""
     accumulated = [1, 2, 3]
     records = [
         {
@@ -81,10 +81,11 @@ def test_no_logprobs():
             "finish_reason": "stop",
         }
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records)
     assert result["prompt_ids"] == [1, 2]
-    assert result["response_ids"] == []
-    assert result["response_mask"] == []
+    assert result["response_ids"] == [3]
+    assert result["response_mask"] == [1]
+    assert result["logprobs"] == [0.0]
 
 
 def test_trailing_trim_within_max_allowed():
@@ -104,7 +105,7 @@ def test_trailing_trim_within_max_allowed():
         },
     ]
     # max_trim_tokens=1: trim_count=1 <= allowed=1 → no ValueError
-    result = build_training_arrays(accumulated, records, max_trim_tokens=1)
+    result = build_training_data(accumulated, records, max_trim_tokens=1)
     assert result["response_ids"] == [10, 11, 20, 30, 31]
     assert result["response_mask"] == [1, 1, 0, 1, 1]
 
@@ -126,7 +127,7 @@ def test_trailing_trim_exceeds_max_raises():
     ]
     # max_trim_tokens=0: trim_count=1 > allowed=0 → ValueError
     with pytest.raises(ValueError, match="trailing trim overflow"):
-        build_training_arrays(accumulated, records, max_trim_tokens=0)
+        build_training_data(accumulated, records, max_trim_tokens=0)
 
 
 def test_last_turn_trim_never_occurs():
@@ -141,6 +142,6 @@ def test_last_turn_trim_never_occurs():
         }
     ]
     # Single-turn (is_last=True from the start): no trim attempted, no ValueError
-    result = build_training_arrays(accumulated, records, max_trim_tokens=0)
+    result = build_training_data(accumulated, records, max_trim_tokens=0)
     assert result["response_ids"] == [10, 11]
     assert result["response_mask"] == [1, 1]

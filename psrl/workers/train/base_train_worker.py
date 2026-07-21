@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from omegaconf import DictConfig
 
+from psrl.utils.converter.param_sync import ParamSyncPlan
 from psrl.utils.logger import DualOutputHandler
 
 psrl_logger = logging.getLogger(__file__)
@@ -43,6 +44,7 @@ class PSRL_BaseTrainWorker:
         self.nixl_storage_client = None
         self.unified_state_dict = None
         self.unified_sharding_dict = None
+        self.param_sync_plan = ParamSyncPlan()
         self._cached_ps_nixl_agent_names = None
         self._cached_ps_nixl_train_storage_client_names = None
         self._cached_ps_worker_handles: dict[str, ray.actor.ActorHandle] = {}
@@ -308,24 +310,16 @@ class PSRL_BaseTrainWorker:
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            with torch.no_grad():
-                for key, param in self.unified_state_dict.items():
-                    if "linear_attn.norm.weight" in key:
-                        param.add_(1)
-
             # ---- DEBUG: log train info BEFORE push ----
             # self._debug_log_train_info(label=f"TRAIN_BEFORE_PUSH_R{self.worker_rank}")
+            self.param_sync_plan.before_push(self.unified_state_dict)
             self.nixl_push_model()
             # TODO(lhy): wait for the push to complete before the next iteration optimizer update
             # This will enable the NIXL push to be overlapped with the next iteration training
             self.wait_for_nixl_push_completion()
+            self.param_sync_plan.after_push(self.unified_state_dict)
             # ---- DEBUG: log PS info AFTER push completes ----
             # self._debug_log_ps_info(label=f"PS_AFTER_PUSH_R{self.worker_rank}")
-
-            with torch.no_grad():
-                for key, param in self.unified_state_dict.items():
-                    if "linear_attn.norm.weight" in key:
-                        param.sub_(1)
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
@@ -362,11 +356,7 @@ class PSRL_BaseTrainWorker:
                 ps_manager_handle.get_ps_nixl_train_storage_client_names.remote()
             )
         self.nixl_pull_model_core(self._cached_ps_nixl_agent_names, self._cached_ps_nixl_train_storage_client_names)
-
-        with torch.no_grad():
-            for key, param in self.unified_state_dict.items():
-                if "linear_attn.norm.weight" in key:
-                    param.sub_(1)
+        self.param_sync_plan.after_pull(self.unified_state_dict)
 
     def nixl_pull_model_core(self, ps_nixl_agent_names: list[str], ps_nixl_train_storage_client_names: list[str]):
         """
@@ -419,7 +409,11 @@ class PSRL_BaseTrainWorker:
             # ---- DEBUG: log train info AFTER pull ----
             self._debug_log_train_info(label=f"TRAIN_AFTER_PULL_R{self.worker_rank}")
             # Reload the optimizer's fp32/bf16 copy from the model's current bf16 params
-            self.reload_optimizer_after_pull()
+            # NOTE(linsh): Only reload after the first pull because
+            # the model is init with empty state dict and pull from CPU PS
+            # for efficiency, but the optimizer state is not maintained by PS.
+            if self.pull_times == 1:
+                self.reload_optimizer_after_pull()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
         # Restore non-persistent buffers (e.g. inv_freq) that are not transferred by NIXL pull.

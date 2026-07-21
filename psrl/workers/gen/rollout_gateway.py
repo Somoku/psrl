@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
-from psrl.workers.gen.smg_adapter import build_rollout_router_args
+from psrl.workers.gen.smg_adapter import build_rollout_router_args, get_trajectory_id_strategy
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -151,7 +151,14 @@ class RolloutGateway:
         session_ip = self.smg_ip
         session_client_concurrency = self._estimate_http_client_concurrency()
 
-        def _run_session_router(smg_url, host, port, client_concurrency, logging_path):
+        def _run_session_router(
+            smg_url,
+            host,
+            port,
+            client_concurrency,
+            trajectory_id_strategy,
+            logging_path,
+        ):
             import uvicorn
 
             from psrl.workers.gen.session_router import (
@@ -167,12 +174,20 @@ class RolloutGateway:
             router = SessionRouter(
                 smg_url=smg_url,
                 client_concurrency=client_concurrency,
+                trajectory_id_strategy=trajectory_id_strategy,
             )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
         self.session_router_process = multiprocessing.Process(
             target=_run_session_router,
-            args=(self.smg_url, session_ip, session_port, session_client_concurrency, self.config.psrl.logging_path),
+            args=(
+                self.smg_url,
+                session_ip,
+                session_port,
+                session_client_concurrency,
+                get_trajectory_id_strategy(self.config),
+                self.config.psrl.logging_path,
+            ),
         )
         self.session_router_process.daemon = True
         self.session_router_process.start()

@@ -14,6 +14,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     MegatronParamMapping,
     QKVMapping,
     ReplicatedMapping,
+    RMSNorm2ZeroCenteredRMSNormMapping,
 )
 from megatron.bridge.models.conversion.utils import unwrap_model
 from torch.nn import Parameter
@@ -29,6 +30,13 @@ from psrl.utils.converter.model_mappings import (
     slice_qwen3_5_in_proj,
     slice_qwen3_5_in_proj_qkv,
 )
+from psrl.utils.converter.param_sync import (
+    ConcatenatedQKVSync,
+    ConversionResult,
+    DTypeCastSync,
+    ParamSyncPlan,
+    ZeroCenteredGammaSync,
+)
 from psrl.utils.converter.utils.parallel_states import ParallelStates
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -39,6 +47,7 @@ class MegatronConverter(BaseConverter):
     def __init__(self, parameter_mapping: ParameterMapping, mpu: ParallelStates | None = None):
         super().__init__(parameter_mapping)
         self.parameter_mapping = parameter_mapping
+        self.sync_plan = ParamSyncPlan()
 
         self.parameter_mapping.disable_tie_word_embeddings()
         self.bridge = AutoBridge.from_hf_config(self.parameter_mapping.config)
@@ -68,6 +77,18 @@ class MegatronConverter(BaseConverter):
         for m in models:
             if hasattr(m, "config") and not hasattr(m.config, "share_embeddings_and_output_weights"):
                 m.config.share_embeddings_and_output_weights = getattr(m, "share_embeddings_and_output_weights", False)
+        # Detect attention_output_gate from the actual Megatron TransformerConfig.
+        # The HF config may not have this attribute, causing model_info to default
+        # to False. But if the Megatron model was built with attention_output_gate=True,
+        # the QKV weight layout includes the gate and we must account for it.
+        if models and hasattr(models[0], "config"):
+            tf_config = models[0].config
+            actual_attn_output_gate = getattr(tf_config, "attention_output_gate", False)
+            if actual_attn_output_gate and not self.model_info.get("attn_output_gate", False):
+                self.model_info["attn_output_gate"] = True
+                # num_heads must be doubled when attn_output_gate is True
+                self.model_info["num_heads"] = self.model_info["num_heads"] * 2
+
         conversion_tasks = self.bridge._model_bridge.build_conversion_tasks(self.parameter_mapping.config, models)
         task_by_local_name = {
             (task.vp_stage, task.param_name): task
@@ -107,37 +128,27 @@ class MegatronConverter(BaseConverter):
         for vpp_rank, name, param in get_model_chunk_generator():
             task = task_by_local_name.get((vpp_rank, name))
             if task is None:
-                # Parameters without a bridge conversion task. This happens for
-                # vision model params when the Megatron VL provider uses HF-style
-                # naming internally (e.g. "vision_model.blocks.0.norm1.weight")
-                # instead of the Megatron-style names the bridge registry expects.
-                # Apply a simple prefix mapping to produce the unified HF key.
                 if name.endswith("output_layer.weight"):
                     # Skip output_layer.weight in the fallthrough — it's the lm_head
                     # which is handled by the tied-weight alias workaround below
                     # (exported from the embedding on the PP stage that has it).
                     continue
-                elif name.startswith("vision_model."):
-                    hf_name = "model.visual." + name[len("vision_model.") :]
-                else:
-                    hf_name = name
-                # Visual QKV params must be reshaped to match vLLM's convention:
-                # vLLM reshapes visual QKV (weight & bias) from (3*H, ...) to (3, H, ...)
-                # using reshape_visual_block_qkv and shards along dim=1. We must do the
-                # same here so the unified sharding is compatible across Train and Gen.
-                if "visual" in hf_name and ".qkv." in hf_name:
-                    converted_param = reshape_visual_block_qkv(param)
-                    converted_state_dict[hf_name] = converted_param
-                    sharding_dict[hf_name] = NIXLSharding(
-                        shard_mesh=OrderedDict([(1, 1)]),
-                        shard_indices=[(0,)],
+
+                if name.startswith("vision_model."):
+                    raise ValueError(
+                        "Megatron-Bridge did not produce a conversion task for vision parameter "
+                        f"{name!r} on vp_stage={vpp_rank}. Decoder-style vision names such as "
+                        "'vision_model.decoder.layers.0.self_attention.linear_qkv.weight' should be "
+                        "covered by the model bridge mapping registry. If this parameter uses a "
+                        "different naming convention, add an alias mapping in Megatron-Bridge instead "
+                        "of translating it in PSRL."
                     )
-                else:
-                    converted_state_dict[hf_name] = param
-                    sharding_dict[hf_name] = NIXLSharding(
-                        shard_mesh=OrderedDict([(0, 1)]),
-                        shard_indices=[(0,)],
-                    )
+
+                converted_state_dict[name] = param
+                sharding_dict[name] = NIXLSharding(
+                    shard_mesh=OrderedDict([(0, 1)]),
+                    shard_indices=[(0,)],
+                )
                 continue
             global_name = task.global_param_name
             new_params = self.convert_parameter(global_name, param, task.mapping)
@@ -171,14 +182,12 @@ class MegatronConverter(BaseConverter):
                     shard_indices=list(sharding_dict[embedding_hf_name].shard_indices),
                 )
 
-        # Cast architecturally-constrained parameters to float32.
-        # Some parameters (e.g., GDN's A_log) must stay in float32 for
-        # numerical stability, matching what vLLM expects. Megatron stores them in
-        # params_dtype (often bfloat16), so we upcast here to ensure Train→PS→Gen
-        # dtype consistency.
-        _FP32_PATTERNS = ("A_log",)
+        # Expose architecturally-constrained parameters in the dtype expected by PS/vLLM.
+        # The sync action keeps this detached copy synchronized in both directions.
+        fp32_patterns = self.parameter_mapping.get_external_fp32_param_patterns()
         for key, tensor in converted_state_dict.items():
-            if tensor.dtype != torch.float32 and any(p in key for p in _FP32_PATTERNS):
+            if tensor.dtype != torch.float32 and any(p in key for p in fp32_patterns):
+                self.sync_plan.add(DTypeCastSync(key=key, source_param=tensor))
                 converted_state_dict[key] = tensor.float()
 
         return converted_state_dict, sharding_dict
@@ -223,6 +232,17 @@ class MegatronConverter(BaseConverter):
             # Handles GDNConv1dMapping, MambaConv1dMapping, and any future ChunkedMapping subclasses.
             # ChunkedMapping has string hf_param and needs component-wise splitting.
             return self._convert_chunked_parameter(full_name, param, mapping.hf_param)
+
+        if isinstance(mapping, RMSNorm2ZeroCenteredRMSNormMapping):
+            # This norm is stored in Megatron as (γ-1). We keep the raw Megatron tensor in
+            # unified_state_dict (zero-centered format) and record the key so that push_model /
+            # nixl_pull_model can apply the ±1 correction without any string-matching heuristic.
+            assert isinstance(mapping.hf_param, str), (
+                f"RMSNorm2ZeroCenteredRMSNormMapping hf_param must be a resolved string, "
+                f"got {type(mapping.hf_param)} for {full_name}"
+            )
+            self.sync_plan.add(ZeroCenteredGammaSync(mapping.hf_param))
+            return {mapping.hf_param: param}
 
         if isinstance(mapping, (AutoMapping, ReplicatedMapping)):
             return self._convert_auto_mapping_parameter(full_name, param, mapping.hf_param)
@@ -282,8 +302,20 @@ class MegatronConverter(BaseConverter):
 
         qkv = torch.cat((q, k, v), dim=0)
         if "visual.blocks" in full_hf_name and "qkv" in full_hf_name:
-            qkv = reshape_visual_block_qkv(qkv)
+            qkv = reshape_visual_block_qkv(qkv, vision_head_size=self.model_info.get("vision_head_size"))
             param.partition_dim = 1
+        self.sync_plan.add(
+            ConcatenatedQKVSync(
+                key=full_hf_name,
+                megatron_name=full_name,
+                source_param=param,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_size=head_size,
+                tp_size=self.mpu.tp_size,
+                vision_head_size=self.model_info.get("vision_head_size"),
+            )
+        )
         return {full_hf_name: qkv}
 
     def _convert_qwen35_in_proj_parameter(self, full_name: str, param: Parameter, full_hf_names: list[str]) -> dict:
@@ -424,7 +456,7 @@ class MegatronConverter(BaseConverter):
             )
             return dict(zip(new_param_names, new_params))
         if "visual.blocks" in hf_name and "qkv" in hf_name:
-            param = reshape_visual_block_qkv(param)
+            param = reshape_visual_block_qkv(param, vision_head_size=self.model_info.get("vision_head_size"))
             param.partition_dim = 1
         return {hf_name: param}
 
@@ -532,7 +564,7 @@ def convert_megatron_inplace(
     parameter_mapping: ParameterMapping,
     model,
     mpu: ParallelStates | None = None,
-):
+) -> ConversionResult:
     """
     Convenience function to convert Megatron model to unified state dict and sharding info.
     Args:
@@ -540,7 +572,9 @@ def convert_megatron_inplace(
         model: The Megatron model instance
         mpu: Megatron parallel states, if None, use current Megatron parallel state
     Returns:
-        (converted_state_dict, sharding_dict)
+        ConversionResult containing the unified state dict, local sharding dict, and a
+        synchronization plan for canonical tensors that are not plain aliases of train parameters.
     """
     converter = MegatronConverter(parameter_mapping, mpu=mpu)
-    return converter.convert_state_and_sharding_dict(model)
+    state_dict, sharding_dict = converter.convert_state_and_sharding_dict(model)
+    return ConversionResult(state_dict=state_dict, sharding_dict=sharding_dict, sync_plan=converter.sync_plan)

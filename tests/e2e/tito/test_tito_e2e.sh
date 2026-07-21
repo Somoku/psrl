@@ -8,7 +8,7 @@
 # 1. Session lifecycle (create/get/delete) via SMG
 # 2. Chat completion with logprobs through full TITO pipeline
 # 3. accumulated_token_ids + per-turn records from SMG GET endpoint
-# 4. Training array construction (trailing trim, loss mask, logprobs)
+# 4. Training-data construction (trailing trim, loss mask, logprobs)
 #
 # Prerequisites:
 #   - source env/psrl.sh
@@ -30,6 +30,7 @@ VLLM_GRPC_PORT="${VLLM_GRPC_PORT:-50051}"
 SMG_PORT="${SMG_PORT:-8150}"
 SESSION_ROUTER_PORT="${SESSION_ROUTER_PORT:-8200}"
 MAX_TURNS="${MAX_TURNS:-3}"
+TRAJECTORY_ID_STRATEGY="${TRAJECTORY_ID_STRATEGY:-manual}"
 LOG_DIR="${LOG_DIR:-/tmp/tito_e2e_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "$LOG_DIR"
@@ -37,6 +38,7 @@ echo "=== TITO E2E Test (Full SMG Pipeline) ==="
 echo "  Model:   $MODEL_PATH"
 echo "  Host:    $HOST_IP"
 echo "  Ports:   vLLM(gRPC)=$VLLM_GRPC_PORT  SMG=$SMG_PORT  SessionRouter=$SESSION_ROUTER_PORT"
+echo "  Trajectory ID strategy: $TRAJECTORY_ID_STRATEGY"
 echo "  Logs:    $LOG_DIR"
 echo ""
 
@@ -101,6 +103,7 @@ router_args = RouterArgs(
     disable_retries=True,
     enable_tito=True,
     tito_debug=False,
+    trajectory_id_strategy='${TRAJECTORY_ID_STRATEGY}',
     request_timeout_secs=120,
     log_level='info',
     log_dir='${LOG_DIR}',
@@ -186,7 +189,10 @@ echo ">>> [Step 3/4] Launching SessionRouter on ${HOST_IP}:${SESSION_ROUTER_PORT
 python -c "
 import uvicorn
 from psrl.workers.gen.session_router import SessionRouter
-router = SessionRouter(smg_url='http://${HOST_IP}:${SMG_PORT}')
+router = SessionRouter(
+    smg_url='http://${HOST_IP}:${SMG_PORT}',
+    trajectory_id_strategy='${TRAJECTORY_ID_STRATEGY}',
+)
 uvicorn.run(router.app, host='0.0.0.0', port=${SESSION_ROUTER_PORT}, log_level='warning')
 " > "$LOG_DIR/session_router.log" 2>&1 &
 PIDS+=($!)

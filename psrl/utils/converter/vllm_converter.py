@@ -165,7 +165,10 @@ class VllmConverter(BaseConverter):
                     converted_name = converted.name
                     converted_param = converted.param
                     if "visual.blocks" in converted_name and "qkv" in converted_name:
-                        converted_param = reshape_visual_block_qkv(converted_param)
+                        converted_param = reshape_visual_block_qkv(
+                            converted_param,
+                            vision_head_size=self.model_info.get("vision_head_size"),
+                        )
                     sharding = self._adjust_kv_sharding(converted_name, sharding, module, self.model_info)
                     converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted_name, converted_param, sharding)
                     converted_state_dict[converted_name] = converted_param
@@ -454,7 +457,7 @@ class VllmConverter(BaseConverter):
             return dict(zip(new_param_names, new_params))
 
         if "visual.blocks" in full_name and "qkv" in full_name:
-            param = reshape_visual_block_qkv(param)
+            param = reshape_visual_block_qkv(param, vision_head_size=self.model_info.get("vision_head_size"))
 
         # Default: No conversion needed
         return {full_name: param}

@@ -539,6 +539,19 @@ class AgentData(ABC, Generic[ObsType, ActType]):
 
         return request
 
+    def prepare_chat_completion_multimodal_data(self) -> dict | None:
+        """Return accumulated multimodal media for session chat normalization."""
+        trajectory = self.session_data.trajectories[-1]
+        if trajectory.image_data is None and trajectory.video_data is None:
+            return None
+
+        mm_data: dict[str, Any] = {}
+        if trajectory.image_data is not None:
+            mm_data["images"] = trajectory.image_data
+        if trajectory.video_data is not None:
+            mm_data["videos"] = trajectory.video_data
+        return mm_data
+
     def compute_step_reward(self, step: Step) -> float:
         """
         Compute the step-level reward.

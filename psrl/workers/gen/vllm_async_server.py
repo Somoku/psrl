@@ -825,7 +825,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # Try to reset prefix cache to ensure clean state
         if reset_prefix_cache:
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self.clear_kv_cache()
 
         return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
@@ -960,6 +960,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         request_id: str,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
+        audio_data: list[Any] | None = None,
         priority: int = 0,
         data_parallel_rank: int = 0,
         version_tag: int | None = None,
@@ -974,6 +975,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 request_id=request_id,
                 image_data=image_data,
                 video_data=video_data,
+                audio_data=audio_data,
                 data_parallel_rank=data_parallel_rank,
                 version_tag=version_tag,
                 is_validate=is_validate,
@@ -1053,8 +1055,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        prompt = TokensPrompt(**prompt_kwargs)
 
         # Add lora request
         lora_request = None
@@ -1132,12 +1137,19 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.active_task_num[data_parallel_rank] -= 1
         self.log_active_tasks(data_parallel_rank, task_done=True)
 
+        multi_modal_data = {
+            k: v for k, v in (("images", image_data), ("videos", video_data), ("audios", audio_data)) if v is not None
+        }
+        if not multi_modal_data:
+            multi_modal_data = None
+
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=token_ids,
             response_mask=[1] * len(token_ids),
             response_log_probs=log_probs,
             routed_experts=routed_experts,
+            multi_modal_data=multi_modal_data,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             interrupted=interrupted,
@@ -1151,6 +1163,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         request_id: str,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
+        audio_data: list[Any] | None = None,
         data_parallel_rank: int = 0,
         version_tag: int | None = None,
         is_validate: bool = False,
@@ -1201,8 +1214,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        prompt = TokensPrompt(**prompt_kwargs)
 
         if data_parallel_rank not in self.active_task_num:
             self.active_task_num[data_parallel_rank] = 0
@@ -1237,11 +1253,18 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.active_task_num[data_parallel_rank] -= 1
         self.log_active_tasks(data_parallel_rank, task_done=True)
 
+        multi_modal_data = {
+            k: v for k, v in (("images", image_data), ("videos", video_data), ("audios", audio_data)) if v is not None
+        }
+        if not multi_modal_data:
+            multi_modal_data = None
+
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=[],
             response_mask=[],
             pooling_output=pooling_output,
+            multi_modal_data=multi_modal_data,
             stop_reason="completed",
             interrupted=False,
             update_status=update_status,

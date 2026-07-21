@@ -419,7 +419,7 @@ which is written by `prepare_swebench.py`.
    injects immutable TITO/PSRL routing headers and forwards each request body
    unchanged to SMG.
 4. After mini-swe-agent exits, PSRL fetches the session once and converts the
-   captured trajectory into canonical training arrays.
+   captured trajectory into canonical training data.
 5. PSRL deletes the TITO session and removes rollout Docker containers in
    `finally` cleanup.
 

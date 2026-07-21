@@ -3,7 +3,6 @@ import torch
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
-    make_slice_parameter,
     reshape_visual_block_qkv,
     slice_attn_conv1d,
     slice_qwen3_5_in_proj_qkv,
@@ -77,18 +76,7 @@ def maybe_convert_to_smaller_parts(model_info, param_name, param):
         return dict(zip(new_param_names, new_params))
     if "visual.blocks" in param_name and "qkv" in param_name:
         vision_head_size = model_info.get("vision_head_size")
-        rows = param.shape[0]
-        if vision_head_size and rows % (3 * vision_head_size) == 0:
-            num_heads_local = rows // (3 * vision_head_size)
-            if len(param.shape) == 1:
-                # Bias: [3*H*h] → [3, H, h, 1]
-                reshaped_data = param.data.reshape(3, num_heads_local, vision_head_size, 1)
-            else:
-                # Weight: [3*H*h, hidden] → [3, H, h, hidden]
-                reshaped_data = param.data.reshape(3, num_heads_local, vision_head_size, *param.shape[1:])
-            param = make_slice_parameter(reshaped_data, param)
-        else:
-            param = reshape_visual_block_qkv(param)
+        param = reshape_visual_block_qkv(param, vision_head_size=vision_head_size)
     if "mlp.experts.gate_up_proj" in param_name:
         param_dict = {}
         num_experts = model_info["num_experts"]

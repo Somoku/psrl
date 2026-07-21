@@ -460,6 +460,18 @@ lmcache:
   gpu_pin_block_budget: 0
 
 rollout_gateway:
+  # TITO trajectory assignment: manual reads x-smg-tito-trajectory-id (default 0),
+  # while auto derives IDs from matching prefix-tree leaves inside SMG.
+  trajectory_id_strategy: manual
+
+  # rust: SMG preprocesses pixels (fast); python: forward HF tensors (exact).
+  multimodal_preprocessing: rust
+
+  # SMG -> vLLM tensor transport. auto uses /dev/shm only after SMG verifies
+  # that the selected worker shares the namespace; otherwise it stays inline.
+  multimodal_tensor_transport: auto
+  multimodal_shm_min_bytes: 65536
+
   # Max HTTP generation concurrency per rollout server.
   # The global HTTP budget is
   # server_max_concurrency * number_of_active_rollout_servers.

@@ -21,7 +21,11 @@ async def mock_create():
 
 @mock_smg.get("/tito/sessions/{sid}")
 async def mock_get(sid: str):
-    return {"session_id": sid, "accumulated_token_ids": [1, 2, 3], "records": []}
+    return {
+        "session_id": sid,
+        "max_trim_tokens": 0,
+        "trajectories": [{"trajectory_id": 0, "accumulated_token_ids": [1, 2, 3], "records": []}],
+    }
 
 
 @mock_smg.delete("/tito/sessions/{sid}")
@@ -75,6 +79,18 @@ def client(router):
     return httpx.AsyncClient(transport=ASGITransport(app=router.app), base_url="http://testserver")
 
 
+@pytest.fixture()
+def auto_router():
+    sr = SessionRouter(smg_url="http://mock-smg", trajectory_id_strategy="auto")
+    sr.client = httpx.AsyncClient(transport=ASGITransport(app=mock_smg), base_url="http://mock-smg")
+    return sr
+
+
+@pytest.fixture()
+def auto_client(auto_router):
+    return httpx.AsyncClient(transport=ASGITransport(app=auto_router.app), base_url="http://testserver")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -84,7 +100,10 @@ async def test_create_session(client, router):
     assert resp.status_code == 200
     data = resp.json()
     assert data["session_id"] == "test-sid-123"
-    assert router.states["test-sid-123"].headers == {"x-request-id": "request-1"}
+    assert router.states["test-sid-123"].headers == {
+        "x-request-id": "request-1",
+        "x-smg-tito-session-id": "test-sid-123",
+    }
 
 
 @pytest.mark.asyncio
@@ -93,7 +112,7 @@ async def test_get_session(client):
     assert resp.status_code == 200
     data = resp.json()
     assert data["session_id"] == "my-session"
-    assert data["accumulated_token_ids"] == [1, 2, 3]
+    assert data["trajectories"][0]["accumulated_token_ids"] == [1, 2, 3]
 
 
 @pytest.mark.asyncio
@@ -121,17 +140,27 @@ async def test_chat_completions_injects_session_metadata(client):
         headers={
             "x-is-sticky": "true",
             "x-request-id": "request-1",
-            "x-smg-tito-trajectory-id": "7",
         },
     )
     await client.post(
         "/sessions/test-sid-123/v1/chat/completions",
         json={"model": "m", "messages": []},
-        headers={"x-request-id": "cannot-override"},
+        headers={"x-request-id": "request-2"},
     )
     assert captured["chat_headers"]["x-is-sticky"] == "true"
-    assert captured["chat_headers"]["x-request-id"] == "request-1"
-    assert captured["chat_headers"]["x-smg-tito-trajectory-id"] == "7"
+    assert captured["chat_headers"]["x-request-id"] == "request-2"
+    assert captured["chat_headers"]["x-smg-tito-trajectory-id"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_auto_strategy_removes_request_trajectory_id(auto_client, auto_router):
+    await auto_client.post(
+        "/sessions/sid-auto/v1/chat/completions",
+        json={"model": "m", "messages": []},
+        headers={"x-smg-tito-trajectory-id": "4"},
+    )
+    assert "x-smg-tito-trajectory-id" not in captured["chat_headers"]
+    assert auto_router.states["sid-auto"].trajectory_turns == {}
 
 
 @pytest.mark.asyncio
@@ -168,13 +197,13 @@ async def test_turn_counter_increments_on_chat_completion(router, client):
     """Turn counter increments exactly once per successful chat completion."""
     payload = {"model": "m", "messages": []}
     state = await router._ensure_state("sid-abc")
-    assert state.turn == 0
+    assert state.get_trajectory_turn(0) == 0
 
     await client.post("/sessions/sid-abc/v1/chat/completions", json=payload)
-    assert state.turn == 1
+    assert state.get_trajectory_turn(0) == 1
 
     await client.post("/sessions/sid-abc/v1/chat/completions", json=payload)
-    assert state.turn == 2
+    assert state.get_trajectory_turn(0) == 2
 
 
 @pytest.mark.asyncio

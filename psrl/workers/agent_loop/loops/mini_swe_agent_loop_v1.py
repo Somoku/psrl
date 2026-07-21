@@ -1,7 +1,3 @@
-"""mini-SWE-agent loop backed by a black-box runner and SMG TITO sessions."""
-
-from __future__ import annotations
-
 import asyncio
 import concurrent.futures
 import logging
@@ -9,17 +5,15 @@ import os
 import re
 from dataclasses import asdict
 
-import ray
 from examples.mini_swe.config import MiniSWEAgentRuntimeConfig, build_runtime_config
 from examples.mini_swe.runner import run_agent
-from transformers import AutoProcessor, AutoTokenizer
-from verl.utils.dataset.rl_dataset import RLHFDataset
 
 from psrl.environments import Environment
 from psrl.utils.concurrency import SlotManager
 from psrl.workers.agent_loop.agent_data import AgentData, MiniSWEAgentData
+from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
-from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
+from psrl.workers.agent_loop.loops.utils import TerminateReason, register
 from psrl.workers.gen.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
@@ -45,33 +39,16 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
 
     def __init__(
         self,
-        trainer_config: DictConfigWrap,
-        rollout_gateway_url: str,
-        reward_manager: ray.actor.ActorHandle,
-        ps_manager_handle: ray.actor.ActorHandle,
-        tokenizer: AutoTokenizer,
-        processor: AutoProcessor,
-        dataset_cls: type[RLHFDataset],
-        data_config: DictConfigWrap,
+        context: AgentLoopContext,
         **kwargs,
     ):
-        super().__init__(
-            trainer_config=trainer_config,
-            rollout_gateway_url=rollout_gateway_url,
-            reward_manager=reward_manager,
-            ps_manager_handle=ps_manager_handle,
-            tokenizer=tokenizer,
-            processor=processor,
-            dataset_cls=dataset_cls,
-            data_config=data_config,
-            **kwargs,
-        )
+        super().__init__(context=context)
         runtime_kwargs = {key: kwargs[key] for key in ("sandbox_config", "agent", "model") if key in kwargs}
         self.runtime_config: MiniSWEAgentRuntimeConfig = build_runtime_config(runtime_kwargs)
-        multi_turn = trainer_config.config.gen_actor_rollout_ref.rollout.multi_turn
+        multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("mini-SWE-agent v1 requires rollout.multi_turn.enable=True.")
-        if trainer_config.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode != "traj":
+        if context.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode != "traj":
             raise ValueError("mini-SWE-agent v1 supports only agent.traj_reward_mode=traj.")
 
     async def _run_agent(
@@ -90,6 +67,7 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
             "observation": runner_observation,
             "runtime_config": asdict(runtime_config),
             "max_turns": self.max_turns,
+            "trajectory_id_strategy": self.trajectory_id_strategy,
             "actor_id": os.getenv("PSRL_ACTOR_ID", ""),
         }
         timeout = _parse_timeout_secs(runtime_config.sandbox_config.environment.container_timeout) + 1200.0
@@ -147,10 +125,10 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
             # not aborted.
             context_exceeded = result.get("exit_status") == "context_exceeded"
 
-            arrays = await self.get_training_arrays(session_id, request.get("trajectory_id", 0))
-            if arrays["num_turns"] == 0:
+            training_data = await self.get_primary_training_data(session_id)
+            if training_data["num_turns"] == 0:
                 return None, TerminateReason.UNKNOWN
-            self.attach_training_arrays(agent_data, arrays, update_turn_counts=True)
+            self.attach_training_data(agent_data, training_data, update_turn_counts=True)
             agent_data.set_patch(result.get("submission") or None)
             if result.get("timing") is not None:
                 agent_data.set_timing(result["timing"])
@@ -158,9 +136,9 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
                 agent_data.set_grader_result(result["grader_result"])
 
             terminate_reason = TerminateReason.FINISHED
-            if context_exceeded or len(arrays["response_ids"]) >= int(self.rollout_config.response_length):
+            if context_exceeded or len(training_data["response_ids"]) >= int(self.rollout_config.response_length):
                 terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-            elif arrays["num_turns"] >= self.max_turns:
+            elif training_data["num_turns"] >= self.max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
             finalized = await agent_data.finalize_output()
             return (finalized, terminate_reason) if finalized is not None else (None, TerminateReason.ABORTED)

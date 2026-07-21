@@ -83,8 +83,9 @@ from psrl.utils.post_processor import (
     load_group_post_processor,
 )
 from psrl.utils.server.command import Command, CommandType
-from psrl.workers.agent_loop import PSRL_AgentLoopManager, PSRL_AgentLoopWorker
+from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
+from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
 from psrl.workers.config.reward_model import resolve_active_managers
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 from psrl.workers.gen.rollout_gateway import RolloutGateway

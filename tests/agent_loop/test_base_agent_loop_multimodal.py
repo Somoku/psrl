@@ -65,13 +65,19 @@ async def test_rust_multimodal_payload_requests_expanded_prompt_ids():
         executor=None,
     )
 
-    payload = await builder.build(None, ["https://example.com/image.png"], {})
+    first_stage_image = SimpleNamespace(size=(224, 320))
+    payload = await builder.build(
+        None,
+        ["https://example.com/image.png"],
+        {"images": [first_stage_image]},
+    )
 
     assert payload == {
         "image_data": ["https://example.com/image.png"],
         "multimodal_token_mode": "unexpanded",
         "modalities": ["image"],
         "return_prompt_token_ids": True,
+        "image_preprocessing": {"resize_targets": [{"width": 224, "height": 320}]},
     }
 
 

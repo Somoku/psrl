@@ -41,7 +41,6 @@ import torch.nn as nn
 
 class MatchMode(enum.Enum):
     """Pattern matching modes for weight layout rules."""
-
     SUFFIX = "suffix"
     PREFIX = "prefix"
     EXACT = "exact"
@@ -65,7 +64,6 @@ class WeightPiece:
         length: Optional slice length along split axis (for view-based slicing)
         transform: Optional nested transform to apply to this piece
     """
-
     hf_name: str
     shard_id: str | int | tuple[int, ...] | None = None
     offset: int | None = None
@@ -88,7 +86,6 @@ class WeightTransform:
         axis: Primary axis for split/concat operations
         metadata: Transform-specific parameters (see per-kind docs)
     """
-
     kind: str
     pieces: tuple[WeightPiece, ...] = ()
     axis: int = 0
@@ -159,7 +156,10 @@ class WeightTransform:
                     If length is None the pieces are split equally.
             axis: Axis along which to split (default 0)
         """
-        weight_pieces = tuple(WeightPiece(hf_name=name, length=length) for name, length in pieces)
+        weight_pieces = tuple(
+            WeightPiece(hf_name=name, length=length)
+            for name, length in pieces
+        )
         return cls(kind="merged_column", pieces=weight_pieces, axis=axis)
 
     @classmethod
@@ -175,7 +175,10 @@ class WeightTransform:
                     If length is None the pieces are split equally.
             axis: Axis along which to split
         """
-        weight_pieces = tuple(WeightPiece(hf_name=name, length=length) for name, length in pieces)
+        weight_pieces = tuple(
+            WeightPiece(hf_name=name, length=length)
+            for name, length in pieces
+        )
         return cls(kind="split", pieces=weight_pieces, axis=axis)
 
     @classmethod
@@ -353,7 +356,8 @@ class WeightTransform:
         return cls(
             kind="index_select",
             pieces=(WeightPiece(hf_name=hf_name),),
-            metadata={"indices": list(indices) if indices else None, "index_attr": index_attr, "dim": dim},
+            metadata={"indices": list(indices) if indices else None,
+                      "index_attr": index_attr, "dim": dim},
         )
 
     @classmethod
@@ -503,11 +507,11 @@ class NameMapper:
         """Apply the first matching substitution."""
         for src, dst in self._pairs:
             if self._mode == "prefix" and name.startswith(src):
-                return dst + name[len(src) :]
+                return dst + name[len(src):]
             elif self._mode == "substr" and src in name:
                 return name.replace(src, dst, 1)
             elif self._mode == "suffix" and name.endswith(src):
-                return name[: -len(src)] + dst
+                return name[:-len(src)] + dst
             elif self._mode == "regex":
                 result = re.sub(src, dst, name)
                 if result != name:
@@ -530,7 +534,6 @@ class ReversibleNameMap:
         vllm_to_hf: Mapping applied when converting vLLM names to HF names
         hf_to_vllm: Mapping applied when converting HF names to vLLM names
     """
-
     vllm_to_hf: NameMapper | Mapping[str, str] | None = None
     hf_to_vllm: NameMapper | Mapping[str, str] | None = None
 
@@ -568,11 +571,9 @@ class ReversibleNameMap:
 
         Example::
 
-            ReversibleNameMap.from_prefix_pairs(
-                {
-                    "language_model.layers.": "language_model.model.layers.",
-                }
-            )
+            ReversibleNameMap.from_prefix_pairs({
+                "language_model.layers.": "language_model.model.layers.",
+            })
 
         The reverse mapping is automatically derived by swapping keys/values.
         """
@@ -606,7 +607,6 @@ class WeightSyncPolicy:
 
     Note: MTP and Eagle parameters are included by default.
     """
-
     include_prefixes: tuple[str, ...] = ()
     exclude_prefixes: tuple[str, ...] = ()
     exclude_substrs: tuple[str, ...] = ()
@@ -649,7 +649,6 @@ class WeightLayoutRule:
         module_types: Optional filter on module type
         metadata: Extra metadata for this rule
     """
-
     vllm_pattern: str
     hf_patterns: tuple[str, ...]
     transform: WeightTransform
@@ -674,7 +673,9 @@ class WeightLayoutRule:
             if not re.fullmatch(pattern, name):
                 return False
 
-        if self.module_types and module is not None and not isinstance(module, tuple(self.module_types)):
+        if self.module_types and module is not None and not isinstance(
+            module, tuple(self.module_types)
+        ):
             return False
 
         return True
@@ -692,7 +693,6 @@ class WeightLayoutMount:
         plan: The sub-model's WeightLayoutPlan
         name_map: Optional additional name map applied at this mount boundary
     """
-
     prefix: str
     plan: WeightLayoutPlan
     name_map: ReversibleNameMap | None = None
@@ -706,7 +706,6 @@ class WeightLayoutMount:
 @dataclass(frozen=True)
 class FlattenedRule:
     """A WeightLayoutRule with its resolved module prefix."""
-
     prefix: str
     rule: WeightLayoutRule
 
@@ -714,7 +713,6 @@ class FlattenedRule:
 @dataclass(frozen=True)
 class ResolvedWeightLayoutPlan:
     """Flattened weight layout plan with all mounts resolved into flat rules."""
-
     rules: tuple[FlattenedRule, ...] = ()
     name_map: ReversibleNameMap | None = None
     sync: WeightSyncPolicy = field(default_factory=WeightSyncPolicy)
@@ -738,7 +736,9 @@ class ResolvedWeightLayoutPlan:
     ) -> Sequence[FlattenedRule]:
         """Find all rules whose pattern matches the given parameter name."""
         matches = []
-        index: dict[str, list[FlattenedRule]] = getattr(self, "_prefix_index", {})
+        index: dict[str, list[FlattenedRule]] = getattr(
+            self, "_prefix_index", {}
+        )
 
         # Check rules with empty prefix (apply to all params)
         for flattened in index.get("", []):
@@ -755,7 +755,7 @@ class ResolvedWeightLayoutPlan:
             if rules_for_prefix is None:
                 continue
             prefix_dot = candidate + "."
-            relative_name = param_name[len(prefix_dot) :]
+            relative_name = param_name[len(prefix_dot):]
             for flattened in rules_for_prefix:
                 if flattened.rule.matches(relative_name, module):
                     matches.append(flattened)
@@ -781,7 +781,6 @@ class WeightLayoutPlan:
         name_map: Global HF <-> vLLM name mapping applied after transforms
         sync: Policy controlling which parameters are synchronised
     """
-
     rules: tuple[WeightLayoutRule, ...] = ()
     mounts: tuple[WeightLayoutMount, ...] = ()
     name_map: ReversibleNameMap | None = None
@@ -801,8 +800,14 @@ class WeightLayoutPlan:
             mounted_resolved = mount.plan.flatten()
             merged_sync = merged_sync.merge(mounted_resolved.sync)
             for flattened in mounted_resolved.rules:
-                new_prefix = f"{mount.prefix}.{flattened.prefix}".rstrip(".") if flattened.prefix else mount.prefix
-                flattened_rules.append(FlattenedRule(prefix=new_prefix, rule=flattened.rule))
+                new_prefix = (
+                    f"{mount.prefix}.{flattened.prefix}".rstrip(".")
+                    if flattened.prefix
+                    else mount.prefix
+                )
+                flattened_rules.append(
+                    FlattenedRule(prefix=new_prefix, rule=flattened.rule)
+                )
 
         return ResolvedWeightLayoutPlan(
             rules=tuple(flattened_rules),
@@ -1003,9 +1008,7 @@ class WeightLayoutBuilder:
             vllm_p = f"{vllm}.{sub}"
             q_p, k_p, v_p = f"{q}.{sub}", f"{k}.{sub}", f"{v}.{sub}"
             transform = WeightTransform.qkv(
-                q_p,
-                k_p,
-                v_p,
+                q_p, k_p, v_p,
                 num_heads_attr=num_heads_attr,
                 num_kv_heads_attr=num_kv_heads_attr,
                 head_size_attr=head_size_attr,
@@ -1076,11 +1079,7 @@ class WeightLayoutBuilder:
             match: Pattern matching mode
         """
         transform = WeightTransform.fused_moe(
-            w13,
-            w2,
-            gate,
-            up,
-            down,
+            w13, w2, gate, up, down,
             num_experts=num_experts,
             num_experts_attr=num_experts_attr,
             ep_aware=ep_aware,
@@ -1171,7 +1170,9 @@ class WeightLayoutBuilder:
             match: Pattern matching mode
         """
         for pattern in patterns:
-            transform = WeightTransform.permute_qk_rotary(pattern, head_dim=head_dim, head_dim_attr=head_dim_attr)
+            transform = WeightTransform.permute_qk_rotary(
+                pattern, head_dim=head_dim, head_dim_attr=head_dim_attr
+            )
             self.add_rule(pattern, pattern, transform, match=match)
         return self
 
@@ -1198,7 +1199,9 @@ class WeightLayoutBuilder:
         match: MatchMode | str = MatchMode.SUFFIX,
     ) -> WeightLayoutBuilder:
         """Add an index-select rule."""
-        transform = WeightTransform.index_select(hf, indices=indices, index_attr=index_attr, dim=dim)
+        transform = WeightTransform.index_select(
+            hf, indices=indices, index_attr=index_attr, dim=dim
+        )
         return self.add_rule(vllm, hf, transform, match=match)
 
     def alias(
@@ -1240,7 +1243,8 @@ class WeightLayoutBuilder:
         new_transform = WeightTransform(
             kind="custom",
             pieces=rule.transform.pieces,
-            metadata={**rule.transform.metadata, "transform_instance": transform},
+            metadata={**rule.transform.metadata,
+                      "transform_instance": transform},
         )
         new_rule = WeightLayoutRule(
             vllm_pattern=rule.vllm_pattern,
@@ -1282,7 +1286,9 @@ class WeightLayoutBuilder:
         from vllm_patches.weight_layouts import register_weight_layouts_for_module
 
         register_weight_layouts_for_module(type(module).__module__)
-        if hasattr(module, "build_weight_layout") and callable(module.build_weight_layout):
+        if hasattr(module, "build_weight_layout") and callable(
+            module.build_weight_layout
+        ):
             sub_plan = module.build_weight_layout()  # type: ignore[union-attr]
         else:
             sub_plan = WeightLayoutPlan()
@@ -1349,7 +1355,6 @@ def build_auto_weight_layout(
 
     try:
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
-
         has_fused_moe = True
     except ImportError:
         FusedMoE = None  # type: ignore[assignment, misc]
@@ -1367,7 +1372,11 @@ def build_auto_weight_layout(
         seen_modules.add(mod_name)
 
         # Sub-models that declare their own layout
-        if mod is not model and hasattr(mod, "build_weight_layout") and callable(mod.build_weight_layout):
+        if (
+            mod is not model
+            and hasattr(mod, "build_weight_layout")
+            and callable(mod.build_weight_layout)
+        ):
             builder.mount_module(mod_name, mod)
             continue
 
@@ -1375,7 +1384,9 @@ def build_auto_weight_layout(
         if isinstance(mod, QKVParallelLinear):
             builder.add_rule(
                 mod_name + ".weight",
-                (mod_name + ".q_proj.weight", mod_name + ".k_proj.weight", mod_name + ".v_proj.weight"),
+                (mod_name + ".q_proj.weight",
+                 mod_name + ".k_proj.weight",
+                 mod_name + ".v_proj.weight"),
                 WeightTransform.qkv(
                     mod_name + ".q_proj.weight",
                     mod_name + ".k_proj.weight",
@@ -1386,7 +1397,9 @@ def build_auto_weight_layout(
             if getattr(mod, "bias", None) is not None:
                 builder.add_rule(
                     mod_name + ".bias",
-                    (mod_name + ".q_proj.bias", mod_name + ".k_proj.bias", mod_name + ".v_proj.bias"),
+                    (mod_name + ".q_proj.bias",
+                     mod_name + ".k_proj.bias",
+                     mod_name + ".v_proj.bias"),
                     WeightTransform.qkv(
                         mod_name + ".q_proj.bias",
                         mod_name + ".k_proj.bias",
@@ -1400,14 +1413,18 @@ def build_auto_weight_layout(
                 builder.add_rule(
                     mod_name + ".weight",
                     tuple(n + ".weight" for n in spec),
-                    WeightTransform.merged_column([(n + ".weight", None) for n in spec]),
+                    WeightTransform.merged_column(
+                        [(n + ".weight", None) for n in spec]
+                    ),
                     match=MatchMode.EXACT,
                 )
                 if getattr(mod, "bias", None) is not None:
                     builder.add_rule(
                         mod_name + ".bias",
                         tuple(n + ".bias" for n in spec),
-                        WeightTransform.merged_column([(n + ".bias", None) for n in spec]),
+                        WeightTransform.merged_column(
+                            [(n + ".bias", None) for n in spec]
+                        ),
                         match=MatchMode.EXACT,
                     )
         elif has_fused_moe and isinstance(mod, FusedMoE):

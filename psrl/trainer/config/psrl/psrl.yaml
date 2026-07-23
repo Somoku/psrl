@@ -276,7 +276,7 @@ nixl:
 broadcast_init:
 
   # Set to true to use rank-0 broadcast initialization instead of each worker reading disk.
-  enabled: False
+  enabled: True
 
   # Broadcast algorithm. Supported: binary_tree. Reserved for future: ring.
   algorithm: binary_tree
@@ -333,7 +333,7 @@ tms:
   #  - "null": disable TMS
   #  - "train": enable TMS for training workers only
   #  - "all": enable TMS for both rollout and training workers
-  range: all
+  range: null
 
   # Whether to enable TMS on CUDA graphs
   # When enabled, CUDA graphs will be released by TMS to save GPU memory
@@ -343,7 +343,7 @@ tms:
   # Whether to enable TMS on NIXL temp buffers
   # When enabled, NIXL temp buffers will be released by TMS to save GPU
   # and the reregister will be simplified.
-  enable_nixl: True
+  enable_nixl: False
 
 # LMCache KV cache offloading configuration.
 # When enabled, vLLM offloads KV cache to the specified backend (CPU by default),

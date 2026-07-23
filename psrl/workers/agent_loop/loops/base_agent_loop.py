@@ -24,7 +24,10 @@ from psrl.utils.dataset.utils import _pre_process_inputs
 from psrl.utils.rollout.gateway_multimodal import GatewayMultimodalPayloadBuilder
 from psrl.utils.rollout.loop_timer import LoopTimer
 from psrl.utils.rollout.trajectory_writer import TrajectoryWriter
-from psrl.utils.rollout.vision_utils import messages_contain_images, resolve_message_image_refs
+from psrl.utils.rollout.vision_utils import (
+    messages_contain_images,
+    resolve_message_image_refs,
+)
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.gen.utils import TokenInput, TokenOutput
@@ -56,8 +59,9 @@ class AgentLoopBase(ABC):
         self.traj_writer = TrajectoryWriter.from_config(self.config)
         self.timer = LoopTimer()
         self.dataset_cls = context.dataset_cls
-        self.data_config = context.data_config
+        self.data_config = context.data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
+        self.mm_processor_kwargs = dict(self.data_config.get("mm_processor_kwargs", {}))
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)
         self.loop = asyncio.get_running_loop()
         self.response_length = self.rollout_config.response_length
@@ -146,6 +150,7 @@ class AgentLoopBase(ABC):
                     images=images,
                     videos=videos,
                     audio=audios,
+                    mm_processor_kwargs=self.mm_processor_kwargs,
                 )
                 prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
             else:
@@ -357,7 +362,6 @@ class AgentLoopBase(ABC):
                     f"len(prompt_token_ids)={len(prompt_ids)}."
                 )
             self._validate_multimodal_prompt_length(prompt_ids)
-
         # rollout instance id
         replica_id = base_worker_id
         rollout_instance_id = (replica_id, int(target_dp_rank) if target_dp_rank is not None else 0)
@@ -398,6 +402,7 @@ class AgentLoopBase(ABC):
             response_log_probs=log_probs,
             routed_experts=routed_experts,
             multi_modal_data=request_input.multi_modal_data,
+            mm_processor_kwargs=request_input.mm_processor_kwargs,
             stop_reason=finish_reason,
             interrupted=interrupted,
             update_status=PSRL_RequestStatus.ROLLOUT_COMPLETED,
@@ -414,10 +419,14 @@ class AgentLoopBase(ABC):
         messages = None
         raw_prompt = request.get("raw_prompt")
         raw_prompt_has_images = bool(raw_prompt and messages_contain_images(raw_prompt))
+        expected_multimodal_token_mode = (
+            "unexpanded"
+            if self.gateway_multimodal.uses_rust_preprocessing and raw_prompt_has_images
+            else "preexpanded"
+        )
         rebuild_unexpanded_multimodal_ids = bool(
-            self.gateway_multimodal.uses_rust_preprocessing
-            and raw_prompt_has_images
-            and not self.gateway_multimodal.uses_rust_preprocessing
+            raw_prompt_has_images
+            and request.get("_raw_prompt_multimodal_token_mode") != expected_multimodal_token_mode
         )
         if "raw_prompt_ids" not in request or rebuild_unexpanded_multimodal_ids:
             if request.get("input_ids", None) is not None and not rebuild_unexpanded_multimodal_ids:
@@ -445,6 +454,8 @@ class AgentLoopBase(ABC):
                     ),
                 )
                 request["raw_prompt_ids"] = np.array(raw_prompt_ids)
+                if raw_prompt_has_images:
+                    request["_raw_prompt_multimodal_token_mode"] = expected_multimodal_token_mode
                 if multi_modal_data:
                     request["multi_modal_data"] = multi_modal_data
             else:
@@ -478,6 +489,7 @@ class AgentLoopBase(ABC):
             version_tag=version_tag,
             cu_response_len=len(raw_response_ids),
             multi_modal_data=multi_modal_data,
+            mm_processor_kwargs=getattr(self, "mm_processor_kwargs", None) if multi_modal_data else None,
             raw_prompt=messages,
             is_validate=is_validate,
             stop_token_ids=request.get("stop_token_ids", None),

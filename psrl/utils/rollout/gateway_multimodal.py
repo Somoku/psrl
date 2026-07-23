@@ -1,7 +1,11 @@
 from enum import Enum
 
 import torch
-from psrl.utils.rollout.vision_utils import serialize_image_inputs, serialize_tensor
+from psrl.utils.rollout.vision_utils import (
+    image_resize_targets,
+    serialize_image_inputs,
+    serialize_tensor,
+)
 from verl.utils.tokenizer import build_multimodal_processor_inputs
 
 
@@ -40,6 +44,9 @@ class GatewayMultimodalPayloadBuilder:
             # SMG owns placeholder expansion in this mode. PSRL needs the exact
             # expanded IDs used by vLLM for training-data alignment.
             payload["return_prompt_token_ids"] = True
+            payload["image_preprocessing"] = {
+                "resize_targets": image_resize_targets(mm_data.get("images") or [], len(image_refs))
+            }
         else:
             payload["preprocessed_mm_inputs"] = await self._python_inputs(request_input, mm_data)
         return payload
@@ -53,6 +60,7 @@ class GatewayMultimodalPayloadBuilder:
             self.processor,
             text=[prompt_text],
             images=images,
+            mm_processor_kwargs=request_input.mm_processor_kwargs,
         )
         inputs.pop("input_ids", None)
         inputs.pop("attention_mask", None)

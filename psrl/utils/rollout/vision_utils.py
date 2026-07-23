@@ -19,6 +19,34 @@ def messages_contain_images(messages: list[dict]) -> bool:
     )
 
 
+def image_resize_targets(images: list, expected_count: int) -> list[dict[str, int]]:
+    """Return compact first-stage resize targets for SMG's Rust path.
+
+    ``qwen_vl_utils`` has already produced these PIL images. Sending only their
+    dimensions lets SMG repeat that first resize from the original URL before
+    its model processor runs, without serializing the resized pixels.
+    """
+    if len(images) != expected_count:
+        raise ValueError(
+            "Cannot align first-stage image resize targets: "
+            f"received {len(images)} processed images for {expected_count} image references."
+        )
+
+    targets = []
+    for index, image in enumerate(images):
+        size = getattr(image, "size", None)
+        if not isinstance(size, (tuple, list)) or len(size) != 2:
+            raise TypeError(
+                "Rust multimodal preprocessing requires decoded first-stage images "
+                f"with (width, height) size metadata; image {index} is {type(image).__name__}."
+            )
+        width, height = (int(size[0]), int(size[1]))
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid first-stage image size at index {index}: {width}x{height}.")
+        targets.append({"width": width, "height": height})
+    return targets
+
+
 def _encode_single_image(image: PILImage.Image, fmt: str = "PNG") -> str:
     """Encode one PIL image to a base64 data-URL string (sync, CPU-bound)."""
     buf = io.BytesIO()

@@ -628,6 +628,7 @@ class PSRL_AgentLoopWorker:
             images=images,
             videos=videos,
             audio=audios,
+            mm_processor_kwargs=getattr(output, "mm_processor_kwargs", None),
         )
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)

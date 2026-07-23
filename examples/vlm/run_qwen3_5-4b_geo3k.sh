@@ -155,14 +155,14 @@ python3 -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     train_actor_rollout_ref.ref.megatron.param_offload=False \
     \
-    psrl.routing_strategy.method="round_robin" \
-    psrl.routing_strategy.enable_group_sampling_on_multi_instances=True \
-    psrl.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
-    psrl.routing_strategy.max_concurrent_seqs_per_instance=1024 \
+    psrl.rollout_coordination.routing_strategy.method="round_robin" \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
+    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
+    psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
-    psrl.sync_and_mig_strategy.method="greedy" \
+    psrl.rollout_coordination.sync_and_mig_strategy.method="greedy" \
     \
-    psrl.partial_rollout.enable=True \
+    psrl.rollout_coordination.partial_rollout.enable=True \
     \
     reward.launch_reward_fn_async=True \
     \

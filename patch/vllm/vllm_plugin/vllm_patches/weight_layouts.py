@@ -80,9 +80,7 @@ def _deepseek_layout(model: Any) -> WeightLayoutPlan:
     builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
     qk_nope_head_dim = getattr(model.config, "qk_nope_head_dim", 0)
     qk_rope_head_dim = getattr(model.config, "qk_rope_head_dim", 0)
-    use_mha = model.config.model_type == "deepseek" or all(
-        dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim)
-    )
+    use_mha = model.config.model_type == "deepseek" or all(dim == 0 for dim in (qk_nope_head_dim, qk_rope_head_dim))
     fuse_qkv_a_proj = getattr(model.config, "q_lora_rank", None) is not None
     if use_mha:
         builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
@@ -163,6 +161,7 @@ def _qwen_vl_layout(model: Any) -> WeightLayoutPlan:
     builder.mount_module("language_model", model.language_model)
     return builder.build()
 
+
 def _qwen3_5_vl_gen_layout(model: Any) -> WeightLayoutPlan:
     """Layout for Qwen3.5-VL gen/validate workers.
 
@@ -197,6 +196,7 @@ def _qwen3_5_vl_gen_layout(model: Any) -> WeightLayoutPlan:
     # exclude defensively in case class hierarchy changes.
     builder.exclude_substr("mtp")
     return builder.build()
+
 
 def _qwen2_5_vl_layout(model: Any) -> WeightLayoutPlan:
     builder = WeightLayoutBuilder(model)
@@ -260,9 +260,7 @@ def _qwen3_5_layout(model: Any) -> WeightLayoutPlan:
     for module in model.modules():
         if hasattr(module, "in_proj_qkvz") and hasattr(module.in_proj_qkvz, "output_sizes"):
             tp_size = getattr(module.in_proj_qkvz, "tp_size", 1)
-            q_size, k_size, v_size, z_size = [
-                size // tp_size for size in module.in_proj_qkvz.output_sizes
-            ]
+            q_size, k_size, v_size, z_size = [size // tp_size for size in module.in_proj_qkvz.output_sizes]
             builder.split_param(
                 "in_proj_qkvz.weight",
                 (
@@ -346,10 +344,7 @@ def register_weight_layouts_for_module(module_name: str) -> None:
 
 def register_weight_layouts() -> None:
     """Attach layouts to supported vLLM model modules already in memory."""
-    modules = {
-        f"vllm.model_executor.models.{target.rsplit('.', 1)[0]}"
-        for target in _LAYOUTS
-    }
+    modules = {f"vllm.model_executor.models.{target.rsplit('.', 1)[0]}" for target in _LAYOUTS}
     for module_name in modules:
         register_weight_layouts_for_module(module_name)
 
@@ -360,8 +355,7 @@ def install_weight_layout_registry_hook() -> None:
     lazy_model = getattr(registry, "_LazyRegisteredModel", None)
     if lazy_model is None:
         logger.warning(
-            "vLLM has no _LazyRegisteredModel; layouts will be attached on "
-            "supports_weight_layout() checks instead"
+            "vLLM has no _LazyRegisteredModel; layouts will be attached on supports_weight_layout() checks instead"
         )
         return
     if getattr(lazy_model, "_psrl_weight_layout_hook", False):

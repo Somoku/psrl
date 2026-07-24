@@ -215,11 +215,11 @@ class TaskRunner:
         self.mapping[PSRL_Role.Actor] = ["train_pool"]
 
     def add_critic_worker(self, config):
-        """Add critic worker using the engine-based PSRL_TrainWorker."""
-        from psrl.workers.train.engine_train_worker import PSRL_EngineTrainWorker as PSRL_TrainWorker
+        """Add critic worker using verl's unified engine TrainingWorker."""
+        from verl.workers.engine_workers import TrainingWorker
 
         if need_critic(config):
-            self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(PSRL_TrainWorker)
+            self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(TrainingWorker)
             self.mapping[PSRL_Role.Critic] = ["train_pool"]
 
     def init_resource_pool_mgr(self, config):

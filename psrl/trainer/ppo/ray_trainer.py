@@ -2754,8 +2754,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the values of the batch."""
         # 1. compute value
+        # infer_batch is registered with blocking=False and returns a
+        # DataProtoFuture. DataProtoFuture.get() does not support KVBatchMeta
+        # outputs, so we only force worker completion via ray.get(futures); the
+        # computed values are written back to TransferQueue by the tqbridge
+        # collect side and read from TQ below.
         output = self.critic_wg.infer_batch(batch)
-        assert len(output) == len(batch)
+        ray.get(output.futures)
 
         # 2. write value back to TransferQueue
         data = tq.kv_batch_get(

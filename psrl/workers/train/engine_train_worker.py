@@ -530,6 +530,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         if engine.optimizer is None:
             return
         optimizer = engine.optimizer
+        if not hasattr(optimizer, "reload_model_params"):
+            return
         # Megatron optimizers (Float16OptimizerWithFloat16Params, DistributedOptimizer,
         # ChainedOptimizer) all support reload_model_params() which copies
         # the model's current float16 params into the optimizer's fp32/bf16 master copy.

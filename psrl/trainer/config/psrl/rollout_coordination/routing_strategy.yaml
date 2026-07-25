@@ -8,9 +8,11 @@ method: request_num_balance
 # SMG cache-aware routing hyperparameters (used when method is cache_aware or cache_aware_v1).
 cache_aware_policy:
 
+  # Approximate radix-tree -> minimum load routing.
   # Minimum cache-hit ratio for the approximate radix-tree fallback path.
+  # If cache-hit ratio is less than cache_threshold, the request will be routed to the instance with the minimum load.
   # Only used when KV events are unavailable; event-driven scoring ignores it. Range 0.0-1.0.
-  cache_threshold: 0.3
+  cache_threshold: 0.0
 
   # Weights for event-driven multi-tier overlap scoring.
   # score(worker) = gpu_overlap_weight * gpu_hit_blocks
@@ -18,9 +20,10 @@ cache_aware_policy:
   # A GPU hit costs ~zero reload; an LMCache (off-GPU) hit must be loaded back to
   # the GPU, so it is cheaper than re-prefill but not free. Keep gpu >= lmcache.
   gpu_overlap_weight: 1.0
-  lmcache_overlap_weight: 0.5
+  lmcache_overlap_weight: 0
 
-  # Load-balancing trigger: shortest-queue when BOTH abs AND rel thresholds are met.
+  # Directly trigger the minimum load routing when both thresholds are met.
+  # max - min > balance_abs_threshold and (max - min) / min > balance_rel_threshold
   balance_abs_threshold: 16
   balance_rel_threshold: 1.5
 
@@ -28,12 +31,18 @@ cache_aware_policy:
   # read the backend engine token_usage snapshot for these triggers; the
   # request-count spread (balance_abs/rel above) uses in-flight worker.load().
   balance_token_usage_threshold: 0.75
-  overload_token_usage_threshold: 0.85
+  overload_token_usage_threshold: 1.0
 
   # Approximate tree maintenance (fallback when KV events unavailable).
   eviction_interval_secs: 60
   max_tree_size: 67108864  # 2**26
   block_size: 16           # KV block size for event-driven routing
+
+  # [cache_aware_v1 only] KV-capacity admission threshold.
+  # Reject when effective_kv_used + new_tokens > kv_capacity_threshold * max_model_len.
+  # Set below 1.0 to reserve headroom for response-token growth during decode
+  # (e.g. 0.85 leaves 15% buffer). 1.0 = reject only at full capacity.
+  kv_capacity_threshold: 2.0
 
 # KV cache transfer: when a request is re-routed to a different rollout instance
 # (hint != selected; e.g. non-sticky partial loopback or coordinator-side mig),
@@ -111,10 +120,6 @@ snapshot_staleness_threshold_in_ms: 1000
 # Max waiting requests per instance after preemption (vLLM preemption *notification*
 # threshold only; not an admission signal).
 max_num_waiting_reqs_after_preemption: 1000
-
-# Max estimated concurrent sequences per instance
-# No need to tune this value, it is only used to estimate the max sequence length that can saturate the KV Cache
-max_estimated_concurrent_seqs_per_instance: 32768
 
 # Max concurrent sequences per instance. Also sets vLLM max_num_seqs (oc.select) and
 # is the admission gate's in-flight count cap. Lower to bound concurrency. 0 = no cap.

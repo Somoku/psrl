@@ -4,7 +4,6 @@ import io
 import logging
 import os
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
 
 import numpy as np
 import ray
@@ -28,7 +27,6 @@ from psrl.utils.rollout.loop_timer import LoopTimer
 from psrl.utils.rollout.trajectory_writer import TrajectoryWriter
 from psrl.utils.rollout.vision_utils import extract_image_ref, serialize_image_inputs
 from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason
-from psrl.workers.agent_loop.sticky_session import sticky_session
 from psrl.workers.gen.utils import TokenInput, TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
@@ -264,53 +262,29 @@ class AgentLoopBase(ABC):
                 set((sampling_params.get("stop_token_ids") or []) + request_input.stop_token_ids)
             )
         with self.timer.generation():
-            if self.config.psrl.rollout_gateway.enable:
-                if not self.gateway_addr:
-                    raise RuntimeError("Rollout gateway is enabled but gateway address is empty.")
+            if not self.gateway_addr:
+                raise RuntimeError("Rollout gateway address is empty.")
 
-                # Route multimodal requests to /v1/chat/completions (which has a full
-                # Rust-side vision preprocessing pipeline) and text-only requests to
-                # /generate (lower latency, returns output_ids directly).
-                mm_data = request_input.multi_modal_data
-                has_images = mm_data is not None and bool(mm_data.get("images"))
-                has_videos = mm_data is not None and bool(mm_data.get("videos"))
+            # Route multimodal requests to /v1/chat/completions (which has a full
+            # Rust-side vision preprocessing pipeline) and text-only requests to
+            # /generate (lower latency, returns output_ids directly).
+            mm_data = request_input.multi_modal_data
+            has_images = mm_data is not None and bool(mm_data.get("images"))
+            has_videos = mm_data is not None and bool(mm_data.get("videos"))
 
-                if has_videos:
-                    raise NotImplementedError(
-                        "Video input is not yet supported via the SMG gateway. "
-                        "Implement a /v1/chat/completions video path when ready."
-                    )
+            if has_videos:
+                raise NotImplementedError(
+                    "Video input is not yet supported via the SMG gateway. "
+                    "Implement a /v1/chat/completions video path when ready."
+                )
 
-                if has_images:
-                    return await self._generate_via_chat_completions(
-                        request_input, sampling_params, is_sticky_session, mm_data
-                    )
+            if has_images:
+                return await self._generate_via_chat_completions(
+                    request_input, sampling_params, is_sticky_session, mm_data
+                )
 
-                # ── Text-only: fast /generate path ──────────────────────────────
-                return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
-            else:
-                mm_data = request_input.multi_modal_data
-                if mm_data is not None and (mm_data.get("images") or mm_data.get("videos")):
-                    psrl_logger.warning(
-                        "request_id=%s: Multi-modal data (images/videos) is present but the "
-                        "Ray-actor rollout path does not support forwarding image data. "
-                        "Enable the Rust gateway (psrl.rollout_gateway.enable=true) for "
-                        "multimodal inference.",
-                        request_input.request_id,
-                    )
-                async with sticky_session(self.rollout_router, request) if is_sticky_session else nullcontext():
-                    # TODO(linsh): move sampling params as param of `route_generate`
-                    output = await self.rollout_router.route_generate.remote(
-                        request_input.input_ids,
-                        request_input.request_id,
-                        request_input.prompt_id,
-                        request_input.version_tag,
-                        request_input.rollout_instance_id,
-                        request_input.cu_response_len,
-                        request_input.is_validate,
-                        request_input.stop_token_ids,
-                    )
-            return output
+            # ── Text-only: fast /generate path ──────────────────────────────
+            return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
 
     async def _generate_via_generate_endpoint(
         self,

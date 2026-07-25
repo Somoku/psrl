@@ -155,6 +155,13 @@ class LMCacheConfig:
     # prefill computation).  Can reduce effective TTFT for cache-hit requests.
     enable_async_loading: bool = False
 
+    # Whether LMCache publishes its own store events into vLLM's KV event
+    # stream, so the SMG router can index the off-GPU tier and score
+    # `lmcache_overlap_weight` against it.  Derived at runtime by
+    # `_build_kv_cache_manager()` from the routing config: without this the
+    # router's LMCache tier stays empty and that weight is silently a no-op.
+    enable_kv_events: bool = False
+
     def get_backend_enum(self) -> KVCacheBackend:
         """
         Convert the string backend to `KVCacheBackend` enum.
@@ -237,6 +244,8 @@ class LMCacheConfig:
             env_vars["LMCACHE_CACHE_POLICY"] = self.cache_policy
         if self.enable_async_loading:
             env_vars["LMCACHE_ENABLE_ASYNC_LOADING"] = "True"
+        if self.enable_kv_events:
+            env_vars["LMCACHE_ENABLE_KV_EVENTS"] = "True"
 
         # P2P / Controller configuration.
         # When enable_p2p is True, tell the LMCache engine to register with the

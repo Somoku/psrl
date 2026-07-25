@@ -12,6 +12,23 @@ os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 psrl_logger = logging.getLogger(__name__)
 logging.getLogger("minisweagent.environment").setLevel(logging.WARNING)
 
+
+def _silence_litellm() -> None:
+    """Suppress LiteLLM's BadRequestError banner (print, not logging).
+
+    LiteLLM's exception mapper always ``print``s
+    ``Give Feedback / Get Help`` + ``LiteLLM.Info: ...`` unless
+    ``litellm.suppress_debug_info`` is True. Logger level tweaks do nothing.
+    """
+    try:
+        import litellm
+
+        litellm.suppress_debug_info = True
+    except Exception:
+        pass
+    logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+    logging.getLogger("litellm").setLevel(logging.ERROR)
+
 _PROXY_ENV_KEYS = [
     "http_proxy",
     "https_proxy",
@@ -133,6 +150,8 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     from minisweagent.models import get_model
 
     from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
+
+    _silence_litellm()
 
     class _TimedAgent(DefaultAgent):
         """DefaultAgent that accumulates wall-clock model vs environment time.

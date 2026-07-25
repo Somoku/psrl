@@ -1,7 +1,7 @@
 # PSRL Codebase Map
 
 > **Purpose**: Fast-lookup reference for the entire PSRL project. Read this file first to orient yourself in any module.
-> **Last updated**: 2026-07-06 | **Total**: ~216 source files in `psrl/`, 8 unit tests, config-as-code via veRL re-export
+> **Last updated**: 2026-07-22 | **Total**: ~210 source files in `psrl/`, 8 unit tests, config-as-code via veRL re-export
 >
 > **Major shifts since 2026-05**: rollout now runs through the vendored **SMG** gateway (Rust router) with **SessionRouter + TITO** session capture; sample data moves over **TransferQueue** instead of Ray-serialized batches; KV cache offload/reuse via **LMCache**; **RolloutCoordinator** (mixin-composed) replaces the old `rollout_coordinator.py`; a unified **engine train worker** supersedes the separate FSDP/Megatron workers; a standalone **reward-model service** and **gen reward functions** were added; **resource elasticity** (`elastic_rm`) and a **gRPC PSManager** service landed. See §15 for the terminology glossary.
 
@@ -83,7 +83,6 @@ psrl/
 │
 ├── workers/                      # ★ Distributed workers (Ray actors)
 │   ├── gen/                      # --- Generation / Rollout ---
-│   │   ├── gen_worker.py         # PSRL_GenWorker (~1373 lines): vLLM inference + NIXL model pull
 │   │   ├── vllm_async_server.py  # PSRL_vLLMHttpServer / PSRL_vLLMReplica: gRPC vLLM engine server for SMG
 │   │   ├── vllm_rollout.py       # vLLM rollout wrapper
 │   │   ├── vllm_extension.py     # vLLM engine extensions
@@ -109,10 +108,8 @@ psrl/
 │   │           └── thunder_agent.py # ThunderAgentScheduler: KV-capacity hang/continue (ThunderAgent port)
 │   │
 │   ├── train/                    # --- Training ---
-│   │   ├── engine_train_worker.py # ★ NEW unified worker (replaces fsdp_/megatron_ workers)
-│   │   ├── base_train_worker.py  # PSRL_BaseTrainWorker: NIXL push, version mgmt
-│   │   ├── fsdp_train_worker.py  # PSRL_FSDPTrainWorker (legacy path, still present)
-│   │   └── megatron_train_worker.py # PSRL_MegatronTrainWorker (legacy path, still present)
+│   │   ├── engine_train_worker.py # ★ NEW unified worker (fsdp_/megatron_ workers moved to deprecated/)
+│   │   └── base_train_worker.py  # PSRL_BaseTrainWorker: NIXL push, version mgmt
 │   │
 │   ├── ps/                       # --- Parameter Server ---
 │   │   ├── ps_manager.py         # PSManager (~1373 lines): version store + staleness inventory
@@ -143,10 +140,7 @@ psrl/
 │   ├── agent_loop/               # --- Multi-Turn / Session Agent Loop ---
 │   │   ├── manager.py            # PSRL_AgentLoopManager: top-level coordinator
 │   │   ├── worker.py             # AgentLoopWorker: single worker process
-│   │   ├── router.py             # Routes requests to workers
-│   │   ├── route_strategy.py     # Routing strategies (round-robin, etc.)
 │   │   ├── gateway_client.py     # Client for SMG rollout gateway
-│   │   ├── request_queue.py      # Async request queue
 │   │   ├── sticky_session.py     # Session affinity for multi-turn
 │   │   ├── prometheus_utils.py   # Monitoring metrics
 │   │   ├── agent_data/           # Data structures for agent interactions
@@ -156,8 +150,7 @@ psrl/
 │   │       ├── base_agent_loop.py, generate_agent_loop.py, batch_generate_agent_loop.py
 │   │       ├── multi_turn_agent_loop.py, multi_turn_completion_agent_loop.py
 │   │       ├── session_agent_loop.py    # ★ NEW: SMG SessionRouter + TITO-backed loop
-│   │       ├── mini_swe_agent_loop.py   # MiniSWEAgentLoop + _PSRLModel (SWE-bench RL)
-│   │       ├── mini_swe_agent_loop_v1.py# earlier mini-swe loop variant
+│   │       ├── mini_swe_agent_loop_v1.py# ★ CURRENT active SWE-bench agent loop (Docker + async PSRL rollout)
 │   │       └── utils.py
 │   │
 │   └── config/                   # Worker-level config dataclasses (trimmed)
@@ -266,6 +259,16 @@ unit_tests/          # trimmed to focused suites
 ├── workers/agent_loop/test_kv_cache_aware_strategy.py
 └── workers/ps/test_ps_manager_broadcast.py
 
+deprecated/          # files moved here during dead-code cleanup (not imported by active code)
+├── workers/gen/gen_worker.py               # PSRL_GenWorker (superseded by PSRL_vLLMReplica)
+├── workers/train/fsdp_train_worker.py      # PSRL_FSDPTrainWorker (superseded by EngineTrainWorker)
+├── workers/train/megatron_train_worker.py  # PSRL_MegatronTrainWorker (superseded by EngineTrainWorker)
+├── workers/agent_loop/router.py            # RolloutRouter (superseded by RolloutGateway/SMG)
+├── workers/agent_loop/route_strategy.py    # Python routing strategies
+├── workers/agent_loop/request_queue.py     # Python request queue
+├── workers/agent_loop/loops/mini_swe_agent_loop.py  # MiniSWEAgentLoop (superseded by V1)
+└── unit_tests/workers/agent_loop/test_kv_cache_aware_strategy.py  # moved with router code
+
 examples/
 ├── mini_swe/        # ★ SWE-bench RL recipe (fsdp_/megatron_ launch scripts, config.py,
 │                    #   reward.py, swebench_grader.py, runner.py, eval/, prepare/)
@@ -325,7 +328,6 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 
 | Class | File | Role |
 |-------|------|------|
-| `PSRL_GenWorker` | `workers/gen/gen_worker.py` | vLLM inference + async NIXL model pulling |
 | `PSRL_vLLMHttpServer` / `PSRL_vLLMReplica` | `workers/gen/vllm_async_server.py` | gRPC vLLM engine server registered with SMG |
 | `RolloutGateway` | `workers/gen/rollout_gateway.py` | Ray actor launching SMG Router + SessionRouter subprocesses |
 | `RolloutCoordinator` | `workers/gen/rollout_coordination/coordinator.py` | Drives SMG: stats, pause/resume, weight-version, sync/migrate (mixin-composed) |
@@ -345,8 +347,7 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 
 | Class | File | Role |
 |-------|------|------|
-| `MiniSWEAgentLoop` | `workers/agent_loop/loops/mini_swe_agent_loop.py` | In-process SWE agent orchestration + sync/async bridge |
-| `_PSRLModel` | same file | Queue-based bridge: mini-swe-agent sync → PSRL async rollout |
+| `MiniSWEAgentLoopV1` | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` | CURRENT active SWE-bench agent loop: Docker env + async PSRL rollout bridge |
 | `MiniSWEAgentData` | `workers/agent_loop/agent_data/mini_swe_agent_data.py` | Trajectory building, patch extraction, grading state |
 | `ConversationAgentData` | `workers/agent_loop/agent_data/conversation_agent_data.py` | Chat-template base (OpenAI format, token counting) |
 | `MiniSWEEnvironment` | `environments/mini_swe_env.py` | SWE task parsing, per-problem config override merging |
@@ -443,7 +444,7 @@ utils/tito/training_data.py converts them to prompt/response/mask/logprob arrays
 ### 6.6 mini-SWE Agent Flow (SWE-bench RL)
 
 ```
-MiniSWEAgentLoop.run(request)
+MiniSWEAgentLoopV1.run(request)
   → MiniSWEEnvironment.reset(task): parse extra_info, apply_data_overrides → runtime_config
   → worker thread: DefaultAgent.run(task) in DockerEnvironment
       (observe → _PSRLModel.query() → parse action → exec in Docker;
@@ -544,9 +545,8 @@ Run with pytest under the psrl conda env.
 | File | Lines | Why it matters |
 |------|-------|---------------|
 | `trainer/ppo/ray_trainer.py` | ~3476 | THE main training loop — start here for any training question |
-| `trainer/ppo/strategies/` | — | Step orchestration: `base.py` (StepStrategy ABC), `full_batch.py`, `fine_grain_overlap.py` |
+| `trainer/ppo/strategies/` | — | Step orchestration: `base.py` (StepStrategy ABC), `full_batch.py` for the default path, `fine_grain_overlap.py` for chunk-overlap |
 | `workers/ps/ps_manager.py` | ~1373 | Central coordination point for all workers (also gRPC-served) |
-| `workers/gen/gen_worker.py` | ~1373 | vLLM generation + model pull logic |
 | `workers/ps/staleness_controller.py` | ~1365 | THE staleness system — core async innovation |
 | `workers/reward/reward_manager.py` | ~1138 | Reward pipeline over TransferQueue |
 | `workers/gen/rollout_coordination/coordinator.py` | ~771 | SMG-driving coordinator (mixin composition) |
@@ -559,7 +559,7 @@ Run with pytest under the psrl conda env.
 ```
 main_ppo.py (TaskRunner, TransferQueue init)
   → ray_trainer.py (PSRL_RayPPOTrainer)
-    → workers/gen/gen_worker.py (PSRL_GenWorker) → utils/nixl/client.py, vllm_rollout.py
+    → workers/gen/vllm_async_server.py (PSRL_vLLMReplica) → utils/nixl/client.py, vllm_rollout.py
     → workers/gen/rollout_gateway.py (RolloutGateway) → smg_adapter.py → third_party/smg
     → workers/gen/rollout_coordination/coordinator.py (RolloutCoordinator)
         → session/thunder_agent.py, sync_and_migrate/*, smg_adapter.py, elastic_rm/diagnostics
@@ -593,14 +593,14 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | Add/modify training backend | `workers/train/engine_train_worker.py` (unified FSDP/Megatron) |
 | Add a rule/score reward | `workers/reward/reward_loop/` + `registry.py` |
 | Add a generative reward model | `workers/reward/gen_reward_function/` (`@gen_reward_func`) + `reward_model/` service |
-| Modify vLLM inference / scheduling | `workers/gen/gen_worker.py`, `vllm_async_server.py`, `rollout_scheduler.py` |
+| Modify vLLM inference / scheduling | `workers/gen/vllm_async_server.py`, `rollout_scheduler.py` |
 | Add a tool / tool parser | `tools/`, `tools/tool_parser/` (model-specific parsers) |
 | Change data loading | `utils/dataset/data_processor.py`, `rl_dataset.py` |
 | Add model arch / weight layout | `utils/converter/` (converter + `weight_layout_*`, `modeling/`) |
 | Save/restore Megatron ckpt | `utils/checkpoint/megatron_saver.py`, `scripts/convert_perrank_to_dcp.py` |
 | Build TITO training arrays | `utils/tito/training_data.py` |
 | Train on SWE-bench | `examples/mini_swe/` (launch scripts, `runner.py`, `config.py`) |
-| Debug SWE agent rollouts | `workers/agent_loop/loops/mini_swe_agent_loop.py` |
+| Debug SWE agent rollouts | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` |
 | Change SWE grading | `examples/mini_swe/swebench_grader.py` |
 | Run benchmarks | `psrl/bench/`, `examples/bench/` |
 | Install from scratch | `scripts/install_basic.sh` → `install_nixl.sh` → `install_lmcache.sh` → `install_megatron.sh` → `reinstall_smg.sh` |

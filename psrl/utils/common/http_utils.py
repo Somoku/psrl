@@ -327,16 +327,35 @@ _OVERLONG_MARKERS = (
     "exceeds the model's maximum context length",
 )
 
+# Must match SMG `PROMPT_OVERFLOW_ERROR_CODE` / servicer trailing metadata.
+_PROMPT_OVERFLOW_ERROR_CODE = "prompt_overflow"
+
 
 class PromptOverflowError(Exception):
-    """vLLM rejected a prompt that exceeds max_model_len.
+    """vLLM / SMG rejected a prompt that exceeds max_model_len.
 
     Raised in two paths:
-    - SMG HTTP path: detected in _classify_http_error() by matching the 400 body.
+    - SMG HTTP path: detected in `_classify_http_error()` via
+      `x-smg-error-code: prompt_overflow` (preferred) or 400 body markers.
     - LiteLLM path: raised by overflow.py wrappers to abort the tenacity retry loop.
     Callers should treat this as a deliberate termination and map it to
     TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED.
     """
+
+
+def _smg_error_code(response_headers: Mapping[str, str] | None) -> str | None:
+    """Read `x-smg-error-code` case-insensitively from response headers."""
+    if not response_headers:
+        return None
+    code = response_headers.get("x-smg-error-code")
+    if code is not None:
+        return code
+    # Plain `dict` mocks are case-sensitive; scan manually.
+    if not hasattr(response_headers, "getall"):
+        for key, value in response_headers.items():
+            if key.lower() == "x-smg-error-code":
+                return value
+    return None
 
 
 def _classify_http_error(
@@ -347,28 +366,25 @@ def _classify_http_error(
 
     Otherwise returns `exc` unchanged. Callers should `raise` the returned
     exception; chained `__cause__` is preserved when a translation occurs.
+
+    Only known sentinel codes (`request_aborted`, `prompt_overflow`) are
+    translated — other 400s stay as transport errors so real client mistakes
+    are not silently swallowed.
     """
     if not isinstance(exc, aiohttp.ClientResponseError):
         return exc
     if exc.status != 400:
         return exc
-    response_headers = exc.headers or {}
-    # Header lookups must be case-insensitive: aiohttp returns a `CIMultiDict`
-    # that supports it natively, but plain `dict` instances (e.g. from a mock)
-    # do not, so fall back to a manual scan.
-    code = response_headers.get("x-smg-error-code")
-    if code is None and not hasattr(response_headers, "getall"):
-        for key, value in response_headers.items():
-            if key.lower() == "x-smg-error-code":
-                code = value
-                break
+    code = _smg_error_code(exc.headers)
     if code == "request_aborted":
         request_id = (request_headers or {}).get("x-request-id", "")
         translated = RequestAbortedByGatewayError(request_id=request_id, message=str(exc.message))
         translated.__cause__ = exc
         return translated
     body_text = str(exc.message)
-    if any(marker in body_text for marker in _OVERLONG_MARKERS):
+    if code == _PROMPT_OVERFLOW_ERROR_CODE or any(
+        marker in body_text for marker in _OVERLONG_MARKERS
+    ):
         translated = PromptOverflowError(f"Prompt exceeds max_model_len: {body_text}")
         translated.__cause__ = exc
         return translated

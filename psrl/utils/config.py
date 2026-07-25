@@ -357,9 +357,6 @@ def validate_config(
         if multiplier < 1:
             raise ValueError("psrl.fine_grain_overlap.multiplier must be >= 1.")
 
-        if config.psrl.colocate:
-            raise ValueError("psrl.fine_grain_overlap is not supported with psrl.colocate=True.")
-
         effective_gran, chunk_groups = resolve_fine_grain_chunk_size(config, dp_size_fgo)
 
         ppo_epochs = config.train_actor_rollout_ref.actor.get("ppo_epochs", 1)

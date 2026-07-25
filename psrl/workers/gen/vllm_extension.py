@@ -9,7 +9,7 @@ from verl.utils.device import get_device_id
 from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.distributed.kv_transfer import get_kv_transfer_group
-from vllm.v1.core.kv_cache_utils import estimate_max_model_len
+from vllm.v1.core.kv_cache_utils import get_max_concurrency_for_kv_cache_config
 from vllm_patches.interfaces import supports_weight_layout
 
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
@@ -251,25 +251,20 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             f"time: {time_end - time_start}s"
         )
 
-    def estimate_max_model_len(self):
-        """Estimate the maximum model length that can fit in the available KV cache memory."""
-        assert hasattr(self, "available_kv_cache_memory_bytes"), "available_kv_cache_memory_bytes must be set"
+    def get_total_kv_cache_tokens(self) -> int:
+        """Total KV-cache token capacity of this instance, post-allocation.
+
+        Uses vLLM's own `max_concurrency * max_model_len` formula (the same one
+        behind the "GPU KV cache size: N tokens" startup log line), which is
+        exact for hybrid/sliding-window layouts and already accounts for
+        DCP/PCP sharding, unlike a naive `num_gpu_blocks * block_size`.
+        """
         assert hasattr(self, "vllm_config"), "vllm_config must be set"
-        kv_cache_spec = self.get_kv_cache_spec()
-        assert kv_cache_spec is not None, "kv_cache_spec must not be None"
-        # It use the binary search to estimate the max model length
-        actual_max_model_len = self.vllm_config.model_config.max_model_len
-        # Set the max model length to the upper limit of the estimation
-        self.vllm_config.model_config.max_model_len = self.vllm_config.additional_config.get(
-            "max_model_len_used_in_estimation",
-            self.vllm_config.model_config.max_model_len * 8192,
-        )
-        estimated_max_model_len = estimate_max_model_len(
-            self.vllm_config, kv_cache_spec, self.available_kv_cache_memory_bytes
-        )
-        # Restore the actual max model length
-        self.vllm_config.model_config.max_model_len = actual_max_model_len
-        return estimated_max_model_len
+        kv_cache_config = getattr(self.model_runner, "kv_cache_config", None)
+        if kv_cache_config is None or not kv_cache_config.kv_cache_groups:
+            return 0
+        max_concurrency = get_max_concurrency_for_kv_cache_config(self.vllm_config, kv_cache_config)
+        return int(max_concurrency * self.vllm_config.model_config.max_model_len)
 
     def cuda_synchronize(self):
         try:
@@ -451,8 +446,8 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         reused by subsequent requests.  Corresponds to the
         `lmcache.clear_on_weight_update` config flag.
 
-        Invoked via `collective_rpc("lmcache_clear_all_from_backend")` from
-        `PSRL_GenWorker.pull_model_async()`.
+        Invoked via `collective_rpc("lmcache_clear_all_from_backend")` after a
+        weight pull completes (NIXL pull or CPU pull).
         """
         engine = self._get_lmcache_engine()
         engine.clear()

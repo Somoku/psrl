@@ -137,9 +137,11 @@ class PSRL_AgentLoopManager:
         self.train_chunk_size: int | None = None
         # Maps buffer_id -> number of prompt-groups already handed out as chunks.
         self._train_chunk_consumed: dict[int, int] = {}
-        # Maps (buffer_id, chunk_index) -> list of asyncio.Future waiting for that chunk,
-        # OR maps ("resolved", buffer_id, chunk_index) -> (KVBatchMeta, bool) for pre-resolved chunks.
-        self._train_chunk_waiters: dict[tuple, list | tuple] = {}
+        # Maps (buffer_id, chunk_index) -> list of asyncio.Future waiting for that chunk.
+        self._train_chunk_waiters: dict[tuple[int, int], list] = {}
+        # Durable store for emitted chunks: (buffer_id, chunk_index) -> (KVBatchMeta, is_last).
+        # Kept separate from waiters so results survive flush / waiter-bookkeeping churn.
+        self._resolved_train_chunks: dict[tuple[int, int], tuple] = {}
 
         # Track finished child requests for Group Sampling
         self.rollout_request_tracker: dict[
@@ -510,8 +512,9 @@ class PSRL_AgentLoopManager:
             self.log_ready_buffer(buffer_id, is_validate=False)
             await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id)
             self._emit_pending_chunks(buffer_id)
-            # Clean up accumulated state; sentinel keys in `_train_chunk_waiters`
-            # are consumed lazily by `wait_for_training_chunk`.
+            # Clean up accumulated state; resolved chunks in
+            # `_resolved_train_chunks` are consumed lazily by
+            # `wait_for_training_chunk`.
             self._train_chunk_consumed.pop(buffer_id, None)
             accumulated_buffers.pop(buffer_id, None)
             accumulated_buffer_size.pop(buffer_id, None)
@@ -1423,23 +1426,27 @@ class PSRL_AgentLoopManager:
         Emits chunks sequentially: chunk_index=0, 1, ...  Each chunk contains
         exactly train_chunk_size prompt-groups, except the final chunk which
         carries whatever remains.  is_last=True on the last chunk.
+
+        Entries are sliced in stable accumulation order (not re-sorted by
+        prompt_id across emits). Re-sorting the full list on every emit shifts
+        which groups fall into the already-consumed prefix and can emit the
+        wrong / duplicate groups for later chunks.
         """
         if self.train_chunk_size is None:
             return
         if buffer_id not in self.train_accumulated_buffers:
             return
 
-        # Build a flat, sorted list of ALL accumulated EntryInfos for this buffer.
+        # Flat list in stable insertion order (version then append order).
         accumulated_buffers = self.train_accumulated_buffers[buffer_id]
         all_entry_infos: list = []
         for model_version in sorted(accumulated_buffers.keys()):
             all_entry_infos.extend(accumulated_buffers[model_version])
-        all_entry_infos.sort(key=lambda ei: ei.prompt_id)
 
         total_accumulated = len(all_entry_infos)
         consumed = self._train_chunk_consumed.get(buffer_id, 0)
         ready_total = self.ready_entries_per_buffer
-        is_buffer_complete = (total_accumulated >= ready_total)
+        is_buffer_complete = total_accumulated >= ready_total
 
         while True:
             available = total_accumulated - consumed
@@ -1455,25 +1462,41 @@ class PSRL_AgentLoopManager:
             elif available >= self.train_chunk_size:
                 emit_count = self.train_chunk_size
                 # is_last if this chunk reaches the total.
-                is_last = (consumed + emit_count >= ready_total)
+                is_last = consumed + emit_count >= ready_total
             else:
                 # Not enough accumulated yet; stop.
                 break
 
-            # Build the chunk KVBatchMeta from the slice.
-            chunk_entries = all_entry_infos[consumed: consumed + emit_count]
+            # Slice by accumulation order, then sort within the chunk for
+            # deterministic GRPO group layout without disturbing the consumed prefix.
+            chunk_entries = all_entry_infos[consumed : consumed + emit_count]
+            chunk_entries = sorted(chunk_entries, key=lambda ei: ei.prompt_id)
             chunk_batch = self.entry_infos_to_kv_batch_meta(chunk_entries, is_validate=False)
 
-            # Resolve the waiter or store as pre-resolved sentinel.
+            result = (chunk_batch, is_last)
+            # WARNING so this shows under default PSRL_LOGGING_LEVEL=WARN.
+            psrl_logger.warning(
+                "Emitted train chunk buffer=%d idx=%d size=%d is_last=%s (consumed %d -> %d / %d)",
+                buffer_id,
+                chunk_idx,
+                len(chunk_batch),
+                is_last,
+                consumed,
+                consumed + emit_count,
+                ready_total,
+            )
+
+            # Wake waiters if present; otherwise keep a durable resolved entry for
+            # late wait_for_training_chunk callers. Do not leave a resolved entry
+            # after waking waiters — that would double-deliver the same chunk.
             if key in self._train_chunk_waiters:
                 for fut in self._train_chunk_waiters[key]:
                     if not fut.done():
-                        fut.set_result((chunk_batch, is_last))
+                        fut.set_result(result)
                 del self._train_chunk_waiters[key]
+                self._resolved_train_chunks.pop(key, None)
             else:
-                # Store as a resolved sentinel for late-arriving callers.
-                sentinel_key = ("resolved", buffer_id, chunk_idx)
-                self._train_chunk_waiters[sentinel_key] = (chunk_batch, is_last)
+                self._resolved_train_chunks[key] = result
 
             self._train_chunk_consumed[buffer_id] = consumed + emit_count
             consumed += emit_count
@@ -1537,14 +1560,44 @@ class PSRL_AgentLoopManager:
         Returns (chunk_meta, is_last).  is_last=True means this chunk
         completes the full batch and no more chunks will be emitted.
         """
-        sentinel_key = ("resolved", buffer_id, chunk_index)
-        if sentinel_key in self._train_chunk_waiters:
-            result = self._train_chunk_waiters.pop(sentinel_key)
+        key = (buffer_id, chunk_index)
+        if key in self._resolved_train_chunks:
+            result = self._resolved_train_chunks.pop(key)
+            psrl_logger.warning(
+                "wait_for_training_chunk: buffer=%d idx=%d ready immediately (is_last=%s, size=%d)",
+                buffer_id,
+                chunk_index,
+                result[1],
+                len(result[0]),
+            )
             return result
 
-        key = (buffer_id, chunk_index)
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._train_chunk_waiters.setdefault(key, []).append(fut)
+
+        # Re-check after registration in case emit raced between the miss and append.
+        if key in self._resolved_train_chunks:
+            result = self._resolved_train_chunks.pop(key)
+            waiters = self._train_chunk_waiters.get(key, [])
+            if fut in waiters:
+                waiters.remove(fut)
+                if not waiters:
+                    del self._train_chunk_waiters[key]
+            if not fut.done():
+                fut.set_result(result)
+            psrl_logger.warning(
+                "wait_for_training_chunk: buffer=%d idx=%d resolved via race re-check (is_last=%s)",
+                buffer_id,
+                chunk_index,
+                result[1],
+            )
+            return result
+
+        psrl_logger.warning(
+            "wait_for_training_chunk: buffer=%d idx=%d waiting for emit...",
+            buffer_id,
+            chunk_index,
+        )
         return await fut
 
     async def wait_for_validation_batch(self, buffer_id: int) -> KVBatchMeta:
@@ -1646,14 +1699,10 @@ class PSRL_AgentLoopManager:
         if not is_validate:
             # Clear chunk-yielding bookkeeping for this buffer.
             self._train_chunk_consumed.pop(buffer_id, None)
-            # Stale waiters (shouldn't exist, but guard):
-            stale_keys = [
-                k for k in self._train_chunk_waiters
-                if isinstance(k, tuple) and (
-                    (len(k) == 2 and k[0] == buffer_id)  # (buffer_id, chunk_idx)
-                    or (len(k) == 3 and k[0] == "resolved" and k[1] == buffer_id)  # sentinel
-                )
-            ]
-            for k in stale_keys:
+            stale_waiter_keys = [k for k in self._train_chunk_waiters if k[0] == buffer_id]
+            for k in stale_waiter_keys:
                 del self._train_chunk_waiters[k]
+            stale_resolved_keys = [k for k in self._resolved_train_chunks if k[0] == buffer_id]
+            for k in stale_resolved_keys:
+                del self._resolved_train_chunks[k]
         return buffer

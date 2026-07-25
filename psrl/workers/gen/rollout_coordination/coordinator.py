@@ -175,8 +175,8 @@ class RolloutCoordinator(
         # Engine status tracking
         # Track the latest engine stats of each instance
         self.instance_to_engine_status: dict[RolloutInstanceId, EngineStats] = {}
-        # Absolute KV-cache token capacity per instance (num_gpu_blocks * block_size,
-        # obtained via estimate_max_model_len). Used by the hang/continue scheduler.
+        # Absolute KV-cache token capacity per instance (max_concurrency * max_model_len,
+        # obtained via get_total_kv_cache_tokens). Used by the hang/continue scheduler.
         self.instance_to_total_kv_tokens: dict[RolloutInstanceId, int] = {}
 
         # --- Session hang/continue scheduling (ThunderAgent port) ---

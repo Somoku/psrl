@@ -65,7 +65,7 @@ from psrl.utils.logger import (
 )
 from psrl.utils.ray import shared_pull_model_context_async
 from psrl.workers.config import RolloutConfig
-from psrl.workers.gen.smg_adapter import build_worker_registration_payload, is_cache_aware_method
+from psrl.workers.gen.smg_adapter import build_worker_registration_payload, cfg_get, is_cache_aware_method
 from psrl.workers.gen.stats_collector import DPLBStatCollector
 from psrl.workers.gen.utils import DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT, TokenOutput
 from psrl.workers.gen.zmq_queue import ZMQPushQueue
@@ -207,6 +207,24 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 str(self.psrl_config.get("ps_manager_ip", "127.0.0.1")),
             )
             lmcache_raw["lmcache_instance_id"] = lmcache_instance_id
+
+        # The router can only score the off-GPU tier if LMCache publishes its
+        # store events into vLLM's KV event stream. Derive it from the routing
+        # config the same way `_build_kv_events_args()` derives the vLLM-side
+        # publisher, so `lmcache_overlap_weight` cannot be set to a value that
+        # silently does nothing.
+        lmcache_raw["enable_kv_events"] = bool(
+            lmcache_raw.get("enable", False)
+            and is_cache_aware_method(self.psrl_config.rollout_coordination.routing_strategy.method)
+            and float(
+                cfg_get(
+                    self.psrl_config,
+                    "rollout_coordination.routing_strategy.cache_aware_policy.lmcache_overlap_weight",
+                    0.0,
+                )
+            )
+            > 0.0
+        )
 
         lmcache_cfg = LMCacheConfig(**lmcache_raw)
         if lmcache_cfg.enable_p2p:
@@ -461,8 +479,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # AGENT(VERL): setup rollout scheduler for PSRL
         args["scheduler_cls"] = "psrl.workers.gen.rollout_scheduler.RolloutScheduler"
         args["additional_config"] = {
-            "max_model_len_used_in_estimation": self.config.max_model_len
-            * self.psrl_config.rollout_coordination.routing_strategy.max_estimated_concurrent_seqs_per_instance,
             "enable_weights_cpu_backup": self.config.enable_weights_cpu_backup,
         }
 
@@ -863,8 +879,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             return  # reward model: no PS instance registration
         if hasattr(self, "_is_rollout_instance_registered"):
             return
-        if not self.psrl_config.rollout_gateway.enable:
-            self.base_worker_id = str(self.get_replica_idx())
         rollout_instance_ids = [(self.base_worker_id, i) for i in range(self.get_instance_num())]
         await self.gen_interface.ps_manager_handle.register_rollout_instance.remote(rollout_instance_ids)
         self.curr_rollout_instance_model_version = [0] * self.get_instance_num()
@@ -874,7 +888,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         if self.node_rank != 0:
             return None
         await self._wait_for_grpc_servicer_ready()
-        max_model_len = await self.estimate_max_model_len()
+        total_kv_tokens = await self.get_total_kv_cache_tokens()
         # Register to rollout gateway
         gateway_url = gateway_url.rstrip("/")
         if self._gateway_client is None or self._gateway_client.closed:
@@ -899,7 +913,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         payload = build_worker_registration_payload(
             url=f"grpc://{self._server_address}:{self._server_port}",
             model_id=self.model_config.path,
-            max_model_len=max_model_len,
+            max_model_len=total_kv_tokens,
             dp_size=self.config.data_parallel_size,
             tp_size=self.config.tensor_model_parallel_size,
             pp_size=self.config.pipeline_model_parallel_size,
@@ -1497,14 +1511,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     ###### Utility Methods ######
 
-    async def estimate_max_model_len(self) -> int:
+    async def get_total_kv_cache_tokens(self) -> int:
         await self._is_init_model.wait()
         # engine.collective_rpc returns a per-worker list; all ranks return the
-        # same estimate. The shared collective_rpc wrapper discards its result,
+        # same value. The shared collective_rpc wrapper discards its result,
         # so call the engine directly and unwrap.
-        results = await self.engine.collective_rpc(method="estimate_max_model_len")
+        results = await self.engine.collective_rpc(method="get_total_kv_cache_tokens")
         if not results:
-            raise RuntimeError("estimate_max_model_len collective_rpc returned no results")
+            raise RuntimeError("get_total_kv_cache_tokens collective_rpc returned no results")
         return int(results[0])
 
 

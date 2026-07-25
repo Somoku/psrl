@@ -1,0 +1,6 @@
+# Whether to disable the attention in Qwen2.5
+disable_attn: False
+
+# Whether to fix the weight of the model
+# Useful for analysis
+fix_weight: False

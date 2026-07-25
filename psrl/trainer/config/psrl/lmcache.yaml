@@ -1,0 +1,112 @@
+# LMCache KV cache offloading configuration.
+# When enabled, vLLM offloads KV cache to the specified backend (CPU by default),
+# enabling prefix cache hits across multi-turn agent loop turns without re-prefill.
+
+# Whether to enable LMCache KV offloading in vLLM.
+enable: False
+
+# Backend for offloaded KV: "cpu", "disk", or "remote" (TODO: remote).
+backend: cpu
+
+# Total offload budget in GiB, summed across all TP ranks.
+# vLLM automatically divides this by the number of KV ranks (TP x PP) to
+# compute the per-rank budget passed to LMCache as max_local_cpu_size.
+# Do NOT set LMCACHE_MAX_LOCAL_CPU_SIZE as an env var — that would apply
+# the total budget to every rank, overcounting memory.
+offload_size_gb: 100.0
+
+# Token chunk size for hash-based KV indexing (must divide the block size).
+chunk_size: 256
+
+# Full LMCache YAML config path.  When set, overrides all individual fields.
+config_file: null
+
+# Whether to clear stale KV cache after model weight pull from PS.
+clear_on_weight_update: False
+
+# Whether to enable multi-version KV cache.
+multi_version_kv: True
+
+# --- CPU backend ---
+
+# GiB of CPU memory to keep free and never use for KV offloading.
+reserve_local_cpu_size: 0.0
+
+# --- Disk backend ---
+
+# Filesystem path for disk-backed KV storage (required when backend=disk).
+disk_path: null
+
+# Max disk usage in GiB when using the disk backend.
+max_disk_size_gb: 1000.0
+
+# --- Remote backend (TODO) ---
+
+# Remote LMCache server URL (e.g., "redis://host:6379").
+remote_url: null
+
+# --- Cache behaviour ---
+
+# Also cache KV from decode steps (increases memory, helps multi-turn reuse).
+save_decode_cache: True
+
+# NOTE(lhy): Buggy, do not use. 
+# Persist a chunk even when not fully filled (helps short prompts < chunk_size).
+save_unfull_chunk: False
+
+# Eviction policy: "LRU" (default) or "FIFO".
+cache_policy: LRU
+
+# Overlap KV cache retrieval with prefill computation to reduce TTFT.
+# NOTE(lhy): This is buggy, do not use.
+enable_async_loading: False
+
+# --- P2P cross-instance KV transfer ---
+# Required when routing_strategy.kv_transfer.enable is True.
+
+# Enable LMCache P2P backend + Controller for cross-instance KV transfer.
+# Requires clear_on_weight_update=False and multi_version_kv=True (P2PBackend
+# does not support clear on weight sync; version tags prevent stale KV hits).
+# A shared Controller process is started by RolloutCoordinator and its URL is
+# broadcast to all GenWorker instances at startup.
+# Each instance is automatically assigned lmcache_instance_id = psrl_instance_{id}.
+enable_p2p: False
+
+# Transport channel for P2P transfer.
+# "nixl" -- uses UCX (PSRL already has NIXL/UCX installed); automatically
+#           selects shared-memory/IPC on same node and RDMA on multi-node.
+#           Recommended for all deployment topologies.
+# "tcp"  -- fallback when NIXL/UCX is unavailable.
+p2p_transfer_channel: nixl
+
+# Base port for the shared LMCache Controller's HTTP API (FastAPI/uvicorn).
+# PSRL calls this port for /move, /lookup etc. REST endpoints.
+# RolloutCoordinator picks the actual port starting from this value
+# using find_available_port().
+controller_base_port: 9000
+
+# Seconds to wait for the shared LMCache Controller HTTP API (GET /openapi.json)
+# to become healthy before failing init. The controller imports torch+vLLM at
+# startup (~30-40s standalone) and runs on the busy ps_manager node, so under
+# cluster CPU/FS contention it can exceed the old 90s budget.
+controller_health_timeout_s: 3000
+
+# Host where the LMCache Controller runs. Defaults to psrl.ps_manager_ip.
+# Both PSRL (HTTP) and LMCache workers (ZMQ) connect to this host.
+controller_host: ${psrl.ps_manager_ip}
+
+# ZMQ PULL port: Controller listens here for LMCache worker registrations
+# and heartbeats. Each vLLM instance's LMCache worker connects to this port
+# on startup to register itself with the Controller.
+controller_pull_port: 8300
+
+# ZMQ REPLY port: Controller sends task instructions (move, clear, etc.)
+# to LMCache workers through this port. Workers connect here to receive
+# commands dispatched by the Controller after a /move HTTP request.
+controller_reply_port: 8400
+
+# Maximum number of GPU KV blocks PSRL may hold pinned simultaneously
+# (used by routing_strategy.kv_transfer.transfer_mode == "pin_sync").
+# When exceeded, the oldest-pinned trajectory is unpinned (PSRL-side LRU).
+# 0 means no limit.
+gpu_pin_block_budget: 0

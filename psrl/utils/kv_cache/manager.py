@@ -16,7 +16,7 @@ class KVCacheManager:
 
     Stateless with respect to trajectory identity — all public methods accept
     `tokens: list[int]` directly.  Trajectory-to-token mapping is maintained
-    by `RolloutRouter`.
+    by the routing gateway (RolloutGateway / SMG).
 
     Responsibilities:
     - Orchestrate KV cache operations via `collective_rpc` and EngineCore utilities.
@@ -126,8 +126,8 @@ class KVCacheManager:
         """
         Set the per-instance LMCache identifier.
 
-        Must be called once by `PSRL_GenWorker` after construction, passing the
-        numeric instance id assigned to this worker group.  Sets
+        Must be called once by the vLLM replica setup code after construction,
+        passing the numeric instance id assigned to this worker group.  Sets
         `lmcache_instance_id` to `"psrl_instance_{instance_id}"`, which the
         LMCache Controller uses to identify KV transfer sources and destinations.
 
@@ -141,9 +141,9 @@ class KVCacheManager:
         """
         Set the shared LMCache Controller URL.
 
-        Called by `PSRL_GenWorker.set_lmcache_controller_url()` after
+        Called by the vLLM replica setup code after
         `RolloutCoordinator.init_lmcache_p2p()` broadcasts the URL of the
-        single shared Controller subprocess to all GenWorker instances.
+        single shared Controller subprocess to all vLLM instances.
 
         Args:
             controller_url (str): Base URL of the shared Controller, e.g.

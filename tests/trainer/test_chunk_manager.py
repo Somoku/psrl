@@ -44,7 +44,8 @@ class FakeManager:
 
         self.train_chunk_size = chunk_size
         self._train_chunk_consumed: dict[int, int] = {}
-        self._train_chunk_waiters: dict[tuple, list | tuple] = {}
+        self._train_chunk_waiters: dict[tuple, list] = {}
+        self._resolved_train_chunks: dict[tuple, tuple] = {}
         self.ready_entries_per_buffer = ready_total
         self.rollout_n = rollout_n
         self.train_accumulated_buffers: dict[int, dict[int, list]] = {}
@@ -111,10 +112,10 @@ class TestChunkEmission:
         asyncio.run(_run())
 
     def test_chunk_arrives_before_waiter(self):
-        """Pre-resolved sentinel is consumed correctly by a late-arriving waiter.
+        """Pre-resolved chunk is consumed correctly by a late-arriving waiter.
 
-        Simulates the case where the rollout side is fast: the sentinel is
-        already in `_train_chunk_waiters` when `wait_for_training_chunk` runs.
+        Simulates the case where the rollout side is fast: the chunk is already
+        in `_resolved_train_chunks` when `wait_for_training_chunk` runs.
         """
 
         async def _run():
@@ -125,9 +126,9 @@ class TestChunkEmission:
             mgr._add_groups(buf, n_groups=2)
             mgr._emit_pending_chunks(buf)
 
-            # Sentinel should be stored.
-            assert ("resolved", buf, 0) in mgr._train_chunk_waiters, (
-                "Expected pre-resolved sentinel in _train_chunk_waiters."
+            # Resolved chunk should be stored.
+            assert (buf, 0) in mgr._resolved_train_chunks, (
+                "Expected pre-resolved chunk in _resolved_train_chunks."
             )
 
             # Late-arriving waiter should resolve immediately.
@@ -136,9 +137,9 @@ class TestChunkEmission:
             assert len(chunk_meta) == 2
             assert is_last is False
 
-            # Sentinel consumed; should be gone.
-            assert ("resolved", buf, 0) not in mgr._train_chunk_waiters, (
-                "Sentinel should have been consumed by wait_for_training_chunk."
+            # Consumed; should be gone.
+            assert (buf, 0) not in mgr._resolved_train_chunks, (
+                "Resolved chunk should have been consumed by wait_for_training_chunk."
             )
 
         asyncio.run(_run())
@@ -194,10 +195,7 @@ class TestChunkEmission:
         asyncio.run(_run())
 
     def test_chunk_size_none_no_op(self):
-        """`_emit_pending_chunks` is a strict no-op when `train_chunk_size is None`.
-
-        No sentinel keys should appear in `_train_chunk_waiters` after the call.
-        """
+        """`_emit_pending_chunks` is a strict no-op when `train_chunk_size is None`."""
         mgr = FakeManager(chunk_size=None, ready_total=4)
         buf = 4
 
@@ -208,7 +206,42 @@ class TestChunkEmission:
             f"Expected empty _train_chunk_waiters when chunk_size is None, "
             f"got {list(mgr._train_chunk_waiters.keys())!r}."
         )
+        assert not mgr._resolved_train_chunks, (
+            f"Expected empty _resolved_train_chunks when chunk_size is None, "
+            f"got {list(mgr._resolved_train_chunks.keys())!r}."
+        )
         assert not mgr._train_chunk_consumed, (
             f"Expected empty _train_chunk_consumed when chunk_size is None, "
             f"got {mgr._train_chunk_consumed!r}."
         )
+
+    def test_accumulation_order_not_resorted_across_emits(self):
+        """Later chunks must not re-slice a prompt_id-resorted full list.
+
+        If high prompt_ids finish first, re-sorting the full buffer on the
+        second emit would duplicate those groups and drop the late low ids.
+        """
+
+        async def _run():
+            mgr = FakeManager(chunk_size=2, ready_total=4)
+            buf = 0
+
+            # High prompt_ids complete first.
+            mgr._add_groups(buf, n_groups=2, start_prompt_id=2)
+            mgr._emit_pending_chunks(buf)
+            c0, last0 = await mgr.wait_for_training_chunk(buf, 0)
+            assert sorted(map(int, c0.keys)) == [2, 3]
+            assert last0 is False
+
+            # Low prompt_ids complete later.
+            mgr._add_groups(buf, n_groups=2, start_prompt_id=0)
+            mgr._emit_pending_chunks(buf)
+            assert (buf, 1) in mgr._resolved_train_chunks, "chunk 1 must be emitted"
+            c1, last1 = await mgr.wait_for_training_chunk(buf, 1)
+            assert last1 is True
+            assert sorted(map(int, c1.keys)) == [0, 1], (
+                f"chunk 1 should be the late groups [0,1], got {c1.keys}"
+            )
+            assert set(c0.keys).isdisjoint(c1.keys)
+
+        asyncio.run(_run())

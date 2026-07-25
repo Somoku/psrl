@@ -1,0 +1,23 @@
+# Agentic RL feature toggles.
+
+# Error handling for terminations where TerminateReason.needs_manager_retry()
+# is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
+# (unclassified failure / zero turns produced). Timeouts and aborts are
+# handled by their own paths and do NOT route through this switch.
+# True  (default): on training failure, worker notifies manager to dispatch a
+#                  replacement request so the buffer slot is eventually filled;
+#                  on validation failure, manager shrinks val_buffer_size by 1
+#                  so the waiter is unblocked (result has fewer rows).
+# False           : raise RuntimeError immediately, crashing the worker so the
+#                   failure is visible rather than silently stalling training.
+manager_retry_on_error: True
+
+# Per-trajectory text dump written by all agent loops via TrajectoryWriter.
+# Files land at <dir>/v{version}/{uid}.txt (one per rollout trajectory).
+trajectory_output:
+  # Whether to write per-trajectory text files.
+  enable: True
+  # Output directory. Empty -> <psrl.logging_path>/trajectories.
+  dir: ""
+
+# TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml

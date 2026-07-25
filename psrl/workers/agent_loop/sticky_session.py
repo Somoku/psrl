@@ -30,7 +30,7 @@ class StickySession:
         """Initialize sticky session context.
 
         Args:
-            rollout_router_handle: Ray actor handle to RolloutRouter.
+            rollout_router_handle: Ray actor handle to the routing gateway.
             request_id (int): The request ID for this session.
         """
         self.rollout_router_handle = rollout_router_handle
@@ -51,7 +51,7 @@ def sticky_session(rollout_router_handle, request):
     """Convenience function to create sticky session from request.
 
     Args:
-        rollout_router_handle: Ray actor handle to RolloutRouter.
+        rollout_router_handle: Ray actor handle to the routing gateway.
         request: dict containing request with 'uid' in non_tensor_batch.
 
     Returns:

@@ -62,7 +62,7 @@ class PSRL_AgentLoopWorker:
         """
 
         # Per-actor identity used to label every Docker container this worker
-        # spawns (rollout containers in MiniSWEAgentLoop, grader containers in
+        # spawns (rollout containers in MiniSWEAgentLoopV1, grader containers in
         # swebench_grader). The reaper sidecar below filters by this label to
         # reclaim only this actor's containers when the actor process dies,
         # which is robust under SIGKILL, OOM, Ray actor restart, and

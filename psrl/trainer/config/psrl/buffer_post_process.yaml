@@ -1,0 +1,9 @@
+# Post processor for buffer requests in batch mode
+
+# Whether to enable buffer post-processing
+enable: False
+
+# Name of the registered buffer post-processor to use
+# Available options: "dynamic_sampling_filter", "no_filter"
+# When name is "dynamic_sampling_filter", requires algorithm.filter_groups.metric to be set
+name: null

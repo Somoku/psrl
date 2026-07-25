@@ -4,6 +4,7 @@ Plot per-request route/pop segment timeline + per-instance KV-cache scatter.
 Top panel:  each request_id on its own row; coloured horizontal segments show
             which instance it was running on between a route event and the
             matching pop event (one turn).  Gaps = env/tool execution time.
+            Incomplete turns (route without a matching pop) are omitted.
 Bottom panel: KV-cache utilisation per instance over time (route + pop events).
 
 Both panels share the same x-axis (relative minutes from the first log event).
@@ -167,43 +168,35 @@ def parse_log(
 
 def pair_segments(
     req_events: dict[int, list[tuple[float, str, int]]],
-    window_end_min: float,
-) -> dict[int, list[tuple[float, float, int, bool]]]:
+) -> dict[int, list[tuple[float, float, int]]]:
     """
     For each request, pair route→pop events into segments.
 
+    Only complete route→pop pairs are kept. A route with no matching pop
+    (orphaned mid-stream, or still open at window end) is dropped and not drawn.
+
     Returns:
-        segments: req_id -> list of (t_start, t_end, instance, is_dangling).
-            is_dangling=True means the route had no matching pop (still running
-            or outside window); the segment extends to window_end_min.
+        segments: req_id -> list of (t_start, t_end, instance).
     """
-    segments: dict[int, list[tuple[float, float, int, bool]]] = {}
+    segments: dict[int, list[tuple[float, float, int]]] = {}
 
     for req_id, events in req_events.items():
-        segs: list[tuple[float, float, int, bool]] = []
+        segs: list[tuple[float, float, int]] = []
         open_route: tuple[float, int] | None = None
 
         for t_min, kind, inst in events:
             if kind == "route":
-                # New route opens a segment; close any dangling open (shouldn't
-                # happen in well-formed logs, but guard against it).
-                if open_route is not None:
-                    t_r, inst_r = open_route
-                    t_end = max(t_r + _MIN_SEG_MIN, t_r)
-                    segs.append((t_r, window_end_min, inst_r, True))
+                # Previous route never got a pop — drop it, start the new one.
                 open_route = (t_min, inst)
             elif kind == "pop":
                 if open_route is not None:
                     t_r, inst_r = open_route
                     t_end = max(t_min, t_r + _MIN_SEG_MIN)
-                    segs.append((t_r, t_end, inst_r, False))
+                    segs.append((t_r, t_end, inst_r))
                     open_route = None
                 # pop with no open route: its route predates our window; skip.
 
-        if open_route is not None:
-            t_r, inst_r = open_route
-            segs.append((t_r, window_end_min, inst_r, True))
-
+        # Trailing open route (no pop in window): drop, do not draw.
         if segs:
             segments[req_id] = segs
 
@@ -214,7 +207,7 @@ def pair_segments(
 
 
 def plot(
-    segments: dict[int, list[tuple[float, float, int, bool]]],
+    segments: dict[int, list[tuple[float, float, int]]],
     kv_events: dict[int, list[tuple[float, float]]],
     window_end_min: float,
     num_requests: int,
@@ -241,18 +234,15 @@ def plot(
         legend_handles: dict[int, matplotlib.lines.Line2D] = {}
 
         for req_id, segs in segments.items():
-            for t_start, t_end, inst, dangling in segs:
+            for t_start, t_end, inst in segs:
                 col = colors[inst % len(colors)]
-                lw = 1.5
-                alpha = 0.4 if dangling else 0.85
-                ls = "--" if dangling else "-"
                 line = matplotlib.lines.Line2D(
                     [t_start, t_end],
                     [req_id, req_id],
                     color=col,
-                    linewidth=lw,
-                    alpha=alpha,
-                    linestyle=ls,
+                    linewidth=1.5,
+                    alpha=0.85,
+                    linestyle="-",
                     solid_capstyle="butt",
                 )
                 ax_top.add_line(line)
@@ -412,7 +402,7 @@ def main() -> None:
         f"{len(kv_events)} instances have KV data."
     )
 
-    segments = pair_segments(req_events, args.duration_min)
+    segments = pair_segments(req_events)
     psrl_logger.info(f"Paired segments for {len(segments)} requests.")
 
     n_instances = args.instances
@@ -420,7 +410,7 @@ def main() -> None:
         # Infer from route dst_instance and pop instance observed in the window.
         all_insts = set(kv_events.keys())
         for segs in segments.values():
-            for _, _, inst, _ in segs:
+            for _, _, inst in segs:
                 all_insts.add(inst)
         n_instances = max(all_insts) + 1 if all_insts else 8
         psrl_logger.info(f"Auto-detected {n_instances} instances.")

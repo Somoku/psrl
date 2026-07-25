@@ -1,0 +1,9 @@
+# Fine-grained overlap between rollout and training.
+# Allows starting training stages before the full batch is collected.
+# granularity: none (default, full batch) | mini_batch | micro_batch
+# multiplier:  int >= 1; chunk_size = base_unit * multiplier, clamped to full batch
+# overlap_scope: recompute (forward stages only, math identical to none)
+#              | pre_step  (also do advantage+update per chunk; GRPO recommended)
+granularity: none
+multiplier: 1
+overlap_scope: recompute

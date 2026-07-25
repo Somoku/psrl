@@ -1,0 +1,17 @@
+# Whether to use torch_memory_saver (TMS) for GPU management
+
+# Range of TMS to enable, available options:
+#  - "null": disable TMS
+#  - "train": enable TMS for training workers only
+#  - "all": enable TMS for both rollout and training workers
+range: all
+
+# Whether to enable TMS on CUDA graphs
+# When enabled, CUDA graphs will be released by TMS to save GPU memory
+# This requires range to be "all"
+enable_cuda_graph: False
+
+# Whether to enable TMS on NIXL temp buffers
+# When enabled, NIXL temp buffers will be released by TMS to save GPU
+# and the reregister will be simplified.
+enable_nixl: True

@@ -7,6 +7,8 @@ recompute scope: per-sample stages (old_log_prob/ref/values/reward) run
 pre_step + mini_batch scope: each chunk IS one mini-batch; advantage and
   one optimizer step run per chunk.  Exact for GRPO (group-local normalization);
   approximate for GAE/REINFORCE++/GDPO (masked_whiten scope changes).
+  PS weight push is deferred until the last chunk so ``maybe_delete_buffer``
+  does not tear down the current buffer mid-step.
 
 ``run_step`` switches to trainer mode immediately, then pulls chunks from the
 manager as they become available, so per-sample GPU work on chunk N overlaps
@@ -110,11 +112,29 @@ class FineGrainOverlapStrategy(StepStrategy):
         chunk_idx = 0
 
         while True:
+            # Use warning so these show under default PSRL_LOGGING_LEVEL=WARN.
+            psrl_logger.warning(
+                "FineGrainOverlap: waiting for buffer=%d chunk=%d",
+                buffer_id,
+                chunk_idx,
+            )
             chunk_meta, is_last = ray.get(
                 t.agent_loop_manager.wait_for_training_chunk.remote(buffer_id, chunk_idx)
             )
+            psrl_logger.warning(
+                "FineGrainOverlap: got buffer=%d chunk=%d size=%d is_last=%s; sampling replay buffer",
+                buffer_id,
+                chunk_idx,
+                len(chunk_meta),
+                is_last,
+            )
 
             t.replay_buffer.sample(chunk_meta.keys, chunk_meta.partition_id)
+            psrl_logger.warning(
+                "FineGrainOverlap: replay sample ready for buffer=%d chunk=%d",
+                buffer_id,
+                chunk_idx,
+            )
 
             if t.config.trainer.balance_batch:
                 chunk_meta = t._balance_batch(chunk_meta, metrics=metrics)
@@ -162,13 +182,22 @@ class FineGrainOverlapStrategy(StepStrategy):
                             chunk_meta = t._update_critic(chunk_meta, metrics=metrics)
 
                 if t.config.trainer.critic_warmup <= t.global_steps:
+                    # Push only on the last chunk. Intermediate pushes advance the
+                    # PS version and trigger maybe_delete_buffer(version-1), which
+                    # tears down the current training buffer before remaining
+                    # chunks are consumed (deadlock / silent stall).
                     with marked_timer("update_actor", timing_raw, color="red"):
                         with log_dual_events(
-                            "Update actor",
+                            f"Update actor (chunk {chunk_idx}, push={is_last})",
                             psrl_logger,
                             event_type=EventType.TRAIN,
                         ):
-                            chunk_meta = t._update_actor(chunk_meta, metrics=metrics)
+                            chunk_meta = t._update_actor(
+                                chunk_meta, metrics=metrics, push_model=is_last
+                            )
+                            # Ephemeral per-chunk control flag; must not survive into
+                            # KVBatchMeta.concat (False on intermediate, True on last).
+                            chunk_meta.extra_info.pop("push_model", None)
 
             chunks.append(chunk_meta)
             chunk_idx += 1

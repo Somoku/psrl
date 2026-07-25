@@ -103,9 +103,6 @@ class SimpleRolloutTester:
             "trust_remote_code": self.config.model.get("trust_remote_code", False),
             "seed": 0,
             "worker_extension_cls": "psrl.bench.rollout.vllm_extension.vLLMWorkerExtension",
-            "additional_config": {
-                "max_model_len_used_in_estimation": rollout_config.max_num_seqs * 32768 * 32,
-            },
         }
 
         # Create AsyncLLM with stats collector
@@ -272,19 +269,19 @@ class SimpleRolloutTester:
 
         return results
 
-    async def estimate_max_model_len(self):
-        """Estimate the max model length."""
-        max_model_len = await self.llm.collective_rpc(
-            "estimate_max_model_len",
+    async def get_total_kv_cache_tokens(self):
+        """Get the total KV-cache token capacity of the engine."""
+        total_kv_tokens = await self.llm.collective_rpc(
+            "get_total_kv_cache_tokens",
             args=(),
         )
-        return max_model_len
+        return total_kv_tokens
 
     async def run_performance_test(self):
         """Run performance tests using AsyncLLM directly."""
         test_mode = self.config.rollout_test.get("mode", "synthetic")  # "synthetic" or "real_data"
-        estimated_max_model_len = await self.estimate_max_model_len()
-        psrl_logger.info(f"Estimated max model length: {estimated_max_model_len}")
+        total_kv_tokens = await self.get_total_kv_cache_tokens()
+        psrl_logger.info(f"Total KV-cache token capacity: {total_kv_tokens}")
         psrl_logger.info(f"Starting rollout performance test in {test_mode} mode...")
 
         # Run performance test

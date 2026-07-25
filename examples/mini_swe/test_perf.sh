@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_low_gpu_perf
-experiment_name=max_waiting_1_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=group_sticky_thunder_agent_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -162,7 +162,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.rollout_coordination.routing_strategy.kv_transfer.enable=False \
     psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode=async \
     psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=0 \
-    psrl.rollout_coordination.session_strategy.thunder_agent.enable=False \
+    psrl.rollout_coordination.session_strategy.thunder_agent.enable=True \
     psrl.rollout_coordination.sync_and_mig_strategy.mig.enable=False \
     psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator=request_num \
     psrl.rollout_coordination.sync_and_mig_strategy.mig.threshold=10 \
@@ -181,8 +181,9 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
     psrl.rollout_coordination.routing_strategy.method=cache_aware_v1 \
-    psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky=False \
-    psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
+    psrl.rollout_coordination.routing_strategy.cache_aware_policy.lmcache_overlap_weight=0.5 \
+    psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky=True \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=True \
     \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \

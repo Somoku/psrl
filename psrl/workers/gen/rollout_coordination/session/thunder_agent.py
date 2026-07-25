@@ -314,7 +314,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
     """
 
     async def _refresh_kv_token_capacities(self) -> None:
-        """Fetch absolute KV-token capacity (estimate_max_model_len) for rollout
+        """Fetch absolute KV-token capacity (get_total_kv_cache_tokens) for rollout
         instances that don't have it cached yet."""
         missing_replicas = {
             instance_id[0]
@@ -323,10 +323,10 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
             and instance_id[0] in self.tag_to_replica_ids["rollout"]
         }
         for replica_id in missing_replicas:
-            max_len = int(await self.server_handles[replica_id].estimate_max_model_len.remote())
+            total_tokens = int(await self.server_handles[replica_id].get_total_kv_cache_tokens.remote())
             for instance_id in self.instance_ids:
                 if instance_id[0] == replica_id:
-                    self.instance_to_total_kv_tokens[instance_id] = max_len
+                    self.instance_to_total_kv_tokens[instance_id] = total_tokens
 
     def _build_instance_capacities(self):
         """Snapshot per-instance KV capacity for the scheduler (rollout instances only)."""
@@ -336,7 +336,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
                 continue
             total = self.instance_to_total_kv_tokens.get(instance_id)
             if not total:
-                # Capacity not resolved yet; skip until estimate_max_model_len lands.
+                # Capacity not resolved yet; skip until get_total_kv_cache_tokens lands.
                 continue
             used = int(round(engine_status.get_kv_cache_utilization() * total))
             capacities.append(

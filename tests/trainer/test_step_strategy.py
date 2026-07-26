@@ -1,7 +1,7 @@
-import pytest
 from unittest.mock import MagicMock
-from psrl.trainer.ppo.strategies import STAGE_META, build_step_strategy
 
+import pytest
+from psrl.trainer.ppo.strategies import STAGE_META, build_step_strategy
 
 pytestmark = pytest.mark.cpu_test
 
@@ -18,12 +18,14 @@ class TestStageMeta:
 class TestBuildStepStrategy:
     def test_none_granularity_returns_full_batch(self):
         from psrl.trainer.ppo.strategies import FullBatchStepStrategy
+
         trainer = MagicMock()
         strategy = build_step_strategy(None, trainer)
         assert isinstance(strategy, FullBatchStepStrategy)
 
     def test_explicit_none_returns_full_batch(self):
         from psrl.trainer.ppo.strategies import FullBatchStepStrategy
+
         trainer = MagicMock()
         cfg = MagicMock()
         cfg.granularity = "none"

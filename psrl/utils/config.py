@@ -33,9 +33,7 @@ def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
     multiplier = int(fgo.get("multiplier", 1)) if fgo is not None else 1
 
     if multiplier < 1:
-        raise ValueError(
-            f"psrl.fine_grain_overlap.multiplier must be >= 1, got {multiplier}"
-        )
+        raise ValueError(f"psrl.fine_grain_overlap.multiplier must be >= 1, got {multiplier}")
 
     rollout_n = config.gen_actor_rollout_ref.rollout.n
     full_batch_samples = config.data.train_batch_size * rollout_n
@@ -281,14 +279,13 @@ def validate_config(
     kv_transfer_cfg = config.psrl.rollout_coordination.routing_strategy.get("kv_transfer", {})
 
     if kv_transfer_cfg.get("enable", False):
-        assert lmcache_cfg.get("enable", False), (
-            "psrl.lmcache.enable must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
+        kv_transfer_required = (
+            "must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
         )
-        assert lmcache_cfg.get("enable_p2p", False), (
-            "psrl.lmcache.enable_p2p must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
-        )
+        assert lmcache_cfg.get("enable", False), f"psrl.lmcache.enable {kv_transfer_required}"
+        assert lmcache_cfg.get("enable_p2p", False), f"psrl.lmcache.enable_p2p {kv_transfer_required}"
         assert config.psrl.rollout_coordination.partial_rollout.enable, (
-            "psrl.rollout_coordination.partial_rollout.enable must be True when psrl.rollout_coordination.routing_strategy.kv_transfer.enable is True."
+            f"psrl.rollout_coordination.partial_rollout.enable {kv_transfer_required}"
         )
 
     if lmcache_cfg.get("enable_p2p", False):
@@ -336,9 +333,7 @@ def validate_config(
     # ---- fine_grain_overlap validation ----
     fgo = config.psrl.get("fine_grain_overlap", None)
     if fgo is not None and str(fgo.get("granularity", "none")) != "none":
-        train_n_gpus_fgo = (
-            config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
-        )
+        train_n_gpus_fgo = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
         actor_strategy = config.train_actor_rollout_ref.actor.strategy
         dp_size_fgo = train_n_gpus_fgo  # FSDP dp_size == train_n_gpus (no model parallelism for FSDP)
         if actor_strategy == "megatron":

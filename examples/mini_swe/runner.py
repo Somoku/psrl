@@ -29,6 +29,7 @@ def _silence_litellm() -> None:
     logging.getLogger("LiteLLM").setLevel(logging.ERROR)
     logging.getLogger("litellm").setLevel(logging.ERROR)
 
+
 _PROXY_ENV_KEYS = [
     "http_proxy",
     "https_proxy",

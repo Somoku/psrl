@@ -7,10 +7,9 @@ All tests use `asyncio.run()` so they work without `pytest-asyncio`.
 """
 
 import asyncio
-
-import pytest
 from unittest.mock import MagicMock
 
+import pytest
 from transfer_queue import KVBatchMeta
 
 pytestmark = pytest.mark.cpu_test
@@ -127,9 +126,7 @@ class TestChunkEmission:
             mgr._emit_pending_chunks(buf)
 
             # Resolved chunk should be stored.
-            assert (buf, 0) in mgr._resolved_train_chunks, (
-                "Expected pre-resolved chunk in _resolved_train_chunks."
-            )
+            assert (buf, 0) in mgr._resolved_train_chunks, "Expected pre-resolved chunk in _resolved_train_chunks."
 
             # Late-arriving waiter should resolve immediately.
             chunk_meta, is_last = await mgr.wait_for_training_chunk(buf, 0)
@@ -211,8 +208,7 @@ class TestChunkEmission:
             f"got {list(mgr._resolved_train_chunks.keys())!r}."
         )
         assert not mgr._train_chunk_consumed, (
-            f"Expected empty _train_chunk_consumed when chunk_size is None, "
-            f"got {mgr._train_chunk_consumed!r}."
+            f"Expected empty _train_chunk_consumed when chunk_size is None, got {mgr._train_chunk_consumed!r}."
         )
 
     def test_accumulation_order_not_resorted_across_emits(self):
@@ -239,9 +235,7 @@ class TestChunkEmission:
             assert (buf, 1) in mgr._resolved_train_chunks, "chunk 1 must be emitted"
             c1, last1 = await mgr.wait_for_training_chunk(buf, 1)
             assert last1 is True
-            assert sorted(map(int, c1.keys)) == [0, 1], (
-                f"chunk 1 should be the late groups [0,1], got {c1.keys}"
-            )
+            assert sorted(map(int, c1.keys)) == [0, 1], f"chunk 1 should be the late groups [0,1], got {c1.keys}"
             assert set(c0.keys).isdisjoint(c1.keys)
 
         asyncio.run(_run())

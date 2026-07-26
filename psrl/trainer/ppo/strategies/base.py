@@ -46,7 +46,7 @@ class StepStrategy(ABC):
     without copying state.
     """
 
-    def __init__(self, trainer: "PSRL_RayPPOTrainer") -> None:
+    def __init__(self, trainer: PSRL_RayPPOTrainer) -> None:
         self.trainer = trainer
 
     @abstractmethod
@@ -87,10 +87,10 @@ class StepStrategy(ABC):
             max_steps_duration=t.max_steps_duration,
             redundant_time=t.config.trainer.esi_redundant_time,
         )
-        if actor_updated and t.config.trainer.save_freq > 0 and (
-            is_last_step
-            or t.global_steps % t.config.trainer.save_freq == 0
-            or esi_close
+        if (
+            actor_updated
+            and t.config.trainer.save_freq > 0
+            and (is_last_step or t.global_steps % t.config.trainer.save_freq == 0 or esi_close)
         ):
             if esi_close:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
@@ -106,9 +106,7 @@ class StepStrategy(ABC):
         if rollout_data_dir:
             t._log_rollout_data(batch, timing_raw, rollout_data_dir)
 
-        if t.config.trainer.test_freq > 0 and (
-            is_last_step or t.global_steps % t.config.trainer.test_freq == 0
-        ):
+        if t.config.trainer.test_freq > 0 and (is_last_step or t.global_steps % t.config.trainer.test_freq == 0):
             with marked_timer("testing", timing_raw, color="green"):
                 with log_dual_events("Validate", psrl_logger, event_type=EventType.VAL):
                     val_metrics: dict = t._validate()
@@ -117,7 +115,7 @@ class StepStrategy(ABC):
             metrics.update(val_metrics)
 
 
-def build_step_strategy(cfg, trainer: "PSRL_RayPPOTrainer") -> StepStrategy:
+def build_step_strategy(cfg, trainer: PSRL_RayPPOTrainer) -> StepStrategy:
     """Return the appropriate ``StepStrategy`` based on ``psrl.fine_grain_overlap``."""
     if cfg is None or str(getattr(cfg, "granularity", "none")) == "none":
         from psrl.trainer.ppo.strategies.full_batch import FullBatchStepStrategy

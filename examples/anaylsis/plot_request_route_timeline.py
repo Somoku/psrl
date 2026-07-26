@@ -16,12 +16,10 @@ Usage:
 import argparse
 import logging
 import re
-import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib
-import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -153,9 +151,7 @@ def parse_log(
             events_captured += 1
             lines_read += 1
 
-    psrl_logger.info(
-        f"Parsed {lines_read} relevant lines; {events_captured} route/pop events captured."
-    )
+    psrl_logger.info(f"Parsed {lines_read} relevant lines; {events_captured} route/pop events captured.")
 
     if t0 is None:
         raise ValueError("No parseable events found in the log file.")
@@ -349,10 +345,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--instances",
         type=int,
         default=None,
-        help=(
-            "Number of instances (for colour map). "
-            "Auto-detected from the log if omitted."
-        ),
+        help=("Number of instances (for colour map). Auto-detected from the log if omitted."),
     )
     p.add_argument(
         "--kv-max-points-per-instance",
@@ -387,8 +380,7 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     psrl_logger.info(
-        f"Parsing {args.log_path!r} for requests 0..{args.num_requests - 1} "
-        f"over {args.duration_min} min window."
+        f"Parsing {args.log_path!r} for requests 0..{args.num_requests - 1} over {args.duration_min} min window."
     )
 
     t0, req_events, kv_events = parse_log(
@@ -398,8 +390,7 @@ def main() -> None:
     )
 
     psrl_logger.info(
-        f"Window t0={t0}, {len(req_events)} requests have events, "
-        f"{len(kv_events)} instances have KV data."
+        f"Window t0={t0}, {len(req_events)} requests have events, {len(kv_events)} instances have KV data."
     )
 
     segments = pair_segments(req_events)

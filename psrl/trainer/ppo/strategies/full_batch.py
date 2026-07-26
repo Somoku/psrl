@@ -8,16 +8,11 @@ step body.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import ray
 from verl.utils.debug import marked_timer
 
 from psrl.trainer.ppo.strategies.base import StepStrategy, psrl_logger
 from psrl.utils.logger import EventType, log_dual_events
-
-if TYPE_CHECKING:
-    from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
 
 class FullBatchStepStrategy(StepStrategy):
@@ -37,9 +32,7 @@ class FullBatchStepStrategy(StepStrategy):
                 psrl_logger,
                 event_type=EventType.WAIT,
             ):
-                batch = ray.get(
-                    t.agent_loop_manager.wait_for_training_batch.remote(buffer_id)
-                )
+                batch = ray.get(t.agent_loop_manager.wait_for_training_batch.remote(buffer_id))
                 t.replay_buffer.sample(batch.keys, batch.partition_id)
             with log_dual_events(
                 "Switch to trainer mode",
@@ -87,9 +80,7 @@ class FullBatchStepStrategy(StepStrategy):
                     psrl_logger,
                     event_type=EventType.OTHER,
                 ):
-                    batch = ray.get(
-                        t.reward_manager.wait_for_reward_of_requests.remote(batch)
-                    )
+                    batch = ray.get(t.reward_manager.wait_for_reward_of_requests.remote(batch))
         else:
             with log_dual_events(
                 "Normalize reward",

@@ -76,8 +76,12 @@ class PSRL_AgentLoopManager:
         self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
 
         if self.config.psrl.rollout_coordination.redundant_rollout.enable:
-            self.entries_per_buffer = self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
-            self.ready_entries_per_buffer = self.config.psrl.rollout_coordination.redundant_rollout.alg_global_batch_size
+            self.entries_per_buffer = (
+                self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size
+            )
+            self.ready_entries_per_buffer = (
+                self.config.psrl.rollout_coordination.redundant_rollout.alg_global_batch_size
+            )
         else:
             self.entries_per_buffer = self.config.psrl.staleness_buffer_entries
             self.ready_entries_per_buffer = self.config.psrl.staleness_buffer_entries
@@ -634,7 +638,9 @@ class PSRL_AgentLoopManager:
         Get the expected PS version tag based on the current staleness and request counter.
         """
         if self.config.psrl.rollout_coordination.redundant_rollout.enable:
-            buffer_size = self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size * self.rollout_n
+            buffer_size = (
+                self.config.psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size * self.rollout_n
+            )
         else:
             buffer_size = self.config.psrl.staleness_buffer_entries * self.rollout_n
 
@@ -1552,9 +1558,7 @@ class PSRL_AgentLoopManager:
         batch_meta = await fut
         return batch_meta
 
-    async def wait_for_training_chunk(
-        self, buffer_id: int, chunk_index: int
-    ) -> tuple["KVBatchMeta", bool]:
+    async def wait_for_training_chunk(self, buffer_id: int, chunk_index: int) -> tuple["KVBatchMeta", bool]:
         """Await a specific chunk (by index) for a given buffer.
 
         Returns (chunk_meta, is_last).  is_last=True means this chunk

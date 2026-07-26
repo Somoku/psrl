@@ -170,9 +170,7 @@ class ThunderAgentScheduler(SessionScheduler):
         buffer = self.buffer_per_session
         # Mutable [instance_id, remaining] rows for instances with room.
         caps = [
-            [instance_id, remaining]
-            for instance_id, remaining in remaining_by_instance.items()
-            if remaining > buffer
+            [instance_id, remaining] for instance_id, remaining in remaining_by_instance.items() if remaining > buffer
         ]
         total_capacity = sum(row[1] for row in caps)
         if not caps or total_capacity <= 0:
@@ -261,9 +259,7 @@ class ThunderAgentScheduler(SessionScheduler):
           reservation) or a generate (drops its footprint) session raises
           ``remaining`` self-consistently while ``shared`` stays fixed.
         """
-        generate_tokens_full = sum(
-            s.total_tokens for s in running if s.status != STATUS_ENV
-        )
+        generate_tokens_full = sum(s.total_tokens for s in running if s.status != STATUS_ENV)
         shared = max(0, generate_tokens_full - inst.used_tokens)
 
         generate_tokens = 0
@@ -339,9 +335,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
                 # Capacity not resolved yet; skip until get_total_kv_cache_tokens lands.
                 continue
             used = int(round(engine_status.get_kv_cache_utilization() * total))
-            capacities.append(
-                InstanceCapacity(instance_id=instance_id, total_kv_tokens=total, used_tokens=used)
-            )
+            capacities.append(InstanceCapacity(instance_id=instance_id, total_kv_tokens=total, used_tokens=used))
         return capacities
 
     @staticmethod
@@ -400,9 +394,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
             instances = self._build_instance_capacities()
             to_hang, to_continue = self._thunder_scheduler.decide(instances, sessions)
             if to_hang:
-                resp = await self._session_post_json(
-                    "/control/hang", [{"session_id": sid} for sid in to_hang]
-                )
+                resp = await self._session_post_json("/control/hang", [{"session_id": sid} for sid in to_hang])
                 # The router hangs idle sessions immediately but defers those with a
                 # turn in flight to the next turn boundary; surface both so the
                 # decision can be reconciled against SessionRouter.log.

@@ -24,8 +24,6 @@ TODO (future): pre_step + micro_batch scope — true cross-chunk gradient
 
 from __future__ import annotations
 
-import logging
-import os
 from typing import TYPE_CHECKING
 
 import ray
@@ -54,7 +52,7 @@ class FineGrainOverlapStrategy(StepStrategy):
                    micro_batch is a future phase).
     """
 
-    def __init__(self, trainer: "PSRL_RayPPOTrainer", cfg) -> None:
+    def __init__(self, trainer: PSRL_RayPPOTrainer, cfg) -> None:
         """Initialize and register the chunk size with the manager.
 
         Args:
@@ -64,9 +62,7 @@ class FineGrainOverlapStrategy(StepStrategy):
         super().__init__(trainer)
         t = trainer
         dp_size = t._get_dp_size(t.actor_wg, "actor")
-        self.effective_granularity, self.chunk_groups = resolve_fine_grain_chunk_size(
-            t.config, dp_size
-        )
+        self.effective_granularity, self.chunk_groups = resolve_fine_grain_chunk_size(t.config, dp_size)
         self.overlap_scope = str(cfg.get("overlap_scope", "recompute"))
 
         if self.overlap_scope == "pre_step" and self.effective_granularity != "mini_batch":
@@ -118,9 +114,7 @@ class FineGrainOverlapStrategy(StepStrategy):
                 buffer_id,
                 chunk_idx,
             )
-            chunk_meta, is_last = ray.get(
-                t.agent_loop_manager.wait_for_training_chunk.remote(buffer_id, chunk_idx)
-            )
+            chunk_meta, is_last = ray.get(t.agent_loop_manager.wait_for_training_chunk.remote(buffer_id, chunk_idx))
             psrl_logger.warning(
                 "FineGrainOverlap: got buffer=%d chunk=%d size=%d is_last=%s; sampling replay buffer",
                 buffer_id,
@@ -156,9 +150,7 @@ class FineGrainOverlapStrategy(StepStrategy):
 
             if t.config.reward.launch_reward_fn_async:
                 with marked_timer("async_reward_get", timing_raw, color="yellow"):
-                    chunk_meta = ray.get(
-                        t.reward_manager.wait_for_reward_of_requests.remote(chunk_meta)
-                    )
+                    chunk_meta = ray.get(t.reward_manager.wait_for_reward_of_requests.remote(chunk_meta))
             else:
                 chunk_meta = ray.get(t.reward_manager.normalize_reward.remote(chunk_meta))
 
@@ -192,9 +184,7 @@ class FineGrainOverlapStrategy(StepStrategy):
                             psrl_logger,
                             event_type=EventType.TRAIN,
                         ):
-                            chunk_meta = t._update_actor(
-                                chunk_meta, metrics=metrics, push_model=is_last
-                            )
+                            chunk_meta = t._update_actor(chunk_meta, metrics=metrics, push_model=is_last)
                             # Ephemeral per-chunk control flag; must not survive into
                             # KVBatchMeta.concat (False on intermediate, True on last).
                             chunk_meta.extra_info.pop("push_model", None)

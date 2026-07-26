@@ -382,9 +382,7 @@ def _classify_http_error(
         translated.__cause__ = exc
         return translated
     body_text = str(exc.message)
-    if code == _PROMPT_OVERFLOW_ERROR_CODE or any(
-        marker in body_text for marker in _OVERLONG_MARKERS
-    ):
+    if code == _PROMPT_OVERFLOW_ERROR_CODE or any(marker in body_text for marker in _OVERLONG_MARKERS):
         translated = PromptOverflowError(f"Prompt exceeds max_model_len: {body_text}")
         translated.__cause__ = exc
         return translated

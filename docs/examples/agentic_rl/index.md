@@ -40,15 +40,26 @@ training pipeline. The design is **inspired by veRL's agent loop**: see
 [veRL Agentic RL Training](https://verl.readthedocs.io/en/latest/start/agentic_rl.html)
 for the architectural blueprint we built on.
 
-PSRL now supports two complementary integration modes:
+Rather than a single loop, PSRL registers several agent loops and picks one per
+request via `rollout.agent.default_agent_loop` (or a per-request override). They fall
+into two complementary integration modes:
+
+| Agent loop | Registered name | Mode | Used by |
+|---|---|---|---|
+| `GenerateAgentLoop` | `generate_only_agent` | Native, single-turn generate (default) | Single-turn RLVR |
+| `MultiTurnAgentLoop` | `multi_turn_agent` | Native, multi-turn streaming w/ tools | ReTool |
+| `MultiTurnCompletionAgentLoop` | `multi_turn_completion_agent` | Native, multi-turn completion style | Custom multi-turn |
+| `MiniSWEAgentLoopV1` | `mini_swe_agent` | Session/TITO, black-box agent | SWE-agent |
 
 - **Native loops** use the generic `Environment` + `AgentData` interfaces and call
-  rollout generation directly.
+  rollout generation directly. `GenerateAgentLoop` (single-turn) and
+  `MultiTurnAgentLoop` (tool-using, e.g. ReTool) are the common ones.
 - **Session/TITO loops** give third-party agents a session-scoped OpenAI API through
   SessionRouter. SMG preserves instance affinity and captures exact token IDs,
-  log-probabilities, and turn boundaries for training.
+  log-probabilities, and turn boundaries for training. `MiniSWEAgentLoopV1` (the
+  SWE loop) is built on this mode.
 
-Both modes write completed trajectories to TransferQueue; the trainer consumes
+Both modes write completed trajectories to TransferQueue, and the trainer consumes
 metadata-only `KVBatchMeta` batches.
 
 ---
@@ -94,8 +105,8 @@ recipe-specific extras such as a tool-config or agent-config YAML).
 | `*.rollout.agent.data.name=<name>` | Picks the registered `AgentData` (e.g. `tool_agent_data`, `mini_swe_agent_data`) |
 | `data.return_raw_chat=True` | Keep raw chat messages so the agent loop can re-format them across turns |
 
-Session/TITO loops additionally require `psrl.rollout_gateway.enable=True` (the
-default). See {doc}`../../design/router_tito` for the request and training-data path.
+Session/TITO loops use the SMG gateway (the only supported request path).
+See {doc}`../../design/router_tito` for the request and training-data path.
 
 The `*` placeholder stands for **both** `gen_actor_rollout_ref` (training-time
 rollouts) **and** `train_actor_rollout_ref` (validation rollouts that run on the

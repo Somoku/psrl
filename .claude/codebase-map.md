@@ -1,9 +1,11 @@
 # PSRL Codebase Map
 
 > **Purpose**: Fast-lookup reference for the entire PSRL project. Read this file first to orient yourself in any module.
-> **Last updated**: 2026-07-22 | **Total**: ~210 source files in `psrl/`, 8 unit tests, config-as-code via veRL re-export
+> **Last updated**: 2026-07-26 | **Total**: 213 Python files in `psrl/`, ~100 test files in `tests/`, config-as-code via veRL re-export
 >
 > **Major shifts since 2026-05**: rollout now runs through the vendored **SMG** gateway (Rust router) with **SessionRouter + TITO** session capture; sample data moves over **TransferQueue** instead of Ray-serialized batches; KV cache offload/reuse via **LMCache**; **RolloutCoordinator** (mixin-composed) replaces the old `rollout_coordinator.py`; a unified **engine train worker** supersedes the separate FSDP/Megatron workers; a standalone **reward-model service** and **gen reward functions** were added; **resource elasticity** (`elastic_rm`) and a **gRPC PSManager** service landed. See §15 for the terminology glossary.
+>
+> **Latest changes (2026-07-25/26, commit `11b6d65`)**: the monolithic `psrl.yaml` was **split into 16 per-topic group files** plus the 6 existing `rollout_coordination/` ones (§4) — note `elastic_rm` moved under `psrl.deployment.elastic_rm`; **fine-grained rollout/train overlap** landed as a `StepStrategy` (`psrl.fine_grain_overlap`); pre-SMG dead code (gen worker, FSDP/Megatron train workers, Python router/route-strategy/request-queue, mini-SWE loop v0) moved to top-level `deprecated/`; the real test suite is `tests/` (pytest `testpaths`), not `unit_tests/`.
 
 ---
 
@@ -74,9 +76,18 @@ psrl/
 │       ├── cost_model/analyze.py # Performance cost model analysis
 │       ├── throughput_model/     # Per-model throughput fit JSONs (Qwen2.5-7B, Qwen3-8B)
 │       ├── hydra_plugins/psrl_searchpath.py  # Hydra search-path plugin (adds veRL + PSRL config dirs)
-│       ├── psrl/psrl.yaml        # PSRL-specific config root (staleness, PS mode, agentic_rl,
-│       │                         #   elastic_rm, lmcache, rollout_coordination defaults)
-│       ├── psrl/rollout_coordination/*.yaml  # routing / sync_and_mig / partial / redundant /
+│       ├── psrl/                 # ★ RESTRUCTURED: psrl.yaml split into per-topic group files
+│       │   ├── psrl.yaml         # Thin root: `defaults:` list + a few scalars (staleness, ps_mode, ...)
+│       │   ├── deployment.yaml   # Node/GPU layout per role + heterogeneous_rollout + elastic_rm.*
+│       │   ├── rollout_gateway.yaml   # SMG gateway process knobs (concurrency, RUST_LOG, post actors)
+│       │   ├── server_rollout.yaml    # HTTP rollout service entrypoint for agent loops
+│       │   ├── status_collection.yaml # Engine→coordinator→router status sync + stats_recorder
+│       │   ├── fine_grain_overlap.yaml# ★ NEW: granularity / multiplier / overlap_scope
+│       │   ├── lmcache.yaml, tms.yaml, nixl.yaml       # KV offload / memory pause-resume / RDMA
+│       │   ├── agentic_rl.yaml, checkpoint.yaml, broadcast_init.yaml
+│       │   ├── group_post_process.yaml, buffer_post_process.yaml
+│       │   ├── log_prob.yaml, memory_logger.yaml, profile.yaml
+│       │   └── rollout_coordination/*.yaml  # routing / sync_and_mig / partial / redundant /
 │       │                                     #   proactive_filter / session strategies
 │       ├── critic/, data/, reward/, rollout/ # component group configs
 │       └── ppo_trainer.yaml / ppo_megatron_trainer.yaml  # top-level templates
@@ -95,7 +106,7 @@ psrl/
 │   │   ├── zmq_queue.py          # ZMQPush/PullQueue: cross-process stats/command transport
 │   │   ├── utils.py              # RolloutInstanceId + shared gen constants
 │   │   └── rollout_coordination/ # ★ NEW: RolloutCoordinator (mixin composition)
-│   │       ├── coordinator.py    # RolloutCoordinator: composes all mixins, public API (~771 lines)
+│   │       ├── coordinator.py    # RolloutCoordinator: composes all mixins, public API (~838 lines)
 │   │       ├── base.py           # CoordinatorBase: HTTP gateway helpers + routing-loop control
 │   │       ├── command_loop.py   # CommandHandlerMixin: consumes command queue
 │   │       ├── status_loop.py    # StatusMixin: polls SMG stats / routing-loop status
@@ -138,7 +149,8 @@ psrl/
 │   │       └── gateway.py        # RM gateway wiring
 │   │
 │   ├── agent_loop/               # --- Multi-Turn / Session Agent Loop ---
-│   │   ├── manager.py            # PSRL_AgentLoopManager: top-level coordinator
+│   │   ├── manager.py            # PSRL_AgentLoopManager (~1708): dispatch, chunk emission for
+│   │   │                         #   fine-grain overlap, distributed HTTP POST actor pool
 │   │   ├── worker.py             # AgentLoopWorker: single worker process
 │   │   ├── gateway_client.py     # Client for SMG rollout gateway
 │   │   ├── sticky_session.py     # Session affinity for multi-turn
@@ -164,17 +176,19 @@ psrl/
 │   ├── function_tool.py          # Function-call tool wrapper
 │   ├── sandbox_fusion_tool.py    # SandboxFusion code execution tool
 │   ├── utils.py                  # Tool utilities
-│   ├── mcp_clients/              # MCP client management (manager, schema, token_bucket)
+│   ├── mcp_clients/manager.py    # MCP client management
 │   └── tool_parser/              # Parse tool calls from LLM output
-│       ├── base.py, manager.py, hermes_tool_parser.py, xml_fc_tool_parser.py
-│       └── gemma4_/gpt_oss_/qwen3_coder_tool_parser.py  # ★ NEW model-specific parsers
+│       ├── base.py               # ToolParser ABC + registry
+│       ├── hermes_tool_parser.py, xml_fc_tool_parser.py
+│       └── gemma4_/gpt_oss_/qwen3_coder_tool_parser.py  # model-specific parsers
 │
 ├── environments/                 # ★ Training environments
 │   ├── base.py, tool_env.py
 │   └── mini_swe_env.py           # MiniSWEEnvironment (SWE-bench task parsing + config merging)
 │
 ├── utils/                        # ★ Shared utilities
-│   ├── config.py                 # PSRL config helpers
+│   ├── config.py                 # validate_config() (cross-group config checks) +
+│   │                             #   resolve_fine_grain_chunk_size()
 │   ├── transferqueue_utils.py    # ★ NEW: TransferQueue field read/write helpers
 │   │
 │   ├── kv_cache/                 # ★ NEW: LMCache integration
@@ -209,9 +223,10 @@ psrl/
 │   ├── logger/                   # Logging subsystem (data/env/memory/ps/ray + deprecated)
 │   ├── dataset/                  # data_processor.py (DataProcessor), rl_dataset.py, utils.py
 │   ├── post_processor/           # base.py + buffer_post_process/ + group_post_process/
-│   ├── profiling/                # collector / analyzer / records
-│   ├── common/                   # chat_template, docker_utils, http_utils, http_io_thread,
-│   │                             #   memory_utils, nixl_names, patch_utils, serialization, ...
+│   ├── profiling/                # collector / event_converter / records
+│   ├── common/                   # chat_template, docker_utils, http_utils (+ distributed POST
+│   │                             #   actor pool), http_io_thread, memory_utils, nixl_names,
+│   │                             #   patch_utils, serialization, worker_naming, dynamic_import
 │   ├── ray/                      # lazy_primitives, lock_context
 │   ├── reward_score/             # sandbox_fusion.py + default async scorer
 │   ├── rollout/                  # loop_timer, overflow, rollout_trace, trajectory_writer, vision_utils
@@ -239,6 +254,9 @@ third_party/
 patch/               # Git patches applied at install time (see apply_patch.sh)
 ├── vllm/  verl/  nixl/  lm_cache/  transfer_queue/  megatron_bridge/  transformer_engine/
 
+hydra_plugins/       # Repo-root Hydra plugin package (auto-discovered by Hydra on sys.path);
+└── psrl_searchpath.py   # mirrors psrl/trainer/config/hydra_plugins/psrl_searchpath.py
+
 scripts/
 ├── install_basic.sh        # Core deps + vLLM + veRL (patches applied)
 ├── install_nixl.sh         # NIXL + UCX
@@ -254,27 +272,30 @@ docs/                # ★ Sphinx/MyST docs — read design/ for authoritative s
              parameter_server.md, staleness_control.md, flexible_rollout.md,
              resource_elasticity.md, index.md
 
-unit_tests/          # trimmed to focused suites
-├── kv_cache/test_lmcache_config.py
-├── workers/agent_loop/test_kv_cache_aware_strategy.py
-└── workers/ps/test_ps_manager_broadcast.py
+tests/               # ★ THE test suite (pyproject `testpaths = ["tests"]`) — ~100 files, see §10
 
-deprecated/          # files moved here during dead-code cleanup (not imported by active code)
+unit_tests/          # Legacy remnant, NOT on testpaths; only kv_cache/ + workers/ps/ survive
+                     # (agent_loop suite moved to deprecated/unit_tests/ with the router code)
+
+deprecated/          # ★ Top-level graveyard: pre-SMG code, not imported by anything active
 ├── workers/gen/gen_worker.py               # PSRL_GenWorker (superseded by PSRL_vLLMReplica)
 ├── workers/train/fsdp_train_worker.py      # PSRL_FSDPTrainWorker (superseded by EngineTrainWorker)
 ├── workers/train/megatron_train_worker.py  # PSRL_MegatronTrainWorker (superseded by EngineTrainWorker)
 ├── workers/agent_loop/router.py            # RolloutRouter (superseded by RolloutGateway/SMG)
-├── workers/agent_loop/route_strategy.py    # Python routing strategies
-├── workers/agent_loop/request_queue.py     # Python request queue
-├── workers/agent_loop/loops/mini_swe_agent_loop.py  # MiniSWEAgentLoop (superseded by V1)
-└── unit_tests/workers/agent_loop/test_kv_cache_aware_strategy.py  # moved with router code
+├── workers/agent_loop/route_strategy.py    # Python routing strategies (now in the SMG Rust router)
+├── workers/agent_loop/request_queue.py     # Python request queue (now in SMG)
+├── workers/agent_loop/loops/mini_swe_agent_loop.py     # MiniSWEAgentLoop v0 (superseded by V1)
+└── unit_tests/workers/agent_loop/{conftest.py,test_kv_cache_aware_strategy.py}
 
 examples/
-├── mini_swe/        # ★ SWE-bench RL recipe (fsdp_/megatron_ launch scripts, config.py,
-│                    #   reward.py, swebench_grader.py, runner.py, eval/, prepare/)
+├── mini_swe/        # ★ SWE-bench RL recipe: fsdp_/megatron_ launch scripts (7B–32B, swe_gym +
+│                    #   swe_smith), config.py, reward.py, swebench_grader.py, runner.py,
+│                    #   config/, data/, eval/, prepare/, plus checked-in run logs
 ├── dapo_trainer/    # DAPO recipes (fsdp + megatron, 3B–70B)
-├── tx/              # Qwen3 / Qwen3.5 launch scripts
-├── bench/rollout/, ray/, retool/, visualization/, anaylsis/
+├── tx/              # Qwen3 / Qwen3.5 launch scripts (8B/32B, 4B/35B-A3B)
+├── anaylsis/        # [sic] Rollout analysis plots: plot_request_route_timeline.py,
+│                    #   plot_trajectory_record.py, build_cost_model.py, regression.py, scripts/
+├── bench/rollout/, ray/, retool/, visualization/
 └── deprecated/      # Old grpo/ppo/precision recipes (kept for reference)
 ```
 
@@ -282,22 +303,37 @@ examples/
 
 ## 4. Configuration System
 
-**Hydra-based**, compositional YAML. Since the veRL merge, **config dataclasses are re-exported from veRL** (`psrl/trainer/config/__init__.py` does `from verl.trainer.config import *`). PSRL-specific config lives under `psrl/trainer/config/psrl/`. A Hydra search-path plugin (`hydra_plugins/psrl_searchpath.py`) stitches the veRL and PSRL config dirs together.
+**Hydra-based**, compositional YAML. Since the veRL merge, **config dataclasses are re-exported from veRL** (`psrl/trainer/config/__init__.py` does `from verl.trainer.config import *`). PSRL-specific config lives under `psrl/trainer/config/psrl/`. A Hydra search-path plugin stitches the veRL and PSRL config dirs together; it exists twice — `psrl/trainer/config/hydra_plugins/psrl_searchpath.py` and a repo-root `hydra_plugins/psrl_searchpath.py` (Hydra auto-discovers the top-level `hydra_plugins` package on `sys.path`). Keep both in sync.
 
 ### PSRL-specific config root: `psrl/trainer/config/psrl/psrl.yaml`
 
-Composes these groups (under `psrl.rollout_coordination.*`):
+**★ Restructured (commit `11b6d65`)**: `psrl.yaml` used to be a ~530-line monolith. It is now a thin root holding only a `defaults:` list plus a handful of scalars; every topic lives in its own sibling YAML, merged at `psrl.<group>`. When looking for a knob, open the group file rather than grepping `psrl.yaml`.
 
-| Group file | Controls |
+Scalars still in `psrl.yaml`: `ps_manager_ip`, `reward_service_ip`, `staleness`, `staleness_buffer_entries`, `rollout_n`, `ps_mode` (`cpu_ref`/`nixl_cpu`), `logging_path`, `retry_bound`, `retry_ratio`, `colocate_validate_and_train`, `fuse_rollout_with_validate`.
+
+| Group file → key | Controls |
 |-----------|----------|
-| `rollout_coordination/routing_strategy.yaml` | SMG worker-selection method (`cache_aware`, `cache_aware_policy.*`, load-balance) |
-| `rollout_coordination/sync_and_mig_strategy.yaml` | weight-sync mode (greedy vs status-based) + request migration rules |
+| `deployment.yaml` → `psrl.deployment` | Node/GPU counts per role (`train_nnodes`, `n_rollout_instances`, `rollout_ngpus_per_node_per_instance`, `total_nnodes`), `heterogeneous_rollout.*`, and **`elastic_rm.*`** (★ moved here from `psrl.elastic_rm`) |
+| `rollout_gateway.yaml` → `psrl.rollout_gateway` | SMG gateway process: `server_max_concurrency`, `rust_log_filter`, health-check waits, `use_distributed_post` + `post_actor_num_per_node` (Ray HTTP POST actor pool) |
+| `server_rollout.yaml` → `psrl.server_rollout` | HTTP rollout service entrypoint used by agent loops (`gateway.router_ip/port`, `server_concurrency`) |
+| `status_collection.yaml` → `psrl.status_collection` | Engine→coordinator→router status sync intervals, file-dump level, `stats_recorder.*` |
+| `fine_grain_overlap.yaml` → `psrl.fine_grain_overlap` | ★ NEW: `granularity` (`none`/`mini_batch`/`micro_batch`), `multiplier`, `overlap_scope` (`recompute`/`pre_step`) |
+| `lmcache.yaml` → `psrl.lmcache` | LMCache KV offload (`enable`, `backend`, offload budget, prefix reuse) |
+| `tms.yaml` → `psrl.tms` | torch_memory_saver `range` (`null`/`train`/`all`), `enable_cuda_graph`, `enable_nixl` |
+| `nixl.yaml` → `psrl.nixl` | NIXL server IP/port, pinned temp-memory slots (used by `ps_mode: nixl_cpu`) |
+| `agentic_rl.yaml` → `psrl.agentic_rl` | `manager_retry_on_error`, per-trajectory text dump via `TrajectoryWriter` |
+| `checkpoint.yaml` → `psrl.checkpoint` | `use_dcp_save` (DCP vs PSRL's UCX-safe per-rank `torch.save`) |
+| `broadcast_init.yaml` → `psrl.broadcast_init` | Rank-0 PS worker reads ckpt and broadcasts via NIXL (`binary_tree`) |
+| `group_post_process.yaml` / `buffer_post_process.yaml` | Registered post-processors (`dynamic_sampling_filter`, `no_filter`) for group/buffer stages |
+| `log_prob.yaml`, `memory_logger.yaml`, `profile.yaml` | Rollout-engine logprobs; periodic memory logging; analysis toggles (`disable_attn`, `fix_weight`) |
+| `rollout_coordination/routing_strategy.yaml` | SMG worker-selection `method` (`request_num_balance` default; also `random`, `round_robin`, `throughput_optimal[_with_budget]`, `cache_aware`, `cache_aware_v1`) |
+| `rollout_coordination/sync_and_mig_strategy.yaml` | weight-sync mode (`greedy` vs `status_based`) + request migration rules |
 | `rollout_coordination/partial_rollout.yaml` | partial-rollout loopback on weight-sync abort |
 | `rollout_coordination/redundant_rollout.yaml` | redundant/over-sampling rollout |
-| `rollout_coordination/proactive_filter_strategy.yaml` | proactive filtering of samples |
+| `rollout_coordination/proactive_filter_strategy.yaml` | proactive filtering of samples (`retry`/`truncate`) |
 | `rollout_coordination/session_strategy.yaml` | session hang/continue (ThunderAgent) params |
 
-Top-level `psrl.*` keys: `staleness`, `staleness_buffer_entries`, `rollout_n`, `ps_mode` (`cpu_ref`/`nixl_cpu`), `colocate`, `agentic_rl.*` (manager retry, trajectory dump), `elastic_rm.*` (resource elasticity), `lmcache.*` (KV cache). Also a top-level `transfer_queue.*` group (enabled in `main_ppo.py`).
+There is also a top-level `transfer_queue.*` group, force-enabled in `main_ppo.py`. Cross-group consistency is checked by `psrl/utils/config.py::validate_config()`.
 
 ### Launch Command
 
@@ -341,7 +377,7 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 | `GenRewardManager` | `workers/reward/reward_loop/gen.py` | Routes reward requests to SMG reward-model gateway |
 | `KVCacheManager` | `utils/kv_cache/manager.py` | LMCache offload / prefix retrieval / cross-instance transfer |
 | `ElasticExecutor` | `utils/elastic_rm/elastic_executor.py` | Pause/resume workloads for GPU re-sharing |
-| `PSRL_AgentLoopManager` | `workers/agent_loop/manager.py` | Multi-turn / session tool-use orchestration |
+| `PSRL_AgentLoopManager` | `workers/agent_loop/manager.py` | Multi-turn / session tool-use orchestration; also yields training chunks (`wait_for_training_chunk`) for fine-grain overlap and owns the distributed POST actor pool |
 
 ### mini-SWE Agent Layer
 
@@ -399,6 +435,12 @@ for step in range(total_steps):
   ⑤ critic update; ⑥ actor (PPO) update  [both via EngineTrainWorker]
   ⑦ Periodic: validate, checkpoint, log
 ```
+
+Steps ①–⑥ are executed by the `StepStrategy` selected via `build_step_strategy()`:
+`FullBatchStepStrategy` waits for the whole batch (default), while `FineGrainOverlapStrategy`
+consumes mini/micro-batch chunks from `PSRL_AgentLoopManager.wait_for_training_chunk()` so the
+per-sample stages (`old_log_prob`, `ref_log_prob`, `values`, `reward` — see `STAGE_META`) start
+before rollout finishes. `overlap_scope: pre_step` additionally runs advantage+update per chunk.
 
 ### 6.3 Asynchronous Rollout + Staleness
 
@@ -513,16 +555,30 @@ Supports newer arches (DeepSeek-V2, Qwen3.5). Per-format loading in `converter/m
 
 ## 10. Testing Map
 
-`unit_tests/` is now focused (heavy suites retired):
+**`tests/` is the real suite** — `pyproject.toml` sets `testpaths = ["tests"]`. (`unit_tests/` is a legacy leftover holding only `kv_cache/test_lmcache_config.py` and `workers/ps/test_ps_manager_broadcast.py`; it is not collected by default.)
 
 ```
-unit_tests/
-├── kv_cache/            → LMCache config validation
-├── workers/agent_loop/  → KV-cache-aware routing strategy + conftest
-└── workers/ps/          → PSManager broadcast logic
+tests/
+├── trainer/          → step strategies, fine-grain overlap config, chunk manager,
+│                       main_ppo imports, PSRL_Role
+├── config/           → reward config + YAML merge semantics
+├── converter/        → converter compat, model registry, vLLM weight-layout plugin, packing specs
+├── state_dict/       → FSDP1/FSDP2/vLLM converter round-trips (+ scripts/ launchers)
+├── nixl/             → comm planner, sharding, send/recv, e2e (+ config/nixl_e2e.yaml, scripts/)
+├── parameter_server/ → PSManager, request status tracker
+├── staleness/        → staleness controller
+├── workers/reward/   → RM manager / coordinator (incl. elastic) / gateway / gen reward manager
+├── workers/train/    → EngineTrainWorker init, load-weight flag
+├── gen_dplb/         → SMG adapter cache-aware routing, stats recorder
+├── tito/, e2e/tito/  → SessionRouter + TITO training-data build (+ test_tito_e2e.sh)
+├── elastic_rm/       → elastic executor + scaling policy instance IDs
+├── ray_utils/        → lazy primitives, lock context, GPU sharing, version waiter, ...
+├── fsdp/, megatron/, torch_dist/, checkpoint/  → GPU/dist smoke tests (mostly .sh-driven)
+├── dataset/, environments/, tools/, unit/      → DataProcessor, env registry, LMCache snapshot
+└── test_thunder_agent_scheduler.py             → session hang/continue scheduler
 ```
 
-Run with pytest under the psrl conda env.
+CPU-only tests are marked `pytest.mark.cpu_test`. Run with pytest under the psrl conda env.
 
 ---
 
@@ -544,13 +600,16 @@ Run with pytest under the psrl conda env.
 
 | File | Lines | Why it matters |
 |------|-------|---------------|
-| `trainer/ppo/ray_trainer.py` | ~3476 | THE main training loop — start here for any training question |
-| `trainer/ppo/strategies/` | — | Step orchestration: `base.py` (StepStrategy ABC), `full_batch.py` for the default path, `fine_grain_overlap.py` for chunk-overlap |
+| `trainer/ppo/ray_trainer.py` | ~3337 | THE main training loop — start here for any training question |
+| `workers/agent_loop/manager.py` | ~1708 | Request dispatch, chunk emission for fine-grain overlap (`_emit_pending_chunks`, `wait_for_training_chunk`), distributed POST actor pool |
 | `workers/ps/ps_manager.py` | ~1373 | Central coordination point for all workers (also gRPC-served) |
 | `workers/ps/staleness_controller.py` | ~1365 | THE staleness system — core async innovation |
 | `workers/reward/reward_manager.py` | ~1138 | Reward pipeline over TransferQueue |
-| `workers/gen/rollout_coordination/coordinator.py` | ~771 | SMG-driving coordinator (mixin composition) |
-| `workers/gen/session_router.py` | ~496 | Session/TITO hang-continue routing |
+| `workers/gen/rollout_coordination/coordinator.py` | ~838 | SMG-driving coordinator (mixin composition) |
+| `workers/train/engine_train_worker.py` | ~592 | Unified FSDP/Megatron update worker |
+| `workers/gen/session_router.py` | ~571 | Session/TITO hang-continue routing |
+| `trainer/ppo/strategies/` | ~510 | Step orchestration: `base.py` (StepStrategy ABC + `STAGE_META`), `full_batch.py` (default), `fine_grain_overlap.py` (chunk-pipelined) |
+| `utils/config.py` | ~394 | `validate_config()` cross-group checks + fine-grain chunk sizing |
 
 ---
 
@@ -581,15 +640,18 @@ main_ppo.py (TaskRunner, TransferQueue init)
 |--------------|-------|
 | Understand the training loop | `trainer/ppo/ray_trainer.py::fit()` |
 | Understand / extend the step pipeline | `trainer/ppo/strategies/` — `base.py` for the ABC, `full_batch.py` for the default path, `fine_grain_overlap.py` for chunk-overlap |
-| Change PPO hyperparameters | veRL configs (re-exported) + `psrl/trainer/config/psrl/psrl.yaml` |
+| Change PPO hyperparameters | veRL configs (re-exported) + `psrl/trainer/config/psrl/*.yaml` (per-topic group files, see §4) |
+| Find a PSRL config knob | Open the matching group file under `psrl/trainer/config/psrl/` — `psrl.yaml` is now only a `defaults:` list |
+| Enable rollout/train overlap | `psrl/trainer/config/psrl/fine_grain_overlap.yaml` + `trainer/ppo/strategies/fine_grain_overlap.py` |
+| Change node/GPU layout | `psrl/trainer/config/psrl/deployment.yaml` (`psrl.deployment.*`) |
 | Understand rollout routing / SMG | `docs/design/router_tito.md`, `workers/gen/smg_adapter.py`, `rollout_gateway.py` |
 | Change weight-sync / request migration | `workers/gen/rollout_coordination/sync_and_migrate/` + `sync_and_mig_strategy.yaml` |
 | Change session hang/continue | `rollout_coordination/session/thunder_agent.py` + `session_strategy.yaml`, `session_router.py` |
 | Debug model version issues | `workers/ps/staleness_controller.py`, `workers/ps/ps_manager.py` |
 | Debug model transfer failures | `utils/nixl/client.py`, `workers/train/base_train_worker.py` |
 | Work with sample data plane | `utils/transferqueue_utils.py`, `docs/design/transfer_queue.md` |
-| Tune KV cache / LMCache | `utils/kv_cache/`, `psrl.lmcache.*`, `docs/design/kv_cache.md` |
-| Configure resource elasticity | `utils/elastic_rm/`, `psrl.elastic_rm.*`, `docs/design/resource_elasticity.md` |
+| Tune KV cache / LMCache | `utils/kv_cache/`, `psrl.lmcache.*` (`lmcache.yaml`), `docs/design/kv_cache.md` |
+| Configure resource elasticity | `utils/elastic_rm/`, **`psrl.deployment.elastic_rm.*`** (`deployment.yaml`), `docs/design/resource_elasticity.md` |
 | Add/modify training backend | `workers/train/engine_train_worker.py` (unified FSDP/Megatron) |
 | Add a rule/score reward | `workers/reward/reward_loop/` + `registry.py` |
 | Add a generative reward model | `workers/reward/gen_reward_function/` (`@gen_reward_func`) + `reward_model/` service |
@@ -603,6 +665,9 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | Debug SWE agent rollouts | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` |
 | Change SWE grading | `examples/mini_swe/swebench_grader.py` |
 | Run benchmarks | `psrl/bench/`, `examples/bench/` |
+| Run / add tests | `tests/` (pytest `testpaths`); `unit_tests/` is a legacy remnant |
+| Find pre-SMG legacy code | top-level `deprecated/` (gen worker, FSDP/Megatron train workers, Python router, mini-SWE loop v0) |
+| Plot rollout routing / trajectories | `examples/anaylsis/plot_request_route_timeline.py`, `plot_trajectory_record.py` |
 | Install from scratch | `scripts/install_basic.sh` → `install_nixl.sh` → `install_lmcache.sh` → `install_megatron.sh` → `reinstall_smg.sh` |
 | Read authoritative subsystem specs | `docs/design/` |
 
@@ -624,4 +689,6 @@ main_ppo.py (TaskRunner, TransferQueue init)
 | **elastic_rm** | Resource elasticity subsystem re-sharing GPUs across train/gen/eval/reward |
 | **partial rollout** | On weight-sync abort, SMG preserves the generated prefix and continues the request after re-selection instead of restarting |
 | **RolloutInstanceId** | `(base_worker_id, dp_rank)` — identifies one data-parallel vLLM instance for routing/affinity |
+| **fine-grain overlap** | Starting training stages on mini/micro-batch chunks before the full rollout batch is collected; implemented as `FineGrainOverlapStrategy` and configured by `psrl.fine_grain_overlap` |
+| **StepStrategy** | Pluggable per-step orchestration seam in `trainer/ppo/strategies/`; `STAGE_META` tags each phase `per_sample` / `batch_coupled` / `optimizer_step` |
 ```

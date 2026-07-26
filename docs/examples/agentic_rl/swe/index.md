@@ -4,9 +4,9 @@ This recipe trains a policy to solve software-engineering tasks with
 [mini-SWE-agent](https://github.com/SWE-agent/mini-SWE-agent), Docker sandboxes,
 fresh-container grading, and PSRL's asynchronous GRPO/DAPO training path.
 
-The current integration treats mini-SWE-agent as a **black-box agent**. It uses its
-normal Python bindings and OpenAI-compatible model client; PSRL does not replace the
-model with the legacy `_PSRLModel` queue bridge.
+This recipe treats mini-SWE-agent as a **black-box agent**: it uses its normal Python
+bindings and OpenAI-compatible model client, which talks to PSRL through a
+session-scoped OpenAI endpoint served by SessionRouter.
 
 ---
 
@@ -15,29 +15,29 @@ model with the legacy `_PSRLModel` queue bridge.
 ```{mermaid}
 sequenceDiagram
     participant ALW as AgentLoopWorker
-    participant LOOP as MiniSWEAgentLoopV1
+    participant MSL as MiniSWEAgentLoopV1
     participant SR as SessionRouter
-    participant SMG as SMG + TITO
+    participant SMG as SMG TITO
     participant V as vLLM
-    participant A as mini-SWE-agent
+    participant A as miniSWEagent
     participant D as Docker sandbox
     participant G as Fresh grader container
     participant TQ as TransferQueue
 
-    ALW->>LOOP: run(request)
-    LOOP->>SR: create TITO session + routing headers
-    LOOP->>A: run_agent(session-scoped API URL)
+    ALW->>MSL: run(request)
+    MSL->>SR: create TITO session and routing headers
+    MSL->>A: run_agent(session-scoped API URL)
     A->>D: inspect, edit, and test repository
     A->>SR: OpenAI chat completion
     SR->>SMG: session request
     SMG->>V: route generation
     V-->>A: assistant turn
     Note over A,D: repeat until submit / max turns / timeout
-    LOOP->>G: apply patch and execute F2P/P2P tests
-    LOOP->>SR: fetch TITO session
-    SR-->>LOOP: tokens, masks, logprobs, turn records
-    LOOP->>TQ: finalized trajectory + patch + grader result
-    LOOP->>SR: delete session
+    MSL->>G: apply patch and execute F2P/P2P tests
+    MSL->>SR: fetch TITO session
+    SR-->>MSL: tokens, masks, logprobs, turn records
+    MSL->>TQ: finalized trajectory, patch, grader result
+    MSL->>SR: delete session
 ```
 
 Per episode:
@@ -56,7 +56,7 @@ Per episode:
    `response_mask`, rollout log-probabilities, and optional routed-expert tensors,
    then writes the finalized trajectory to TransferQueue.
 
-The environment's command outputs are included in `response_ids` with mask `0`;
+The environment's command outputs are included in `response_ids` with mask `0`, while
 assistant-generated tokens use mask `1`. This preserves the full multi-turn context
 while training only on policy tokens.
 
@@ -90,9 +90,6 @@ dataset schema or environment handling is updated.
 | SMG TITO | Captures canonical model-side tokens, log-probabilities, masks, and turn boundaries |
 | `MiniSWEAgentData` | Adds patch, grader result, turn count, and resolve-rate metadata |
 | `examples/mini_swe/reward.py` | Converts grader output into binary or shaped training rewards |
-
-The older `mini_swe_agent_loop.py` queue-bridge implementation remains in the tree
-for compatibility, but current agent YAML files target `MiniSWEAgentLoopV1`.
 
 ---
 

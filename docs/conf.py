@@ -54,7 +54,9 @@ source_suffix = {
 
 master_doc = "index"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# README.md is the maintainer build guide, not a site page, so keep it out of the
+# toctree to avoid an "isn't included in any toctree" warning.
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md", "superpowers"]
 
 # -- Options for HTML output ----------------------------------------------
 
@@ -65,6 +67,7 @@ html_theme_options = {
         "text": "PSRL",
     },
     "github_url": "https://github.com/lhy101/psrl",
+    # Docs live in the code repo, so "Edit this page" resolves to a real source file.
     "use_edit_page_button": True,
     "show_toc_level": 2,
     "navigation_depth": 3,
@@ -83,9 +86,16 @@ html_context = {
     "doc_path": "docs/",
 }
 
+templates_path = ["_templates"]
+
 html_static_path = ["_static"]
 html_css_files = ["css/custom.css"]
 html_js_files = ["js/relabel.js"]
+
+html_sidebars = {
+    "index": ["sidebar-collapse", "sidebar-nav-bs"],
+    "**": ["sidebar-brand", "sidebar-collapse", "sidebar-nav-bs"],
+}
 
 # -- Copybutton configuration --------------------------------------------
 

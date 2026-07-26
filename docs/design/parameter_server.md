@@ -231,7 +231,7 @@ so model consumers can prefer a local CPU storage worker when one is available.
 - **Staleness Control**: version tags and Reserve/Occupy/Consume buffers are owned
   by the same `PSManager` actor, so weight push and buffer state always advance
   atomically. See [Staleness Control](staleness_control).
-- **Flexible Rollout**: the sync strategy (`psrl.sync_and_mig_strategy.sync`) is
+- **Flexible Rollout**: the sync strategy (`psrl.rollout_coordination.sync_and_mig_strategy.sync`) is
   what decides *when* a rollout instance triggers a pull, the PS only services the
   pull when asked. See [Flexible Rollout](flexible_rollout).
 - **Resource Elasticity (TMS)**: when `psrl.tms.enable_nixl=True`, NIXL's pinned

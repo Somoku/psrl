@@ -1,9 +1,8 @@
 # Router, SessionRouter, and TITO
 
-PSRL uses [SMG](https://github.com/Somoku/smg) as its default rollout gateway. PSRL
-does not use an unmodified general-purpose SMG deployment: it configures and extends
-SMG with PSRL-aware worker selection, routing-loop state, partial-rollout loopback,
-weight-version updates, KV transfer, and TITO training-data capture.
+PSRL uses [SMG](https://github.com/psrl-project/smg) as its rollout gateway, configured and
+extended with PSRL-aware worker selection, routing-loop state, partial-rollout
+loopback, weight-version updates, KV transfer, and TITO training-data capture.
 
 ## Request Path
 
@@ -23,7 +22,7 @@ flowchart LR
 - **SessionRouter** on an automatically selected port starting at `8200`.
 
 Rollout replicas register with SMG as gRPC workers. A single registered worker may
-represent several data-parallel ranks; routing and session affinity identify an
+represent several data-parallel ranks, and routing and session affinity identify an
 instance by `(base_worker_id, dp_rank)`.
 
 ## PSRL Changes to SMG
@@ -48,9 +47,10 @@ statistics, weight-version updates, routing-loop status, and pause/resume operat
 This allows weight synchronization to stop new dispatches before interrupting an
 instance, then safely resume routing after the new version is installed.
 
-For event-driven hierarchical cache routing, configure
-`psrl.routing_strategy.method=cache_aware`. The current SMG binding uses
-`cache_aware`, not the older `kv_cache_aware` spelling.
+For prefix-cache-aware routing, configure
+`psrl.rollout_coordination.routing_strategy.method=cache_aware` (SMG's native,
+single-tier policy) or `cache_aware_v1` (PSRL's multi-tier variant that also scores
+off-GPU LMCache prefix hits).
 
 ## Partial Rollout in SMG
 
@@ -72,8 +72,21 @@ workers itself. Its responsibilities are:
 - Preserve immutable PSRL routing headers such as request ID, prompt ID, version,
   validation flag, and trajectory ID.
 - Inject `x-smg-tito-session-id` on every session request.
-- Capture the first successful `x-base-worker-id` and `x-target-dp-rank`, then pin
-  later turns to that rollout instance.
+- Record the **version tag** SMG pins on the first routed turn (`x-version-tag`) and
+  carry it into every subsequent turn, so re-routes only pick instances whose weight
+  version is at least as fresh as the one that first served the trajectory. This is
+  how per-trajectory staleness control is enforced across multi-turn sessions.
+- **Sticky affinity (opt-in)**: when trajectory-sticky routing is enabled
+  (`psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky=True`, sent as
+  the `x-is-sticky` header), capture the first successful `x-base-worker-id` and
+  `x-target-dp-rank` and pin later turns to that rollout instance for KV-cache prefix
+  reuse. When sticky is off, later turns are free to re-route.
+- **Hang / continue**: track per-session status (`generate` while inferring on
+  vLLM/SMG, `env` while calling the environment) and a hang state (`running` / `hung`).
+  When the RolloutCoordinator's session strategy requests a hang, the session blocks at
+  its next turn boundary (a mid-turn request is deferred and converted to hung once the
+  in-flight turn returns, so no work is aborted). A continue releases it. See
+  {doc}`flexible_rollout` (Session Strategy).
 - Track in-flight requests so session deletion waits for active turns to drain.
 
 The session-scoped endpoint is OpenAI compatible:
@@ -119,10 +132,10 @@ PSRL supports two agent-loop integration styles:
 | Style | Request path | Best suited for |
 |---|---|---|
 | Native PSRL loop | AgentLoop directly calls rollout generation and constructs trajectory fields | Generic `Environment` + `AgentData` tasks and existing multi-turn loops |
-| Session/TITO loop | Agent uses a session-scoped OpenAI API; TITO reconstructs training arrays | Third-party or black-box agents such as mini-SWE-agent |
+| Session/TITO loop | Agent uses a session-scoped OpenAI API, and TITO reconstructs training arrays | Third-party or black-box agents such as mini-SWE-agent |
 
-Session/TITO loops require the SMG rollout gateway. Native loops can use SMG or the
-legacy Ray router, although SMG is the default.
+Session/TITO loops require the SMG rollout gateway. Native loops run on the same SMG
+gateway.
 
 ## Configuration
 
@@ -134,18 +147,20 @@ psrl:
     use_distributed_post: false
     post_actor_num_per_node: 8
 
-  agentic_rl:
-    sticky_session: false
-
-  routing_strategy:
-    method: round_robin
-    candidate_sort_indicator: version
-    enable_group_sampling_on_multi_instances: true
+  rollout_coordination:
+    routing_strategy:
+      method: round_robin
+      candidate_sort_indicator: version
+      enable_group_sticky: true         # pin same-prompt_id requests to one instance
+      enable_trajectory_sticky: true    # pin later turns of a trajectory (session sticky)
+    session_strategy:
+      thunder_agent:
+        enable: false                   # capacity-based hang/continue (opt-in)
 ```
 
 SMG enables TITO for the rollout gateway automatically. `tito_debug` and
 `tito_gc_threshold` are accepted by the adapter when added as rollout-gateway
-overrides; debug validation adds CPU overhead and is intended for development.
+overrides. Debug validation adds CPU overhead and is intended for development.
 
 ```{seealso}
 - {doc}`architecture`: complete PSRL data and control flow

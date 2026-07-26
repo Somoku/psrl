@@ -10,11 +10,18 @@ PSRL employs several complementary techniques to maximize generation throughput 
 Different complementary rollout coordination techniques in PSRL.
 ```
 
+All of these strategies live under a single config group, `psrl.rollout_coordination.*`,
+composed from six Hydra sub-groups: `partial_rollout`, `redundant_rollout`,
+`routing_strategy`, `sync_and_mig_strategy`, `proactive_filter_strategy`, and
+`session_strategy`. Each is described below (proactive filter is covered in
+{doc}`staleness_control`, while session strategy is summarized here and detailed in
+{doc}`router_tito`).
+
 ---
 
 ## Partial Rollout
 
-**Config**: `psrl.partial_rollout.*`
+**Config**: `psrl.rollout_coordination.partial_rollout.*`
 
 ### Concept
 
@@ -34,9 +41,10 @@ it reaches a terminal result.
 
 ```yaml
 psrl:
-  partial_rollout:
-    enable: true
-    interrupt_as_prompt: false
+  rollout_coordination:
+    partial_rollout:
+      enable: true
+      interrupt_as_prompt: false
 ```
 
 ### When to Use
@@ -54,7 +62,7 @@ psrl:
 
 ## Redundant Rollout
 
-**Config**: `psrl.redundant_rollout.*`
+**Config**: `psrl.rollout_coordination.redundant_rollout.*`
 
 ### Concept
 
@@ -78,14 +86,15 @@ Both levels cut tail latency by paying extra compute on aborted work.
 
 ```yaml
 psrl:
-  redundant_rollout:
-    enable: true
-    # Batch-level: launch 80 prompts, keep the first 64 that fully complete.
-    alg_global_batch_size: 64
-    redundant_global_batch_size: 80
-    # Group-level: launch 10 responses per prompt, keep the first 8 per prompt.
-    alg_rollout_n: 8
-    redundant_rollout_n: 10
+  rollout_coordination:
+    redundant_rollout:
+      enable: true
+      # Batch-level: launch 80 prompts, keep the first 64 that fully complete.
+      alg_global_batch_size: 64
+      redundant_global_batch_size: 80
+      # Group-level: launch 10 responses per prompt, keep the first 8 per prompt.
+      alg_rollout_n: 8
+      redundant_rollout_n: 10
 ```
 
 The **redundancy ratio** at each level is `redundant / alg`. The two ratios are independent, total over-provisioning is their product (e.g. `1.25 × 1.25 ≈ 1.56×` extra trajectories launched in the example above).
@@ -103,7 +112,7 @@ The second condition is the important one. For example, early in training the lo
 
 ## Routing Strategy
 
-**Config**: `psrl.routing_strategy.*`
+**Config**: `psrl.rollout_coordination.routing_strategy.*`
 
 SMG is the default Router. Its routing policy ranks load/cache candidates only after
 the PSRL worker selector has enforced model-version eligibility, partial/sticky
@@ -118,12 +127,14 @@ instance hints, prompt-group affinity, and PSManager reservation constraints.
 | `request_num_balance` | Route to the instance with the fewest currently queued requests. |
 | `throughput_optimal` | Cost-model-based routing that estimates per-instance throughput using the Waterfall model. |
 | `throughput_optimal_with_budget` | Same as `throughput_optimal` plus token budget estimation for generation length prediction. |
-| `cache_aware` | Maximize prefix cache hits using SMG's multi-tier KV event/index data. |
+| `cache_aware` | SMG's **native** prefix-cache-aware routing. Scores GPU-resident prefix overlap and applies shortest-queue load balancing (single-tier). |
+| `cache_aware_v1` | PSRL's **optimized, multi-tier** variant. On top of the native behaviour it also scores off-GPU (LMCache CPU-tier) prefix hits via `cache_aware_policy.lmcache_overlap_weight`. Prefer this when LMCache offload is enabled. |
 
 ```yaml
 psrl:
-  routing_strategy:
-    method: throughput_optimal
+  rollout_coordination:
+    routing_strategy:
+      method: throughput_optimal
 ```
 
 ### Cost Model (for `throughput_optimal`)
@@ -159,18 +170,19 @@ When `enable_multi_priority_queue=True`, requests are queued by their trajectory
 
 ```yaml
 psrl:
-  routing_strategy:
-    method: throughput_optimal
-    enable_multi_priority_queue: true
+  rollout_coordination:
+    routing_strategy:
+      method: throughput_optimal
+      enable_multi_priority_queue: true
 ```
 
 ### KV Transfer
 
-**Config**: `psrl.routing_strategy.kv_transfer.*`
+**Config**: `psrl.rollout_coordination.routing_strategy.kv_transfer.*`
 
 When SMG re-routes a request to a different instance, it can ask the LMCache transfer
 path to move accumulated KV instead of recomputing it. The source worker performs the
-data movement; the shared LMCache Controller provides registration and fallback
+data movement, while the shared LMCache Controller provides registration and fallback
 control rather than carrying KV payloads itself.
 
 | Field | Type | Description |
@@ -185,10 +197,11 @@ control rather than carrying KV payloads itself.
 
 ```yaml
 psrl:
-  routing_strategy:
-    kv_transfer:
-      enable: true
-      transfer_mode: sync
+  rollout_coordination:
+    routing_strategy:
+      kv_transfer:
+        enable: true
+        transfer_mode: sync
 ```
 
 :::{seealso}
@@ -199,7 +212,7 @@ psrl:
 
 ## Sync & Migration Strategy
 
-**Config**: `psrl.sync_and_mig_strategy.*`
+**Config**: `psrl.rollout_coordination.sync_and_mig_strategy.*`
 
 ### Sync Strategy
 
@@ -219,10 +232,13 @@ Determines **when** a rollout instance pulls new weights from the Parameter Serv
 
 ```yaml
 psrl:
-  sync_and_mig_strategy:
-    indicator: request_num
-    threshold: 2
-    check_req_before_sync: true
+  rollout_coordination:
+    sync_and_mig_strategy:
+      method: status_based
+      sync:
+        indicator: request_num
+        threshold: 2
+        check_req_before_sync: true
 ```
 
 ### Migration Strategy
@@ -239,15 +255,56 @@ Balances load across instances by **interrupting requests** on overloaded instan
 
 ```yaml
 psrl:
-  sync_and_mig_strategy:
-    mig:
-      enable: true
-      indicator: request_num
-      threshold: 2.0       # Trigger when one instance has 2x the load of another
-      stop_indicator: request_num
-      stop_threshold: 1.2  # Stop when imbalance drops below 1.2x
+  rollout_coordination:
+    sync_and_mig_strategy:
+      mig:
+        enable: true
+        indicator: request_num
+        threshold: 2.0       # Trigger when one instance has 2x the load of another
+        stop_indicator: request_num
+        stop_threshold: 1.2  # Stop when imbalance drops below 1.2x
 ```
 
 :::{tip}
 The sync and migration strategies work **together**, evaluated in order each tick: sync is considered first, and migration is only considered if no sync was triggered.
+:::
+
+---
+
+## Session Strategy (Hang / Continue)
+
+**Config**: `psrl.rollout_coordination.session_strategy.*`
+
+The techniques above target single-shot generation. For **multi-turn TITO sessions**,
+a trajectory alternates between generating on a pinned vLLM instance and calling its
+environment, and it holds KV cache on that instance across the whole episode. When
+many sticky sessions pile onto one instance, they can exceed its KV-cache capacity.
+
+The **session strategy**, ported from **ThunderAgent**, adds capacity-based
+**hang / continue** scheduling on top of routing:
+
+- **Hang**: when a pinned instance is over KV capacity, the RolloutCoordinator hangs a
+  whole session, blocking its *next* turn at the SessionRouter without aborting any
+  in-flight turn. Env-status sessions (already off-GPU, cheapest to shed) are hung
+  first, then generate-status sessions, smallest footprint first.
+- **Continue**: hung sessions are readmitted (best-fit-decreasing) as soon as their
+  pinned instance frees enough capacity.
+
+This is currently the only integrated session strategy and is under active
+development. It is disabled by default (`thunder_agent.enable: False`).
+
+```yaml
+psrl:
+  rollout_coordination:
+    session_strategy:
+      thunder_agent:
+        enable: true
+        check_interval_in_ms: 1000
+        env_token_weight: 1.0
+        buffer_per_session: 100
+```
+
+:::{seealso}
+{doc}`router_tito` for how hang/continue interacts with SessionRouter, sticky routing,
+and TITO session capture.
 :::

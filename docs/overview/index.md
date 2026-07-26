@@ -3,12 +3,20 @@
 ## What is PSRL?
 
 **PSRL** is a reinforcement learning (RL) framework for efficient large language
-model post-training. It decouples rollout, reward, and training while coordinating
-them through a Parameter Server, an SMG-based rollout gateway, and TransferQueue.
+model (LLM) post-training. It decouples rollout, reward, and training while coordinating
+them through a Parameter Server.
 Generation and training progress asynchronously while model-version staleness remains
 explicitly bounded.
 
 Built on [veRL](https://github.com/volcengine/verl), PSRL focuses on the system bottlenecks that emerge in agentic, dynamic, and long-tailed RL workloads: uneven rollout latency, version-aware weight management, multi-turn KV cache reuse, and elastic resource allocation across rollout, reward, and training models.
+
+```{figure} /_static/img/PSRL_arch.svg
+:alt: PSRL System Architecture
+:width: 100%
+:align: center
+
+Overall PSRL system architecture.
+```
 
 ## Key Capabilities
 
@@ -23,12 +31,32 @@ Built on [veRL](https://github.com/volcengine/verl), PSRL focuses on the system 
 
 ## Supported Backends
 
-| Component | Backend | Parallelism |
-|---|---|---|
-| **Rollout gateway** | SMG | HTTP/OpenAI ingress, PSRL-aware routing loop, gRPC proxy, TITO |
-| **Rollout engine** | vLLM | DP + TP + PP serving through PSRL's gRPC integration |
-| **Training** | FSDP2 | FSDP sharding + Ulysses SP |
-| **Training** | Megatron-LM | TP + PP + CP + EP |
+PSRL keeps the **generation** and **training** stacks fully decoupled, so each side
+can be scaled and swapped independently.
 
-See {doc}`../design/architecture` for the three-plane architecture and
-{doc}`../design/router_tito` for the SMG integration.
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} Rollout
+:class-card: psrl-feature-card
+
+**SMG + vLLM**
+
+The SMG gateway provides the HTTP/OpenAI ingress, the PSRL-aware routing loop, the
+gRPC proxy, and TITO session capture. vLLM is the inference backend (DP + TP + PP
+serving through PSRL's gRPC integration).
+:::
+
+:::{grid-item-card} Training
+:class-card: psrl-feature-card
+
+**FSDP2** &nbsp;·&nbsp; **Megatron**
+
+A single unified engine train worker drives both backends. FSDP2 offers HSDP
+sharding plus Ulysses sequence parallelism. Megatron adds DP + TP + PP + CP + EP for
+large and MoE models.
+:::
+
+::::
+
+See {doc}`../design/architecture` for the detailed architecture.

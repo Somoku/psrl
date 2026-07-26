@@ -29,10 +29,10 @@ Training is "all-or-nothing" because mainstream parallelism backends (FSDP, Mega
 PSRL uses [torch_memory_saver](https://github.com/fzyzcjy/torch_memory_saver) (TMS) as its underlying primitive for dynamic GPU memory management when multiple workloads are colocated on the same GPUs.
 
 :::{important}
-The current TransferQueue-based trainer does not implement `psrl.colocate=True` and
-raises `NotImplementedError` in that branch. TMS is still used for supported worker
-sleep/wake and memory-management paths, but do not interpret `tms.range=all` as
-making the unsupported train/rollout colocate mode available.
+TMS is used for supported worker sleep/wake and memory-management paths.
+`tms.range=all` selects which workers TMS manages. It does not enable a
+train/rollout colocate mode. PSRL runs training and generation on separate
+GPU allocations.
 :::
 
 TMS operates in two phases:

@@ -35,20 +35,28 @@ where every rollout already shares the same outcome.
 
 | Path | Backend | Model | Cluster | Launch Script |
 |------|---------|-------|---------|---------------|
-| **FSDP 7B** | FSDP2 | Qwen2.5-Math-7B | 4 nodes × 8 GPU | `advanced_qwen2.5_7b_fsdp.sh` |
-| **Megatron 8B** | Megatron-LM | Qwen3-8B | 4+ nodes × 8 GPU | `qwen3_8b_megatron.sh` |
-| **Megatron 30B** | Megatron-LM | Qwen3-30B-A3B (MoE) | 6+ nodes × 8 GPU | `qwen3_30b_megatron.sh` |
+| **FSDP 3B** | FSDP2 | Qwen2.5-3B-Instruct | 2 nodes × 8 GPU | `qwen2.5_3b_fsdp.sh` |
+| **Megatron 8B** | Megatron | Qwen3-8B | 4+ nodes × 8 GPU | `qwen3_8b_megatron.sh` |
+| **Megatron 30B** | Megatron | Qwen3-30B-A3B (MoE) | 8+ nodes × 8 GPU | `qwen3_30b_megatron.sh` |
+
+:::{note}
+The `advanced_*` launch scripts (e.g. `advanced_qwen2.5_7b_fsdp.sh`) additionally
+turn on the full rollout-coordination stack: `throughput_optimal` routing with a cost
+model, multi-priority queues, `status_based` sync, request migration, and proactive
+filtering. They require extra tuning to run well. Start from the plain scripts above,
+which use the safe defaults, before layering on advanced coordination.
+:::
 
 ---
 
 ## Quick Launch
 
 ```bash
-# FSDP path (default staleness=2)
-bash examples/dapo_trainer/advanced_qwen2.5_7b_fsdp.sh
+# FSDP path (default staleness=3)
+bash examples/dapo_trainer/qwen2.5_3b_fsdp.sh
 
 # With custom staleness
-bash examples/dapo_trainer/advanced_qwen2.5_7b_fsdp.sh 3
+bash examples/dapo_trainer/qwen2.5_3b_fsdp.sh 2
 ```
 
 ---

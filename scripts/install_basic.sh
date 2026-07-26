@@ -76,7 +76,7 @@ fi
 
 echo "Building SMG from source..."
 pushd $THIRD_PARTY_PATH
-git clone https://github.com/Somoku/smg.git -b psrl-dev
+git clone https://github.com/psrl-project/smg.git -b psrl-dev
 cd smg
 # Comment out the smg-tui workspace dependency (not needed for PSRL build)
 sed -i 's|^smg-tui = { version = "0.1.0", path = "tui" }|# smg-tui = { version = "0.1.0", path = "tui" }|' Cargo.toml

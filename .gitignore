@@ -31,6 +31,11 @@ tensorflow/my_graph/*
 **/*.parquet
 **/*.lock
 
+# Documentation figures are source assets, not runtime artifacts, so they are
+# re-included after the broad file-type rules above.
+!docs/_static/img/*.png
+!assets/*.png
+
 # Common artifact directories
 **/checkpoints
 **/wget-log

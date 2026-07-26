@@ -18,13 +18,6 @@ Each subsection covers one major design component, including motivation, archite
 Overall system design with decoupled training and generation, module responsibilities, and deployment topology.
 :::
 
-:::{grid-item-card} {octicon}`server;1.5em` Parameter Server
-:link: parameter_server
-:link-type: doc
-
-CPU-based distributed weight storage with unified sharding, RDMA push/pull, and broadcast initialization.
-:::
-
 :::{grid-item-card} {octicon}`hubot;1.5em` Router, SessionRouter & TITO
 :link: router_tito
 :link-type: doc
@@ -39,6 +32,13 @@ multi-turn training-data capture.
 
 Asynchronous sample storage and metadata-only data exchange across rollout, reward,
 and training.
+:::
+
+:::{grid-item-card} {octicon}`server;1.5em` Parameter Server
+:link: parameter_server
+:link-type: doc
+
+CPU-based distributed weight storage with unified sharding, RDMA push/pull, and broadcast initialization.
 :::
 
 :::{grid-item-card} {octicon}`iterations;1.5em` Flexible Rollout

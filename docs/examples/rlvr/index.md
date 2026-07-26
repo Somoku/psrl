@@ -16,7 +16,7 @@ extends GRPO with asymmetric clipping plus a dynamic sampling filter.
 | [GRPO](grpo) | Group Relative Policy Optimization, per-prompt advantage normalization, no critic | Coming soon |
 | [DAPO](dapo) | GRPO variant with asymmetric clipping + dynamic sampling filter | Ready |
 
-All algorithms support both FSDP and Megatron-LM training backends, with vLLM rollout and NIXL-based GPU-direct model transfer.
+All algorithms support both FSDP and Megatron training backends, with vLLM rollout and NIXL-based GPU-direct model transfer.
 
 ---
 

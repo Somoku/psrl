@@ -98,12 +98,10 @@ TensorDict-only data path.
 
 - Size `total_storage_size` for in-flight prompts, redundant trajectories,
   validation data, and at least one active training buffer.
-- Use multiple SimpleStorage units for multi-node load distribution; the config
+- Use multiple SimpleStorage units for multi-node load distribution. The config
   recommends at least twice the number of nodes.
 - Consumed keys are cleared only after the training step. Aborted request cleanup is
   coordinated with request-status tracking.
-- `psrl.colocate=True` is not implemented with the current `KVBatchMeta` training
-  flow.
 - MooncakeStore is experimental. Validate metadata/master availability and RDMA
   device configuration before production use.
 

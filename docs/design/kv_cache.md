@@ -54,13 +54,14 @@ sequenceDiagram
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enable` | bool | `False` | Master switch for LMCache integration |
-| `offload_size_gb` | float | `20.0` | Total CPU memory budget for KV offloading (divided across TP ranks) |
+| `offload_size_gb` | float | `100.0` | Total CPU memory budget for KV offloading (divided across TP ranks) |
 | `chunk_size` | int | `256` | Token chunk size for hash-based indexing |
 | `save_decode_cache` | bool | `True` | Also cache KV from decode steps (helps multi-turn reuse) |
-| `clear_on_weight_update` | bool | `True` | Invalidate stale KV after model weight sync |
-| `enable_async_loading` | bool | `True` | Overlap KV retrieval with prefill computation |
+| `clear_on_weight_update` | bool | `False` | Invalidate the whole cache after model weight sync |
+| `multi_version_kv` | bool | `True` | Tag entries with the model version so stale-weight KV is skipped instead of cleared |
+| `enable_async_loading` | bool | `False` | Overlap KV retrieval with prefill computation (known bug, keep disabled) |
 | `cache_policy` | str | `LRU` | Cache eviction: `LRU` or `FIFO` |
-| `backend` | str | `cpu` | Storage backend: `cpu` (default), `disk` |
+| `backend` | str | `cpu` | Storage backend: `cpu` (default), `disk`, `remote` (not yet implemented) |
 
 ```yaml
 psrl:
@@ -69,8 +70,9 @@ psrl:
     offload_size_gb: 40.0
     chunk_size: 256
     save_decode_cache: true
-    clear_on_weight_update: true
-    enable_async_loading: true
+    clear_on_weight_update: false
+    multi_version_kv: true
+    enable_async_loading: false
     cache_policy: LRU
     backend: cpu
 ```
@@ -80,9 +82,14 @@ psrl:
 :::{admonition} `clear_on_weight_update`
 :class: important
 
-When the rollout instance syncs to a new model version, all cached KV becomes **stale**: it was computed with the old weights. Setting `clear_on_weight_update: true` (the default) invalidates the entire cache on sync, which is correct but expensive for multi-turn trajectories that span a version boundary.
+When the rollout instance syncs to a new model version, all cached KV becomes **stale**: it was computed with the old weights. Serving subsequent turns from stale-weight KV causes accuracy degradation that compounds on top of the staleness bound itself, so stale entries must not be reused.
 
-Under any `staleness ≥ 1` setting, **keeping `clear_on_weight_update: true` is recommended**: continuing to serve subsequent turns from KV computed by stale weights causes accuracy degradation that compounds on top of the staleness bound itself. Set it to `false` only if you are willing to trade a measurable accuracy hit for the throughput win on long multi-turn trajectories.
+PSRL offers two mechanisms for this, and you should run exactly one of them:
+
+- `multi_version_kv: true` (the shipped default) tags each cached entry with the model version that produced it, so a lookup at version *N* simply misses entries from earlier versions. Nothing is thrown away, which means KV from other still-valid versions survives the sync.
+- `clear_on_weight_update: true` invalidates the entire cache on every sync. Correct, but coarse and expensive for multi-turn trajectories that span a version boundary.
+
+P2P transfer forces the choice: `enable_p2p: true` requires `multi_version_kv: true` and `clear_on_weight_update: false`, because the P2P backend does not implement clear-on-weight-sync.
 :::
 
 :::{tip}
@@ -106,27 +113,37 @@ When the Router moves a request to a different rollout instance (due to load bal
 ### Architecture
 
 - **LMCache Controller**: A shared process started by the Rollout Coordinator before
-  vLLM initialization. It maintains worker registration and fallback control.
-- **LMCache workers**: Source and destination workers perform the hot-path data move,
-  avoiding a controller bottleneck.
+  vLLM initialization. It maintains worker registration and answers peer-lookup
+  queries (`/query_worker_info`) so instances learn each other's transfer endpoints.
+  It is **not** on the KV data path.
+- **LMCache workers**: Source and destination workers perform the hot-path data move
+  directly, avoiding a controller bottleneck.
 - **Transport**: Transfer uses the NIXL library (same as PS weight transfer):
   - `nixl`: UCX transport: auto-selects shared memory (same node), IPC (same machine), or RDMA (cross-node).
   - `tcp`: Fallback TCP transport for environments without UCX/RDMA.
 
 ### Transfer Flow
 
+A move is initiated on the **source** instance (triggered by the router/coordinator
+when a request is re-routed). The source GenWorker calls `transfer_direct()`, which
+sends a `MoveWorkerMsg` over a ZMQ REQ socket to its local LMCache worker, and the worker
+pushes the KV blocks to the destination's endpoint (`new_position`) over NIXL/TCP and
+replies with a `MoveWorkerRetMsg` carrying the number of tokens moved. The Controller
+is consulted only beforehand, to resolve the destination's peer endpoint.
+
 ```{mermaid}
 sequenceDiagram
-    participant Router
-    participant Src as Source Instance
-    participant Ctrl as LMCache Controller
-    participant Dst as Destination Instance
+    participant RC as Router / Coordinator
+    participant Src as Source GenWorker
+    participant SrcW as Source LMCache worker
+    participant Dst as Dest LMCache worker
 
-    Router->>Src: move(prefix, destination)
-    Src->>Dst: NIXL/TCP KV transfer
-    Dst-->>Src: transfer result
-    Src-->>Router: migration result
-    Router->>Dst: resume_generation(request_id)
+    RC->>Src: transfer_direct(tokens, src, dst)
+    Src->>SrcW: MoveWorkerMsg (ZMQ REQ, new_position=dst endpoint)
+    SrcW->>Dst: push KV blocks (NIXL / TCP)
+    Dst-->>SrcW: blocks received
+    SrcW-->>Src: MoveWorkerRetMsg(num_tokens)
+    Src-->>RC: transfer result (bool)
 ```
 
 ### Configuration
@@ -150,7 +167,7 @@ psrl:
 
 ### Integration with Routing
 
-P2P KV transfer integrates with the `psrl.routing_strategy.kv_transfer` configuration (see {doc}`flexible_rollout`). The Router decides **whether** to transfer, LMCache handles **how** the data moves.
+P2P KV transfer integrates with the `psrl.rollout_coordination.routing_strategy.kv_transfer` configuration (see {doc}`flexible_rollout`). The Router decides **whether** to transfer, LMCache handles **how** the data moves.
 
 | `transfer_mode` | Behavior | Best For |
 |-----------------|----------|----------|

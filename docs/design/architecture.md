@@ -16,7 +16,7 @@ Overall PSRL system architecture showing decoupled training and generation.
 
 ### Train Workers
 
-Execute policy gradient updates using either FSDP2 or Megatron-LM as the distributed training backend. After each gradient step completes, train workers **push** the updated model weights to the Parameter Server via RDMA (cross-node) or shared memory (same node). Train workers operate independently of generation, they consume ready buffers from the staleness system and produce new model versions.
+Execute policy gradient updates using either FSDP2 or Megatron as the distributed training backend. After each gradient step completes, train workers **push** the updated model weights to the Parameter Server via RDMA (cross-node) or shared memory (same node). Train workers operate independently of generation, they consume ready buffers from the staleness system and produce new model versions.
 
 ### Parameter Server (PS Manager + PS Workers)
 
@@ -38,12 +38,20 @@ Each Agent Worker handles **one trajectory at a time**, running the agent loop t
 
 A centralized monitoring component that collects status from all rollout instances, queue depth, KV cache utilization, request throughput, and model version. Provides a **global view** used by the Router and sync/migration strategies to make informed decisions.
 
-### Router (Rollout Router)
+### Router (TITO Router, SMG)
 
-Dispatches generation requests from Agent Workers to rollout instances based on the configured routing strategy. Strategies range from simple (random, round-robin) to model-aware (throughput-optimal with cost model, KV-cache-aware). The Router is the central point where load balancing and locality decisions are made.
+The default router is the **SMG RolloutGateway**, a Rust routing gateway that
+dispatches generation requests from Agent Workers to rollout instances. It does not
+apply a load-balancing policy blindly: PSRL configures SMG with a **PSRL-aware worker
+selection** strategy that first filters instances by servable model version and
+admission/reservation state (queried from PSManager over gRPC), honors partial-rollout
+and sticky-session hints and prompt-group affinity, then ranks the remaining
+candidates by the configured routing strategy (random, round-robin, throughput-optimal
+with a cost model, or cache-aware). SMG also captures multi-turn training data via
+**TITO** and exposes a session-scoped OpenAI API through the **SessionRouter**.
 
 :::{seealso}
-{doc}`flexible_rollout` for detailed routing strategies and their configuration.
+{doc}`router_tito` for SMG worker selection, SessionRouter, and TITO. See {doc}`flexible_rollout` for detailed routing strategies and their configuration.
 :::
 
 ### Rollout Instances
@@ -67,35 +75,39 @@ The following diagram shows the complete data flow for one training iteration:
 sequenceDiagram
     participant AM as Agent Manager
     participant AW as Agent Worker
-    participant Router
-    participant RI as Rollout Instance
+    participant SMG as SMG Router
+    participant RI as vLLM Replica
     participant PS as Parameter Server
+    participant TQ as TransferQueue
     participant TW as Train Worker
     participant Reward
 
     AM->>AW: dispatch(prompt)
-    AW->>Router: generate(tokens)
-    Router->>RI: route(request)
+    AW->>SMG: generate(tokens, version_tag)
+    SMG->>PS: admission + reserve
+    SMG->>RI: route(request) via gRPC
     RI-->>AW: response
     AW->>Reward: compute_score(trajectory)
-    Reward-->>AM: reward
-    AM->>PS: occupy(buffer_entry)
+    Reward-->>TQ: write reward fields
+    AW->>TQ: write trajectory fields
+    AW->>PS: occupy(buffer_entry)
     PS->>TW: buffer_ready signal
+    TW->>TQ: read batch metadata (KVBatchMeta)
     TW->>PS: pull(weights) → train → push(new_weights)
-    PS->>RI: sync_trigger(new_version)
-    RI->>PS: pull(new_weights)
+    PS->>SMG: weight-version update
+    SMG->>RI: pause → pull(new_weights) → resume
 ```
 
 **Step-by-step:**
 
 1. **Dispatch**: Agent Manager assigns a prompt (with a reserved buffer slot) to an available Agent Worker.
-2. **Generation**: Agent Worker sends generation requests through the Router to a rollout instance.
-3. **Multi-turn** (optional): For agentic tasks, the worker may execute tools and generate multiple turns.
-4. **Reward**: Completed trajectory is scored by the Reward Service.
-5. **Occupy**: The scored trajectory occupies its reserved slot in the staleness buffer.
-6. **Training**: When a buffer is full (Ready state), the Train Worker consumes it for one gradient step.
+2. **Generation**: Agent Worker sends generation requests through the SMG Router, which checks version/admission with the Parameter Server, then dispatches to a vLLM replica over gRPC.
+3. **Multi-turn** (optional): For agentic tasks, the worker may execute tools and generate multiple turns (session/TITO capture).
+4. **Reward**: Completed trajectory is scored by the Reward Service, and reward fields land in TransferQueue.
+5. **Occupy**: The scored trajectory occupies its reserved slot in the staleness buffer, and trajectory fields are written to TransferQueue.
+6. **Training**: When a buffer is full (Ready state), the Train Worker reads the batch metadata from TransferQueue and consumes it for one gradient step.
 7. **Weight Push**: Updated weights are pushed to PS via RDMA.
-8. **Sync**: Rollout instances pull new weights when their sync strategy triggers.
+8. **Sync**: The RolloutCoordinator gates SMG on the new version, pausing dispatch, letting instances pull new weights, then resuming routing.
 
 :::{tip}
 Steps 1-5 (generation) and steps 6-8 (training) run **concurrently**: this is the core advantage of PSRL's decoupled design. The staleness system (see {doc}`staleness_control`) ensures bounded off-policy error.
@@ -130,10 +142,11 @@ Deployment topology is configured via `psrl.deployment.*`:
 ```yaml
 psrl:
   deployment:
-    train_nnodes: 2
-    gen_nnodes: 2
-    gen_tp: 8          # Tensor parallelism within each rollout instance
-    num_instances: 2   # Number of rollout instances
+    train_nnodes: 2                          # Training nodes
+    train_ngpus_per_node: 8                  # GPUs per training node
+    n_rollout_instances: 2                   # Number of rollout instances
+    rollout_nnodes_per_instance: 1           # Nodes per rollout instance
+    rollout_ngpus_per_node_per_instance: 8   # GPUs per node within each instance (TP size)
 ```
 
 :::{admonition} Scaling Guidance

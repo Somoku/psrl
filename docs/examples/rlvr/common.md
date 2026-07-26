@@ -9,32 +9,47 @@ focus on the bits that actually differ between recipes.
 
 ## Architecture
 
+Even single-turn RLVR runs through PSRL's decoupled online-serving path. A prompt is
+driven by an **AgentLoopWorker**, dispatched through the **SMG RolloutGateway** (PSRL
+worker selection + gRPC proxy), and served by a **vLLM server replica**
+(`PSRL_vLLMReplica`, a gRPC engine host). Completed samples flow to the trainer over
+**TransferQueue**, and weights move between training and serving over **NIXL**.
+
 ```
-┌─────────────────────────────────────────────────────┐
-│                  PSRL RLVR Trainer                  │
-│  (actor, vLLM rollout, reward scoring, TIS)         │
-└──────────────────────┬──────────────────────────────┘
-                       │
-         ┌─────────────┴──────────────┐
-         │                            │
-         ▼                            ▼
-┌─────────────────┐         ┌──────────────────┐
-│  vLLM GenWorker │         │  FSDP / Megatron │
-│  (rollout gen)  │         │  TrainWorker     │
-└────────┬────────┘         └────────┬─────────┘
-         │                           │
-         └───── NIXL (GPU-direct) ───┘
+                    ┌─────────────────────────────────────────────┐
+                    │              PSRL RLVR Trainer               │
+                    │   (actor update, reward scoring, TIS)        │
+                    └───────────────┬──────────────────────────────┘
+        weights (NIXL) ▲            │ metadata (TransferQueue)
+                       │            ▼
+        ┌──────────────┴───┐   ┌───────────────────┐
+        │  FSDP / Megatron │   │   AgentLoopWorker  │
+        │   TrainWorker    │   │  (single-turn RLVR)│
+        └──────────────────┘   └─────────┬─────────┘
+                       ▲                  │ HTTP generate
+                       │ NIXL pull        ▼
+        ┌──────────────┴────────┐  ┌───────────────────┐
+        │ Parameter Server (PS) │  │ SMG RolloutGateway │
+        │  version + staleness  │◄─┤  (worker select +  │
+        └──────────────────────-┘  │   gRPC proxy)      │
+                       ▲            └─────────┬─────────┘
+                       │ NIXL pull            │ gRPC
+                       │            ┌─────────▼─────────┐
+                       └────────────┤ vLLM server replica│
+                                    │ (PSRL_vLLMReplica) │
+                                    └───────────────────┘
 ```
 
 The trainer orchestrates:
-- **Rollout generation** on dedicated vLLM nodes
+- **Rollout generation** on dedicated vLLM server replicas behind the SMG gateway
 - **Reward scoring** via verifiable answer checking
 - **Policy updates** with PPO-style clipped surrogate loss
 - **Token Importance Sampling (TIS)** for off-policy correction under PSRL's
   decoupled train/gen architecture
 
-For deeper background on the decoupled design, see {doc}`../../design/architecture`
-and {doc}`../../design/staleness_control`.
+For deeper background on the decoupled design and the online request path, see
+{doc}`../../design/architecture`, {doc}`../../design/router_tito`, and
+{doc}`../../design/staleness_control`.
 
 ---
 

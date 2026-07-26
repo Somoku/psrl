@@ -118,7 +118,7 @@ Staleness controls the maximum version gap between generation and training:
 - `staleness=3` (default for this example): generation can run up to 3 versions ahead of training
 - Higher values increase throughput but may degrade sample quality
 
-Values of 2--3 provide a good balance between throughput and policy freshness for
+Values of 2 to 3 provide a good balance between throughput and policy freshness for
 most workloads.
 :::
 
@@ -147,11 +147,14 @@ first few hundred steps as the policy learns to solve more GSM8K problems.
 
 ## What Happens Under the Hood
 
-1. **Generation workers** (1 node, vLLM instances) generate rollouts from the current policy.
-2. AgentLoopWorkers send requests through the **SMG RolloutGateway**, whose PSRL
-   worker selector checks version/admission state with PSManager before dispatching
-   to a vLLM gRPC replica.
-3. Completed trajectories are written to **TransferQueue**; the trainer receives a
+1. **AgentLoopWorkers** drive rollout. For a DAPO math task each prompt runs as a
+   **single-turn agent** (one prompt → one response, no tool calls). They send
+   generation requests through the **SMG RolloutGateway**, whose PSRL worker
+   selector checks version/admission state with PSManager before dispatching to a
+   vLLM gRPC replica.
+2. The selected **vLLM instances** (1 node here) generate rollouts from the current
+   policy version.
+3. Completed trajectories are written to **TransferQueue**, and the trainer receives a
    lightweight `KVBatchMeta` and reads/writes fields as the DAPO stages execute.
 4. After each training step, training workers push updated weights to the
    **Parameter Server**. Rollout workers pull new versions when coordinated by the

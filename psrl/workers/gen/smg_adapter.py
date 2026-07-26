@@ -90,7 +90,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
             cfg_get(config, "psrl.rollout_coordination.routing_strategy.admission_reject_on_waiting", False)
         ),
         kv_capacity_threshold=float(
-            cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_capacity_threshold", 1.0)
+            _cache_aware_cfg(config, "kv_capacity_threshold", 1.0)
         ),
         eviction_interval_secs=int(_cache_aware_cfg(config, "eviction_interval_secs", 60)),
         max_tree_size=int(_cache_aware_cfg(config, "max_tree_size", 2**26)),
@@ -134,6 +134,38 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         api_key=None,
         disable_health_check=True,
     )
+    # region agent log
+    try:
+        import json as _dbg_json
+        import os as _dbg_os
+        import time as _dbg_time
+
+        with open("/apdcephfs_zwfy10/share_303541817/lhy/.cursor/debug-48f20e.log", "a") as _dbg_f:
+            _dbg_f.write(
+                _dbg_json.dumps(
+                    {
+                        "sessionId": "48f20e",
+                        "runId": "run1",
+                        "hypothesisId": "H2",
+                        "location": "psrl/workers/gen/smg_adapter.py:137",
+                        "message": "Rollout router args: tier scoring weights handed to Rust gateway",
+                        "data": {
+                            "pid": _dbg_os.getpid(),
+                            "policy": str(routing_method),
+                            "gpu_overlap_weight": cli_args.gpu_overlap_weight,
+                            "lmcache_overlap_weight": cli_args.lmcache_overlap_weight,
+                            "block_size": cli_args.block_size,
+                            "lmcache_enable": cfg_get(config, "psrl.lmcache.enable", None),
+                            "lmcache_chunk_size": cfg_get(config, "psrl.lmcache.chunk_size", None),
+                        },
+                        "timestamp": int(_dbg_time.time() * 1000),
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # endregion
     return RouterArgs.from_cli_args(cli_args, use_router_prefix=False)
 
 

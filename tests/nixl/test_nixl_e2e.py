@@ -84,13 +84,10 @@ def validate_parallel_config(cfg: DictConfig) -> None:
         train_tp = megatron.tensor_model_parallel_size
         train_pp = megatron.pipeline_model_parallel_size
         train_cp = megatron.get("context_parallel_size", 1)
-        train_ep = megatron.get("expert_model_parallel_size", 1)
         model_parallel_size = train_tp * train_pp * train_cp
         assert num_train % model_parallel_size == 0, (
             f"num_train {num_train} must be divisible by Megatron TP*PP*CP {model_parallel_size}."
         )
-        train_dp = num_train // model_parallel_size
-        assert train_dp % train_ep == 0, f"Megatron DP {train_dp} must be divisible by EP {train_ep}."
 
 
 def assert_state_dict_all_ones(state_dict: dict[str, torch.Tensor], actor_label: str) -> None:
@@ -327,24 +324,42 @@ class TrainClientActor:
         use_mbridge = True
 
         if use_mbridge:
-            from verl.models.mcore.mbridge import AutoBridge
+            from megatron.bridge import AutoBridge
 
-            bridge = AutoBridge.from_config(hf_config, dtype=dtype)
-            tf_config = bridge.config
-            tf_config.fp16 = dtype == torch.float16
-            tf_config.bf16 = dtype == torch.bfloat16
+            bridge = AutoBridge.from_hf_config(hf_config)
+            provider = bridge.to_megatron_provider(load_weights=False)
+            virtual_pipeline_model_parallel_size = self.megatron_config.get("virtual_pipeline_model_parallel_size", 1)
+            if virtual_pipeline_model_parallel_size == 1:
+                virtual_pipeline_model_parallel_size = None
+            provider_overrides = {
+                "tensor_model_parallel_size": self.megatron_config.get("tensor_model_parallel_size", 4),
+                "pipeline_model_parallel_size": self.megatron_config.get("pipeline_model_parallel_size", 2),
+                "expert_model_parallel_size": self.megatron_config.get("expert_model_parallel_size", 1),
+                "expert_tensor_parallel_size": self.megatron_config.get("expert_tensor_parallel_size", 1),
+                "virtual_pipeline_model_parallel_size": virtual_pipeline_model_parallel_size,
+                "context_parallel_size": self.megatron_config.get("context_parallel_size", 1),
+                "sequence_parallel": self.megatron_config.get("sequence_parallel", False),
+            }
+            provider.apply_overrides_and_finalize(
+                dtype=dtype,
+                overrides=provider_overrides,
+            )
+            tf_config = None
         else:
             tf_config = hf_to_mcore_config(hf_config, dtype)
 
         from verl.utils.megatron_utils import McoreModuleWrapperConfig, make_megatron_module
 
         wrap_config = McoreModuleWrapperConfig()
-        actor_module, _ = make_megatron_module(
+        actor_module, updated_tf_config = make_megatron_module(
             wrap_config,
             tf_config,
             hf_config,
             bridge=bridge if use_mbridge else None,
+            provider=provider,
         )
+        if use_mbridge:
+            tf_config = updated_tf_config
         self.model = actor_module
 
         for name, param in self.model[0].named_parameters():
@@ -375,7 +390,9 @@ class TrainClientActor:
 
             model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=self.trust_remote_code)
             parameter_mapping = create_parameter_mapping("Megatron", model_config)
-            state_dict, sharding = convert_megatron_inplace(parameter_mapping, self.model)
+            conversion_result = convert_megatron_inplace(parameter_mapping, self.model)
+            state_dict = conversion_result.state_dict
+            sharding = conversion_result.sharding_dict
         for tensor in state_dict.values():
             if torch.is_tensor(tensor) and tensor.is_floating_point():
                 tensor.data.fill_(1)

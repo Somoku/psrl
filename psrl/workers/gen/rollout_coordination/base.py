@@ -6,12 +6,6 @@ import json
 import logging
 import os
 
-from psrl.workers.gen.smg_adapter import (
-    ROUTING_LOOP_STATUS_PATH,
-    WORKERS_STATS_PATH,
-    WORKERS_UPDATE_WEIGHT_VERSION_PATH,
-)
-
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
@@ -24,9 +18,7 @@ class CoordinatorBase:
     """
 
     async def _gateway_post_json(self, path: str, payload, params: dict | None = None):
-        if self.gateway_base_url is None:
-            raise RuntimeError("Rust gateway base url is not initialized")
-        url = f"{self.gateway_base_url}{path}"
+        url = f"{self.rollout_gateway_url}{path}"
         async with self.gateway_client.post(url, json=payload, params=params) as resp:
             resp.raise_for_status()
             text = await resp.text()
@@ -35,9 +27,7 @@ class CoordinatorBase:
             return json.loads(text)
 
     async def _gateway_get_json(self, path: str, params: dict | None = None):
-        if self.gateway_base_url is None:
-            raise RuntimeError("Rust gateway base url is not initialized")
-        url = f"{self.gateway_base_url}{path}"
+        url = f"{self.rollout_gateway_url}{path}"
         psrl_logger.debug(f"Making GET request to {url} with params {params}")
         async with self.gateway_client.get(url, params=params) as resp:
             resp.raise_for_status()
@@ -72,9 +62,5 @@ class CoordinatorBase:
         Returns:
             bool: True if any worker-selection stage is active, False otherwise.
         """
-        if self.use_rust_gateway:
-            data = await self._gateway_get_json("/routing_loop/status")
-            is_selecting = bool(data.get("selecting", False))
-        else:
-            is_selecting = await self.rollout_router.is_routing.remote()
-        return is_selecting
+        data = await self._gateway_get_json("/routing_loop/status")
+        return bool(data.get("selecting", False))

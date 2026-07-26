@@ -162,6 +162,42 @@ def _qwen_vl_layout(model: Any) -> WeightLayoutPlan:
     return builder.build()
 
 
+def _qwen3_5_vl_gen_layout(model: Any) -> WeightLayoutPlan:
+    """Layout for Qwen3.5-VL gen/validate workers.
+
+    Visual encoder
+        Vision encoder weights (model.visual.*) are synced via NIXL so that
+        rollout servers started with load_format=dummy receive correct vision
+        weights.  Qwen3.5's ViT uses separate linear_fc1 / linear_fc2 in its
+        MLP (unlike Qwen2.5-VL which has a fused mlp.gate_up_proj), so no
+        merged() call is needed on the visual_builder.
+
+    MTP exclusion
+        vLLM's Qwen3_5ForConditionalGeneration does NOT instantiate MTP
+        (mtp.*) sub-modules — those are skipped in load_weights and kept in a
+        separate Eagle3 speculative-decoding model class.  Excluding "mtp"
+        makes the intent explicit and guards against future accidental
+        registration if the class hierarchy changes.
+
+    GDN (Gated DeltaNet) TP sharding
+        The language_model sub-module is a Qwen3_5ForCausalLM.  Mounting it
+        via mount_module() triggers build_weight_layout() on that sub-module,
+        which runs _qwen3_5_layout().  That function handles all GDN-specific
+        TP splits (in_proj_qkvz.weight → q/k/v/z, conv1d.weight → k/k/v)
+        automatically, so no extra split_param() calls are needed here.
+    """
+    builder = WeightLayoutBuilder(model)
+    builder.name_map(_vl_name_map())
+    builder.mount_module("language_model", model.language_model)
+    # Mount visual encoder — no MLP fusing (Qwen3.5 ViT uses separate linear_fc1/fc2)
+    visual_builder = WeightLayoutBuilder(model.visual)
+    builder.mount_plan("visual", visual_builder.build())
+    # vLLM has no MTP sub-module in Qwen3_5ForConditionalGeneration;
+    # exclude defensively in case class hierarchy changes.
+    builder.exclude_substr("mtp")
+    return builder.build()
+
+
 def _qwen2_5_vl_layout(model: Any) -> WeightLayoutPlan:
     builder = WeightLayoutBuilder(model)
     builder.name_map(_vl_name_map())
@@ -174,17 +210,38 @@ def _qwen2_5_vl_layout(model: Any) -> WeightLayoutPlan:
     builder.mount_plan("visual", visual_builder.build())
     return builder.build()
 
-def _qwen3_5_vl_layout(model: Any) -> WeightLayoutPlan:
-    builder = WeightLayoutBuilder(model)
-    builder.name_map(_vl_name_map())
-    builder.mount_module("language_model", model.language_model)
-    # TODO(linsh): Visual tensors may be CPU-resident?
-    builder.exclude_substr("visual")
-    # exclude defensively in case class hierarchy changes.
-    builder.exclude_substr("mtp")
-    return builder.build()
 
 def _qwen3_5_layout(model: Any) -> WeightLayoutPlan:
+    """Layout for Qwen3.5 language-model workers (Qwen3_5ForCausalLMBase).
+
+    This covers both stand-alone CausalLM gen workers and the language_model
+    sub-module of Qwen3_5ForConditionalGeneration (mounted by
+    _qwen3_5_vl_gen_layout via mount_module).
+
+    GDN (Gated DeltaNet) TP sharding
+    ---------------------------------
+    Each GDN layer has two fused projection tensors that must be split along the
+    TP dimension before NIXL transfer:
+
+      in_proj_qkvz.weight  [4·head_dim × hidden]
+          → in_proj_qkv.weight_q  [q_size × hidden]   (column-parallel Q)
+          → in_proj_qkv.weight_k  [k_size × hidden]   (column-parallel K)
+          → in_proj_qkv.weight_v  [v_size × hidden]   (column-parallel V)
+          → in_proj_z.weight      [z_size × hidden]   (column-parallel gate)
+
+      conv1d.weight  [(k_size + k_size + v_size) × ...]
+          → conv1d.weight_q  [conv_k_size × ...]
+          → conv1d.weight_k  [conv_k_size × ...]
+          → conv1d.weight_v  [conv_v_size × ...]
+
+    MTP exclusion
+    -------------
+    vLLM's Qwen3_5ForCausalLMBase does NOT instantiate MTP (mtp.*) layers.
+    Those are handled by the separate Qwen3_5ForEagle3MTP class used only in
+    Eagle3 speculative-decoding mode.  Excluding "mtp" makes the intent
+    explicit and prevents accidental registration if the vLLM class hierarchy
+    changes in the future.
+    """
     builder = WeightLayoutBuilder(model)
     builder.qkv("qkv_proj", "q_proj", "k_proj", "v_proj")
     builder.merged("gate_up_proj", [("gate_proj", None), ("up_proj", None)])
@@ -227,6 +284,9 @@ def _qwen3_5_layout(model: Any) -> WeightLayoutPlan:
             )
             break
     builder.exclude_substr("rotary_emb.inv_freq")
+    # vLLM does not instantiate MTP layers in Qwen3_5ForCausalLMBase.
+    # Exclude defensively in case of future class hierarchy changes.
+    builder.exclude_substr("mtp.")
     return builder.build()
 
 
@@ -251,7 +311,7 @@ _LAYOUTS: dict[str, LayoutBuilder] = {
     "qwen2_vl.Qwen2VLForConditionalGeneration": _qwen2_vl_layout,
     "qwen3.Qwen3ForCausalLM": _dense_layout,
     "qwen3_5.Qwen3_5ForCausalLMBase": _qwen3_5_layout,
-    "qwen3_5.Qwen3_5ForConditionalGeneration": _qwen3_5_vl_layout,
+    "qwen3_5.Qwen3_5ForConditionalGeneration": _qwen3_5_vl_gen_layout,
     "qwen3_moe.Qwen3MoeModel": _moe_layout,
     "qwen3_moe.Qwen3MoeForCausalLM": _moe_layout,
     "qwen3_vl.Qwen3VLForConditionalGeneration": _qwen_vl_layout,

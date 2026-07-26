@@ -8,7 +8,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
-from psrl.workers.gen.smg_adapter import build_rollout_router_args
+from psrl.workers.gen.smg_adapter import build_rollout_router_args, get_trajectory_id_strategy
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -70,13 +70,16 @@ class RolloutGateway:
         return node if node is not None else default
 
     def _estimate_balanced_concurrent_seqs_per_instance(self) -> int:
-        """Mirror Python router-side balanced concurrency estimation logic."""
+        """Estimate the balanced concurrency budget for SMG."""
         rollout_n = int(self._cfg_get("psrl.rollout_n", 1))
         n_rollout_instances = int(self._cfg_get("psrl.deployment.n_rollout_instances", 1))
         n_rollout_instances = max(1, n_rollout_instances)
 
         if bool(self._cfg_get("psrl.rollout_coordination.redundant_rollout.enable", False)):
-            redundant_global_batch_size = self._cfg_get("psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size", None)
+            redundant_global_batch_size = self._cfg_get(
+                "psrl.rollout_coordination.redundant_rollout.redundant_global_batch_size",
+                None,
+            )
             if redundant_global_batch_size is not None:
                 return max(
                     1,
@@ -148,10 +151,22 @@ class RolloutGateway:
         session_ip = self.smg_ip
         session_client_concurrency = self._estimate_http_client_concurrency()
 
-        def _run_session_router(smg_url, host, port, client_concurrency, logging_path):
+        def _run_session_router(
+            smg_url,
+            host,
+            port,
+            client_concurrency,
+            trajectory_id_strategy,
+            logging_path,
+        ):
             import uvicorn
 
-            from psrl.workers.gen.session_router import SessionRouter, psrl_logger as session_logger
+            from psrl.workers.gen.session_router import (
+                SessionRouter,
+            )
+            from psrl.workers.gen.session_router import (
+                psrl_logger as session_logger,
+            )
 
             if logging_path:
                 session_logger.addHandler(DualOutputHandler(logging_path, "SessionRouter"))
@@ -159,12 +174,20 @@ class RolloutGateway:
             router = SessionRouter(
                 smg_url=smg_url,
                 client_concurrency=client_concurrency,
+                trajectory_id_strategy=trajectory_id_strategy,
             )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
         self.session_router_process = multiprocessing.Process(
             target=_run_session_router,
-            args=(self.smg_url, session_ip, session_port, session_client_concurrency, self.config.psrl.logging_path),
+            args=(
+                self.smg_url,
+                session_ip,
+                session_port,
+                session_client_concurrency,
+                get_trajectory_id_strategy(self.config),
+                self.config.psrl.logging_path,
+            ),
         )
         self.session_router_process.daemon = True
         self.session_router_process.start()

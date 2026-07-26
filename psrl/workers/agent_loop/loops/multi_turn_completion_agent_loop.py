@@ -53,6 +53,7 @@ class MultiTurnCompletionAgentLoop(SessionAgentLoop):
                         sampling_params,
                         tools=tools,
                         chat_template_kwargs=agent_data.apply_chat_template_kwargs,
+                        multi_modal_data=agent_data.prepare_chat_completion_multimodal_data(),
                     )
                 except PromptOverflowError:
                     terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
@@ -88,8 +89,8 @@ class MultiTurnCompletionAgentLoop(SessionAgentLoop):
             if terminate_reason == TerminateReason.FINISHED and not done:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
 
-            arrays = await self.get_training_arrays(session_id, request.get("trajectory_id", 0))
-            self.attach_training_arrays(agent_data, arrays)
+            training_data = await self.get_primary_training_data(session_id)
+            self.attach_training_data(agent_data, training_data)
             return await agent_data.finalize_output(), terminate_reason
         finally:
             try:

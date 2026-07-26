@@ -14,7 +14,7 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     request_raw,
 )
-from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH
+from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH, TRAJECTORY_ID_STRATEGIES
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -27,6 +27,9 @@ SESSION_HUNG = "hung"
 # on vLLM/SMG (generate) or between turns / calling the environment (env).
 STATUS_GENERATE = "generate"
 STATUS_ENV = "env"
+
+SESSION_ID_HEADER = "x-smg-tito-session-id"
+TRAJECTORY_ID_HEADER = "x-smg-tito-trajectory-id"
 
 
 @dataclass(slots=True)
@@ -91,11 +94,17 @@ class SessionRouter:
         self,
         smg_url: str,
         client_concurrency: int = 1024,
+        trajectory_id_strategy: str = "manual",
     ):
+        trajectory_id_strategy = trajectory_id_strategy.lower()
+        if trajectory_id_strategy not in TRAJECTORY_ID_STRATEGIES:
+            choices = ", ".join(sorted(TRAJECTORY_ID_STRATEGIES))
+            raise ValueError(f"Invalid trajectory_id_strategy {trajectory_id_strategy!r}; expected one of: {choices}.")
         self.smg_url = smg_url.rstrip("/")
         self.app = FastAPI()
         self.client: aiohttp.ClientSession | None = None
         self.client_concurrency = client_concurrency
+        self.trajectory_id_strategy = trajectory_id_strategy
         self.states: dict[str, SessionState] = {}
         self.states_lock = asyncio.Lock()
         self.setup_routes()
@@ -124,10 +133,9 @@ class SessionRouter:
         result = await self._request_upstream("POST", TITO_SESSIONS_PATH)
         if result.status < 400:
             session_id = self.extract_session_id(result)
-            if session_id is not None:
-                state = await self._ensure_state(session_id)
-                async with state.lock:
-                    state.headers = self.session_headers(request.headers)
+            state = await self._ensure_state(session_id)
+            async with state.lock:
+                state.headers = self.session_headers(request.headers, session_id)
         return self.build_response(result)
 
     async def get_session(self, sid: str) -> Response:
@@ -164,8 +172,11 @@ class SessionRouter:
         """Handle a chat completion request within a TITO session."""
         state = await self._ensure_state(sid)
 
-        # Extract trajectory_id from request headers (set in add_session_headers)
-        trajectory_id = self._extract_trajectory_id(request)
+        # SMG owns trajectory resolution in auto mode, so the SessionRouter only
+        # tracks caller-selected IDs in manual mode.
+        trajectory_id = (
+            int(request.headers.get(TRAJECTORY_ID_HEADER, "0")) if self.trajectory_id_strategy == "manual" else None
+        )
 
         # Hang point: block at the entry of the next turn while the session is
         # hung. Any in-flight turn (generate on SMG or an env step between turns)
@@ -179,17 +190,13 @@ class SessionRouter:
                 if state.hang_state != SESSION_HUNG:
                     break
                 continue_event = state.continue_event
-            psrl_logger.debug(
-                f"Session {sid!r} trajectory {trajectory_id} blocked at hang point, "
-                f"awaiting continue."
-            )
+            psrl_logger.debug(f"Session {sid!r} trajectory {trajectory_id} blocked at hang point, awaiting continue.")
             await continue_event.wait()
 
         async with state.lock:
             if state.closing:
                 return JSONResponse(status_code=409, content={"error": "session is closing"})
-            expected_turn = state.get_trajectory_turn(trajectory_id)
-            session_headers = state.headers
+            session_headers = state.headers.copy()
             base_worker_id = state.base_worker_id
             target_dp_rank = state.target_dp_rank
             version_tag = state.version_tag
@@ -199,7 +206,7 @@ class SessionRouter:
             state.inflight += 1
             state.drained.clear()
 
-        headers = self.add_session_headers(request, sid, session_headers)
+        headers = self.add_session_headers(request, session_headers)
         if base_worker_id is not None:
             headers["x-base-worker-id"] = base_worker_id
         if target_dp_rank is not None:
@@ -213,10 +220,7 @@ class SessionRouter:
             headers["x-base-worker-id"] = pin_once_instance[0]
             headers["x-target-dp-rank"] = pin_once_instance[1]
             headers["x-force-pin-once"] = "true"
-            psrl_logger.debug(
-                f"Session {sid!r} turn force-pinned to instance {pin_once_instance!r} "
-                f"(one-shot)."
-            )
+            psrl_logger.debug(f"Session {sid!r} turn force-pinned to instance {pin_once_instance!r} (one-shot).")
         result: HttpResponse | None = None
         try:
             result = await self._request_upstream(
@@ -247,23 +251,8 @@ class SessionRouter:
                     # TITO context, so prompt+completion is the live footprint.
                     self._update_total_tokens(state, result)
 
-                    # Check for out-of-order response arrival
-                    current_turn = state.get_trajectory_turn(trajectory_id)
-                    if current_turn != expected_turn:
-                        # This is a turn skew: response arrived out of order.
-                        # With trajectory-aware tracking, this is expected during
-                        # partial rollout re-dispatch and doesn't block progress.
-                        psrl_logger.debug(
-                            "SessionRouter turn skew for sid=%s trajectory_id=%s "
-                            "expected_turn=%s current_turn=%s. "
-                            "This is expected during re-dispatch (hybrid fix active).",
-                            sid,
-                            trajectory_id,
-                            expected_turn,
-                            current_turn,
-                        )
-
-                    state.advance_trajectory_turn(trajectory_id)
+                    if trajectory_id is not None:
+                        state.advance_trajectory_turn(trajectory_id)
 
                 # Deferred-hang conversion: a hang requested mid-turn takes effect
                 # now that this trajectory has returned and the session is idle.
@@ -272,8 +261,7 @@ class SessionRouter:
                     state.hang_state = SESSION_HUNG
                     state.continue_event.clear()
                     psrl_logger.debug(
-                        f"Session {sid!r} deferred hang applied at turn boundary "
-                        f"(trajectory {trajectory_id})."
+                        f"Session {sid!r} deferred hang applied at turn boundary (trajectory {trajectory_id})."
                     )
 
         return self.build_response(result)
@@ -281,8 +269,8 @@ class SessionRouter:
     async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
         state = await self._ensure_state(sid)
         async with state.lock:
-            session_headers = state.headers
-        headers = self.add_session_headers(request, sid, session_headers)
+            session_headers = state.headers.copy()
+        headers = self.add_session_headers(request, session_headers)
         result = await self._request_upstream(
             request.method,
             path,
@@ -345,12 +333,8 @@ class SessionRouter:
                     state.marked_for_hang = True
                     deferred.append(sid)
         if applied or deferred or missing:
-            psrl_logger.info(
-                f"control_hang: hung={applied} deferred={deferred} missing={missing}."
-            )
-        return JSONResponse(
-            content={"hung": applied, "deferred": deferred, "missing": missing}
-        )
+            psrl_logger.info(f"control_hang: hung={applied} deferred={deferred} missing={missing}.")
+        return JSONResponse(content={"hung": applied, "deferred": deferred, "missing": missing})
 
     async def control_continue(self, request: Request) -> Response:
         """Continue (un-hang) the given sessions.
@@ -380,9 +364,7 @@ class SessionRouter:
                 applied.append(sid)
         if applied or missing:
             pinned = {sid: inst for sid, inst in pins.items() if inst is not None}
-            psrl_logger.info(
-                f"control_continue: continued={applied} missing={missing} pinned={pinned}."
-            )
+            psrl_logger.info(f"control_continue: continued={applied} missing={missing} pinned={pinned}.")
         return JSONResponse(content={"continued": applied, "missing": missing})
 
     @staticmethod
@@ -459,7 +441,7 @@ class SessionRouter:
         async with self.states_lock:
             state = self.states.get(sid)
             if state is None:
-                state = SessionState()
+                state = SessionState(headers={SESSION_ID_HEADER: sid})
                 self.states[sid] = state
             return state
 
@@ -467,7 +449,6 @@ class SessionRouter:
         self,
         method: str,
         path: str,
-        *,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
     ) -> HttpResponse:
@@ -512,25 +493,8 @@ class SessionRouter:
         return self.client
 
     @staticmethod
-    def _extract_trajectory_id(request: Request) -> int:
-        """Extract trajectory_id from x-smg-tito-trajectory-id header.
-
-        Returns:
-            int: The trajectory_id, or 0 if not present or invalid.
-        """
-        trajectory_id_str = request.headers.get("x-smg-tito-trajectory-id", "0")
-        return int(trajectory_id_str)
-
-    @staticmethod
     def build_response(result: HttpResponse) -> Response:
         content_type = result.headers.get("content-type", "")
-        if not result.body or result.status in (204, 304):
-            return Response(
-                content=result.body,
-                status_code=result.status,
-                headers=result.headers,
-                media_type=content_type or None,
-            )
         return Response(
             content=result.body,
             status_code=result.status,
@@ -539,33 +503,39 @@ class SessionRouter:
         )
 
     @staticmethod
-    def extract_session_id(result: HttpResponse) -> str | None:
-        session_id = result.json().get("session_id")
-        return session_id if isinstance(session_id, str) else None
+    def extract_session_id(result: HttpResponse) -> str:
+        session_id = result.json()["session_id"]
+        return session_id
 
     @staticmethod
-    def session_headers(headers) -> dict[str, str]:
-        """Capture immutable routing metadata supplied when a session is created."""
+    def session_headers(headers, sid: str) -> dict[str, str]:
+        """Capture session defaults and bind them to the session identity."""
         allowed = {
-            "x-base-worker-id",
-            "x-is-sticky",
-            "x-is-validate",
             "x-prompt-id",
             "x-request-id",
-            "x-smg-tito-trajectory-id",
-            "x-target-dp-rank",
+            "x-is-validate",
+            "x-is-sticky",
             "x-version-tag",
+            "x-base-worker-id",
+            "x-target-dp-rank",
         }
-        return {key.lower(): value for key, value in headers.items() if key.lower() in allowed}
+        session_headers = {key.lower(): value for key, value in headers.items() if key.lower() in allowed}
+        session_headers[SESSION_ID_HEADER] = sid
+        return session_headers
 
-    @staticmethod
     def add_session_headers(
+        self,
         request: Request,
-        sid: str,
-        session_headers: dict[str, str] | None = None,
+        session_headers: dict[str, str],
     ) -> dict[str, str]:
-        headers = filter_http_headers(request.headers)
-        headers.update(session_headers or {})
-        headers["x-smg-tito-session-id"] = sid
-        headers.setdefault("x-smg-tito-trajectory-id", "0")
+        # Session headers are defaults and request-scoped values take precedence.
+        # The session identity is reserved and can only come from SessionState.
+        request_headers = filter_http_headers(request.headers)
+        request_headers.pop(SESSION_ID_HEADER, None)
+        if self.trajectory_id_strategy == "auto":
+            request_headers.pop(TRAJECTORY_ID_HEADER, None)
+        headers = dict(session_headers)
+        headers.update(request_headers)
+        if self.trajectory_id_strategy == "manual":
+            headers.setdefault(TRAJECTORY_ID_HEADER, "0")
         return headers

@@ -10,11 +10,9 @@ WORKERS_UPDATE_WEIGHT_VERSION_PATH = "/workers/update_weight_version"
 WORKERS_STATS_PATH = "/workers/stats"
 ROUTING_LOOP_STATUS_PATH = "/routing_loop/status"
 TITO_SESSIONS_PATH = "tito/sessions"
+TRAJECTORY_ID_STRATEGIES = frozenset({"auto", "manual"})
 
 CACHE_AWARE_METHODS = frozenset({"cache_aware", "cache_aware_v1"})
-
-# Legacy top-level routing_strategy keys kept for backward compatibility.
-_LEGACY_CACHE_AWARE_KEYS = frozenset({"cache_threshold", "gpu_overlap_weight", "lmcache_overlap_weight"})
 
 
 def is_cache_aware_method(method: str) -> bool:
@@ -30,14 +28,19 @@ def cfg_get(config: Any, path: str, default: Any = None) -> Any:
     return node if node is not None else default
 
 
+def get_trajectory_id_strategy(config: Any) -> str:
+    """Return the validated TITO trajectory ID strategy configured for PSRL."""
+    strategy = str(cfg_get(config, "psrl.rollout_gateway.trajectory_id_strategy", "manual")).lower()
+    if strategy not in TRAJECTORY_ID_STRATEGIES:
+        choices = ", ".join(sorted(TRAJECTORY_ID_STRATEGIES))
+        raise ValueError(f"Invalid trajectory_id_strategy {strategy!r}; expected one of: {choices}.")
+    return strategy
+
+
 def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
     nested = cfg_get(config, f"psrl.rollout_coordination.routing_strategy.cache_aware_policy.{key}", None)
     if nested is not None:
         return nested
-    if key in _LEGACY_CACHE_AWARE_KEYS:
-        legacy = cfg_get(config, f"psrl.rollout_coordination.routing_strategy.{key}", None)
-        if legacy is not None:
-            return legacy
     return default
 
 
@@ -51,8 +54,12 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
     # KV-cache transfer when a request is re-routed to a different instance
     # (hint != selected). Independent of coordinator-side imbalance migration.
     kv_transfer_enable = bool(cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.enable", False))
-    kv_transfer_mode = str(cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode", "async"))
-    kv_transfer_timeout_ms = int(cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_timeout_ms", 30000))
+    kv_transfer_mode = str(
+        cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode", "async")
+    )
+    kv_transfer_timeout_ms = int(
+        cfg_get(config, "psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_timeout_ms", 30000)
+    )
 
     psrl_logger.info(
         "[sticky] SMG router args: enable_group_sticky=%s, kv_transfer_enable=%s, kv_transfer_mode=%s",
@@ -102,13 +109,17 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         max_num_waiting_reqs_after_preemption=int(
             cfg_get(config, "psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
         ),
-        delta_throughput_threshold=float(cfg_get(config, "psrl.rollout_coordination.routing_strategy.delta_throughput_threshold", 0.5)),
+        delta_throughput_threshold=float(
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.delta_throughput_threshold", 0.5)
+        ),
         max_prompt_length=int(
             cfg_get(config, "data.max_prompt_length", cfg_get(config, "rollout.prompt_length", 8192))
         ),
         request_budget=request_budget,
         enable_routing_loop=True,
-        routing_loop_check_interval_ms=int(cfg_get(config, "psrl.rollout_coordination.routing_strategy.check_interval_in_ms", 10)),
+        routing_loop_check_interval_ms=int(
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.check_interval_in_ms", 10)
+        ),
         routing_loop_request_sort_key=str(
             cfg_get(config, "psrl.rollout_coordination.routing_strategy.request_sort_indicator", "short_length")
         ),
@@ -118,7 +129,9 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         routing_loop_dispatch_batch_size=1,
         worker_selection_strategy="psrl",
         psrl_ps_manager_addr=ps_manager_addr,
-        psrl_candidate_sort_key=str(cfg_get(config, "psrl.rollout_coordination.routing_strategy.candidate_sort_indicator", "version")),
+        psrl_candidate_sort_key=str(
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.candidate_sort_indicator", "version")
+        ),
         psrl_enable_group_sticky=enable_group_sticky,
         psrl_kv_transfer_enable=kv_transfer_enable,
         psrl_kv_transfer_mode=kv_transfer_mode,
@@ -126,6 +139,11 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         enable_tito=True,
         tito_debug=bool(cfg_get(config, "psrl.rollout_gateway.tito_debug", False)),
         tito_gc_threshold=cfg_get(config, "psrl.rollout_gateway.tito_gc_threshold", None),
+        trajectory_id_strategy=get_trajectory_id_strategy(config),
+        multimodal_tensor_transport=str(
+            cfg_get(config, "psrl.rollout_gateway.multimodal_tensor_transport", "auto")
+        ).lower(),
+        multimodal_shm_min_bytes=int(cfg_get(config, "psrl.rollout_gateway.multimodal_shm_min_bytes", 64 * 1024)),
         service_discovery=False,
         prometheus_port=None,
         request_timeout_secs=2**64 - 1,
@@ -191,7 +209,9 @@ def build_reward_router_args(config: Any, host: str, port: int, prometheus_port:
         max_num_waiting_reqs_after_preemption=int(
             cfg_get(config, "psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption", 1000)
         ),
-        delta_throughput_threshold=float(cfg_get(config, "psrl.rollout_coordination.routing_strategy.delta_throughput_threshold", 0.5)),
+        delta_throughput_threshold=float(
+            cfg_get(config, "psrl.rollout_coordination.routing_strategy.delta_throughput_threshold", 0.5)
+        ),
         max_prompt_length=32768,
         request_budget=1024,
         enable_routing_loop=False,

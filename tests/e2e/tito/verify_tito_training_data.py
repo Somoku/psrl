@@ -5,7 +5,7 @@ Validates the full data path through SMG's TITO pipeline:
 1. Session lifecycle (create/get/delete)
 2. Chat completions with forced logprobs through TITO
 3. accumulated_token_ids and per-turn records from SMG
-4. Training array construction (trailing trim, loss mask, logprobs alignment)
+4. Training-data construction (trailing trim, loss mask, logprobs alignment)
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import json
 import sys
 
 import httpx
-from psrl.utils.tito.training_data import build_training_arrays
+from psrl.utils.tito.training_data import build_training_data
 from transformers import AutoTokenizer
 
 CALCULATOR_TOOL = {
@@ -51,11 +51,14 @@ def delete_session(base_url: str, client: httpx.Client, sid: str):
         print(f"  ⚠ Delete failed: {e}")
 
 
-def chat(base_url, client, sid, messages, model, tools=None):
+def chat(base_url, client, sid, messages, model, tools=None, trajectory_id=None):
     body = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 256}
     if tools:
         body["tools"] = tools
-    resp = client.post(f"{base_url}/sessions/{sid}/v1/chat/completions", json=body)
+    headers = None
+    if trajectory_id is not None:
+        headers = {"x-smg-tito-trajectory-id": str(trajectory_id)}
+    resp = client.post(f"{base_url}/sessions/{sid}/v1/chat/completions", json=body, headers=headers)
     resp.raise_for_status()
     return resp.json()
 
@@ -85,18 +88,18 @@ def run_tool(tool_calls):
 # ---------------------------------------------------------------------------
 # Verification logic
 # ---------------------------------------------------------------------------
-def verify_training_arrays(accumulated, records, label, max_trim_tokens: int = 0):
-    """Verify build_training_arrays produces correct output."""
+def verify_training_data(accumulated, records, label, max_trim_tokens: int = 0):
+    """Verify build_training_data produces correct output."""
     try:
-        arrays = build_training_arrays(accumulated, records, max_trim_tokens=max_trim_tokens)
+        training_data = build_training_data(accumulated, records, max_trim_tokens=max_trim_tokens)
     except ValueError as e:
-        print(f"  ✗ build_training_arrays raised ValueError: {e}")
+        print(f"  ✗ build_training_data raised ValueError: {e}")
         return False
-    p = arrays["prompt_ids"]
-    r = arrays["response_ids"]
-    m = arrays["response_mask"]
-    lp = arrays["logprobs"]
-    nt = arrays["num_turns"]
+    p = training_data["prompt_ids"]
+    r = training_data["response_ids"]
+    m = training_data["response_mask"]
+    lp = training_data["logprobs"]
+    nt = training_data["num_turns"]
     errors = []
 
     # 1. Array length consistency
@@ -135,13 +138,13 @@ def verify_training_arrays(accumulated, records, label, max_trim_tokens: int = 0
         errors.append("no model tokens (all mask=0)")
 
     # 7. Last-turn output must fully align with accumulated (no trim on last turn).
-    #    build_training_arrays already guards this; here we double-check for diagnostics.
+    #    build_training_data already guards this; here we double-check for diagnostics.
     if records:
         last_lps = records[-1].get("output_logprobs") or []
         last_output_ids = [int(pair[1]) for pair in last_lps]
         if last_output_ids and accumulated:
             # Compute the start position of the last turn's output in accumulated
-            # by replaying the cursor logic from build_training_arrays.
+            # by replaying the cursor logic from build_training_data.
             cursor = 0
             for rec_i, rec_r in enumerate(records[:-1]):
                 cursor = rec_r["prompt_token_count"] + len(rec_r.get("output_logprobs") or [])
@@ -232,14 +235,14 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
         data = get_session_data(base_url, client, sid)
         max_trim_tokens = data.get("max_trim_tokens", 0)
 
-        # Support both single-trajectory (flat) and multi-trajectory formats.
-        if "trajectories" in data:
-            traj = data["trajectories"][0] if data["trajectories"] else {}
-            acc = traj.get("accumulated_token_ids", [])
-            recs = traj.get("records", [])
-        else:
-            acc = data.get("accumulated_token_ids", [])
-            recs = data.get("records", [])
+        trajectories = data.get("trajectories")
+        if not isinstance(trajectories, list) or len(trajectories) != 1:
+            count = len(trajectories) if isinstance(trajectories, list) else "invalid"
+            print(f"  ✗ Expected one trajectory, got {count}")
+            return False
+        trajectory = trajectories[0]
+        acc = trajectory.get("accumulated_token_ids", [])
+        recs = trajectory.get("records", [])
 
         if not acc:
             print("  ✗ accumulated_token_ids is empty — TITO did not capture data")
@@ -267,7 +270,7 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
                 else:
                     print(f"  ~ Turn {i} TITO mismatch [assistant_text] (expected, non-fatal)")
 
-        ok = verify_training_arrays(acc, recs, "single-turn-tito", max_trim_tokens=max_trim_tokens) and ok
+        ok = verify_training_data(acc, recs, "single-turn-tito", max_trim_tokens=max_trim_tokens) and ok
         return ok
     finally:
         delete_session(base_url, client, sid)
@@ -314,13 +317,14 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
         data = get_session_data(base_url, client, sid)
         max_trim_tokens = data.get("max_trim_tokens", 0)
 
-        if "trajectories" in data:
-            traj = data["trajectories"][0] if data["trajectories"] else {}
-            acc = traj.get("accumulated_token_ids", [])
-            recs = traj.get("records", [])
-        else:
-            acc = data.get("accumulated_token_ids", [])
-            recs = data.get("records", [])
+        trajectories = data.get("trajectories")
+        if not isinstance(trajectories, list) or len(trajectories) != 1:
+            count = len(trajectories) if isinstance(trajectories, list) else "invalid"
+            print(f"  ✗ Expected one trajectory, got {count}")
+            return False
+        trajectory = trajectories[0]
+        acc = trajectory.get("accumulated_token_ids", [])
+        recs = trajectory.get("records", [])
 
         if not acc:
             print("  ✗ accumulated_token_ids is empty — TITO not working")
@@ -348,7 +352,65 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
                 else:
                     print(f"  ~ Turn {i} TITO mismatch [assistant_text] (expected, non-fatal)")
 
-        ok = verify_training_arrays(acc, recs, "multi-turn-tito", max_trim_tokens=max_trim_tokens) and ok
+        ok = verify_training_data(acc, recs, "multi-turn-tito", max_trim_tokens=max_trim_tokens) and ok
+        return ok
+    finally:
+        delete_session(base_url, client, sid)
+
+
+def test_independent_trajectories_with_tito(base_url, client, model, tokenizer):
+    print("\n" + "=" * 60)
+    print("Test 4: Independent conversations in one TITO session")
+    print("=" * 60)
+    sid = create_session(base_url, client)
+    try:
+        first = chat(
+            base_url,
+            client,
+            sid,
+            [{"role": "user", "content": "Return the single word alpha."}],
+            model,
+            trajectory_id=0,
+        )
+        second = chat(
+            base_url,
+            client,
+            sid,
+            [{"role": "user", "content": "Return the single word beta."}],
+            model,
+            trajectory_id=1,
+        )
+        ok = verify_logprobs_in_response(first, "independent-0")
+        ok = verify_logprobs_in_response(second, "independent-1") and ok
+
+        data = get_session_data(base_url, client, sid)
+        trajectories = data.get("trajectories", [])
+        by_id = {str(item.get("trajectory_id", item.get("id", 0))): item for item in trajectories}
+        if set(by_id) != {"0", "1"}:
+            print(f"  ✗ Expected trajectory IDs 0 and 1, got {sorted(by_id)}")
+            return False
+
+        training_data = []
+        for trajectory_id in ("0", "1"):
+            trajectory = by_id[trajectory_id]
+            records = trajectory.get("records", [])
+            if len(records) != 1:
+                print(f"  ✗ trajectory {trajectory_id} has {len(records)} records; expected one")
+                return False
+            if not verify_training_data(
+                trajectory.get("accumulated_token_ids", []),
+                records,
+                f"independent-{trajectory_id}",
+                max_trim_tokens=data.get("max_trim_tokens", 0),
+            ):
+                ok = False
+            training_data.append(build_training_data(trajectory.get("accumulated_token_ids", []), records))
+
+        if training_data[0]["prompt_ids"] == training_data[1]["prompt_ids"]:
+            print("  ✗ Independent conversations unexpectedly have identical prompts")
+            ok = False
+        else:
+            print("  ✓ Independent prompts were preserved as separate training samples")
         return ok
     finally:
         delete_session(base_url, client, sid)
@@ -385,6 +447,7 @@ def main():
         ("lifecycle", test_lifecycle(base, client)),
         ("single-turn", test_single_turn_with_tito(base, client, model, tokenizer)),
         ("multi-turn", test_multi_turn_with_tito(base, client, model, args.max_turns, tokenizer)),
+        ("independent", test_independent_trajectories_with_tito(base, client, model, tokenizer)),
     ]
 
     print("\n" + "=" * 60)

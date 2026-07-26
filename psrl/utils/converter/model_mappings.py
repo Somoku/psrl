@@ -98,13 +98,28 @@ def reshape_qkv_to_3d(
     return make_slice_parameter(reshaped_data, param)
 
 
-def reshape_visual_block_qkv(param):
+def reshape_visual_block_qkv(param, vision_head_size: int | None = None):
     """
-    For Qwen3.5, reshape qkv to support correct tp sharding (shard_dim=1)
+    For Qwen3.5, reshape qkv to support correct tp sharding (shard_dim=1).
+
+    When vision_head_size is provided, produces the 4-D layout
+    [3, num_heads_local, head_size, ...] that is consistent with the PS/HF
+    converter format, enabling NIXL weight sync between gen and PS clients.
+    Without vision_head_size, falls back to the simpler 3-D layout
+    [3, rows/3, ...].
     """
     rows = param.shape[0]
     assert rows % 3 == 0, f"Expected rows={rows} to be divisible by 3 for visual block qkv weights."
-    reshaped_data = param.data.reshape(3, rows // 3, *param.shape[1:])
+    if vision_head_size and rows % (3 * vision_head_size) == 0:
+        num_heads_local = rows // (3 * vision_head_size)
+        if len(param.shape) == 1:
+            # Bias: [3*H*h] → [3, H, h, 1]
+            reshaped_data = param.data.reshape(3, num_heads_local, vision_head_size, 1)
+        else:
+            # Weight: [3*H*h, hidden] → [3, H, h, hidden]
+            reshaped_data = param.data.reshape(3, num_heads_local, vision_head_size, *param.shape[1:])
+    else:
+        reshaped_data = param.data.reshape(3, rows // 3, *param.shape[1:])
     return make_slice_parameter(reshaped_data, param)
 
 
@@ -741,6 +756,10 @@ class ParameterMapping(ABC):
                 info["vision_head_size"] = vision_head_size
 
         return info
+
+    def get_external_fp32_param_patterns(self) -> tuple[str, ...]:
+        """Return unified key substrings for params that must be exposed to PS/vLLM as fp32."""
+        return ("A_log",)
 
 
 class ModelRegistry:

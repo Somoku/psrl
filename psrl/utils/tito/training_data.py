@@ -1,7 +1,7 @@
-"""Build RL training arrays from TITO session data.
+"""Build RL training data from a TITO trajectory.
 
 Converts accumulated_token_ids + per-turn records (from SMG GET /tito/sessions)
-into prompt_ids, response_ids, response_mask, and logprobs arrays.
+into the canonical prompt, response, mask, and log-probability fields.
 """
 
 from __future__ import annotations
@@ -39,13 +39,13 @@ def _assemble_routed_experts(records: list[dict], total_len: int) -> np.ndarray 
     return routed_experts
 
 
-def build_training_arrays(
+def build_training_data(
     accumulated_token_ids: list[int],
     records: list[dict],
     max_trim_tokens: int = 0,
     prompt_ids_override: list[int] | None = None,
 ) -> dict:
-    """Convert TITO session data into training arrays.
+    """Convert one TITO trajectory into canonical training data.
 
     Args:
         accumulated_token_ids: Full token sequence from TITO store (prompt + all turns).
@@ -188,7 +188,7 @@ def build_training_arrays(
     routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
 
     psrl_logger.debug(
-        "[TITO build_training_arrays] prompt_len=%d tito_prompt_len=%d response_len=%d "
+        "[TITO build_training_data] prompt_len=%d tito_prompt_len=%d response_len=%d "
         "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d re_tokens=%s",
         len(prompt_ids),
         first_prompt_len,
@@ -202,7 +202,7 @@ def build_training_arrays(
 
     if not all_response_ids and records:
         psrl_logger.error(
-            "[TITO] build_training_arrays: response_ids empty but num_turns=%d! "
+            "[TITO] build_training_data: response_ids empty but num_turns=%d! "
             "records=%s, accumulated_len=%d, prompt_len=%d",
             len(records),
             [

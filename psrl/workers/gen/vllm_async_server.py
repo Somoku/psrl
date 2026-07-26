@@ -33,7 +33,6 @@ from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_NAME,
     VLLM_LORA_PATH,
     build_cli_args_from_config,
-    build_mtp_speculative_config,
     get_vllm_max_lora_rank,
 )
 from verl.workers.rollout.vllm_rollout.vllm_async_server import (
@@ -411,11 +410,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # mtp (None for diffusion models; only LLM models use speculative decoding)
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
-            args["speculative_config"] = build_mtp_speculative_config(
-                self.config.mtp.method,
-                self.config.mtp.num_speculative_tokens,
-                args.get("speculative_config"),
-            )
+            speculative_config = {
+                "method": self.config.mtp.method,
+                "num_speculative_tokens": self.config.mtp.num_speculative_tokens,
+            }
+            args["speculative_config"] = speculative_config
 
         # Always report data_parallel_size so SMG's DP discovery step can find it
         # in the gRPC server_info response (required for worker registration).
@@ -620,11 +619,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         start_time = time.time()
         kv_transfer_cfg = self.psrl_config.rollout_coordination.routing_strategy.get("kv_transfer", {})
         kv_transfer_enabled = bool(kv_transfer_cfg.get("enable", False))
-        stats_log_interval_s = (
-            float(kv_transfer_cfg.get("stats_log_interval_s", 30))
-            if kv_transfer_enabled
-            else 0.0
-        )
+        stats_log_interval_s = float(kv_transfer_cfg.get("stats_log_interval_s", 30)) if kv_transfer_enabled else 0.0
         servicer = VllmEngineServicer(
             engine_client,
             start_time,
@@ -737,8 +732,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 last_error = str(exc)
 
             psrl_logger.debug(
-                "Waiting for gRPC servicer before gateway registration: replica=%s target=%s "
-                "attempt=%d error=%s",
+                "Waiting for gRPC servicer before gateway registration: replica=%s target=%s attempt=%d error=%s",
                 self.get_replica_idx(),
                 self._grpc_health_probe_target(),
                 attempt,
@@ -846,7 +840,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         # Try to reset prefix cache to ensure clean state
         if reset_prefix_cache:
-            await self.engine.reset_prefix_cache(reset_connector=True)
+            await self.clear_kv_cache()
 
         return {"aborted_count": len(request_ids), "request_ids": request_ids}
 
@@ -981,6 +975,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         request_id: str,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
+        audio_data: list[Any] | None = None,
         priority: int = 0,
         data_parallel_rank: int = 0,
         version_tag: int | None = None,
@@ -995,6 +990,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 request_id=request_id,
                 image_data=image_data,
                 video_data=video_data,
+                audio_data=audio_data,
                 data_parallel_rank=data_parallel_rank,
                 version_tag=version_tag,
                 is_validate=is_validate,
@@ -1074,8 +1070,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        prompt = TokensPrompt(**prompt_kwargs)
 
         # Add lora request
         lora_request = None
@@ -1153,12 +1152,19 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.active_task_num[data_parallel_rank] -= 1
         self.log_active_tasks(data_parallel_rank, task_done=True)
 
+        multi_modal_data = {
+            k: v for k, v in (("images", image_data), ("videos", video_data), ("audios", audio_data)) if v is not None
+        }
+        if not multi_modal_data:
+            multi_modal_data = None
+
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=token_ids,
             response_mask=[1] * len(token_ids),
             response_log_probs=log_probs,
             routed_experts=routed_experts,
+            multi_modal_data=multi_modal_data,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             interrupted=interrupted,
@@ -1172,6 +1178,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         request_id: str,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
+        audio_data: list[Any] | None = None,
         data_parallel_rank: int = 0,
         version_tag: int | None = None,
         is_validate: bool = False,
@@ -1222,8 +1229,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             multi_modal_data["image"] = image_data
         if video_data is not None:
             multi_modal_data["video"] = video_data
+        if audio_data is not None:
+            multi_modal_data["audio"] = audio_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids, "multi_modal_data": multi_modal_data}
+        prompt = TokensPrompt(**prompt_kwargs)
 
         if data_parallel_rank not in self.active_task_num:
             self.active_task_num[data_parallel_rank] = 0
@@ -1258,11 +1268,18 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.active_task_num[data_parallel_rank] -= 1
         self.log_active_tasks(data_parallel_rank, task_done=True)
 
+        multi_modal_data = {
+            k: v for k, v in (("images", image_data), ("videos", video_data), ("audios", audio_data)) if v is not None
+        }
+        if not multi_modal_data:
+            multi_modal_data = None
+
         return TokenOutput(
             prompt_ids=prompt_ids,
             response_ids=[],
             response_mask=[],
             pooling_output=pooling_output,
+            multi_modal_data=multi_modal_data,
             stop_reason="completed",
             interrupted=False,
             update_status=update_status,
@@ -1364,7 +1381,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             worker_zmq_urls: This replica's rank-sorted local LMCacheWorker ZMQ URLs.
         """
         assert self.kv_cache_manager is not None, "KVCacheManager is not initialized. Call launch_server() first."
-        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)    
+        self.kv_cache_manager.set_peer_registry(registry, worker_zmq_urls)
 
     def set_lmcache_controller_url(self, controller_url: str) -> None:
         """Receive the shared LMCache Controller URL from `RolloutCoordinator`."""
@@ -1376,11 +1393,11 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     def kv_set_current_version(self, version: int) -> None:
         """
-        Set the current model version for KV cache tagging.
+        Commit this replica's actual model version for KV cache tagging.
 
-        Called by `RolloutCoordinator._broadcast_kv_current_version()` after a
-        weight sync completes and before the router admission loop is reopened,
-        ensuring every new request after this point carries the updated version tag.
+        The version is written locally only after this replica has completed its
+        weight pull. This keeps LMCache tags aligned with the weights that produced
+        the KV tensors and avoids advancing unrelated replicas.
 
         Args:
             version (int): The new model version number.
@@ -1395,7 +1412,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         data_parallel_rank = 0  # take dp 0 as representative for the replica
 
         if self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version:
-            return self.curr_rollout_instance_model_version[data_parallel_rank]
+            curr_model_version = self.curr_rollout_instance_model_version[data_parallel_rank]
+            self.kv_set_current_version(curr_model_version)
+            return curr_model_version
 
         async with shared_pull_model_context_async(self.gen_interface.ps_manager_handle):
             with log_dual_events("Pull model (partial rollout)", psrl_logger, event_type=EventType.PULL):
@@ -1404,18 +1423,19 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         curr_model_version = await self.gen_interface.ps_manager_handle.get_rollout_instance_model_version.remote(
             (self.base_worker_id, data_parallel_rank)
         )
+        assert curr_model_version >= ps_version, (
+            f"Current rollout instance model version should not be less than the required PS version, "
+            f"but got {curr_model_version} vs. {ps_version}."
+        )
         for dp_rank in data_parallel_ranks:
             self.curr_rollout_instance_model_version[dp_rank] = curr_model_version
+        self.kv_set_current_version(curr_model_version)
 
-        assert self.curr_rollout_instance_model_version[data_parallel_rank] >= ps_version, (
-            f"Current rollout instance model version should not be less than the required PS version, "
-            f"but got {self.curr_rollout_instance_model_version[data_parallel_rank]} vs. {ps_version}"
-        )
-        if self.curr_rollout_instance_model_version[data_parallel_rank] > ps_version:
+        if curr_model_version > ps_version:
             psrl_logger.warning(
                 f"Actual model version after pull (partial rollout) is "
-                f"{self.curr_rollout_instance_model_version[data_parallel_rank]}, "
-                f"which is higher than the required PS version {ps_version}"
+                f"{curr_model_version}, "
+                f"which is higher than the required PS version {ps_version}."
             )
         if self.stat_collector is not None:
             for dp_rank in data_parallel_ranks:

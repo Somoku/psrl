@@ -4,7 +4,7 @@
 #  - "null": disable TMS
 #  - "train": enable TMS for training workers only
 #  - "all": enable TMS for both rollout and training workers
-range: all
+range: null
 
 # Whether to enable TMS on CUDA graphs
 # When enabled, CUDA graphs will be released by TMS to save GPU memory
@@ -14,4 +14,4 @@ enable_cuda_graph: False
 # Whether to enable TMS on NIXL temp buffers
 # When enabled, NIXL temp buffers will be released by TMS to save GPU
 # and the reregister will be simplified.
-enable_nixl: True
+enable_nixl: False

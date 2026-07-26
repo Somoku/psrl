@@ -15,7 +15,6 @@ from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils import hf_tokenizer
 from verl.utils import tensordict_utils as tu
 from verl.utils.fs import copy_to_local
-from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 from psrl.utils.logger import (
@@ -27,6 +26,7 @@ from psrl.utils.server.command import Command, CommandExtension, CommandType
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.reward.reward_loop import load_reward_manager
 from psrl.workers.reward.reward_model import RewardModelManager
+from psrl.workers.reward.utils import ensure_reward_attention_mask
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -694,8 +694,7 @@ class RewardLoopManager(CommandExtension):
             raw_response_len = f.pop("response_len", 1)
             if raw_response_len <= 0:
                 psrl_logger.error(
-                    "wait_for_reward_of_requests: response_len=%d for key=%s, "
-                    "reward_score=%s, reward_keys=%s",
+                    "wait_for_reward_of_requests: response_len=%d for key=%s, reward_score=%s, reward_keys=%s",
                     raw_response_len,
                     request_keys_to_put[i] if i < len(request_keys_to_put) else "?",
                     f.get("reward_score"),
@@ -891,91 +890,8 @@ class RewardLoopManager(CommandExtension):
             coefs.append(reward_model_dict.get("reward_coef", 1.0))
         return reward_spec_keys, reward_managers, coefs
 
-    def _compute_multi_modal_inputs(self, data: TensorDict, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Compute multi-modal inputs with image and video.
-
-        Mirrors ``PSRL_AgentLoopManager._compute_multi_modal_inputs`` but omits
-        ``images_seqlens`` computation (not needed by reward functions).
-        """
-        multi_modal_inputs = {}
-        if self.processor is None:
-            return multi_modal_inputs
-
-        images = tu.get(data, "multi_modal_data", {})[0].get("images", None)
-        videos = tu.get(data, "multi_modal_data", {})[0].get("videos", None)
-        # split the videos and according metadatas
-        if videos is not None:
-            videos, video_metadatas = zip(*videos, strict=False)
-            videos, video_metadatas = list(videos), list(video_metadatas)
-        else:
-            video_metadatas = None
-        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-        multi_modal_inputs = self.processor(
-            text=[current_text],
-            images=images,
-            videos=videos,
-            video_metadata=video_metadatas,
-            return_tensors="pt",
-            do_sample_frames=False,
-        )
-        multi_modal_inputs.pop("input_ids", None)
-        multi_modal_inputs.pop("attention_mask", None)
-
-        # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
-        # because np.array() only keeps the keys for BatchFeature.
-        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
-        image_grid_thw = multi_modal_inputs.get("image_grid_thw")
-        if image_grid_thw is not None:
-            images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
-            multi_modal_inputs["images_seqlens"] = images_seqlens
-        return multi_modal_inputs
-
-    def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
-        """Compute position ids for multi-modal inputs."""
-        if self.processor is None:
-            return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
-
-        multi_modal_kwargs = {
-            "image_grid_thw": multi_modal_inputs.get("image_grid_thw"),
-            "video_grid_thw": multi_modal_inputs.get("video_grid_thw"),
-        }
-        # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
-        if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
-            mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[0][input_ids[0] == self.processor.image_token_id] = 1
-            mm_token_type_ids[0][input_ids[0] == self.processor.video_token_id] = 2
-            multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
-
-        # Model's get_rope_index has been dynamically bind to the processor.
-        vision_position_ids, _ = self.processor.get_rope_index(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            **multi_modal_kwargs,
-        )
-        vision_position_ids = vision_position_ids.transpose(0, 1)  # (3, 1, seq_len) => (1, 3, seq_len)
-
-        valid_mask = attention_mask[0].bool()
-        text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
-        text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
-        text_position_ids = text_position_ids.unsqueeze(0)
-        position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
-        return position_ids
-
     def pre_process(self, inputs: TensorDict) -> TensorDict:
-        """Add attention_mask and position_ids to TensorDict's tensor batch."""
-        prompts = tu.get(inputs, "prompts").squeeze(0)  # [1, prompt_len] -> [prompt_len]
-        responses = tu.get(inputs, "responses").squeeze(0)  # [1, response_len] -> [response_len]
-        # prompts and responses are 1D unpadded tensors stored per-sample in TQ.
-        input_ids = torch.cat([prompts, responses], dim=0)
-        attention_mask = torch.ones_like(input_ids, dtype=torch.int64)  # No padding
-        # _compute_multi_modal_inputs and _compute_position_ids expect [1, seq_len].
-        multi_modal_inputs = self._compute_multi_modal_inputs(inputs, input_ids.unsqueeze(0))
-        position_ids = self._compute_position_ids(
-            input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
-        )
-        inputs["attention_mask"] = attention_mask.unsqueeze(0)
-        inputs["position_ids"] = position_ids
-        return inputs
+        return ensure_reward_attention_mask(inputs)
 
     async def compute_score_local(
         self,

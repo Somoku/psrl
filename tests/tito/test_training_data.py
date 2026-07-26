@@ -4,7 +4,7 @@ import base64
 import io
 
 import numpy as np
-from psrl.utils.tito.training_data import build_training_arrays
+from psrl.utils.tito.training_data import build_training_data
 
 
 def _npy_b64(arr: np.ndarray) -> str:
@@ -23,7 +23,7 @@ def test_single_turn_no_trim():
             "finish_reason": "stop",
         }
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records)
     assert result["prompt_ids"] == [1, 2, 3]
     assert result["response_ids"] == [10, 11, 12]
     assert result["response_mask"] == [1, 1, 1]
@@ -45,7 +45,7 @@ def test_two_turns_with_env_tokens():
             "finish_reason": "stop",
         },
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records)
     assert result["prompt_ids"] == [1, 2, 3]
     assert result["response_ids"] == [10, 11, 20, 21, 30, 31]
     assert result["response_mask"] == [1, 1, 0, 0, 1, 1]
@@ -67,21 +67,21 @@ def test_trailing_trim():
             "finish_reason": "stop",
         },
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records, max_trim_tokens=1)
     assert result["response_ids"] == [10, 11, 20, 30, 31]
     assert result["response_mask"] == [1, 1, 0, 1, 1]
     assert result["logprobs"] == [-0.5, -0.3, 0.0, -0.2, -0.1]
 
 
 def test_empty_records():
-    result = build_training_arrays([], [])
+    result = build_training_data([], [])
     assert result["prompt_ids"] == []
     assert result["response_ids"] == []
     assert result["num_turns"] == 0
 
 
 def test_no_logprobs():
-    """Records without logprobs should still work."""
+    """Records without logprobs recover token IDs and use neutral logprobs."""
     accumulated = [1, 2, 3]
     records = [
         {
@@ -90,10 +90,11 @@ def test_no_logprobs():
             "finish_reason": "stop",
         }
     ]
-    result = build_training_arrays(accumulated, records)
+    result = build_training_data(accumulated, records)
     assert result["prompt_ids"] == [1, 2]
-    assert result["response_ids"] == []
-    assert result["response_mask"] == []
+    assert result["response_ids"] == [3]
+    assert result["response_mask"] == [1]
+    assert result["logprobs"] == [0.0]
 
 
 def test_routed_experts_none_when_absent():
@@ -106,7 +107,7 @@ def test_routed_experts_none_when_absent():
             "finish_reason": "stop",
         }
     ]
-    assert build_training_arrays(accumulated, records)["routed_experts"] is None
+    assert build_training_data(accumulated, records)["routed_experts"] is None
 
 
 def test_routed_experts_cross_turn_assembly():
@@ -146,7 +147,7 @@ def test_routed_experts_cross_turn_assembly():
             },
         },
     ]
-    re = build_training_arrays(accumulated, records)["routed_experts"]
+    re = build_training_data(accumulated, records)["routed_experts"]
     # 9 tokens assembled, last sampled token has no RE → 8 rows.
     assert re.shape == (8, num_layers, top_k)
     assert re.dtype == np.uint8

@@ -113,7 +113,6 @@ examples/mini_swe/
 # Core integration modules inside psrl/
 psrl/workers/agent_loop/loops/session_agent_loop.py       # Shared SessionRouter/TITO lifecycle
 psrl/workers/agent_loop/loops/mini_swe_agent_loop_v1.py   # Session-router/TITO black-box loop
-psrl/workers/agent_loop/loops/mini_swe_agent_loop.py      # Legacy queue-bridge loop
 psrl/workers/agent_loop/agent_data/mini_swe_agent_data.py # MiniSWEAgentData
 psrl/environments/mini_swe_env.py                         # MiniSWEEnvironment
 ```
@@ -420,7 +419,7 @@ which is written by `prepare_swebench.py`.
    injects immutable TITO/PSRL routing headers and forwards each request body
    unchanged to SMG.
 4. After mini-swe-agent exits, PSRL fetches the session once and converts the
-   captured trajectory into canonical training arrays.
+   captured trajectory into canonical training data.
 5. PSRL deletes the TITO session and removes rollout Docker containers in
    `finally` cleanup.
 

@@ -57,6 +57,8 @@ psrl = "psrl.trainer.config.hydra_plugins.psrl_searchpath:PSRLSearchPathPlugin"
 [tool.ruff]
 line-length = 119
 src = ["psrl"]
+# Archived pre-SMG code kept for reference only; never imported by live code.
+extend-exclude = ["deprecated"]
 
 [tool.ruff.lint]
 select = [

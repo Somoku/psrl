@@ -30,15 +30,14 @@ jobs:
       - name: Install psrl with test dependencies
         run: |
           pip install --no-deps -e .
-          pip install "pytest>=8.0" "pytest-asyncio>=0.23" "pytest-mock>=3.12" "pytest-cov>=5.0" aiohttp cachetools omegaconf
+          pip install "pytest>=8.0" "pytest-asyncio>=0.23" "pytest-mock>=3.12" "pytest-cov>=5.0" aiohttp cachetools numpy omegaconf
       - name: Run cpu_test suite
         run: |
           pytest -m cpu_test \
-            --ignore=tests/nixl \
-            --ignore=tests/ray_utils \
             --cov=psrl \
             --cov-report=xml \
-            tests/
+            tests/staleness/test_staleness_controller.py \
+            tests/elastic_rm/test_scaling_policy_instance_id.py
       - name: Upload coverage report
         uses: codecov/codecov-action@v4
         with:

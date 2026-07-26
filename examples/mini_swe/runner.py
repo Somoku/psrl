@@ -74,6 +74,15 @@ def _build_model_config(payload: dict[str, Any]) -> dict[str, Any]:
     top_k = model_kwargs.pop("top_k", None)
     if top_k is not None and int(top_k) >= 0:
         model_kwargs["extra_body"] = {"top_k": int(top_k)}
+    extra_headers = dict(model_kwargs.get("extra_headers") or {})
+    if payload.get("trajectory_id_strategy", "manual") == "manual":
+        extra_headers["x-smg-tito-trajectory-id"] = "0"
+    else:
+        extra_headers.pop("x-smg-tito-trajectory-id", None)
+    if extra_headers:
+        model_kwargs["extra_headers"] = extra_headers
+    else:
+        model_kwargs.pop("extra_headers", None)
     model_kwargs.update(
         {
             "api_base": payload["base_url"],
@@ -148,7 +157,6 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.environments import get_environment
     from minisweagent.models import get_model
-
     from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
 
     _silence_litellm()

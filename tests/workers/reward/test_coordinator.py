@@ -27,8 +27,7 @@ _MOCKED_MODULES = [
     "psrl.workers.gen.stats_collector",
     "psrl.workers.gen.utils",
     "psrl.workers.gen.zmq_queue",
-    "psrl.workers.gen",
-    "psrl.workers.gen.rollout_coordinator",
+    "psrl.workers.gen.rollout_coordination",
 ]
 for _mod in _MOCKED_MODULES:
     if _mod not in sys.modules:
@@ -58,11 +57,11 @@ sys.modules["psrl.utils.server.command"].CommandType = MagicMock
 
 # Create a real RolloutCoordinator stub so we can test inheritance
 class _RolloutCoordinatorStub(_CommandExtensionStub):
-    def __init__(self, config, ps_manager, rollout_router):
+    def __init__(self, config, ps_manager, rollout_gateway_url):
         super().__init__()
         self.config = config
         self.ps_manager = ps_manager
-        self.rollout_router = rollout_router
+        self.rollout_gateway_url = rollout_gateway_url
 
     async def sync_model(self):
         return "base_sync"
@@ -86,10 +85,7 @@ class _RolloutCoordinatorStub(_CommandExtensionStub):
         pass
 
 
-sys.modules["psrl.workers.gen.rollout_coordinator"].RolloutCoordinator = _RolloutCoordinatorStub
-
-# Now stub the gen package __init__
-sys.modules["psrl.workers.gen"].RolloutCoordinator = _RolloutCoordinatorStub
+sys.modules["psrl.workers.gen.rollout_coordination"].RolloutCoordinator = _RolloutCoordinatorStub
 
 _coord_path = (
     pathlib.Path(__file__).parent.parent.parent.parent
@@ -103,6 +99,11 @@ _spec = importlib.util.spec_from_file_location("psrl.workers.reward.reward_model
 _coord_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_coord_mod)
 RewardModelCoordinator = _coord_mod.RewardModelCoordinator
+
+# Remove package stubs after loading the isolated class so other test modules can
+# import the real rollout coordinator in the same pytest process.
+sys.modules.pop("psrl.workers.gen.rollout_coordination", None)
+sys.modules.pop("psrl.workers.gen", None)
 
 
 def _make_config():

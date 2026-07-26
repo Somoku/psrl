@@ -16,7 +16,7 @@ class KVCacheManager:
 
     Stateless with respect to trajectory identity — all public methods accept
     `tokens: list[int]` directly.  Trajectory-to-token mapping is maintained
-    by the routing gateway (RolloutGateway / SMG).
+    by the SMG rollout gateway.
 
     Responsibilities:
     - Orchestrate KV cache operations via `collective_rpc` and EngineCore utilities.
@@ -198,9 +198,9 @@ class KVCacheManager:
         """
         Set the current model version used to tag new KV cache entries.
 
-        Called by the gen server after the rollout coordinator broadcasts the
-        new version following a weight sync.  Affects all subsequent KV store
-        and P2P transfer operations on this instance.
+        Called locally by the gen server after this replica completes a weight
+        pull and reads back its actual model version. Affects all subsequent KV
+        store and P2P transfer operations on this instance.
 
         Args:
             version (int): The new model version number (monotonically increasing).
@@ -431,9 +431,7 @@ class KVCacheManager:
 
         # Fan out one MoveWorkerMsg per local rank, each to its own LMCacheWorker.
         request_configs: dict | None = (
-            {"lmcache.tag.model_version": str(dst_model_version)}
-            if dst_model_version >= 0
-            else None
+            {"lmcache.tag.model_version": str(dst_model_version)} if dst_model_version >= 0 else None
         )
 
         async def _move_rank(rank: int) -> int:

@@ -12,8 +12,8 @@ from psrl.workers.gen.smg_adapter import (
     WORKERS_UPDATE_STATS_PATH,
     build_worker_stats_update,
 )
-from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.gen.stats_collector import EngineStats
+from psrl.workers.gen.utils import RolloutInstanceId
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -27,7 +27,7 @@ class StatusMixin:
     Expects ``self`` to carry: ``status_queue``, ``replica_idx_to_replica_id``,
     ``instance_to_engine_status``, ``stop_process_status_queue``,
     ``stop_sync_status_to_router``, ``stop_stats_recorder``,
-    ``rollout_router``, ``use_rust_gateway``, ``config``,
+    ``config``,
     ``_stats_recorder``, and the ``_gateway_post_json`` helper.
     """
 
@@ -90,21 +90,16 @@ class StatusMixin:
 
     async def _sync_status_to_router(self):
         """Broadcast the engine status to the router."""
-        assert self.rollout_router is not None, "Rollout router is not set in RolloutCoordinator"
-
         while not self.stop_sync_status_to_router:
             # Broadcast the engine status to the router every coordinator sync interval
             await asyncio.sleep(self.config.psrl.status_collection.coordinator_sync_interval_in_ms / 1000)
-            if self.use_rust_gateway:
-                if not self.instance_to_engine_status:
-                    continue
-                updates = []
-                for instance_id, engine_status in self.instance_to_engine_status.items():
-                    replica_id, dp_rank = instance_id
-                    updates.append(build_worker_stats_update(replica_id, dp_rank, engine_status.snapshot))
-                await self._gateway_post_json(WORKERS_UPDATE_STATS_PATH, payload=updates)
-            else:
-                await self.rollout_router.update_instance_status.remote(self.instance_to_engine_status)
+            if not self.instance_to_engine_status:
+                continue
+            updates = []
+            for instance_id, engine_status in self.instance_to_engine_status.items():
+                replica_id, dp_rank = instance_id
+                updates.append(build_worker_stats_update(replica_id, dp_rank, engine_status.snapshot))
+            await self._gateway_post_json(WORKERS_UPDATE_STATS_PATH, payload=updates)
         psrl_logger.info("Stopped syncing engine status to router.")
 
     async def _stats_recorder_loop(self):

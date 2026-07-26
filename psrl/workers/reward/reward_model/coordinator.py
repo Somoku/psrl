@@ -2,8 +2,6 @@ import asyncio
 import logging
 import os
 
-import ray
-
 from psrl.workers.gen.rollout_coordination import RolloutCoordinator
 
 psrl_logger = logging.getLogger(__name__)
@@ -33,14 +31,13 @@ class RewardModelCoordinator(RolloutCoordinator):
         self,
         config,
         rm_config,
-        rollout_router: ray.actor.ActorHandle | str,
+        rollout_gateway_url: str,
     ) -> None:
         # ps_manager=None: no PS handle needed for reward models.
-        # rollout_router=None: reward gateway is managed separately by RewardModelGateway.
         super().__init__(
             config=config,
             ps_manager=None,
-            rollout_router=rollout_router,
+            rollout_gateway_url=rollout_gateway_url,
         )
         self.rm_config = rm_config
         self.reward_model_name = rm_config.reward_model_name
@@ -113,7 +110,7 @@ class RewardModelCoordinator(RolloutCoordinator):
         active request counter maintained by smg for round-robin scheduling).
         Falls back to 0 on any error so elastic RM degrades gracefully.
         """
-        if not self.gateway_base_url:
+        if not self.rollout_gateway_url:
             return 0
         try:
             data = await self._gateway_get_json("/workers")

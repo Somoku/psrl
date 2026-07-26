@@ -24,6 +24,7 @@ from verl.workers.engine_workers import ActorRolloutRefWorker
 
 from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.converter import create_parameter_mapping
+from psrl.utils.converter.param_sync import ParamSyncPlan
 
 # Megatron imports — protected with TORCH_CUDA_ARCH_LIST to avoid CUDA JIT errors on CPU workers
 # (mirrors the guard used in verl.workers.engine.megatron.__init__)
@@ -34,6 +35,7 @@ try:
     from psrl.utils.converter.megatron_converter import convert_megatron_inplace  # noqa: E402
 except ImportError:
     convert_megatron_inplace = None
+from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
 
 if not is_cuda_available and os.environ.get("TORCH_CUDA_ARCH_LIST") == "8.0":
     del os.environ["TORCH_CUDA_ARCH_LIST"]
@@ -178,15 +180,19 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 self.actor.engine.module,
                 fsdp_strategy=self.config.actor.strategy,
             )
+            self.param_sync_plan = ParamSyncPlan()
         elif strategy == "megatron":
             assert convert_megatron_inplace is not None, (
                 "psrl.utils.converter.megatron_converter could not be imported. Make sure Megatron-LM is installed."
             )
             parameter_mapping = create_parameter_mapping("Megatron", model_config)
-            self.unified_state_dict, self.local_sharding_dict = convert_megatron_inplace(
+            conversion_result = convert_megatron_inplace(
                 parameter_mapping,
                 self.actor.engine.module,
             )
+            self.unified_state_dict = conversion_result.state_dict
+            self.local_sharding_dict = conversion_result.sharding_dict
+            self.param_sync_plan = conversion_result.sync_plan
         else:
             raise NotImplementedError(f"nixl_convert_params does not support strategy '{strategy}'.")
 
@@ -377,8 +383,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         buffer storage to 0 releases the entire contiguous allocation in one operation
         (typically 2 cudaFree calls per buffer group: one for params, one for grads).
         """
-        from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
-
         try:
             from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
         except ImportError:
@@ -412,8 +416,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         physical memory is reallocated by the caching allocator). NIXL pull fills the
         actual weight data after this call.
         """
-        from megatron.bridge.models.conversion.utils import unwrap_model  # noqa: PLC0415
-
         try:
             from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
         except ImportError:
@@ -544,6 +546,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         if engine.optimizer is None:
             return
         optimizer = engine.optimizer
+        if not hasattr(optimizer, "reload_model_params"):
+            return
         # Megatron optimizers (Float16OptimizerWithFloat16Params, DistributedOptimizer,
         # ChainedOptimizer) all support reload_model_params() which copies
         # the model's current float16 params into the optimizer's fp32/bf16 master copy.

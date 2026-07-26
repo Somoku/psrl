@@ -78,7 +78,7 @@ class RolloutCoordinator(
         self,
         config,
         ps_manager: ray.actor.ActorHandle,
-        rollout_router: ray.actor.ActorHandle | str,
+        rollout_gateway_url: str,
         session_router_url: str | None = None,
     ):
         """
@@ -95,7 +95,7 @@ class RolloutCoordinator(
 
         Args:
             config: Configuration object containing PSRL settings
-            rollout_router: Handle to the rollout router actor
+            rollout_gateway_url: HTTP base URL of the SMG rollout gateway.
             session_router_url: HTTP base URL of the SessionRouter (for session
                 hang/continue control). None disables the thunder_agent loop.
         """
@@ -113,28 +113,20 @@ class RolloutCoordinator(
         # For convenience, maintain separate lists for rollout and validate instances
         self.tag_to_replica_ids = {"rollout": set(), "validate": set()}
 
-        self.rollout_router = rollout_router
-        self.use_rust_gateway = isinstance(rollout_router, str)
-        self.gateway_client: aiohttp.ClientSession | None = None
-        self.gateway_addr: str | None = None
-        self.gateway_base_url: str | None = None
-        if self.use_rust_gateway:
-            self.gateway_addr = rollout_router
-            self.gateway_base_url = self.gateway_addr
-            connector = aiohttp.TCPConnector(
-                limit=DEFAULT_MAX_CONNECTIONS,
-                limit_per_host=DEFAULT_MAX_CONNECTIONS,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-            )
-            timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
-            self.gateway_client = aiohttp.ClientSession(
-                connector=connector,
-                timeout=timeout,
-            )
-        else:
-            self.gateway_addr = None
-            self.gateway_base_url = None
+        if not rollout_gateway_url:
+            raise ValueError("Rollout gateway URL must not be empty.")
+        self.rollout_gateway_url = rollout_gateway_url.rstrip("/")
+        connector = aiohttp.TCPConnector(
+            limit=DEFAULT_MAX_CONNECTIONS,
+            limit_per_host=DEFAULT_MAX_CONNECTIONS,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+        timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+        self.gateway_client = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout,
+        )
 
         # Stats collection
         status_host = ray.util.get_node_ip_address().strip("[]")
@@ -182,10 +174,7 @@ class RolloutCoordinator(
         # --- Session hang/continue scheduling (ThunderAgent port) ---
         self.session_router_url = session_router_url.rstrip("/") if session_router_url else None
         self._thunder_agent_cfg = self.config.psrl.rollout_coordination.session_strategy.thunder_agent
-        self._thunder_agent_enabled = bool(
-            self._thunder_agent_cfg.enable
-            and self.session_router_url is not None
-        )
+        self._thunder_agent_enabled = bool(self._thunder_agent_cfg.enable and self.session_router_url is not None)
         self.thunder_agent_task = None
         self.stop_thunder_agent = False
         self._thunder_scheduler = None
@@ -401,7 +390,7 @@ class RolloutCoordinator(
         for instance_id in pulled_instance_ids:
             self.instance_to_model_version[instance_id] = self.ps_model_version
             self.instance_to_version_after_sync[instance_id] = self.ps_model_version
-        if self.use_rust_gateway and pulled_instance_ids:
+        if pulled_instance_ids:
             updates = build_weight_version_updates(pulled_instance_ids, self.ps_model_version)
             await self._publish_weight_version_updates(updates)
             psrl_logger.info(
@@ -522,7 +511,7 @@ class RolloutCoordinator(
             self._stats_recorder.close()
         psrl_logger.info("All background tasks have been stopped.")
         self.status_queue.close()
-        if self.gateway_client is not None and not self.gateway_client.closed:
+        if not self.gateway_client.closed:
             await self.gateway_client.close()
         if self._session_client is not None and not self._session_client.closed:
             await self._session_client.close()
@@ -537,8 +526,6 @@ class RolloutCoordinator(
             "stage=RolloutCoordinator_enter model=%s elapsed_since_entry_s=0.000",
             model_tag,
         )
-        if self.rollout_router is None:
-            return 0
         log_elastic_rm_backlog_diag(
             psrl_logger,
             "stage=RolloutCoordinator_before_router_rpc model=%s since_enter_s=%.3f",
@@ -546,17 +533,14 @@ class RolloutCoordinator(
             time.monotonic() - t_enter,
         )
         t_rpc = time.monotonic()
-        if self.use_rust_gateway:
-            status = await self._gateway_get_json(ROUTING_LOOP_STATUS_PATH)
-            pending_value = status.get("pending_request_num", status.get("queue_len"))
-            if pending_value is None:
-                worker_stats = await self._gateway_get_json(WORKERS_STATS_PATH)
-                stats = worker_stats if isinstance(worker_stats, list) else worker_stats.get("workers", [])
-                pending = sum(int(item.get("running_requests", 0)) for item in stats if isinstance(item, dict))
-            else:
-                pending = int(pending_value)
+        status = await self._gateway_get_json(ROUTING_LOOP_STATUS_PATH)
+        pending_value = status.get("pending_request_num", status.get("queue_len"))
+        if pending_value is None:
+            worker_stats = await self._gateway_get_json(WORKERS_STATS_PATH)
+            stats = worker_stats if isinstance(worker_stats, list) else worker_stats.get("workers", [])
+            pending = sum(int(item.get("running_requests", 0)) for item in stats if isinstance(item, dict))
         else:
-            pending = int(await self.rollout_router.get_pending_request_count.remote())
+            pending = int(pending_value)
         log_elastic_rm_backlog_diag(
             psrl_logger,
             "stage=RolloutCoordinator_after_router_rpc model=%s pending=%d router_rpc_s=%.3f since_enter_s=%.3f",
@@ -715,25 +699,6 @@ class RolloutCoordinator(
         psrl_logger.info(
             f"[LMCache] Peer registry broadcast to {len(server_items)} replicas "
             f"({total_ranks} ranks total): {len(peer_registry)} instances with peers."
-        )
-
-    async def _broadcast_kv_current_version(self, version: int) -> None:
-        """
-        Broadcast the current model version to all gen-server actors so that
-        subsequent KV store/retrieve calls tag entries with this version.
-
-        Must be called after all in-flight requests have looped back and before
-        the router admission loop is re-opened, so the first new request after
-        router re-open uses the updated version tag.
-        """
-        server_items = self._get_ordered_server_items("all")
-        futures = [
-            server_handle.kv_set_current_version.remote(version)
-            for _, _, server_handle in server_items
-        ]
-        await asyncio.gather(*futures)
-        psrl_logger.info(
-            f"[LMCache] Broadcast kv_current_version={version} to {len(server_items)} replicas."
         )
 
     def start_lmcache_controller(self) -> str:

@@ -30,6 +30,8 @@ class TokenInput:
     """the current response length for this generation"""
     multi_modal_data: dict | None = None
     """the multi-modal data for this generation, e.g., image/video features or metadata"""
+    mm_processor_kwargs: dict[str, Any] | None = None
+    """kwargs required to reproduce the rollout's local multimodal tensors"""
     is_validate: bool = False
     """whether this request is for validation purpose"""
     stop_token_ids: list[int] | None = None
@@ -54,6 +56,8 @@ class TokenOutput:
     """pooling output tensor for pooling/reward models (torch.Tensor or None)"""
     multi_modal_data: dict | None = None
     """the multi-modal data for this generation, e.g., image/video features or metadata"""
+    mm_processor_kwargs: dict[str, Any] | None = None
+    """kwargs required to reproduce the rollout's local multimodal tensors"""
     reward_score: float | None = None
     """Reward score for the trajectory."""
     stop_reason: str | None = None

@@ -18,6 +18,10 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+from verl.utils.tokenizer import (
+    build_multimodal_processor_inputs,
+    get_processor_token_id,
+)
 from verl.workers.config.model import HFModelConfig
 
 from psrl.utils.common.chat_template import resolve_chat_template_value
@@ -29,6 +33,7 @@ from psrl.utils.common.http_io_thread import init_http_io_thread
 from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
 from psrl.utils.rollout.rollout_trace import RolloutTraceConfig, rollout_trace_attr
+from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.utils import AGENT_LOOP_REGISTRY, DictConfigWrap, TerminateReason
 from psrl.workers.gen.utils import TokenOutput
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
@@ -45,7 +50,7 @@ class PSRL_AgentLoopWorker:
         self,
         config: DictConfig,
         ps_manager_handle: ray.actor.ActorHandle,
-        rollout_router: ray.actor.ActorHandle | str,
+        rollout_gateway_url: str,
         session_router_url: str,
         worker_id: int = 0,
         worker_num: int = 1,
@@ -55,7 +60,7 @@ class PSRL_AgentLoopWorker:
         Args:
             config (DictConfig): Configuration containing model and rollout settings.
             ps_manager_handle (ray.actor.ActorHandle): Handle to the parameter server manager.
-            rollout_router (ray.actor.ActorHandle | str): Handle to the rollout router actor.
+            rollout_gateway_url (str): HTTP base URL of the SMG rollout gateway.
             session_router_url (str): URL of the session router.
             worker_id (int): Unique identifier for this worker instance.
             worker_num (int): Total number of worker instances.
@@ -103,7 +108,7 @@ class PSRL_AgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
 
-        self.rollout_router = rollout_router
+        self.rollout_gateway_url = rollout_gateway_url
         self.session_router_url = session_router_url
         self.ps_manager_handle = ps_manager_handle
         self.agent_loop_manager = None
@@ -348,13 +353,7 @@ class PSRL_AgentLoopWorker:
         request_ids = tu.get(batch, "uid")
 
         global_steps = tu.get(batch, "global_steps", -1)
-        # `validate` is stored as a NonTensorStack, so `tu.get` unwraps it to a
-        # Python list (e.g. [False]). A list is always truthy, which would make
-        # every train rollout look like a validation rollout downstream (notably
-        # in `notify_group_failed`, collapsing the train-retry path). Normalize
-        # to a scalar bool here.
-        _validate_raw = tu.get(batch, "validate", False)
-        validate = bool(_validate_raw[0]) if isinstance(_validate_raw, (list, tuple)) else bool(_validate_raw)
+        validate = tu.get(batch, "validate", False)[0]
 
         with rollout_trace_attr(
             prompt_index=prompt_index,
@@ -368,18 +367,23 @@ class PSRL_AgentLoopWorker:
             )
             agent_loop_config = AGENT_LOOP_REGISTRY[agent_name]
 
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
-                trainer_config=DictConfigWrap(config=self.config),
-                rollout_router=self.rollout_router,
+            context = AgentLoopContext(
+                config=self.config,
+                rollout_gateway_url=self.rollout_gateway_url,
+                session_router_url=self.session_router_url,
                 reward_manager=self.reward_manager,
                 ps_manager_handle=self.ps_manager_handle,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
-                session_router_url=self.session_router_url,
             )
+            # Keep framework objects out of Hydra's dataclass conversion path.
+            agent_loop_factory = hydra.utils.instantiate(
+                config=agent_loop_config,
+                _partial_=True,
+            )
+            agent_loop = agent_loop_factory(context=context)
 
             with log_dual_events(
                 f"Agent loop with requests {request_ids}",
@@ -438,22 +442,21 @@ class PSRL_AgentLoopWorker:
                     # `tu.get(batch, "validate")` here would be a truthy list and
                     # wrongly route train failures into the validation branch of
                     # `notify_group_failed`, skipping the fresh-data refill.
-                    is_validate = validate
                     failed_uid = tu.get(batch, "uid")[0]
                     parent_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else failed_uid
                     if self.config.psrl.agentic_rl.get("manager_retry_on_error", True):
                         psrl_logger.warning(
                             "Group slot lost for uid=%s parent_id=%s "
-                            "(terminate_reason=%s, is_validate=%s), notifying manager.",
+                            "(terminate_reason=%s, validate=%s), notifying manager.",
                             failed_uid,
                             parent_id,
                             terminate_reason.value,
-                            is_validate,
+                            validate,
                         )
                         await self.agent_loop_manager.notify_group_failed.remote(
                             parent_id=parent_id,
                             failed_uid=failed_uid,
-                            is_validate=is_validate,
+                            is_validate=validate,
                         )
                     else:
                         raise RuntimeError(
@@ -470,7 +473,6 @@ class PSRL_AgentLoopWorker:
             # Put the output into the TransferQueue and notify PSManager
             # + AgentLoopManager via metadata-only RPCs.
             if output is not None:
-                is_validate = validate
                 with log_dual_events(
                     "Update request status",
                     psrl_logger,
@@ -480,7 +482,7 @@ class PSRL_AgentLoopWorker:
                     update_status_success = await self.ps_manager_handle.update_request_status.remote(
                         request_ids,
                         PSRL_RequestStatus.COMPLETED,
-                        is_validate=is_validate,
+                        is_validate=validate,
                     )
 
                 if update_status_success:
@@ -572,6 +574,13 @@ class PSRL_AgentLoopWorker:
             position_ids = self._compute_position_ids(
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
+            # ``images_seqlens`` is training-engine metadata used for ViT FLOPs/MFU
+            # accounting, not a model input. Keep a single top-level copy instead of
+            # forwarding it through ``multi_modal_inputs`` as well.
+            images_seqlens = multi_modal_inputs.pop("images_seqlens", None)
+            if images_seqlens is None:
+                images_seqlens = torch.empty(0, dtype=torch.int64)
+            multi_modal_inputs.pop("mm_token_type_ids", None)
 
             if len(outputs) > 1:
                 keys.append(f"{uid}_{i}")
@@ -587,6 +596,7 @@ class PSRL_AgentLoopWorker:
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            field["images_seqlens"] = images_seqlens
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             field["seq_len"] = prompt_len + response_len
             field["prompt_len"] = prompt_len
@@ -600,30 +610,25 @@ class PSRL_AgentLoopWorker:
             fields.append(field)
         return keys, fields
 
-    def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
+    def _compute_multi_modal_inputs(self, output, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
         """Compute multi-modal inputs with image and video."""
         multi_modal_inputs = {}
         if self.processor is None:
             return multi_modal_inputs
-        if output.multi_modal_data is None:
-            return multi_modal_inputs
 
-        images = output.multi_modal_data.get("images")
-        videos = output.multi_modal_data.get("videos")
-        # split the videos and according metadatas
-        if videos is not None:
-            videos, video_metadatas = zip(*videos, strict=False)
-            videos, video_metadatas = list(videos), list(video_metadatas)
-        else:
-            video_metadatas = None
+        multi_modal_data = output.multi_modal_data or {}
+        images = multi_modal_data.get("images")
+        videos = multi_modal_data.get("videos")
+        audios = multi_modal_data.get("audios")
         current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
-        multi_modal_inputs = self.processor(
+
+        multi_modal_inputs = build_multimodal_processor_inputs(
+            self.processor,
             text=[current_text],
             images=images,
             videos=videos,
-            video_metadata=video_metadatas,
-            return_tensors="pt",
-            do_sample_frames=False,
+            audio=audios,
+            mm_processor_kwargs=getattr(output, "mm_processor_kwargs", None),
         )
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)
@@ -637,9 +642,14 @@ class PSRL_AgentLoopWorker:
             multi_modal_inputs["images_seqlens"] = images_seqlens
         return multi_modal_inputs
 
-    def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
+    def _compute_position_ids(
+        self,
+        input_ids,
+        attention_mask,
+        multi_modal_inputs,
+    ) -> torch.Tensor:
         """Compute position ids for multi-modal inputs."""
-        if self.processor is None:
+        if self.processor is None or not hasattr(self.processor, "get_rope_index"):
             return compute_position_id_with_mask(attention_mask)  # (1, seq_len)
 
         multi_modal_kwargs = {
@@ -649,8 +659,12 @@ class PSRL_AgentLoopWorker:
         # For transformers>=5.3.0, mm_token_type_ids is only used to calculate position ids.
         if multi_modal_inputs.pop("mm_token_type_ids", None) is not None:
             mm_token_type_ids = torch.zeros_like(input_ids)
-            mm_token_type_ids[0][input_ids[0] == self.processor.image_token_id] = 1
-            mm_token_type_ids[0][input_ids[0] == self.processor.video_token_id] = 2
+            image_token_id = get_processor_token_id(self.processor, "image")
+            video_token_id = get_processor_token_id(self.processor, "video")
+            if image_token_id is not None:
+                mm_token_type_ids[0][input_ids[0] == image_token_id] = 1
+            if video_token_id is not None:
+                mm_token_type_ids[0][input_ids[0] == video_token_id] = 2
             multi_modal_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
         # Model's get_rope_index has been dynamically bind to the processor.

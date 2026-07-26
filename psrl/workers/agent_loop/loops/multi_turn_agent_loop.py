@@ -2,15 +2,12 @@ import asyncio
 import logging
 import os
 
-import ray
-from transformers import AutoProcessor, AutoTokenizer
-from verl.utils.dataset.rl_dataset import RLHFDataset
-
 from psrl.environments.base import Environment
 from psrl.utils.rollout.rollout_trace import rollout_trace_op
 from psrl.workers.agent_loop.agent_data import AgentData
+from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.base_agent_loop import AgentLoopBase
-from psrl.workers.agent_loop.loops.utils import DictConfigWrap, TerminateReason, register
+from psrl.workers.agent_loop.loops.utils import TerminateReason, register
 from psrl.workers.gen.utils import TokenOutput
 
 psrl_logger = logging.getLogger(__name__)
@@ -30,31 +27,10 @@ class MultiTurnAgentLoop(AgentLoopBase):
     5. Finalizes and returns the generated response along with termination metadata.
     """
 
-    def __init__(
-        self,
-        trainer_config: DictConfigWrap,
-        rollout_router: ray.actor.ActorHandle | str,
-        reward_manager: ray.actor.ActorHandle,
-        ps_manager_handle: ray.actor.ActorHandle,
-        tokenizer: AutoTokenizer,
-        processor: AutoProcessor,
-        dataset_cls: type[RLHFDataset],
-        data_config: DictConfigWrap,
-        **kwargs,
-    ):
-        super().__init__(
-            trainer_config=trainer_config,
-            rollout_router=rollout_router,
-            reward_manager=reward_manager,
-            ps_manager_handle=ps_manager_handle,
-            tokenizer=tokenizer,
-            processor=processor,
-            dataset_cls=dataset_cls,
-            data_config=data_config,
-            **kwargs,
-        )
-        self.max_turns = trainer_config.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-        self.env_step_timeout = trainer_config.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
+    def __init__(self, context: AgentLoopContext) -> None:
+        super().__init__(context=context)
+        self.max_turns = context.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
+        self.env_step_timeout = context.config.gen_actor_rollout_ref.rollout.agent.env.step_timeout
 
     def get_generate_fields(self) -> list[str]:
         fields = super().get_generate_fields()

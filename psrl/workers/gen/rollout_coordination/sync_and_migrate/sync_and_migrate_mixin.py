@@ -25,10 +25,10 @@ class SyncAndMigrateMixin:
     Expects ``self`` to carry: ``instance_ids``, ``server_handles``,
     ``instance_to_model_version``, ``instance_to_latest_stale_model_version``,
     ``instance_to_version_after_sync``, ``model_sync_tasks``, ``replica_sync_tasks``,
-    ``ps_model_version``, ``ps_manager``, ``rollout_router``, ``use_rust_gateway``,
+    ``ps_model_version``, ``ps_manager``,
     ``config``, ``command_queue``, and the ``_gateway_post/get_json``,
-    ``_set_routing_loop_running``, ``exec_command``, ``set_rollout_instance_model_version``,
-    ``_broadcast_kv_current_version`` methods.
+    ``_set_routing_loop_running``, ``exec_command``, and
+    ``set_rollout_instance_model_version`` methods.
     """
 
     def _expand_replica_instance_ids(self, instance_ids: list[RolloutInstanceId]) -> list[RolloutInstanceId]:
@@ -38,9 +38,9 @@ class SyncAndMigrateMixin:
     async def _publish_weight_version_updates(self, updates: list[dict]) -> None:
         result = await self._gateway_post_json(WORKERS_UPDATE_WEIGHT_VERSION_PATH, payload=updates)
         if int(result.get("rejected", 0)) != 0 or int(result.get("updated", 0)) != len(updates):
-            raise RuntimeError(f"Rust gateway rejected replica weight-version update: {result}")
+            raise RuntimeError(f"SMG gateway rejected replica weight-version update: {result}.")
 
-    async def _finish_rust_gateway_sync(
+    async def _finish_gateway_sync(
         self,
         replica_ids: list[str],
         instance_ids: list[RolloutInstanceId],
@@ -144,92 +144,56 @@ class SyncAndMigrateMixin:
         ):
             instance_ids = self._expand_replica_instance_ids(instance_ids)
             replica_ids = sorted({instance_id[0] for instance_id in instance_ids})
-            if self.use_rust_gateway:
-                sleeping = await asyncio.gather(
-                    *[self.server_handles[replica_id].is_sleeping.remote() for replica_id in replica_ids]
-                )
-                replica_ids = [replica_id for replica_id, is_sleeping in zip(replica_ids, sleeping) if not is_sleeping]
-                instance_ids = [instance_id for instance_id in instance_ids if instance_id[0] in replica_ids]
-                if not replica_ids:
-                    return
+            sleeping = await asyncio.gather(
+                *[self.server_handles[replica_id].is_sleeping.remote() for replica_id in replica_ids]
+            )
+            replica_ids = [replica_id for replica_id, is_sleeping in zip(replica_ids, sleeping) if not is_sleeping]
+            instance_ids = [instance_id for instance_id in instance_ids if instance_id[0] in replica_ids]
+            if not replica_ids:
+                return
             await self._wait_for_replica_syncs(replica_ids)
             for instance_id in instance_ids:
                 self.instance_to_latest_stale_model_version[instance_id] = self.instance_to_model_version.get(
                     instance_id, 0
                 )
 
-            if self.use_rust_gateway:
-                await self._set_routing_loop_running(False)
-                try:
-                    await asyncio.gather(
-                        *[self.server_handles[replica_id].pause_for_sync.remote() for replica_id in replica_ids]
-                    )
-                    if (
-                        wait_interrupted_partial_requests_loop_back
-                        and self.config.psrl.rollout_coordination.partial_rollout.enable
-                    ):
-                        await self._wait_interrupted_partial_requests_loop_back(instance_ids)
-
-                    if self.config.psrl.lmcache.multi_version_kv:
-                        await self._broadcast_kv_current_version(self.ps_model_version)
-
-                    pull_futures = [
-                        self.server_handles[replica_id].pull_model_for_sync.remote(self.ps_model_version)
-                        for replica_id in replica_ids
-                    ]
-                    updates = build_weight_version_updates(instance_ids, self.ps_model_version)
-                    await self._publish_weight_version_updates(updates)
-                    for instance_id in instance_ids:
-                        self.instance_to_version_after_sync[instance_id] = self.ps_model_version
-                    await self._set_routing_loop_running(True)
-                    psrl_logger.info(
-                        f"Published version {self.ps_model_version} and resumed routing for replicas {replica_ids}"
-                    )
-                except Exception:
-                    await self._quarantine_failed_replicas(replica_ids, instance_ids)
-                    raise
-
-                completion = self._finish_rust_gateway_sync(
-                    replica_ids,
-                    instance_ids,
-                    self.ps_model_version,
-                    pull_futures,
+            await self._set_routing_loop_running(False)
+            try:
+                await asyncio.gather(
+                    *[self.server_handles[replica_id].pause_for_sync.remote() for replica_id in replica_ids]
                 )
-                if wait_model_sync:
-                    await completion
-                else:
-                    self._track_model_sync_task(asyncio.create_task(completion), replica_ids)
-                return
-            else:
-                await self.rollout_router.pause_routing.remote()
-            psrl_logger.info("Paused routing for synchronization")
+                if (
+                    wait_interrupted_partial_requests_loop_back
+                    and self.config.psrl.rollout_coordination.partial_rollout.enable
+                ):
+                    await self._wait_interrupted_partial_requests_loop_back(instance_ids)
 
-            await self.rollout_router.update_currently_syncing_instances.remote(instance_ids, self.ps_model_version)
-
-            await self.exec_command(
-                Command(
-                    type=CommandType.SYNC,
-                    instance_ids=instance_ids,
-                    curr_ps_model_version=self.ps_model_version,
-                    wait_model_sync=wait_model_sync,
-                ),
-                blocking=True,
-            )
-            if (
-                wait_interrupted_partial_requests_loop_back
-                and self.config.psrl.rollout_coordination.partial_rollout.enable
-            ):
-                await self._wait_interrupted_partial_requests_loop_back(instance_ids)
+                pull_futures = [
+                    self.server_handles[replica_id].pull_model_for_sync.remote(self.ps_model_version)
+                    for replica_id in replica_ids
+                ]
+                updates = build_weight_version_updates(instance_ids, self.ps_model_version)
+                await self._publish_weight_version_updates(updates)
+                for instance_id in instance_ids:
+                    self.instance_to_version_after_sync[instance_id] = self.ps_model_version
+                await self._set_routing_loop_running(True)
                 psrl_logger.info(
-                    f"All interrupted requests on the synchronized instances {instance_ids} have been looped back"
+                    f"Published version {self.ps_model_version} and resumed routing for replicas {replica_ids!r}."
                 )
+            except Exception:
+                await self._quarantine_failed_replicas(replica_ids, instance_ids)
+                raise
 
-            if self.config.psrl.lmcache.multi_version_kv:
-                await self._broadcast_kv_current_version(self.ps_model_version)
-
-            if not self.use_rust_gateway:
-                await self.rollout_router.resume_routing.remote()
-            psrl_logger.info("Resumed routing after synchronization")
+            completion = self._finish_gateway_sync(
+                replica_ids,
+                instance_ids,
+                self.ps_model_version,
+                pull_futures,
+            )
+            if wait_model_sync:
+                await completion
+            else:
+                self._track_model_sync_task(asyncio.create_task(completion), replica_ids)
 
     async def check_no_activate_tasks(self, instance_id: RolloutInstanceId) -> bool:
         """
@@ -251,11 +215,7 @@ class SyncAndMigrateMixin:
         )
         assert self.config.psrl.rollout_coordination.partial_rollout.enable, "Partial rollout is not enabled"
 
-        if self.use_rust_gateway:
-            return await self._check_should_sync(instance_id)
-        else:
-            # Fallback: delegate to Router via Ray RPC (original path)
-            return await self.rollout_router.check_should_sync.remote(instance_id)
+        return await self._check_should_sync(instance_id)
 
     async def _check_should_sync(self, instance_id: RolloutInstanceId) -> bool:
         instance_status = self.instance_to_engine_status[instance_id]
@@ -346,11 +306,7 @@ class SyncAndMigrateMixin:
             "Rollout migration is only supported when status collection is enabled"
         )
 
-        if self.use_rust_gateway:
-            migrate_instance_ids = await self._check_should_migrate()
-        else:
-            # Fallback: delegate to Router via Ray RPC (original path)
-            migrate_instance_ids = await self.rollout_router.check_should_migrate.remote()
+        migrate_instance_ids = await self._check_should_migrate()
 
         if migrate_instance_ids:
             with log_dual_events(
@@ -359,10 +315,7 @@ class SyncAndMigrateMixin:
                 level=logging.INFO,
                 event_type=EventType.OTHER,
             ):
-                if self.use_rust_gateway:
-                    await self._set_routing_loop_running(False)
-                else:
-                    await self.rollout_router.pause_routing.remote()
+                await self._set_routing_loop_running(False)
                 psrl_logger.info("Paused routing for migration")
                 await self.exec_command(
                     Command(
@@ -377,10 +330,7 @@ class SyncAndMigrateMixin:
                         f"All interrupted requests on the migrated instances "
                         f"{migrate_instance_ids} have been looped back"
                     )
-                if self.use_rust_gateway:
-                    await self._set_routing_loop_running(True)
-                else:
-                    await self.rollout_router.resume_routing.remote()
+                await self._set_routing_loop_running(True)
                 psrl_logger.info("Resumed routing after migration")
 
     async def _check_should_migrate(self) -> list[RolloutInstanceId]:

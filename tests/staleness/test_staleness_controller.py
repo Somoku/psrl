@@ -34,7 +34,7 @@ class TestEntryInfoHashing:
         assert d[dummy_entry_info] == "value"
 
 
-# ── StalenessBuffer low-level insert/delete ───────────────────────────────────
+# StalenessBuffer low-level insert/delete
 
 
 class TestStalenessBufferInsert:
@@ -64,7 +64,7 @@ class TestStalenessBufferInsert:
             staleness_buffer.delete(999)
 
 
-# ── StalenessInventory capacity and buffer creation ──────────────────────────
+# StalenessInventory capacity and buffer creation
 
 
 class TestStalenessInventoryCapacity:
@@ -83,7 +83,7 @@ class TestStalenessInventoryCapacity:
         assert buffer_ids[0] < buffer_ids[1]
 
 
-# ── StalenessBuffer.get_status() ─────────────────────────────────────────────
+# StalenessBuffer.get_status()
 
 
 class TestStalenessBufferStatus:
@@ -229,7 +229,7 @@ class TestUpdateRequestMetadata:
         stored = inv.buffers[buffer_id].entries[entry_id].entry_info
         stored.request_idx = "bad-type"
 
-        with pytest.raises(AssertionError, match=r"got <class 'str'>: 'bad-type'"):
+        with pytest.raises(AssertionError, match=r"got 'bad-type' \(type=str\)"):
             inv.update_request_instance_id(
                 request_id=request_id,
                 new_instance_id=("worker", 1),

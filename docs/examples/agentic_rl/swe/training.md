@@ -63,5 +63,5 @@ partial credit for file-level and line-level overlap.
 ```{seealso}
 Full launch-script parameter reference, agent-YAML schema, evaluation guide, and
 troubleshooting:
-[`examples/mini_swe/README.md`](https://github.com/lhy101/psrl/blob/main/examples/mini_swe/README.md).
+[`examples/mini_swe/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/mini_swe/README.md).
 ```

@@ -61,7 +61,7 @@ path used by the recommended mini-SWE-agent v1 loop.
 - SandboxFusion Swarm service deployed (port 8080 on all nodes)
 
 ```{seealso}
-Full setup instructions including Docker image baking, Swarm deployment, and troubleshooting are in [`examples/retool/README.md`](https://github.com/lhy101/psrl/blob/main/examples/retool/README.md).
+Full setup instructions including Docker image baking, Swarm deployment, and troubleshooting are in [`examples/retool/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/retool/README.md).
 ```
 
 ```{toctree}

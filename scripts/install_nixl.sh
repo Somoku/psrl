@@ -78,7 +78,7 @@ fi
 echo "2. Install nixl"
 mkdir -p $THIRD_PARTY_PATH/nixl_src
 pushd $THIRD_PARTY_PATH/nixl_src
-# git clone -b v1.2.0 https://github.com/ai-dynamo/nixl.git
+git clone -b v1.2.0 https://github.com/ai-dynamo/nixl.git
 cd nixl
 mkdir -p build
 # Disable obj backend

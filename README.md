@@ -7,18 +7,17 @@ An Efficient Asynchronous RL Framework for LLM Post-Training
 </h3>
 
 <p align="center">
-| <a href="https://psrl-preview.readthedocs.io/en/latest/"><b>Documentation</b></a> |
-<a href="https://arxiv.org/abs/2601.12784"><b>Paper (SIGMOD 2027)</b></a> |
-<a href="https://psrl-preview.readthedocs.io/en/latest/tutorial/quickstart.html"><b>Quick Start</b></a> |
-<a href="https://psrl-preview.readthedocs.io/en/latest/examples/index.html"><b>Examples</b></a> |
-<a href="https://psrl-preview.readthedocs.io/en/latest/design/architecture.html"><b>Architecture</b></a> |
+| <a href="https://psrl.readthedocs.io/en/latest/"><b>Documentation</b></a> |
+<a href="https://arxiv.org/abs/2601.12784"><b>Paper</b></a> |
+<a href="https://psrl.readthedocs.io/en/latest/tutorial/quickstart.html"><b>Quick Start</b></a> |
+<a href="https://psrl.readthedocs.io/en/latest/examples/index.html"><b>Examples</b></a> |
+<a href="https://psrl.readthedocs.io/en/latest/design/architecture.html"><b>Architecture</b></a> |
 </p>
 
 <p align="center">
-<a href="https://psrl-preview.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat" alt="Documentation"></a>
+<a href="https://psrl.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat" alt="Documentation"></a>
 <a href="https://arxiv.org/abs/2601.12784"><img src="https://img.shields.io/static/v1?label=SIGMOD%202027&message=Paper&color=red" alt="Paper"></a>
 <a href="https://github.com/volcengine/verl"><img src="https://img.shields.io/badge/built%20on-veRL-blueviolet" alt="Built on veRL"></a>
-<a href="https://www.python.org/downloads/release/python-3120/"><img src="https://img.shields.io/badge/python-3.12-blue.svg" alt="Python 3.12"></a>
 <a href="./LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green.svg" alt="License"></a>
 </p>
 
@@ -40,7 +39,7 @@ Built on [veRL](https://github.com/volcengine/verl), PSRL focuses on the system 
 
 <div align="center">
   <img src="assets/PSRL_arch.svg" alt="PSRL System Architecture" width="90%">
-  <p><em>Overall PSRL system architecture: decoupled rollout / reward / training coordinated by a Parameter Server.</em></p>
+  <p><em>Overall PSRL system architecture.</em></p>
 </div>
 
 ### Why PSRL
@@ -48,9 +47,9 @@ Built on [veRL](https://github.com/volcengine/verl), PSRL focuses on the system 
 - ⚡ **Async without sacrificing convergence**: trajectory-level version binding with a Reserve/Occupy/Consume protocol keeps staleness bounded while training and generation run concurrently.
 - 🔌 **RDMA-native weight sync**: a CPU-side Parameter Server pushes/pulls weights via NIXL over UCX/RDMA (or local shared memory), avoiding collective-style synchronization barriers between train and gen clusters.
 - 🧵 **Built for long-tailed rollout**: partial rollout, redundant rollout, intelligent routing, and load-balanced migration work together to minimize idle GPU time from uneven trajectory lengths.
-- 🤖 **Agentic RL out of the box**: native environment loops plus SessionRouter/TITO let both integrated and black-box agents (e.g. mini-SWE-agent) train through PSRL with minimal code changes.
+- 🤖 **Agentic RL out of the box**: native environment loops plus SessionRouter/TITO let both integrated and black-box agents train through PSRL with minimal code changes.
 
-## ⚡ Quick Start
+## 🚀 Quick Start
 
 ### Prerequisites
 
@@ -86,7 +85,7 @@ bash scripts/install_lmcache.sh
 pip install -e .
 ```
 
-See the [Installation guide](https://psrl-preview.readthedocs.io/en/latest/tutorial/installation.html) for prerequisites, verification steps, and details on each component.
+See the [Installation guide](https://psrl.readthedocs.io/en/latest/tutorial/installation.html) for prerequisites, verification steps, and details on each component.
 
 ### Run Your First Training Job
 
@@ -100,7 +99,7 @@ bash examples/dapo_trainer/qwen2.5_3b_fsdp.sh
 
 > `staleness` controls the maximum version gap between generation and training: `staleness=0` is fully synchronous (generation blocks until training catches up), while `staleness>0` lets generation run ahead of training asynchronously to boost throughput.
 
-For the full step-by-step walkthrough (data preparation, cluster layout, monitoring metrics), see the **[Quick Start guide](https://psrl-preview.readthedocs.io/en/latest/tutorial/quickstart.html)**.
+For the full step-by-step walkthrough (data preparation, cluster layout, monitoring metrics), see the **[Quick Start guide](https://psrl.readthedocs.io/en/latest/tutorial/quickstart.html)**.
 
 ## 📚 Examples
 
@@ -108,19 +107,19 @@ Production-ready training recipes demonstrating PSRL's capabilities across diffe
 
 | Recipe | Task Domain | Reward Type | Backend | Script | Status |
 |---|---|---|---|---|---|
-| [DAPO](https://psrl-preview.readthedocs.io/en/latest/examples/rlvr/dapo.html) | Math / Reasoning | Verifiable (boxed answer) | FSDP / Megatron | [`examples/dapo_trainer/`](examples/dapo_trainer/) | ✅ Ready |
-| [PPO](https://psrl-preview.readthedocs.io/en/latest/examples/rlvr/ppo.html) | General | Verifiable | FSDP / Megatron | — | 🚧 TBD |
-| [GRPO](https://psrl-preview.readthedocs.io/en/latest/examples/rlvr/grpo.html) | General | Verifiable | FSDP / Megatron | — | 🚧 TBD |
-| [ReTool](https://psrl-preview.readthedocs.io/en/latest/examples/agentic_rl/retool/index.html) | Math + Code Interpreter | Verifiable + tool-call shaping | FSDP / Megatron | [`examples/retool/`](examples/retool/) | ✅ Ready |
-| [SWE-agent](https://psrl-preview.readthedocs.io/en/latest/examples/agentic_rl/swe/index.html) | Software Engineering | Test execution (F2P/P2P) | FSDP / Megatron | [`examples/mini_swe/`](examples/mini_swe/) | ✅ Ready |
-| [LLM-as-a-Judge](https://psrl-preview.readthedocs.io/en/latest/examples/generative_reward_model/llm_as_a_judge.html) | General / Open-ended | Judge LLM score | — | — | 🚧 TBD |
-| [On-Policy Distillation](https://psrl-preview.readthedocs.io/en/latest/examples/generative_reward_model/on_policy_distillation.html) | General / Open-ended | Teacher token-level supervision | — | — | 🚧 TBD |
+| [DAPO](https://psrl.readthedocs.io/en/latest/examples/rlvr/dapo.html) | Math / Reasoning | Verifiable | FSDP / Megatron | [`examples/dapo_trainer/`](examples/dapo_trainer/) | ✅ Ready |
+| [PPO](https://psrl.readthedocs.io/en/latest/examples/rlvr/ppo.html) | Math / Reasoning | Verifiable | FSDP / Megatron | [`examples/ppo_trainer/`](examples/ppo_trainer/) | ✅ Ready |
+| [GRPO](https://psrl.readthedocs.io/en/latest/examples/rlvr/grpo.html) | Math / Reasoning | Verifiable | FSDP / Megatron | [`examples/grpo_trainer/`](examples/grpo_trainer/) | ✅ Ready |
+| [ReTool](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/retool/index.html) | Math + Code Interpreter | Verifiable | FSDP / Megatron | [`examples/retool/`](examples/retool/) | ✅ Ready |
+| [SWE-agent](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/swe/index.html) | Software Engineering | Test execution (F2P/P2P) | FSDP / Megatron | [`examples/mini_swe/`](examples/mini_swe/) | ✅ Ready |
+| [LLM-as-a-Judge](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/llm_as_a_judge.html) | Open-ended | Judge LLM score | — | — | 🚧 TBD |
+| [On-Policy Distillation](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/on_policy_distillation.html) | Open-ended | Teacher token-level supervision | — | — | 🚧 TBD |
 
 ## 📖 Documentation
 
-- **Tutorial**: [Installation](https://psrl-preview.readthedocs.io/en/latest/tutorial/installation.html) · [Quick Start](https://psrl-preview.readthedocs.io/en/latest/tutorial/quickstart.html) · [Configuration](https://psrl-preview.readthedocs.io/en/latest/tutorial/configuration.html)
-- **Designs & Features**: [Architecture](https://psrl-preview.readthedocs.io/en/latest/design/architecture.html) · [Staleness Control](https://psrl-preview.readthedocs.io/en/latest/design/staleness_control.html) · [Flexible Rollout](https://psrl-preview.readthedocs.io/en/latest/design/flexible_rollout.html) · [Parameter Server](https://psrl-preview.readthedocs.io/en/latest/design/parameter_server.html) · [Router, SessionRouter & TITO](https://psrl-preview.readthedocs.io/en/latest/design/router_tito.html) · [KV Cache Management](https://psrl-preview.readthedocs.io/en/latest/design/kv_cache.html) · [Resource Elasticity](https://psrl-preview.readthedocs.io/en/latest/design/resource_elasticity.html)
-- **Examples**: [RLVR](https://psrl-preview.readthedocs.io/en/latest/examples/rlvr/index.html) · [Agentic RL](https://psrl-preview.readthedocs.io/en/latest/examples/agentic_rl/index.html) · [Generative Reward Model](https://psrl-preview.readthedocs.io/en/latest/examples/generative_reward_model/index.html)
+- **Tutorial**: [Installation](https://psrl.readthedocs.io/en/latest/tutorial/installation.html) · [Quick Start](https://psrl.readthedocs.io/en/latest/tutorial/quickstart.html) · [Configuration](https://psrl.readthedocs.io/en/latest/tutorial/configuration.html) ·  [Performance Tuning](https://psrl.readthedocs.io/en/latest/tutorial/performance_tunning.html)
+- **Examples**: [RLVR](https://psrl.readthedocs.io/en/latest/examples/rlvr/index.html) · [Agentic RL](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/index.html) · [Generative Reward Model](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/index.html)
+- **Designs & Features**: [Architecture](https://psrl.readthedocs.io/en/latest/design/architecture.html) · [Staleness Control](https://psrl.readthedocs.io/en/latest/design/staleness_control.html) · [Flexible Rollout](https://psrl.readthedocs.io/en/latest/design/flexible_rollout.html) · [Parameter Server](https://psrl.readthedocs.io/en/latest/design/parameter_server.html) · [Router, SessionRouter & TITO](https://psrl.readthedocs.io/en/latest/design/router_tito.html) · [KV Cache Management](https://psrl.readthedocs.io/en/latest/design/kv_cache.html) · [Resource Elasticity](https://psrl.readthedocs.io/en/latest/design/resource_elasticity.html)
 
 ## 🤝 Contributing to PSRL
 
@@ -139,7 +138,7 @@ pre-commit run
 
 ## 💬 Community
 
-We use [GitHub Issues](https://github.com/lhy101/psrl/issues) for bug reports, feature requests and general questions. We warmly welcome everyone to join in and help shape PSRL!
+We use [GitHub Issues](https://github.com/psrl-project/psrl/issues) for bug reports, feature requests and general questions. We warmly welcome everyone to join in and help shape PSRL!
 
 ## 📮 Contact Us
 

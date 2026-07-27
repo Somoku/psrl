@@ -574,11 +574,12 @@ selected instance may accept a request based on in-flight count, KV capacity
   **Default:** `True`
 
 `rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption`
-: Forwarded to vLLM as `preemption_notification_threshold`: the engine notifies the
-  gateway once its waiting queue exceeds this many requests after a preemption. This
-  is purely a **notification** threshold and is unrelated to admission, despite the
-  similar name.
-  **Default:** `1000`
+: Forwarded to vLLM as `preemption_notification_threshold`. The engine notifies the
+  gateway once its waiting queue exceeds this many requests after a preemption, and
+  those preempted requests are then looped back to the SMG router for global
+  re-scheduling instead of staying queued on the local instance. This is a
+  **notification** threshold, unrelated to admission despite the similar name.
+  **Default:** `1024`
 
 :::{important}
 With the default SMG gateway, set `rollout_coordination.routing_strategy.method` to
@@ -801,16 +802,24 @@ in multi-turn workloads.
   **Default:** `256`
 
 `lmcache.clear_on_weight_update`
-: Evict all cached KV entries after each model weight pull from the PS. Prevents
-  stale-weight KV from being reused in the next generation round. The default is
-  `False` because the shipped configuration relies on `multi_version_kv` instead,
-  which is the finer-grained mechanism and the one P2P requires.
+: Evict all cached KV entries after each model weight pull from the PS. This prevents
+  stale-weight KV from being reused in the next generation round, but it is a blunt
+  instrument, it discards every reusable prefix in the offload backend once per
+  weight update. The default is `False` because the
+  shipped configuration relies on `multi_version_kv` instead, which is the
+  finer-grained mechanism and the one P2P requires.
   **Default:** `False`
 
 `lmcache.multi_version_kv`
-: Tag cached KV entries with the model version so stale-weight entries are not
-  reused, instead of clearing the whole cache. Required when `enable_p2p: True`
-  (P2P does not support clear-on-weight-sync), in which case
+: Tag cached KV entries with the model version that produced them, so a request
+  running under version N can never structurally hit an entry produced under version
+  M, instead of clearing the whole cache on every update. Stale entries then age out
+  naturally through ordinary LRU eviction as new-version entries fill the cache. This
+  is the shipped default because under `psrl.staleness > 0` different rollout
+  instances can legitimately sit at different model versions at the same time, so clearing the
+  whole cache on every pull would throw away prefixes that a still-behind instance
+  could still use. Required when `enable_p2p: True` (the shared P2P backend has no
+  clear operation and relies entirely on version tags), in which case
   `clear_on_weight_update` must be `False`.
   **Default:** `True`
 
@@ -919,7 +928,7 @@ workloads to share GPU memory.
   - `train`: manage training worker memory only
   - `all`: manage both rollout and training worker memory
 
-  **Default:** `all`
+  **Default:** `null`
 
 `tms.enable_cuda_graph`
 : Release CUDA graphs via TMS when not in use. Requires `range: all`.
@@ -927,7 +936,7 @@ workloads to share GPU memory.
 
 `tms.enable_nixl`
 : Manage NIXL temporary buffers with TMS (simplifies re-registration after resume).
-  **Default:** `True`
+  **Default:** `False`
 
 ### Agentic RL
 

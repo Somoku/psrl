@@ -38,7 +38,7 @@ test = [
 ]
 
 [project.urls]
-Homepage="https://github.com/lhy101/psrl"
+Homepage="https://github.com/psrl-project/psrl"
 
 [tool.setuptools]
 package-dir = {"" = "."}

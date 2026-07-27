@@ -44,11 +44,11 @@ The PS answers this with three design decisions:
 ## Architecture
 
 PSRL splits the Parameter Server into two cooperating roles, both implemented under
-[`psrl/workers/ps/`](https://github.com/lhy101/psrl/blob/main/psrl/workers/ps).
+[`psrl/workers/ps/`](https://github.com/psrl-project/psrl/blob/main/psrl/workers/ps).
 
 ### PS Manager (control plane)
 
-A single Ray actor (`PSManager`, [`ps_manager.py`](https://github.com/lhy101/psrl/blob/main/psrl/workers/ps/ps_manager.py))
+A single Ray actor (`PSManager`, [`ps_manager.py`](https://github.com/psrl-project/psrl/blob/main/psrl/workers/ps/ps_manager.py))
 launched on the head node. It owns:
 
 - The **current model version tag** and a small `ModelStore` per version (either the
@@ -69,7 +69,7 @@ calls and updates metadata, but the actual bytes flow worker-to-worker.
 ### PS Workers (data plane)
 
 A group of CPU-side processes (`PSStorageWorker` +
-[`PSWorkerGroup`](https://github.com/lhy101/psrl/blob/main/psrl/workers/ps/ps_worker_group.py))
+[`PSWorkerGroup`](https://github.com/psrl-project/psrl/blob/main/psrl/workers/ps/ps_worker_group.py))
 placed on relevant rollout, actor, and validation nodes. Each PS Worker holds a shard of the model
 weights in pinned CPU memory and exposes NIXL endpoints that:
 
@@ -200,7 +200,7 @@ psrl:
 When enabled, only the **rank-0 PS Worker** reads the checkpoint from disk, it then
 fans the state dict out to all other workers in `ceil(log2(N))` rounds of binary
 broadcast over the same NIXL endpoints used for steady-state push/pull
-([`broadcast.py`](https://github.com/lhy101/psrl/blob/main/psrl/workers/ps/broadcast.py)).
+([`broadcast.py`](https://github.com/psrl-project/psrl/blob/main/psrl/workers/ps/broadcast.py)).
 
 Use this whenever PS Workers outnumber what your shared filesystem can comfortably
 serve in parallel (typically `>= 4` nodes).

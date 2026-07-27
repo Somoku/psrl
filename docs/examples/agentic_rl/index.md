@@ -68,7 +68,7 @@ metadata-only `KVBatchMeta` batches.
 
 Every agentic recipe in PSRL is built from the same three pieces, kept fully generic
 so new tasks can plug in without touching the loop itself. The full developer guide
-lives at [`psrl/environments/README.md`](https://github.com/lhy101/psrl/blob/main/psrl/environments/README.md).
+lives at [`psrl/environments/README.md`](https://github.com/psrl-project/psrl/blob/main/psrl/environments/README.md).
 In short:
 
 | Component | Role |

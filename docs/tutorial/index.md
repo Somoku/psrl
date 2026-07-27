@@ -12,4 +12,5 @@ multi-node DAPO training run with staleness-bounded asynchronous rollout.
 installation
 quickstart
 configuration
+performance_tuning
 ```

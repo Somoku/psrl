@@ -85,7 +85,7 @@ every episode will collapse to `-0.6` reward.
 
 ```{seealso}
 Full bake / Swarm / troubleshooting docs:
-[`examples/retool/docker_scripts/README.md`](https://github.com/lhy101/psrl/blob/main/examples/retool/docker_scripts/README.md)
+[`examples/retool/docker_scripts/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/retool/docker_scripts/README.md)
 and
-[`examples/retool/sandbox_fusion/README.md`](https://github.com/lhy101/psrl/blob/main/examples/retool/sandbox_fusion/README.md).
+[`examples/retool/sandbox_fusion/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/retool/sandbox_fusion/README.md).
 ```

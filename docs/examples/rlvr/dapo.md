@@ -74,5 +74,5 @@ bash examples/dapo_trainer/qwen2.5_3b_fsdp.sh 2
 ---
 
 ```{seealso}
-Full scripts and configuration details are in the [`examples/dapo_trainer/`](https://github.com/lhy101/psrl/tree/main/examples/dapo_trainer) directory.
+Full scripts and configuration details are in the [`examples/dapo_trainer/`](https://github.com/psrl-project/psrl/tree/main/examples/dapo_trainer) directory.
 ```

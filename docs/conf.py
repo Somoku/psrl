@@ -61,12 +61,13 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md", "superpower
 # -- Options for HTML output ----------------------------------------------
 
 html_theme = "pydata_sphinx_theme"
+html_title = "PSRL Documentation"
 
 html_theme_options = {
     "logo": {
         "text": "PSRL",
     },
-    "github_url": "https://github.com/lhy101/psrl",
+    "github_url": "https://github.com/psrl-project/psrl",
     # Docs live in the code repo, so "Edit this page" resolves to a real source file.
     "use_edit_page_button": True,
     "show_toc_level": 2,
@@ -80,7 +81,7 @@ html_theme_options = {
 }
 
 html_context = {
-    "github_user": "lhy101",
+    "github_user": "psrl-project",
     "github_repo": "psrl",
     "github_version": "main",
     "doc_path": "docs/",

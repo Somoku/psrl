@@ -52,5 +52,5 @@ it would otherwise produce a wrong answer.
 
 ```{seealso}
 Full launch-script parameter reference, tool registry schema, and troubleshooting:
-[`examples/retool/README.md`](https://github.com/lhy101/psrl/blob/main/examples/retool/README.md).
+[`examples/retool/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/retool/README.md).
 ```

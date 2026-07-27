@@ -119,7 +119,7 @@ snapshot_staleness_threshold_in_ms: 1000
 
 # Max waiting requests per instance after preemption (vLLM preemption *notification*
 # threshold only; not an admission signal).
-max_num_waiting_reqs_after_preemption: 1000
+max_num_waiting_reqs_after_preemption: 1024
 
 # Max concurrent sequences per instance. Also sets vLLM max_num_seqs (oc.select) and
 # is the admission gate's in-flight count cap. Lower to bound concurrency. 0 = no cap.

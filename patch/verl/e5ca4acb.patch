@@ -706,10 +706,18 @@ index 991ccdb2..0b0d62be 100644
              optimizer = None
              lr_scheduler = None
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 918d85ef..96b3e556 100644
+index 918d85ef..66a1f586 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
-@@ -69,6 +69,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+@@ -15,6 +15,7 @@
+ import inspect
+ import logging
+ import os
++from contextlib import nullcontext
+ from functools import partial
+ from typing import Any, Callable, ContextManager, Iterator, Optional
+ 
+@@ -69,6 +70,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import postprocess_batch_func, prepare_micro_batches
  from .utils import set_random_seed
  
@@ -723,7 +731,7 @@ index 918d85ef..96b3e556 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -293,20 +300,21 @@ class MegatronEngine(BaseEngine):
+@@ -293,20 +301,21 @@ class MegatronEngine(BaseEngine):
          self.tf_config = updated_tf_config
          print(f"module: {len(module)}")
  
@@ -758,7 +766,7 @@ index 918d85ef..96b3e556 100644
  
          if torch.distributed.get_rank() == 0:
              print_model_size(module[0])
-@@ -370,83 +378,89 @@ class MegatronEngine(BaseEngine):
+@@ -370,83 +379,89 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._build_tf_config()
  

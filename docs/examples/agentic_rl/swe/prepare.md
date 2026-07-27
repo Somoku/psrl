@@ -94,5 +94,5 @@ Both steps are idempotent, already-cached tars and already-loaded images are ski
 ---
 
 ```{seealso}
-Full instructions including mirror configuration, retry strategies, and disk planning: [`examples/mini_swe/prepare/README.md`](https://github.com/lhy101/psrl/blob/main/examples/mini_swe/prepare/README.md)
+Full instructions including mirror configuration, retry strategies, and disk planning: [`examples/mini_swe/prepare/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/mini_swe/prepare/README.md)
 ```

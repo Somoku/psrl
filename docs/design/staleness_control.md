@@ -161,7 +161,7 @@ Once a group is fully occupied, it may turn out to carry **no learning signal**:
 
 Mechanism: a `group_post_process` named `dynamic_sampling_filter` (implementation: `psrl/utils/post_processor/group_post_process/filter.py`) computes the standard deviation of `algorithm.filter_groups.metric` across the group and discards the group when it is `0`.
 
-Configuration (see [examples/mini_swe/fsdp_qwen_7b_swe_smith.sh:220-222](https://github.com/lhy101/psrl/blob/main/examples/mini_swe/fsdp_qwen_7b_swe_smith.sh#L220-L222)):
+Configuration (see [examples/mini_swe/fsdp_qwen_7b_swe_smith.sh:220-222](https://github.com/psrl-project/psrl/blob/main/examples/mini_swe/fsdp_qwen_7b_swe_smith.sh#L220-L222)):
 
 ```yaml
 psrl:

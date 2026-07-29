@@ -122,17 +122,17 @@ psrl/tools/sandbox_fusion_tool.py                       # SandboxFusionTool base
 ### Software
 
 ```bash
-# 1. Create conda environment and install PSRL (from repo root)
-conda create -n psrl python=3.11
+# 1. Create conda environment and install PSRL (from repo root).
+#    Full details: ../../CONTRIBUTING.md and the Installation guide.
+conda create -n psrl python=3.12
 conda activate psrl
 
-bash scripts/install_basic.sh
+bash scripts/install_basic.sh      # includes torch_memory_saver (TMS)
 bash scripts/install_nixl.sh
 bash scripts/install_megatron.sh   # required for megatron_*.sh paths only
-bash scripts/install_tms.sh
 bash scripts/install_lmcache.sh
 
-python -m pip install -e .
+pip install -e .
 
 # 2. Cluster-ops tools (used by docker_scripts/ and sandbox_fusion/)
 #    pssh for multi-node SSH; skopeo for proxy-friendly image pulls.

@@ -931,10 +931,10 @@ index 918d85ef..66a1f586 100644
      def train_mode(self, **kwargs):
          """
 diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
-index bf379b49..a5a82112 100644
+index bf379b49..882e9f0b 100644
 --- a/verl/workers/engine_workers.py
 +++ b/verl/workers/engine_workers.py
-@@ -85,10 +85,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
+@@ -85,10 +85,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
  
          from verl.workers.engine import BaseEngine, EngineRegistry
  
@@ -942,12 +942,10 @@ index bf379b49..a5a82112 100644
 -
          set_numa_affinity()
  
-+        initialize_global_process_group_ray(timeout_second=None)
-+
          self.config = config
          self.model_config = self.config.model_config
          self.engine_config = self.config.engine_config
-@@ -499,6 +499,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+@@ -499,6 +497,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
      @register(dispatch_mode=Dispatch.ONE_TO_ALL)
      def init_model(self):
          model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)

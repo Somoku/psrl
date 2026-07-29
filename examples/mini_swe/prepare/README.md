@@ -33,6 +33,7 @@ Three independent data paths are supported:
 | `docker_scripts/prefetch_example.sh` | Reference invocation that chains `prefetch_images.sh` + `load_all_nodes.sh` |
 | `docker_scripts/swe_gym.sh` | Convenience wrapper: prefetch full SWE-Gym images (2438 problems) |
 | `docker_scripts/swe_gym_subset.sh` | Convenience wrapper: prefetch SWE-Gym-Subset images (100 problems) |
+| `docker_scripts/swe_eval_subset.sh` | Convenience wrapper: prefetch SWE-bench eval subset images |
 | `docker_scripts/swe_smith.sh` | Convenience wrapper: prefetch SWE-smith images |
 | `docker_scripts/probe_mirrors.sh` | Quickly check which public Docker Hub mirrors can serve a given image (uses `skopeo inspect`, no download) |
 | `docker_scripts/load_all_nodes.sh` | `pssh` fan-out: on every host listed in a file, `docker load` every `*.tar` in a shared-FS image dir, with per-node parallelism and skip-if-already-loaded |

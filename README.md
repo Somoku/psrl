@@ -23,7 +23,7 @@ An Efficient Asynchronous RL Framework for LLM Post-Training
 
 ---
 
-**PSRL** is an efficient asynchronous RL framework for LLM post-training, targeting the system bottlenecks that emerge in **agentic, dynamic, and long-tailed** RL workloads.
+**PSRL** is an efficient asynchronous RL framework for LLM post-training, targeting the system bottlenecks that emerge in **agentic, dynamic, and long-tailed** RL workloads, achieving up to **2.68×** throughput improvement. It is developed by a joint team from **PKU & SJTU**.
 
 ## 📰 News
 
@@ -117,7 +117,7 @@ Production-ready training recipes demonstrating PSRL's capabilities across diffe
 
 ## 📖 Documentation
 
-- **Tutorial**: [Installation](https://psrl.readthedocs.io/en/latest/tutorial/installation.html) · [Quick Start](https://psrl.readthedocs.io/en/latest/tutorial/quickstart.html) · [Configuration](https://psrl.readthedocs.io/en/latest/tutorial/configuration.html) ·  [Performance Tuning](https://psrl.readthedocs.io/en/latest/tutorial/performance_tunning.html)
+- **Tutorial**: [Installation](https://psrl.readthedocs.io/en/latest/tutorial/installation.html) · [Quick Start](https://psrl.readthedocs.io/en/latest/tutorial/quickstart.html) · [Configuration](https://psrl.readthedocs.io/en/latest/tutorial/configuration.html) · [Performance Tuning](https://psrl.readthedocs.io/en/latest/tutorial/performance_tuning.html)
 - **Examples**: [RLVR](https://psrl.readthedocs.io/en/latest/examples/rlvr/index.html) · [Agentic RL](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/index.html) · [Generative Reward Model](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/index.html)
 - **Designs & Features**: [Architecture](https://psrl.readthedocs.io/en/latest/design/architecture.html) · [Staleness Control](https://psrl.readthedocs.io/en/latest/design/staleness_control.html) · [Flexible Rollout](https://psrl.readthedocs.io/en/latest/design/flexible_rollout.html) · [Parameter Server](https://psrl.readthedocs.io/en/latest/design/parameter_server.html) · [Router, SessionRouter & TITO](https://psrl.readthedocs.io/en/latest/design/router_tito.html) · [KV Cache Management](https://psrl.readthedocs.io/en/latest/design/kv_cache.html) · [Resource Elasticity](https://psrl.readthedocs.io/en/latest/design/resource_elasticity.html)
 
@@ -146,13 +146,11 @@ For enterprises interested in adopting or deploying PSRL at scale, including tec
 
 ## 🙏 Acknowledgements
 
-PSRL is built upon the foundations of [veRL](https://github.com/volcengine/verl), an open-source RLHF framework from ByteDance Seed.
-
-We also thank the following projects that PSRL integrates with or draws inspiration from: [vLLM](https://github.com/vllm-project/vllm), [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), [TransferQueue](https://github.com/Ascend/TransferQueue), [LMCache](https://github.com/LMCache/LMCache), and [NIXL](https://github.com/ai-dynamo/nixl)/UCX for RDMA transport. We also appreciate all the pioneering and inspirable projects from the community, including but not limited to [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), [AReaL](https://github.com/areal-project/AReaL), [slime](https://github.com/THUDM/slime), and [NeMo-RL](https://github.com/NVIDIA/NeMo-RL).
+PSRL is built upon the foundations of [veRL](https://github.com/volcengine/verl). We also thank the following projects that PSRL integrates with or draws inspiration from: [vLLM](https://github.com/vllm-project/vllm), [Megatron-LM](https://github.com/NVIDIA/Megatron-LM), [TransferQueue](https://github.com/Ascend/TransferQueue), [LMCache](https://github.com/LMCache/LMCache), and [NIXL](https://github.com/ai-dynamo/nixl)/UCX for RDMA transport. We also appreciate all the pioneering and inspirable projects from the community, including but not limited to [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF), [AReaL](https://github.com/areal-project/AReaL), [slime](https://github.com/THUDM/slime), and [NeMo-RL](https://github.com/NVIDIA/NeMo-RL).
 
 ## 📄 Citation
 
-If you use PSRL in your research, please cite our SIGMOD 2027 paper:
+If you use PSRL in your research, please cite our paper:
 
 ```bibtex
 @article{li2026staleflow,

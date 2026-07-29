@@ -38,7 +38,7 @@ checkout or installed package.
 
 ```bash
 bash scripts/install_basic.sh
-pip install .
+python -m pip install -e .
 ```
 
 `install_basic.sh` currently installs:

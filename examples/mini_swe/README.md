@@ -75,13 +75,16 @@ examples/mini_swe/
 ├── runner.py                             # Black-box mini-swe/Docker/grader runner
 ├── reward.py                             # Reward function (patch-overlap + test-execution)
 ├── swebench_grader.py                    # Fresh-container grader for SWE-smith / SWE-Gym / Verified (shared by training + eval)
-├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset
-├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (real RL)
-├── fsdp_qwen_7b_swe_smith_v1.sh          # Session-router/TITO v1 end-to-end entry point
-├── fsdp_qwen_7b_swe_gym.sh               # Launch script — SWE-Gym (real RL, FSDP)
+├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset (FSDP, 7B)
+├── fsdp_qwen_14b_dapo.sh                 # Launch script — toy / DAPO path (FSDP, 14B)
+├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (FSDP, 7B)
+├── fsdp_qwen_7b_swe_gym.sh               # Launch script — SWE-Gym (FSDP, 7B)
+├── megatron_qwen_4b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 4B)
 ├── megatron_qwen_7b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 7B)
 ├── megatron_qwen_8b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 8B)
+├── megatron_qwen_8b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 8B)
 ├── megatron_qwen_32b_swe_smith.sh        # Launch script — SWE-smith (Megatron, 32B)
+├── test_perf.sh                          # Performance / throughput probe
 ├── config/
 │   ├── simple_agent_config.yaml          # Agent config for toy path
 │   ├── swebench_agent_config.yaml        # Agent config for SWE-smith / SWE-Gym / Verified
@@ -107,6 +110,7 @@ examples/mini_swe/
         ├── swe_smith.sh                  # Convenience wrapper for SWE-smith images
         ├── swe_gym.sh                    # Convenience wrapper for SWE-Gym images
         ├── swe_gym_subset.sh             # Convenience wrapper for SWE-Gym-Subset images
+        ├── swe_eval_subset.sh            # Convenience wrapper for SWE-bench eval subset images
         ├── probe_mirrors.sh              # Check which public Docker Hub mirrors serve a given image
         └── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
 

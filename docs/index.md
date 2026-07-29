@@ -12,7 +12,7 @@ sd_hide_title: true
 ```
 
 
-**PSRL** is an efficient asynchronous RL framework for LLM post-training. Built on top of [veRL](https://github.com/volcengine/verl), PSRL features efficient RDMA weight synchronization via parameter servers, fine-grained staleness control, and flexible rollout coordination to achieve up to **2.68x throughput improvement**.
+**PSRL** is an efficient asynchronous RL framework for LLM post-training. Developed by a joint team from **PKU & SJTU** and built on top of [veRL](https://github.com/volcengine/verl), PSRL features efficient RDMA weight synchronization via parameter servers, fine-grained staleness control, and flexible rollout coordination to achieve up to **2.68x throughput improvement**.
 
 ---
 

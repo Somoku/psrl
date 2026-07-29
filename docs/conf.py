@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.abspath(".."))
 # -- Project information --------------------------------------------------
 
 project = "PSRL"
-copyright = "2025, PKUDAIR Lab PSRL Team"
-author = "PKUDAIR Lab PSRL Team"
+copyright = "2025, PKU & SJTU PSRL Team"
+author = "PKU & SJTU PSRL Team"
 release = "0.1.0"
 
 # -- General configuration ------------------------------------------------

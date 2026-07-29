@@ -8,50 +8,6 @@ Your support can take many forms:
 - Improve documentation or add examples.
 - Review pull requests and help other contributors.
 
-## Installation for Developers
-
-Install PSRL from scratch to set up a local development environment. This allows you to run tests, debug, and contribute code.
-
-**Prerequisites:** GCC ≥ 9, CUDA 12.8, Python 3.11, Rust & Cargo
-
-```bash
-# Install Rust (if not already installed)
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-
-# Create and activate conda environment
-conda create -n psrl python=3.11
-conda activate psrl
-
-# Install all dependencies (PyTorch 2.9.1, FlashAttention, apex, SMG, vLLM, veRL)
-bash scripts/install_basic.sh
-
-# Install PSRL in editable mode with gRPC support
-pip install -e ".[grpc]"
-```
-
-The `install_basic.sh` script installs (in order): PyTorch 2.9.1 + CUDA 12.8, FlashAttention, FlashInfer, apex, SMG (from `psrl_dev` branch), vLLM (patched), veRL (patched), then `pip install -e ".[grpc]"`.
-
-### Optional components
-
-```bash
-# Megatron-LM backend
-bash scripts/install_megatron.sh
-
-# NIXL (NVIDIA Inference Transfer Library) for weight streaming
-bash scripts/install_nixl.sh
-```
-
-### Installing test dependencies
-
-To run the test suite locally, install the `test` extras:
-
-```bash
-pip install -e ".[test]"
-# or with gRPC support
-pip install -e ".[grpc,test]"
-```
-
 ## Code Linting and Formatting
 
 PSRL uses [Ruff](https://docs.astral.sh/ruff/) for linting and formatting, enforced via [pre-commit](https://pre-commit.com/). Code style settings:
@@ -82,30 +38,39 @@ pre-commit run --all-files ruff-check
 pre-commit run --all-files ruff-format
 ```
 
-The CI `pre-commit` workflow runs `pre-commit run --all-files` on every pull request and push to `main`. All checks must pass before merging.
+The CI `pre-commit` workflow runs pre-commit on changed files on every pull request and push to `main`. All checks must pass before merging.
 
 ## Testing
 
-PSRL's test suite is organized under `tests/` by feature area. There are four CI workflows, each targeting a different hardware tier.
+PSRL's test suite is organized under `tests/` by feature area. CI workflows target different hardware tiers.
 
 ### Test structure
 
 ```
 tests/
+├── agent_loop/         # Multi-turn agent loop and agent data
+├── checkpoint/         # Checkpoint save/load
+├── config/             # Trainer and Hydra config
 ├── converter/          # vLLM weight converter — SupportsWeightLayoutSpec, ParameterMapping
 ├── dataset/            # Data processor and dataset utilities
+├── e2e/                # End-to-end training smoke paths
+├── elastic_rm/         # Elastic resource manager / scaling policy
 ├── environments/       # Environment plugin registry
 ├── fsdp/               # FSDP1/FSDP2 model loading (GPU, torchrun)
-├── gen/           # StatsRecorder and rollout generation stats
+├── gen_dplb/           # StatsRecorder and rollout generation / DP load-balancing stats
 ├── megatron/           # Megatron model initialization (GPU)
+├── mem_agent/          # Memory-agent helpers
 ├── nixl/               # NIXL communication planner, sharding, e2e (multi-node GPU)
 ├── parameter_server/   # RequestStatusTracker and PSManager
 ├── ray_utils/          # Ray actor utilities (real Ray cluster, GPU runner)
 ├── staleness/          # StalenessBuffer and StalenessInventory
 ├── state_dict/         # State dict conversion scripts (GPU, torchrun)
+├── tito/               # SessionRouter / TITO integration
 ├── tools/              # MCP tool integration
 ├── torch_dist/         # torch.distributed broadcast (GPU, torchrun)
-└── trainer/            # PSRL_Role enum and trainer config dataclasses
+├── trainer/            # PSRL_Role enum and trainer config dataclasses
+├── unit/               # Small isolated unit tests
+└── workers/            # Worker-level tests
 ```
 
 ### Running tests locally
@@ -117,10 +82,10 @@ pip install -e ".[test]"
 pytest -m cpu_test --ignore=tests/nixl --ignore=tests/ray_utils tests/
 ```
 
-**GPU + Ray integration tests** (requires self-hosted runner with psrl env):
+**GPU + Ray integration tests** (requires a GPU machine with the PSRL conda env activated):
 
 ```bash
-source /jizhicfs/johnnyslin/env/psrl.sh
+conda activate psrl
 pytest -m "not cpu_test" --ignore=tests/nixl -x tests/
 ```
 
@@ -149,7 +114,7 @@ bash tests/state_dict/scripts/test_vllm_converter_new_api.sh
 
 ```bash
 # On target node first:
-RECV_IP=<target_ip> bash tests/nixl/scripts/test_send_recv_target.sh
+recv_IP=<target_ip> bash tests/nixl/scripts/test_send_recv_target.sh
 
 # Then on initiator node:
 SEND_IP=<initiator_ip> RECV_IP=<target_ip> bash tests/nixl/scripts/test_send_recv_initiator.sh
@@ -185,7 +150,8 @@ PSRL_TEST_LARGE_ARRAYS=1 pytest tests/ray_utils/test_lazy_primitives.py tests/ra
 
 | Workflow | Trigger | Runner | What it runs |
 |---|---|---|---|
-| `pre-commit.yml` | PR + push to `main` | `ubuntu-latest` | Ruff lint and format |
+| `pre-commit.yml` | PR + push to `main` | `ubuntu-latest` | Ruff lint and format on changed files |
+| `smoke_cpu_tests.yml` | PR + push to `main` | `ubuntu-latest` | Minimal CPU smoke pytest (no full PSRL install) |
 | `cpu_unit_tests.yml` | PR + push to `main` (`.py` changes) | `ubuntu-latest` | `pytest -m cpu_test` — fast feedback on every PR |
 | `gpu_unit_tests.yml` | Push to `main` + dispatch | `self-hosted [gpu]` | All non-`cpu_test` pytest tests (Ray, vLLM, gRPC) |
 | `gpu_distributed.yml` | Push to `main` + dispatch | `self-hosted [gpu]` | torchrun tests: FSDP, torch_dist, state_dict converter |
@@ -209,4 +175,3 @@ PSRL_TEST_LARGE_ARRAYS=1 pytest tests/ray_utils/test_lazy_primitives.py tests/ra
 ## License
 
 See the [LICENSE](LICENSE) file for full details.
-

@@ -74,6 +74,6 @@ popd
 bash "$PSRL_PATH/patch/apply_patch.sh" megatron_bridge
 
 echo "5. Apply TransformerEngine patch (flash-attn-3 + context parallel compat)"
-bash "$PSRL_PATH/patch/apply_patch.sh" transformer_engine --force || true
+bash "$PSRL_PATH/patch/apply_patch.sh" transformer_engine --force
 
 echo "Successfully installed all packages for Megatron"

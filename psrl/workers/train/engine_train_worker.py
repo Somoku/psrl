@@ -482,6 +482,17 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                        'empty' skips weight loading (used by async NIXL boot path,
                        where NIXL streams the real weights from the parameter server).
         """
+        # Pre-initialize the default process group with an extended timeout before
+        # model init. megatron-core 0.19.0 added all_gather_object in _get_param_groups
+        # (called during optimizer build) that uses the default gloo process group.
+        # On cold filesystems, distributed checkpoint resharding causes a large spread
+        # in when workers reach that collective, exceeding the default 1800s gloo timeout.
+        # Calling this here (before ActorRolloutRefWorker.init_model's call) pre-empts
+        # the default init so all subsequent gloo operations use the extended timeout.
+        from verl.utils.distributed import initialize_global_process_group_ray
+
+        initialize_global_process_group_ray(timeout_second=36000)
+
         with log_dual_events("Initialize model", psrl_logger, event_type=EventType.INIT):
             skip_load_weight = init_mode == "empty"
             strategy = self.config.actor.strategy

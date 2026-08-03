@@ -16,7 +16,7 @@ license = { file = "LICENSE" }
 dependencies = [
     "aiohttp>=3.9.0",
     "cachetools>=5.0.0",
-    "vllm-psrl-patches @ file:patch/vllm/vllm_plugin",
+    "vllm-psrl-patches",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -38,7 +38,10 @@ test = [
 ]
 
 [project.urls]
-Homepage="https://github.com/psrl-project/psrl"
+Homepage="https://github.com/lhy101/psrl"
+
+[tool.uv.sources]
+vllm-psrl-patches = { path = "patch/vllm/vllm_plugin", editable = true }
 
 [tool.setuptools]
 package-dir = {"" = "."}

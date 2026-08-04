@@ -20,14 +20,13 @@ DAPO algorithm with asynchronous staleness-3 training across 2 nodes (16 GPUs).
 ## Choose your runtime
 
 If you use Docker, run the following command from the repository root before following
-the steps below. Run the remaining commands inside the container, and keep the same
-image and workspace mount on every node:
+the steps below.
 
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=16g \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   -v "$PWD:/home/psrl" \
-  -it psrl:cuda
+  -it psrl:latest
 ```
 
 If you installed from source, activate the environment created by the

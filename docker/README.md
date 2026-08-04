@@ -50,9 +50,7 @@ gateway/data-plane development. It does not support PSRL GPU training.
 
 ## Start a container
 
-The image already contains PSRL at `/home/psrl`. Mount the source checkout when
-you want to use local changes, and mount a persistent workspace for models,
-datasets, and checkpoints:
+The image already contains PSRL at `/home/psrl`.
 
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=16g \
@@ -64,7 +62,7 @@ docker run --rm --gpus all --ipc=host --shm-size=16g \
 Inside the container, run the usual PSRL commands from `/home/psrl`:
 
 ```bash
-bash examples/ray/ray_start.sh /workspace/hosts/16GPUs
+bash examples/ray/ray_start.sh ${PSRL_WORKSPACE}/hosts/16GPUs
 bash examples/dapo_trainer/qwen2.5_3b_fsdp.sh
 ```
 
@@ -78,9 +76,7 @@ docker run --rm -it \
   psrl:cpu
 ```
 
-For multi-node NIXL/UCX/Mooncake traffic, start the same image on every node,
-keep the workspace paths consistent, and expose the host's RDMA devices using
-your cluster's standard Docker configuration (for example, `--device=/dev/infiniband`).
+For multi-node NIXL/UCX/Mooncake traffic, start the same image on every node, and expose the host's RDMA devices using your cluster's standard Docker configuration (for example, `--device=/dev/infiniband`).
 
 ## Notes
 

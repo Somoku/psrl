@@ -2,7 +2,7 @@
 
 # PSRL GPU development/runtime image.
 # Build from the repository root:
-#   docker build --progress=plain -f docker/Dockerfile -t psrl:cuda .
+#   docker build --progress=plain -f docker/Dockerfile -t psrl:latest .
 
 ARG CUDA_VERSION=13.0.3
 ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04

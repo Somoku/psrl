@@ -42,9 +42,6 @@ CUDA-only libraries and cannot run GPU training.
 
 ### Start the container
 
-Run this command from the repository root. The first mount makes local source edits
-visible inside the container; the second keeps training data outside the container:
-
 ```bash
 docker run --rm --gpus all --ipc=host --shm-size=16g \
   --ulimit memlock=-1 --ulimit stack=67108864 \

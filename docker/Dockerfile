@@ -49,6 +49,7 @@ ENV DEBIAN_FRONTEND=${DEBIAN_FRONTEND} \
     CUDA_HOME=/usr/local/cuda \
     NVSHMEM_DIR=/root/deepep/nvshmem \
     PSRL_HOME=/home/psrl \
+    PSRL_WORKSPACE=/home/workspace \
     PSRL_THIRD_PARTY=/root \
     PSRL_PATCH_DIR=/root/patch \
     UCX_HOME=/root/ucx \
@@ -330,8 +331,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         rm -rf /root/flash-attention; \
     fi && \
     CUDA_WHEEL_TAG="cu$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr -d '.')" && \
-    uv pip install --no-build-isolation "flashinfer-python==${FLASHINFER_VERSION}" \
+    uv pip install --no-build-isolation \
+        "flashinfer-python==${FLASHINFER_VERSION}" \
         --extra-index-url "https://flashinfer.ai/whl/${CUDA_WHEEL_TAG}" && \
+    uv pip install \
+        "flashinfer-cubin==${FLASHINFER_VERSION}" \
+        --index-url "https://flashinfer.ai/whl" && \
     uv pip install "flash-linear-attention==0.4.2"
 
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -449,12 +454,11 @@ RUN rm -rf /root/.cache/pip /root/.cache/uv
 
 WORKDIR ${PSRL_HOME}
 
-ENV HF_XET_HIGH_PERFORMANCE=1 \
-    HF_HUB_DOWNLOAD_TIMEOUT=60 \
-    PYTHONUNBUFFERED=1 \
-    TOKENIZERS_PARALLELISM=true \
-    PSRL_WORKSPACE=/home \
-    VERL_DATAPROTO_SERIALIZATION_METHOD=numpy
+RUN mkdir -p ${PSRL_WORKSPACE}/env
+COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
+
+ENV VIRTUAL_ENV=/root/venv \
+    PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 LABEL org.opencontainers.image.title="PSRL CUDA" \
       org.opencontainers.image.description="PSRL post-training environment with CUDA, vLLM, veRL, SMG, NIXL, LMCache, Megatron, Mooncake, and DeepEP" \

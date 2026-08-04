@@ -39,6 +39,7 @@ echo "All nodes cleaned up."
 echo "Starting Head node at ${HEAD_IP}"
 pssh -H "${HEAD_IP}" -i \
     "source ${env_file} && \
+    cd ${PSRL_WORKSPACE} && \
     ray start --head \
     --port=${PORT} \
     --dashboard-host=0.0.0.0 \
@@ -50,6 +51,7 @@ if [ ${#workers[@]} -gt 0 ]; then
     echo "Starting ${#workers[@]} Worker nodes"
     pssh -H "${workers[*]}" -i \
         "source ${env_file} && \
+        cd ${PSRL_WORKSPACE} && \
         ray start --address=${HEAD_IP}:${PORT} \
         --num-cpus=32"
 fi

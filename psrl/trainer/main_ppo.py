@@ -222,6 +222,16 @@ class TaskRunner:
             self.role_worker_mapping[PSRL_Role.Critic] = ray.remote(TrainingWorker)
             self.mapping[PSRL_Role.Critic] = ["train_pool"]
 
+    def add_ref_policy_worker(self, config):
+        """Add a reference policy worker when KL loss or KL reward is enabled."""
+        if not need_reference_policy(config):
+            return
+
+        from verl.workers.engine_workers import ActorRolloutRefWorker
+
+        self.role_worker_mapping[PSRL_Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+        self.mapping[PSRL_Role.RefPolicy] = ["train_pool"]
+
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
         deployment_config = config.psrl.deployment
@@ -393,6 +403,7 @@ class TaskRunner:
             tq_future = executor.submit(tq.init, config.transfer_queue)
             self.add_actor_rollout_worker(config)
             self.add_critic_worker(config)
+            self.add_ref_policy_worker(config)
 
             # AGENT(VERL): PSRL use reward model worker.
             self.add_reward_model_worker(config)

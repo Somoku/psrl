@@ -377,7 +377,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             "compilation_config": compilation_config,
             # AGENT(VERL): thread runner/task through for pooling model support in PSRL
             "runner": self.config.get("runner", "generate"),
-            "no_async_scheduling": True,
             **engine_kwargs,
         }
 

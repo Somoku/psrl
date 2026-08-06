@@ -20,13 +20,18 @@ pytestmark = pytest.mark.cpu_test
 # ---------------------------------------------------------------------------
 
 
-def _make_entry_info(prompt_id: int, request_idx: int = 0, model_version: int = 1):
+def _make_entry_info(
+    prompt_id: int,
+    request_idx: int = 0,
+    model_version: int = 1,
+    n_trajectory: int = 1,
+):
     """Build a minimal EntryInfo-like mock."""
     ei = MagicMock()
     ei.prompt_id = prompt_id
     ei.get_entry_version.return_value = model_version
     ei.request_idx = request_idx
-    ei.n_trajectory = 1
+    ei.n_trajectory = n_trajectory
     ei.model_version = model_version
     return ei
 
@@ -43,11 +48,13 @@ class FakeManager:
 
         self.train_chunk_size = chunk_size
         self._train_chunk_consumed: dict[int, int] = {}
+        self._train_chunk_emitted_entry_ids: dict[int, set[int]] = {}
         self._train_chunk_waiters: dict[tuple, list] = {}
         self._resolved_train_chunks: dict[tuple, tuple] = {}
         self.ready_entries_per_buffer = ready_total
         self.rollout_n = rollout_n
         self.train_accumulated_buffers: dict[int, dict[int, list]] = {}
+        self.train_accumulated_buffer_size: dict[int, int] = {}
 
         # Bind real methods from the production class.
         self._emit_pending_chunks = PSRL_AgentLoopManager._emit_pending_chunks.__get__(self)
@@ -55,11 +62,14 @@ class FakeManager:
 
     def entry_infos_to_kv_batch_meta(self, entries, is_validate: bool = False) -> KVBatchMeta:
         """Return a minimal KVBatchMeta for the given entry list."""
-        return KVBatchMeta(
-            keys=[str(e.prompt_id) for e in entries],
-            tags=[{"uid": e.prompt_id} for e in entries],
-            partition_id="train",
-        )
+        keys = []
+        tags = []
+        for entry in entries:
+            for trajectory_index in range(entry.n_trajectory):
+                key = str(entry.prompt_id) if entry.n_trajectory == 1 else f"{entry.prompt_id}_{trajectory_index}"
+                keys.append(key)
+                tags.append({"uid": entry.prompt_id})
+        return KVBatchMeta(keys=keys, tags=tags, partition_id="train")
 
     def _add_groups(
         self,
@@ -67,12 +77,23 @@ class FakeManager:
         n_groups: int,
         start_prompt_id: int = 0,
         model_version: int = 1,
+        n_trajectory: int = 1,
     ) -> None:
         """Append n_groups fake EntryInfo objects to `train_accumulated_buffers[buffer_id]`."""
         if buffer_id not in self.train_accumulated_buffers:
             self.train_accumulated_buffers[buffer_id] = {}
-        entries = [_make_entry_info(start_prompt_id + i, model_version=model_version) for i in range(n_groups)]
+        entries = [
+            _make_entry_info(
+                start_prompt_id + i,
+                model_version=model_version,
+                n_trajectory=n_trajectory,
+            )
+            for i in range(n_groups)
+        ]
         self.train_accumulated_buffers[buffer_id].setdefault(model_version, []).extend(entries)
+        self.train_accumulated_buffer_size[buffer_id] = (
+            self.train_accumulated_buffer_size.get(buffer_id, 0) + n_groups
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,19 +244,36 @@ class TestChunkEmission:
             buf = 0
 
             # High prompt_ids complete first.
-            mgr._add_groups(buf, n_groups=2, start_prompt_id=2)
+            mgr._add_groups(buf, n_groups=2, start_prompt_id=2, model_version=2)
             mgr._emit_pending_chunks(buf)
             c0, last0 = await mgr.wait_for_training_chunk(buf, 0)
             assert sorted(map(int, c0.keys)) == [2, 3]
             assert last0 is False
 
             # Low prompt_ids complete later.
-            mgr._add_groups(buf, n_groups=2, start_prompt_id=0)
+            mgr._add_groups(buf, n_groups=2, start_prompt_id=0, model_version=1)
             mgr._emit_pending_chunks(buf)
             assert (buf, 1) in mgr._resolved_train_chunks, "chunk 1 must be emitted"
             c1, last1 = await mgr.wait_for_training_chunk(buf, 1)
             assert last1 is True
             assert sorted(map(int, c1.keys)) == [0, 1], f"chunk 1 should be the late groups [0,1], got {c1.keys}"
             assert set(c0.keys).isdisjoint(c1.keys)
+
+        asyncio.run(_run())
+
+    def test_multi_trajectory_request_is_not_split(self):
+        """A request remains one chunk unit even when it expands to trajectories."""
+
+        async def _run():
+            mgr = FakeManager(chunk_size=1, ready_total=2)
+            buf = 1
+
+            mgr._add_groups(buf, n_groups=1, n_trajectory=3)
+            mgr._emit_pending_chunks(buf)
+            chunk, is_last = await mgr.wait_for_training_chunk(buf, 0)
+
+            assert chunk.keys == ["0_0", "0_1", "0_2"]
+            assert {tag["uid"] for tag in chunk.tags} == {0}
+            assert is_last is False
 
         asyncio.run(_run())

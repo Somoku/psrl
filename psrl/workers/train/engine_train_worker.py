@@ -16,6 +16,7 @@ from verl.single_controller.base.decorator import (
     make_nd_compute_dataproto_dispatch_fn,
     register,
 )
+from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, is_cuda_available
 from verl.utils.fs import copy_to_local
 from verl.utils.memory_utils import aggressive_empty_cache
@@ -519,26 +520,16 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        """Train the actor for one step, then optionally push updated weights to the PS.
-
-        ``push_model`` (non-tensor on ``data``, default True) controls whether weights
-        are pushed after the optimizer step. Fine-grain ``pre_step`` overlap sets this
-        False on intermediate chunks so the PS version only advances once the full
-        training buffer has been consumed — matching the invariant that
-        ``maybe_delete_buffer(version-1)`` runs only after that buffer is fully trained.
-        """
-        from verl.utils import tensordict_utils as tu
-
+        """Train the actor for one step, then optionally push updated weights to the PS."""
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
-        torch.cuda.synchronize()
 
         # Default True preserves full-batch / recompute behavior.
-        do_push = bool(tu.get_non_tensor_data(data, key="push_model", default=True))
-        if not do_push:
-            psrl_logger.info("Skipping PS push after actor update (push_model=False).")
+        push_model = tu.get_non_tensor_data(data, key="push_model", default=True)
+        if not push_model:
             return output
 
+        torch.cuda.synchronize()
         context_manager = (
             exclusive_push_model_context(self.train_interface.ps_manager_handle)
             if self.is_train_representative_rank

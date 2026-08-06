@@ -67,7 +67,7 @@ class PSRL_AgentLoopWorker:
         """
 
         # Per-actor identity used to label every Docker container this worker
-        # spawns (rollout containers in MiniSWEAgentLoopV1, grader containers in
+        # spawns (rollout containers in MiniSWEAgentLoop, grader containers in
         # swebench_grader). The reaper sidecar below filters by this label to
         # reclaim only this actor's containers when the actor process dies,
         # which is robust under SIGKILL, OOM, Ray actor restart, and
@@ -509,10 +509,10 @@ class PSRL_AgentLoopWorker:
                 raise raised_error
 
     async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: TensorDict):
-        """Process generation output: fire TQ write + notify manager (non-blocking occupy).
+        """Commit generation output to TQ and notify the manager.
 
-        The worker fires the TQ write as an async task and sends metadata to the manager
-        for occupy processing. The worker only blocks on the TQ write completion.
+        Tensor payloads stay in TQ; only compact request metadata is sent to the
+        manager for group occupation.
         """
         uid = tu.get(batch, "uid")[0]
         is_validate = tu.get(batch, "validate")[0]
@@ -531,7 +531,7 @@ class PSRL_AgentLoopWorker:
             tags=[{"status": "success"}] * len(keys),
         )
 
-        # Notify manager with metadata only (immediately, no await on TQ write)
+        # Notify manager with metadata only after output commit.
         await self.agent_loop_manager.put_result.remote(
             {
                 "request_id": uid,
@@ -542,14 +542,6 @@ class PSRL_AgentLoopWorker:
                 "is_validate": is_validate,
             }
         )
-
-        # Clear original input data for n_trajectory > 1 because of
-        # the difference between input/outputs keys.
-        if len(outputs) > 1:
-            await tq.async_kv_clear(
-                keys=batch.keys,
-                partition_id=partition_id,
-            )
 
     def _build_output_fields(
         self,

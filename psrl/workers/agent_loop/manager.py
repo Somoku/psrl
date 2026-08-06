@@ -141,6 +141,9 @@ class PSRL_AgentLoopManager:
         self.train_chunk_size: int | None = None
         # Maps buffer_id -> number of prompt-groups already handed out as chunks.
         self._train_chunk_consumed: dict[int, int] = {}
+        # Entry identities already emitted for each buffer. The version buckets
+        # may be reordered by late arrivals, so a numeric offset is insufficient.
+        self._train_chunk_emitted_entry_ids: dict[int, set[int]] = {}
         # Maps (buffer_id, chunk_index) -> list of asyncio.Future waiting for that chunk.
         self._train_chunk_waiters: dict[tuple[int, int], list] = {}
         # Durable store for emitted chunks: (buffer_id, chunk_index) -> (KVBatchMeta, is_last).
@@ -520,6 +523,7 @@ class PSRL_AgentLoopManager:
             # `_resolved_train_chunks` are consumed lazily by
             # `wait_for_training_chunk`.
             self._train_chunk_consumed.pop(buffer_id, None)
+            self._train_chunk_emitted_entry_ids.pop(buffer_id, None)
             accumulated_buffers.pop(buffer_id, None)
             accumulated_buffer_size.pop(buffer_id, None)
             return True
@@ -1449,13 +1453,15 @@ class PSRL_AgentLoopManager:
         for model_version in sorted(accumulated_buffers.keys()):
             all_entry_infos.extend(accumulated_buffers[model_version])
 
-        total_accumulated = len(all_entry_infos)
+        emitted_entry_ids = self._train_chunk_emitted_entry_ids.setdefault(buffer_id, set())
+        pending_entry_infos = [entry for entry in all_entry_infos if id(entry) not in emitted_entry_ids]
         consumed = self._train_chunk_consumed.get(buffer_id, 0)
         ready_total = self.ready_entries_per_buffer
-        is_buffer_complete = total_accumulated >= ready_total
+        accumulated_size = self.train_accumulated_buffer_size.get(buffer_id, len(all_entry_infos))
+        is_buffer_complete = accumulated_size >= ready_total
 
         while True:
-            available = total_accumulated - consumed
+            available = len(pending_entry_infos)
             chunk_idx = consumed // self.train_chunk_size
             key = (buffer_id, chunk_idx)
 
@@ -1475,7 +1481,8 @@ class PSRL_AgentLoopManager:
 
             # Slice by accumulation order, then sort within the chunk for
             # deterministic GRPO group layout without disturbing the consumed prefix.
-            chunk_entries = all_entry_infos[consumed : consumed + emit_count]
+            chunk_entries = pending_entry_infos[:emit_count]
+            del pending_entry_infos[:emit_count]
             chunk_entries = sorted(chunk_entries, key=lambda ei: ei.prompt_id)
             chunk_batch = self.entry_infos_to_kv_batch_meta(chunk_entries, is_validate=False)
 
@@ -1504,6 +1511,7 @@ class PSRL_AgentLoopManager:
             else:
                 self._resolved_train_chunks[key] = result
 
+            emitted_entry_ids.update(id(entry) for entry in chunk_entries)
             self._train_chunk_consumed[buffer_id] = consumed + emit_count
             consumed += emit_count
 

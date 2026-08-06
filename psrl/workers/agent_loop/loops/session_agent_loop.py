@@ -227,6 +227,8 @@ class SessionAgentLoop(AgentLoopBase):
     @staticmethod
     def build_token_output(training_data: dict, *, extra_fields: dict | None = None) -> TokenOutput:
         """Convert one TITO trajectory into the canonical rollout output."""
+        trajectory_fields = dict(extra_fields or {})
+        trajectory_fields["trajectory_id"] = training_data["trajectory_id"]
         return TokenOutput(
             prompt_ids=training_data["prompt_ids"],
             response_ids=training_data["response_ids"],
@@ -236,7 +238,7 @@ class SessionAgentLoop(AgentLoopBase):
             stop_reason=training_data.get("finish_reason"),
             num_turns=training_data["num_turns"],
             rollout_instance_id=training_data.get("rollout_instance_id"),
-            extra_fields=dict(extra_fields or {}),
+            extra_fields=trajectory_fields,
         )
 
     @staticmethod

@@ -52,12 +52,12 @@ class RewardManagerBase(ABC):
             value = tu.get(data_item, field_name, None)
             if isinstance(value, Mapping):
                 merged.update(value)
+        merged.update(runtime_info)
 
         tool_extra_fields = tu.get(data_item, "tool_extra_fields", None)
         if tool_extra_fields is not None:
             merged.update(tool_extra_fields.items())
 
-        merged.update(runtime_info)
         return merged
 
     @classmethod

@@ -1,6 +1,12 @@
 from omegaconf import DictConfig
 from verl.utils.config import omega_conf_to_dataclass
 
+from psrl.trainer.ppo.batch_schedule import (
+    REQUEST_AGG_MODE,
+    SUPPORTED_BATCH_AGG_MODES,
+    TRAJECTORY_AGG_MODE,
+)
+
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
     """
@@ -225,6 +231,31 @@ def validate_config(
 
     # ---- PSRL specific validation ----
 
+    batch_agg_mode = config.psrl.agentic_rl.get("batch_agg_mode", TRAJECTORY_AGG_MODE)
+    assert batch_agg_mode in SUPPORTED_BATCH_AGG_MODES, (
+        "psrl.agentic_rl.batch_agg_mode must be one of "
+        f"{sorted(SUPPORTED_BATCH_AGG_MODES)}, got {batch_agg_mode!r}."
+    )
+    if batch_agg_mode == REQUEST_AGG_MODE and not config.psrl.rollout_coordination.redundant_rollout.enable:
+        rollout_n = config.gen_actor_rollout_ref.rollout.n
+        requests_per_buffer = config.psrl.staleness_buffer_entries * rollout_n
+        actor_entries_per_update = config.train_actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
+        assert requests_per_buffer % actor_entries_per_update == 0, (
+            "With psrl.agentic_rl.batch_agg_mode='request', requests_per_buffer "
+            "must be divisible by the actor entries_per_update: "
+            f"{requests_per_buffer} % {actor_entries_per_update} != 0. "
+            "Adjust psrl.staleness_buffer_entries or "
+            "train_actor_rollout_ref.actor.ppo_mini_batch_size."
+        )
+        if use_critic:
+            critic_entries_per_update = config.critic.ppo_mini_batch_size * rollout_n
+            assert requests_per_buffer % critic_entries_per_update == 0, (
+                "With psrl.agentic_rl.batch_agg_mode='request', requests_per_buffer "
+                "must be divisible by the critic entries_per_update: "
+                f"{requests_per_buffer} % {critic_entries_per_update} != 0. "
+                "Adjust psrl.staleness_buffer_entries or critic.ppo_mini_batch_size."
+            )
+
     # Check NIXL compatibility
     if config.psrl.ps_mode == "nixl_cpu" or config.psrl.ps_mode == "nixl_gpu":
         assert config.psrl.nixl.server_ip == config.psrl.ps_manager_ip, (
@@ -353,6 +384,26 @@ def validate_config(
             raise ValueError("psrl.fine_grain_overlap.multiplier must be >= 1.")
 
         effective_gran, chunk_groups = resolve_fine_grain_chunk_size(config, dp_size_fgo)
+
+        if batch_agg_mode == REQUEST_AGG_MODE and overlap_scope == "pre_step":
+            if config.psrl.rollout_coordination.redundant_rollout.enable:
+                selected_requests_per_group = config.psrl.rollout_coordination.redundant_rollout.alg_rollout_n
+            else:
+                selected_requests_per_group = config.gen_actor_rollout_ref.rollout.n
+            requests_per_window = chunk_groups * selected_requests_per_group
+            actor_requests_per_update = (
+                config.train_actor_rollout_ref.actor.ppo_mini_batch_size * selected_requests_per_group
+            )
+            assert requests_per_window % actor_requests_per_update == 0, (
+                "Request-aggregated pre_step windows must contain a whole number of actor updates: "
+                f"{requests_per_window} % {actor_requests_per_update} != 0."
+            )
+            if use_critic:
+                critic_requests_per_update = config.critic.ppo_mini_batch_size * selected_requests_per_group
+                assert requests_per_window % critic_requests_per_update == 0, (
+                    "Request-aggregated pre_step windows must contain a whole number of critic updates: "
+                    f"{requests_per_window} % {critic_requests_per_update} != 0."
+                )
 
         ppo_epochs = config.train_actor_rollout_ref.actor.get("ppo_epochs", 1)
         if overlap_scope == "pre_step" and ppo_epochs > 1:

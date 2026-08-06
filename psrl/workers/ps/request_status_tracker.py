@@ -4,11 +4,11 @@ from enum import Enum
 from functools import wraps
 
 import ray
-import transfer_queue as tq
 from omegaconf import DictConfig
 
 from psrl.utils.logger import DualOutputHandler, deprecated, get_ps_logger
 from psrl.utils.server.command import Command, CommandType
+from psrl.utils.transferqueue_utils import PayloadState, clear_payload, request_payload_keys
 from psrl.workers.gen.utils import INVALID_ROLLOUT_INSTANCE_ID, RolloutInstanceId
 from psrl.workers.ps.staleness_controller import EntryInfo
 
@@ -168,7 +168,7 @@ class RequestStatusTracker:
 
         request_update_success = [True for _ in range(len(request_id))]
 
-        abort_request_ids = []
+        abort_payload_keys = []
         for i, req_id in enumerate(request_id):
             # Check if the request is marked for abortion
             if self._check_aborted_request(req_id, remove=True):
@@ -193,7 +193,7 @@ class RequestStatusTracker:
                     request_update_success[i] = False
                     current_status = self._request_id_to_status.get(req_id)
                     if current_status in TQ_COMMITTED_STATUSES:
-                        abort_request_ids.append(str(req_id))
+                        abort_payload_keys.extend(self._request_tq_keys(req_id))
                     continue
             else:
                 raise KeyError(f"Request ID {req_id} not found in request info map.")
@@ -210,8 +210,12 @@ class RequestStatusTracker:
                 raise KeyError(f"Request ID {req_id} not found in status map.")
 
         # Clear the aborted requests from transferqueue
-        if abort_request_ids:
-            tq.kv_clear(keys=abort_request_ids, partition_id="val" if is_validate else "train")
+        if abort_payload_keys:
+            clear_payload(
+                keys=abort_payload_keys,
+                partition_id="val" if is_validate else "train",
+                state=PayloadState.DROPPED,
+            )
 
         return request_update_success[0] if len(request_update_success) == 1 else request_update_success
 
@@ -362,6 +366,11 @@ class RequestStatusTracker:
             return True
         return False
 
+    def _request_tq_keys(self, request_id: int) -> list[str]:
+        """Reconstruct the committed payload keys for a tracked request."""
+        n_trajectory = self._request_infos[request_id].n_trajectory
+        return request_payload_keys(request_id, n_trajectory)
+
     def _abort_requests(self, request_ids: list[int] | int, blocking: bool = False):
         """
         Mark requests for abortion.
@@ -388,7 +397,7 @@ class RequestStatusTracker:
         abort_requests_for_rollout = set()
         abort_requests_for_reward = set()
         abort_requests_for_completed = set()
-        abort_requests_with_tq_entry: set[int] = set()
+        abort_payload_keys: list[str] = []
 
         for status, req_ids in status_to_req_ids.items():
             psrl_logger.info(f"Classifying aborted requests in status {status}: {req_ids}")
@@ -399,7 +408,8 @@ class RequestStatusTracker:
             elif status in {PSRL_RequestStatus.COMPLETED}:
                 abort_requests_for_completed.update(req_ids)
             if status in TQ_COMMITTED_STATUSES:
-                abort_requests_with_tq_entry.update(req_ids)
+                for req_id in req_ids:
+                    abort_payload_keys.extend(self._request_tq_keys(req_id))
 
         futures = []
         # Abort requests in rollout stage (ROLLOUT_RUNNING)
@@ -441,10 +451,11 @@ class RequestStatusTracker:
 
         # Clear data from transfer queue only for aborted requests whose payload was already
         # committed to the partition.
-        if abort_requests_with_tq_entry:
-            tq.kv_clear(
-                keys=[str(req_id) for req_id in abort_requests_with_tq_entry],
+        if abort_payload_keys:
+            clear_payload(
+                keys=abort_payload_keys,
                 partition_id="train",
+                state=PayloadState.DROPPED,
             )
 
     def classify_requests_in_status(self, request_ids: list[int] | int) -> dict:

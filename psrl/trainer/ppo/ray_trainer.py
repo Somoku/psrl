@@ -6,6 +6,7 @@ import os
 import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -13,7 +14,7 @@ import ray
 import requests
 import torch
 import transfer_queue as tq
-from omegaconf import OmegaConf, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tensordict import TensorDict
 from tqdm import tqdm
@@ -63,6 +64,13 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
+from psrl.trainer.ppo.batch_schedule import (
+    TRAJECTORY_AGG_MODE,
+    BatchScheduleStep,
+    build_batch_schedule,
+    get_batch_schedule_strategy,
+    resolve_sample_keys,
+)
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
@@ -83,6 +91,7 @@ from psrl.utils.post_processor import (
     load_group_post_processor,
 )
 from psrl.utils.server.command import Command, CommandType
+from psrl.utils.transferqueue_utils import PayloadState, clear_payload
 from psrl.workers.agent_loop.manager import PSRL_AgentLoopManager
 from psrl.workers.agent_loop.prometheus_utils import update_prometheus_config
 from psrl.workers.agent_loop.worker import PSRL_AgentLoopWorker
@@ -195,39 +204,43 @@ class ReplayBuffer:
             keys (list[str]): Keys to sample.
             partition_id (str): Partition of transfer queue, e.g. "train" or "val".
         """
-        waited = 0.0
-        logged_stuck = False
+        log_interval = 10.0
+        next_log_time = time.monotonic()
         while True:
             time.sleep(self.poll_interval)
-            waited += self.poll_interval
             with self.lock:
-                should_wait = False
-                missing_or_running: list[str] = []
                 partition = self.partitions[partition_id]
+                success_count = 0
+                running_count = 0
+                unknown_count = 0
+                missing_keys = []
                 for key in keys:
-                    tag = partition.get(key, {})
-                    if tag.get("status", "running") == "running":
-                        should_wait = True
-                        if len(missing_or_running) < 8:
-                            missing_or_running.append(
-                                f"{key}:{'miss' if key not in partition else tag.get('status', 'running')}"
-                            )
-                    elif tag.get("status", "running") == "success":
+                    tag = partition.get(key)
+                    if tag is None:
+                        missing_keys.append(key)
                         continue
+
+                    status = tag.get("status", "running")
+                    if status == "running":
+                        running_count += 1
+                    elif status == "success":
+                        success_count += 1
                     else:
-                        psrl_logger.debug(f"Unknown status {tag['status']} for key {key}")
-                if not should_wait:
-                    return
-            # Surface silent stalls (default poll is quiet otherwise).
-            if not logged_stuck and waited >= 30.0:
-                logged_stuck = True
+                        unknown_count += 1
+                        psrl_logger.debug(f"Unknown status {status!r} for key {key!r}.")
+
+            should_wait = bool(missing_keys) or running_count > 0
+            if not should_wait:
+                return
+
+            current_time = time.monotonic()
+            if current_time >= next_log_time:
                 psrl_logger.warning(
-                    "ReplayBuffer.sample still waiting after %.1fs: partition=%s n_keys=%d stuck_examples=%s",
-                    waited,
-                    partition_id,
-                    len(keys),
-                    missing_or_running,
+                    f"ReplayBuffer is waiting for samples: partition_id={partition_id!r}, total={len(keys)}, "
+                    f"success={success_count}, running={running_count}, missing={len(missing_keys)}, "
+                    f"unknown={unknown_count}, missing_keys[:20]={missing_keys[:20]!r}."
                 )
+                next_log_time = current_time + log_interval
 
 
 class PSRL_RayPPOTrainer(RayPPOTrainer):
@@ -279,6 +292,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.train_actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        self.batch_agg_mode = self.config.psrl.agentic_rl.get(
+            "batch_agg_mode",
+            TRAJECTORY_AGG_MODE,
+        )
+        self.batch_schedule_strategy = get_batch_schedule_strategy(self.batch_agg_mode)
 
         # AGENT(VERL): skip legacy worker impl and dataloader in PSRL
         # PSRL's dataloader is moved to `data_processor`.
@@ -1211,7 +1229,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             dump_all_keys.extend(test_result.keys)
 
             # 5. Release TQ storage for this val batch.
-            tq.kv_clear(keys=test_result.keys, partition_id=test_result.partition_id)
+            clear_payload(
+                keys=test_result.keys,
+                partition_id=test_result.partition_id,
+                state=PayloadState.CONSUMED,
+            )
             self.replay_buffer.remove(test_result.keys, test_result.partition_id)
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
@@ -2695,6 +2717,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
+        if self.batch_schedule_strategy.dispatch_steps_individually:
+            # Controller-scheduled steps are padded independently. The full
+            # physical batch only needs to satisfy DP dispatch for preprocessing
+            # and inference.
+            return dp_size
+
         required_multiple = dp_size
 
         # If enabled with critic training, the batch should align with critic PPO mini-batches.
@@ -2711,6 +2739,102 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # Notice lcm(a, b, c) == lcm(lcm(a, b), c), so it is optimal.
         return required_multiple
+
+    def _prepare_scheduled_batch(
+        self,
+        batch: KVBatchMeta,
+        step: BatchScheduleStep,
+        dp_size: int,
+    ) -> tuple[KVBatchMeta, list[str]]:
+        """
+        Materialize one schedule step's metadata and add DP-only padding.
+        """
+        if step.sample_indices is None:
+            return batch, []
+
+        scheduled_batch = batch.select_keys(resolve_sample_keys(batch.keys, step.sample_indices))
+        original_size = len(scheduled_batch)
+        scheduled_batch = upsample_batch_to_divisible_size(
+            scheduled_batch,
+            dp_size,
+            self.tokenizer.eos_token_id,
+        )
+        return scheduled_batch, scheduled_batch.keys[original_size:]
+
+    @staticmethod
+    def _reduce_scheduled_metrics(
+        outputs: list[TensorDict],
+        prefix: str,
+        mfu_key: str,
+    ) -> dict:
+        """
+        Reduce metrics emitted by one or more scheduled worker dispatches.
+        """
+        metrics_across_steps: dict[str, list] = defaultdict(list)
+        for output in outputs:
+            step_metrics = reduce_metrics(dict(output["metrics"]))
+            step_metrics = rename_dict(step_metrics, prefix)
+            step_metrics[mfu_key] = step_metrics.pop(f"{prefix}mfu")
+            for key, value in step_metrics.items():
+                metrics_across_steps[key].append(value)
+        return reduce_metrics(metrics_across_steps)
+
+    def _run_scheduled_update(
+        self,
+        batch: KVBatchMeta,
+        *,
+        training_config: DictConfig,
+        dp_size: int,
+        base_extra_info: dict,
+        update_fn: Callable[[KVBatchMeta], TensorDict],
+        metric_prefix: str,
+        mfu_key: str,
+        finalize_step: bool = True,
+        pushes_model: bool = False,
+    ) -> dict:
+        """
+        Build and execute a schedule with shared lifecycle and metric handling.
+        """
+        entries_per_update = self.batch_schedule_strategy.entries_per_update(
+            training_config.ppo_mini_batch_size,
+            rollout_n=self.config.gen_actor_rollout_ref.rollout.n,
+            algorithm_rollout_n=self.alg_rollout_n,
+        )
+        schedule = build_batch_schedule(
+            batch.tags,
+            self.batch_agg_mode,
+            entries_per_update,
+            epochs=training_config.ppo_epochs,
+            shuffle=training_config.shuffle,
+            seed=training_config.data_loader_seed,
+        )
+        outputs: list[TensorDict] = []
+        for step_index, step in enumerate(schedule.steps):
+            scheduled_batch, padding_keys = self._prepare_scheduled_batch(batch, step, dp_size)
+            is_final_step = step_index == len(schedule.steps) - 1
+            scheduled_batch.extra_info.update(base_extra_info)
+            scheduled_batch.extra_info.update(step.worker_extra_info())
+            scheduled_batch.extra_info["advance_lr_scheduler"] = finalize_step and is_final_step
+            if pushes_model:
+                scheduled_batch.extra_info["push_model"] = finalize_step and is_final_step
+
+            try:
+                outputs.append(update_fn(scheduled_batch))
+            finally:
+                if padding_keys:
+                    clear_payload(
+                        keys=padding_keys,
+                        partition_id=scheduled_batch.partition_id,
+                        state=PayloadState.CONSUMED,
+                    )
+
+        physical_samples = sum(not tag.get("is_padding", False) for tag in batch.tags)
+        psrl_logger.info(
+            f"{metric_prefix.rstrip('/')} batch schedule: aggregation_mode={schedule.aggregation_mode!r}, "
+            f"entries_per_update={schedule.entries_per_update}, worker_dispatches={len(schedule.steps)}, "
+            f"physical_samples={physical_samples}."
+        )
+        return self._reduce_scheduled_metrics(outputs, metric_prefix, mfu_key)
 
     def _balance_batch(self, batch: KVBatchMeta, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -2990,68 +3114,66 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         return batch
 
-    def _update_actor(self, batch: KVBatchMeta, metrics: dict, push_model: bool = True) -> KVBatchMeta:
-        """Update the actor network.
-
-        Args:
-            batch: Training batch metadata.
-            metrics: Metrics dict updated in-place.
-            push_model: If True (default), push weights to the PS after the
-                optimizer step. Fine-grain ``pre_step`` overlap passes False for
-                intermediate chunks so the version bump / buffer deletion only
-                happens after the last chunk of the step.
+    def _update_actor(
+        self,
+        batch: KVBatchMeta,
+        metrics: dict,
+        finalize_step: bool = True,
+    ) -> KVBatchMeta:
         """
-        ppo_mini_batch_size = self.config.train_actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
-        calculate_entropy = self.config.train_actor_rollout_ref.actor.calculate_entropy or (
-            self.config.train_actor_rollout_ref.actor.entropy_coeff != 0.0
-        )
+        Update the actor and finalize shared step state on the last window.
+        """
+        actor_config = self.config.train_actor_rollout_ref.actor
+        calculate_entropy = actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0
         distillation_use_topk = (
             self.distillation_config.distillation_loss.loss_settings.use_topk
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
-        extra_info = {
+        base_extra_info = {
             "calculate_entropy": calculate_entropy,
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
-            "epochs": self.config.train_actor_rollout_ref.actor.ppo_epochs,
-            "seed": self.config.train_actor_rollout_ref.actor.data_loader_seed,
-            "dataloader_kwargs": {"shuffle": self.config.train_actor_rollout_ref.actor.shuffle},
-            "shuffle": self.config.train_actor_rollout_ref.actor.shuffle,
             "multi_turn": self.config.gen_actor_rollout_ref.rollout.multi_turn.enable,
             "distillation_use_topk": distillation_use_topk,
             "compute_loss": True,
-            "push_model": push_model,
         }
-        batch.extra_info.update(extra_info)
-
-        output: TensorDict = self.actor_wg.update_actor(batch)
-        output = rename_dict(output["metrics"], "actor/")
-        output["perf/mfu/actor"] = output.pop("actor/mfu")
-        actor_metrics = reduce_metrics(output)
+        actor_metrics = self._run_scheduled_update(
+            batch,
+            training_config=actor_config,
+            dp_size=self._get_dp_size(self.actor_wg, "actor"),
+            base_extra_info=base_extra_info,
+            update_fn=self.actor_wg.update_actor,
+            metric_prefix="actor/",
+            mfu_key="perf/mfu/actor",
+            finalize_step=finalize_step,
+            pushes_model=True,
+        )
         metrics.update(actor_metrics)
-
         return batch
 
-    def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Update the critic network."""
-        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
-        extra_info = {
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
-            "epochs": self.config.critic.ppo_epochs,
-            "seed": self.config.critic.data_loader_seed,
-            "dataloader_kwargs": {"shuffle": self.config.critic.shuffle},
-        }
-        batch.extra_info.update(extra_info)
+    def _update_critic(
+        self,
+        batch: KVBatchMeta,
+        metrics: dict,
+        finalize_step: bool = True,
+    ) -> KVBatchMeta:
+        """
+        Update the critic and advance its scheduler on the last window.
+        """
+        critic_config = self.config.critic
 
-        output = self.critic_wg.train_mini_batch(batch)
-        output: TensorDict = output.get()
-        output = rename_dict(output["metrics"], "critic/")
-        output["perf/mfu/critic"] = output.pop("critic/mfu")
-        critic_metrics = reduce_metrics(output)
+        def update_critic(scheduled_batch: KVBatchMeta) -> TensorDict:
+            return self.critic_wg.train_mini_batch(scheduled_batch).get()
+
+        critic_metrics = self._run_scheduled_update(
+            batch,
+            training_config=critic_config,
+            dp_size=self._get_dp_size(self.critic_wg, "critic"),
+            base_extra_info={},
+            update_fn=update_critic,
+            metric_prefix="critic/",
+            mfu_key="perf/mfu/critic",
+            finalize_step=finalize_step,
+        )
         metrics.update(critic_metrics)
 
         return batch
@@ -3298,7 +3420,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             self._compute_metrics(batch, metrics, timing_raw, global_steps=self.global_steps)
 
-            tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
+            clear_payload(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                state=PayloadState.CONSUMED,
+            )
             self.replay_buffer.remove(batch.keys, batch.partition_id)
 
             # AGENT(VERL): skip curriculum sampler processing here in PSRL.

@@ -205,7 +205,7 @@ class ReplayBuffer:
             partition_id (str): Partition of transfer queue, e.g. "train" or "val".
         """
         log_interval = 10.0
-        next_log_time = time.monotonic()
+        next_log_time = time.monotonic() + log_interval
         while True:
             time.sleep(self.poll_interval)
             with self.lock:
@@ -2827,6 +2827,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         partition_id=scheduled_batch.partition_id,
                         state=PayloadState.CONSUMED,
                     )
+                    self.replay_buffer.remove(padding_keys, scheduled_batch.partition_id)
 
         physical_samples = sum(not tag.get("is_padding", False) for tag in batch.tags)
         psrl_logger.info(

@@ -543,6 +543,14 @@ class PSRL_AgentLoopWorker:
             }
         )
 
+        # Multi-trajectory outputs use suffixed keys, so the original input
+        # key is no longer owned by the resulting training payload.
+        if len(outputs) > 1:
+            await tq.async_kv_clear(
+                keys=[str(uid)],
+                partition_id=partition_id,
+            )
+
     def _build_output_fields(
         self,
         outputs: list,

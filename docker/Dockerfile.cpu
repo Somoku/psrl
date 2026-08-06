@@ -328,6 +328,9 @@ COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
 ENV VIRTUAL_ENV=/root/venv \
     PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+RUN echo 'export VIRTUAL_ENV=/root/venv' >> ~/.bashrc && \
+    echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
+
 LABEL org.opencontainers.image.title="PSRL CPU" \
       org.opencontainers.image.description="CPU development and smoke-test environment for PSRL" \
       org.opencontainers.image.source="https://github.com/psrl-project/psrl" \

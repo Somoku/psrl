@@ -450,6 +450,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     python -c "import psrl, smg.router, torch, transfer_queue, verl, vllm, vllm_patches" && \
     python -c "import lmcache, nixl, torch_memory_saver"
 
+RUN --mount=type=cache,target=/root/.cache/uv \
+    CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
+    uv pip install "nvidia-nccl-cu${CUDA_MAJOR}==2.30.7"
+
 RUN rm -rf /root/.cache/pip /root/.cache/uv
 
 WORKDIR ${PSRL_HOME}
@@ -459,6 +463,9 @@ COPY docker/env.sh ${PSRL_WORKSPACE}/env/psrl.sh
 
 ENV VIRTUAL_ENV=/root/venv \
     PATH="/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+RUN echo 'export VIRTUAL_ENV=/root/venv' >> ~/.bashrc && \
+    echo 'export PATH=/root/venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:/usr/local/nvidia/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> ~/.bashrc
 
 LABEL org.opencontainers.image.title="PSRL CUDA" \
       org.opencontainers.image.description="PSRL post-training environment with CUDA, vLLM, veRL, SMG, NIXL, LMCache, Megatron, Mooncake, and DeepEP" \

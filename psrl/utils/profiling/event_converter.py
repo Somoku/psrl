@@ -117,9 +117,7 @@ def events_to_profiling_records(
         # Cache hit info is meaningful only for the first segment.
         seg_num_computed = num_cached_tokens if seg_idx == 0 else 0
         seg_total_seq_len = total_seq_len
-        cache_hit_rate = (
-            seg_num_computed / seg_total_seq_len if seg_total_seq_len > 0 else 0.0
-        )
+        cache_hit_rate = seg_num_computed / seg_total_seq_len if seg_total_seq_len > 0 else 0.0
 
         pr = PrefillRecord(
             trigger=trigger,

@@ -105,9 +105,7 @@ def compute_score(
     prediction = extract_boxed_answer((solution_str or "")[-300:])
     num_turns = int(extra_info.get("num_turns", 0) or 0)
     answers = _answers(ground_truth)
-    accuracy = float(
-        bool(prediction) and any(_normalize(prediction) == _normalize(answer) for answer in answers)
-    )
+    accuracy = float(bool(prediction) and any(_normalize(prediction) == _normalize(answer) for answer in answers))
     score = accuracy / num_turns if num_turns > 0 else accuracy
     qa_metrics = [_qa_metrics(prediction, answer) for answer in answers]
     return {

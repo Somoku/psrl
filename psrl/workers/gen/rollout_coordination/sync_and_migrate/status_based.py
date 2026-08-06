@@ -81,10 +81,7 @@ class StatusBasedSyncMixin:
             if sync_instance_ids:
                 psrl_logger.info(f"Sync with ps {sync_instance_ids}")
                 await self.sync_with_ps(sync_instance_ids)
-            elif (
-                not have_syncing_instance
-                and self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.enable
-            ):
+            elif not have_syncing_instance and self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.enable:
                 # No instance is syncing with PS, check if migration is needed
                 await self.check_and_migrate()
 

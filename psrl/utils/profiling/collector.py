@@ -65,9 +65,7 @@ class TurnProfilingCollector:
 
         # Skip if no profiling data was attached.
         if generation_start_wall_ts == 0.0 and generation_end_wall_ts == 0.0:
-            psrl_logger.warning(
-                f"on_turn_complete: No profiling data for turn {self._turn_index}, skipping."
-            )
+            psrl_logger.warning(f"on_turn_complete: No profiling data for turn {self._turn_index}, skipping.")
             self._turn_index += 1
             return
 
@@ -163,11 +161,7 @@ class TurnProfilingCollector:
             return None
 
         profiling_end_ts = time.time()
-        total_duration_s = (
-            profiling_end_ts - self._trajectory_start_ts
-            if self._trajectory_start_ts > 0
-            else 0.0
-        )
+        total_duration_s = profiling_end_ts - self._trajectory_start_ts if self._trajectory_start_ts > 0 else 0.0
 
         profiling_data = TrajectoryProfilingData(
             request_id=request_id,

@@ -108,7 +108,7 @@ class VllmQwen3ParameterMapping(ParameterMapping):
             ("gate_up_proj", "gate_proj", MappingType.GATE_UP_PROJ_SPLIT, 0),
             ("gate_up_proj", "up_proj", MappingType.GATE_UP_PROJ_SPLIT, 1),
         ]
-        
+
 
 # Qwen3Moe
 vllm_qwen3_moe_classes = []

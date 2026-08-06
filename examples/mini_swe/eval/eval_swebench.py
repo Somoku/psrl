@@ -121,7 +121,6 @@ def _run_agent_on_swe_problem(
     from minisweagent.config import get_config_from_spec
     from minisweagent.models import get_model
     from minisweagent.utils.serialize import recursive_merge
-
     from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
 
     image_name = get_swebench_image_name(swe_problem)

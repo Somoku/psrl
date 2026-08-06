@@ -91,9 +91,7 @@ class FakeManager:
             for i in range(n_groups)
         ]
         self.train_accumulated_buffers[buffer_id].setdefault(model_version, []).extend(entries)
-        self.train_accumulated_buffer_size[buffer_id] = (
-            self.train_accumulated_buffer_size.get(buffer_id, 0) + n_groups
-        )
+        self.train_accumulated_buffer_size[buffer_id] = self.train_accumulated_buffer_size.get(buffer_id, 0) + n_groups
 
 
 # ---------------------------------------------------------------------------

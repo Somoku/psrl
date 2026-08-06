@@ -233,8 +233,7 @@ def validate_config(
 
     batch_agg_mode = config.psrl.agentic_rl.get("batch_agg_mode", TRAJECTORY_AGG_MODE)
     assert batch_agg_mode in SUPPORTED_BATCH_AGG_MODES, (
-        "psrl.agentic_rl.batch_agg_mode must be one of "
-        f"{sorted(SUPPORTED_BATCH_AGG_MODES)}, got {batch_agg_mode!r}."
+        f"psrl.agentic_rl.batch_agg_mode must be one of {sorted(SUPPORTED_BATCH_AGG_MODES)}, got {batch_agg_mode!r}."
     )
     if batch_agg_mode == REQUEST_AGG_MODE and not config.psrl.rollout_coordination.redundant_rollout.enable:
         rollout_n = config.gen_actor_rollout_ref.rollout.n

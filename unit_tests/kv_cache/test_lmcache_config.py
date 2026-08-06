@@ -2,7 +2,6 @@ import os
 from unittest.mock import patch
 
 import pytest
-
 from psrl.utils.kv_cache.config import LMCacheConfig
 from psrl.utils.kv_cache.manager import KVCacheManager
 from psrl.utils.kv_cache.types import KVCacheBackend, KVCacheStatus
@@ -132,9 +131,7 @@ class TestLMCacheConfig:
     # ------------------------------------------------------------------ #
 
     def test_remote_env_vars(self):
-        config = LMCacheConfig(
-            enable=True, backend="remote", remote_url="redis://host:6379"
-        )
+        config = LMCacheConfig(enable=True, backend="remote", remote_url="redis://host:6379")
         env_vars = config.to_env_vars()
         assert env_vars["LMCACHE_REMOTE_URL"] == "redis://host:6379"
 

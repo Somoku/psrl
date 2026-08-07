@@ -520,12 +520,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @gpu_memory_logger_decorator(log_only_rank_0=False)
     def update_actor(self, data: TensorDict) -> TensorDict:
-        """Train the actor for one step, then optionally push updated weights to the PS."""
+        """Train the actor for one step, then push updated weights to the PS."""
         with log_dual_events("Train actor", psrl_logger, event_type=EventType.TRAIN):
             output = ActorRolloutRefWorker.update_actor(self, data)
-
-        # Default True preserves full-batch / recompute behavior.
-        push_model = tu.get_non_tensor_data(data, key="push_model", default=True)
+        push_model = tu.pop(data, key="push_model", default=True)
         if not push_model:
             return output
 

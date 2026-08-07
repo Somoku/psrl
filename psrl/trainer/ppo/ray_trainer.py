@@ -2746,9 +2746,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         step: BatchScheduleStep,
         dp_size: int,
     ) -> tuple[KVBatchMeta, list[str]]:
-        """
-        Materialize one schedule step's metadata and add DP-only padding.
-        """
+        """Materialize one schedule step's metadata and add DP-only padding."""
         if step.sample_indices is None:
             return batch, []
 
@@ -2767,9 +2765,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         prefix: str,
         mfu_key: str,
     ) -> dict:
-        """
-        Reduce metrics emitted by one or more scheduled worker dispatches.
-        """
+        """Reduce metrics emitted by one or more scheduled worker dispatches."""
         metrics_across_steps: dict[str, list] = defaultdict(list)
         for output in outputs:
             step_metrics = reduce_metrics(dict(output["metrics"]))
@@ -2790,11 +2786,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         metric_prefix: str,
         mfu_key: str,
         finalize_step: bool = True,
-        pushes_model: bool = False,
+        push_model: bool = False,
     ) -> dict:
-        """
-        Build and execute a schedule with shared lifecycle and metric handling.
-        """
+        """Build and execute a schedule with shared lifecycle and metric handling."""
         entries_per_update = self.batch_schedule_strategy.entries_per_update(
             training_config.ppo_mini_batch_size,
             rollout_n=self.config.gen_actor_rollout_ref.rollout.n,
@@ -2815,7 +2809,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             scheduled_batch.extra_info.update(base_extra_info)
             scheduled_batch.extra_info.update(step.worker_extra_info())
             scheduled_batch.extra_info["advance_lr_scheduler"] = finalize_step and is_final_step
-            if pushes_model:
+            if push_model:
                 scheduled_batch.extra_info["push_model"] = finalize_step and is_final_step
 
             try:
@@ -2829,11 +2823,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     )
                     self.replay_buffer.remove(padding_keys, scheduled_batch.partition_id)
 
-        physical_samples = sum(not tag.get("is_padding", False) for tag in batch.tags)
         psrl_logger.info(
-            f"{metric_prefix.rstrip('/')} batch schedule: aggregation_mode={schedule.aggregation_mode!r}, "
-            f"entries_per_update={schedule.entries_per_update}, worker_dispatches={len(schedule.steps)}, "
-            f"physical_samples={physical_samples}."
+            "%s batch schedule: aggregation_mode=%s, entries_per_update=%d, "
+            "worker_dispatches=%d, physical_samples=%d.",
+            metric_prefix.rstrip("/"),
+            schedule.aggregation_mode,
+            schedule.entries_per_update,
+            len(schedule.steps),
+            sum(not tag.get("is_padding", False) for tag in batch.tags),
         )
         return self._reduce_scheduled_metrics(outputs, metric_prefix, mfu_key)
 
@@ -2912,11 +2909,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the values of the batch."""
         # 1. compute value
-        # infer_batch is registered with blocking=False and returns a
-        # DataProtoFuture. DataProtoFuture.get() does not support KVBatchMeta
-        # outputs, so we only force worker completion via ray.get(futures); the
-        # computed values are written back to TransferQueue by the tqbridge
-        # collect side and read from TQ below.
         output = self.critic_wg.infer_batch(batch)
         ray.get(output.futures)
 
@@ -3121,9 +3113,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         metrics: dict,
         finalize_step: bool = True,
     ) -> KVBatchMeta:
-        """
-        Update the actor and finalize shared step state on the last window.
-        """
+        """Update the actor and finalize shared step state on the last window."""
         actor_config = self.config.train_actor_rollout_ref.actor
         calculate_entropy = actor_config.calculate_entropy or actor_config.entropy_coeff != 0.0
         distillation_use_topk = (
@@ -3146,7 +3136,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             metric_prefix="actor/",
             mfu_key="perf/mfu/actor",
             finalize_step=finalize_step,
-            pushes_model=True,
+            push_model=True,
         )
         metrics.update(actor_metrics)
         return batch
@@ -3157,9 +3147,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         metrics: dict,
         finalize_step: bool = True,
     ) -> KVBatchMeta:
-        """
-        Update the critic and advance its scheduler on the last window.
-        """
+        """Update the critic and advance its scheduler on the last window."""
         critic_config = self.config.critic
 
         def update_critic(scheduled_batch: KVBatchMeta) -> TensorDict:

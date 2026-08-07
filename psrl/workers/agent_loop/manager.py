@@ -21,6 +21,13 @@ from psrl.utils.logger import (
     log_single_event,
 )
 from psrl.utils.ray import AsyncBusyPollingRayLock
+from psrl.utils.transferqueue_utils import (
+    PayloadState,
+    async_clear_payload,
+    clear_payload,
+    request_payload_keys,
+    validate_ready_payload,
+)
 from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
@@ -320,13 +327,15 @@ class PSRL_AgentLoopManager:
 
             # Process training results one-by-one (group sampling requires it).
             for result in train_results:
-                occupy_success = await self.occupy_requests(**result)
-                if not occupy_success and result["n_trajectory"] > 1:
-                    keys = [f"{result['request_id']}_{i}" for i in range(result["n_trajectory"])]
-                    await tq.async_kv_clear(
-                        keys=keys,
-                        partition_id="train",
-                    )
+                dispositions = await self.occupy_requests(**result)
+                assert len(dispositions) == 1, (
+                    f"Expected one disposition for scalar training result, got {dispositions}."
+                )
+                psrl_logger.debug(
+                    "Training result request_id=%s entered payload state %s.",
+                    result["request_id"],
+                    dispositions[0].value,
+                )
 
             if not train_results and not val_results:
                 await asyncio.sleep(0)  # Yield control to the event loop only when idle
@@ -447,11 +456,6 @@ class PSRL_AgentLoopManager:
         self._request_counter += len(data)
         return len(data)
 
-    def _request_tq_keys(self, request_id: int, n_trajectory: int) -> list[str]:
-        if n_trajectory == 1:
-            return [str(request_id)]
-        return [f"{request_id}_{i}" for i in range(n_trajectory)]
-
     def _entry_info_tq_keys(self, entry_info: EntryInfo, rollout_n: int) -> list[str]:
         request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
         n_trajectories = (
@@ -462,10 +466,34 @@ class PSRL_AgentLoopManager:
         keys: list[str] = []
         for request_idx, n_trajectory in zip(request_idxs, n_trajectories):
             request_id = entry_info.prompt_id * rollout_n + request_idx
-            keys.extend(self._request_tq_keys(request_id, n_trajectory))
+            keys.extend(request_payload_keys(request_id, n_trajectory))
         return keys
 
-    async def _purge_tracker_group(self, parent_id: int, rollout_n: int) -> list[EntryInfo]:
+    async def _clear_payload_if_present(
+        self,
+        keys: list[str],
+        partition_id: str,
+        state: PayloadState,
+    ) -> None:
+        """Clear the currently present subset of a terminal payload."""
+        if not state.is_terminal:
+            raise ValueError(f"Cannot clear payload in non-terminal state {state.value!r}.")
+        partitions = await tq.async_kv_list(partition_id=partition_id)
+        partition = partitions.get(partition_id, {})
+        existing_keys = [key for key in keys if key in partition]
+        if existing_keys:
+            await async_clear_payload(
+                keys=existing_keys,
+                partition_id=partition_id,
+                state=state,
+            )
+
+    async def _purge_tracker_group(
+        self,
+        parent_id: int,
+        rollout_n: int,
+        is_validate: bool,
+    ) -> list[EntryInfo]:
         """Drop partially accumulated tracker entries and their TQ payloads."""
         entries = self.rollout_request_tracker.pop(parent_id, [])
         if not entries:
@@ -475,9 +503,10 @@ class PSRL_AgentLoopManager:
         for entry_info in entries:
             keys.extend(self._entry_info_tq_keys(entry_info, rollout_n))
         if keys:
-            await tq.async_kv_clear(
+            await self._clear_payload_if_present(
                 keys=keys,
-                partition_id="train",
+                partition_id="val" if is_validate else "train",
+                state=PayloadState.DROPPED,
             )
         psrl_logger.info(
             "_purge_tracker_group: removed %d partial entries (%d TQ keys) for parent_id=%s.",
@@ -504,6 +533,8 @@ class PSRL_AgentLoopManager:
         prompt_entry_infos.sort(key=lambda ei: ei.prompt_id)
 
         batch = self.entry_infos_to_kv_batch_meta(prompt_entry_infos, is_validate)
+        partitions = await tq.async_kv_list(partition_id=batch.partition_id)
+        validate_ready_payload(batch.keys, batch.partition_id, partitions)
 
         # Chunk path (train only): skip the full-batch waiter machinery.
         # Chunks are emitted progressively by `_emit_pending_chunks`; this call
@@ -569,7 +600,7 @@ class PSRL_AgentLoopManager:
                 )
                 await self.ps_manager_handle.abort_requests.remote(sibling_uids, blocking=False)
 
-            await self._purge_tracker_group(parent_id, rollout_n)
+            await self._purge_tracker_group(parent_id, rollout_n, is_validate)
 
             if is_validate:
                 if self.val_buffer_size is None or self.val_buffer_size <= 0:
@@ -717,19 +748,21 @@ class PSRL_AgentLoopManager:
         version_tag: int | list[int],
         n_trajectory: int | list[int] = 1,
         is_validate: bool = False,
-    ) -> bool:
+    ) -> list[PayloadState]:
         """Flat-arg RPC invoked by rollout workers once a request finishes.
 
         The rollout worker has already written the per-sample TensorDict to TQ
-        under ``str(request_id)``. This method accepts either a single request
-        via scalar arguments or a batch via list arguments (all list args must
-        share the same length). It appends the corresponding ``EntryInfo``
-        objects into the manager's trackers and triggers PSManager occupation,
-        running group/buffer post-processing on KVBatchMeta slices (never on
-        tensor payload).
+        under keys reconstructed from ``request_id`` and ``n_trajectory``. This
+        method accepts either a single request via scalar arguments or a batch
+        via list arguments (all list args must share the same length). It
+        appends the corresponding ``EntryInfo`` objects into the manager's
+        trackers and triggers PSManager occupation, running group/buffer
+        post-processing on KVBatchMeta slices (never on tensor payload).
 
         Returns:
-            bool: True if the request is occupied, False if the request is aborted.
+            One payload lifecycle state per input request. ``PENDING_GROUP`` is
+            accepted ownership, not a failure and never authorizes payload
+            cleanup.
         """
         # Normalize scalar inputs to batch form.
         if isinstance(request_id, list):
@@ -750,19 +783,22 @@ class PSRL_AgentLoopManager:
             )
 
         if not request_ids:
-            return False
+            return []
 
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             alg_rollout_n = self.val_rollout_n if is_validate else self.alg_rollout_n
+            partition_id = "val" if is_validate else "train"
 
             ready_buffer_ids: set[int] = set()
-            occupy_futures: list = []
-            abort_request_ids: list[int] = []
+            dispositions = [PayloadState.PENDING_GROUP for _ in request_ids]
+            request_positions = {request_id: i for i, request_id in enumerate(request_ids)}
+            occupy_jobs: list[tuple[list[int], object, list[str]]] = []
+            dropped_payload_keys: list[str] = []
 
             # 1. Judge whether to abort requests and occupy requests in the PS worker
-            for request_id, prompt_id, rollout_instance_id, version_tag, n_trajectory in zip(
-                request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories
+            for position, (request_id, prompt_id, rollout_instance_id, version_tag, n_trajectory) in enumerate(
+                zip(request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories)
             ):
                 if prompt_id in self._failed_group_ids:
                     psrl_logger.warning(
@@ -772,9 +808,11 @@ class PSRL_AgentLoopManager:
                         prompt_id,
                         is_validate,
                     )
-                    await tq.async_kv_clear(
-                        keys=self._request_tq_keys(request_id, n_trajectory),
-                        partition_id="val" if is_validate else "train",
+                    dispositions[position] = PayloadState.DROPPED
+                    await async_clear_payload(
+                        keys=request_payload_keys(request_id, n_trajectory),
+                        partition_id=partition_id,
+                        state=PayloadState.DROPPED,
                     )
                     continue
 
@@ -845,12 +883,14 @@ class PSRL_AgentLoopManager:
                                 )
 
                         # Abort the extra finished entries beyond alg_rollout_n
-                        abort_request_ids.extend(
-                            [
-                                prompt_id * rollout_n + entry_info.request_idx
-                                for entry_info in entry_infos[alg_rollout_n:]
-                            ]
-                        )
+                        extra_entry_infos = entry_infos[alg_rollout_n:]
+                        for extra_entry_info in extra_entry_infos:
+                            extra_request_id = prompt_id * rollout_n + extra_entry_info.request_idx
+                            dropped_payload_keys.extend(
+                                request_payload_keys(extra_request_id, extra_entry_info.n_trajectory)
+                            )
+                            if extra_request_id in request_positions:
+                                dispositions[request_positions[extra_request_id]] = PayloadState.DROPPED
 
                         alg_entry_infos = entry_infos[:alg_rollout_n]
                         add_data = True
@@ -859,6 +899,10 @@ class PSRL_AgentLoopManager:
                             add_data = await self._group_post_process(alg_entry_infos)
 
                         if not add_data:
+                            for dropped_entry_info in alg_entry_infos:
+                                dropped_request_id = prompt_id * rollout_n + dropped_entry_info.request_idx
+                                if dropped_request_id in request_positions:
+                                    dispositions[request_positions[dropped_request_id]] = PayloadState.DROPPED
                             # Retry immediately and no occupation.
                             # NOTE(linsh): data has been cleared in `_group_post_process`.
                             psrl_logger.info(
@@ -873,41 +917,65 @@ class PSRL_AgentLoopManager:
                             child_request_ids = [
                                 prompt_id * rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
                             ]
-                            occupy_futures.append(
-                                self.ps_manager_handle.occupy_rollout_instance_request.remote(
-                                    prompt_id=prompt_id,
-                                    request_ids=child_request_ids,
-                                    is_validate=is_validate,
+                            job_positions = [
+                                request_positions[child_request_id]
+                                for child_request_id in child_request_ids
+                                if child_request_id in request_positions
+                            ]
+                            job_keys = []
+                            for child_request_id, child_entry_info in zip(child_request_ids, alg_entry_infos):
+                                job_keys.extend(request_payload_keys(child_request_id, child_entry_info.n_trajectory))
+                            occupy_jobs.append(
+                                (
+                                    job_positions,
+                                    self.ps_manager_handle.occupy_rollout_instance_request.remote(
+                                        prompt_id=prompt_id,
+                                        request_ids=child_request_ids,
+                                        is_validate=is_validate,
+                                    ),
+                                    job_keys,
                                 )
                             )
                 else:
                     # Without group sampling (e.g., PPO).
                     # Group post processing is not used and every data will be added.
-                    occupy_futures.append(
-                        self.ps_manager_handle.occupy_rollout_instance_request.remote(
-                            prompt_id=request_id,
-                            is_validate=is_validate,
+                    occupy_jobs.append(
+                        (
+                            [position],
+                            self.ps_manager_handle.occupy_rollout_instance_request.remote(
+                                prompt_id=request_id,
+                                is_validate=is_validate,
+                            ),
+                            request_payload_keys(request_id, n_trajectory),
                         )
                     )
 
             # 2. Occupy requests in the PS worker
-            if not occupy_futures:
-                return False
-            with log_dual_events(
-                "Occupy requests",
-                psrl_logger,
-                level=logging.DEBUG,
-                event_type=EventType.OTHER,
-            ):
-                results = await asyncio.gather(*occupy_futures)
+            if occupy_jobs:
+                with log_dual_events(
+                    "Occupy requests",
+                    psrl_logger,
+                    level=logging.DEBUG,
+                    event_type=EventType.OTHER,
+                ):
+                    results = await asyncio.gather(*(job[1] for job in occupy_jobs))
+            else:
+                results = []
 
             # 3. Handle the occupied results to accumulate data
-            for result in results:
+            for (job_positions, _, job_keys), result in zip(occupy_jobs, results):
                 buffer_id, occupy_num, prompt_entry_info = result
-                # If occupy failed due to READY status, the requests must be aborted already
-                # Just continue
                 if buffer_id is None:
+                    for job_position in job_positions:
+                        dispositions[job_position] = PayloadState.DROPPED
+                    await self._clear_payload_if_present(
+                        keys=job_keys,
+                        partition_id=partition_id,
+                        state=PayloadState.DROPPED,
+                    )
                     continue
+                for job_position in job_positions:
+                    dispositions[job_position] = PayloadState.OCCUPIED
 
                 psrl_logger.debug(
                     f"Successfully occupied prompt {prompt_entry_info} into "
@@ -946,17 +1014,18 @@ class PSRL_AgentLoopManager:
                     psrl_logger.info(f"Add buffer {buffer_id} to ready_buffer_ids")
                     ready_buffer_ids.add(buffer_id)
 
-            # 4. Release TQ state for aborted entries (beyond alg_rollout_n).
-            if abort_request_ids:
-                await tq.async_kv_clear(
-                    keys=[str(request_id) for request_id in abort_request_ids],
-                    partition_id="val" if is_validate else "train",
+            # 4. Release TQ state for explicitly dropped entries beyond alg_rollout_n.
+            if dropped_payload_keys:
+                await async_clear_payload(
+                    keys=dropped_payload_keys,
+                    partition_id=partition_id,
+                    state=PayloadState.DROPPED,
                 )
 
             # 5. Process READY buffers
             for buffer_id in sorted(list(ready_buffer_ids)):
                 await self._flush_ready_buffer(buffer_id, is_validate)
-            return True
+            return dispositions
 
     def maybe_add_buffer(self, buffer_id: int, batch: KVBatchMeta, is_validate: bool = False) -> bool:
         """
@@ -1084,7 +1153,11 @@ class PSRL_AgentLoopManager:
 
         processed_data = self.group_post_process_fn(data)
         if processed_data is None:
-            await tq.async_kv_clear(keys=keys, partition_id="train")
+            await async_clear_payload(
+                keys=keys,
+                partition_id="train",
+                state=PayloadState.DROPPED,
+            )
             return False
 
         # Mutation path: re-upsert the processed TensorDict under the same keys.
@@ -1128,7 +1201,11 @@ class PSRL_AgentLoopManager:
         self.train_accumulated_buffer_size[buffer_id] = 0
 
         if processed_data is None or processed_size == 0:
-            tq.kv_clear(keys=original_keys, partition_id=batch_meta.partition_id)
+            clear_payload(
+                keys=original_keys,
+                partition_id=batch_meta.partition_id,
+                state=PayloadState.DROPPED,
+            )
             return False, None
 
         # Partial clear: recover kept keys from the processor's uid column and
@@ -1145,7 +1222,11 @@ class PSRL_AgentLoopManager:
                 kept_keys.append(f"{request_id}_{trajectory_index}")
         dropped_keys = [k for k in original_keys if k not in set(kept_keys)]
         if dropped_keys:
-            tq.kv_clear(keys=dropped_keys, partition_id=batch_meta.partition_id)
+            clear_payload(
+                keys=dropped_keys,
+                partition_id=batch_meta.partition_id,
+                state=PayloadState.DROPPED,
+            )
         tq.kv_batch_put(keys=kept_keys, partition_id=batch_meta.partition_id, fields=processed_data)
 
         prompt_entry_infos = self.extract_entry_infos_from_td(processed_data)
@@ -1535,24 +1616,10 @@ class PSRL_AgentLoopManager:
                 await self.handle_waiting_buffer(buffer_id)
 
                 if self.train_accumulated_buffer_size[buffer_id] == self.ready_entries_per_buffer:
-                    # TODO: This inline-flush path reads train_accumulated_buffers directly and bypasses
-                    # chunk emission entirely.  If the chunked training path is ever routed through here
-                    # (i.e. chunking is enabled and wait_for_training_chunk callers can reach this code
-                    # path), _emit_pending_chunks(buffer_id) must be called before/after
-                    # maybe_add_buffer so that chunk waiters are resolved correctly.
-                    prompt_entry_infos = []
-                    for model_version in sorted(list(self.train_accumulated_buffers[buffer_id].keys())):
-                        prompt_entry_infos.extend(self.train_accumulated_buffers[buffer_id][model_version])
-                    batch_meta = self.entry_infos_to_kv_batch_meta(prompt_entry_infos, is_validate=False)
-                    # Apply buffer post-processing if exists and add to data_buffers
-                    add_buffer = self.maybe_add_buffer(buffer_id, batch_meta)
+                    # Share the single publish path so READY validation, chunk
+                    # emission, and accumulator cleanup stay consistent.
+                    add_buffer = await self._flush_ready_buffer(buffer_id, is_validate=False)
                     if add_buffer:
-                        psrl_logger.info(
-                            f"Buffer {buffer_id} is READY with {len(self.train_data_buffers[buffer_id])} entries."
-                        )
-                        await self.handle_ready_buffer(buffer_id)
-                        self.train_accumulated_buffers.pop(buffer_id)
-                        self.train_accumulated_buffer_size.pop(buffer_id)
                         psrl_logger.info(
                             f"Buffer {buffer_id} is ready after the abort "
                             f"and truncate strategy, returning immediately."

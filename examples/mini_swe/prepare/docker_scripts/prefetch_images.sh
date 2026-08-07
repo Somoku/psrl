@@ -7,7 +7,7 @@
 # not need any proxy config).
 #
 # Usage:
-#   source /jizhicfs/lhy/env/psrl.sh       # sets http_proxy for skopeo
+#   source ${PSRL_WORKSPACE}/env/psrl.sh       # sets http_proxy for skopeo
 #   bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
 #       --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet \
 #       --workers 4

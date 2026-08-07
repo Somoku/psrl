@@ -3,13 +3,13 @@
 # directory to every host in a hosts file, in parallel via pssh.
 #
 # This assumes the image directory lives on a *shared* filesystem that every
-# node can read (e.g. /jizhicfs/lhy/docker_images/swe), so no scp/rsync copy
+# node can read (e.g. ${PSRL_WORKSPACE}/docker_images/swe), so no scp/rsync copy
 # step is needed — each node loads directly off the shared path.
 #
 # Usage:
 #   bash load_all_nodes.sh \
-#       --hosts     /jizhicfs/lhy/hosts/32GPUs \
-#       --image-dir /jizhicfs/lhy/docker_images/swe
+#       --hosts     ${PSRL_WORKSPACE}/hosts/32GPUs \
+#       --image-dir ${PSRL_WORKSPACE}/docker_images/swe
 #
 # Options:
 #   --hosts FILE           Hosts file, one IP (or IP:port) per line. Lines

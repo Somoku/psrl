@@ -12,7 +12,7 @@ Usage:
     torchrun --nproc_per_node=8 --nnodes=2 --node_rank=$RANK \
         --master_addr=$MASTER --master_port=$PORT \
         scripts/convert_perrank_to_dcp.py \
-        --input_dir /tmp/lhy/global_step_1/actor/dist_ckpt \
+        --input_dir /tmp/global_step_1/actor/dist_ckpt \
         --output_dir /path/to/dcp_output/global_step_1/actor/dist_ckpt \
         --tp_size 4 --pp_size 1 --cp_size 1 --ep_size 1
 

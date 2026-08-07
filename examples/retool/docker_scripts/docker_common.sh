@@ -1,6 +1,6 @@
 # Shared helpers for docker_*.sh in this directory — source from those scripts; do not execute.
 # Cluster env (set directly or via script-specific positional args before use):
-#   DOCKER_NODE_IPS  — comma-separated ip:gpu_count, e.g. 28.1.1.1:8,28.1.1.2:8
+#   DOCKER_NODE_IPS  — comma-separated ip:gpu_count, e.g. 192.168.1.1:8,192.168.1.2:8
 #   DOCKER_NODE_NUM  — optional; use only the first N hosts from the list (default: all entries)
 # After docker_cluster_init succeeds:
 #   DOCKER_CLUSTER_HOSTS   — bash array of plain IPs

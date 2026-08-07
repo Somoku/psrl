@@ -4,13 +4,11 @@ export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
-HF_MODEL_PATH=/jizhicfs/pkuhetu/models/Qwen3.5-35B-A3B  
-train_files=/jizhicfs/pkuhetu/zym/verl/data/retool_dapo/train.parquet
-test_files=/jizhicfs/pkuhetu/zym/verl/data/retool_aime2024/train.parquet
-# train_files=/jizhicfs/pkuhetu/zym/verl/data/gsm8k/train.parquet
-# test_files=/jizhicfs/pkuhetu/zym/verl/data/gsm8k/test.parquet
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3.5-35B-A3B  
+train_files=${PSRL_WORKSPACE}/data/retool_dapo/train.parquet
+test_files=${PSRL_WORKSPACE}/data/retool_aime2024/train.parquet
 
-OUTPUT_DIR=/jizhicfs/pkuhetu/zym/tx/psrl/tx-output
+OUTPUT_DIR=${PSRL_PATH}/examples/tx/output
 mkdir -p "$OUTPUT_DIR"
 project_name=tx
 experiment_name=qwen3_5_35b_a3b_megatron_resp_10240_lr1e-6_grpo-psrl-staleness3

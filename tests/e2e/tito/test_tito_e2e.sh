@@ -17,15 +17,15 @@
 #
 # Usage:
 #   bash tests/e2e/tito/test_tito_e2e.sh [model_path]
-#   HOST_IP=10.0.0.1 bash tests/e2e/tito/test_tito_e2e.sh
+#   HOST_IP=127.0.0.1 bash tests/e2e/tito/test_tito_e2e.sh
 # =============================================================================
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PSRL_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-MODEL_PATH="${1:-${MODEL_PATH:-/jizhicfs/johnnyslin/models/Qwen2.5-0.5B-Instruct}}"
-HOST_IP="${HOST_IP:-28.49.36.157}"
+MODEL_PATH="${1:-${MODEL_PATH:-${PSRL_WORKSPACE}/models/Qwen2.5-0.5B-Instruct}}"
+HOST_IP="${HOST_IP:-127.0.0.1}"
 VLLM_GRPC_PORT="${VLLM_GRPC_PORT:-50051}"
 SMG_PORT="${SMG_PORT:-8150}"
 SESSION_ROUTER_PORT="${SESSION_ROUTER_PORT:-8200}"

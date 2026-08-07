@@ -71,9 +71,11 @@ rest are workers):
 
 ```
 # ${PSRL_WORKSPACE}/hosts/16GPUs
-29.162.225.74
-28.59.19.217
+192.168.1.1
+192.168.1.2
 ```
+
+Replace these example hostnames with the actual hostnames or addresses of the nodes in your cluster.
 
 Then start the cluster from the launch node:
 

@@ -1,12 +1,12 @@
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
-HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen3-32B
-DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen3-32B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3-32B
+DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-32B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
-TRAIN_FILE=/jizhicfs/lhy/data/dapo/dapo-math-17k.parquet
-TEST_FILE=/jizhicfs/lhy/data/dapo/aime-2024.parquet
+TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
+TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
-OUTPUT_DIR=/jizhicfs/lhy/psrl_agent/examples/dapo_trainer/output
+OUTPUT_DIR=${PSRL_PATH}/examples/dapo_trainer/output
 mkdir -p "$OUTPUT_DIR"
 project_name=tx
 experiment_name=qwen3_32b_megatron_resp_10240_lr1e-6_grpo-psrl-staleness2-5+3-partial

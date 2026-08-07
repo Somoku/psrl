@@ -85,7 +85,6 @@ class MetaClientActor:
 
 def test_nixl_meta_comm():
     ray.init(ignore_reinit_error=True)
-    listen_ip = "29.210.128.48"
     listen_port = 23458
     state_dict_data = {"a": [1.0, 2.0, 3.0], "b": [4.0, 5.0, 6.0]}
     num_agents = 2
@@ -94,10 +93,11 @@ def test_nixl_meta_comm():
 
     # Start meta server
     print("Starting meta server")
-    ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
-    assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
+    ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes() if node.get("Alive", True)}
+    assert ip_to_node_id, "Ray cluster has no available nodes."
+    listen_ip, node_id = sorted(ip_to_node_id.items())[0]
     server = MetaServerActor.options(
-        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)
+        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
     ).remote(server_name, listen_ip, listen_port, num_agents)
     ray.get(server.init_is_ready.remote())
 

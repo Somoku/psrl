@@ -4,7 +4,7 @@
 # (chat completions + bash tool calls).
 #
 # Usage:
-#   bash serve_vllm.sh --checkpoint /jizhicfs/lhy/checkpoints/my-step-1000 \
+#   bash serve_vllm.sh --checkpoint ${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
 #                      --tp 2 --port 8000 --tool-call-parser hermes
 #
 # Options (all long-form):
@@ -54,7 +54,7 @@
 #                               Must contain `conda activate` plus all the
 #                               NCCL / UCX / vLLM / cudnn / torch
 #                               LD_LIBRARY_PATH knobs. The default
-#                               (/jizhicfs/lhy/env/psrl.sh) is the same file
+#                               (${PSRL_WORKSPACE}/env/psrl.sh) is the same file
 #                               training uses; pass '' to disable sourcing.
 #   --foreground                Don't background; stream logs to this shell.
 #                               Useful for debugging; incompatible with the
@@ -91,7 +91,7 @@ DIST_BACKEND=""
 EXTRA=""
 LOG_FILE=""
 PID_FILE=""
-ENV_SCRIPT="/jizhicfs/lhy/env/psrl.sh"
+ENV_SCRIPT="${PSRL_WORKSPACE}/env/psrl.sh"
 FOREGROUND=0
 WAIT_READY=1800
 DRY_RUN=0
@@ -136,7 +136,7 @@ done
 # Source the env script (handles conda activation + NCCL / UCX / vLLM /
 # library-path setup). Skipped only when explicitly disabled with --env-script ''.
 #
-# psrl.sh chains into /jizhicfs/lhy/activate which references $no_proxy /
+# psrl.sh chains into ${PSRL_WORKSPACE}/activate which references $no_proxy /
 # $LD_LIBRARY_PATH unconditionally, so we temporarily disable `set -u` around
 # the source. The rest of this script keeps nounset checking.
 if [[ -n "$ENV_SCRIPT" ]]; then

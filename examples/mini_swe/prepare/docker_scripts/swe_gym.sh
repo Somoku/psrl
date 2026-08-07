@@ -17,12 +17,12 @@ WORKERS=${SWE_PREFETCH_WORKERS:-4}
 bash "$SCRIPT_DIR/prefetch_images.sh" \
     --parquet "$PREPARE_DIR/../data/swe_gym_2438/train.parquet" \
     --workers "$WORKERS" \
-    --image-dir /jizhicfs/lhy/docker_images/swe_gym \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe_gym \
     --method skopeo \
     --mirrors docker.1ms.run,docker.1panel.live,proxy.vvvv.ee,lispy.org,registry.cyou \
     --no-direct-fallback \
     --retries 10
 
 bash "$SCRIPT_DIR/load_all_nodes.sh" \
-    --hosts /jizhicfs/lhy/hosts/64GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe_gym
+    --hosts ${PSRL_WORKSPACE}/hosts/64GPUs \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe_gym

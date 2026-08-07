@@ -38,7 +38,7 @@ test = [
 ]
 
 [project.urls]
-Homepage="https://github.com/lhy101/psrl"
+Homepage="https://github.com/psrl-project/psrl"
 
 [tool.uv.sources]
 vllm-psrl-patches = { path = "patch/vllm/vllm_plugin", editable = true }

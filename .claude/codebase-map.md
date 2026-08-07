@@ -338,7 +338,6 @@ There is also a top-level `transfer_queue.*` group, force-enabled in `main_ppo.p
 ### Launch Command
 
 ```bash
-source /jizhicfs/lhy/env/psrl.sh
 python -m psrl.trainer.main_ppo \
     ++trainer.total_epochs=10 \
     ++psrl.deployment.train_nnodes=2 \
@@ -592,7 +591,6 @@ CPU-only tests are marked `pytest.mark.cpu_test`. Run with pytest under the psrl
 | **Assertions** | Always include descriptive message with period |
 | **Linting** | Ruff, line length 119 |
 | **Language** | English only in all code artifacts |
-| **Env activation** | `source /jizhicfs/lhy/env/psrl.sh` before any command |
 
 ---
 

@@ -18,9 +18,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-MODEL="/jizhicfs/lhy/models/SWE-agent-LM-7B"
+MODEL="${PSRL_WORKSPACE}/models/SWE-agent-LM-7B"
 SERVED_MODEL_NAME="SWE-agent-LM-7B"
-HOSTS_FILE="/jizhicfs/lhy/hosts/32GPUs_another"
+HOSTS_FILE="${PSRL_WORKSPACE}/hosts/32GPUs_another"
 DATASET="examples/mini_swe/data/verified_subset_80/train.parquet"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
@@ -32,7 +32,7 @@ GRADER_TIMEOUT=1800
 SSH_TIMEOUT=7200
 
 # Shared-FS env script (conda + NCCL / UCX / vLLM / library paths).
-ENV_SCRIPT="/jizhicfs/lhy/env/psrl.sh"
+ENV_SCRIPT="${PSRL_WORKSPACE}/env/psrl.sh"
 
 # Source locally; temporarily disable -u because the env script references
 # some vars (no_proxy, LD_LIBRARY_PATH) that may be unset in a fresh shell.

@@ -55,8 +55,8 @@ docker tag <built-image>  code_sandbox:server
 Save it to the shared FS so you can fan it out in Step 2:
 
 ```bash
-mkdir -p /jizhicfs/lhy/docker_images
-docker save -o /jizhicfs/lhy/docker_images/code_sandbox.tar code_sandbox:server
+mkdir -p ${PSRL_WORKSPACE}/docker_images
+docker save -o ${PSRL_WORKSPACE}/docker_images/code_sandbox.tar code_sandbox:server
 ```
 
 #### Option B: pull from a Docker Hub mirror via `skopeo`
@@ -69,7 +69,7 @@ straight to a `docker-archive` tar without needing `dockerd` at all:
 ```bash
 DOCKERHUB_MIRROR=docker.m.daocloud.io \
 DOCKER_INSTALL_METHOD=skopeo \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_install.sh
@@ -103,7 +103,7 @@ Same as `skopeo` but using [`crane`](https://github.com/google/go-containerregis
 
 ```bash
 DOCKER_INSTALL_METHOD=crane \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_install.sh
@@ -116,9 +116,9 @@ DOCKER_IMAGE_TAG=code_sandbox:server \
 Once the tar exists on the shared FS, fan out with `docker_copy.sh`:
 
 ```bash
-DOCKER_NODE_IPS=28.49.196.175:8,28.49.196.77:8,28.58.226.5:8,28.49.38.163:8,29.162.234.163:8,28.49.37.141:8,28.59.83.117:8,29.162.224.113:8 \
+DOCKER_NODE_IPS="${NODE_IPS}" \
 DOCKER_NODE_NUM=8 \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_copy.sh
@@ -163,21 +163,21 @@ DOCKER_IMAGE_FILE="code_sandbox.tar"
 
 DOCKERHUB_MIRROR=docker.m.daocloud.io \
 DOCKER_INSTALL_METHOD=skopeo \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=$DOCKER_IMAGE_FILE \
 DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG \
   bash examples/retool/docker_scripts/docker_install.sh
 
-DOCKER_NODE_IPS=28.49.196.175:8,28.49.196.77:8,28.58.226.5:8,28.49.38.163:8,29.162.234.163:8,28.49.37.141:8,28.59.83.117:8,29.162.224.113:8 \
+DOCKER_NODE_IPS="${NODE_IPS}" \
 DOCKER_NODE_NUM=8 \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=$DOCKER_IMAGE_FILE \
 DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG \
   bash examples/retool/docker_scripts/docker_copy.sh
 ```
 
 > **Heads up**: the committed `example.sh` currently points at
-> `/jizhicfs/lhy/psrl_agent/scripts/docker/docker_install.sh`, which is a
+> `scripts/docker/docker_install.sh`, which is a
 > legacy path that no longer exists — the real scripts are the ones in
 > this directory (`examples/retool/docker_scripts/`). Update the path when
 > copying the example.
@@ -191,15 +191,17 @@ starting / stopping / inspecting `dockerd` on one host or all hosts:
 
 ```bash
 # Start dockerd everywhere (idempotent: pkills any existing dockerd first on restart)
-DOCKER_NODE_IPS=28.49.196.175:8,28.49.196.77:8,... \
+DOCKER_NODE_IPS="${NODE_IPS}" \
 DOCKER_NODE_NUM=8 \
   bash examples/retool/docker_scripts/docker_manager.sh start all
 
 # Check whether dockerd is responsive on every node
-DOCKER_NODE_IPS=... bash examples/retool/docker_scripts/docker_manager.sh status all
+DOCKER_NODE_IPS="${NODE_IPS}" \
+  bash examples/retool/docker_scripts/docker_manager.sh status all
 
 # Tail /var/log/docker.log on one specific node
-DOCKER_NODE_IPS=... bash examples/retool/docker_scripts/docker_manager.sh logs 28.49.196.175
+DOCKER_NODE_IPS="${NODE_IPS}" \
+  bash examples/retool/docker_scripts/docker_manager.sh logs "192.168.1.1"
 ```
 
 Actions:
@@ -255,7 +257,7 @@ Any node printing `MISSING` should be re-fanned:
 
 ```bash
 DOCKER_NODE_IPS=<that-one-node>:8 DOCKER_NODE_NUM=1 \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_copy.sh

@@ -172,6 +172,10 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_first_pipeline_stage=${NUM_LAYERS_IN_FIRST_PIPELINE_STAGE} \
     +train_actor_rollout_ref.actor.megatron.override_transformer_config.num_layers_in_last_pipeline_stage=${NUM_LAYERS_IN_LAST_PIPELINE_STAGE} \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_router_dtype=fp32 \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_flex_dispatcher_backend=deepep \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type=flex \
+    +train_actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True \
     \
     reward.active_managers='[dapo]' \
     reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.enable=${enable_overlong_buffer} \

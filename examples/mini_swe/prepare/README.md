@@ -182,14 +182,14 @@ On many clusters the docker daemon itself cannot reach `registry-1.docker.io`
 (user-space proxy env vars like `http_proxy` are **not** inherited by
 `dockerd`). `prefetch_images.sh` sidesteps this by using **skopeo** — a
 user-space tool that honours `$http_proxy` / `$https_proxy` from
-`/jizhicfs/lhy/env/psrl.sh` and writes straight to a local `docker-archive`
+`${PSRL_WORKSPACE}/env/psrl.sh` and writes straight to a local `docker-archive`
 tar (or directly into `dockerd` via the Unix socket). No daemon proxy config
 needed.
 
 #### 3.2 — Dry-run
 
 ```bash
-source /jizhicfs/lhy/env/psrl.sh   # sets http_proxy for skopeo
+source ${PSRL_WORKSPACE}/env/psrl.sh   # sets http_proxy for skopeo
 bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
     --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet \
     --dry-run
@@ -201,10 +201,9 @@ by the parquet.
 #### 3.3 — Full pull
 
 ```bash
-source /jizhicfs/lhy/env/psrl.sh
 bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
     --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet \
-    --image-dir /jizhicfs/lhy/docker_images/swe \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe \
     --workers 4 \
     --retries 5 \
     --mirrors docker.xuanyuan.me,docker.1ms.run,docker.1panel.live,hub.rat.dev,dockerproxy.net,proxy.vvvv.ee,docker.xiaogenban1993.com,lispy.org,registry.cyou \
@@ -249,7 +248,6 @@ one that actually works as of 2026-04. Before trusting a new mirror,
 probe it first:
 
 ```bash
-source /jizhicfs/lhy/env/psrl.sh
 bash examples/mini_swe/prepare/docker_scripts/probe_mirrors.sh \
     swebench/swesmith.x86_64.paramiko_1776_paramiko.23f92003
 ```
@@ -292,10 +290,9 @@ Feed the list back into `prefetch_images.sh` via `--images` (same flags as the
 full pull, just swap `--parquet` for `--images`):
 
 ```bash
-source /jizhicfs/lhy/env/psrl.sh
 bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
     --images /tmp/failed_images.txt \
-    --image-dir /jizhicfs/lhy/docker_images/swe \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe \
     --workers 8 \
     --retries 10 \
     --mirrors docker.xuanyuan.me,docker.1ms.run,docker.1panel.live,hub.rat.dev,dockerproxy.net,proxy.vvvv.ee,docker.xiaogenban1993.com,lispy.org,registry.cyou \
@@ -307,7 +304,7 @@ retrying is cheap — only the genuinely missing/truncated ones get re-pulled.
 
 > **Disk budget**: The 1k smith subset uses ~131 unique images, total
 > ~330–500 GB of `docker-archive` tars on the shared FS. The 5k subset roughly
-> doubles that. Plan `/jizhicfs/lhy/docker_images/swe` capacity accordingly,
+> doubles that. Plan `${PSRL_WORKSPACE}/docker_images/swe` capacity accordingly,
 > and on each node reserve ~1–2× that again for `/var/lib/docker` after
 > `docker load`.
 
@@ -315,15 +312,14 @@ retrying is cheap — only the genuinely missing/truncated ones get re-pulled.
 
 ### Step 4: Fan out to all cluster nodes
 
-Once every image has a complete tar in `/jizhicfs/lhy/docker_images/swe/`, use
+Once every image has a complete tar in `${PSRL_WORKSPACE}/docker_images/swe/`, use
 `load_all_nodes.sh` to `docker load` them on every host **in parallel** over
-`pssh`. Because `/jizhicfs/` is mounted on every node, tars are loaded
-**directly from the shared path** — no `scp`/`rsync` copy stage.
+`pssh`.
 
 ```bash
 bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
-    --hosts     /jizhicfs/lhy/hosts/32GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe
+    --hosts     ${PSRL_WORKSPACE}/hosts/32GPUs \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe
 ```
 
 Key defaults and flags:
@@ -344,10 +340,10 @@ After the run, the script prints a per-host summary:
 
 ```
 --- summary ---
-  28.49.196.175         loaded=131  skipped=0    failed=0
-  29.162.234.163        loaded=0    skipped=131  failed=0   # already had them
-  28.49.37.141          loaded=130  skipped=0    failed=1
-  29.162.224.113        loaded=131  skipped=0    failed=0
+  192.168.1.1                loaded=131  skipped=0    failed=0
+  192.168.1.2                loaded=0    skipped=131  failed=0   # already had them
+  192.168.1.3                loaded=130  skipped=0    failed=1
+  192.168.1.4                loaded=131  skipped=0    failed=0
 ```
 
 Full per-host output is in `_load_logs/<timestamp>/stdout/<ip>` and
@@ -360,13 +356,13 @@ delta and feed it to `--images-list`:
 
 ```bash
 # Build a subset file with only the NEW images:
-diff <(ls /jizhicfs/lhy/docker_images/swe/*.tar | xargs -n1 basename -s .tar | sort) \
+diff <(ls ${PSRL_WORKSPACE}/docker_images/swe/*.tar | xargs -n1 basename -s .tar | sort) \
      <(previous_deployed_list.txt) \
     | grep '^<' | sed 's/^< //' > /tmp/new_images.txt
 
 bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
-    --hosts /jizhicfs/lhy/hosts/128GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe \
+    --hosts ${PSRL_WORKSPACE}/hosts/128GPUs \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe \
     --images-list /tmp/new_images.txt
 ```
 
@@ -388,9 +384,9 @@ Old images already on every node are untouched (thanks to
   `--hosts` pointing to just that node — `--skip-existing` makes the retry
   cheap:
   ```bash
-  echo 28.49.37.141 > /tmp/one_host
+  echo node-c > /tmp/one_host
   bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
-      --hosts /tmp/one_host --image-dir /jizhicfs/lhy/docker_images/swe \
+      --hosts /tmp/one_host --image-dir ${PSRL_WORKSPACE}/docker_images/swe \
       --parallel-per-node 4
   ```
 
@@ -468,7 +464,7 @@ Use the convenience wrappers or invoke `prefetch_images.sh` directly:
 
 ```bash
 # Convenience wrapper (full dataset)
-source /jizhicfs/lhy/env/psrl.sh
+source ${PSRL_WORKSPACE}/env/psrl.sh
 bash examples/mini_swe/prepare/docker_scripts/swe_gym.sh
 
 # Convenience wrapper (subset)
@@ -477,7 +473,7 @@ bash examples/mini_swe/prepare/docker_scripts/swe_gym_subset.sh
 # Manual invocation (equivalent)
 bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
     --parquet examples/mini_swe/data/swe_gym_2438/train.parquet \
-    --image-dir /jizhicfs/lhy/docker_images/swe_gym \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe_gym \
     --workers 4 \
     --retries 5 \
     --mirrors docker.xuanyuan.me,docker.1ms.run,docker.1panel.live,hub.rat.dev
@@ -487,8 +483,8 @@ Then fan out to all cluster nodes:
 
 ```bash
 bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
-    --hosts /jizhicfs/lhy/hosts/32GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe_gym
+    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe_gym
 ```
 
 > **Disk budget**: The full 2438-instance dataset uses ~200 unique images,

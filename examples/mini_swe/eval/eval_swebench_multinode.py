@@ -9,10 +9,10 @@ one combined output directory.
 Prerequisites (same as the single-node ``eval_swebench`` entry point):
 
 - The repository (``--repo-root``) lives on a *shared* filesystem that every
-  target host can read (e.g. ``/jizhicfs/lhy/psrl_agent``).
+  target host can read.
 - The output directory (``--output-dir``) is on the same shared FS — each
   worker writes its shard artefacts there directly, no rsync needed.
-- The env script (``--env-script``, default ``/jizhicfs/lhy/env/psrl.sh``)
+- The env script (``--env-script``, default ``${PSRL_WORKSPACE}/env/psrl.sh``)
   is readable from every host and contains the same ``conda activate`` and
   NCCL / UCX / vLLM / LD_LIBRARY_PATH setup that PSRL training uses.
 - Every host has the Docker images required by its shard already loaded
@@ -41,7 +41,7 @@ Output layout::
 Usage::
 
     python -m examples.mini_swe.eval.eval_swebench_multinode \\
-        --hosts /jizhicfs/lhy/hosts/32GPUs \\
+        --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \\
         --dataset examples/mini_swe/data/verified_subset_80/train.parquet \\
         --output-dir examples/mini_swe/output/eval/gold_sanity_mn \\
         --gold-patches \\
@@ -227,7 +227,7 @@ def _build_remote_command(
         repo_root (str): Absolute path to the psrl_agent repo on the shared FS.
         env_script (str): Path to a shared-FS env script that performs
             ``conda activate`` and exports the NCCL / UCX / vLLM /
-            LD_LIBRARY_PATH knobs (typical: ``/jizhicfs/lhy/env/psrl.sh``).
+            LD_LIBRARY_PATH knobs (typical: ``${PSRL_WORKSPACE}/env/psrl.sh``).
             Pass ``""`` to skip sourcing entirely.
         dataset_path (str): Absolute path to the per-host shard parquet.
         output_dir (str): Absolute path to the per-host output directory.
@@ -785,12 +785,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--repo-root",
-        default="/jizhicfs/lhy/psrl_agent",
+        default="${PSRL_WORKSPACE}/psrl_agent",
         help="Absolute path to the psrl_agent repo on the shared FS.",
     )
     parser.add_argument(
         "--env-script",
-        default="/jizhicfs/lhy/env/psrl.sh",
+        default="${PSRL_WORKSPACE}/env/psrl.sh",
         help=(
             "Path on the shared FS to an env script sourced on every remote "
             "host before invoking eval_swebench.  It must perform `conda "

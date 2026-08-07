@@ -3,11 +3,11 @@ DOCKER_IMAGE_FILE="python_3.11-slim.tar"
 
 DOCKERHUB_MIRROR=docker.m.daocloud.io \
 DOCKER_INSTALL_METHOD=skopeo \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=$DOCKER_IMAGE_FILE \
 DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG \
-/jizhicfs/lhy/psrl_agent/scripts/docker/docker_install.sh \
+scripts/docker/docker_install.sh \
 
 DOCKER_NODE_IPS=$NODE_IP_LIST DOCKER_NODE_NUM=8 \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images DOCKER_IMAGE_FILE=$DOCKER_IMAGE_FILE DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG \
-/jizhicfs/lhy/psrl_agent/scripts/docker/docker_copy.sh
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images DOCKER_IMAGE_FILE=$DOCKER_IMAGE_FILE DOCKER_IMAGE_TAG=$DOCKER_IMAGE_TAG \
+scripts/docker/docker_copy.sh

@@ -2,14 +2,14 @@ source ${PSRL_WORKSPACE}/env/psrl.sh
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
-HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen3-8B
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3-8B
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-8B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
-train_files=/jizhicfs/lhy/data/dapo/dapo-math-17k.parquet
-test_files=/jizhicfs/lhy/data/dapo/aime-2024.parquet
+train_files=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
+test_files=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
-OUTPUT_DIR=/jizhicfs/lhy/psrl_agent/examples/dapo_trainer/tx-output
+OUTPUT_DIR=${PSRL_PATH}/examples/dapo_trainer/output
 mkdir -p "$OUTPUT_DIR"
 project_name=tx_test_lhy
 experiment_name=qwen3_8b_megatron_dcp

@@ -86,7 +86,7 @@ managers:
     rollout_nnodes_per_instance: 1
   
     model:
-      path: /jizhicfs/pkuhetu/models/Qwen3-8B
+      path: ${PSRL_WORKSPACE}/models/Qwen3-8B
       external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
       trust_remote_code: False
   
@@ -142,7 +142,7 @@ managers:
     rollout_nnodes_per_instance: 1
   
     model:
-      path: /jizhicfs/pkuhetu/yfzhao/psrl/models/Skywork-Reward-V2-Qwen3-8B
+      path: ${PSRL_WORKSPACE}/models/Skywork-Reward-V2-Qwen3-8B
       external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
       trust_remote_code: False
   

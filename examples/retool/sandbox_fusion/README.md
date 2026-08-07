@@ -8,7 +8,7 @@ Currently we deploy SandBoxFusion with Docker Swarm, which will deploy the servi
 
 - Docker installed on all nodes.
 - SSH access to all nodes.
-- `SANDBOX_NODE_IPS` in environment variables: comma-separated `ip:gpu_count` pairs (e.g. `28.1.1.1:8,28.1.1.2:8`). The GPU count is stripped before use.
+- `SANDBOX_NODE_IPS` in environment variables: comma-separated `ip:gpu_count` pairs (e.g. `192.168.1.1:8,192.168.1.2:8`). The GPU count is stripped before use.
 - `SANDBOX_NODE_NUM` (optional): number of nodes to use; defaults to the count of IPs in `SANDBOX_NODE_IPS`.
 - Image name is hardcoded as `code_sandbox:server` in `launch_service.sh` — load that tag onto every node before launching (see [docker_scripts/README.md](../docker_scripts/README.md)).
 

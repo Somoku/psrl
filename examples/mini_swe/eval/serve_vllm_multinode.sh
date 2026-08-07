@@ -31,8 +31,8 @@
 # Usage
 # -----
 #   bash serve_vllm_multinode.sh \
-#       --hosts /jizhicfs/lhy/hosts/32GPUs \
-#       --checkpoint /jizhicfs/lhy/checkpoints/my-step-1000 \
+#       --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
+#       --checkpoint ${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
 #       --tp 2 --port 8000 \
 #       --served-model-name my-model \
 #       --tool-call-parser hermes \
@@ -63,12 +63,12 @@
 #   --outdir DIR                Where to write endpoints.txt + logs.
 #                               Default: examples/mini_swe/output/serve/<ts>.
 #   --repo-root PATH            Absolute path to psrl_agent repo on shared FS
-#                               (default: /jizhicfs/lhy/psrl_agent).
+#                               (default: ${PSRL_WORKSPACE}/psrl_agent).
 #   --env-script PATH           Env script forwarded to every host's
 #                               serve_vllm.sh. Must contain `conda activate`
 #                               plus all the NCCL / UCX / vLLM / cudnn / torch
 #                               LD_LIBRARY_PATH knobs. Default:
-#                               /jizhicfs/lhy/env/psrl.sh (same as training).
+#                               ${PSRL_WORKSPACE}/env/psrl.sh (same as training).
 #                               Pass '' to disable sourcing.
 #   --ssh-user USER             Optional ssh username.
 #   --dry-run                   Print the per-host ssh command and exit.
@@ -97,8 +97,8 @@ DIST_BACKEND=""
 EXTRA=""
 WAIT_READY=1800
 OUTDIR=""
-REPO_ROOT="/jizhicfs/lhy/psrl_agent"
-ENV_SCRIPT="/jizhicfs/lhy/env/psrl.sh"
+REPO_ROOT="${PSRL_WORKSPACE}/psrl_agent"
+ENV_SCRIPT="${PSRL_WORKSPACE}/env/psrl.sh"
 SSH_USER=""
 DRY_RUN=0
 

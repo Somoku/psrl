@@ -14,12 +14,12 @@ WORKERS=${SWE_PREFETCH_WORKERS:-1}
 bash "$SCRIPT_DIR/prefetch_images.sh" \
     --parquet "$PREPARE_DIR/../data/verified_subset_80/train.parquet" \
     --workers "$WORKERS" \
-    --image-dir /jizhicfs/lhy/docker_images/swe_eval \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe_eval \
     --method skopeo \
     --mirrors docker.1ms.run,docker.1panel.live,proxy.vvvv.ee,lispy.org,registry.cyou \
     --no-direct-fallback \
     --retries 10
 
 bash "$SCRIPT_DIR/load_all_nodes.sh" \
-    --hosts /jizhicfs/lhy/hosts/32GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe_eval
+    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe_eval

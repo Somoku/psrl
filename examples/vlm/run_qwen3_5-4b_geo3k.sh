@@ -4,9 +4,9 @@ export VLLM_WORKER_MULTIPROC_METHOD="spawn"
 
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
 
-HF_MODEL_PATH=/jizhicfs/pkuhetu/zym/Qwen3.5-4B 
-train_files=/jizhicfs/pkuhetu/zym/verl/data/geo3k/train.parquet
-test_files=/jizhicfs/pkuhetu/zym/verl/data/geo3k/test.parquet
+HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3.5-4B 
+train_files=${PSRL_WORKSPACE}/data/geo3k/train.parquet
+test_files=${PSRL_WORKSPACE}/data/geo3k/test.parquet
 
 OUTPUT_DIR=${PSRL_WORKSPACE}/output
 mkdir -p "$OUTPUT_DIR"

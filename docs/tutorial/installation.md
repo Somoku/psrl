@@ -1,9 +1,68 @@
 # Installation
 
-PSRL is installed from source because its core runtime combines pinned PyTorch,
-vLLM, veRL, SMG, NIXL, and optional KV-cache components.
+PSRL supports two installation paths:
 
-## Prerequisites
+- **Docker:** a reproducible image with the pinned runtime and native
+  dependencies already installed.
+- **From source:** a conda-based setup for development or custom dependency versions.
+
+## Install with Docker
+
+The Docker build context is the repository root. Build the image that matches your
+workload, then run PSRL inside it.
+
+### Prerequisites
+
+- Docker with BuildKit enabled.
+- For GPU training, an NVIDIA driver (R580 or newer) and the NVIDIA Container Toolkit.
+- A persistent host directory for models, datasets, and checkpoints.
+
+### Build the image
+
+GPU image:
+
+```bash
+docker build --progress=plain \
+  -f docker/Dockerfile \
+  -t psrl:latest .
+```
+
+CPU image (for imports, tests, and gateway/data-plane development):
+
+```bash
+docker buildx build --load --progress=plain \
+  --platform=linux/amd64 \
+  -f docker/Dockerfile.cpu \
+  -t psrl:cpu .
+```
+
+The GPU image contains the full PSRL stack, including CUDA, PyTorch, vLLM, veRL,
+NIXL/UCX, LMCache, Megatron, SMG, and PSRL. The CPU image intentionally omits
+CUDA-only libraries and cannot run GPU training.
+
+### Start the container
+
+```bash
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$PWD:/home/psrl" \
+  -it psrl:latest
+```
+
+The image already installs PSRL at `/home/psrl`, so no additional `pip install`
+command is needed. For a CPU shell, omit `--gpus all` and replace `psrl:latest` with
+`psrl:cpu`.
+
+For multi-node NIXL/UCX/Mooncake traffic, start the same image on every node and use
+your cluster's standard RDMA device configuration (for example,
+`--device=/dev/infiniband`).
+
+## Install from source
+
+PSRL's source installation combines pinned PyTorch, vLLM, veRL, SMG, NIXL, and
+optional KV-cache components.
+
+### Prerequisites
 
 | Requirement | Notes |
 |---|---|
@@ -24,7 +83,7 @@ rustc --version
 cargo --version
 ```
 
-## Create the Environment
+### Create the Environment
 
 ```bash
 conda create -n psrl python=3.12
@@ -34,7 +93,7 @@ conda activate psrl
 All nodes in a Ray cluster must use the same environment and see the same PSRL
 checkout or installed package.
 
-## Core Installation
+### Core Installation
 
 ```bash
 bash scripts/install_basic.sh
@@ -54,7 +113,7 @@ python -m pip install -e .
 The installer clones sources under `third_party/`. Set `VLLM_PATH` or `VERL_PATH`
 before running it to use an existing checkout.
 
-## SMG Requirements
+### SMG Requirements
 
 SMG is the mandatory online request path:
 
@@ -80,7 +139,7 @@ maturin develop --features vendored-openssl
 For SMG development, rebuild from the exact SMG checkout used by PSRL, then restart
 the training job so the gateway subprocess loads the new binding.
 
-## Optional Performance Components
+### Optional Performance Components
 
 Run these after the core installer:
 
@@ -124,7 +183,7 @@ with `p2p_transfer_channel=nixl` also requires NIXL/UCX.
 
 ::::
 
-## Verification
+### Verification
 
 Run the checks below in sequence. Commands marked **(optional)** apply only if you
 installed the corresponding component.

@@ -23,6 +23,7 @@ from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
     make_slice_parameter,
+    make_visual_qkv_tp_sharding,
     reshape_visual_block_qkv,
     slice_attn_conv1d,
     slice_gate_up_proj,
@@ -303,7 +304,6 @@ class MegatronConverter(BaseConverter):
         qkv = torch.cat((q, k, v), dim=0)
         if "visual.blocks" in full_hf_name and "qkv" in full_hf_name:
             qkv = reshape_visual_block_qkv(qkv, vision_head_size=self.model_info.get("vision_head_size"))
-            param.partition_dim = 1
         self.sync_plan.add(
             ConcatenatedQKVSync(
                 key=full_hf_name,
@@ -457,7 +457,6 @@ class MegatronConverter(BaseConverter):
             return dict(zip(new_param_names, new_params))
         if "visual.blocks" in hf_name and "qkv" in hf_name:
             param = reshape_visual_block_qkv(param, vision_head_size=self.model_info.get("vision_head_size"))
-            param.partition_dim = 1
         return {hf_name: param}
 
     def _convert_chunked_parameter(self, full_name: str, param: Parameter, hf_name: str) -> dict:
@@ -538,6 +537,11 @@ class MegatronConverter(BaseConverter):
             shard_size = self.mpu.etp_size
             shard_indices = [(self.mpu.etp_rank,)]
             shard_dim = 0 if "fc1" in full_name else 1
+        elif is_tp_param and "vision_model" in full_name and "qkv" in full_name:
+            return make_visual_qkv_tp_sharding(
+                tp_size=self.mpu.tp_size,
+                tp_rank=self.mpu.tp_rank,
+            )
         elif is_tp_param:
             shard_size = self.mpu.tp_size
             assert hasattr(param, "partition_dim"), (

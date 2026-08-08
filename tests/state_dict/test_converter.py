@@ -381,7 +381,8 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         param = _make_param((4096,))
         sharding = _default_sharding()
         out_p, out_s = conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
-        self.assertIs(out_p, param)
+        self.assertEqual(out_p.shape, (8, 512, 1))
+        self.assertEqual(out_p.untyped_storage().data_ptr(), param.untyped_storage().data_ptr())
         self.assertIs(out_s, sharding)
 
     def test_noop_no_model_info(self):

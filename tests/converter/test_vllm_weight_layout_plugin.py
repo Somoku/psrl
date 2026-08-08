@@ -27,6 +27,7 @@ EXPECTED_LAYOUT_TARGETS = {
     "qwen2_vl.Qwen2VLForConditionalGeneration",
     "qwen3.Qwen3ForCausalLM",
     "qwen3_5.Qwen3_5ForCausalLMBase",
+    "qwen3_5.Qwen3_5ForConditionalGeneration",
     "qwen3_moe.Qwen3MoeModel",
     "qwen3_moe.Qwen3MoeForCausalLM",
     "qwen3_vl.Qwen3VLForConditionalGeneration",

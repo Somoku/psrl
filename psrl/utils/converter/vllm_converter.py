@@ -20,6 +20,7 @@ from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     MappingType,
     ParameterMapping,
+    make_visual_qkv_tp_sharding,
     reshape_visual_block_qkv,
     slice_attn_conv1d,
     slice_fused_moe_w2_weight,
@@ -169,6 +170,10 @@ class VllmConverter(BaseConverter):
                             converted_param,
                             vision_head_size=self.model_info.get("vision_head_size"),
                         )
+                        sharding = make_visual_qkv_tp_sharding(
+                            tp_size=getattr(module, "tp_size", 1),
+                            tp_rank=self.tp_rank or 0,
+                        )
                     sharding = self._adjust_kv_sharding(converted_name, sharding, module, self.model_info)
                     converted_param, sharding = self.maybe_reshape_qkv_to_3d(converted_name, converted_param, sharding)
                     converted_state_dict[converted_name] = converted_param
@@ -247,6 +252,11 @@ class VllmConverter(BaseConverter):
                 new_params = self.convert_parameter(full_name, param, module, fused_mappings, model_info)
                 sharding = self.get_sharding_for_param(module, param_name, full_name)
                 for new_param_name, new_param in new_params.items():
+                    if "visual.blocks" in new_param_name and "qkv" in new_param_name:
+                        sharding = make_visual_qkv_tp_sharding(
+                            tp_size=getattr(module, "tp_size", 1),
+                            tp_rank=self.tp_rank or 0,
+                        )
                     adjusted_sharding = self._adjust_kv_sharding(new_param_name, sharding, module, model_info)
                     new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(
                         new_param_name, new_param, adjusted_sharding
@@ -523,10 +533,7 @@ class VllmConverter(BaseConverter):
                     VocabParallelEmbedding,
                 ),
             ):
-                if full_name is not None and "visual.blocks" in full_name and "qkv" in full_name:
-                    shard_dim = 1
-                else:
-                    shard_dim = 0
+                shard_dim = 0
             elif isinstance(module, RowParallelLinear):
                 if param_name == "bias":
                     # NOTE(zym) bias doesn't need to be sharded

@@ -8,6 +8,7 @@ from torch.distributed.tensor import DTensor
 from verl.utils.fsdp_utils import fsdp_version
 
 from psrl.utils.converter.base_converter import BaseConverter
+from psrl.utils.converter.hf_converter import convert_hf_local_shard
 from psrl.utils.converter.model_mappings import ParameterMapping
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
@@ -64,8 +65,15 @@ class FSDPConverter(BaseConverter):
             # NOTE(lhy): Reshape Q/K/V local shards to 3D to match slice_qkv_proj_megatron layout
             # and update sharding to reflect the new tensor shape.
             local_param, sharding = self.maybe_reshape_qkv_to_3d(param_name, local_param, sharding)
-            converted_state_dict[param_name] = local_param
-            sharding_dict[param_name] = sharding
+            converted_params = convert_hf_local_shard(
+                self.model_info,
+                param_name,
+                local_param,
+                sharding,
+            )
+            for converted_name, (converted_param, converted_sharding) in converted_params.items():
+                converted_state_dict[converted_name] = converted_param
+                sharding_dict[converted_name] = converted_sharding
         return converted_state_dict, sharding_dict
 
     def get_sharding_for_param(self, param_name: str, param: DTensor) -> NIXLSharding:

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -236,17 +237,65 @@ def slice_gate_up_proj(
     ]
 
 
+@dataclass(frozen=True)
+class QKVTPLayout:
+    """
+    Describe Q/KV head placement across a tensor-parallel group.
+
+    Attributes:
+        tp_size (int): Tensor-parallel world size.
+        num_heads_local (int): Number of query heads stored by each TP rank.
+        num_kv_heads_local (int): Number of key/value heads stored by each TP rank.
+        num_kv_head_replicas (int): Number of TP ranks sharing each KV shard.
+    """
+
+    tp_size: int
+    num_heads_local: int
+    num_kv_heads_local: int
+    num_kv_head_replicas: int
+
+    @property
+    def num_kv_shards(self) -> int:
+        """
+        Return the number of distinct KV shards across all TP ranks.
+        """
+        return self.tp_size // self.num_kv_head_replicas
+
+    def get_kv_shard_rank(self, tp_rank: int) -> int:
+        """
+        Return the distinct KV shard index owned by a TP rank.
+
+        Args:
+            tp_rank (int): Tensor-parallel rank.
+
+        Returns:
+            int: KV shard index shared by this TP rank and its replicas.
+        """
+        assert 0 <= tp_rank < self.tp_size, (
+            f"Tensor parallel rank must be in [0, {self.tp_size}), got tp_rank = {tp_rank}."
+        )
+        return tp_rank // self.num_kv_head_replicas
+
+
 def get_qkv_tp_layout(
     num_heads: int,
     num_kv_heads: int,
     tp_size: int,
-) -> tuple[int, int, int]:
+) -> QKVTPLayout:
     """
-    Return local Q/KV head counts and the KV replication factor for TP.
+    Build the complete Q/KV head layout for tensor parallelism.
 
     vLLM partitions KV heads when there are at least as many KV heads as TP
     ranks. When TP is larger, each KV head is replicated across a contiguous
     group of TP ranks.
+
+    Args:
+        num_heads (int): Global number of query heads.
+        num_kv_heads (int): Global number of key/value heads.
+        tp_size (int): Tensor-parallel world size.
+
+    Returns:
+        QKVTPLayout: Local head counts and KV shard replication metadata.
     """
     assert tp_size > 0, f"Tensor parallel size must be positive, got tp_size = {tp_size}."
     assert num_kv_heads > 0, f"Number of KV heads must be positive, got num_kv_heads = {num_kv_heads}."
@@ -270,7 +319,12 @@ def get_qkv_tp_layout(
         num_kv_heads_local = 1
         num_kv_head_replicas = tp_size // num_kv_heads
 
-    return num_heads // tp_size, num_kv_heads_local, num_kv_head_replicas
+    return QKVTPLayout(
+        tp_size=tp_size,
+        num_heads_local=num_heads // tp_size,
+        num_kv_heads_local=num_kv_heads_local,
+        num_kv_head_replicas=num_kv_head_replicas,
+    )
 
 
 def slice_qkv_proj(
@@ -299,18 +353,20 @@ def slice_qkv_proj(
         list[Parameter]: A list of three 2D parameters sharing storage with fused_param:
             [
               q_param, # shape (num_heads // tp_size * head_size, hidden)
-              k_param, # shape (num_kv_heads // tp_size * head_size, hidden)
-              v_param, # shape (num_kv_heads // tp_size * head_size, hidden)
+              k_param, # shape (num_kv_heads_local * head_size, hidden)
+              v_param, # shape (num_kv_heads_local * head_size, hidden)
             ]
+            When `num_kv_heads < tp_size`, `num_kv_heads_local` is 1 and the
+            same KV shard is replicated across multiple TP ranks.
     """
-    num_heads_local, num_kv_heads_local, _ = get_qkv_tp_layout(
+    layout = get_qkv_tp_layout(
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         tp_size=tp_size,
     )
-    q_len = num_heads_local * head_size
-    k_len = num_kv_heads_local * head_size
-    v_len = num_kv_heads_local * head_size
+    q_len = layout.num_heads_local * head_size
+    k_len = layout.num_kv_heads_local * head_size
+    v_len = layout.num_kv_heads_local * head_size
 
     assert fused_param.data.shape[output_dim] == (q_len + k_len + v_len), (
         f"Dim {output_dim} of fused parameter shape {fused_param.data.shape} "

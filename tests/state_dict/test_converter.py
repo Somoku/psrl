@@ -6,7 +6,7 @@ Covers:
   - HFParameterMapping / FSDPParameterMapping: basic instantiation and get_mappings
   - ModelRegistry / create_parameter_mapping: config object (not path) API
   - reshape_qkv_to_3d: shape and storage-sharing correctness
-  - slice_qkv_proj: shape and storage-sharing for various TP sizes
+  - QKVTPLayout / slice_qkv_proj: head placement, shape, and storage-sharing for various TP sizes
   - BaseConverter.__init__: model_info populated from parameter_mapping via super()
   - BaseConverter.maybe_reshape_qkv_to_3d: all three sharding cases (A/B/C)
     and the no-op cases (non-QKV name, 1D param, no model_info)
@@ -26,6 +26,7 @@ from psrl.utils.converter.hf_converter import HFConverter, convert_hf_inplace
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
     create_parameter_mapping,
+    get_qkv_tp_layout,
     model_registry,
     register_model,
     reshape_qkv_to_3d,
@@ -257,11 +258,37 @@ class TestSliceQKVProj(unittest.TestCase):
     """Tests for slice_qkv_proj (returns 2D shards)."""
 
     def _fused(self, num_heads, num_kv_heads, head_size, tp_size=1, H=4096):
-        nl = num_heads // tp_size
-        kl = num_kv_heads // tp_size
-        total = (nl + 2 * kl) * head_size
+        layout = get_qkv_tp_layout(num_heads, num_kv_heads, tp_size)
+        total = (layout.num_heads_local + 2 * layout.num_kv_heads_local) * head_size
         data = torch.randn(total, H)
         return Parameter(data)
+
+    def test_layout_with_partitioned_kv_heads(self):
+        layout = get_qkv_tp_layout(num_heads=32, num_kv_heads=8, tp_size=4)
+        self.assertEqual(layout.num_heads_local, 8)
+        self.assertEqual(layout.num_kv_heads_local, 2)
+        self.assertEqual(layout.num_kv_head_replicas, 1)
+        self.assertEqual(layout.num_kv_shards, 4)
+        self.assertEqual([layout.get_kv_shard_rank(rank) for rank in range(4)], [0, 1, 2, 3])
+
+    def test_layout_with_replicated_kv_heads(self):
+        layout = get_qkv_tp_layout(num_heads=16, num_kv_heads=2, tp_size=8)
+        self.assertEqual(layout.num_heads_local, 2)
+        self.assertEqual(layout.num_kv_heads_local, 1)
+        self.assertEqual(layout.num_kv_head_replicas, 4)
+        self.assertEqual(layout.num_kv_shards, 2)
+        self.assertEqual([layout.get_kv_shard_rank(rank) for rank in range(8)], [0, 0, 0, 0, 1, 1, 1, 1])
+
+    def test_shapes_with_replicated_kv_heads(self):
+        H = 256
+        fused = self._fused(num_heads=16, num_kv_heads=2, head_size=64, tp_size=8, H=H)
+        q, k, v = slice_qkv_proj(fused, num_heads=16, num_kv_heads=2, head_size=64, tp_size=8)
+        self.assertEqual(q.shape, (2 * 64, H))
+        self.assertEqual(k.shape, (64, H))
+        self.assertEqual(v.shape, (64, H))
+        fused_storage_ptr = fused.data.untyped_storage().data_ptr()
+        for shard in (q, k, v):
+            self.assertEqual(shard.data.untyped_storage().data_ptr(), fused_storage_ptr)
 
     def test_shapes_tp1(self):
         H = 4096

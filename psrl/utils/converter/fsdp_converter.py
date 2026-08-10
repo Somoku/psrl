@@ -14,15 +14,7 @@ from psrl.utils.converter.model_mappings import ParameterMapping, get_fused_moe_
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 
-def _clone_sharding(sharding: NIXLSharding) -> NIXLSharding:
-    """Create an independent copy of a sharding descriptor."""
-    return NIXLSharding(
-        shard_mesh=sharding.shard_mesh.copy(),
-        shard_indices=list(sharding.shard_indices),
-    )
-
-
-def _split_dim0_fused_fsdp_param(
+def split_dim0_fused_fsdp_param(
     local_param: torch.Tensor,
     sharding: NIXLSharding,
     component_names: list[str],
@@ -65,7 +57,10 @@ def _split_dim0_fused_fsdp_param(
         offset = 0
         for name, size in zip(component_names, component_sizes):
             converted_state_dict[name] = local_param.narrow(0, offset, size)
-            converted_sharding_dict[name] = _clone_sharding(sharding)
+            converted_sharding_dict[name] = NIXLSharding(
+                shard_mesh=sharding.shard_mesh.copy(),
+                shard_indices=list(sharding.shard_indices),
+            )
             offset += size
         return converted_state_dict, converted_sharding_dict
 
@@ -105,7 +100,7 @@ def _split_dim0_fused_fsdp_param(
     return converted_state_dict, converted_sharding_dict
 
 
-def _split_fused_moe_fsdp_param(
+def split_fused_moe_fsdp_param(
     model_info: dict,
     param_name: str,
     local_param: torch.Tensor,
@@ -197,7 +192,7 @@ def _split_fused_moe_fsdp_param(
         for expert_id in range(num_experts):
             expert_param = local_param[expert_id]
             if gate_up_prefix is not None:
-                split_state, split_sharding = _split_dim0_fused_fsdp_param(
+                split_state, split_sharding = split_dim0_fused_fsdp_param(
                     local_param=expert_param,
                     sharding=canonical_projection_sharding,
                     component_names=[
@@ -216,7 +211,10 @@ def _split_fused_moe_fsdp_param(
                     )
                 name = f"{down_prefix}.{expert_id}.down_proj.weight"
                 converted_state_dict[name] = expert_param
-                converted_sharding_dict[name] = _clone_sharding(canonical_projection_sharding)
+                converted_sharding_dict[name] = NIXLSharding(
+                    shard_mesh=canonical_projection_sharding.shard_mesh.copy(),
+                    shard_indices=list(canonical_projection_sharding.shard_indices),
+                )
         return converted_state_dict, converted_sharding_dict
 
     raise ValueError(
@@ -273,7 +271,7 @@ class FSDPConverter(BaseConverter):
             local_param = param.to_local()
             # Compute sharding from original 2D DTensor placements before any reshape.
             sharding = self.get_sharding_for_param(param_name, param)
-            moe_split = _split_fused_moe_fsdp_param(
+            moe_split = split_fused_moe_fsdp_param(
                 self.model_info,
                 param_name,
                 local_param,

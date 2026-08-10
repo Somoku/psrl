@@ -268,8 +268,6 @@ class AgentLoopBase(ABC):
                 set((sampling_params.get("stop_token_ids") or []) + request_input.stop_token_ids)
             )
         with self.timer.generation():
-            if not self.gateway_addr:
-                raise RuntimeError("Rollout gateway address is empty.")
             # All requests (text-only and multimodal) use /generate:
             # - input_ids are pre-tokenized by apply_chat_template (no SMG re-tokenize)
             # - image_data accepts URL strings (SMG fetches) or base64 (PIL fallback)

@@ -5,6 +5,7 @@ import torch
 from psrl.utils.converter.base_converter import BaseConverter
 from psrl.utils.converter.model_mappings import (
     ParameterMapping,
+    get_fused_moe_expert_prefix,
     make_visual_qkv_tp_sharding,
     reshape_visual_block_qkv,
     slice_attn_conv1d,
@@ -84,23 +85,47 @@ def maybe_convert_to_smaller_parts(model_info, param_name, param):
         return dict(zip(new_param_names, new_params))
     if "visual.blocks" in param_name and "qkv" in param_name:
         param = reshape_visual_block_qkv(param, vision_head_size=model_info.get("vision_head_size"))
-    if "mlp.experts.gate_up_proj" in param_name:
+
+    gate_up_prefix = get_fused_moe_expert_prefix(param_name, "gate_up_proj")
+    if gate_up_prefix is not None:
         param_dict = {}
         num_experts = model_info["num_experts"]
-        name_prefix = param_name.rsplit(".", 1)[0]
+        if param.ndim != 3 or param.shape[0] != num_experts:
+            raise ValueError(
+                f"Expected fused gate_up_proj with shape [num_experts, 2 * intermediate_size, hidden_size], "
+                f"got {tuple(param.shape)} for {param_name} with num_experts={num_experts}."
+            )
+        intermediate_size = model_info.get("moe_intermediate_size")
+        if intermediate_size is not None and param.shape[1] != 2 * intermediate_size:
+            raise ValueError(
+                f"Expected fused gate_up_proj dim 1 to be {2 * intermediate_size}, "
+                f"got {param.shape[1]} for {param_name}."
+            )
         for i in range(num_experts):
-            gate_name = f"{name_prefix}.{i}.gate_proj.weight"
-            up_name = f"{name_prefix}.{i}.up_proj.weight"
+            gate_name = f"{gate_up_prefix}.{i}.gate_proj.weight"
+            up_name = f"{gate_up_prefix}.{i}.up_proj.weight"
             gate_param, up_param = param[i].chunk(2, dim=0)
             param_dict[gate_name] = gate_param
             param_dict[up_name] = up_param
         return param_dict
-    if "mlp.experts.down_proj" in param_name:
+
+    down_prefix = get_fused_moe_expert_prefix(param_name, "down_proj")
+    if down_prefix is not None:
         param_dict = {}
         num_experts = model_info["num_experts"]
-        name_prefix = param_name.rsplit(".", 1)[0]
+        if param.ndim != 3 or param.shape[0] != num_experts:
+            raise ValueError(
+                f"Expected fused down_proj with shape [num_experts, hidden_size, intermediate_size], "
+                f"got {tuple(param.shape)} for {param_name} with num_experts={num_experts}."
+            )
+        intermediate_size = model_info.get("moe_intermediate_size")
+        if intermediate_size is not None and param.shape[2] != intermediate_size:
+            raise ValueError(
+                f"Expected fused down_proj dim 2 to be {intermediate_size}, "
+                f"got {param.shape[2]} for {param_name}."
+            )
         for i in range(num_experts):
-            down_name = f"{name_prefix}.{i}.down_proj.weight"
+            down_name = f"{down_prefix}.{i}.down_proj.weight"
             param_dict[down_name] = param[i]
         return param_dict
     return {param_name: param}

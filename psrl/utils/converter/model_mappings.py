@@ -236,6 +236,43 @@ def slice_gate_up_proj(
     ]
 
 
+def get_qkv_tp_layout(
+    num_heads: int,
+    num_kv_heads: int,
+    tp_size: int,
+) -> tuple[int, int, int]:
+    """
+    Return local Q/KV head counts and the KV replication factor for TP.
+
+    vLLM partitions KV heads when there are at least as many KV heads as TP
+    ranks. When TP is larger, each KV head is replicated across a contiguous
+    group of TP ranks.
+    """
+    assert tp_size > 0, f"Tensor parallel size must be positive, got tp_size = {tp_size}."
+    assert num_kv_heads > 0, f"Number of KV heads must be positive, got num_kv_heads = {num_kv_heads}."
+    assert num_heads % tp_size == 0, (
+        "Number of heads must be divisible by tensor parallel size, "
+        f"but got num_heads = {num_heads} and tp_size = {tp_size}."
+    )
+
+    if num_kv_heads >= tp_size:
+        assert num_kv_heads % tp_size == 0, (
+            "Number of KV heads must be divisible by tensor parallel size when KV heads are partitioned, "
+            f"but got num_kv_heads = {num_kv_heads} and tp_size = {tp_size}."
+        )
+        num_kv_heads_local = num_kv_heads // tp_size
+        num_kv_head_replicas = 1
+    else:
+        assert tp_size % num_kv_heads == 0, (
+            "Tensor parallel size must be divisible by the number of KV heads when KV heads are replicated, "
+            f"but got tp_size = {tp_size} and num_kv_heads = {num_kv_heads}."
+        )
+        num_kv_heads_local = 1
+        num_kv_head_replicas = tp_size // num_kv_heads
+
+    return num_heads // tp_size, num_kv_heads_local, num_kv_head_replicas
+
+
 def slice_qkv_proj(
     fused_param: Parameter,
     num_heads: int,
@@ -266,16 +303,11 @@ def slice_qkv_proj(
               v_param, # shape (num_kv_heads // tp_size * head_size, hidden)
             ]
     """
-    assert num_heads % tp_size == 0, (
-        "Number of heads must be divisible by tensor parallel size, "
-        f"but got num_heads = {num_heads} and tp_size = {tp_size}."
+    num_heads_local, num_kv_heads_local, _ = get_qkv_tp_layout(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        tp_size=tp_size,
     )
-    assert num_kv_heads % tp_size == 0, (
-        "Number of KV heads must be divisible by tensor parallel size, "
-        f"but got num_kv_heads = {num_kv_heads} and tp_size = {tp_size}."
-    )
-    num_heads_local = num_heads // tp_size
-    num_kv_heads_local = num_kv_heads // tp_size
     q_len = num_heads_local * head_size
     k_len = num_kv_heads_local * head_size
     v_len = num_kv_heads_local * head_size
@@ -440,6 +472,16 @@ def slice_fused_moe_w2_weight(
         down = fused_param.data[expert_id]
         expert_params.append(make_slice_parameter(down, fused_param))
     return expert_params
+
+
+def get_fused_moe_expert_prefix(param_name: str, projection: str) -> str | None:
+    """Return the canonical `...mlp.experts` prefix for a fused MoE parameter."""
+    for suffix in (f".{projection}.weight", f".{projection}"):
+        if param_name.endswith(suffix):
+            prefix = param_name[: -len(suffix)]
+            if prefix.endswith(".mlp.experts"):
+                return prefix
+    return None
 
 
 def slice_in_proj_qkvz(

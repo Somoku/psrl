@@ -19,8 +19,7 @@ def sync_master_params_from_model(engine) -> None:
     opts = getattr(engine.optimizer, "chained_optimizers", [engine.optimizer])
     for opt in opts:
         assert hasattr(opt, "_copy_model_params_to_main_params"), (
-            f"{type(opt).__name__} must implement _copy_model_params_to_main_params "
-            "for fp32 master param resync"
+            f"{type(opt).__name__} must implement _copy_model_params_to_main_params for fp32 master param resync"
         )
         opt._copy_model_params_to_main_params()
     if engine._is_offload_optimizer:

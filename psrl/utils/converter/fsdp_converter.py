@@ -139,9 +139,7 @@ def _split_fused_moe_fsdp_param(
 
     intermediate_size = model_info.get("moe_intermediate_size")
     if gate_up_prefix is not None and (
-        not isinstance(intermediate_size, int)
-        or isinstance(intermediate_size, bool)
-        or intermediate_size <= 0
+        not isinstance(intermediate_size, int) or isinstance(intermediate_size, bool) or intermediate_size <= 0
     ):
         raise ValueError(
             f"A positive moe_intermediate_size is required to split {param_name}, got {intermediate_size}."

@@ -121,8 +121,7 @@ def maybe_convert_to_smaller_parts(model_info, param_name, param):
         intermediate_size = model_info.get("moe_intermediate_size")
         if intermediate_size is not None and param.shape[2] != intermediate_size:
             raise ValueError(
-                f"Expected fused down_proj dim 2 to be {intermediate_size}, "
-                f"got {param.shape[2]} for {param_name}."
+                f"Expected fused down_proj dim 2 to be {intermediate_size}, got {param.shape[2]} for {param_name}."
             )
         for i in range(num_experts):
             down_name = f"{down_prefix}.{i}.down_proj.weight"

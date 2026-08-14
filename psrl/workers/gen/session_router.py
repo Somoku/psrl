@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -13,6 +14,13 @@ from psrl.utils.common.http_utils import (
     create_aiohttp_client,
     filter_http_headers,
     request_raw,
+)
+from psrl.workers.gen.harness_protocol import (
+    anthropic_error_body,
+    anthropic_error_response,
+    anthropic_stream_response,
+    openai_stream_response,
+    responses_stream_response,
 )
 from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH, TRAJECTORY_ID_STRATEGIES
 
@@ -115,6 +123,9 @@ class SessionRouter:
         self.app.get("/sessions/{sid}")(self.get_session)
         self.app.delete("/sessions/{sid}")(self.delete_session)
         self.app.post("/sessions/{sid}/v1/chat/completions")(self.session_chat_completions)
+        self.app.post("/sessions/{sid}/v1/responses")(self.session_responses)
+        self.app.post("/sessions/{sid}/v1/messages/count_tokens")(self.session_anthropic_count_tokens)
+        self.app.post("/sessions/{sid}/v1/messages")(self.session_messages)
         # Coordinator-facing hang/continue control plane.
         self.app.get("/control/sessions")(self.control_list_sessions)
         self.app.post("/control/hang")(self.control_hang)
@@ -169,7 +180,131 @@ class SessionRouter:
         return self.build_response(result)
 
     async def session_chat_completions(self, sid: str, request: Request) -> Response:
-        """Handle a chat completion request within a TITO session."""
+        """Handle Chat Completions, synthesizing SSE after a completed turn."""
+        prepared = await self.prepare_protocol_request(request, "chat")
+        if isinstance(prepared, Response):
+            return prepared
+        content, stream = prepared
+
+        result, response_body = await self.run_protocol_turn(
+            sid,
+            request,
+            content,
+            upstream_path="v1/chat/completions",
+        )
+        if stream and result.status < 400:
+            if response_body is None:
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": "backend returned an invalid chat completion response"}},
+                )
+            return openai_stream_response(response_body, headers=result.headers)
+        return self.build_response(result)
+
+    async def session_responses(self, sid: str, request: Request) -> Response:
+        """Proxy Codex Responses natively, buffering one complete training turn."""
+        prepared = await self.prepare_protocol_request(request, "responses")
+        if isinstance(prepared, Response):
+            return prepared
+        content, stream = prepared
+        result, response_body = await self.run_protocol_turn(
+            sid,
+            request,
+            content,
+            upstream_path="v1/responses",
+        )
+        if result.status >= 400:
+            return self.build_response(result)
+
+        if stream:
+            if response_body is None:
+                return JSONResponse(
+                    status_code=502,
+                    content={
+                        "error": {"type": "api_error", "message": "backend returned an invalid Responses response"}
+                    },
+                )
+            return responses_stream_response(response_body, headers=result.headers)
+        return self.build_response(result)
+
+    async def session_messages(self, sid: str, request: Request) -> Response:
+        """Proxy Anthropic Messages natively, buffering one complete training turn."""
+        prepared = await self.prepare_protocol_request(request, "messages")
+        if isinstance(prepared, Response):
+            return prepared
+        content, stream = prepared
+        result, response_body = await self.run_protocol_turn(
+            sid,
+            request,
+            content,
+            upstream_path="v1/messages",
+        )
+        if result.status >= 400:
+            return anthropic_error_response(result)
+
+        if stream:
+            if response_body is None:
+                return JSONResponse(
+                    status_code=502,
+                    content=anthropic_error_body(502, "backend returned an invalid Messages response"),
+                )
+            return anthropic_stream_response(response_body, headers=result.headers)
+        return self.build_response(result)
+
+    @staticmethod
+    async def prepare_protocol_request(
+        request: Request,
+        protocol: str,
+    ) -> tuple[bytes, bool] | Response:
+        """Buffer one JSON request and force a completed upstream turn."""
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            message = "request body must be valid JSON"
+            error = (
+                anthropic_error_body(400, message)
+                if protocol == "messages"
+                else {"error": {"type": "invalid_request_error", "message": message}}
+            )
+            return JSONResponse(status_code=400, content=error)
+
+        if not isinstance(body, dict):
+            message = "request body must be an object"
+            error = (
+                anthropic_error_body(400, message)
+                if protocol == "messages"
+                else {"error": {"type": "invalid_request_error", "message": message}}
+            )
+            return JSONResponse(status_code=400, content=error)
+
+        stream = body.get("stream") is True
+        body["stream"] = False
+        if protocol == "chat":
+            body["logprobs"] = True
+            body["top_logprobs"] = 1
+        content = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode()
+        return content, stream
+
+    async def session_anthropic_count_tokens(self, sid: str, request: Request) -> Response:
+        """Return the optional Claude Code token-count hint.
+
+        Counting must use the backend tokenizer to be exact.  The harness treats
+        this endpoint as an advisory hint, so returning zero avoids a second
+        untracked tokenization path and matches the other training adapters.
+        """
+        await self._ensure_state(sid)
+        await request.body()
+        return JSONResponse(content={"input_tokens": 0})
+
+    async def run_protocol_turn(
+        self,
+        sid: str,
+        request: Request,
+        content: bytes,
+        *,
+        upstream_path: str,
+    ) -> tuple[HttpResponse, Mapping[str, object] | None]:
+        """Run one completed protocol turn with shared TITO bookkeeping."""
         state = await self._ensure_state(sid)
 
         # SMG owns trajectory resolution in auto mode, so the SessionRouter only
@@ -186,7 +321,7 @@ class SessionRouter:
         while True:
             async with state.lock:
                 if state.closing:
-                    return JSONResponse(status_code=409, content={"error": "session is closing"})
+                    return self._json_result(409, {"error": "session is closing"}), None
                 if state.hang_state != SESSION_HUNG:
                     break
                 continue_event = state.continue_event
@@ -195,7 +330,7 @@ class SessionRouter:
 
         async with state.lock:
             if state.closing:
-                return JSONResponse(status_code=409, content={"error": "session is closing"})
+                return self._json_result(409, {"error": "session is closing"}), None
             session_headers = state.headers.copy()
             base_worker_id = state.base_worker_id
             target_dp_rank = state.target_dp_rank
@@ -207,6 +342,8 @@ class SessionRouter:
             state.drained.clear()
 
         headers = self.add_session_headers(request, session_headers)
+        headers["accept"] = "application/json"
+        headers["content-type"] = "application/json"
         if base_worker_id is not None:
             headers["x-base-worker-id"] = base_worker_id
         if target_dp_rank is not None:
@@ -222,13 +359,16 @@ class SessionRouter:
             headers["x-force-pin-once"] = "true"
             psrl_logger.debug(f"Session {sid!r} turn force-pinned to instance {pin_once_instance!r} (one-shot).")
         result: HttpResponse | None = None
+        response_body: Mapping[str, object] | None = None
         try:
             result = await self._request_upstream(
                 "POST",
-                "v1/chat/completions",
-                content=await request.body(),
+                upstream_path,
+                content=content,
                 headers=headers,
             )
+            if result.status < 400:
+                response_body = result.json()
         finally:
             # Single combined critical section: close out inflight bookkeeping
             # and, on success, advance the trajectory's turn counter.
@@ -249,7 +389,7 @@ class SessionRouter:
                     # Update the session token footprint from the usage block.
                     # usage.prompt_tokens already includes the full accumulated
                     # TITO context, so prompt+completion is the live footprint.
-                    self._update_total_tokens(state, result)
+                    self._update_total_tokens(state, response_body)
 
                     if trajectory_id is not None:
                         state.advance_trajectory_turn(trajectory_id)
@@ -260,11 +400,16 @@ class SessionRouter:
                     state.marked_for_hang = False
                     state.hang_state = SESSION_HUNG
                     state.continue_event.clear()
-                    psrl_logger.debug(
-                        f"Session {sid!r} deferred hang applied at turn boundary (trajectory {trajectory_id})."
-                    )
 
-        return self.build_response(result)
+        return result, response_body
+
+    @staticmethod
+    def _json_result(status: int, body: dict) -> HttpResponse:
+        return HttpResponse(
+            status=status,
+            body=json.dumps(body, ensure_ascii=False).encode(),
+            headers={"content-type": "application/json"},
+        )
 
     async def session_proxy(self, sid: str, path: str, request: Request) -> Response:
         state = await self._ensure_state(sid)
@@ -422,14 +567,18 @@ class SessionRouter:
         return pins
 
     @staticmethod
-    def _update_total_tokens(state: SessionState, result: HttpResponse) -> None:
-        """Update state.total_tokens from a chat-completion response's usage block."""
-        try:
-            usage = result.json().get("usage") or {}
-            prompt = int(usage.get("prompt_tokens", 0))
-            completion = int(usage.get("completion_tokens", 0))
-        except Exception:
+    def _update_total_tokens(
+        state: SessionState,
+        response_body: Mapping[str, object] | None,
+    ) -> None:
+        """Update state.total_tokens from Chat, Responses, or Messages usage."""
+        if response_body is None:
             return
+        usage = response_body.get("usage")
+        if not isinstance(usage, Mapping):
+            return
+        prompt = usage.get("prompt_tokens", usage.get("input_tokens", 0))
+        completion = usage.get("completion_tokens", usage.get("output_tokens", 0))
         footprint = prompt + completion
         if footprint > state.total_tokens:
             state.total_tokens = footprint

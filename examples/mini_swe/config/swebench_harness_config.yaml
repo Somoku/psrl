@@ -1,0 +1,33 @@
+- name: mini_swe_claude_code
+  _target_: psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop.MiniSWEHarnessAgentLoop
+  sandbox_config: &sandbox_config
+    max_parallel_tasks_per_worker: 8
+    collect_resource_metrics: ${oc.decode:${oc.env:PSRL_SANDBOX_COLLECT_RESOURCE_METRICS,false}}
+    snapshot_verifier: true
+    environment:
+      # Prefer a task image with the CLI preinstalled. The install command below
+      # is a compatibility fallback and is paid once per disposable sandbox.
+      image: "swebench-sentinel-override-per-instance"
+      cwd: "/testbed"
+      container_timeout: "2h"
+    rollout_environment:
+      memory: "8g"
+    grader_environment:
+      memory: "30g"
+      timeout: 900
+  harness:
+    kind: claude_code
+    executable: claude
+    install:
+      command: curl -fsSL https://claude.ai/install.sh | bash && ln -sf /root/.local/bin/claude /usr/local/bin/claude
+      timeout_s: 600
+
+- name: mini_swe_codex
+  _target_: psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop.MiniSWEHarnessAgentLoop
+  sandbox_config: *sandbox_config
+  harness:
+    kind: codex
+    executable: codex
+    install:
+      command: npm install -g @openai/codex
+      timeout_s: 600

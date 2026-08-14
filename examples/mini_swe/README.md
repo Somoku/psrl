@@ -306,6 +306,80 @@ ray status | head -5
 bash examples/mini_swe/fsdp_qwen_7b_swe_gym.sh
 ```
 
+To replace mini-SWE-agent's native loop with Claude Code or Codex, prepare rows
+whose `agent_name` selects the corresponding entry in
+`config/swebench_harness_config.yaml`:
+
+```bash
+python -m examples.mini_swe.prepare.prepare_swe_gym \
+  --dataset gym-subset \
+  --agent-name mini_swe_claude_code \
+  --output-dir examples/mini_swe/data/swe_gym_claude
+
+python -m examples.mini_swe.prepare.prepare_swe_gym \
+  --dataset gym-subset \
+  --agent-name mini_swe_codex \
+  --output-dir examples/mini_swe/data/swe_gym_codex
+```
+
+Launch either dataset through the same trainer. Harness mode must use TITO's
+automatic prefix-tree trajectory IDs so sub-agents and context-compression
+branches remain in one session without sharing a trajectory ID:
+
+```bash
+AGENT_LOOP_CONFIG_PATH="$(pwd)/examples/mini_swe/config/swebench_harness_config.yaml" \
+TRAJECTORY_ID_STRATEGY=auto \
+TRAIN_FILE="$(pwd)/examples/mini_swe/data/swe_gym_claude/train.parquet" \
+TEST_FILE="$(pwd)/examples/mini_swe/data/swe_gym_claude/train.parquet" \
+bash examples/mini_swe/fsdp_qwen_7b_swe_gym.sh
+```
+
+The task image should ideally contain the selected CLI. If it does not, the
+example config runs each project's official installation command inside the
+disposable agent sandbox. Prebuilt images avoid repeated package installation
+and are recommended for throughput. `callback_base_url` is only needed when a remote
+backend cannot reach the worker's configured SessionRouter origin; local Docker
+rewrites loopback through `host.docker.internal` automatically.
+
+Lifecycle ordering is: create `session_id`, acquire the task sandbox, optionally
+snapshot the clean filesystem, prepare and run the harness, fetch all TITO
+trajectories, destroy the agent sandbox and session, then grade the captured
+patch in a separate clean sandbox. Cancelling the loop cancels the active CLI
+exec and releases the sandbox lease; SessionRouter deletion drains any in-flight
+inference request before removing session state.
+
+#### Extending harness training to another task
+
+`HarnessAgentLoop` owns the protocol and resource lifecycle. A task integration
+subclasses it and supplies only the following hooks:
+
+| Hook | Task responsibility |
+|------|---------------------|
+| `prepare_harness_task` | Return prompt, rollout `SandboxSpec`, backend, and opaque task state |
+| `collect_harness_artifact` | Optionally collect a patch, answer file, or other result before sandbox deletion |
+| `finalize_harness_task` | Optionally grade the artifact in a clean environment and return reward fields |
+| `close_harness_task` | Release task-only resources such as environments or concurrency slots |
+
+Only `prepare_harness_task` is abstract. Tasks without artifacts or an external
+grader can use the other default implementations. The generic layer owns session
+creation/deletion, sandbox leases, harness abort, TITO collection, trajectory
+validation, response capping, reward dispatch, and snapshot cleanup.
+
+```python
+class MyHarnessAgentLoop(HarnessAgentLoop):
+    async def prepare_harness_task(self, request):
+        state = await prepare_my_task(request)
+        return HarnessTaskContext(
+            state=state,
+            prompt=state.prompt,
+            sandbox_spec=state.sandbox_spec,
+            backend=state.backend,
+        )
+
+    async def close_harness_task(self, task):
+        await task.state.close()
+```
+
 Or with Megatron parallelism:
 
 ```bash
@@ -434,6 +508,7 @@ and rewrites forwarded proxy URLs whose host is `localhost`, `127.0.0.1`, or
 | `config/simple_agent_config.yaml` | Toy path — single `python:3.11-slim` image, preexisting repos |
 | `config/swebench_agent_config.yaml` | SWE-smith-py / SWE-Gym / Verified — per-SWE-problem images, `cwd=/testbed` |
 | `config/swebench_agent_config_xml_fc.yaml` | Same as above but with XML function-calling format (for newer models) |
+| `config/swebench_harness_config.yaml` | Claude Code or Codex harness over the same SWE task and grader contracts |
 
 The `environment.image` field in `swebench_agent_config.yaml` is intentionally set
 to a sentinel value (`swebench-sentinel-override-per-instance`). The real image is
@@ -459,8 +534,8 @@ which is written by `prepare_swebench.py`.
 | `sandbox_config.snapshot_verifier` | Infrastructure | Use a capability-gated clean verifier snapshot when its spec matches exactly |
 | `sandbox_config.collect_resource_metrics` | Infrastructure | Sample per-trajectory memory/CPU once; disabled by default |
 | `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node (`0` = unlimited) |
-| `agent.system_template` | **Required** | System prompt (no default) |
-| `agent.problem_template` | **Required** | Per-SWE-problem prompt template; maps to `instance_template` in mini-swe-agent (no default) |
+| `agent.system_template` | Native required | System prompt used only by mini-swe-agent (no default) |
+| `agent.problem_template` | Native required | Maps to mini-swe-agent's `instance_template`; harness loops build their own prompt |
 | `agent.cost_limit` | Optional | LiteLLM cost limit per episode (`0.0` = unlimited) |
 
 ---

@@ -5,7 +5,7 @@ import os
 import threading
 from dataclasses import asdict
 
-from examples.mini_swe.config import MiniSWEAgentRuntimeConfig, build_runtime_config
+from examples.mini_swe.config import MINI_SWE_SLOT_PREFIX, MiniSWEAgentRuntimeConfig, build_runtime_config
 from examples.mini_swe.runner import parse_duration_seconds, run_agent
 
 from psrl.environments import Environment
@@ -119,7 +119,7 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
                     str(self.config.trainer.project_name),
                     str(self.config.trainer.experiment_name),
                 )
-                run_slot = await SlotManager.acquire(parallelism, namespace, prefix="psrl_mini_swe_agent_slots")
+                run_slot = await SlotManager.acquire(parallelism, namespace, prefix=MINI_SWE_SLOT_PREFIX)
 
             session_id = await self.create_session(request)
             if self.sandbox_manager is None:

@@ -21,6 +21,8 @@ from omegaconf import DictConfig, OmegaConf
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
+MINI_SWE_SLOT_PREFIX = "psrl_mini_swe_agent_slots"
+
 
 # ---------------------------------------------------------------------------
 # Nested structured dataclasses
@@ -77,9 +79,6 @@ class MiniSandboxConfig:
     # Per-turn timeout forwarded to mini-swe-agent's model client.
     rollout_turn_timeout: int = 480
 
-    # Legacy queue-bridge loop compatibility.
-    query_timeout: int = 600
-
 
 @dataclass
 class MiniAgentConfig:
@@ -90,9 +89,8 @@ class MiniAgentConfig:
     `AgentConfig` (no defaults in upstream). `problem_template` maps to
     mini-swe-agent's `instance_template` kwarg.
 
-    Both templates should be provided via simple_agent_config.yaml; the
-    empty-string defaults here are intentional -- `build_runtime_config` will
-    raise if they remain unset after YAML merge.
+    Native mini-swe-agent configs must provide both templates. Harness-based
+    loops reuse the sandbox portion of this schema and do not require them.
     """
 
     cost_limit: float = 0.0
@@ -170,7 +168,10 @@ def _ensure_dict(val: Any) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def build_runtime_config(yaml_kwargs: dict[str, Any]) -> MiniSWEAgentRuntimeConfig:
+def build_runtime_config(
+    yaml_kwargs: dict[str, Any],
+    require_agent_templates: bool = True,
+) -> MiniSWEAgentRuntimeConfig:
     """
     Build config by merging YAML kwargs onto the `OmegaConf` structured schema.
     """
@@ -184,7 +185,7 @@ def build_runtime_config(yaml_kwargs: dict[str, Any]) -> MiniSWEAgentRuntimeConf
     merged = OmegaConf.merge(schema, OmegaConf.create(raw))
     cfg: MiniSWEAgentRuntimeConfig = OmegaConf.to_object(merged)  # type: ignore[assignment]
 
-    if not cfg.agent.system_template or not cfg.agent.problem_template:
+    if require_agent_templates and (not cfg.agent.system_template or not cfg.agent.problem_template):
         raise ValueError(
             "agent.system_template and agent.problem_template must be provided "
             "in simple_agent_config.yaml (they have no hardcoded defaults)."

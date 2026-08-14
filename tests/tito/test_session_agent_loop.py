@@ -25,6 +25,15 @@ def _bare_loop(trajectory_id_strategy: str = "manual") -> SessionAgentLoop:
     return loop
 
 
+def test_session_urls_share_one_protocol_neutral_root() -> None:
+    loop = _bare_loop()
+    loop.session_router_url = "http://router:8080"
+
+    assert loop.session_root_url("session-1") == "http://router:8080/sessions/session-1"
+    assert loop.session_api_url("session-1") == "http://router:8080/sessions/session-1/v1"
+    assert loop.session_root_url("session-1", "https://public-router/") == ("https://public-router/sessions/session-1")
+
+
 def test_mini_swe_model_headers_follow_trajectory_strategy():
     payload = {
         "runtime_config": {"model": {}, "sandbox_config": {"rollout_turn_timeout": 30}},

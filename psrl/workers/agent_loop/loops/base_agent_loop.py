@@ -235,6 +235,7 @@ class AgentLoopBase(ABC):
             "data_source": np.array([kwargs.get("data_source", "unknown")]),
             "reward_model": np.array([kwargs.get("reward_model", {})], dtype=object),
             "extra_info": np.array([kwargs.get("extra_info", {})], dtype=object),
+            "agent_reward_info": np.array([final_output.agent_reward_info], dtype=object),
             "reward_model_dicts": np.array([kwargs.get("reward_model_dicts", [])], dtype=object),
         }
         if kwargs.get("parent_id") is not None:

@@ -238,7 +238,7 @@ def _snapshot_compatible(left: SandboxSpec, right: SandboxSpec) -> bool:
     return left.source == right.source and left.resources == right.resources
 
 
-def _build_grader_spec(payload: dict[str, Any]) -> SandboxSpec | None:
+def build_grader_spec(payload: dict[str, Any]) -> SandboxSpec | None:
     """Build the verifier spec when this task uses the fresh-container grader."""
     observation = payload["observation"]
     swe_image = str(observation.get("swe_problem_image", "") or "")
@@ -272,7 +272,7 @@ def _capture_resource_metrics(
     return True
 
 
-def _grade_patch(
+def grade_patch(
     payload: dict[str, Any],
     patch: str,
     sandbox: SyncSandboxManager,
@@ -299,7 +299,7 @@ def _grade_patch(
             else "verified"
         )
         grader_config = resolve_container_config(payload, grading=True)
-        grader_spec = grader_spec or _build_grader_spec(payload)
+        grader_spec = grader_spec or build_grader_spec(payload)
         if grader_spec is None:
             return _grader_failure(swe_problem, "missing_grader_spec")
         verifier_snapshot = (
@@ -378,7 +378,7 @@ def run_agent(
         harness = create_harness(payload, sandbox, rollout_spec, cancel_event)
         timing["sandbox_create_s"] = time.perf_counter() - sandbox_create_start
         sandbox_config = payload["runtime_config"]["sandbox_config"]
-        grader_spec = _build_grader_spec(payload)
+        grader_spec = build_grader_spec(payload)
         if (
             sandbox_config.get("snapshot_verifier", True)
             and grader_spec is not None
@@ -415,7 +415,7 @@ def run_agent(
         except Exception:
             psrl_logger.warning("MiniSWE harness cleanup before grading failed.", exc_info=True)
         grade_start = time.perf_counter()
-        grader_result = _grade_patch(payload, patch, sandbox, baseline_snapshot, grader_spec)
+        grader_result = grade_patch(payload, patch, sandbox, baseline_snapshot, grader_spec)
         timing["grading_s"] = time.perf_counter() - grade_start
         return {
             "exit_status": result.get("exit_status", ""),

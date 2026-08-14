@@ -155,6 +155,7 @@ psrl/
 │   │   ├── gateway_client.py     # Client for SMG rollout gateway
 │   │   ├── sticky_session.py     # Session affinity for multi-turn
 │   │   ├── prometheus_utils.py   # Monitoring metrics
+│   │   ├── harness/              # Harness protocol/config/adapters + immutable task contract
 │   │   ├── agent_data/           # Data structures for agent interactions
 │   │   │   ├── base.py, conversation_agent_data.py, tool_agent_data.py
 │   │   │   └── mini_swe_agent_data.py  # MiniSWEAgentData (patch + grading state)
@@ -162,6 +163,8 @@ psrl/
 │   │       ├── base_agent_loop.py, generate_agent_loop.py, batch_generate_agent_loop.py
 │   │       ├── multi_turn_agent_loop.py, multi_turn_completion_agent_loop.py
 │   │       ├── session_agent_loop.py    # ★ NEW: SMG SessionRouter + TITO-backed loop
+│   │       ├── harness_agent_loop.py    # Generic task/sandbox/harness/TITO lifecycle (template method)
+│   │       ├── mini_swe_harness_agent_loop.py # Mini-SWE task hooks: env, patch, clean grader
 │   │       ├── mini_swe_agent_loop_v1.py# ★ CURRENT SWE-bench loop (pluggable sandbox + async rollout)
 │   │       └── utils.py
 │   │
@@ -377,16 +380,19 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 | `KVCacheManager` | `utils/kv_cache/manager.py` | LMCache offload / prefix retrieval / cross-instance transfer |
 | `ElasticExecutor` | `utils/elastic_rm/elastic_executor.py` | Pause/resume workloads for GPU re-sharing |
 | `PSRL_AgentLoopManager` | `workers/agent_loop/manager.py` | Multi-turn / session tool-use orchestration; also yields training chunks (`wait_for_training_chunk`) for fine-grain overlap and owns the distributed POST actor pool |
+| `HarnessAgentLoop` | `workers/agent_loop/loops/harness_agent_loop.py` | Generic template-method loop owning task sandbox, harness process, session-scoped TITO capture, abort, and cleanup |
+| `HarnessTaskContext` | `workers/agent_loop/harness/task.py` | Immutable task description: prompt, sandbox specs/backend, snapshot/metrics policy, and opaque task state |
 
 ### mini-SWE Agent Layer
 
 | Class | File | Role |
 |-------|------|------|
 | `MiniSWEAgentLoopV1` | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` | CURRENT SWE-bench loop: sync sandbox facade + async PSRL rollout bridge |
+| `MiniSWEHarnessAgentLoop` | `workers/agent_loop/loops/mini_swe_harness_agent_loop.py` | Harness-based SWE loop; supplies environment, prompt, patch collection, clean grading, and task cleanup hooks |
 | `MiniSWEAgentData` | `workers/agent_loop/agent_data/mini_swe_agent_data.py` | Trajectory building, patch extraction, grading state |
 | `ConversationAgentData` | `workers/agent_loop/agent_data/conversation_agent_data.py` | Chat-template base (OpenAI format, token counting) |
 | `MiniSWEEnvironment` | `environments/mini_swe_env.py` | SWE task parsing, per-problem config override merging |
-| `MiniSWEAgentAdapter` | `examples/mini_swe/harness_adapter.py` | Third-party synchronous harness protocol → generic sandbox session |
+| `ClaudeCodeHarness` / `CodexHarness` | `workers/agent_loop/harness/` | CLI-specific installation, launch, callback environment, output bounding, and abort behavior |
 
 ### Sandbox Layer
 
@@ -504,6 +510,20 @@ MiniSWEAgentLoopV1.run(request)
   → capable microVM only: clean baseline snapshot → matching verifier restore
   → post-rollout grading (smith: checkout+patch+revert-tests+harness / gym: eval_script)
   → finalize: compute_score(data_source) → DataProto with reward
+```
+
+Harness-based comparison path:
+
+```
+HarnessAgentLoop.run(request)                       # generic lifecycle owner
+  → MiniSWEHarnessAgentLoop.prepare_harness_task  # environment + task sandbox spec
+  → create TITO session + acquire task sandbox
+  → ClaudeCodeHarness/CodexHarness.prepare + run  # CLI calls session-scoped URL
+  → TITO prefix tree emits one or more trajectories
+  → collect_harness_artifact                     # patch before sandbox release
+  → release agent sandbox + delete/drain session
+  → MiniSWEHarnessAgentLoop.finalize_harness_task # independent clean grader
+  → reward + TokenOutput(s) + generic cleanup
 ```
 
 ---

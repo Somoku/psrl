@@ -78,10 +78,6 @@ class MiniSWEEnvironment(Environment[dict, None]):
         """
         self.task = task
 
-        # Log available keys for debugging data pipeline issues.
-        task_keys = list(task.keys()) if isinstance(task, dict) else []
-        psrl_logger.debug(f"MiniSWEEnvironment reset: task keys={task_keys}.")
-
         # Extract extra_info if available (may be absent when the data pipeline
         # does not copy it to gen_batch — the reward_manager holds the original).
         extra_info_raw = task.get("extra_info", {}) if isinstance(task, dict) else {}
@@ -94,15 +90,6 @@ class MiniSWEEnvironment(Environment[dict, None]):
             extra_info = extra_info_raw
         else:
             extra_info = {}
-
-        # DEBUG: Log extra_info grading fields to diagnose missing grader issue.
-        psrl_logger.warning(
-            f"MiniSWEEnvironment reset: extra_info type={type(extra_info_raw).__name__}, "
-            f"extra_info keys={list(extra_info.keys()) if isinstance(extra_info, dict) else 'N/A'}, "
-            f"swe_grader={extra_info.get('swe_grader', 'MISSING')!r}, "
-            f"has_swe_problem_image={bool(extra_info.get('swe_problem_image', ''))}, "
-            f"task_keys={task_keys}."
-        )
 
         # Fall back to raw_prompt for problem_statement if extra_info is empty.
         problem_statement = extra_info.get("problem_statement", "") or ""
@@ -152,23 +139,21 @@ class MiniSWEEnvironment(Environment[dict, None]):
             extra_info.get("swe_restore_tests", False) or extra_info.get("needs_head_minus_one", False)
         )
 
-        # Assert: after fallback, grading fields must be non-empty.
-        # If both old and new field names are missing, the parquet is broken.
-        assert swe_grader, (
-            f"extra_info has neither 'swe_grader' nor 'grader' field. "
-            f"Re-run prepare_swebench.py to regenerate the parquet. "
-            f"Available keys: {sorted(extra_info.keys())}."
+        psrl_logger.debug(
+            f"MiniSWEEnvironment reset: extra_info type={type(extra_info_raw).__name__}, "
+            f"extra_info keys={list(extra_info)}, "
+            f"swe_grader={swe_grader or 'MISSING'!r}, "
+            f"has_swe_problem_image={bool(swe_problem_image)}, "
+            f"task_keys={list(task) if isinstance(task, dict) else []}."
         )
-        assert swe_problem and isinstance(swe_problem, dict) and swe_problem.get("instance_id"), (
-            f"extra_info has neither 'swe_problem' nor 'instance' with valid data. "
-            f"Re-run prepare_swebench.py to regenerate the parquet. "
-            f"Available keys: {sorted(extra_info.keys())}."
-        )
-        assert swe_problem_image, (
-            f"extra_info has neither 'swe_problem_image' nor 'image_name' field. "
-            f"Re-run prepare_swebench.py to regenerate the parquet. "
-            f"Available keys: {sorted(extra_info.keys())}."
-        )
+
+        if swe_grader == "swebench_fresh_container" and (
+            not isinstance(swe_problem, dict) or not swe_problem.get("instance_id") or not swe_problem_image
+        ):
+            raise ValueError(
+                "Fresh-container grading requires swe_problem with instance_id and swe_problem_image; "
+                f"available extra_info keys: {sorted(extra_info.keys())}."
+            )
 
         observation = {
             "problem_statement": problem_statement,
@@ -184,10 +169,10 @@ class MiniSWEEnvironment(Environment[dict, None]):
             "swe_restore_tests": swe_restore_tests,
         }
 
-        _problem_short = f"{problem_statement[:80]}..." if len(problem_statement) > 80 else problem_statement
+        problem_short = f"{problem_statement[:80]}..." if len(problem_statement) > 80 else problem_statement
         psrl_logger.debug(
             f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment reset: "
-            f"problem={_problem_short!r}, "
+            f"problem={problem_short!r}, "
             f"repo={preexisting_repo_name!r}, preexisting={use_preexisting_repo}."
         )
 

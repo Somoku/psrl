@@ -83,6 +83,10 @@ class SyncSandboxSession:
         """Return current resource usage."""
         return run_coroutine_on_loop(self._event_loop, self._lease.session.stats())
 
+    def resolve_callback_url(self, url: str) -> str:
+        """Translate a worker URL into one reachable from the sandbox."""
+        return self._lease.session.resolve_callback_url(url)
+
     def pause(self, mode: PauseMode = PauseMode.HIBERNATE) -> None:
         """Pause with explicit freeze or hibernate semantics."""
         feature = {

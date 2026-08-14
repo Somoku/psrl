@@ -8,7 +8,9 @@ from examples.mini_swe.harness_adapter import MiniSWEAgentAdapter, MiniSWEAgentC
 from examples.mini_swe.runner import (
     _capture_resource_metrics,
     _snapshot_compatible,
+    build_grader_spec,
     build_sandbox_spec,
+    grade_patch,
     parse_duration_seconds,
     resolve_container_config,
 )
@@ -112,6 +114,13 @@ def test_verifier_snapshot_requires_matching_runtime_resources() -> None:
     grader = build_sandbox_spec(payload, grading=True)
 
     assert _snapshot_compatible(rollout, grader)
+
+
+def test_ungraded_minisweagent_task_does_not_require_swebench_metadata() -> None:
+    payload = _payload()
+
+    assert build_grader_spec(payload) is None
+    assert grade_patch(payload, "diff --git a/a.py b/a.py\n", object()) is None
 
 
 def test_optional_resource_metrics_do_not_fail_rollout() -> None:

@@ -92,7 +92,12 @@ class SessionAgentLoop(AgentLoopBase):
 
     def session_api_url(self, session_id: str) -> str:
         """Return the OpenAI-compatible API base for one session."""
-        return f"{self.session_router_url}/sessions/{session_id}/v1"
+        return f"{self.session_root_url(session_id)}/v1"
+
+    def session_root_url(self, session_id: str, base_url: str | None = None) -> str:
+        """Return the protocol-neutral root for one session."""
+        root = (base_url or self.session_router_url).rstrip("/")
+        return f"{root}/sessions/{session_id}"
 
     async def run_session(
         self,

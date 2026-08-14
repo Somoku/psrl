@@ -446,6 +446,15 @@ class DockerSession(SandboxSession):
     def command_count(self) -> int:
         return self._command_count
 
+    def resolve_callback_url(self, url: str) -> str:
+        """Rewrite worker-loopback URLs through the configured host gateway."""
+        if self._spec is None or self._spec.policy_profile is None:
+            return url
+        policy = self.backend.policy_profiles.get(self._spec.policy_profile)
+        if policy is None or not policy.host_gateway_alias:
+            return url
+        return _rewrite_loopback_proxy(url, policy.host_gateway_alias)
+
     async def exec(
         self,
         command: str,

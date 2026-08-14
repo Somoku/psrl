@@ -252,6 +252,10 @@ class SandboxSession(ABC):
         """Return resource usage when supported."""
         return ResourceUsage()
 
+    def resolve_callback_url(self, url: str) -> str:
+        """Translate a worker URL into an equivalent URL reachable from this sandbox."""
+        return url
+
     @property
     def spec(self) -> SandboxSpec | None:
         """Return the creation spec when this process created the session."""

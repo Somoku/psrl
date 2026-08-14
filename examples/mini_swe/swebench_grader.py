@@ -2,9 +2,9 @@
 SWE-bench / SWE-smith-py Grader for PSRL RL Training.
 
 Grades a model's patch against the SWE problem's FAIL_TO_PASS / PASS_TO_PASS
-tests by spinning up a fresh Docker container (isolated from the rollout
-container), applying the patch, running the per-SWE-problem test suite, and
-parsing the results with the official swebench / swesmith grading harness.
+tests in a fresh sandbox (isolated from the rollout sandbox), applies the
+patch, runs the per-SWE-problem test suite, and parses the result with the
+official swebench / swesmith grading harness.
 
 Design is aligned with OpenClaw-RL's ``swe_exec_server.py::container_evaluate``
 (fresh container, git reset + git apply, eval script, harness grading with
@@ -22,18 +22,17 @@ grade_fresh_container(swe_problem, model_patch, grader_kind, image_name,
                       timeout, swe_task_id) -> dict
 """
 
-from __future__ import annotations
-
 import logging
 import os
 import re
+import shlex
 import tempfile
 import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from psrl.utils.common.docker_utils import force_remove_containers_by_label
+from psrl.sandbox import SandboxSpec, SnapshotRef, SyncSandboxManager, SyncSandboxSession
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -50,13 +49,8 @@ _OUTPUT_TAIL_BYTES = 4096
 # args (those are added per-call).
 _BASE_RUN_ARGS: list[str] = [
     "--rm",
-    "--memory=30g",  # 10g was too small: heavy repos (scikit-learn, xarray)
-    # run `pip install -e .` inside the container and can
-    # temporarily exceed 10g, triggering cgroup OOM kills.
-    "--network",
-    "host",
-    "--add-host",
-    "host.docker.internal:host-gateway",
+    # Heavy repositories can exceed 10 GiB while installing build dependencies.
+    "--memory=30g",
 ]
 
 # ---------------------------------------------------------------------------
@@ -557,17 +551,19 @@ def grade_fresh_container(
     image_name: str,
     timeout: int = _DEFAULT_EVAL_TIMEOUT,
     swe_task_id: str = "",
-    memory: str = "",
+    memory: str | int | None = "",
+    sandbox: SyncSandboxManager | None = None,
+    sandbox_spec: SandboxSpec | None = None,
+    sandbox_snapshot: SnapshotRef | None = None,
 ) -> dict[str, Any]:
     """
-    Grade a model patch in a fresh Docker container.
+    Grade a model patch in a fresh sandbox.
 
-    This is the primary grading entry point called from the PSRL agent loop
-    after a rollout completes.  It:
+    PSRL training supplies a synchronous sandbox manager and `sandbox_spec`; the optional direct-Docker path
+    remains only for the standalone evaluation CLI. This function:
 
     1. Runs ``analyze_patch_policy`` — returns immediately if violated.
-    2. Spawns a fresh ``DockerEnvironment`` from the same image used in the
-       rollout (so the image is always locally cached).
+    2. Spawns a fresh sandbox from the same image used in the rollout.
     3. For SWE-smith SWE problems, runs ``git checkout HEAD~1`` to restore the
        F2P test files removed on the HEAD commit.
     4. Resets the working tree and applies the model patch via ``git apply``.
@@ -586,6 +582,9 @@ def grade_fresh_container(
         memory (str): ``--memory`` limit for the grading container (e.g.
             ``"30g"``).  When empty the module-level default
             (``_BASE_RUN_ARGS``) is used unchanged.
+        sandbox: Generic synchronous PSRL sandbox manager used by training.
+        sandbox_spec: Backend-neutral grading sandbox request used by training.
+        sandbox_snapshot: Compatible clean baseline restored only by stateful microVM backends.
 
     Returns:
         dict[str, Any]: Grading result with keys:
@@ -603,8 +602,6 @@ def grade_fresh_container(
             - ``output_tail`` (str)
             - ``resolved_by`` (str)
     """
-    from minisweagent.environments.docker import DockerEnvironment
-
     swe_problem_id: str = swe_problem.get("instance_id", "unknown")
     log_prefix = f"[swebench_grader, task_id={swe_task_id or swe_problem_id}]"
     t0 = time.monotonic()
@@ -691,7 +688,7 @@ def grade_fresh_container(
         run_args.append(f"--memory={memory}")
     run_args += ["--label", grader_label]
     # Per-actor label consumed by the reaper sidecar in
-    # psrl.utils.common.docker_utils. The grader runs in the same Ray actor
+    # psrl.sandbox.utils.docker_utils. The grader runs in the same Ray actor
     # process as the agent loop (via _GRADER_THREAD_POOL), so PSRL_ACTOR_ID
     # is the same value the rollout container was tagged with.
     _actor_id = os.environ.get("PSRL_ACTOR_ID", "")
@@ -709,30 +706,60 @@ def grade_fresh_container(
         "NO_PROXY",
     ]
 
-    docker_env: DockerEnvironment | None = None
+    sandbox_session: SyncSandboxSession | None = None
+    docker_environment: Any | None = None
+    uses_psrl_sandbox = sandbox is not None
     apply_ok = False
     eval_output = ""
     eval_returncode = -1
     timed_out = False
     error_msg: str | None = None
 
+    def execute(command: str, *, cwd: str, command_timeout: int | None = None) -> dict[str, Any]:
+        """Execute through the generic PSRL data plane or standalone Docker fallback."""
+        if sandbox_session is not None:
+            result = sandbox_session.exec(command, cwd=cwd, timeout_s=command_timeout)
+            return {
+                "output": result.stdout + result.stderr,
+                "returncode": result.exit_code,
+                "exception_info": "",
+            }
+        if docker_environment is None:
+            raise RuntimeError("Grading sandbox is not initialized.")
+        if command_timeout is None:
+            return docker_environment.execute({"command": command}, cwd=cwd)
+        return docker_environment.execute({"command": command}, cwd=cwd, timeout=command_timeout)
+
     try:
         psrl_logger.info(f"{log_prefix} Spawning eval container: image={image_name!r}, grader_kind={grader_kind!r}.")
-        docker_env = DockerEnvironment(
-            image=image_name,
-            cwd="/testbed",
-            run_args=run_args,
-            forward_env=_PROXY_ENV_KEYS,
-            container_timeout=_DEFAULT_CONTAINER_TIMEOUT,
-        )
-        psrl_logger.info(f"{log_prefix} Eval container started: id={docker_env.container_id!r}.")
+        if sandbox is not None:
+            if sandbox_spec is None:
+                raise ValueError("sandbox_spec is required when sandbox is provided.")
+            if sandbox_snapshot is not None:
+                sandbox_session = sandbox.restore(
+                    sandbox_snapshot,
+                    sandbox_spec,
+                    state_policy=sandbox_spec.state_policy,
+                )
+            else:
+                sandbox_session = sandbox.create(sandbox_spec)
+            sandbox_id = sandbox_session.ref.sandbox_id
+        else:
+            from minisweagent.environments.docker import DockerEnvironment
+
+            docker_environment = DockerEnvironment(
+                image=image_name,
+                cwd="/testbed",
+                run_args=run_args,
+                forward_env=_PROXY_ENV_KEYS,
+                container_timeout=_DEFAULT_CONTAINER_TIMEOUT,
+            )
+            sandbox_id = docker_environment.container_id
+        psrl_logger.info(f"{log_prefix} Eval container started: id={sandbox_id!r}.")
 
         # --- 3. SWE-smith: restore F2P test files via HEAD~1 ---
         if grader_kind == "smith":
-            out = docker_env.execute(
-                {"command": "git checkout HEAD~1"},
-                cwd="/testbed",
-            )
+            out = execute("git checkout HEAD~1", cwd="/testbed")
             if out["returncode"] != 0:
                 psrl_logger.warning(
                     f"{log_prefix} git checkout HEAD~1 failed (rc={out['returncode']}): {out['output'][:200]}."
@@ -740,14 +767,18 @@ def grade_fresh_container(
 
         # --- 4. Reset tree and apply model patch ---
         apply_cmd = "git reset --hard HEAD && git clean -fd"
-        out = docker_env.execute({"command": apply_cmd}, cwd="/testbed")
+        out = execute(apply_cmd, cwd="/testbed")
         if out["returncode"] != 0:
             psrl_logger.warning(f"{log_prefix} git reset failed (rc={out['returncode']}).")
 
-        # Write patch to a tmp file inside the container via heredoc.
-        delimiter = "PSRL_PATCH_EOF"
-        apply_cmd2 = f"git apply <<'{delimiter}'\n{model_patch}\n{delimiter}"
-        out2 = docker_env.execute({"command": apply_cmd2}, cwd="/testbed")
+        # PSRL's file API avoids heredoc delimiter collisions and shell expansion.
+        if sandbox_session is not None:
+            sandbox_session.write_bytes("/tmp/psrl-model.patch", model_patch.encode())
+            apply_cmd2 = "git apply /tmp/psrl-model.patch"
+        else:
+            delimiter = "PSRL_PATCH_EOF"
+            apply_cmd2 = f"git apply <<'{delimiter}'\n{model_patch}\n{delimiter}"
+        out2 = execute(apply_cmd2, cwd="/testbed")
         apply_ok = out2["returncode"] == 0
         if not apply_ok:
             psrl_logger.info(f"{log_prefix} git apply failed (rc={out2['returncode']}): {out2['output'][:300]}.")
@@ -756,28 +787,25 @@ def grade_fresh_container(
         if grader_kind == "smith" and apply_ok:
             eval_test_files = _extract_eval_test_files(swe_problem)
             if eval_test_files:
-                files_str = " ".join(eval_test_files)
-                out3 = docker_env.execute(
-                    {"command": f"git checkout -- {files_str}"},
-                    cwd="/testbed",
-                )
+                files_str = shlex.join(eval_test_files)
+                out3 = execute(f"git checkout -- {files_str}", cwd="/testbed")
                 if out3["returncode"] != 0:
                     psrl_logger.warning(f"{log_prefix} Reverting test files failed (rc={out3['returncode']}).")
 
         # --- 6. Run eval script ---
-        eval_delim = "PSRL_EVAL_EOF"
-        eval_cmd = f"bash <<'{eval_delim}'\n{eval_script}\n{eval_delim}"
+        if sandbox_session is not None:
+            sandbox_session.write_bytes("/tmp/psrl-eval.sh", eval_script.encode())
+            eval_cmd = "bash /tmp/psrl-eval.sh"
+        else:
+            eval_delim = "PSRL_EVAL_EOF"
+            eval_cmd = f"bash <<'{eval_delim}'\n{eval_script}\n{eval_delim}"
         psrl_logger.info(f"{log_prefix} Running eval script (timeout={timeout}s)...")
 
         # DockerEnvironment.execute honours the container_timeout but not
         # a per-command timeout at the API level.  We use subprocess timeout
         # by passing it as an override; if it raises, we catch below.
         try:
-            out_eval = docker_env.execute(
-                {"command": eval_cmd},
-                cwd="/testbed",
-                timeout=timeout,
-            )
+            out_eval = execute(eval_cmd, cwd="/testbed", command_timeout=timeout)
             eval_output = out_eval.get("output", "")
             eval_returncode = out_eval.get("returncode", -1)
             if out_eval.get("exception_info"):
@@ -791,19 +819,27 @@ def grade_fresh_container(
         error_msg = str(exc)
         psrl_logger.error(f"{log_prefix} Container error: {exc}.")
     finally:
-        if docker_env is not None:
+        if sandbox_session is not None:
             try:
-                docker_env.cleanup()
+                sandbox_session.close()
+            except Exception as cleanup_exc:
+                psrl_logger.warning(f"{log_prefix} Sandbox cleanup failed: {cleanup_exc}.")
+        elif docker_environment is not None:
+            try:
+                docker_environment.cleanup()
             except Exception as cleanup_exc:
                 psrl_logger.warning(f"{log_prefix} Container cleanup failed: {cleanup_exc}.")
         # Synchronous belt-and-suspenders sweep by label. ``docker_env.cleanup``
         # is a fire-and-forget shell ``docker stop`` that has been observed to
         # silently succeed without actually killing the container; ``docker rm
         # -f`` here guarantees the eval container is gone before we return.
-        try:
-            force_remove_containers_by_label("psrl.grader_task_id", grader_label.split("=", 1)[1])
-        except Exception as sweep_exc:
-            psrl_logger.warning(f"{log_prefix} Label sweep failed: {sweep_exc}.")
+        if not uses_psrl_sandbox:
+            try:
+                from psrl.sandbox.utils.docker_utils import force_remove_containers_by_label
+
+                force_remove_containers_by_label("psrl.grader_task_id", grader_label.split("=", 1)[1])
+            except Exception as sweep_exc:
+                psrl_logger.warning(f"{log_prefix} Label sweep failed: {sweep_exc}.")
 
     elapsed = time.monotonic() - t0
     output_tail = eval_output[-_OUTPUT_TAIL_BYTES:] if eval_output else ""

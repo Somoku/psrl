@@ -396,6 +396,31 @@ their image at rollout time produce a zero-reward episode and waste the
 rollout slot, so validate once with `docker run --rm <a-sample-image> true`
 on every host before kicking off training.
 
+#### 4.3 — Scaling beyond full replication
+
+PSRL intentionally keeps one node-local Docker daemon per Ray node. Do not
+point all workers at one remote daemon: every command and file transfer would
+cross the network, and that daemon would become a scheduling and failure
+bottleneck.
+
+Full image replication is appropriate for small clusters or when any task can
+land on any node. For larger clusters, reduce disk and warm-up cost in this
+order:
+
+1. generate an exact image manifest for the planned dataset shard and pass it
+   through `--images-list`;
+2. serve images from a cluster-local pull-through registry cache and pin tags
+   to digests;
+3. expose image-presence as a Ray node resource/label and route a task only to
+   a warm node;
+4. evaluate P2P distribution or a lazy-pull containerd snapshotter only after
+   metrics show image transfer dominates rollout time.
+
+Kubernetes is useful when the organization already needs multi-tenant policy
+and cluster admission, but creating a Pod per agent turn/episode adds more
+control-plane latency and memory than PSRL's node-local persistent Engine API.
+It is not a performance upgrade by itself.
+
 ---
 
 ## Path C — SWE-Gym (real RL, pre-computed eval scripts)
@@ -515,7 +540,7 @@ Each output row produced by `prepare_swebench.py` or `prepare_swe_gym.py` contai
 | `extra_info.swe_grader` | `str` | `"swebench_fresh_container"`. Activates post-rollout fresh-container grading in the agent loop. |
 | `extra_info.sandbox_overrides.environment.image` | `str` | Per-SWE-problem image injected into `MiniEnvironmentConfig` at rollout time. |
 | `extra_info.sandbox_overrides.environment.cwd` | `str` | Always `"/testbed"` for real SWE problems. |
-| `agent_name` | `str` | `"mini_swe_agent"`. Selects `MiniSWEAgentLoop` in the agent loop registry. |
+| `agent_name` | `str` | `"mini_swe_agent"`. Selects `MiniSWEAgentLoopV1` in the agent loop registry. |
 
 ### SWE-Gym-specific fields
 

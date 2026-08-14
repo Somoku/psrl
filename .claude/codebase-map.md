@@ -162,7 +162,7 @@ psrl/
 │   │       ├── base_agent_loop.py, generate_agent_loop.py, batch_generate_agent_loop.py
 │   │       ├── multi_turn_agent_loop.py, multi_turn_completion_agent_loop.py
 │   │       ├── session_agent_loop.py    # ★ NEW: SMG SessionRouter + TITO-backed loop
-│   │       ├── mini_swe_agent_loop_v1.py# ★ CURRENT active SWE-bench agent loop (Docker + async PSRL rollout)
+│   │       ├── mini_swe_agent_loop_v1.py# ★ CURRENT SWE-bench loop (pluggable sandbox + async rollout)
 │   │       └── utils.py
 │   │
 │   └── config/                   # Worker-level config dataclasses (trimmed)
@@ -224,7 +224,7 @@ psrl/
 │   ├── dataset/                  # data_processor.py (DataProcessor), rl_dataset.py, utils.py
 │   ├── post_processor/           # base.py + buffer_post_process/ + group_post_process/
 │   ├── profiling/                # collector / event_converter / records
-│   ├── common/                   # chat_template, docker_utils, http_utils (+ distributed POST
+│   ├── common/                   # async_utils, chat_template, http_utils (+ distributed POST
 │   │                             #   actor pool), http_io_thread, memory_utils, nixl_names,
 │   │                             #   patch_utils, serialization, worker_naming, dynamic_import
 │   ├── ray/                      # lazy_primitives, lock_context
@@ -382,10 +382,21 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 
 | Class | File | Role |
 |-------|------|------|
-| `MiniSWEAgentLoopV1` | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` | CURRENT active SWE-bench agent loop: Docker env + async PSRL rollout bridge |
+| `MiniSWEAgentLoopV1` | `workers/agent_loop/loops/mini_swe_agent_loop_v1.py` | CURRENT SWE-bench loop: sync sandbox facade + async PSRL rollout bridge |
 | `MiniSWEAgentData` | `workers/agent_loop/agent_data/mini_swe_agent_data.py` | Trajectory building, patch extraction, grading state |
 | `ConversationAgentData` | `workers/agent_loop/agent_data/conversation_agent_data.py` | Chat-template base (OpenAI format, token counting) |
 | `MiniSWEEnvironment` | `environments/mini_swe_env.py` | SWE task parsing, per-problem config override merging |
+| `MiniSWEAgentAdapter` | `examples/mini_swe/harness_adapter.py` | Third-party synchronous harness protocol → generic sandbox session |
+
+### Sandbox Layer
+
+| Class | File | Role |
+|-------|------|------|
+| `SandboxManager` / `SandboxLease` | `sandbox/manager.py` | Worker registry, idempotent create, capability/state-policy gates and lifecycle ownership |
+| `SyncSandboxManager` / `SyncSandboxSession` | `sandbox/sync.py` | Thread facade over the owning worker event loop; no extra backend client/loop |
+| `DockerBackend` | `sandbox/backends/docker.py` | Persistent Engine API data/lifecycle plane, security policy, metrics and crash-reaper ownership |
+| `AgentEnvBackend` | `sandbox/backends/e2b.py` | AgentEnv image/template factory plus native full-state fork/snapshot driver |
+| `CubeSandboxBackend` | `sandbox/backends/e2b.py` | Cube template factory plus snapshot/restore branch driver |
 
 ### Staleness System
 
@@ -487,10 +498,10 @@ utils/tito/training_data.py converts them to prompt/response/mask/logprob arrays
 ```
 MiniSWEAgentLoopV1.run(request)
   → MiniSWEEnvironment.reset(task): parse extra_info, apply_data_overrides → runtime_config
-  → worker thread: DefaultAgent.run(task) in DockerEnvironment
-      (observe → _PSRLModel.query() → parse action → exec in Docker;
-       _PSRLModel bridges sync calls to async PSRL rollout via queues)
-  → async _generation_loop: poll req_q → rollout → res_q; token/timeout/turn guards
+  → SandboxManager.sync() → SyncSandboxManager
+  → worker thread: DefaultAgent.run(task) through MiniSWEAgentAdapter
+      (observe → model query → parse action → generic SyncSandboxSession.exec)
+  → capable microVM only: clean baseline snapshot → matching verifier restore
   → post-rollout grading (smith: checkout+patch+revert-tests+harness / gym: eval_script)
   → finalize: compute_score(data_source) → DataProto with reward
 ```

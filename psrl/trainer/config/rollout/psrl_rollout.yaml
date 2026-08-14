@@ -163,6 +163,39 @@ agent:
     # Agent data class name.
     name: null
 
+  # Worker-local registry of hot-pluggable sandbox backends. Docker is the
+  # default so code-executing loops cannot silently bypass SandboxManager.
+  sandbox:
+
+    _target_: psrl.sandbox.config.SandboxManagerConfig
+
+    default_backend: docker
+
+    backends:
+
+      docker:
+        _target_: psrl.sandbox.backends.DockerBackend
+
+        # Rootless is opt-in because existing clusters may still use a rootful
+        # node-local daemon. Set require_rootless=true after daemon migration.
+        security:
+          require_rootless: false
+          pids_limit: 4096
+          cap_drop:
+            - ALL
+          cap_add: []
+          no_new_privileges: true
+          read_only_rootfs: false
+
+        policy_profiles:
+
+          # Keep sandbox traffic isolated while making node-local services and
+          # loopback proxy URLs reachable through one stable hostname.
+          mini_swe:
+            network_mode: bridge
+            host_gateway_alias: host.docker.internal
+            rewrite_loopback_proxies: true
+
   # Maximum number of retries for each trajectory in case of failures.
   retry_limit: 1
 

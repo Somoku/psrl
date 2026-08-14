@@ -118,7 +118,10 @@ examples/mini_swe/
 psrl/workers/agent_loop/loops/session_agent_loop.py       # Shared SessionRouter/TITO lifecycle
 psrl/workers/agent_loop/loops/mini_swe_agent_loop_v1.py   # Session-router/TITO black-box loop
 psrl/workers/agent_loop/agent_data/mini_swe_agent_data.py # MiniSWEAgentData
-psrl/environments/mini_swe_env.py                         # MiniSWEEnvironment
+psrl/environments/mini_swe_env.py                         # Task metadata → observation adapter
+psrl/sandbox/                                             # Backend-neutral runtime abstraction
+examples/mini_swe/harness_adapter.py                      # Third-party synchronous harness adapter
+examples/mini_swe/runner.py                               # Episode orchestration + SandboxSpec mapping
 ```
 
 ---
@@ -170,6 +173,35 @@ Read that file before running training for the first time.
 ---
 
 ## Training
+
+### Sandbox regression acceptance
+
+Before a long run, validate the exact node image and persistent Engine path:
+
+```bash
+ruff check .
+pytest -q tests/sandbox
+PSRL_RUN_DOCKER_INTEGRATION=1 pytest -q -s tests/sandbox/test_docker_live.py
+python tests/sandbox/benchmark_docker_backend.py \
+  --image python:3.11-slim --iterations 100 --concurrency 16 \
+  | tee docker-sandbox-benchmark.json
+```
+
+Then enable one resource sample per episode and run the existing five-step
+cluster smoke job (or the normal launch script for the target dataset):
+
+```bash
+export PSRL_SANDBOX_COLLECT_RESOURCE_METRICS=true
+bash examples/mini_swe/test_perf.sh 1
+```
+
+Compare the same dataset/model/seed and concurrency on the baseline and this
+branch. Acceptance requires equal task/patch/grader semantics, no remaining
+`psrl.sandbox=true` containers after shutdown, no monotonically growing dockerd
+RSS, and non-regressed p50/p95 create/exec/episode latency. Trajectory timing
+contains `sandbox_create_s`, `sandbox_peak_memory_mib` and
+`sandbox_cpu_total_s`; final worker logs contain aggregate operation counts,
+failures and mean/max latency.
 
 ### Toy dataset
 
@@ -382,6 +414,19 @@ MiniSWEAgentRuntimeConfig   (dataclass defaults in config.py)
        └── extra_info per SWE problem  (sandbox_overrides / agent_overrides)
 ```
 
+`sandbox_config.environment` is the shared container base. The optional
+`rollout_environment` and `grader_environment` mappings override that base for
+their respective lifecycle; `env` entries are merged while scalar and list
+fields replace the base value.
+
+MiniSWE model traffic stays in the AgentLoopWorker process, so Docker bridge
+networking does not sit between the model client and SessionRouter, SMG, vLLM,
+or ModelProxy. Commands inside the container can reach node-local services at
+`host.docker.internal`. The `mini_swe` Docker policy in
+`psrl/trainer/config/rollout/psrl_rollout.yaml` creates that host-gateway mapping
+and rewrites forwarded proxy URLs whose host is `localhost`, `127.0.0.1`, or
+`::1`; remote proxy URLs pass through unchanged.
+
 ### Choosing the right config YAML
 
 | YAML | Use with |
@@ -402,8 +447,17 @@ which is written by `prepare_swebench.py`.
 | `rollout.multi_turn.enable` | Required | Must be `True` for mini-SWE-agent |
 | `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode |
 | `sandbox_config.environment.image` | Data-affine | Docker image (overridden per-SWE-problem for SWE-smith path) |
+| `sandbox_config.environment.template` | Data-affine | Provider template/snapshot ID for AgentEnv or CubeSandbox |
 | `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (`/testbed` for SWE-bench images) |
+| `sandbox_config.environment.forward_env` | Infrastructure | Additional host environment names to forward; proxy variables are always included once |
+| `sandbox_config.environment` | Infrastructure | Shared image/template, cwd, env, forwarded env and timeout base for rollout and grader |
+| `sandbox_config.rollout_environment` | Infrastructure | Rollout-only overrides, including `memory` and command `timeout` |
+| `sandbox_config.grader_environment` | Infrastructure | Fresh-verifier overrides; resources must match rollout to reuse a microVM snapshot |
 | `sandbox_config.environment.container_timeout` | Infrastructure | Max container lifetime (default: `2h`) |
+| `sandbox_config.backend` | Infrastructure | Optional backend name from PSRL's worker-local sandbox registry |
+| `sandbox_config.policy_profile` | Infrastructure | Docker policy profile; set `null` for microVM providers |
+| `sandbox_config.snapshot_verifier` | Infrastructure | Use a capability-gated clean verifier snapshot when its spec matches exactly |
+| `sandbox_config.collect_resource_metrics` | Infrastructure | Sample per-trajectory memory/CPU once; disabled by default |
 | `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node (`0` = unlimited) |
 | `agent.system_template` | **Required** | System prompt (no default) |
 | `agent.problem_template` | **Required** | Per-SWE-problem prompt template; maps to `instance_template` in mini-swe-agent (no default) |
@@ -424,8 +478,9 @@ which is written by `prepare_swebench.py`.
    unchanged to SMG.
 4. After mini-swe-agent exits, PSRL fetches the session once and converts the
    captured trajectory into canonical training data.
-5. PSRL deletes the TITO session and removes rollout Docker containers in
-   `finally` cleanup.
+5. PSRL releases generic sandbox leases and deletes the TITO session in
+   `finally` cleanup. Docker containers are removed; capable microVM providers
+   also clean up temporary verifier snapshots.
 
 ### Runner execution
 
@@ -433,6 +488,13 @@ The runner uses mini-swe-agent's official Python bindings and runs in a bounded,
 dedicated worker-thread pool. This keeps Docker rollout distributed with PSRL's
 AgentLoopWorkers, avoids a task-level HTTP hop or centralized agent-server
 bottleneck, and leaves the default executor available for timeout cleanup.
+The same path works with AgentEnv and CubeSandbox because the runner only sees
+`SyncSandboxManager` and capability flags.
+
+The Docker backend uses a worker-persistent Engine API connection pool; it does
+not spawn a Docker CLI process for create/exec/file operations. See
+[`psrl/sandbox/README.md`](../../psrl/sandbox/README.md) for live conformance,
+benchmark and microVM snapshot/restore commands.
 
 ---
 
@@ -499,11 +561,8 @@ rate. Both are visible in wandb as `train/score` and `train/acc`.
 Stop all rollout and grader containers left behind by an aborted run:
 
 ```bash
-# Rollout containers
-docker ps -q --filter "label=psrl.swe_task_id" | xargs -r docker stop
-
-# Grader containers
-docker ps -q --filter "label=psrl.grader_task_id" | xargs -r docker stop
+# All PSRL-owned Docker sandboxes
+docker ps -aq --filter "label=psrl.sandbox=true" | xargs -r docker rm -f
 
 # Ray cluster
 ray stop --force

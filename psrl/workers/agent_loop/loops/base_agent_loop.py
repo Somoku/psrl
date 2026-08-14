@@ -60,6 +60,7 @@ class AgentLoopBase(ABC):
         self.timer = LoopTimer()
         self.dataset_cls = context.dataset_cls
         self.data_config = context.data_config.config
+        self.sandbox_manager = context.sandbox_manager
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = dict(self.data_config.get("mm_processor_kwargs", {}))
         self.system_prompt = initialize_system_prompt(self.tokenizer, **self.apply_chat_template_kwargs)

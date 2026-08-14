@@ -3,8 +3,8 @@ mini-SWE-agent Runtime Configuration for PSRL.
 
 Dataclass-based config for the mini-SWE-agent integration. These configs
 control the PSRL-side orchestration (sandbox timeouts, parallelism, templates).
-mini-swe-agent's own components (`DockerEnvironment`, `DefaultAgent`,
-`LitellmTextbasedModel`) are configured directly via their Python APIs
+mini-swe-agent's own components (`DefaultAgent`, `LitellmTextbasedModel`) are
+configured directly via their Python APIs
 in the black-box runner -- no YAML generation is needed.
 """
 
@@ -30,11 +30,11 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 @dataclass
 class MiniEnvironmentConfig:
     """
-    Environment settings passed to mini-swe-agent's `get_environment()`.
+    Backend-neutral environment settings used to build a `SandboxSpec`.
     """
 
-    environment_class: str = "docker"
     image: str = "python:3.11-slim"
+    template: str | None = None
     cwd: str = "/testbed"
     env: dict = field(
         default_factory=lambda: {
@@ -45,23 +45,11 @@ class MiniEnvironmentConfig:
             "TQDM_DISABLE": "1",
         }
     )
-    run_args: list = field(
-        default_factory=lambda: [
-            "--rm",
-            "--memory=8g",
-            "--network",
-            "host",
-            "--add-host",
-            "host.docker.internal:host-gateway",
-        ]
-    )
+    forward_env: list[str] = field(default_factory=list)
+    memory: str | int | None = "8g"
     container_timeout: str = "2h"
-    # Memory limit for the fresh grading container (separate from the rollout
-    # container above).  Heavy repos (scikit-learn, xarray, matplotlib) run
-    # `pip install -e .` inside the grading container, which can temporarily
-    # require 15–25 GB.  Set higher than the rollout container to avoid
-    # cgroup OOM kills during grading.
-    grader_memory: str = "30g"
+    # Default shell-command timeout; case-specific mappings may override it.
+    timeout: int = 30
 
 
 @dataclass
@@ -71,7 +59,20 @@ class MiniSandboxConfig:
     """
 
     max_parallel_tasks_per_worker: int = 0
+    backend: str | None = None
+    policy_profile: str | None = "mini_swe"
+    snapshot_verifier: bool = True
+    collect_resource_metrics: bool = False
+    # Shared base plus small case-specific overlays keeps rollout and verifier
+    # behavior aligned without duplicating image, cwd, env, or lifetime config.
     environment: MiniEnvironmentConfig = field(default_factory=MiniEnvironmentConfig)
+    rollout_environment: dict[str, Any] = field(default_factory=dict)
+    grader_environment: dict[str, Any] = field(
+        default_factory=lambda: {
+            "memory": "30g",
+            "timeout": 900,
+        }
+    )
 
     # Per-turn timeout forwarded to mini-swe-agent's model client.
     rollout_turn_timeout: int = 480

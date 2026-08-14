@@ -3,8 +3,8 @@ mini-SWE-agent Environment for PSRL.
 
 This environment adapts the mini-SWE-agent integration to PSRL's `Environment`
 interface. It handles:
-- `reset()`: Parse task metadata, build per-instance config, create workspace.
-- `close()`: Clean up temporary directories and safety-net Docker container cleanup.
+- `reset()`: Parse task metadata and build per-instance config.
+- `close()`: Close episode-local state; sandbox leases own runtime cleanup.
 
 It does NOT use `step()` because mini-swe-agent manages its own tool execution
 loop internally via `DefaultAgent.run()`.
@@ -12,7 +12,6 @@ loop internally via `DefaultAgent.run()`.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -30,7 +29,6 @@ from omegaconf import DictConfig
 from transformers import AutoProcessor, AutoTokenizer
 
 from psrl.environments.base import Environment, EnvStepOutput
-from psrl.utils.common.docker_utils import force_remove_containers_by_label
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
@@ -41,9 +39,8 @@ class MiniSWEEnvironment(Environment[dict, None]):
     """
     Environment adapter for mini-SWE-agent in-process episodes.
 
-    Prepares per-episode workspaces, applies per-instance config overrides,
-    and provides safety-net Docker cleanup. Docker container lifecycle is
-    primarily managed by mini-swe-agent's `DockerEnvironment` internally.
+    Prepares per-episode metadata and applies per-instance config overrides.
+    Runtime lifecycle is managed by PSRL's sandbox lease abstraction.
     """
 
     def __init__(
@@ -150,6 +147,7 @@ class MiniSWEEnvironment(Environment[dict, None]):
         swe_grader = str(extra_info.get("swe_grader", "") or extra_info.get("grader", "") or "")
         swe_problem = extra_info.get("swe_problem", None) or extra_info.get("instance", None) or {}
         swe_problem_image = str(extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or "")
+        swe_problem_template = str(extra_info.get("swe_problem_template", "") or "")
         swe_restore_tests = bool(
             extra_info.get("swe_restore_tests", False) or extra_info.get("needs_head_minus_one", False)
         )
@@ -182,6 +180,7 @@ class MiniSWEEnvironment(Environment[dict, None]):
             "swe_grader": swe_grader,
             "swe_problem": swe_problem,
             "swe_problem_image": swe_problem_image,
+            "swe_problem_template": swe_problem_template,
             "swe_restore_tests": swe_restore_tests,
         }
 
@@ -205,25 +204,11 @@ class MiniSWEEnvironment(Environment[dict, None]):
 
     async def close(self) -> None:
         """
-        Safety-net cleanup for Docker containers and temporary directories.
+        Close episode-local environment state.
 
-        Primary Docker cleanup is handled by mini-swe-agent's
-        `DockerEnvironment.cleanup()`. This method provides a fallback
-        via label-based container cleanup in case the primary path fails.
-
-        Uses ``docker rm -f`` (not ``docker stop``) because rollout sandboxes
-        are disposable and ``docker stop`` has been observed to silently
-        succeed without actually killing containers that have many runaway
-        in-container children or active ``docker exec`` sessions racing the
-        SIGTERM/SIGKILL window.
+        Sandbox lifecycle belongs to the lease created by the agent loop, so
+        this dataset adapter intentionally performs no backend-specific work.
         """
-        if self._swe_task_id:
-            await asyncio.to_thread(
-                force_remove_containers_by_label,
-                "psrl.swe_task_id",
-                self._swe_task_id,
-            )
-
         psrl_logger.debug(f"[mini-SWE-agent, task_id={self._swe_task_id}] MiniSWEEnvironment closed.")
 
     @property

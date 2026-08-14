@@ -1,5 +1,4 @@
 import asyncio
-import atexit
 import logging
 import os
 import traceback
@@ -24,11 +23,8 @@ from verl.utils.tokenizer import (
 )
 from verl.workers.config.model import HFModelConfig
 
+from psrl.sandbox.config import build_sandbox_manager
 from psrl.utils.common.chat_template import resolve_chat_template_value
-from psrl.utils.common.docker_utils import (
-    force_remove_containers_by_label,
-    spawn_actor_reaper,
-)
 from psrl.utils.common.http_io_thread import init_http_io_thread
 from psrl.utils.common.http_utils import configure_distributed_post, init_http_client
 from psrl.utils.logger import DualOutputHandler, EventType, log_dual_events
@@ -66,30 +62,9 @@ class PSRL_AgentLoopWorker:
             worker_num (int): Total number of worker instances.
         """
 
-        # Per-actor identity used to label every Docker container this worker
-        # spawns (rollout containers in MiniSWEAgentLoopV1, grader containers in
-        # swebench_grader). The reaper sidecar below filters by this label to
-        # reclaim only this actor's containers when the actor process dies,
-        # which is robust under SIGKILL, OOM, Ray actor restart, and
-        # multiple-actors-per-node packing.
+        # Backends use this identity to scope runtime resources to one Ray actor.
         self._actor_id = f"w{worker_id}-{os.uname().nodename}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         os.environ["PSRL_ACTOR_ID"] = self._actor_id
-        # Use the config parameter directly (self.config is set below) so the
-        # reaper log lands next to the AgentLoopWorker_N.log files.
-        _reaper_log_dir = getattr(getattr(config, "psrl", None), "logging_path", None)
-        self._reaper_proc = spawn_actor_reaper(
-            self._actor_id,
-            log_dir=_reaper_log_dir,
-        )
-        # On graceful shutdown, _terminate_reaper synchronously reaps our
-        # actor's containers (belt) AND signals the bash sidecar to skip its
-        # post-mortem sweep (suspenders).
-        atexit.register(self._terminate_reaper)
-        psrl_logger.info(
-            f"PSRL_AgentLoopWorker {worker_id}: actor_id={self._actor_id!r}, "
-            f"reaper pid={self._reaper_proc.pid}, "
-            f"reaper log_dir={_reaper_log_dir!r}."
-        )
 
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
@@ -113,6 +88,8 @@ class PSRL_AgentLoopWorker:
         self.ps_manager_handle = ps_manager_handle
         self.agent_loop_manager = None
         self.reward_manager = None
+        sandbox_config = OmegaConf.select(config, "gen_actor_rollout_ref.rollout.agent.sandbox")
+        self.sandbox_manager = build_sandbox_manager(sandbox_config)
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (
@@ -171,29 +148,6 @@ class PSRL_AgentLoopWorker:
         handler = DualOutputHandler(self.config.psrl.logging_path, self.log_prefix)
         logging.getLogger("psrl").addHandler(handler)
         psrl_logger.addHandler(handler)
-
-    def _terminate_reaper(self) -> None:
-        """Belt-and-suspenders cleanup on graceful actor shutdown.
-
-        Belt: synchronously force-remove our actor's containers from the
-              actor process itself. Takes ~5-30 s for hundreds of containers,
-              well within Ray's SIGTERM grace period. This is the fast path
-              that wins the race against the bash sidecar.
-        Suspenders: also signal the bash sidecar to terminate so it does not
-                    run a redundant (and harmless) post-mortem sweep after we
-                    already cleaned up here.
-        """
-        try:
-            force_remove_containers_by_label("psrl.actor_id", self._actor_id)
-        except Exception as e:
-            psrl_logger.debug(f"Synchronous atexit reap failed: {e}.")
-        proc = getattr(self, "_reaper_proc", None)
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-        except Exception as e:
-            psrl_logger.debug(f"Failed to terminate reaper sidecar: {e}.")
 
     def set_agent_loop_manager(self, agent_loop_manager: ray.actor.ActorHandle):
         """Set the agent loop manager handle for communication.
@@ -254,17 +208,21 @@ class PSRL_AgentLoopWorker:
 
     async def stop_busy_loop(self):
         """Stop the busy loop and wait for the current task to complete."""
-        if not self.busy_loop_task or self.busy_loop_task.done():
-            return
-
-        self.stop_busy_loop_task = True
-        # Wait for the background task to finish
-        # Note: This is now async-safe and won't deadlock when called from Ray actors
-        try:
-            await asyncio.wait_for(self.busy_loop_task, timeout=10.0)
-        except asyncio.TimeoutError:
-            psrl_logger.warning("Timeout waiting for busy loop task to complete")
-            self.busy_loop_task.cancel()
+        if self.busy_loop_task and not self.busy_loop_task.done():
+            self.stop_busy_loop_task = True
+            # Wait for the background task to finish. This is async-safe and
+            # will not deadlock when called from Ray actors.
+            try:
+                await asyncio.wait_for(self.busy_loop_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                psrl_logger.warning("Timeout waiting for busy loop task to complete")
+                self.busy_loop_task.cancel()
+        if self.agent_programs:
+            await asyncio.gather(*self.agent_programs, return_exceptions=True)
+        if self.sandbox_manager is not None:
+            metrics = {name: snapshot.as_dict() for name, snapshot in self.sandbox_manager.metrics_snapshot().items()}
+            psrl_logger.info("Final sandbox lifecycle metrics: %s.", metrics)
+            await self.sandbox_manager.shutdown()
 
     async def _launch_agent_loop(self):
         """Main loop that processes agent programs from the pending queue."""
@@ -377,6 +335,7 @@ class PSRL_AgentLoopWorker:
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
+                sandbox_manager=self.sandbox_manager,
             )
             # Keep framework objects out of Hydra's dataclass conversion path.
             agent_loop_factory = hydra.utils.instantiate(

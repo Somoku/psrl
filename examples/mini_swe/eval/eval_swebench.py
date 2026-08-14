@@ -121,7 +121,6 @@ def _run_agent_on_swe_problem(
     from minisweagent.config import get_config_from_spec
     from minisweagent.models import get_model
     from minisweagent.utils.serialize import recursive_merge
-
     from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
 
     image_name = get_swebench_image_name(swe_problem)
@@ -147,13 +146,15 @@ def _run_agent_on_swe_problem(
         yaml_cfg.pop(k, None)
     sb = yaml_cfg.pop("sandbox_config", None)
     if isinstance(sb, dict) and "environment" in sb and "environment" not in yaml_cfg:
-        yaml_cfg["environment"] = sb["environment"]
-    # PSRL training hardcodes DockerEnvironment; mini-swe-agent's
-    # `get_environment` requires `environment_class` to dispatch.  Default to
-    # 'docker' here so the standalone eval picks the same backend training uses.
+        yaml_cfg["environment"] = recursive_merge(
+            sb["environment"],
+            sb.get("rollout_environment", {}),
+        )
+    # Standalone evaluation calls mini-swe-agent directly and therefore needs
+    # its upstream environment dispatcher. PSRL training uses SandboxManager.
     env_block = yaml_cfg.setdefault("environment", {})
     if isinstance(env_block, dict):
-        env_block.setdefault("environment_class", "docker")  # training hardcodes Docker
+        env_block.setdefault("environment_class", "docker")
     if "agent" in yaml_cfg and isinstance(yaml_cfg["agent"], dict):
         agent_cfg = dict(yaml_cfg["agent"])
         if "problem_template" in agent_cfg and "instance_template" not in agent_cfg:

@@ -37,6 +37,8 @@ from verl.workers.config.rollout import (
     RolloutConfig as _VeRLRolloutConfig,
 )
 
+from psrl.sandbox.config import SandboxManagerConfig
+
 
 @dataclass
 class PoolingConfig(BaseConfig):
@@ -84,6 +86,7 @@ class AgentLoopConfig(_VeRLAgentLoopConfig):
     trajectory_timeout: float | None = None
     env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     data: AgentDataConfig = field(default_factory=AgentDataConfig)
+    sandbox: SandboxManagerConfig = field(default_factory=SandboxManagerConfig)
     retry_limit: int = 1
     raise_on_error: bool = True
     gamma: float = 0.0
@@ -135,4 +138,5 @@ __all__ = [
     "CheckpointEngineConfig",
     "EnvironmentConfig",
     "AgentDataConfig",
+    "SandboxManagerConfig",
 ]

@@ -21,6 +21,7 @@ def _bare_loop(trajectory_id_strategy: str = "manual") -> SessionAgentLoop:
     )
     loop.timer = SimpleNamespace(generation=nullcontext)
     loop.model_config = SimpleNamespace(path="model")
+    loop.tito_model_type = "qwen3"
 
     return loop
 
@@ -41,6 +42,14 @@ def test_mini_swe_model_headers_follow_trajectory_strategy():
     assert "extra_headers" not in auto["model_kwargs"]
 
 
+def test_session_headers_bind_exact_model_type():
+    loop = _bare_loop()
+
+    headers = loop.build_session_headers({"uid": 3})
+
+    assert headers["x-smg-tito-model-type"] == "qwen3"
+
+
 @pytest.mark.asyncio
 async def test_create_session_does_not_bind_a_trajectory(monkeypatch):
     captured = {}
@@ -58,6 +67,7 @@ async def test_create_session_does_not_bind_a_trajectory(monkeypatch):
     assert session_id == "sid"
     assert "x-smg-tito-trajectory-id" not in captured["headers"]
     assert captured["headers"]["x-request-id"] == "3"
+    assert captured["headers"]["x-smg-tito-model-type"] == "qwen3"
 
 
 @pytest.mark.asyncio

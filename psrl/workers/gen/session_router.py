@@ -518,6 +518,7 @@ class SessionRouter:
             "x-version-tag",
             "x-base-worker-id",
             "x-target-dp-rank",
+            "x-smg-tito-model-type",
         }
         session_headers = {key.lower(): value for key, value in headers.items() if key.lower() in allowed}
         session_headers[SESSION_ID_HEADER] = sid

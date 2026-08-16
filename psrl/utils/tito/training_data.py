@@ -4,39 +4,60 @@ Converts accumulated_token_ids + per-turn records (from SMG GET /tito/sessions)
 into the canonical prompt, response, mask, and log-probability fields.
 """
 
-from __future__ import annotations
-
 import base64
 import io
 import logging
 import os
 
 import numpy as np
+import torch
+
+from psrl.utils.routed_experts import canonicalize_routed_experts, validate_routed_experts_array
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-def _assemble_routed_experts(records: list[dict], total_len: int) -> np.ndarray | None:
-    """Assemble per-turn routed-experts blobs into one position-indexed tensor."""
-    blobs = []
-    for record in records:
-        re = record.get("routed_experts")
-        if not re:
-            continue
-        arr = np.load(io.BytesIO(base64.b64decode(re["data"])))
-        blobs.append((int(re["prompt_start"]), arr))
-
-    if not blobs:
+def _assemble_routed_experts(
+    records: list[dict],
+    prompt_length: int,
+    response_length: int,
+) -> torch.Tensor | None:
+    """Concatenate per-turn segments into the canonical tensor."""
+    if not any(record.get("routed_experts") is not None for record in records):
         return None
 
-    _, sample = blobs[0]
-    routed_experts = np.zeros((max(total_len, 0), *sample.shape[1:]), dtype=sample.dtype)
-    for prompt_start, arr in blobs:
-        end = min(prompt_start + arr.shape[0], total_len)
-        if end > prompt_start:
-            routed_experts[prompt_start:end] = arr[: end - prompt_start]
-    return routed_experts
+    expected_shape: tuple[int, int] | None = None
+    expected_dtype: np.dtype | None = None
+    segments: list[np.ndarray] = []
+    for turn_index, record in enumerate(records):
+        routed_experts = record.get("routed_experts")
+        if routed_experts is None:
+            raise ValueError(f"Missing routed_experts segment at TITO turn {turn_index}.")
+        encoded = base64.b64decode(routed_experts["data"])
+        array = np.load(io.BytesIO(encoded))
+        array = validate_routed_experts_array(array)
+
+        metadata_shape = (int(routed_experts["num_layers"]), int(routed_experts["top_k"]))
+        metadata_dtype = np.dtype(routed_experts["dtype"])
+        if metadata_shape != array.shape[1:] or metadata_dtype != array.dtype:
+            raise ValueError(
+                f"routed_experts metadata mismatch at TITO turn {turn_index}: "
+                f"metadata shape/dtype={metadata_shape!r}/{metadata_dtype!r}, "
+                f"array shape/dtype={array.shape[1:]!r}/{array.dtype!r}."
+            )
+        if expected_shape is None:
+            expected_shape = array.shape[1:]
+            expected_dtype = array.dtype
+        elif array.shape[1:] != expected_shape or array.dtype != expected_dtype:
+            raise ValueError(
+                f"routed_experts shape/dtype changed at TITO turn {turn_index}: "
+                f"expected {expected_shape!r}/{expected_dtype!r}, got {array.shape[1:]!r}/{array.dtype!r}."
+            )
+        segments.append(array)
+
+    compact = np.concatenate(segments, axis=0)
+    return canonicalize_routed_experts(compact, prompt_length, response_length)
 
 
 def build_training_data(
@@ -76,116 +97,77 @@ def build_training_data(
             "num_turns": 0,
         }
 
+    if not isinstance(max_trim_tokens, int) or max_trim_tokens < 0:
+        raise ValueError(f"max_trim_tokens must be a non-negative integer, got {max_trim_tokens!r}.")
+
     all_response_ids: list[int] = []
     all_response_mask: list[int] = []
     all_logprobs: list[float] = []
 
     cursor = 0
     total_acc_len = len(accumulated_token_ids)
-    for i, record in enumerate(records):
-        prompt_len = record["prompt_token_count"]
-        raw_lps = record.get("output_logprobs") or []
+    for turn_index, record in enumerate(records):
+        prompt_len = int(record.get("prompt_token_count", 0))
+        if prompt_len < cursor or prompt_len > total_acc_len:
+            raise ValueError(
+                f"Invalid prompt boundary at TITO turn {turn_index}: "
+                f"cursor={cursor}, prompt_token_count={prompt_len}, accumulated_length={total_acc_len}."
+            )
 
-        # Environment/user tokens between previous cursor and this turn's prompt end
-        if cursor > 0 and prompt_len > cursor:
+        if turn_index > 0:
             env_ids = accumulated_token_ids[cursor:prompt_len]
             all_response_ids.extend(env_ids)
             all_response_mask.extend([0] * len(env_ids))
             all_logprobs.extend([0.0] * len(env_ids))
 
-            psrl_logger.debug(
-                "[TITO turn %d] env_ids: cursor=%d, prompt_len=%d, env_count=%d, env_ids[:5]=%s",
-                i,
-                cursor,
-                prompt_len,
-                len(env_ids),
-                str(env_ids[:5]),
+        raw_logprobs = record.get("output_logprobs", [])
+        output_ids: list[int] = []
+        output_logprobs: list[float] = []
+        for pair in raw_logprobs:
+            output_logprobs.append(float(pair[0]))
+            output_ids.append(int(pair[1]))
+
+        matched = 0
+        for token_id in output_ids:
+            position = prompt_len + matched
+            if position >= total_acc_len or accumulated_token_ids[position] != token_id:
+                break
+            matched += 1
+
+        is_last = turn_index == len(records) - 1
+        trim_count = len(output_ids) - matched
+        allowed_trim = 0 if is_last else max_trim_tokens
+        if trim_count > allowed_trim:
+            raise ValueError(
+                f"TITO output tokens diverge at turn {turn_index}: "
+                f"trim_count={trim_count} exceeds allowed={allowed_trim}."
             )
 
-        # Assistant output tokens
-        output_ids = [int(pair[1]) for pair in raw_lps]
-        output_logprobs = [float(pair[0]) for pair in raw_lps]
-
-        # Fallback: if output_logprobs was None but accumulated_token_ids has
-        # tokens beyond prompt_len, recover token IDs from the accumulated buffer.
-        # This happens when the session router did not record logprobs (e.g.
-        # top_logprobs=0 edge case). Logprobs are filled with 0.0.
-        if not output_ids and prompt_len < total_acc_len:
-            is_last = i == len(records) - 1
-            if is_last:
-                end = total_acc_len
-            else:
-                end = records[i + 1]["prompt_token_count"]
-            if end > prompt_len:
-                output_ids = list(accumulated_token_ids[prompt_len:end])
-                output_logprobs = [0.0] * len(output_ids)
-                psrl_logger.warning(
-                    "[TITO turn %d] output_logprobs missing, recovered %d tokens from accumulated_token_ids",
-                    i,
-                    len(output_ids),
-                )
-
-        # Trailing trim for non-last turns: greedy match against accumulated.
-        # The last turn never trims -- boundary tokens are part of the final output.
-        is_last = i == len(records) - 1
-        if not is_last and output_ids:
-            matched = 0
-            for j, tid in enumerate(output_ids):
-                pos = prompt_len + j
-                if pos < len(accumulated_token_ids) and tid == accumulated_token_ids[pos]:
-                    matched += 1
-                else:
-                    break
-            trim_count = len(output_ids) - matched
-
-            psrl_logger.debug(
-                "[TITO turn %d] trim analysis: is_last=%s, matched=%d, "
-                "trim_count=%d, allowed=%d, prompt_len=%d, "
-                "output_len=%d, total_acc_len=%d",
-                i,
-                is_last,
-                matched,
-                trim_count,
-                max_trim_tokens,
-                prompt_len,
-                len(output_ids),
-                total_acc_len,
-            )
-
-            # Validate against the model-specific ceiling.
-            # Last turn: no trimming ever allowed (allowed = 0).
-            # Non-last turn: at most max_trim_tokens (typically 0 or 1).
-            allowed = max_trim_tokens  # is_last already guarded above
-            if trim_count > allowed:
-                raise ValueError(
-                    f"TITO trailing trim overflow at turn {i}: "
-                    f"trim_count={trim_count} exceeds allowed={allowed} "
-                    f"(max_trim_tokens={max_trim_tokens}). "
-                    f"output_ids[-3:]={output_ids[-3:]}, "
-                    f"accumulated[{prompt_len + matched}:{prompt_len + matched + 3}]="
-                    f"{accumulated_token_ids[prompt_len + matched : prompt_len + matched + 3]}"
-                )
-
-            if trim_count > 0:
-                output_ids = output_ids[:matched]
-                output_logprobs = output_logprobs[:matched]
-                psrl_logger.debug(
-                    "[TITO turn %d] trimmed %d tokens, remaining output_len=%d",
-                    i,
-                    trim_count,
-                    len(output_ids),
-                )
+        output_ids = output_ids[:matched]
+        output_logprobs = output_logprobs[:matched]
         all_response_ids.extend(output_ids)
-        all_response_mask.extend([1] * len(output_ids))
+        all_response_mask.extend([1] * matched)
         all_logprobs.extend(output_logprobs)
+        cursor = prompt_len + matched
 
-        cursor = prompt_len + len(output_ids)
+    if cursor != total_acc_len:
+        raise ValueError(
+            f"TITO reconstruction did not consume accumulated tokens: cursor={cursor}, "
+            f"accumulated_length={total_acc_len}."
+        )
+    if not (len(all_response_ids) == len(all_response_mask) == len(all_logprobs)):
+        raise ValueError("TITO response token, mask, and logprob lengths are not aligned.")
 
     first_prompt_len = records[0]["prompt_token_count"]
-    prompt_ids = (
-        list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
-    )
-    routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
+    prompt_ids = accumulated_token_ids[:first_prompt_len]
+    if prompt_ids_override is not None:
+        if len(prompt_ids_override) != first_prompt_len:
+            raise ValueError(
+                "prompt_ids_override length must match the captured TITO prompt length: "
+                f"got {len(prompt_ids_override)} and {first_prompt_len}."
+            )
+        prompt_ids = list(prompt_ids_override)
+    routed_experts = _assemble_routed_experts(records, len(prompt_ids), len(all_response_ids))
 
     psrl_logger.debug(
         "[TITO build_training_data] prompt_len=%d tito_prompt_len=%d response_len=%d "

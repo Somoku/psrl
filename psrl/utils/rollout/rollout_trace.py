@@ -465,27 +465,36 @@ async def _decode_token_ids(owner, token_ids):
     return await loop.run_in_executor(None, tokenizer.decode, token_ids)
 
 
-async def _add_token2text(owner, result):
+def _trace_field(value, field_name):
+    if isinstance(value, dict):
+        return value.get(field_name)
+    return getattr(value, field_name, None)
+
+
+async def _add_token2text(owner, inputs, result):
+    """Return a trace-safe copy enriched with decoded prompt and response text."""
     if isinstance(result, tuple):
         if len(result) == 2 and _looks_like_terminate_reason(result[1]):
             return {
-                "output": await _add_token2text(owner, result[0]),
+                "output": await _add_token2text(owner, inputs, result[0]),
                 "terminate_reason": _json_trace_metadata(result[1]),
             }
-        return [await _add_token2text(owner, item) for item in result]
+        return [await _add_token2text(owner, inputs, item) for item in result]
     if isinstance(result, list):
-        return [await _add_token2text(owner, item) for item in result]
-    if isinstance(result, dict):
-        return {str(key): await _add_token2text(owner, value) for key, value in result.items()}
+        return [await _add_token2text(owner, inputs, item) for item in result]
 
     result_dict = _normalize_trace_output(result)
     if not isinstance(result_dict, dict):
         return result_dict
 
-    prompt_ids = getattr(result, "prompt_ids", result_dict.get("prompt_ids"))
-    response_ids = getattr(result, "response_ids", result_dict.get("response_ids"))
+    prompt_ids = _trace_field(result, "prompt_ids")
+    if prompt_ids is None and isinstance(inputs, dict):
+        prompt_ids = inputs.get("prompt_ids")
+    response_ids = _trace_field(result, "response_ids")
+    if response_ids is None:
+        response_ids = _trace_field(result, "token_ids")
     if prompt_ids is None and response_ids is None:
-        return result_dict
+        return {str(key): await _add_token2text(owner, inputs, value) for key, value in result_dict.items()}
 
     try:
         prompt_text = await _decode_token_ids(owner, prompt_ids)
@@ -553,7 +562,7 @@ def rollout_trace_op(func):
                 result = await func(self, *args, **kwargs)
 
                 if enable_token2text:
-                    _result = await _add_token2text(self, result)
+                    _result = await _add_token2text(self, inputs, result)
                     tracer.finish_call(call, output=_result)
                 else:
                     tracer.finish_call(call, output=_normalize_trace_output(result))
@@ -570,7 +579,7 @@ def rollout_trace_op(func):
                 span.set_inputs(inputs)
                 result = await func(self, *args, **kwargs)
                 if enable_token2text:
-                    _result = await _add_token2text(self, result)
+                    _result = await _add_token2text(self, inputs, result)
                     span.set_outputs(_result)
                 else:
                     span.set_outputs(_normalize_trace_output(result))
@@ -580,7 +589,7 @@ def rollout_trace_op(func):
             try:
                 result = await func(self, *args, **kwargs)
                 if enable_token2text:
-                    _result = await _add_token2text(self, result)
+                    _result = await _add_token2text(self, inputs, result)
                     _log_trackio_trace(func.__qualname__, inputs, output=_result)
                 else:
                     _log_trackio_trace(func.__qualname__, inputs, output=result)

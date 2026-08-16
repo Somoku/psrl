@@ -29,10 +29,13 @@ from verl.trainer.distillation.losses import is_distillation_enabled
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
+    RolloutMoELoadBalanceMetricsAccumulator,
     compute_data_metrics,
+    compute_moe_lb_metrics,
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
@@ -318,6 +321,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.server_addresses = []
 
         self.replay_buffer = ReplayBuffer(poll_interval=0.1)
+        self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
+            model_config=self.config.train_actor_rollout_ref.model
+        )
 
         # Rollout gateway lifecycle and endpoints.
         self.rollout_gateway_url: str | None = None
@@ -2990,16 +2996,21 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         return batch
 
-    def _update_actor(self, batch: KVBatchMeta, metrics: dict, push_model: bool = True) -> KVBatchMeta:
+    def _update_actor(
+        self,
+        batch: KVBatchMeta,
+        metrics: dict,
+        push_model: bool = True,
+        advance_lr_scheduler: bool = True,
+    ) -> KVBatchMeta:
         """Update the actor network.
 
         Args:
             batch: Training batch metadata.
             metrics: Metrics dict updated in-place.
-            push_model: If True (default), push weights to the PS after the
-                optimizer step. Fine-grain ``pre_step`` overlap passes False for
-                intermediate chunks so the version bump / buffer deletion only
-                happens after the last chunk of the step.
+            push_model: If True, push weights to the PS after the optimizer step.
+            advance_lr_scheduler: If True, advance the actor LR scheduler after the update.
+                Fine-grain overlap sets both flags only for the final logical chunk.
         """
         ppo_mini_batch_size = self.config.train_actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
@@ -3023,6 +3034,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "distillation_use_topk": distillation_use_topk,
             "compute_loss": True,
             "push_model": push_model,
+            "advance_lr_scheduler": advance_lr_scheduler,
         }
         batch.extra_info.update(extra_info)
 
@@ -3034,8 +3046,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         return batch
 
-    def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
-        """Update the critic network."""
+    def _update_critic(
+        self,
+        batch: KVBatchMeta,
+        metrics: dict,
+        advance_lr_scheduler: bool = True,
+    ) -> KVBatchMeta:
+        """Update the critic network, optionally advancing its LR scheduler."""
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.gen_actor_rollout_ref.rollout.n
         extra_info = {
@@ -3044,6 +3061,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "epochs": self.config.critic.ppo_epochs,
             "seed": self.config.critic.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.critic.shuffle},
+            "advance_lr_scheduler": advance_lr_scheduler,
         }
         batch.extra_info.update(extra_info)
 
@@ -3074,7 +3092,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
         if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
             fields.extend(gdpo_reward_keys)
-        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        moe_lb_metrics_interval = self.config.gen_actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
+        data = get_metric_data_with_optional_routed_experts(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            fields=fields,
+            moe_lb_metrics_interval=moe_lb_metrics_interval,
+            global_steps=global_steps,
+            accumulator=self._rollout_moe_lb_metrics_accumulator,
+            kv_batch_get=tq.kv_batch_get,
+        )
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
@@ -3097,6 +3124,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps})
+        metrics.update(
+            compute_moe_lb_metrics(
+                metrics_batch=metrics_batch,
+                moe_lb_metrics_interval=moe_lb_metrics_interval,
+                global_steps=global_steps,
+                accumulator=self._rollout_moe_lb_metrics_accumulator,
+            )
+        )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()

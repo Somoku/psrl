@@ -19,19 +19,11 @@ pressure (``address.c:1139 Assertion `addr_version == UCP_OBJECT_VERSION_V2'``).
 tensor (e.g. SwiGLU ``linear_fc1.weight`` as ``[hidden, 2*ffn_hidden]``), so
 the split/merge round-trip that DCP normally performs is avoided entirely.
 
-## Backward compatibility
-
-``_unwrap_sharded_state_dict`` also handles checkpoints saved in the legacy
-``per_rank_torch_save`` format, where ``apply_factories()`` was called before
-``torch.save()``.  That leaves ``list[ShardedTensor]`` entries for
-``ShardedTensorFactory`` outputs (e.g. SwiGLU ``linear_fc1.weight`` split into
-``[gate_half, up_half]``); these are reconstructed via
-``torch.cat([x.data for x in lst])``.
-
 ## Parallel config constraint
 
-The parallel config (TP / PP / DP / world_size) must be identical between save
-and load runs.  The saved ``parallel_config.json`` is validated on load.
+The topology (TP, PP/VPP, CP, EP, ETP, DP, and world size), optimizer mode,
+and architecture must be identical between save and load runs. The versioned
+``parallel_config.json`` is validated before any state is restored.
 """
 
 import json
@@ -48,7 +40,68 @@ from megatron.core.dist_checkpointing.mapping import (
 logger = logging.getLogger(__name__)
 
 _METADATA_FILE = "parallel_config.json"
-_KNOWN_FORMATS = frozenset({"per_rank_plain_tensors", "per_rank_torch_save"})
+_METADATA_VERSION = 2
+_CHECKPOINT_FORMAT = "per_rank_plain_tensors"
+
+
+def _parallel_world_size(getter_name: str) -> int:
+    getter = getattr(mpu, getter_name, None)
+    if getter is None:
+        return 1
+    value = getter()
+    return 1 if value is None else int(value)
+
+
+def _build_metadata(extra_metadata: dict | None = None) -> dict:
+    metadata = {
+        "metadata_version": _METADATA_VERSION,
+        "format": _CHECKPOINT_FORMAT,
+        "topology": {
+            "world_size": torch.distributed.get_world_size(),
+            "tp_size": _parallel_world_size("get_tensor_model_parallel_world_size"),
+            "pp_size": _parallel_world_size("get_pipeline_model_parallel_world_size"),
+            "vpp_size": _parallel_world_size("get_virtual_pipeline_model_parallel_world_size"),
+            "cp_size": _parallel_world_size("get_context_parallel_world_size"),
+            "ep_size": _parallel_world_size("get_expert_model_parallel_world_size"),
+            "etp_size": _parallel_world_size("get_expert_tensor_parallel_world_size"),
+            "dp_size": _parallel_world_size("get_data_parallel_world_size"),
+        },
+    }
+    if extra_metadata:
+        for key in ("optimizer_mode", "architecture"):
+            if key in extra_metadata:
+                metadata[key] = extra_metadata[key]
+    return metadata
+
+
+def _validate_metadata(saved: dict, expected: dict) -> None:
+    if saved.get("metadata_version") != _METADATA_VERSION:
+        raise ValueError(
+            f"Unsupported per-rank checkpoint metadata version {saved.get('metadata_version')!r}; "
+            f"expected {_METADATA_VERSION}."
+        )
+    if saved.get("format") != _CHECKPOINT_FORMAT:
+        raise ValueError(
+            f"Unsupported per-rank checkpoint format {saved.get('format')!r}; expected {_CHECKPOINT_FORMAT!r}."
+        )
+
+    mismatches = []
+    saved_topology = saved.get("topology", {})
+    for key, current_value in expected["topology"].items():
+        saved_value = saved_topology.get(key)
+        if saved_value != current_value:
+            mismatches.append(f"{key}: saved={saved_value!r}, current={current_value!r}")
+    for key in ("optimizer_mode", "architecture"):
+        current_value = expected.get(key)
+        saved_value = saved.get(key)
+        if current_value is not None and saved_value != current_value:
+            mismatches.append(f"{key}: saved={saved_value!r}, current={current_value!r}")
+    if mismatches:
+        raise ValueError(
+            "Per-rank checkpoints require identical topology and optimizer/model configuration; "
+            + "; ".join(mismatches)
+            + "."
+        )
 
 
 def _assert_no_sharded_objects(obj, _path="root"):
@@ -96,10 +149,9 @@ def _extract_plain_state_dict(obj):
 def _unwrap_sharded_state_dict(obj):
     """Unwrap Megatron checkpoint wrappers from a loaded state dict (load path).
 
-    Handles both the current format (plain tensors — effectively a no-op) and
-    the legacy ``per_rank_torch_save`` format where ``apply_factories()`` was
-    called before ``torch.save()``, leaving ``list[ShardedTensor]`` entries for
-    ``ShardedTensorFactory`` outputs.
+    Plain tensors are returned unchanged. Lists of sharded tensors are joined
+    defensively for checkpoints whose tensor payload was migrated from the old
+    factory-expanded representation into the current metadata format.
     """
     if isinstance(obj, dict):
         return {k: _unwrap_sharded_state_dict(v) for k, v in obj.items()}
@@ -119,7 +171,12 @@ def _unwrap_sharded_state_dict(obj):
     return obj
 
 
-def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
+def save_megatron_checkpoint(
+    sharded_state_dict,
+    ckpt_path,
+    async_save: bool = False,
+    metadata: dict | None = None,
+):
     """Save a Megatron sharded state dict using per-rank ``torch.save``.
 
     Args:
@@ -127,9 +184,11 @@ def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
             ``ShardedTensorFactory``, ``ShardedTensor``, ``ShardedObject``,
             ``LocalNonpersistentObject``).
         ckpt_path (str): Directory to save checkpoint files into.
-        async_save (bool): Unused; kept for API compatibility.
+        async_save (bool): Must be False; per-rank saves are synchronous.
+        metadata (dict | None): Optimizer mode and architecture metadata supplied by the manager.
     """
-    assert not async_save, "async_save is not supported by save_megatron_checkpoint"
+    if async_save:
+        raise ValueError("Per-rank Megatron checkpoints do not support async_save.")
 
     plain_state_dict = _extract_plain_state_dict(sharded_state_dict)
     _assert_no_sharded_objects(plain_state_dict)
@@ -143,22 +202,22 @@ def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
     assert os.path.exists(save_path), f"torch.save appeared to succeed but {save_path!r} not found on disk"
 
     if rank == 0:
-        metadata = {
-            "format": "per_rank_plain_tensors",
-            "world_size": world_size,
-            "tp_size": mpu.get_tensor_model_parallel_world_size(),
-            "pp_size": mpu.get_pipeline_model_parallel_world_size(),
-            "dp_size": mpu.get_data_parallel_world_size(),
-        }
+        checkpoint_metadata = _build_metadata(metadata)
+        if checkpoint_metadata["topology"]["world_size"] != world_size:
+            raise RuntimeError("Distributed world size changed while saving a per-rank checkpoint.")
         with open(os.path.join(ckpt_path, _METADATA_FILE), "w") as f:
-            json.dump(metadata, f, indent=2)
+            json.dump(checkpoint_metadata, f, indent=2)
 
     torch.distributed.barrier()
     logger.info("[Rank %d] Saved per-rank checkpoint to %s", rank, save_path)
     return None
 
 
-def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001  (sharded_state_dict unused; kept for API compatibility)
+def load_megatron_checkpoint(
+    sharded_state_dict,
+    ckpt_dir,
+    expected_metadata: dict | None = None,
+):  # noqa: ARG001
     """Load a per-rank Megatron checkpoint from *ckpt_dir*.
 
     Validates the parallel config stored in ``parallel_config.json`` and
@@ -169,6 +228,7 @@ def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001  (sh
             ``load_dist_checkpointing``.
         ckpt_dir (str): Directory containing ``rank_<N>.pt`` files and
             ``parallel_config.json``.
+        expected_metadata (dict | None): Optimizer mode and architecture expected by the manager.
 
     Returns:
         State dict with plain tensors and objects (no Megatron wrappers).
@@ -176,28 +236,22 @@ def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001  (sh
     rank = torch.distributed.get_rank()
     rank_path = os.path.join(ckpt_dir, f"rank_{rank}.pt")
 
-    assert os.path.exists(rank_path), (
-        f"Per-rank checkpoint not found: {rank_path!r}.  "
-        f"Only the per-rank format saved by save_megatron_checkpoint is supported."
-    )
+    if not os.path.exists(rank_path):
+        raise FileNotFoundError(
+            f"Per-rank checkpoint not found: {rank_path!r}. Only checkpoints saved by "
+            "save_megatron_checkpoint are supported."
+        )
 
     metadata_path = os.path.join(ckpt_dir, _METADATA_FILE)
-    assert os.path.exists(metadata_path), (
-        f"Metadata file not found: {metadata_path!r}.  Checkpoint directory may be corrupt or incomplete."
-    )
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(
+            f"Metadata file not found: {metadata_path!r}. Checkpoint directory may be corrupt or incomplete."
+        )
 
     with open(metadata_path) as f:
         metadata = json.load(f)
 
-    fmt = metadata.get("format")
-    assert fmt in _KNOWN_FORMATS, f"Unknown checkpoint format {fmt!r}; expected one of {sorted(_KNOWN_FORMATS)}"
-
-    saved_ws = metadata.get("world_size")
-    current_ws = torch.distributed.get_world_size()
-    assert saved_ws == current_ws, (
-        f"Checkpoint world_size={saved_ws} != current world_size={current_ws}.  "
-        f"Cannot load per-rank checkpoint with a different parallel config."
-    )
+    _validate_metadata(metadata, _build_metadata(expected_metadata))
 
     raw_state_dict = torch.load(rank_path, map_location="cpu", weights_only=False)
     state_dict = _unwrap_sharded_state_dict(raw_state_dict)

@@ -89,12 +89,10 @@ class MegatronConverter(BaseConverter):
                 # num_heads must be doubled when attn_output_gate is True
                 self.model_info["num_heads"] = self.model_info["num_heads"] * 2
 
-        conversion_tasks = self.bridge._model_bridge.build_conversion_tasks(self.parameter_mapping.config, models)
-        task_by_local_name = {
-            (task.vp_stage, task.param_name): task
-            for task in conversion_tasks
-            if task is not None and task.vp_stage is not None and task.megatron_module is not None
-        }
+        # The public API returns one globally ordered directory on every PP rank.
+        # Keep placeholders in the traversal so PP/VPP ranks observe the same task
+        # order; only materialize entries whose parameter is local to this rank.
+        conversion_tasks = list(self.bridge.get_conversion_tasks(models))
         embedding_hf_name = next(
             (
                 task.mapping.hf_param
@@ -106,34 +104,41 @@ class MegatronConverter(BaseConverter):
             ),
             None,
         )
+        converted_local_param_ids = set()
 
-        def get_model_chunk_generator():
-            for vpp_rank, model in enumerate(models):
-                existing_keys = set()
-                for name, param in model.named_parameters():
-                    existing_keys.add(name)
-                    yield vpp_rank, name, param
-                # NOTE(megatron-bridge): there is a bug in megatron GPTModel
-                # decoder.layers[n].mlp.router.expert_bias" in GPTModel
-                # is not registered in named_parameter, but in state_dict().
-                # for now we patch it by adding those keys to extra_keys.
-                extra_keys = [
-                    x
-                    for x in model.state_dict()
-                    if "_extra_state" not in x and "expert_bias" in x and x not in existing_keys
-                ]
-                for name in extra_keys:
-                    yield vpp_rank, name, model.state_dict()[name]
+        for task in conversion_tasks:
+            if task is None or task.param_weight is None:
+                continue
+            param = task.param_weight
+            global_name = task.global_param_name
+            converted_local_param_ids.add(id(param))
+            new_params = self.convert_parameter(global_name, param, task.mapping)
+            sharding = self.get_sharding_for_param(global_name, param)
+            for new_param_name, new_param in new_params.items():
+                # Each output param must own a separate sharding object because the server
+                # mutates shardings in place during `refactor_based_on_finer_shard_mesh`.
+                param_sharding = NIXLSharding(
+                    shard_mesh=OrderedDict(sharding.shard_mesh),
+                    shard_indices=list(sharding.shard_indices),
+                )
+                new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, param_sharding)
+                converted_state_dict[new_param_name] = new_param
+                sharding_dict[new_param_name] = sharding_for_param
 
-        for vpp_rank, name, param in get_model_chunk_generator():
-            task = task_by_local_name.get((vpp_rank, name))
-            if task is None:
-                if name.endswith("output_layer.weight"):
-                    # Skip output_layer.weight in the fallthrough — it's the lm_head
-                    # which is handled by the tied-weight alias workaround below
-                    # (exported from the embedding on the PP stage that has it).
+        # Preserve PSRL's pass-through handling for local parameters that the bridge
+        # intentionally omits, including router expert biases absent from `named_parameters`.
+        for vpp_rank, model in enumerate(models):
+            local_state = model.state_dict()
+            local_params = list(model.named_parameters())
+            existing_keys = {name for name, _ in local_params}
+            local_params.extend(
+                (name, local_state[name])
+                for name in local_state
+                if "_extra_state" not in name and "expert_bias" in name and name not in existing_keys
+            )
+            for name, param in local_params:
+                if id(param) in converted_local_param_ids or name.endswith("output_layer.weight"):
                     continue
-
                 if name.startswith("vision_model."):
                     raise ValueError(
                         "Megatron-Bridge did not produce a conversion task for vision parameter "
@@ -143,29 +148,11 @@ class MegatronConverter(BaseConverter):
                         "different naming convention, add an alias mapping in Megatron-Bridge instead "
                         "of translating it in PSRL."
                     )
-
                 converted_state_dict[name] = param
                 sharding_dict[name] = NIXLSharding(
                     shard_mesh=OrderedDict([(0, 1)]),
                     shard_indices=[(0,)],
                 )
-                continue
-            global_name = task.global_param_name
-            new_params = self.convert_parameter(global_name, param, task.mapping)
-            sharding = self.get_sharding_for_param(global_name, param)
-            for new_param_name, new_param in new_params.items():
-                # Each output param must own a SEPARATE sharding object because the server
-                # mutates shardings in-place during refactor_based_on_finer_shard_mesh.
-                # Without copy, Q/K/V from the same QKV split share one object, and
-                # refactoring Q's sharding (different unified mesh due to attn_output_gate)
-                # would corrupt K/V's sharding.
-                param_sharding = NIXLSharding(
-                    shard_mesh=OrderedDict(sharding.shard_mesh),
-                    shard_indices=list(sharding.shard_indices),
-                )
-                new_param, sharding_for_param = self.maybe_reshape_qkv_to_3d(new_param_name, new_param, param_sharding)
-                converted_state_dict[new_param_name] = new_param
-                sharding_dict[new_param_name] = sharding_for_param
 
         # NOTE(lhy): a workaround for lm_head with tied word embeddings.
         # When tie_word_embeddings=True, lm_head.weight == embed_tokens.weight.

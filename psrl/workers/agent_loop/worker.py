@@ -620,7 +620,17 @@ class PSRL_AgentLoopWorker:
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
         audios = multi_modal_data.get("audios")
-        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        image_token_id = get_processor_token_id(self.processor, "image")
+        video_token_id = get_processor_token_id(self.processor, "video")
+        collapse_ids = {token_id for token_id in (image_token_id, video_token_id) if token_id is not None}
+        collapsed_ids: list[int] = []
+        previous_id = None
+        for token_id in input_ids.reshape(-1).tolist():
+            if token_id in collapse_ids and token_id == previous_id:
+                continue
+            collapsed_ids.append(token_id)
+            previous_id = token_id
+        current_text = self.tokenizer.decode(collapsed_ids, skip_special_tokens=True)
 
         multi_modal_inputs = build_multimodal_processor_inputs(
             self.processor,

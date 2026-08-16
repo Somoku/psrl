@@ -37,6 +37,7 @@ class SessionAgentLoop(AgentLoopBase):
         self.session_router_url = context.session_router_url.rstrip("/")
         self.trajectory_id_strategy = get_trajectory_id_strategy(context.config)
         self.max_turns = context.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
+        self.tito_model_type = self.model_config.hf_config.model_type
 
     def get_generate_fields(self) -> list[str]:
         fields = super().get_generate_fields()
@@ -54,6 +55,7 @@ class SessionAgentLoop(AgentLoopBase):
             "x-is-sticky": str(
                 bool(self.config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky)
             ).lower(),
+            "x-smg-tito-model-type": self.tito_model_type,
         }
         rollout_instance_id = request.get("rollout_instance_id")
         if rollout_instance_id is not None:

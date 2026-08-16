@@ -54,6 +54,7 @@ class PSRL_BaseTrainWorker:
         self.nixl_wait_thread = None  # Single thread for all wait operations
         self.nixl_wait_thread_lock = threading.Lock()
         self.nixl_wait_completed = threading.Event()
+        self.nixl_wait_exception: BaseException | None = None
 
         # Build logger
         self.log_prefix = f"BaseTrainWorker_R{self.rank}"
@@ -150,6 +151,7 @@ class PSRL_BaseTrainWorker:
                     "you should wait for it to complete before calling nixl_push_model again."
                 )
             self.nixl_wait_thread = None
+            self.nixl_wait_exception = None
             self.nixl_wait_completed.clear()
 
         # Start a single background thread to wait for all operations
@@ -238,13 +240,15 @@ class PSRL_BaseTrainWorker:
                     # Only the representative rank pushes the model tag to the PS
                     ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
                 self.nixl_storage_client.clear_intermediate_cached_data()
-                self.nixl_wait_completed.set()
                 psrl_logger.debug(
                     f"All NIXL push operations completed, "
                     f"model with version {next_ps_model_version} is successfully pushed to the PS."
                 )
-            except Exception as e:
-                raise RuntimeError(f"Error in NIXL wait thread: {e}") from e
+            except BaseException as error:
+                self.nixl_wait_exception = error
+                psrl_logger.exception("NIXL push failed in the background wait thread.")
+            finally:
+                self.nixl_wait_completed.set()
 
         wait_thread = threading.Thread(target=wait_all_operations, daemon=True)
         wait_thread.start()
@@ -257,10 +261,13 @@ class PSRL_BaseTrainWorker:
         Wait for the NIXL push wait thread to complete.
 
         Args:
-            timeout (float, optional): Maximum time to wait in seconds. If None, wait indefinitely.
+            timeout (float | None): Maximum time to wait in seconds. If None, wait indefinitely.
 
         Returns:
-            bool: True if the thread completed successfully, False if timeout occurred or thread failed.
+            bool: True if the thread completed successfully, or False if the wait timed out.
+
+        Raises:
+            RuntimeError: If the background NIXL push failed.
         """
         with self.nixl_wait_thread_lock:
             if self.nixl_wait_thread is None:
@@ -268,27 +275,15 @@ class PSRL_BaseTrainWorker:
                 return True
 
             psrl_logger.debug("Waiting for NIXL wait thread to complete...")
-            if timeout is not None:
-                # Use the event to wait with timeout
-                if self.nixl_wait_completed.wait(timeout=timeout):
-                    # Event was set, check if thread actually completed successfully
-                    self.nixl_wait_thread.join(timeout=1.0)  # Brief join to catch any exceptions
-                    if self.nixl_wait_thread.is_alive():
-                        psrl_logger.warning("NIXL wait thread is still alive after event was set.")
-                        return False
-                    psrl_logger.debug("NIXL wait thread completed successfully.")
-                    return True
-                else:
-                    psrl_logger.warning("Timeout waiting for NIXL wait thread to complete.")
-                    return False
-            else:
-                # Wait indefinitely
-                self.nixl_wait_thread.join()
-                if self.nixl_wait_thread.is_alive():
-                    psrl_logger.warning("NIXL wait thread is still alive after join.")
-                    return False
-                psrl_logger.debug("NIXL wait thread completed successfully.")
-                return True
+            if not self.nixl_wait_completed.wait(timeout=timeout):
+                psrl_logger.warning("Timeout waiting for NIXL wait thread to complete.")
+                return False
+
+            self.nixl_wait_thread.join()
+            if self.nixl_wait_exception is not None:
+                raise RuntimeError("NIXL push failed in the background wait thread.") from self.nixl_wait_exception
+            psrl_logger.debug("NIXL wait thread completed successfully.")
+            return True
 
     def get_nixl_wait_thread_status(self) -> dict:
         """
@@ -304,6 +299,7 @@ class PSRL_BaseTrainWorker:
                 "has_thread": True,
                 "alive": self.nixl_wait_thread.is_alive(),
                 "completed": self.nixl_wait_completed.is_set(),
+                "failed": self.nixl_wait_exception is not None,
             }
 
     def push_model(self):

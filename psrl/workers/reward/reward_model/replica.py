@@ -14,8 +14,8 @@ class RewardModelReplica(PSRL_vLLMReplica):
        the parameter server, so ``sync_with_ps`` and ``pull_model`` are no-ops.
 
     2. **Pooling mode** — the rollout config for a reward model replica must set
-       ``runner: pooling`` so that ``PSRL_vLLMHttpServer`` dispatches requests to
-       ``_encode_internal()`` instead of the autoregressive generation path.
+       ``runner: pooling`` so the vLLM engine exposes pooling tasks through the SMG
+       gRPC servicer. Direct ``generate()`` and ``_encode_internal()`` calls are disabled.
     """
 
     def __init__(

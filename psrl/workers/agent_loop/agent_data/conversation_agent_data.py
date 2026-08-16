@@ -8,8 +8,8 @@ import torch
 from omegaconf import DictConfig
 from PIL import Image
 from verl.utils import tensordict_utils as tu
-from verl.utils.chat_template import apply_chat_template, initialize_system_prompt
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.tokenizer.chat_template import apply_chat_template, initialize_system_prompt
 
 from psrl.environments.base import ConversationType, Environment
 from psrl.workers.agent_loop.agent_data.base import AgentData, SessionData, Trajectory
@@ -33,7 +33,11 @@ def normalize_openai_messages(openai_messages: list[dict]) -> ConversationType:
             content = ""
         else:
             content = str(content)
-        messages.append({"role": str(message.get("role", "")), "content": content})
+        normalized = {"role": str(message.get("role", "")), "content": content}
+        for key in ("name", "tool_call_id", "tool_calls", "reasoning_content"):
+            if message.get(key) is not None:
+                normalized[key] = message[key]
+        messages.append(normalized)
     return messages
 
 
@@ -218,7 +222,6 @@ class ConversationAgentData(AgentData[ConversationType, object]):
         )
 
         assistant_content = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        self.add_step_chat_message({"role": "assistant", "content": assistant_content})
         self.set_step_model_response(assistant_content)
 
         try:
@@ -228,6 +231,10 @@ class ConversationAgentData(AgentData[ConversationType, object]):
         except Exception as exc:
             self.get_current_step().info["action_decode_error"] = repr(exc)
             action = []
+        assistant_message = {"role": "assistant", "content": assistant_content}
+        if isinstance(action, list) and action:
+            assistant_message["tool_calls"] = action
+        self.add_step_chat_message(assistant_message)
         if action is not None:
             self.set_step_action(action)
 

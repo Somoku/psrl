@@ -106,6 +106,17 @@ def validate_config(
 
     # AGENT(VERL): PSRL distinguish train and rollout gpu resources
 
+    actor_router_replay = config.train_actor_rollout_ref.actor.router_replay.mode
+    rollout_routing_replay = config.gen_actor_rollout_ref.rollout.enable_rollout_routing_replay
+    if actor_router_replay == "R3" and not rollout_routing_replay:
+        raise ValueError(
+            "Router replay mode R3 requires gen_actor_rollout_ref.rollout.enable_rollout_routing_replay=True."
+        )
+    if rollout_routing_replay and actor_router_replay != "R3":
+        raise ValueError(
+            "Rollout routing replay is only valid with train_actor_rollout_ref.actor.router_replay.mode='R3'."
+        )
+
     # number of GPUs used in training
     train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
     if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:

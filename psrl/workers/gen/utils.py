@@ -3,6 +3,8 @@ from typing import Any
 
 import torch
 
+from psrl.utils.routed_experts import canonicalize_routed_experts
+
 # (worker_id, data_parallel_rank)
 RolloutInstanceId = tuple[str, int]
 INVALID_ROLLOUT_INSTANCE_ID: RolloutInstanceId = ("", -1)
@@ -36,6 +38,8 @@ class TokenInput:
     """whether this request is for validation purpose"""
     stop_token_ids: list[int] | None = None
     """extra stop token ids required by model-specific tool parsers"""
+    priority: int = 0
+    """vLLM scheduling priority; lower values are scheduled first"""
 
 
 @dataclass
@@ -109,9 +113,13 @@ class TokenOutput:
         if response_logprobs is not None:
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
 
-        routed_experts = output.pop("routed_experts", None)
+        routed_experts = canonicalize_routed_experts(
+            output.pop("routed_experts", None),
+            prompt_length=len(self.prompt_ids),
+            response_length=len(self.response_ids),
+        )
         if routed_experts is not None:
-            output["routed_experts"] = torch.tensor(routed_experts, dtype=torch.int64)
+            output["routed_experts"] = routed_experts
 
         reward_score = output.get("reward_score", None)
         if reward_score is not None:

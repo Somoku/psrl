@@ -71,8 +71,8 @@ def test_empty_records():
     assert result["num_turns"] == 0
 
 
-def test_no_logprobs():
-    """Records without logprobs recover token IDs and use neutral logprobs."""
+def test_no_logprobs_is_rejected():
+    """Records without training logprobs fail closed."""
     accumulated = [1, 2, 3]
     records = [
         {
@@ -81,11 +81,8 @@ def test_no_logprobs():
             "finish_reason": "stop",
         }
     ]
-    result = build_training_data(accumulated, records)
-    assert result["prompt_ids"] == [1, 2]
-    assert result["response_ids"] == [3]
-    assert result["response_mask"] == [1]
-    assert result["logprobs"] == [0.0]
+    with pytest.raises(ValueError, match="Missing output_logprobs"):
+        build_training_data(accumulated, records)
 
 
 def test_trailing_trim_within_max_allowed():

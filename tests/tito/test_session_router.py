@@ -100,6 +100,7 @@ async def test_create_session(client, router):
         "/sessions",
         headers={
             "x-request-id": "request-1",
+            "x-smg-tito-model-type": "qwen3",
             "x-smg-tito-session-id": "spoofed-sid",
             "x-unrelated": "ignored",
         },
@@ -109,8 +110,21 @@ async def test_create_session(client, router):
     assert data["session_id"] == "test-sid-123"
     assert router.states["test-sid-123"].headers == {
         "x-request-id": "request-1",
+        "x-smg-tito-model-type": "qwen3",
         "x-smg-tito-session-id": "test-sid-123",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_model_type_is_forwarded_to_later_turns(client):
+    await client.post("/sessions", headers={"x-smg-tito-model-type": "qwen3_moe"})
+
+    await client.post(
+        "/sessions/test-sid-123/v1/chat/completions",
+        json={"model": "m", "messages": []},
+    )
+
+    assert captured["chat_headers"]["x-smg-tito-model-type"] == "qwen3_moe"
 
 
 @pytest.mark.asyncio

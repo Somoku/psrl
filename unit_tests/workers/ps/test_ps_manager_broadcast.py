@@ -7,8 +7,9 @@ Tests cover:
 2. TestBindPsWorkerGroupBroadcast — bind_ps_worker_group registers PS agent names on
    MetaServer when broadcast_init is enabled.
 """
-import pytest
-from unittest.mock import MagicMock, patch, call
+
+from unittest.mock import MagicMock, patch
+
 from omegaconf import OmegaConf
 
 
@@ -57,7 +58,7 @@ class TestCoordinateBroadcastInit:
         worker_mock = MagicMock()
         manager._ps_worker_handles_by_rank = [worker_mock]
 
-        with patch("ray.get") as mock_ray_get:
+        with patch("ray.get"):
             manager._coordinate_broadcast_init()
 
         # do_transfer_train_to_gen_after_broadcast must be called exactly once.
@@ -72,7 +73,7 @@ class TestCoordinateBroadcastInit:
         worker1 = MagicMock()
         manager._ps_worker_handles_by_rank = [worker0, worker1]
 
-        with patch("ray.get") as mock_ray_get:
+        with patch("ray.get"):
             manager._coordinate_broadcast_init()
 
         # Round 0: rank 0 is the sender.
@@ -89,8 +90,7 @@ class TestCoordinateBroadcastInit:
         workers = [MagicMock() for _ in range(4)]
         manager._ps_worker_handles_by_rank = workers
 
-        with patch("psrl.workers.ps.ps_manager.build_broadcast_plan", wraps=None) as mock_build, \
-             patch("ray.get"):
+        with patch("psrl.workers.ps.ps_manager.build_broadcast_plan", wraps=None) as mock_build, patch("ray.get"):
             # Make the mock return a plan whose num_rounds() == 0 so we don't need real ray handles.
             fake_plan = MagicMock()
             fake_plan.num_rounds.return_value = 0
@@ -110,7 +110,7 @@ class TestCoordinateBroadcastInit:
         manager._ps_worker_handles_by_rank = [worker0, worker1, worker2]
 
         ray_get_calls = []
-        with patch("ray.get", side_effect=lambda x: ray_get_calls.append(x)) as mock_ray_get:
+        with patch("ray.get", side_effect=lambda x: ray_get_calls.append(x)):
             manager._coordinate_broadcast_init()
 
         # binary_tree with world_size=3: ceil(log2(3)) = 2 rounds, but only round 0 has
@@ -139,8 +139,7 @@ class TestBindPsWorkerGroupBroadcast:
         # Pre-populate ps_nixl_agent_names so enable_broadcast_init_on_server won't raise.
         manager.ps_nixl_agent_names = ["agent_0", "agent_1"]
 
-        with patch.object(manager, "enable_broadcast_init_on_server") as mock_enable, \
-             patch("ray.get"):
+        with patch.object(manager, "enable_broadcast_init_on_server") as mock_enable, patch("ray.get"):
             # Override execute_all_async so agent name futures resolve correctly.
             wg.execute_all_async.return_value = [MagicMock()]
             manager.bind_ps_worker_group(wg)
@@ -153,8 +152,7 @@ class TestBindPsWorkerGroupBroadcast:
         wg = self._make_worker_group_mock(world_size=2)
         wg.execute_all_async.return_value = [MagicMock()]
 
-        with patch("ray.get"), \
-             patch.object(manager, "enable_broadcast_init_on_server") as mock_enable:
+        with patch("ray.get"), patch.object(manager, "enable_broadcast_init_on_server") as mock_enable:
             manager.bind_ps_worker_group(wg)
 
         mock_enable.assert_not_called()

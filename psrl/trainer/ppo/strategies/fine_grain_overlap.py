@@ -171,7 +171,11 @@ class FineGrainOverlapStrategy(StepStrategy):
                             psrl_logger,
                             event_type=EventType.TRAIN,
                         ):
-                            chunk_meta = t._update_critic(chunk_meta, metrics=metrics)
+                            chunk_meta = t._update_critic(
+                                chunk_meta,
+                                metrics=metrics,
+                                finalize_step=is_last,
+                            )
 
                 if t.config.trainer.critic_warmup <= t.global_steps:
                     # Push only on the last chunk. Intermediate pushes advance the
@@ -184,9 +188,14 @@ class FineGrainOverlapStrategy(StepStrategy):
                             psrl_logger,
                             event_type=EventType.TRAIN,
                         ):
-                            chunk_meta = t._update_actor(chunk_meta, metrics=metrics, push_model=is_last)
-                            # Ephemeral per-chunk control flag; must not survive into
-                            # KVBatchMeta.concat (False on intermediate, True on last).
+                            chunk_meta = t._update_actor(
+                                chunk_meta,
+                                metrics=metrics,
+                                finalize_step=is_last,
+                            )
+                            # Dispatch-local lifecycle controls must not survive into
+                            # `KVBatchMeta.concat` with different values per window.
+                            chunk_meta.extra_info.pop("advance_lr_scheduler", None)
                             chunk_meta.extra_info.pop("push_model", None)
 
             chunks.append(chunk_meta)

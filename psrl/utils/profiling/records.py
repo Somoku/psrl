@@ -49,7 +49,7 @@ class PrefillTrigger(StrEnum):
     """
 
     INITIAL = "initial"
-    RESUME = "resume"                               # transient — see docstring
+    RESUME = "resume"  # transient — see docstring
     PREEMPT_RESUME = "preempt_resume"
     INTERNAL_PREEMPT_RESUME = "internal_preempt_resume"
     PARTIAL_ROLLOUT_RESUME = "partial_rollout_resume"
@@ -194,12 +194,7 @@ class ModelTurnRecord:
         Equals the sum of all four components:
         router_wait_time_s + scheduler_wait_time_s + prefill_time_s + decode_time_s.
         """
-        return (
-            self.router_wait_time_s
-            + self.scheduler_wait_time_s
-            + self.prefill_time_s
-            + self.decode_time_s
-        )
+        return self.router_wait_time_s + self.scheduler_wait_time_s + self.prefill_time_s + self.decode_time_s
 
     @property
     def initial_cache_hit_rate(self) -> float:
@@ -287,8 +282,7 @@ class TrajectoryProfilingData:
 
         # Average cache hit rate across turns (each turn already weighted internally).
         avg_cache_hit_rate = (
-            sum(r.avg_cache_hit_rate for r in self.turn_records) / len(self.turn_records)
-            if self.turn_records else 0.0
+            sum(r.avg_cache_hit_rate for r in self.turn_records) / len(self.turn_records) if self.turn_records else 0.0
         )
 
         # Trigger breakdown across all PrefillRecords.

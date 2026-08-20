@@ -24,18 +24,14 @@ TODO (future): pre_step + micro_batch scope — true cross-chunk gradient
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import ray
 from transfer_queue.metadata import KVBatchMeta
 from verl.utils.debug import marked_timer
 
+from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 from psrl.trainer.ppo.strategies.base import StepStrategy, psrl_logger
 from psrl.utils.config import resolve_fine_grain_chunk_size
 from psrl.utils.logger import EventType, log_dual_events
-
-if TYPE_CHECKING:
-    from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
 
 class FineGrainOverlapStrategy(StepStrategy):

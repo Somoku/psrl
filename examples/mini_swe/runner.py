@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from examples.mini_swe.harness_adapter import MiniSWEAgentAdapter, MiniSWEAgentConfig, RunnerCancelled
@@ -53,6 +54,29 @@ _PROXY_ENV_KEYS = [
     "no_proxy",
     "NO_PROXY",
 ]
+
+_HARNESS_TARBALL_MOUNTS = (
+    ("AGENT_NODE_TARBALL", "/tmp/node22.tarball"),
+    ("AGENT_CC_TARBALL", "/tmp/claude-code.tgz"),
+    ("AGENT_CODEX_TARBALL", "/tmp/codex.tgz"),
+)
+
+
+def _harness_tarball_mounts(enabled: bool) -> tuple[MountSpec, ...]:
+    """Resolve optional host tarballs into read-only Docker mounts."""
+    if not enabled:
+        return ()
+
+    mounts: list[MountSpec] = []
+    for env_name, target in _HARNESS_TARBALL_MOUNTS:
+        source_value = os.environ.get(env_name)
+        if not source_value:
+            continue
+        source = Path(source_value).expanduser()
+        if not source.is_file():
+            raise RuntimeError(f"Harness tarball from {env_name} does not exist on the worker host: {source!s}.")
+        mounts.append(MountSpec(str(source), target, read_only=True))
+    return tuple(mounts)
 
 
 def _parse_memory_mb(value: str | int | None) -> int | None:
@@ -116,10 +140,12 @@ def build_sandbox_spec(
     container_config = resolve_container_config(payload, grading=grading)
     observation = payload["observation"]
     cwd = str(container_config.get("cwd", "/testbed"))
-    mounts: tuple[MountSpec, ...] = ()
+    mounts: list[MountSpec] = []
     if not grading and not observation.get("use_preexisting_repo", True) and observation.get("repo_path"):
-        mounts = (MountSpec(str(observation["repo_path"]), "/testbed"),)
+        mounts.append(MountSpec(str(observation["repo_path"]), "/testbed"))
         cwd = "/testbed"
+    if not grading:
+        mounts.extend(_harness_tarball_mounts(bool(container_config.get("mount_harness_tarballs", False))))
 
     task_id = str(observation.get("swe_task_id", ""))
     metadata = {"psrl.swe_task_id": task_id}
@@ -143,7 +169,7 @@ def build_sandbox_spec(
         workdir=cwd,
         metadata=metadata,
         env=sandbox_env,
-        mounts=mounts,
+        mounts=tuple(mounts),
         policy_profile=sandbox_config.get("policy_profile"),
         idle_timeout_s=parse_duration_seconds(container_config.get("container_timeout")),
         idempotency_key=f"{sandbox_prefix}:{'grader' if grading else 'rollout'}",

@@ -94,6 +94,7 @@ class DockerPolicyProfile:
     pids_limit: int | None = None
     cap_drop: tuple[str, ...] | None = None
     cap_add: tuple[str, ...] | None = None
+    no_new_privileges: bool | None = None
     read_only_rootfs: bool | None = None
     seccomp_profile: str | None = None
     user: str | None = None
@@ -243,12 +244,15 @@ class DockerBackend(SandboxBackend):
 
         cap_drop = self.security.cap_drop if policy.cap_drop is None else policy.cap_drop
         cap_add = self.security.cap_add if policy.cap_add is None else policy.cap_add
+        no_new_privileges = (
+            self.security.no_new_privileges if policy.no_new_privileges is None else policy.no_new_privileges
+        )
         read_only = self.security.read_only_rootfs if policy.read_only_rootfs is None else policy.read_only_rootfs
         pids_limit = self.security.pids_limit if policy.pids_limit is None else policy.pids_limit
         seccomp_profile = policy.seccomp_profile or self.security.seccomp_profile
         if seccomp_profile == "unconfined":
             raise ValueError("Docker seccomp cannot be disabled for PSRL sandboxes.")
-        security_options = ["no-new-privileges"] if self.security.no_new_privileges else []
+        security_options = ["no-new-privileges"] if no_new_privileges else []
         if seccomp_profile:
             security_options.append(f"seccomp={seccomp_profile}")
         tmpfs = {**dict(self.security.tmpfs), **dict(policy.tmpfs)}

@@ -30,6 +30,11 @@ def build_sandbox_manager(config: DictConfig | SandboxManagerConfig | None) -> S
         raw_configs = backend_configs or {}
     backends: dict[str, SandboxBackend] = {}
     for name, backend_config in raw_configs.items():
+        if isinstance(backend_config, SandboxBackend):
+            raise TypeError(
+                f"Sandbox backend {name!r} is already instantiated; "
+                "sandbox configuration must remain declarative until worker initialization."
+            )
         backend = hydra.utils.instantiate(backend_config)
         if not isinstance(backend, SandboxBackend):
             raise TypeError(f"Configured sandbox backend {name!r} is not a SandboxBackend.")

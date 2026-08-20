@@ -45,6 +45,10 @@ class HarnessAgentLoop(SessionAgentLoop):
     ) -> None:
         super().__init__(context=context)
         self.harness_config = HarnessConfig.from_value(harness)
+        default_context_window_tokens = int(self.rollout_config.prompt_length) + int(
+            self.rollout_config.response_length
+        )
+        self.compaction_budget = self.harness_config.compaction.resolve(default_context_window_tokens)
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -136,6 +140,10 @@ class HarnessAgentLoop(SessionAgentLoop):
                 session_root_url=session_root_url,
                 workdir=task.sandbox_spec.workdir or "/",
                 model=str(self.model_config.path),
+                context_window_tokens=(self.compaction_budget[0] if self.compaction_budget else None),
+                compaction_token_limit=(self.compaction_budget[1] if self.compaction_budget else None),
+                max_turns=int(self.max_turns) if self.max_turns is not None else None,
+                max_output_tokens=int(self.rollout_config.response_length),
             )
             await harness.prepare(harness_runtime)
             timing["prep_s"] = time.perf_counter() - run_start
@@ -157,11 +165,17 @@ class HarnessAgentLoop(SessionAgentLoop):
             session_id = None
 
             if not training_data or any(item["num_turns"] <= 0 or not item["response_ids"] for item in training_data):
-                psrl_logger.error(
-                    f"{self.harness_config.kind} produced no usable TITO trajectory "
-                    f"(exit_code={harness_result.exit_code!r}, stderr_tail={harness_result.stderr_tail[-2000:]!r})."
+                harness_result = await harness.collect_diagnostics(harness_result)
+                await self._dump_harness_training_data(
+                    request,
+                    training_data,
+                    TerminateReason.ROLLOUT_ERROR,
+                    self._build_partial_reward_info(training_data, harness_result),
                 )
-                return None, TerminateReason.ROLLOUT_ERROR
+                raise RuntimeError(
+                    f"{self.harness_config.kind} produced no usable TITO trajectory.\n"
+                    f"Harness process diagnostics:\n{harness_result.diagnostic_text()}"
+                )
 
             task_reward_info = await self.finalize_harness_task(
                 task,
@@ -176,7 +190,21 @@ class HarnessAgentLoop(SessionAgentLoop):
                 timing,
                 harness_result,
             )
-            outputs = [self._build_capped_output(item) for item in training_data]
+            try:
+                outputs = [self._build_capped_output(item) for item in training_data]
+            except Exception:
+                # The raw TITO trajectory is still valuable when the training
+                # budget cannot represent it (for example, when the harness
+                # system/tool prompt is already larger than prompt+response).
+                # The normal AgentLoopBase dump is unreachable in this case
+                # because run_with_termination_handling receives no output.
+                await self._dump_harness_training_data(
+                    request,
+                    training_data,
+                    TerminateReason.ROLLOUT_ERROR,
+                    reward_info,
+                )
+                raise
             for output in outputs:
                 output.agent_reward_info = dict(reward_info)
             output_value: TokenOutput | list[TokenOutput] = outputs[0] if len(outputs) == 1 else outputs
@@ -283,20 +311,79 @@ class HarnessAgentLoop(SessionAgentLoop):
         timing: dict[str, float],
         harness_result: HarnessResult,
     ) -> dict:
-        num_turns = max(item["num_turns"] for item in training_data)
         return {
             **task_reward_info,
+            **self._build_partial_reward_info(training_data, harness_result),
+            "timing": timing,
+            "harness_stdout_path": harness_result.stdout_path,
+            "harness_stderr_path": harness_result.stderr_path,
+        }
+
+    def _build_partial_reward_info(
+        self,
+        training_data: list[dict],
+        harness_result: HarnessResult,
+    ) -> dict:
+        """Build diagnostics that are safe even for an incomplete trajectory."""
+        num_turns = max((item.get("num_turns", 0) for item in training_data), default=0)
+        return {
             "num_turns": num_turns,
             "actual_num_turns": num_turns,
-            "timing": timing,
+            "trajectory_count": len(training_data),
+            "trajectory_token_lengths": [
+                len(item.get("prompt_ids", [])) + len(item.get("response_ids", [])) for item in training_data
+            ],
+            "compaction_context_window_tokens": (self.compaction_budget[0] if self.compaction_budget else None),
+            "compaction_token_limit": self.compaction_budget[1] if self.compaction_budget else None,
             "harness": self.harness_config.kind,
             "harness_exit_code": harness_result.exit_code,
             "harness_stderr_tail": harness_result.stderr_tail if harness_result.exit_code != 0 else "",
         }
 
+    async def _dump_harness_training_data(
+        self,
+        request: dict,
+        training_data: list[dict],
+        terminate_reason: TerminateReason,
+        reward_info: dict,
+    ) -> None:
+        """Persist raw TITO text before an error prevents normal output handling.
+
+        Successful rollouts are written by ``AgentLoopBase`` after the final
+        output is scored. Error paths can fail before that hook, so use the
+        untruncated TITO data here. This preserves the actual prompt,
+        assistant turns, observations, and compaction branches for debugging.
+        """
+        if not training_data or not getattr(self, "traj_writer", None) or not self.traj_writer.enable:
+            return
+        try:
+            outputs = [self.build_token_output(item) for item in training_data]
+            for output in outputs:
+                output.agent_reward_info = dict(reward_info)
+            output_value: TokenOutput | list[TokenOutput] = outputs[0] if len(outputs) == 1 else outputs
+            await self._resolve_version_for_dump(output_value, request)
+            self._attach_loop_timing(output_value)
+            self._dump_trajectory_text(request, output_value, terminate_reason)
+        except Exception:
+            psrl_logger.warning(
+                "Failed to dump raw harness trajectory for uid=%s.",
+                request.get("uid", "N/A"),
+                exc_info=True,
+            )
+
     def _build_capped_output(self, training_data: dict) -> TokenOutput:
         output = self.build_token_output(training_data)
         response_length = int(self.rollout_config.response_length)
+        if self.compaction_budget:
+            _, trajectory_budget = self.compaction_budget
+            remaining_response_tokens = trajectory_budget - len(output.prompt_ids)
+            if remaining_response_tokens <= 0:
+                raise RuntimeError(
+                    f"TITO trajectory {training_data.get('trajectory_id', '<unknown>')} has prompt length "
+                    f"{len(output.prompt_ids)} >= trajectory budget {trajectory_budget}. "
+                    "The harness prompt/system context is larger than the configured training budget."
+                )
+            response_length = min(response_length, remaining_response_tokens)
         output.response_ids = output.response_ids[:response_length]
         output.response_mask = output.response_mask[:response_length]
         if output.response_log_probs is not None:

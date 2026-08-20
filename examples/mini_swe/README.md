@@ -534,9 +534,17 @@ which is written by `prepare_swebench.py`.
 | `sandbox_config.snapshot_verifier` | Infrastructure | Use a capability-gated clean verifier snapshot when its spec matches exactly |
 | `sandbox_config.collect_resource_metrics` | Infrastructure | Sample per-trajectory memory/CPU once; disabled by default |
 | `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node (`0` = unlimited) |
-| `agent.system_template` | Native required | System prompt used only by mini-swe-agent (no default) |
-| `agent.problem_template` | Native required | Maps to mini-swe-agent's `instance_template`; harness loops build their own prompt |
+| `agent.system_template` | Native required | Native mini-SWE-agent system prompt; harnesses use their adapter-specific system prompt |
+| `agent.problem_template` | Native required | Native `instance_template`; harnesses preserve the same `<pr_description>` task boundary |
 | `agent.cost_limit` | Optional | LiteLLM cost limit per episode (`0.0` = unlimited) |
+
+Harness-specific Claude settings live under `harness`: `system_prompt` replaces
+Claude Code's large default CLI prompt, `tools` limits the tool catalog, and
+`compaction.context_window_tokens` is the CLI capacity. The compaction trigger
+defaults to `data.max_prompt_length + data.max_response_length`; set
+`safety_tokens: 0` when the trigger must be exact. The example uses a 32k CLI
+capacity and an exact 10,240-token training trajectory budget so Claude's
+system/tool overhead does not consume the native 2,048-token data prompt budget.
 
 ---
 

@@ -10,6 +10,7 @@
       image: "swebench-sentinel-override-per-instance"
       cwd: "/testbed"
       container_timeout: "2h"
+      mount_harness_tarballs: true
     rollout_environment:
       memory: "8g"
     grader_environment:
@@ -18,8 +19,43 @@
   harness:
     kind: claude_code
     executable: claude
+    # Claude rejects bypassPermissions when the process runs as root. Keep
+    # Docker root available for task commands, and pre-allow the tools needed
+    # by SWE-bench instead of using the root-incompatible bypass mode.
+    permission_mode: default
+    # Keep Claude's task protocol aligned with swebench_agent_config.yaml while
+    # replacing mini-SWE-agent's one-command response protocol with Claude's
+    # native tools. Replacing the default CLI system prompt is important here:
+    # the full Claude Code prompt/tool catalog is ~20k tokens and cannot fit in
+    # the 2048 + 8192 rollout budget.
+    system_prompt: |
+      You are a helpful coding agent working in the current repository.
+      Solve the software task in <pr_description> by editing source files,
+      running relevant tests, and leaving the working tree with the fix applied.
+      Do not modify tests or project configuration unless the task explicitly
+      requires it. Inspect the repository before editing and verify the result.
+    tools: "Bash,Read,Edit,Write,Glob,Grep"
+    allowed_tools:
+      - Bash
+      - Read
+      - Edit
+      - Write
+      - Glob
+      - Grep
+    # The training trigger is derived from rollout.prompt_length +
+    # rollout.response_length. The larger CLI capacity absorbs Claude's
+    # protocol overhead; safety_tokens=0 keeps the trigger exactly at 10240
+    # for this script.
+    compaction:
+      enabled: true
+      context_window_tokens: 32768
+      safety_tokens: 4096
     install:
-      command: curl -fsSL https://claude.ai/install.sh | bash && ln -sf /root/.local/bin/claude /usr/local/bin/claude
+      strategy: npm_tarball
+      check_command: /usr/local/bin/claude --version
+      node_tarball_env: AGENT_NODE_TARBALL
+      cli_tarball_env: AGENT_CC_TARBALL
+      cli_tarball_path: /tmp/claude-code.tgz
       timeout_s: 600
 
 - name: mini_swe_codex
@@ -28,6 +64,14 @@
   harness:
     kind: codex
     executable: codex
+    compaction:
+      enabled: true
+      context_window_tokens: 32000
+      safety_tokens: 0
     install:
-      command: npm install -g @openai/codex
+      strategy: npm_tarball
+      check_command: /usr/local/bin/codex --version
+      node_tarball_env: AGENT_NODE_TARBALL
+      cli_tarball_env: AGENT_CODEX_TARBALL
+      cli_tarball_path: /tmp/codex.tgz
       timeout_s: 600

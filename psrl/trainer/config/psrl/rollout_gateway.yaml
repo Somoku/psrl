@@ -44,3 +44,9 @@ grpc_registration_health_rpc_timeout_s: 5.0
 # verified to give ~100% cache-overlap routing. The hub path is retained for
 # opt-in use but currently exhibits a 0-overlap indexing bug under investigation.
 enable_kv_event_replay: False
+
+# Enale TITO debug in SMG
+tito_debug: False
+
+# Tool call parser for the SMG gateway
+tool_call_parser: null

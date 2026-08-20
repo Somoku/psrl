@@ -4,11 +4,19 @@ from psrl.sandbox import SandboxSession
 
 
 def build_harness_prompt(problem_statement: str) -> str:
-    """Wrap a SWE problem in instructions suitable for autonomous coding CLIs."""
+    """Render the same task boundary used by the native mini-SWE prompt.
+
+    The native ``problem_template`` starts the task with ``<pr_description>``.
+    Keep the task payload itself identical for Claude Code/Codex; their
+    interaction protocol belongs in the adapter's system prompt instead of
+    being mixed into the dataset problem text.
+    """
+    statement = problem_statement.strip()
     return (
-        "Work on the software task below in the current repository. Inspect the code, implement a robust fix, "
-        "and run relevant tests. Do not merely describe a solution; edit the working tree.\n\n"
-        f"{problem_statement.strip()}"
+        "<pr_description>\n"
+        f"{statement}\n"
+        "</pr_description>\n\n"
+        "Implement the required changes in the current repository and verify the fix."
     )
 
 

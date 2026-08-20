@@ -168,6 +168,10 @@ agent:
   sandbox:
 
     _target_: psrl.sandbox.config.SandboxManagerConfig
+    # Keep backend definitions declarative until `PSRL_AgentLoopWorker` builds its
+    # worker-local sandbox manager. Runtime objects such as Docker clients, metrics
+    # locks, and async locks must not enter `RolloutConfig`.
+    _recursive_: false
 
     default_backend: docker
 
@@ -195,6 +199,9 @@ agent:
             network_mode: bridge
             host_gateway_alias: host.docker.internal
             rewrite_loopback_proxies: true
+            # Allow setuid/sudo inside the task container. Linux capabilities
+            # remain dropped unless explicitly added above.
+            no_new_privileges: false
 
   # Maximum number of retries for each trajectory in case of failures.
   retry_limit: 1

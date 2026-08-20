@@ -158,6 +158,26 @@ async def test_docker_bridge_exposes_host_gateway_and_rewrites_loopback_proxy() 
 
 
 @pytest.mark.asyncio
+async def test_docker_policy_can_enable_suid_without_granting_extra_capabilities() -> None:
+    engine = FakeDockerEngine()
+    backend = DockerBackend(
+        engine=engine,
+        policy_profiles={"root_task": {"no_new_privileges": False}},
+    )
+
+    await backend.create(
+        SandboxSpec(
+            SandboxSource.image("python:3.11"),
+            policy_profile="root_task",
+        )
+    )
+
+    assert engine.config is not None
+    assert "no-new-privileges" not in engine.config["HostConfig"]["SecurityOpt"]
+    assert engine.config["HostConfig"]["CapDrop"] == ["ALL"]
+
+
+@pytest.mark.asyncio
 async def test_docker_create_recovers_idempotent_conflict(monkeypatch) -> None:
     engine = FakeDockerEngine()
     backend = DockerBackend(engine=engine)

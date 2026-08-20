@@ -18,6 +18,20 @@ PPO_RAY_RUNTIME_ENV = {
     },
 }
 
+_HOST_RUNTIME_ENV_KEYS = (
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "AGENT_NODE_TARBALL",
+    "AGENT_CC_TARBALL",
+    "AGENT_CODEX_TARBALL",
+)
+
 
 def get_ppo_ray_runtime_env():
     """
@@ -37,6 +51,11 @@ def get_ppo_ray_runtime_env():
             runtime_env["env_vars"].pop(key, None)
 
     for key in ("PYTHONPATH", "PYTHONPYCACHEPREFIX"):
+        val = os.environ.get(key)
+        if val:
+            runtime_env["env_vars"][key] = val
+
+    for key in _HOST_RUNTIME_ENV_KEYS:
         val = os.environ.get(key)
         if val:
             runtime_env["env_vars"][key] = val

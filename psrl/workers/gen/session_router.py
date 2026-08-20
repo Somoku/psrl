@@ -15,7 +15,7 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     request_raw,
 )
-from psrl.workers.gen.harness_protocol import (
+from psrl.workers.gen.harness.protocol import (
     anthropic_error_body,
     anthropic_error_response,
     anthropic_stream_response,

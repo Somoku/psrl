@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from examples.mini_swe.config import build_runtime_config
-from examples.mini_swe.harness_task import collect_git_patch
+from examples.mini_swe.harness_task import build_harness_prompt, collect_git_patch
 from omegaconf import OmegaConf
 from psrl.sandbox import (
     ExecResult,
@@ -23,8 +23,8 @@ from psrl.sandbox import (
 )
 from psrl.sandbox.backends.docker import DockerBackend, DockerPolicyProfile, DockerSession
 from psrl.workers.agent_loop.harness import (
+    HarnessCompactionConfig,
     HarnessConfig,
-    HarnessResult,
     HarnessRuntime,
     HarnessTaskContext,
     clean_snapshot_compatible,
@@ -99,12 +99,41 @@ class FakeSandbox(SandboxSession):
         return None
 
 
-def _runtime() -> HarnessRuntime:
+def _runtime(
+    context_window_tokens: int | None = None,
+    compaction_token_limit: int | None = None,
+    max_turns: int | None = None,
+    max_output_tokens: int | None = None,
+) -> HarnessRuntime:
     return HarnessRuntime(
         session_id="session-1",
         session_root_url="http://router/sessions/session-1",
         workdir="/testbed",
         model="Qwen/Qwen3",
+        context_window_tokens=context_window_tokens,
+        compaction_token_limit=compaction_token_limit,
+        max_turns=max_turns,
+        max_output_tokens=max_output_tokens,
+    )
+
+
+def test_harness_compaction_budget_uses_a_safe_trigger_before_the_window() -> None:
+    assert HarnessCompactionConfig().resolve(10_240) == (10_240, 9_728)
+    assert HarnessCompactionConfig(safety_tokens=0).resolve(10_240) == (10_240, 10_240)
+    assert HarnessCompactionConfig(context_window_tokens=32_000, safety_tokens=0).resolve(10_240) == (
+        32_000,
+        10_240,
+    )
+    with pytest.raises(ValueError, match="cannot exceed"):
+        HarnessCompactionConfig(trigger_tokens=10_241).resolve(10_240)
+
+
+def test_harness_prompt_preserves_native_miniswe_task_boundary() -> None:
+    prompt = build_harness_prompt("Fix the parser.")
+
+    assert prompt == (
+        "<pr_description>\nFix the parser.\n</pr_description>\n\n"
+        "Implement the required changes in the current repository and verify the fix."
     )
 
 
@@ -116,6 +145,10 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
             "kind": "claude_code",
             "executable": "claude",
             "args": ["--max-budget-usd", "0"],
+            "permission_mode": "default",
+            "allowed_tools": ["Bash", "Read", "Edit"],
+            "system_prompt": "minimal system",
+            "tools": "Bash,Read,Edit",
             "env": {"ANTHROPIC_BASE_URL": "http://must-not-escape", "CUSTOM": "value"},
         }
     )
@@ -130,7 +163,12 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     assert b"hasCompletedOnboarding" in sandbox.writes["/root/.claude.json"]
     cli_command, cwd, env = next(item for item in sandbox.commands if item[0].startswith("claude "))
     assert "--output-format stream-json" in cli_command
-    assert "> /dev/null" in cli_command
+    assert "--permission-mode default" in cli_command
+    assert "--allowedTools Bash Read Edit" in cli_command
+    assert "--system-prompt 'minimal system'" in cli_command
+    assert "--tools Bash,Read,Edit" in cli_command
+    assert "--max-turns" not in cli_command
+    assert "> /root/.psrl-harness/stdout.log" in cli_command
     assert cwd == "/testbed"
     assert env is not None
     assert env["ANTHROPIC_BASE_URL"] == "http://router/sessions/session-1"
@@ -146,8 +184,48 @@ async def test_successful_harness_skips_diagnostic_tail_commands() -> None:
     await harness.prepare(_runtime())
     result = await harness.run("fix", _runtime())
 
-    assert result == HarnessResult(exit_code=0)
+    assert result.exit_code == 0
+    assert result.stdout_tail == ""
+    assert result.stderr_tail == ""
     assert not any(command.startswith("tail -c") for command, _, _ in sandbox.commands)
+
+
+@pytest.mark.asyncio
+async def test_claude_code_receives_token_based_compaction_settings() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="claude_code", executable="claude"), sandbox)
+
+    env = harness.build_env(_runtime(10_240, 9_728))
+
+    assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "10240"
+    assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "95"
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in env
+
+
+def test_claude_code_receives_framework_turn_and_output_limits() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="claude_code", executable="claude"), sandbox)
+    runtime = _runtime(max_turns=12, max_output_tokens=2048)
+
+    command = harness.build_command("fix", runtime)
+    env = harness.build_env(runtime)
+
+    assert "--max-turns 12" in " ".join(command)
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "2048"
+
+
+@pytest.mark.asyncio
+async def test_failed_trajectory_can_collect_output_after_successful_cli_exit() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+    await harness.prepare(_runtime())
+
+    result = await harness.run("fix", _runtime())
+    diagnostic_result = await harness.collect_diagnostics(result)
+
+    assert diagnostic_result.stdout_tail == "bounded tail"
+    assert diagnostic_result.stderr_tail == "bounded tail"
+    assert sum(command.startswith("tail -c") for command, _, _ in sandbox.commands) == 2
 
 
 @pytest.mark.asyncio
@@ -179,6 +257,18 @@ async def test_codex_writes_responses_provider_config_and_uses_session_as_key() 
         "exec",
         "--skip-git-repo-check",
     )
+
+
+@pytest.mark.asyncio
+async def test_codex_writes_compaction_threshold_with_context_headroom() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
+
+    await harness.prepare(_runtime(10_240, 9_728))
+
+    codex_config = sandbox.writes["/root/.codex/config.toml"].decode()
+    assert "model_context_window = 10809" in codex_config
+    assert "model_auto_compact_token_limit = 9728" in codex_config
 
 
 @pytest.mark.asyncio

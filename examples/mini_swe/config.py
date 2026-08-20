@@ -48,6 +48,7 @@ class MiniEnvironmentConfig:
         }
     )
     forward_env: list[str] = field(default_factory=list)
+    mount_harness_tarballs: bool = False
     memory: str | int | None = "8g"
     container_timeout: str = "2h"
     # Default shell-command timeout; case-specific mappings may override it.

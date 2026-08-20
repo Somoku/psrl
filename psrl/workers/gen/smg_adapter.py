@@ -134,7 +134,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         psrl_kv_transfer_enable=kv_transfer_enable,
         psrl_kv_transfer_mode=kv_transfer_mode,
         psrl_kv_transfer_timeout_ms=kv_transfer_timeout_ms,
-        enable_tito=True,
+        enable_tito=bool(cfg_get(config, "psrl.rollout_gateway.enable_tito", True)),
         tito_debug=bool(cfg_get(config, "psrl.rollout_gateway.tito_debug", False)),
         tito_gc_threshold=cfg_get(config, "psrl.rollout_gateway.tito_gc_threshold", None),
         trajectory_id_strategy=get_trajectory_id_strategy(config),
@@ -147,6 +147,7 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         request_timeout_secs=2**64 - 1,
         log_level="warn",
         log_dir=cfg_get(config, "psrl.logging_path", None),
+        tool_call_parser=cfg_get(config, "psrl.rollout_gateway.tool_call_parser", "qwen"),
         api_key=None,
         disable_health_check=True,
     )
@@ -187,6 +188,7 @@ def build_reward_router_args(config: Any, host: str, port: int, prometheus_port:
         request_timeout_secs=2**64 - 1,
         log_level="warn",
         log_dir=cfg_get(config, "psrl.logging_path", None),
+        tool_call_parser=cfg_get(config, "psrl.rollout_gateway.tool_call_parser", "qwen"),
         api_key=None,
         disable_health_check=True,
     )

@@ -3,6 +3,7 @@ import base64
 import io
 import logging
 import os
+import traceback
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -68,6 +69,11 @@ class AgentLoopBase(ABC):
         self.response_length = self.rollout_config.response_length
         self.prompt_length = self.rollout_config.prompt_length
         self.output_in_tq = False
+        # Retry handling may intentionally convert an exception into a
+        # TerminateReason. Keep the original failure for the final worker and
+        # manager diagnostics instead of reducing it to an enum value.
+        self.last_error: BaseException | None = None
+        self.last_error_traceback = ""
         gateway_config = self.config.psrl.rollout_gateway
         self.gateway_multimodal = GatewayMultimodalPayloadBuilder(
             gateway_config.get("multimodal_preprocessing", "rust"),
@@ -701,6 +707,8 @@ class AgentLoopBase(ABC):
                 A tuple containing the output data (if any) and the termination reason.
         """
         request_ids = tu.get(request, "uid", "N/A")
+        self.last_error = None
+        self.last_error_traceback = ""
         try:
             prompt = {}
             for k, v in request.items():
@@ -733,12 +741,14 @@ class AgentLoopBase(ABC):
                         raise RuntimeError(
                             f"Agent loop run for request {request_ids} "
                             f"terminated with error: {terminate_reason.value}."
-                        )
+                        ) from self.last_error
                     psrl_logger.error(
                         "Agent loop run for request %s terminated with "
-                        "error: %s (raise_on_error=False, returning for retry/abort).",
+                        "error: %s (raise_on_error=False, returning for retry/abort).\n"
+                        "Underlying failure:\n%s",
                         request_ids,
                         terminate_reason.value,
+                        self.last_error_traceback or "<no underlying exception was captured>",
                     )
                 return None, terminate_reason
             elif not raise_on_error:
@@ -761,10 +771,14 @@ class AgentLoopBase(ABC):
                 exc_info=True,
             )
             return None, TerminateReason.TRAJECTORY_TIMEOUT
-        except Exception:
+        except Exception as exc:
+            self.last_error = exc
+            self.last_error_traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             if not raise_on_error:
                 psrl_logger.error(
-                    f"Exception in agent_loop.run for request {request_ids}",
+                    "Exception in agent_loop.run for request %s.\nUnderlying failure:\n%s",
+                    request_ids,
+                    self.last_error_traceback,
                     exc_info=True,
                 )
                 return None, TerminateReason.ROLLOUT_ERROR
@@ -861,6 +875,16 @@ class AgentLoopBase(ABC):
             f"env: {n_env} | total: {total_tokens}\n"
             f"[Time Breakdown] {' | '.join(breakdown)}\n"
         )
+        compaction_window = info.get("compaction_context_window_tokens")
+        compaction_limit = info.get("compaction_token_limit")
+        if compaction_window is not None or compaction_limit is not None:
+            text += (
+                "[Compaction] context_window_tokens: "
+                f"{compaction_window if compaction_window is not None else 'disabled'} | "
+                "trigger_tokens: "
+                f"{compaction_limit if compaction_limit is not None else 'disabled'} | "
+                f"trajectory_count: {info.get('trajectory_count', 1)}\n"
+            )
         return text
 
     def _dump_trajectory_text(

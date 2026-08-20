@@ -2,6 +2,7 @@
 
 from psrl.workers.agent_loop.harness.base import (
     Harness,
+    HarnessCompactionConfig,
     HarnessConfig,
     HarnessInstallConfig,
     HarnessResult,
@@ -12,6 +13,7 @@ from psrl.workers.agent_loop.harness.task import HarnessTaskContext, clean_snaps
 
 __all__ = [
     "Harness",
+    "HarnessCompactionConfig",
     "HarnessConfig",
     "HarnessInstallConfig",
     "HarnessResult",

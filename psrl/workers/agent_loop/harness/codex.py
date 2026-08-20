@@ -1,6 +1,7 @@
 """Codex CLI harness adapter."""
 
 import json
+import math
 import shlex
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
@@ -17,12 +18,30 @@ class CodexHarness(Harness):
         if result.exit_code != 0:
             raise RuntimeError(f"Could not create Codex config directory: {result.stderr.strip()}")
         model = self.config.model or runtime.model
-        config = "\n".join(
+        config_lines = [
+            f"model = {json.dumps(model)}",
+            'model_provider = "psrl"',
+            'approval_policy = "never"',
+            'sandbox_mode = "danger-full-access"',
+        ]
+        if runtime.context_window_tokens and runtime.compaction_token_limit:
+            # Current Codex releases clamp the configured auto-compact limit
+            # to 90% of model_context_window.  Choose a synthetic window that
+            # makes the requested token threshold the effective limit while
+            # still leaving room for Codex's compaction turn.
+            codex_context_window = max(
+                runtime.context_window_tokens,
+                math.ceil(runtime.compaction_token_limit / 0.9),
+            )
+            config_lines.extend(
+                (
+                    "",
+                    f"model_context_window = {codex_context_window}",
+                    f"model_auto_compact_token_limit = {runtime.compaction_token_limit}",
+                )
+            )
+        config_lines.extend(
             (
-                f"model = {json.dumps(model)}",
-                'model_provider = "psrl"',
-                'approval_policy = "never"',
-                'sandbox_mode = "danger-full-access"',
                 "",
                 "[model_providers.psrl]",
                 'name = "PSRL TITO"',
@@ -34,6 +53,7 @@ class CodexHarness(Harness):
                 "",
             )
         )
+        config = "\n".join(config_lines)
         await self.sandbox.write_bytes(str(codex_dir / "config.toml"), config.encode())
 
     def build_command(self, prompt: str, runtime: HarnessRuntime) -> Sequence[str]:
@@ -46,9 +66,13 @@ class CodexHarness(Harness):
         )
 
     def build_env(self, runtime: HarnessRuntime) -> Mapping[str, str]:
-        return {
-            **self.config.env,
-            "HOME": self.config.home_dir,
-            "OPENAI_API_KEY": runtime.session_id,
-            "CODEX_HOME": str(PurePosixPath(self.config.home_dir) / ".codex"),
-        }
+        return self.callback_no_proxy(
+            runtime,
+            {
+                **self.inherited_proxy_env(),
+                **self.config.env,
+                "HOME": self.config.home_dir,
+                "OPENAI_API_KEY": runtime.session_id,
+                "CODEX_HOME": str(PurePosixPath(self.config.home_dir) / ".codex"),
+            },
+        )

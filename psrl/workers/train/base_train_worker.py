@@ -407,7 +407,7 @@ class PSRL_BaseTrainWorker:
             # self._debug_log_ps_info(label=f"PS_BEFORE_PULL_R{self.worker_rank}")
             self.nixl_pull_model()
             # ---- DEBUG: log train info AFTER pull ----
-            self._debug_log_train_info(label=f"TRAIN_AFTER_PULL_R{self.worker_rank}")
+            # self._debug_log_train_info(label=f"TRAIN_AFTER_PULL_R{self.worker_rank}")
             # Reload the optimizer's fp32/bf16 copy from the model's current bf16 params
             # NOTE(linsh): Only reload after the first pull because
             # the model is init with empty state dict and pull from CPU PS

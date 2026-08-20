@@ -5,7 +5,10 @@ staleness=${1:-1}
 project_name=psrl_swe_smith
 experiment_name=GRPO-Qwen-4B-swe_smith-megatron-staleness_${staleness}
 
-source ${PSRL_WORKSPACE}/env/psrl.sh
+source ${PSRL_WORKSPACE}/env/env.sh
+
+export AGENT_NODE_TARBALL="/shared/artifacts/node-v22-linux-x64.tar.xz"
+export AGENT_CC_TARBALL="/shared/artifacts/anthropic-ai-claude-code-2.1.233.tgz"
 
 HOME=${PSRL_WORKSPACE}
 PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dirname(psrl.__file__)))")
@@ -21,8 +24,8 @@ echo "=== Pre-flight done ==="
 
 # --- Model ---
 # NOTE(lhy): Modify max_position_embeddings in config.json to 32768 after downloading.
-HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen3-4B-Instruct-2507
-DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-4B-Instruct-2507
+HF_MODEL_PATH=/jizhicfs/lhy/models/Qwen3-4B-Instruct-2507
+DIST_CKPT_PATH=/jizhicfs/lhy/models/mcore_ckpt/Qwen3-4B-Instruct-2507
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path ${HF_MODEL_PATH} --output_path ${DIST_CKPT_PATH}
 
 # --- Data ---
@@ -50,30 +53,30 @@ CKPT_ROOT=${CKPT_ROOT:-$PWD}
 default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 
 # --- Agent loop config (swebench-tuned: cwd=/testbed, swebench-style submit) ---
-agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_agent_config.yaml
+agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_harness_config.yaml
 
 # --- Cluster layout (32 GPUs total: 16 for rollout, 16 for train) ---
 # Rollout: TP=2 (4B is small, TP=2 is sufficient for inference)
 # Train: TP=4, PP=1 (4B fits easily without pipeline parallelism; DP=4)
 # Val: TP=2 (matches rollout engine, 8 instances)
-GEN_TP=4
+GEN_TP=2
 GEN_PP=1
 
-VAL_TP=4
+VAL_TP=2
 
-TRAIN_TP=8
+TRAIN_TP=4
 TRAIN_PP=1
 TRAIN_CP=2
 
-NNODES=4
+NNODES=2
 NGPUS_PER_NODE=8
 
-GEN_NNODES=2
+GEN_NNODES=1
 GEN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 GEN_INSTANCES=$(( (GEN_NNODES * GEN_NGPUS_PER_NODE) / (GEN_TP * GEN_PP) ))
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( GEN_TP * GEN_PP ))
 
-TRAIN_NNODES=2
+TRAIN_NNODES=1
 TRAIN_NGPUS_PER_NODE=${NGPUS_PER_NODE}
 
 VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / VAL_TP ))
@@ -83,7 +86,7 @@ VAL_NGPUS_PER_NODE_PER_INSTANCE=${VAL_TP}
 # Aligned with OpenClaw swe-rl 4B defaults:
 #   GRPO + DAPO asymmetric clip (0.2/0.28), KL effectively off, entropy=0.
 # Dynamic sampling filter: drops rollout groups with std=0 reward.
-enable_dynamic_sampling_filter=True
+enable_dynamic_sampling_filter=False
 adv_estimator=grpo
 use_kl_in_reward=False
 kl_coef=0.0
@@ -93,9 +96,9 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths (from OpenClaw 4B: response=4096, context=32768) ---
-max_turns=30
+max_turns=8
 max_prompt_length=2048
-max_response_length=32768
+max_response_length=29952
 packing_length=$((max_prompt_length + max_response_length))
 
 # --- Training hyperparameters (from OpenClaw 4B) ---
@@ -105,10 +108,10 @@ enable_overlong_buffer=False
 overlong_buffer_len=1024
 overlong_penalty_factor=1.0
 loss_agg_mode="token-mean"
-train_prompt_bsz=32
-n_resp_per_prompt=16
-n_resp_per_prompt_val=16
-train_prompt_mini_bsz=16
+train_prompt_bsz=2
+n_resp_per_prompt=8
+n_resp_per_prompt_val=8
+train_prompt_mini_bsz=2
 
 # --- Sampling (from OpenClaw 4B) ---
 temperature=1
@@ -137,6 +140,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.lmcache.enable=False \
     psrl.logging_path=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name} \
     psrl.log_prob.enable_rollout_engine_log_prob=True \
+    psrl.agentic_rl.trajectory_output.enable=True \
+    psrl.agentic_rl.trajectory_output.dir=${PSRL_PATH}/examples/mini_swe/megatron_psrl_log/${experiment_name}/trajectories \
     psrl.deployment.n_rollout_instances=${GEN_INSTANCES} \
     psrl.deployment.rollout_nnodes_per_instance=1 \
     psrl.deployment.rollout_ngpus_per_node_per_instance=${GEN_NGPUS_PER_NODE_PER_INSTANCE} \
@@ -147,7 +152,13 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
+    psrl.rollout_gateway.trajectory_id_strategy=auto \
+    psrl.rollout_gateway.tito_debug=true \
+    psrl.rollout_gateway.tool_call_parser=qwen \
     \
+    gen_actor_rollout_ref.rollout.agent.default_agent_loop=mini_swe_claude_code \
+    gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
+    gen_actor_rollout_ref.rollout.agent.sandbox.default_backend=docker \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     gen_actor_rollout_ref.rollout.pipeline_model_parallel_size=${GEN_PP} \

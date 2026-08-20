@@ -540,8 +540,21 @@ class PSRL_AgentLoopManager:
             accumulated_buffer_size.pop(buffer_id, None)
         return add_buffer
 
-    async def notify_group_failed(self, parent_id: int, failed_uid: int, is_validate: bool):
+    async def notify_group_failed(
+        self,
+        parent_id: int,
+        failed_uid: int,
+        is_validate: bool,
+        failure_summary: str | None = None,
+    ):
         """Recover a rollout group after one child fails without producing data."""
+        if failure_summary:
+            psrl_logger.error(
+                "notify_group_failed: root cause for parent_id=%s failed_uid=%s:\n%s",
+                parent_id,
+                failed_uid,
+                failure_summary,
+            )
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             if parent_id in self._failed_group_ids:

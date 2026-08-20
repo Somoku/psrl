@@ -7,12 +7,11 @@ expected by the CLI.
 
 import json
 from collections.abc import AsyncIterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-if TYPE_CHECKING:
-    from psrl.utils.common.http_utils import HttpResponse
+from psrl.utils.common.http_utils import HttpResponse
 
 SSE_HEADERS = {
     "cache-control": "no-cache",

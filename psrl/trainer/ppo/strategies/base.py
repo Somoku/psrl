@@ -11,15 +11,12 @@ from __future__ import annotations
 import logging
 import os
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
 
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.debug import marked_timer
 
+from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 from psrl.utils.logger import EventType, log_dual_events
-
-if TYPE_CHECKING:
-    from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

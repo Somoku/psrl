@@ -2,7 +2,87 @@
 Utility helpers for working with TransferQueue's KVBatchMeta.
 """
 
+from collections import Counter
+from enum import Enum
+from typing import Any
+
+import transfer_queue as tq
 from transfer_queue import KVBatchMeta
+
+
+class PayloadState(Enum):
+    """Lifecycle state for payloads stored in TransferQueue."""
+
+    PENDING_GROUP = "pending_group"
+    OCCUPIED = "occupied"
+    READY = "ready"
+    DROPPED = "dropped"
+    CONSUMED = "consumed"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Whether payload ownership has ended and its TQ storage may be cleared."""
+        return self in {PayloadState.DROPPED, PayloadState.CONSUMED}
+
+
+def request_payload_keys(request_id: int, n_trajectory: int) -> list[str]:
+    """Reconstruct the TQ payload keys for one request."""
+    if n_trajectory < 1:
+        raise ValueError(f"n_trajectory must be positive, got {n_trajectory}.")
+    if n_trajectory == 1:
+        return [str(request_id)]
+    return [f"{request_id}_{i}" for i in range(n_trajectory)]
+
+
+def _require_terminal_state(state: PayloadState) -> None:
+    if not state.is_terminal:
+        raise ValueError(f"Cannot clear payload in non-terminal state {state.value!r}.")
+
+
+def clear_payload(
+    keys: list[str] | str,
+    partition_id: str,
+    state: PayloadState,
+) -> None:
+    """Synchronously clear payload storage after entering a terminal state."""
+    _require_terminal_state(state)
+    tq.kv_clear(keys=keys, partition_id=partition_id)
+
+
+async def async_clear_payload(
+    keys: list[str] | str,
+    partition_id: str,
+    state: PayloadState,
+) -> None:
+    """Asynchronously clear payload storage after entering a terminal state."""
+    _require_terminal_state(state)
+    await tq.async_kv_clear(keys=keys, partition_id=partition_id)
+
+
+def validate_ready_payload(
+    keys: list[str],
+    partition_id: str,
+    partitions: dict[str, dict[str, dict[str, Any]]],
+) -> None:
+    """Validate that every key in a prospective READY batch is committed."""
+    duplicate_keys = sorted(key for key, count in Counter(keys).items() if count > 1)
+    partition = partitions.get(partition_id, {})
+    missing_keys = [key for key in keys if key not in partition]
+    non_success_keys = [
+        (key, partition[key].get("status"))
+        for key in keys
+        if key in partition and partition[key].get("status") != "success"
+    ]
+    if duplicate_keys or missing_keys or non_success_keys:
+        raise RuntimeError(
+            "Cannot publish READY payload: "
+            f"partition_id={partition_id!r}, total={len(keys)}, "
+            f"duplicate={len(duplicate_keys)}, missing={len(missing_keys)}, "
+            f"non_success={len(non_success_keys)}, "
+            f"duplicate_keys[:20]={duplicate_keys[:20]!r}, "
+            f"missing_keys[:20]={missing_keys[:20]!r}, "
+            f"non_success_keys[:20]={non_success_keys[:20]!r}."
+        )
 
 
 def kv_batch_meta_update_tags(batch: KVBatchMeta, key: str, value) -> KVBatchMeta:

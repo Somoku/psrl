@@ -206,7 +206,7 @@ class TrainClientActor:
     ):
         assert engine_type in ["fsdp", "fsdp_hybrid", "megatron"], f"engine {engine_type} is not supported"
         if rank == 0:
-            train_master_ip = os.environ.get("LOCAL_IP")
+            train_master_ip = ray.util.get_node_ip_address()
             ray.get(global_store.set_train_master_ip.remote(train_master_ip))
         else:
             train_master_ip = ray.get(global_store.get_train_master_ip.remote())
@@ -476,7 +476,7 @@ class GenClientActor:
         from vllm import LLM
 
         if rank == 0:
-            gen_master_ip = os.environ.get("LOCAL_IP")
+            gen_master_ip = ray.util.get_node_ip_address()
             ray.get(global_store.set_gen_master_ip.remote(gen_master_ip))
             """
             os.environ["UCX_LOG_LEVEL"] = "debug"

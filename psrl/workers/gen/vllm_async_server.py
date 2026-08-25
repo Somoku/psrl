@@ -527,6 +527,13 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         vllm_config.scheduler_config.preemption_notification_threshold = (
             self.psrl_config.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption
         )
+        # Wire prefill composition logging config into SchedulerConfig so RolloutScheduler
+        # can read them directly without relying on environment variables.
+        vllm_config.scheduler_config.psrl_prefill_composition_enable = (
+            self.psrl_config.profile.prefill_composition.enable
+        )
+        vllm_config.scheduler_config.psrl_logging_path = str(self.psrl_config.logging_path)
+        vllm_config.scheduler_config.psrl_replica_idx = self.get_replica_idx()
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}

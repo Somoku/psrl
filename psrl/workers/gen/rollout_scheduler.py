@@ -1,21 +1,109 @@
 import logging
 import os
+import time
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.v1.core.kv_cache_utils import hash_block_tokens, init_none_hash, make_block_hash_with_group_id
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
+from vllm.v1.utils import compute_iteration_details
+
+from psrl.utils.logger import FileOnlyHandler
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class RolloutScheduler(AsyncScheduler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Per-step prefill composition logging.
+        # Config is wired in by run_server() via scheduler_config attributes
+        # (psrl_prefill_composition_enable, psrl_logging_path, psrl_replica_idx),
+        # following the same pattern as preemption_notification_threshold.
+        sc = self.scheduler_config
+        self._pcomp_enable: bool = bool(getattr(sc, "psrl_prefill_composition_enable", False))
+        self._pcomp_logger: logging.Logger | None = None
+        self._pcomp_pending: dict[int, tuple[SchedulerOutput, float]] = {}
+        self._pcomp_step: int = 0
+        if self._pcomp_enable:
+            logging_path = str(getattr(sc, "psrl_logging_path", "~/psrl_logs"))
+            replica_idx = int(getattr(sc, "psrl_replica_idx", 0))
+            self._pcomp_logger = logging.getLogger(f"psrl.prefill_composition.I{replica_idx}")
+            self._pcomp_logger.propagate = False
+            self._pcomp_logger.setLevel(logging.INFO)
+            self._pcomp_logger.addHandler(FileOnlyHandler(logging_path, f"Prefill_I{replica_idx}"))
+
+    def schedule(self) -> SchedulerOutput:
+        sched_out = super().schedule()
+        if self._pcomp_enable:
+            self._pcomp_pending[id(sched_out)] = (sched_out, time.perf_counter())
+        return sched_out
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        result = super().update_from_output(scheduler_output, model_runner_output)
+        if self._pcomp_enable:
+            self._emit_prefill_composition(scheduler_output)
+        return result
+
+    def _emit_prefill_composition(self, scheduler_output: SchedulerOutput) -> None:
+        entry = self._pcomp_pending.pop(id(scheduler_output), None)
+        if entry is None:
+            return
+        _, sched_ts = entry
+        host_ms = (time.perf_counter() - sched_ts) * 1000.0
+
+        iteration_details = compute_iteration_details(scheduler_output)
+        if iteration_details.num_ctx_requests == 0:
+            return
+
+        self._pcomp_step += 1
+        M = scheduler_output.total_num_scheduled_tokens
+        nseq = len(scheduler_output.num_scheduled_tokens)
+
+        lines: list[str] = [
+            f"step={self._pcomp_step} M={M} nseq={nseq} host_ms={host_ms:.1f}"
+            f" ctx_reqs={iteration_details.num_ctx_requests}"
+            f" ctx_tokens={iteration_details.num_ctx_tokens}"
+            f" gen_reqs={iteration_details.num_generation_requests}"
+        ]
+
+        new_req_ids = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        new_req_data = {r.req_id: r for r in scheduler_output.scheduled_new_reqs}
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        cached_num_computed = dict(zip(cached_reqs.req_ids, cached_reqs.num_computed_tokens))
+
+        for idx, (req_id, q) in enumerate(scheduler_output.num_scheduled_tokens.items()):
+            rid_short = req_id[-8:] if len(req_id) > 8 else req_id
+            if req_id in new_req_ids:
+                rd = new_req_data[req_id]
+                hit = rd.num_computed_tokens
+                # Attempt to read local vs external split non-destructively.
+                req_obj = self.requests.get(req_id)
+                pfs = getattr(req_obj, "prefill_stats", None) if req_obj else None
+                if pfs is not None:
+                    local_hit = pfs.num_local_cached_tokens
+                    ext_hit = pfs.num_external_cached_tokens
+                    prompt = pfs.num_prompt_tokens
+                    hit_str = f"hit={hit}(L{local_hit}/E{ext_hit}) q={q} prompt={prompt}"
+                else:
+                    hit_str = f"hit={hit} q={q}"
+                lines.append(f"  [{idx}] rid=..{rid_short} new    {hit_str}")
+            elif cached_reqs.is_context_phase(req_id):
+                ctx = cached_num_computed.get(req_id, 0)
+                lines.append(f"  [{idx}] rid=..{rid_short} chunk  ctx={ctx} q={q}")
+            else:
+                ctx = cached_num_computed.get(req_id, 0)
+                lines.append(f"  [{idx}] rid=..{rid_short} decode ctx={ctx} q={q}")
+
+        self._pcomp_logger.info("\n".join(lines))  # type: ignore[union-attr]
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,

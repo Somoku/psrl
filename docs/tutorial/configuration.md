@@ -1137,8 +1137,10 @@ TransferQueue configuration is a top-level block in `ppo_trainer.yaml`.
 
 ### Profile
 
-Analysis-only switches that deliberately break training correctness. Keep both at
-their defaults for real runs.
+Switches for profiling and analysis. `disable_attn` and `fix_weight` deliberately
+break training correctness. Keep them at `False` for real runs. The `time_split`
+and `prefill_composition` switches are observability-only and safe to enable during
+normal training.
 
 `profile.disable_attn`
 : Disable attention in the rollout engine, propagated to vLLM as `VLLM_DISABLE_ATTN`
@@ -1148,6 +1150,26 @@ their defaults for real runs.
 `profile.fix_weight`
 : Skip the weight-load step after a parameter pull, so rollout instances keep serving
   their initial weights. Useful for measuring sync overhead without the load cost.
+  **Default:** `False`
+
+`profile.time_split.enable`
+: Enable periodic per-replica prefill/decode time-split logging to
+  `<psrl.logging_path>/TimeSplit_I{replica_idx}.log`. Each line reports cumulative
+  prefill and decode wall-time, prefill fraction, token counts, and wall time since
+  engine start.
+  **Default:** `True`
+
+`profile.time_split.interval_in_s`
+: Interval between time-split log entries, in seconds.
+  **Default:** `60.0`
+
+`profile.prefill_composition.enable`
+: Enable per-step prefill composition logging to
+  `<psrl.logging_path>/Prefill_I{replica_idx}.log`. Every engine step that runs a
+  prefill kernel emits one entry: which sequences were batched (new request, chunked
+  prefill, or co-scheduled decode), how many tokens each contributed as cache hit vs.
+  actual compute, and the host-side step duration. No sampling. High log volume on
+  long runs (potentially GB per replica).
   **Default:** `False`
 
 ---

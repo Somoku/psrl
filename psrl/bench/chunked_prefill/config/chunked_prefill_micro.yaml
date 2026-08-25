@@ -1,0 +1,83 @@
+# Chunked prefill micro-benchmark configuration.
+# Override any field via Hydra CLI: python -m psrl.bench.chunked_prefill.main_micro
+#   model.path=/path/to/model  rollout.tensor_parallel_size=4
+#   micro.experiment=e1  rollout.max_num_batched_tokens=65536
+
+psrl:
+  logging_path: ./chunked_prefill_logs
+
+model:
+  path: ~/models/SWE-agent-LM-7B
+  trust_remote_code: false
+
+rollout:
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  dtype: bfloat16
+  gpu_memory_utilization: 0.90
+  max_num_seqs: 1024
+  max_num_batched_tokens: 32768
+  enable_chunked_prefill: true
+  enable_prefix_caching: false
+  max_model_len: 65536
+  seed: 0
+
+micro:
+  # Experiment to run: "e1", "e2", "e3a", "e_chunked", or "all"
+  experiment: all
+
+  # E1: MFU vs total query tokens M.  Sweeps pure-prefill batches.
+  e1:
+    # M values to sweep (total query tokens per step).
+    # Can be overridden to a subset for quick smoke tests.
+    m_values: [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+    # For each M, test both single-request and multi-request decompositions
+    # to verify that GEMM efficiency is M-driven (not per-request q_len).
+    test_decompositions: true
+    # Target per-request q_len for the multi-request decomposition.
+    # Actual chunk may grow if m / multi_chunk_size would exceed max_num_seqs.
+    multi_chunk_size: 16
+
+  # E2: Mixed-batch overhead.  Sweeps (D decode, C prefill chunk, L context).
+  e2:
+    decode_counts: [0, 4, 8, 16, 32, 64]
+    prefill_chunks: [256, 512, 1024, 2048, 4096]
+    context_lens: [512, 2048, 8192]
+
+  # E3a: Per-step activation memory increment.
+  e3a:
+    # Same M sweep as E1; activation measured as increment over the KV baseline.
+    m_values: [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+  # E_chunked: multi-step chunked prefill sequence with per-step timing.
+  # Simulates a long sequence processed across multiple steps when
+  # max_num_batched_tokens < total_len.
+  e_chunked:
+    # Total sequence lengths to probe.
+    total_lens: [4096, 8192, 16384, 32768]
+    # Chunk sizes to probe (tokens per step).
+    # The interesting comparison is: same total_len, different chunk_size.
+    chunk_sizes: [512, 1024, 2048, 4096]
+    # Prefix cache hit lengths (simulate prefix reuse; 0 = no hit).
+    prefix_lens: [0, 2048]
+    # Decode request context lengths to run in parallel alongside each chunk step.
+    # Each list entry is a scenario: e.g. [] = no decode, [2048]*16 = 16 decode reqs.
+    decode_scenarios:
+      - []                  # pure chunked prefill, no concurrent decode
+      - [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]   # 8 decode reqs @ ctx=2048
+      - [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048,
+         2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]  # 16 decode reqs @ ctx=2048
+    warmup: 2
+    iters: 5
+
+  # Common measurement parameters (used by e1/e2/e3a; e_chunked has its own above).
+  warmup: 3
+  iters: 10
+
+  # Peak FLOPs of the target GPU (TFLOPS, bf16).
+  # Used only for MFU calculation; if 0 MFU is reported as null.
+  # H20: 148 TFLOPS (bf16 tensor core)
+  peak_tflops: 148.0
+
+  output_dir: ./results
+  output_prefix: micro

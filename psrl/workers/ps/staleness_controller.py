@@ -1,14 +1,28 @@
 import enum
+import logging
 from dataclasses import dataclass
 from functools import wraps
 
 import numpy as np
 
-from psrl.utils.logger import get_ps_logger
-from psrl.workers.gen.utils import RolloutInstanceId
+# NOTE(lhy): Use standard logging here so that this module can be imported
+# without pulling in the full psrl package (ray, torch, aiohttp, etc.).
+# The psrl logger is still available when the full psrl runtime is active
+# because standard `logging` integrates with any root logger configuration.
+try:
+    from psrl.utils.logger import get_ps_logger as _get_ps_logger
 
-# Use the unified PS logger
-psrl_logger = get_ps_logger()
+    psrl_logger = _get_ps_logger()
+except Exception:
+    psrl_logger = logging.getLogger("psrl.workers.ps.staleness_controller")
+
+# NOTE(lhy): RolloutInstanceId is a lightweight type alias (tuple[str, int]).
+# We define it inline to avoid importing through psrl.workers.gen.__init__,
+# which transitively requires ray and vllm.
+try:
+    from psrl.workers.gen.utils import RolloutInstanceId
+except Exception:
+    RolloutInstanceId = tuple  # type: ignore[assignment,misc]
 
 
 def _state_locked(func):
@@ -352,7 +366,7 @@ class StalenessInventory:
 
         buffer = StalenessBuffer(self.num_entries, self.ready_num_entries, self.staleness)
         self.buffers[buffer_id] = buffer
-        psrl_logger.info(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
+        psrl_logger.debug(f"[Buffer Create]: buffer {buffer_id} created, current buffer IDs: {self.buffers.keys()}")
         self._update_buffer_status(buffer_id)
         self.buffer_id += 1
 

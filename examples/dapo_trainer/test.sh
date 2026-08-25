@@ -89,7 +89,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.kl_loss_coef=0.01 \
     train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
-    +train_actor_rollout_ref.actor.rollout_n=$rollout_N \
+    train_actor_rollout_ref.actor.rollout_n=$rollout_N \
     train_actor_rollout_ref.actor.use_dynamic_bsz=True \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=22528 \
     +train_actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=0 \
@@ -134,7 +134,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     \
     psrl.rollout_coordination.routing_strategy.method="request_num_balance" \
-    psrl.rollout_coordination.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=True \
     psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \

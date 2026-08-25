@@ -113,12 +113,15 @@ class DPLBStatCollector(StatLoggerBase):
         self._cumulative_prefill_computed_tokens: int = 0  # actual computed (cache miss)
         self._cumulative_decode_tokens: int = 0
         self._last_time_split_log_time: float | None = None
-        self._time_split_logger = logging.getLogger(f"psrl.time_split.I{self.replica_idx}")
-        self._time_split_logger.propagate = False
-        self._time_split_logger.setLevel(logging.INFO)
-        self._time_split_logger.addHandler(
-            FileOnlyHandler(self.psrl_config.logging_path, f"TimeSplit_I{self.replica_idx}")
-        )
+        self._time_split_enable: bool = bool(self.psrl_config.profile.time_split.enable)
+        self._time_split_interval_s: float = float(self.psrl_config.profile.time_split.interval_in_s)
+        if self._time_split_enable:
+            self._time_split_logger = logging.getLogger(f"psrl.time_split.I{self.replica_idx}")
+            self._time_split_logger.propagate = False
+            self._time_split_logger.setLevel(logging.INFO)
+            self._time_split_logger.addHandler(
+                FileOnlyHandler(self.psrl_config.logging_path, f"TimeSplit_I{self.replica_idx}")
+            )
 
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
@@ -287,22 +290,23 @@ class DPLBStatCollector(StatLoggerBase):
                     self._cumulative_prefill_time += step_elapsed * (num_pt / total_tokens)
                     self._cumulative_decode_time += step_elapsed * (num_gt / total_tokens)
 
-            # Log cumulative prefill/decode time every 60s.
-            if self._last_time_split_log_time is None:
-                self._last_time_split_log_time = curr_time
-            if curr_time - self._last_time_split_log_time >= 60.0:
-                total_tracked = self._cumulative_prefill_time + self._cumulative_decode_time
-                self._time_split_logger.info(
-                    f"[I{self.replica_idx}] "
-                    f"cumulative_prefill_s={self._cumulative_prefill_time:.2f}, "
-                    f"cumulative_decode_s={self._cumulative_decode_time:.2f}, "
-                    f"prefill_frac={self._cumulative_prefill_time / max(total_tracked, 1e-9):.4f}, "
-                    f"prefill_tokens={self._cumulative_prefill_tokens}, "
-                    f"prefill_computed_tokens={self._cumulative_prefill_computed_tokens}, "
-                    f"decode_tokens={self._cumulative_decode_tokens}, "
-                    f"wall_time_s={curr_time - self.start_time:.1f}"
-                )
-                self._last_time_split_log_time = curr_time
+            # Log cumulative prefill/decode time at configured interval.
+            if self._time_split_enable:
+                if self._last_time_split_log_time is None:
+                    self._last_time_split_log_time = curr_time
+                if curr_time - self._last_time_split_log_time >= self._time_split_interval_s:
+                    total_tracked = self._cumulative_prefill_time + self._cumulative_decode_time
+                    self._time_split_logger.info(
+                        f"[I{self.replica_idx}] "
+                        f"cumulative_prefill_s={self._cumulative_prefill_time:.2f}, "
+                        f"cumulative_decode_s={self._cumulative_decode_time:.2f}, "
+                        f"prefill_frac={self._cumulative_prefill_time / max(total_tracked, 1e-9):.4f}, "
+                        f"prefill_tokens={self._cumulative_prefill_tokens}, "
+                        f"prefill_computed_tokens={self._cumulative_prefill_computed_tokens}, "
+                        f"decode_tokens={self._cumulative_decode_tokens}, "
+                        f"wall_time_s={curr_time - self.start_time:.1f}"
+                    )
+                    self._last_time_split_log_time = curr_time
 
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             if (

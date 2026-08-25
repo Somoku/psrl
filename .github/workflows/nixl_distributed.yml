@@ -21,20 +21,16 @@ jobs:
 
       - name: Install psrl
         run: |
-          source /jizhicfs/johnnyslin/env/psrl.sh
           pip install -e ".[grpc,test]"
 
       - name: Run NIXL unit tests (CPU-only subset)
         run: |
-          source /jizhicfs/johnnyslin/env/psrl.sh
           pytest -m cpu_test tests/nixl/ -v
 
       - name: Run NIXL sharding and comm planner tests
         run: |
-          source /jizhicfs/johnnyslin/env/psrl.sh
           pytest tests/nixl/test_comm_planner.py tests/nixl/test_nixl_sharding.py -v
 
       - name: Run NIXL e2e test (Megatron 16-GPU case)
         run: |
-          source /jizhicfs/johnnyslin/env/psrl.sh
           bash tests/nixl/scripts/test_nixl_e2e.sh

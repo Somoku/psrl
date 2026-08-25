@@ -15,8 +15,8 @@ HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-3B-Instruct
 DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen2.5-3B-Instruct
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path $HF_MODEL_PATH --output_path $DIST_CKPT_PATH
 
-TRAIN_FILE=/jizhicfs/lhy/data/dapo/dapo-math-17k.parquet
-TEST_FILE=/jizhicfs/lhy/data/dapo/aime-2024.parquet
+TRAIN_FILE=${PSRL_WORKSPACE}/data/dapo/dapo-math-17k.parquet
+TEST_FILE=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 
 GEN_DP=1 # DP in the generation side
 GEN_TP=1 # TP in the generation side

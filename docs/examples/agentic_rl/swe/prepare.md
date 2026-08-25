@@ -51,12 +51,12 @@ python -m examples.mini_swe.prepare.prepare_swebench \
 # 3. Pre-fetch Docker images to shared FS
 bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
     --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet \
-    --image-dir /jizhicfs/lhy/docker_images/swe --workers 4
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe --workers 4
 
 # 4. Fan out to all cluster nodes
 bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
-    --hosts /jizhicfs/lhy/hosts/32GPUs \
-    --image-dir /jizhicfs/lhy/docker_images/swe
+    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
+    --image-dir ${PSRL_WORKSPACE}/docker_images/swe
 ```
 
 ---

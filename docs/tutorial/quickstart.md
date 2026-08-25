@@ -17,6 +17,21 @@ DAPO algorithm with asynchronous staleness-3 training across 2 nodes (16 GPUs).
 | Backend | FSDP |
 | Network | InfiniBand / RoCE recommended |
 
+## Choose your runtime
+
+If you use Docker, run the following command from the repository root before following
+the steps below.
+
+```bash
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$PWD:/home/psrl" \
+  -it psrl:latest
+```
+
+If you installed from source, activate the environment created by the
+{doc}`installation` guide and run the commands from the repository root.
+
 ### Cluster Layout
 
 | Variable | Value | Description |
@@ -71,9 +86,11 @@ rest are workers):
 
 ```
 # ${PSRL_WORKSPACE}/hosts/16GPUs
-29.162.225.74
-28.59.19.217
+192.168.1.1
+192.168.1.2
 ```
+
+Replace these example hostnames with the actual hostnames or addresses of the nodes in your cluster.
 
 Then start the cluster from the launch node:
 

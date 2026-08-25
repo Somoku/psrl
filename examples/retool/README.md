@@ -115,7 +115,7 @@ psrl/tools/sandbox_fusion_tool.py                       # SandboxFusionTool base
 
 - NVIDIA GPUs (tested on A100, H100; 8× GPUs per node)
 - 4–8 nodes depending on the path (see table above)
-- Shared filesystem visible on every node (e.g. `/jizhicfs/`) — used to stage
+- Shared filesystem visible on every node — used to stage
   the SandboxFusion image tar and the model checkpoints
 - Docker on every worker node, with a daemon reachable by the current user
 
@@ -214,15 +214,15 @@ In brief:
 # (a) Build or pull code_sandbox:server into a shared-FS tar.
 DOCKERHUB_MIRROR=docker.m.daocloud.io \
 DOCKER_INSTALL_METHOD=skopeo \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_install.sh
 
 # (b) Fan the tar out to every node and docker load + retag.
-DOCKER_NODE_IPS=28.49.196.175:8,28.49.196.77:8,...,29.162.224.113:8 \
+DOCKER_NODE_IPS="${NODE_IPS}" \
 DOCKER_NODE_NUM=8 \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_copy.sh
@@ -233,7 +233,7 @@ DOCKER_IMAGE_TAG=code_sandbox:server \
 See [sandbox_fusion/README.md](sandbox_fusion/README.md).
 
 ```bash
-SANDBOX_NODE_IPS=28.49.196.175:8,28.49.196.77:8,...,29.162.224.113:8 \
+SANDBOX_NODE_IPS="${NODE_IPS}" \
 SANDBOX_NODE_NUM=8 \
   bash examples/retool/sandbox_fusion/launch_service.sh
 ```

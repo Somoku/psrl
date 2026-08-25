@@ -267,7 +267,9 @@ def compute_advantage_for_multi_trajectories(
     final_sessions: dict[str, tuple[int, int]] = {}
     row_session_keys = []
     for i, key in enumerate(batch_keys):
-        fields = key.rsplit("_", 1)
+        # A padding key ends in a UUID, not a trajectory index. Treat it as a
+        # standalone sample; its unique parent_id and zero mask keep its advantage zero.
+        fields = [key] if key.startswith("pad_") else key.rsplit("_", 1)
         if len(fields) == 2:
             uid, index = fields[0], int(fields[1])
             session_key = uid

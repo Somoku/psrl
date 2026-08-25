@@ -23,11 +23,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install psrl with GPU dependencies
         run: |
-          source /jizhicfs/johnnyslin/env/psrl.sh
           pip install -e ".[grpc,test]"
       - name: Run GPU + Ray tests
         run: |
-          source /jizhicfs/johnnyslin/env/psrl.sh
           pytest -m "not cpu_test" \
             --ignore=tests/nixl \
             -x \

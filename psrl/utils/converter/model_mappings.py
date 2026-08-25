@@ -1,9 +1,13 @@
 from abc import ABC, abstractmethod
+from collections import OrderedDict
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 import torch
 from torch.nn import Parameter
+
+from psrl.utils.nixl.nixl_spec import NIXLSharding
 
 _MISSING = object()
 
@@ -100,27 +104,56 @@ def reshape_qkv_to_3d(
 
 def reshape_visual_block_qkv(param, vision_head_size: int | None = None):
     """
-    For Qwen3.5, reshape qkv to support correct tp sharding (shard_dim=1).
+    Reshape a visual QKV tensor to PSRL's flattened-head transfer layout.
 
-    When vision_head_size is provided, produces the 4-D layout
-    [3, num_heads_local, head_size, ...] that is consistent with the PS/HF
-    converter format, enabling NIXL weight sync between gen and PS clients.
-    Without vision_head_size, falls back to the simpler 3-D layout
-    [3, rows/3, ...].
+    The canonical layout is `[3 * num_heads_local, head_size, ...]`. Flattening
+    the Q/K/V component and head axes lets both of these native layouts describe
+    zero-copy views of the same global tensor:
+
+    - FSDP's contiguous flat-row shards.
+    - Tensor parallelism's non-contiguous Q/K/V head groups.
+
+    Their different ownership is represented by `NIXLSharding`, rather than by
+    forcing one backend to materialize or communicate a reordered tensor.
     """
     rows = param.shape[0]
     assert rows % 3 == 0, f"Expected rows={rows} to be divisible by 3 for visual block qkv weights."
-    if vision_head_size and rows % (3 * vision_head_size) == 0:
-        num_heads_local = rows // (3 * vision_head_size)
-        if len(param.shape) == 1:
-            # Bias: [3*H*h] → [3, H, h, 1]
-            reshaped_data = param.data.reshape(3, num_heads_local, vision_head_size, 1)
-        else:
-            # Weight: [3*H*h, hidden] → [3, H, h, hidden]
-            reshaped_data = param.data.reshape(3, num_heads_local, vision_head_size, *param.shape[1:])
+    if vision_head_size is None:
+        raise ValueError("vision_head_size is required for visual QKV canonicalization.")
+    if param.ndim >= 2 and param.shape[1] == vision_head_size:
+        # Megatron's concatenated Q/K/V view is already in flattened-head form.
+        return make_slice_parameter(param.data, param)
+    assert rows % vision_head_size == 0, (
+        f"Expected rows={rows} to be divisible by vision_head_size={vision_head_size}."
+    )
+    if len(param.shape) == 1:
+        reshaped_data = param.data.reshape(rows // vision_head_size, vision_head_size, 1)
     else:
-        reshaped_data = param.data.reshape(3, rows // 3, *param.shape[1:])
+        reshaped_data = param.data.reshape(rows // vision_head_size, vision_head_size, *param.shape[1:])
     return make_slice_parameter(reshaped_data, param)
+
+
+def make_visual_qkv_tp_sharding(
+    tp_size: int,
+    tp_rank: int,
+) -> NIXLSharding:
+    """
+    Describe TP ownership in the flattened-head visual QKV layout.
+
+    A TP rank owns one head range from each of Q, K, and V. In a mesh of
+    `3 * tp_size` equal head shards, rank `r` therefore owns shard indices
+    `r`, `tp_size + r`, and `2 * tp_size + r`.
+    """
+    assert tp_size >= 1, f"tp_size must be positive, got {tp_size}."
+    assert 0 <= tp_rank < tp_size, f"tp_rank must be in [0, {tp_size}), got {tp_rank}."
+    return NIXLSharding(
+        shard_mesh=OrderedDict([(0, 3 * tp_size)]),
+        shard_indices=[
+            (tp_rank,),
+            (tp_size + tp_rank,),
+            (2 * tp_size + tp_rank,),
+        ],
+    )
 
 
 def reshape_q_to_5d(
@@ -204,6 +237,96 @@ def slice_gate_up_proj(
     ]
 
 
+@dataclass(frozen=True)
+class QKVTPLayout:
+    """
+    Describe Q/KV head placement across a tensor-parallel group.
+
+    Attributes:
+        tp_size (int): Tensor-parallel world size.
+        num_heads_local (int): Number of query heads stored by each TP rank.
+        num_kv_heads_local (int): Number of key/value heads stored by each TP rank.
+        num_kv_head_replicas (int): Number of TP ranks sharing each KV shard.
+    """
+
+    tp_size: int
+    num_heads_local: int
+    num_kv_heads_local: int
+    num_kv_head_replicas: int
+
+    @property
+    def num_kv_shards(self) -> int:
+        """
+        Return the number of distinct KV shards across all TP ranks.
+        """
+        return self.tp_size // self.num_kv_head_replicas
+
+    def get_kv_shard_rank(self, tp_rank: int) -> int:
+        """
+        Return the distinct KV shard index owned by a TP rank.
+
+        Args:
+            tp_rank (int): Tensor-parallel rank.
+
+        Returns:
+            int: KV shard index shared by this TP rank and its replicas.
+        """
+        assert 0 <= tp_rank < self.tp_size, (
+            f"Tensor parallel rank must be in [0, {self.tp_size}), got tp_rank = {tp_rank}."
+        )
+        return tp_rank // self.num_kv_head_replicas
+
+
+def get_qkv_tp_layout(
+    num_heads: int,
+    num_kv_heads: int,
+    tp_size: int,
+) -> QKVTPLayout:
+    """
+    Build the complete Q/KV head layout for tensor parallelism.
+
+    vLLM partitions KV heads when there are at least as many KV heads as TP
+    ranks. When TP is larger, each KV head is replicated across a contiguous
+    group of TP ranks.
+
+    Args:
+        num_heads (int): Global number of query heads.
+        num_kv_heads (int): Global number of key/value heads.
+        tp_size (int): Tensor-parallel world size.
+
+    Returns:
+        QKVTPLayout: Local head counts and KV shard replication metadata.
+    """
+    assert tp_size > 0, f"Tensor parallel size must be positive, got tp_size = {tp_size}."
+    assert num_kv_heads > 0, f"Number of KV heads must be positive, got num_kv_heads = {num_kv_heads}."
+    assert num_heads % tp_size == 0, (
+        "Number of heads must be divisible by tensor parallel size, "
+        f"but got num_heads = {num_heads} and tp_size = {tp_size}."
+    )
+
+    if num_kv_heads >= tp_size:
+        assert num_kv_heads % tp_size == 0, (
+            "Number of KV heads must be divisible by tensor parallel size when KV heads are partitioned, "
+            f"but got num_kv_heads = {num_kv_heads} and tp_size = {tp_size}."
+        )
+        num_kv_heads_local = num_kv_heads // tp_size
+        num_kv_head_replicas = 1
+    else:
+        assert tp_size % num_kv_heads == 0, (
+            "Tensor parallel size must be divisible by the number of KV heads when KV heads are replicated, "
+            f"but got tp_size = {tp_size} and num_kv_heads = {num_kv_heads}."
+        )
+        num_kv_heads_local = 1
+        num_kv_head_replicas = tp_size // num_kv_heads
+
+    return QKVTPLayout(
+        tp_size=tp_size,
+        num_heads_local=num_heads // tp_size,
+        num_kv_heads_local=num_kv_heads_local,
+        num_kv_head_replicas=num_kv_head_replicas,
+    )
+
+
 def slice_qkv_proj(
     fused_param: Parameter,
     num_heads: int,
@@ -230,23 +353,20 @@ def slice_qkv_proj(
         list[Parameter]: A list of three 2D parameters sharing storage with fused_param:
             [
               q_param, # shape (num_heads // tp_size * head_size, hidden)
-              k_param, # shape (num_kv_heads // tp_size * head_size, hidden)
-              v_param, # shape (num_kv_heads // tp_size * head_size, hidden)
+              k_param, # shape (num_kv_heads_local * head_size, hidden)
+              v_param, # shape (num_kv_heads_local * head_size, hidden)
             ]
+            When `num_kv_heads < tp_size`, `num_kv_heads_local` is 1 and the
+            same KV shard is replicated across multiple TP ranks.
     """
-    assert num_heads % tp_size == 0, (
-        "Number of heads must be divisible by tensor parallel size, "
-        f"but got num_heads = {num_heads} and tp_size = {tp_size}."
+    layout = get_qkv_tp_layout(
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        tp_size=tp_size,
     )
-    assert num_kv_heads % tp_size == 0, (
-        "Number of KV heads must be divisible by tensor parallel size, "
-        f"but got num_kv_heads = {num_kv_heads} and tp_size = {tp_size}."
-    )
-    num_heads_local = num_heads // tp_size
-    num_kv_heads_local = num_kv_heads // tp_size
-    q_len = num_heads_local * head_size
-    k_len = num_kv_heads_local * head_size
-    v_len = num_kv_heads_local * head_size
+    q_len = layout.num_heads_local * head_size
+    k_len = layout.num_kv_heads_local * head_size
+    v_len = layout.num_kv_heads_local * head_size
 
     assert fused_param.data.shape[output_dim] == (q_len + k_len + v_len), (
         f"Dim {output_dim} of fused parameter shape {fused_param.data.shape} "
@@ -408,6 +528,16 @@ def slice_fused_moe_w2_weight(
         down = fused_param.data[expert_id]
         expert_params.append(make_slice_parameter(down, fused_param))
     return expert_params
+
+
+def get_fused_moe_expert_prefix(param_name: str, projection: str) -> str | None:
+    """Return the canonical `...mlp.experts` prefix for a fused MoE parameter."""
+    for suffix in (f".{projection}.weight", f".{projection}"):
+        if param_name.endswith(suffix):
+            prefix = param_name[: -len(suffix)]
+            if prefix.endswith(".mlp.experts"):
+                return prefix
+    return None
 
 
 def slice_in_proj_qkvz(

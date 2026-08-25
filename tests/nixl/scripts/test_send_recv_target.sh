@@ -6,7 +6,7 @@
 #   RECV_IP   — IP of this (target) node
 #
 # Usage:
-#   RECV_IP=192.168.1.2 bash tests/nixl/scripts/test_send_recv_target.sh
+#   RECV_IP=node-b bash tests/nixl/scripts/test_send_recv_target.sh
 
 set -xeuo pipefail
 

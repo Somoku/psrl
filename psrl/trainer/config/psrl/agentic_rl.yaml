@@ -1,5 +1,12 @@
 # Agentic RL feature toggles.
 
+# Batch aggregation unit: request or trajectory (default).
+# trajectory: Treat every trajectory as one entry in the mini-batch
+# request: Treat all trajectories emitted by one request as one entry,
+#          multiple trajectories in one request only adds engine micro-batches,
+#          and sibling trajectories never cross optimizer steps.
+batch_agg_mode: trajectory
+
 # Error handling for terminations where TerminateReason.needs_manager_retry()
 # is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
 # (unclassified failure / zero turns produced). Timeouts and aborts are

@@ -32,7 +32,7 @@ MIRRORS=(
     registry.cyou
 )
 
-source /jizhicfs/lhy/env/psrl.sh >/dev/null 2>&1 || true
+source ${PSRL_WORKSPACE}/env/psrl.sh >/dev/null 2>&1 || true
 
 echo "Probing ${#MIRRORS[@]} mirrors against image:"
 echo "  $IMG"

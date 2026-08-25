@@ -1010,7 +1010,7 @@ class ClusterScanner:
 # Example usage
 # ----------------------------------------
 if __name__ == "__main__":
-    ips = ["28.49.53.113", "28.49.55.40"]
+    ips = ["192.168.1.1", "192.168.1.2"]
     username = "root"
     ssh_port = 36000
     ssh_key = None

@@ -1,5 +1,4 @@
 """Unit tests for KVCacheManager LMCache local snapshot query."""
-import pytest
 
 
 class TestLmcacheLocalSnapshot:
@@ -7,8 +6,9 @@ class TestLmcacheLocalSnapshot:
 
     def _make_manager(self):
         from unittest.mock import MagicMock
-        from psrl.utils.kv_cache.manager import KVCacheManager
+
         from psrl.utils.kv_cache.config import LMCacheConfig
+        from psrl.utils.kv_cache.manager import KVCacheManager
 
         config = MagicMock(spec=LMCacheConfig)
         config.enable = True
@@ -53,8 +53,8 @@ class TestLmcacheLocalSnapshot:
         chunk_size = 4
         tokens = list(range(12))  # 3 full chunks
 
-        from vllm.utils.hashing import sha256
         from lmcache.v1.token_database import NONE_HASH
+        from vllm.utils.hashing import sha256
 
         hash_fn = sha256
 
@@ -80,8 +80,8 @@ class TestLmcacheLocalSnapshot:
         chunk_size = 4
         tokens = list(range(12))
 
-        from vllm.utils.hashing import sha256
         from lmcache.v1.token_database import NONE_HASH
+        from vllm.utils.hashing import sha256
 
         hash_fn = sha256
 
@@ -106,8 +106,8 @@ class TestLmcacheLocalSnapshot:
         chunk_size = 4
         tokens = list(range(12))
 
-        from vllm.utils.hashing import sha256
         from lmcache.v1.token_database import NONE_HASH
+        from vllm.utils.hashing import sha256
 
         hash_fn = sha256
 
@@ -142,8 +142,8 @@ class TestLmcacheLocalSnapshot:
         """Test that hash function mismatch disables the snapshot."""
         mgr = self._make_manager()
 
-        from vllm.utils.hashing import sha256
         from lmcache.v1.token_database import NONE_HASH
+        from vllm.utils.hashing import sha256
 
         hash_fn = sha256
         mgr._lmcache_hash_fn = hash_fn
@@ -168,8 +168,8 @@ class TestLmcacheLocalSnapshot:
         chunk_size = 4
         tokens = list(range(12))
 
-        from vllm.utils.hashing import sha256
         from lmcache.v1.token_database import NONE_HASH
+        from vllm.utils.hashing import sha256
 
         hash_fn = sha256
 

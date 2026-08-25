@@ -60,7 +60,7 @@ combined output directory:
 
 ```bash
 python -m examples.mini_swe.eval.eval_swebench_multinode \
-    --hosts /jizhicfs/lhy/hosts/32GPUs \
+    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
     --dataset examples/mini_swe/data/verified_subset_80/train.parquet \
     --output-dir examples/mini_swe/output/eval/gold_sanity_mn \
     --gold-patches \
@@ -101,7 +101,7 @@ tool-calls), so vLLM should be started as a **plain text-completion server**
 
 ```bash
 bash examples/mini_swe/eval/serve_vllm.sh \
-    --checkpoint /jizhicfs/lhy/checkpoints/my-step-1000 \
+    --checkpoint ${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
     --served-model-name my-model \
     --port 8000 \
     --tp 4 \            # tensor parallel across 4 GPUs on this host
@@ -144,8 +144,8 @@ across hosts):
 
 ```bash
 bash examples/mini_swe/eval/serve_vllm_multinode.sh \
-    --hosts /jizhicfs/lhy/hosts/32GPUs \
-    --checkpoint /jizhicfs/lhy/checkpoints/my-step-1000 \
+    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
+    --checkpoint ${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
     --served-model-name my-model \
     --port 8000 \
     --tp 4 \
@@ -168,7 +168,7 @@ export OPENAI_API_KEY=dummy
 export NO_PROXY="localhost,127.0.0.1"
 
 python -m examples.mini_swe.eval.eval_swebench_multinode \
-    --hosts /jizhicfs/lhy/hosts/32GPUs \
+    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
     --dataset examples/mini_swe/data/verified_subset_80/train.parquet \
     --output-dir examples/mini_swe/output/eval/my_step1000_mn \
     --model my-model \
@@ -202,7 +202,7 @@ Llama3-Instruct, etc.) you need the tool-call parser on the vLLM side:
 
 ```bash
 bash examples/mini_swe/eval/serve_vllm.sh \
-    --checkpoint /jizhicfs/lhy/checkpoints/external-model \
+    --checkpoint ${PSRL_WORKSPACE}/checkpoints/external-model \
     --served-model-name ext-model \
     --port 8001 \
     --tp 4 \
@@ -237,7 +237,7 @@ node, `ray start --address=<head>:6379` on the workers), then use
 kill "$(cat /tmp/vllm_8000.pid)"
 
 # Every host in a hosts file
-pssh -h /jizhicfs/lhy/hosts/32GPUs -i \
+pssh -h ${PSRL_WORKSPACE}/hosts/32GPUs -i \
     "pkill -f 'vllm.entrypoints.openai.api_server.*--port 8000'"
 ```
 

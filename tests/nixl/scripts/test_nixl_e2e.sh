@@ -40,7 +40,7 @@ if [ $CASE -eq 1 ]; then
         test.megatron.context_parallel_size=1 \
         test.gen.tensor_parallel_size=4 \
         test.gen.pipeline_parallel_size=1 \
-        model.path=/jizhicfs/lhy/models/Qwen2.5-32B \
+        model.path=${PSRL_WORKSPACE}/models/Qwen2.5-32B \
         2>&1 | tee test_nixl_e2e.log
 fi
 
@@ -112,7 +112,7 @@ if [ $CASE -eq 5 ]; then
         test.gen.tensor_parallel_size=4 \
         test.gen.pipeline_parallel_size=1 \
         test.gen.expert_parallel_size=4 \
-        model.path=/jizhicfs/johnnyslin/models/Qwen3-30B-A3B-Instruct-2507 \
+        model.path=${PSRL_WORKSPACE}/models/Qwen3-30B-A3B-Instruct-2507 \
         model.train_dtype=bfloat16 \
         2>&1 | tee test_nixl_e2e.log
 fi
@@ -135,7 +135,7 @@ if [ $CASE -eq 6 ]; then
         test.gen.tensor_parallel_size=2 \
         test.gen.pipeline_parallel_size=1 \
         test.gen.data_parallel_size=4 \
-        model.path=/jizhicfs/johnnyslin/models/Qwen3.5-4B \
+        model.path=${PSRL_WORKSPACE}/models/Qwen3.5-4B \
         model.trust_remote_code=true \
         model.train_dtype=bfloat16 \
         2>&1 | tee test_nixl_e2e.log
@@ -159,7 +159,7 @@ if [ $CASE -eq 7 ]; then
         test.gen.pipeline_parallel_size=1 \
         test.gen.expert_parallel_size=4 \
         test.gen.data_parallel_size=2 \
-        model.path=/jizhicfs/johnnyslin/models/Qwen3.5-35B-A3B \
+        model.path=${PSRL_WORKSPACE}/models/Qwen3.5-35B-A3B \
         model.trust_remote_code=true \
         model.train_dtype=bfloat16 \
         2>&1 | tee test_nixl_e2e.log
@@ -185,7 +185,7 @@ if [ $CASE -eq 8 ]; then
         test.gen.pipeline_parallel_size=1 \
         test.gen.data_parallel_size=2 \
         test.gen.expert_parallel_size=4 \
-        model.path=/jizhicfs/johnnyslin/models/Moonlight-16B-A3B \
+        model.path=${PSRL_WORKSPACE}/models/Moonlight-16B-A3B \
         model.trust_remote_code=true \
         model.train_dtype=bfloat16 \
         2>&1 | tee test_nixl_e2e.log

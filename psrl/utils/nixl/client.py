@@ -534,7 +534,7 @@ class NIXLStorageClient:
             # Pre-scan meta tensors: one 1D buffer per dtype, single _record_region_registration per
             # buffer; each tensor is a view (offset + length, then reshape) via MetaBuffer.
             meta_buffer: MetaBuffer | None = None
-            if binded_meta_tensor_mapping is None and not meta_only:
+            if binded_meta_tensor_mapping is None:
                 entries: list[tuple[tuple[Any, Any], tuple[int, ...], torch.dtype]] = []
                 for key, tensor in state_dict.items():
                     assert key in sharding_dict, f"Key {key} not found in sharding_dict."
@@ -561,6 +561,8 @@ class NIXLStorageClient:
             tensor_infos = {}
             for key, tensor in state_dict.items():
                 assert key in sharding_dict, f"Key {key} not found in sharding_dict."
+                if tensor.device != torch.device("meta") and tensor.untyped_storage().nbytes() == 0:
+                    tensor = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
                 sharding = sharding_dict[key]
                 shard_indices = sharding.shard_indices
                 # assert sharding.is_contiguous_sharding(), "Only contiguous sharding is supported for now."

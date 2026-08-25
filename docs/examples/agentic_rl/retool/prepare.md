@@ -40,14 +40,14 @@ Every rollout worker emits Python `code_interpreter` tool calls that hit
 ```bash
 DOCKERHUB_MIRROR=docker.m.daocloud.io \
 DOCKER_INSTALL_METHOD=skopeo \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_install.sh
 
-DOCKER_NODE_IPS=28.49.196.175:8,...,29.162.224.113:8 \
+DOCKER_NODE_IPS="${NODE_IPS}" \
 DOCKER_NODE_NUM=8 \
-DOCKER_IMAGE_DIR=/jizhicfs/lhy/docker_images \
+DOCKER_IMAGE_DIR=${PSRL_WORKSPACE}/docker_images \
 DOCKER_IMAGE_FILE=code_sandbox.tar \
 DOCKER_IMAGE_TAG=code_sandbox:server \
   bash examples/retool/docker_scripts/docker_copy.sh
@@ -59,7 +59,7 @@ DOCKER_IMAGE_TAG=code_sandbox:server \
 ### Step 2: Deploy the SandboxFusion Swarm service
 
 ```bash
-SANDBOX_NODE_IPS=28.49.196.175:8,...,29.162.224.113:8 \
+SANDBOX_NODE_IPS="${NODE_IPS}" \
 SANDBOX_NODE_NUM=8 \
   bash examples/retool/sandbox_fusion/launch_service.sh
 ```

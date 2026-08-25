@@ -64,6 +64,23 @@ Built on [veRL](https://github.com/volcengine/verl), PSRL focuses on the system 
 
 ### Installation
 
+#### Docker
+
+```bash
+docker build --progress=plain -f docker/Dockerfile -t psrl:latest .
+
+docker run --rm --gpus all --ipc=host --shm-size=16g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$PWD:/home/psrl" \
+  -it psrl:latest
+```
+
+For CPU-only development and smoke tests, build `docker/Dockerfile.cpu` and use
+`psrl:cpu`. See the [Docker guide](docker/README.md) for prerequisites, reproducible
+builds, and multi-node runtime settings.
+
+#### From source
+
 ```bash
 # Rust prerequisite installation
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -73,16 +90,18 @@ source "$HOME/.cargo/env"
 conda create -n psrl python=3.12
 conda activate psrl
 
-# Install all dependencies (including NIXL and Megatron)
+# Install core dependencies
 # If you have an existing **editable** vLLM or veRL installation,
 # you can pass in VLLM_PATH and VERL_PATH to `scripts/install_basic.sh`.
 bash scripts/install_basic.sh
+
+# Install performance components as needed
 bash scripts/install_nixl.sh
 bash scripts/install_megatron.sh
 bash scripts/install_lmcache.sh
 
 # Install PSRL
-pip install -e .
+python -m pip install -e .
 ```
 
 See the [Installation guide](https://psrl.readthedocs.io/en/latest/tutorial/installation.html) for prerequisites, verification steps, and details on each component.

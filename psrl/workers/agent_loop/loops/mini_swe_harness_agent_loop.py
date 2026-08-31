@@ -9,13 +9,14 @@ from dataclasses import asdict, dataclass
 
 from examples.mini_swe.config import MINI_SWE_SLOT_PREFIX, MiniSWEAgentRuntimeConfig, build_runtime_config
 from examples.mini_swe.harness_task import build_harness_prompt, collect_git_patch
+from examples.mini_swe.integrity import scan_claude_code_integrity
 from examples.mini_swe.runner import build_grader_spec, build_sandbox_spec, grade_patch
 
 from psrl.environments import Environment
 from psrl.sandbox import SandboxSession, SnapshotRef, SyncSandboxManager
 from psrl.utils.concurrency import SlotManager
 from psrl.workers.agent_loop.context import AgentLoopContext
-from psrl.workers.agent_loop.harness import HarnessRuntime, HarnessTaskContext
+from psrl.workers.agent_loop.harness import HarnessResult, HarnessRuntime, HarnessTaskContext
 from psrl.workers.agent_loop.loops.harness_agent_loop import HarnessAgentLoop
 from psrl.workers.agent_loop.loops.utils import register
 
@@ -32,6 +33,14 @@ class MiniSWEHarnessTaskState:
     environment: Environment
     payload: dict
     run_slot: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class MiniSWEHarnessArtifact:
+    """Store patch and post-hoc harness integrity diagnostics."""
+
+    patch: str
+    integrity: dict
 
 
 @register("mini_swe_harness")
@@ -96,16 +105,45 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         task: HarnessTaskContext[MiniSWEHarnessTaskState],
         sandbox: SandboxSession,
         runtime: HarnessRuntime,
-    ) -> str:
+        harness_result: HarnessResult,
+    ) -> MiniSWEHarnessArtifact:
         """
-        Capture the repository patch before the rollout sandbox is destroyed.
+        Capture the repository patch and harness tool trace before teardown.
         """
-        return await collect_git_patch(sandbox, runtime.workdir)
+        swe_problem = task.state.payload["observation"].get("swe_problem", {})
+        patch = await collect_git_patch(
+            sandbox,
+            runtime.workdir,
+            base_commit=str(swe_problem.get("base_commit") or "") or None,
+        )
+        integrity: dict = {
+            "violated": False,
+            "reasons": [],
+            "violations": [],
+            "parsed_lines": 0,
+            "malformed_lines": 0,
+            "tool_calls": 0,
+        }
+        if self.harness_config.kind == "claude_code" and harness_result.stdout_path:
+            try:
+                log_bytes = await sandbox.read_bytes(harness_result.stdout_path)
+            except Exception as exc:
+                integrity.update(
+                    {
+                        "violated": True,
+                        "reasons": ["integrity_trace_unavailable"],
+                        "scan_error": str(exc),
+                    }
+                )
+                psrl_logger.warning("Could not read Claude Code tool trace for integrity analysis.", exc_info=True)
+            else:
+                integrity = scan_claude_code_integrity(log_bytes, str(swe_problem.get("repo") or ""))
+        return MiniSWEHarnessArtifact(patch=patch, integrity=integrity)
 
     async def finalize_harness_task(
         self,
         task: HarnessTaskContext[MiniSWEHarnessTaskState],
-        artifact: str,
+        artifact: MiniSWEHarnessArtifact,
         clean_snapshot: SnapshotRef | None,
         timing: dict[str, float],
     ) -> dict:
@@ -113,15 +151,39 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         Grade the Mini-SWE patch and return reward-specific metadata.
         """
         grading_started = time.perf_counter()
-        grader_result = await self._grade_patch(task, artifact, clean_snapshot)
+        if artifact.integrity.get("violated"):
+            swe_problem = task.state.payload["observation"].get("swe_problem", {})
+            grader_result = self._integrity_failure_result(swe_problem, artifact.integrity)
+        else:
+            grader_result = await self._grade_patch(task, artifact.patch, clean_snapshot)
         timing["grading_s"] = time.perf_counter() - grading_started
         result = grader_result or {}
         return {
-            "patch": artifact or None,
+            "patch": artifact.patch or None,
+            "integrity": artifact.integrity,
             "alignment_failed": False,
             "alignment_failure_reason": "",
             "grader_result": result,
             "acc": float(bool(result.get("resolved", False))),
+        }
+
+    @staticmethod
+    def _integrity_failure_result(swe_problem: dict, integrity: dict) -> dict:
+        """Return a grader-shaped failure without executing protected output."""
+        return {
+            "policy_violated": True,
+            "policy_reasons": list(integrity.get("reasons", [])),
+            "resolved": False,
+            "apply_ok": False,
+            "f2p_pass": 0,
+            "f2p_total": len(swe_problem.get("FAIL_TO_PASS", [])),
+            "p2p_pass": 0,
+            "p2p_total": len(swe_problem.get("PASS_TO_PASS", [])),
+            "timeout": False,
+            "error": None,
+            "elapsed_s": 0.0,
+            "output_tail": "",
+            "resolved_by": "integrity_blocked",
         }
 
     async def close_harness_task(self, task: HarnessTaskContext[MiniSWEHarnessTaskState]) -> None:

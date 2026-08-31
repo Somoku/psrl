@@ -45,10 +45,15 @@ class HarnessAgentLoop(SessionAgentLoop):
     ) -> None:
         super().__init__(context=context)
         self.harness_config = HarnessConfig.from_value(harness)
-        default_context_window_tokens = int(self.rollout_config.prompt_length) + int(
-            self.rollout_config.response_length
-        )
-        self.compaction_budget = self.harness_config.compaction.resolve(default_context_window_tokens)
+        self.rollout_budget = int(self.rollout_config.prompt_length) + int(self.rollout_config.response_length)
+        # ``compaction_budget`` only configures the external harness's context
+        # compaction trigger; it is NOT the trainable trajectory budget.
+        self.compaction_budget = self.harness_config.compaction.resolve(self.rollout_budget)
+        # Session-scoped prompt-too-long budget forwarded to SMG (as the
+        # `x-smg-prompt-too-long-limit` header). When the accumulated prompt
+        # reaches this trigger, SMG returns an Anthropic `prompt_too_long` error
+        # so Claude Code's reactive compact keeps the session within the budget.
+        self.prompt_too_long_limit = self.compaction_budget[1] if self.compaction_budget else None
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
             raise ValueError("Harness training requires rollout.multi_turn.enable=True.")
@@ -77,6 +82,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         task: HarnessTaskContext,
         sandbox: SandboxSession,
         runtime: HarnessRuntime,
+        harness_result: HarnessResult,
     ) -> Any:
         """
         Collect an optional task artifact before the agent sandbox is destroyed.
@@ -114,7 +120,16 @@ class HarnessAgentLoop(SessionAgentLoop):
         harness: Harness | None = None
         clean_snapshot: SnapshotRef | None = None
         run_start = time.perf_counter()
-        timing = {"prep_s": 0.0, "assistant_s": 0.0, "env_s": 0.0, "elapsed_s": 0.0}
+        timing = {
+            "prep_s": 0.0,
+            "assistant_s": 0.0,
+            "env_s": 0.0,
+            "elapsed_s": 0.0,
+            "task_prepare_s": 0.0,
+            "sandbox_create_s": 0.0,
+            "snapshot_s": 0.0,
+            "install_s": 0.0,
+        }
         try:
             task = await self.prepare_harness_task(request)
             timing["task_prepare_s"] = time.perf_counter() - run_start
@@ -130,7 +145,9 @@ class HarnessAgentLoop(SessionAgentLoop):
                 lease = await acquire_task
                 raise
             timing["sandbox_create_s"] = time.perf_counter() - sandbox_started
+            snapshot_started = time.perf_counter()
             clean_snapshot = await self._try_snapshot_clean_sandbox(task, lease)
+            timing["snapshot_s"] = time.perf_counter() - snapshot_started
 
             session_root_url = self.session_root_url(session_id, self.harness_config.callback_base_url)
             session_root_url = lease.session.resolve_callback_url(session_root_url)
@@ -143,9 +160,10 @@ class HarnessAgentLoop(SessionAgentLoop):
                 context_window_tokens=(self.compaction_budget[0] if self.compaction_budget else None),
                 compaction_token_limit=(self.compaction_budget[1] if self.compaction_budget else None),
                 max_turns=int(self.max_turns) if self.max_turns is not None else None,
-                max_output_tokens=int(self.rollout_config.response_length),
             )
+            install_started = time.perf_counter()
             await harness.prepare(harness_runtime)
+            timing["install_s"] = time.perf_counter() - install_started
             timing["prep_s"] = time.perf_counter() - run_start
 
             harness_started = time.perf_counter()
@@ -155,7 +173,12 @@ class HarnessAgentLoop(SessionAgentLoop):
                 return None, TerminateReason.TRAJECTORY_TIMEOUT
             timing["assistant_s"] = time.perf_counter() - harness_started
 
-            artifact = await self.collect_harness_artifact(task, lease.session, harness_runtime)
+            artifact = await self.collect_harness_artifact(
+                task,
+                lease.session,
+                harness_runtime,
+                harness_result,
+            )
             await self._capture_resource_metrics(task, lease, timing)
             training_data = await self.get_training_data(session_id)
 
@@ -220,16 +243,21 @@ class HarnessAgentLoop(SessionAgentLoop):
         task: HarnessTaskContext,
         lease: SandboxLease,
     ) -> SnapshotRef | None:
-        if not (
-            clean_snapshot_compatible(task)
-            and lease.session.capabilities.supports(SandboxFeature.FULL_STATE_SNAPSHOT)
-            and lease.session.capabilities.supports(SandboxFeature.RESTORE)
-        ):
+        caps = lease.session.capabilities
+        if caps.supports(SandboxFeature.FILESYSTEM_SNAPSHOT):
+            kind = SnapshotKind.FILESYSTEM
+        elif caps.supports(SandboxFeature.FULL_STATE_SNAPSHOT):
+            kind = SnapshotKind.FULL_STATE
+        else:
+            return None
+        if not caps.supports(SandboxFeature.RESTORE):
+            return None
+        if not clean_snapshot_compatible(task, kind):
             return None
         try:
             return await self.sandbox_manager.checkpoint(
                 lease.session,
-                SnapshotKind.FULL_STATE,
+                kind,
                 task.sandbox_spec.state_policy,
             )
         except Exception:
@@ -374,16 +402,21 @@ class HarnessAgentLoop(SessionAgentLoop):
     def _build_capped_output(self, training_data: dict) -> TokenOutput:
         output = self.build_token_output(training_data)
         response_length = int(self.rollout_config.response_length)
-        if self.compaction_budget:
-            _, trajectory_budget = self.compaction_budget
-            remaining_response_tokens = trajectory_budget - len(output.prompt_ids)
-            if remaining_response_tokens <= 0:
-                raise RuntimeError(
-                    f"TITO trajectory {training_data.get('trajectory_id', '<unknown>')} has prompt length "
-                    f"{len(output.prompt_ids)} >= trajectory budget {trajectory_budget}. "
-                    "The harness prompt/system context is larger than the configured training budget."
-                )
-            response_length = min(response_length, remaining_response_tokens)
+        # Budget the trainable trajectory against the rollout packing budget
+        # (prompt_length + response_length), not the CLI compaction trigger.
+        # A TITO compaction branch legitimately carries the whole pre-compaction
+        # context as its prompt, which can be far larger than the initial prompt.
+        remaining_response_tokens = self.rollout_budget - len(output.prompt_ids)
+        if remaining_response_tokens <= 0:
+            raise RuntimeError(
+                f"TITO trajectory {training_data.get('trajectory_id', '<unknown>')} has prompt length "
+                f"{len(output.prompt_ids)} >= trajectory budget {self.rollout_budget}. "
+                "The harness prompt/system context is larger than the configured training budget "
+                "(rollout.prompt_length + rollout.response_length). Increase the training budget "
+                "(keeping the sum within the model context window) or reduce the harness "
+                "system/tool prompt."
+            )
+        response_length = min(response_length, remaining_response_tokens)
         output.response_ids = output.response_ids[:response_length]
         output.response_mask = output.response_mask[:response_length]
         if output.response_log_probs is not None:

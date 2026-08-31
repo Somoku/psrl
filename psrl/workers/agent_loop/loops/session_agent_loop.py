@@ -63,10 +63,18 @@ class SessionAgentLoop(AgentLoopBase):
 
     async def create_session(self, request: dict) -> str:
         """Create one TITO session and bind its routing metadata."""
+        headers = self.build_session_headers(request)
+        # Optional session-scoped prompt-too-long budget (set by harness loops,
+        # e.g. the compaction trigger). SMG enforces it by returning an Anthropic
+        # `prompt_too_long` error so Claude Code reactively compacts instead of
+        # growing past the training budget.
+        limit = getattr(self, "prompt_too_long_limit", None)
+        if limit is not None:
+            headers["x-smg-prompt-too-long-limit"] = str(limit)
         response = await post(
             f"{self.session_router_url}/sessions",
             payload={},
-            headers=self.build_session_headers(request),
+            headers=headers,
         )
         session_id = response["session_id"]
         psrl_logger.debug("Created TITO session %r.", session_id)
@@ -213,7 +221,8 @@ class SessionAgentLoop(AgentLoopBase):
     ) -> dict:
         """Convert one trajectory from an already-fetched session snapshot."""
         records = trajectory.get("records", [])
-        self._validate_records(records)
+        if self.config.psrl.rollout_gateway.tito_debug:
+            self._validate_records(records)
         training_data = build_training_data(
             trajectory.get("accumulated_token_ids", []),
             records,
@@ -276,5 +285,12 @@ class SessionAgentLoop(AgentLoopBase):
     def _validate_records(records: list[dict]) -> None:
         for turn, record in enumerate(records):
             for mismatch in record.get("mismatch_report", []):
-                if mismatch.get("mismatch_type") != "assistant_text":
-                    raise RuntimeError(f"TITO token ID mismatch at turn {turn}: {mismatch!r}.")
+                # miles-style: the TITO re-tokenization comparator is a DEBUG
+                # diagnostic, not a correctness gate. Its mismatches legitimately
+                # fire on truncated generations (finish_reason=length) and on
+                # responses that embed a special token mid-stream — both produce
+                # raw recorded tokens that the chat-template re-render cannot
+                # reproduce exactly. The real gate is SMG's commit-time prefix
+                # validation, so a mismatch here only warrants a warning; aborting
+                # the whole trajectory on it throws away valid rollouts.
+                psrl_logger.warning("TITO token mismatch at turn %d: %r", turn, mismatch)

@@ -64,15 +64,26 @@
         {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
     {%- endif %}
 {%- endif %}
-
+{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}
+{%- for message in messages[::-1] %}
+    {%- set index = (messages|length - 1) - loop.index0 %}
+    {%- if ns.multi_step_tool and message.role == "user" %}
+        {%- set content = render_content(message.content, false)|trim %}
+        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}
+            {%- set ns.multi_step_tool = false %}
+            {%- set ns.last_query_index = index %}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
 {%- for message in messages %}
     {%- set content = render_content(message.content, true)|trim %}
-    {%- if message.role == "system" %}
-        {%- if not loop.first %}
-            {{- raise_exception('System message must be at the beginning.') }}
-        {%- endif %}
-    {%- elif message.role == "user" %}
+    {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
+        {#- Non-leading system messages (e.g. Claude Code's inline system/agent
+            context) are rendered in place like a user message instead of
+            raising. Mirrors Agent Lightning / Qwen3-4B's tolerant handling. -#}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "system" %}
+        {#- Leading system message was rendered in the system header above; skip. -#}
     {%- elif message.role == "assistant" %}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
@@ -84,11 +95,11 @@
             {%- endif %}
         {%- endif %}
         {%- set reasoning_content = reasoning_content|trim %}
-        {{- '<|im_start|>' + message.role + '\n' }}
-        {%- if reasoning_content %}
-            {{- '<think>\n' + reasoning_content + '\n</think>\n\n' }}
+        {%- if (not (clear_thinking | default(true))) or loop.index0 > ns.last_query_index %}
+            {{- '<|im_start|>' + message.role + '\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+        {%- else %}
+            {{- '<|im_start|>' + message.role + '\n' + content }}
         {%- endif %}
-        {{- content }}
         {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
             {%- for tool_call in message.tool_calls %}
                 {%- if tool_call.function is defined %}

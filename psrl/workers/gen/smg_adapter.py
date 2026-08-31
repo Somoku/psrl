@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -42,6 +43,28 @@ def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
     if nested is not None:
         return nested
     return default
+
+
+def _resolve_custom_chat_template(config: Any) -> str | None:
+    """Resolve `custom_chat_template` to a chat-template FILE PATH for SMG.
+
+    The SMG gateway tokenizer reads the chat template from a file path
+    (``router_config.chat_template``), whereas the PSRL worker accepts either a
+    path or an inline jinja string. When the config value is a path, forward it
+    verbatim; when it is inline jinja, materialize it under the psrl log dir so
+    the gateway can load it.
+    """
+    value = cfg_get(config, "gen_actor_rollout_ref.model.custom_chat_template", None)
+    if not value:
+        return None
+    if os.path.isfile(value):
+        return value
+    log_dir = cfg_get(config, "psrl.logging_path", None) or "/tmp"
+    os.makedirs(log_dir, exist_ok=True)
+    target = os.path.join(log_dir, "custom_chat_template.jinja")
+    with open(target, "w") as f:
+        f.write(value)
+    return target
 
 
 def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr: str):
@@ -148,6 +171,10 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         log_level="warn",
         log_dir=cfg_get(config, "psrl.logging_path", None),
         tool_call_parser=cfg_get(config, "psrl.rollout_gateway.tool_call_parser", "qwen"),
+        # Forward the patched actor chat template (e.g. Qwen3.5 tolerant of
+        # mid-conversation system messages) to the gateway tokenizer so the
+        # harness model requests render with the same template as the data side.
+        chat_template=_resolve_custom_chat_template(config),
         api_key=None,
         disable_health_check=True,
     )

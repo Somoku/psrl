@@ -276,6 +276,32 @@ class PSRL_AgentLoopWorker:
         task.add_done_callback(self._create_task_done_callback(task))
         self.agent_programs.add(task)
 
+    def _create_agent_loop(self, agent_name: str):
+        """Instantiate the registered agent loop with this worker's shared context."""
+        assert agent_name in AGENT_LOOP_REGISTRY, (
+            f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
+        )
+        agent_loop_config = AGENT_LOOP_REGISTRY[agent_name]
+
+        context = AgentLoopContext(
+            config=self.config,
+            rollout_gateway_url=self.rollout_gateway_url,
+            session_router_url=self.session_router_url,
+            reward_manager=self.reward_manager,
+            ps_manager_handle=self.ps_manager_handle,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
+            dataset_cls=self.dataset_cls,
+            data_config=DictConfigWrap(self.config.data),
+            sandbox_manager=self.sandbox_manager,
+        )
+        # Keep framework objects out of Hydra's dataclass conversion path.
+        agent_loop_factory = hydra.utils.instantiate(
+            config=agent_loop_config,
+            _partial_=True,
+        )
+        return agent_loop_factory(context=context)
+
     async def _run_agent_loop(
         self,
         agent_name: str,
@@ -333,26 +359,7 @@ class PSRL_AgentLoopWorker:
             assert agent_name in AGENT_LOOP_REGISTRY, (
                 f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
             )
-            agent_loop_config = AGENT_LOOP_REGISTRY[agent_name]
-
-            context = AgentLoopContext(
-                config=self.config,
-                rollout_gateway_url=self.rollout_gateway_url,
-                session_router_url=self.session_router_url,
-                reward_manager=self.reward_manager,
-                ps_manager_handle=self.ps_manager_handle,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                dataset_cls=self.dataset_cls,
-                data_config=DictConfigWrap(self.config.data),
-                sandbox_manager=self.sandbox_manager,
-            )
-            # Keep framework objects out of Hydra's dataclass conversion path.
-            agent_loop_factory = hydra.utils.instantiate(
-                config=agent_loop_config,
-                _partial_=True,
-            )
-            agent_loop = agent_loop_factory(context=context)
+            agent_loop = self._create_agent_loop(agent_name)
 
             with log_dual_events(
                 f"Agent loop with requests {request_ids}",
@@ -527,14 +534,6 @@ class PSRL_AgentLoopWorker:
                 "is_validate": is_validate,
             }
         )
-
-        # Multi-trajectory outputs use suffixed keys, so the original input
-        # key is no longer owned by the resulting training payload.
-        if len(outputs) > 1:
-            await tq.async_kv_clear(
-                keys=[str(uid)],
-                partition_id=partition_id,
-            )
 
     def _build_output_fields(
         self,

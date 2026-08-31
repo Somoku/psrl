@@ -860,7 +860,19 @@ class AgentLoopBase(ABC):
         if runner_timing.get("grading_s"):
             breakdown.append(f"grading: {runner_timing['grading_s']:.1f}s")
         if runner_timing.get("prep_s"):
-            breakdown.append(f"prep: {runner_timing['prep_s']:.1f}s")
+            # Fine-grained prep breakdown (task prep / sandbox cold start /
+            # clean snapshot / harness install+config) to locate bottlenecks.
+            prep_parts = [f"total={runner_timing['prep_s']:.1f}s"]
+            for key, label in (
+                ("task_prepare_s", "task"),
+                ("sandbox_create_s", "sandbox"),
+                ("snapshot_s", "snapshot"),
+                ("install_s", "install"),
+            ):
+                value = runner_timing.get(key)
+                if value:
+                    prep_parts.append(f"{label}={value:.1f}s")
+            breakdown.append("prep: " + " | ".join(prep_parts))
 
         text = ""
         if patch:

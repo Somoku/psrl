@@ -257,7 +257,7 @@ bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh 3
 
 | Metric | Meaning |
 |--------|---------|
-| `train/score` | Shaped outcome reward: `+1.0` resolved, `-1.0` failed, `0.0` policy violation |
+| `train/score` | Outcome reward: Claude Code `binary_01` uses `1.0/0.0`; legacy signed `binary` uses `+1.0/-1.0` |
 | `train/acc` | Binary resolve rate (0 or 1 per sample) — the primary progress indicator |
 
 ---
@@ -468,6 +468,118 @@ being discarded. Lower values are more on-policy; higher values increase through
 
 ---
 
+## Claude Code harness: sandbox preparation
+
+This section documents how the **`claude_code` harness** (`mini_swe_claude_code`
+in `config/swebench_harness_config.yaml`) prepares its per-task sandboxes:
+the host tarball artifacts, the optional baked template image, and where the
+flow differs from the **mini-SWE-agent** training prepare path. The `codex`
+harness follows the same tarball/bake flow.
+
+### 1. Tarball artifacts (host-side, one-time download)
+
+The Claude Code CLI is an npm package. Two host artifacts are mounted into every
+rollout sandbox (read-only) via `examples/mini_swe/runner.py`:
+
+| Host env var | Mount target | Contents |
+|--------------|--------------|----------|
+| `AGENT_NODE_TARBALL` | `/tmp/node22.tarball` | Node 22 runtime tarball (`.xz` or plain `.tar`) |
+| `AGENT_CC_TARBALL` | `/tmp/claude-code.tgz` | `@anthropic-ai/claude-code` **wrapper** npm tarball (~24 KB; the ~90 MB platform binary is an `optionalDependencies` entry fetched by npm) |
+| `AGENT_CODEX_TARBALL` | `/tmp/codex.tgz` | codex wrapper tarball (codex harness only) |
+
+Set them in the launch environment (e.g. `megatron_qwen_4b_swe_smith.sh`):
+
+```bash
+export AGENT_NODE_TARBALL="/shared/artifacts/node-v22-linux-x64.tar.xz"
+export AGENT_CC_TARBALL="/shared/artifacts/anthropic-ai-claude-code-2.1.233.tgz"
+```
+
+They are propagated to Ray workers via `_HOST_RUNTIME_ENV_KEYS`
+(`psrl/trainer/constants_ppo.py`). Keep the CLI tarball version in sync with
+the platform package (the bake tag and the `check_command` both derive from it).
+
+### 2. Per-sandbox install (fallback path)
+
+When the sandbox image does **not** already contain the CLI, `Harness.prepare`
+runs `_install_cli` (`psrl/workers/agent_loop/harness/base.py`):
+
+1. Ensure a usable runtime: prefer a base image that ships Node ≥ 18 + npm;
+   otherwise extract the mounted Node 22 tarball into `/opt/node22` with
+   `tar --no-same-owner` (the official tarball is owned by `uid 1000`/`iojs`,
+   and sandboxes that deny chown would otherwise fail) and symlink
+   `node`/`npm`/`npx` into `/usr/local/bin`.
+2. `npm install -g --prefix=/usr/local --no-audit --no-fund --prefer-offline <cli.tgz>`
+   — `--prefer-offline` consumes a pre-seeded npm cache when present so only
+   cache misses touch the registry.
+3. Run the harness `check_command` (`/usr/local/bin/claude --version`).
+
+The registry fetch relies on the proxy env (`http_proxy`/`https_proxy`/
+`no_proxy`) forwarded from the launch host into every sandbox — both rollout and
+grader containers get it via `forward_env` in `runner.py`. `mirrors.tencent.com`
+is in `no_proxy`, so the npm mirror is reached directly.
+
+### 3. Baked per-image harness derivatives (recommended, removes the install)
+
+Each SWE task uses its **own** per-problem base image (the parquet's
+`sandbox_overrides.environment.image` — e.g. `swebench/swesmith.x86_64.*`), so
+there is no single "harness image". `bake_harness_image.sh` derives one image
+per base — `psrl/swebench-harness:<sha12(base)>` — that adds Node + npm, the
+Claude Code CLI, and a seeded npm cache:
+
+```bash
+# one-time, per worker host that creates sandboxes:
+bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
+  swebench/swesmith.x86_64.foo:latest          # bake one image
+# or bake every unique image referenced by a parquet:
+bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
+  --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet
+```
+
+What it does per image: decompress the Node tarball on the host once (cached),
+create a container from the base image with the two tarballs mounted **plus the
+host proxy env and `NPM_REGISTRY` forwarded** (default `mirrors.tencent.com/npm`,
+reached directly via `no_proxy`), run the same install command as §2 (seeding a
+shared host npm cache at `NPM_CACHE_DIR` so the ~90 MB platform package is
+downloaded once, not per image), then `docker commit`.
+
+* `runner.py` selects the derivative automatically: for each task it computes
+  `psrl/swebench-harness:<sha12(task-image)>` and uses it when present, else
+  falls back to the task image + the §2 tarball install — **a missing bake never
+  blocks training**.
+* Idempotent: re-bake only when a base image or the CLI/node version changes.
+* Local-only images: on multi-host clusters run the bake on every host, or
+  distribute with `docker save`/`docker load`, or `docker push` to a registry.
+
+### 4. Differences vs. the mini-SWE-agent training prepare flow
+
+| Aspect | mini-SWE-agent | `claude_code` harness |
+|--------|----------------|------------------------|
+| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: npm-installed inside each sandbox, or baked into the template image |
+| Per-sandbox install | None (pure Python on the host) | Node 22 extraction + `npm install -g <tarball>` (eliminated by the bake) |
+| Network dependency | None at rollout time | npm registry fetch (proxy forwarded; offline via baked cache) |
+| System prompt / tools | Native mini-SWE-agent template | Claude Code stock system prompt is retained; task and integrity constraints are in the user prompt, while `tools` limits execution to `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep` |
+| Permission mode | n/a | `permission_mode: default` — Claude rejects `bypassPermissions` as root; tools are pre-allowed instead |
+| Compaction | n/a | `compaction: context_window_tokens=65536, safety_tokens=8192` drives the prompt-too-long limit and Claude's reactive compaction |
+| Sandbox image | Per-task image as-is | Per-image baked derivative `psrl/swebench-harness:<sha12>` when present, else the per-task image + install |
+| Grading | Fresh container from the SWE problem image | Same fresh-container grader; additionally supports **clean-snapshot reuse** — the clean rollout sandbox is `docker commit`ted (`FILESYSTEM_SNAPSHOT` + `RESTORE` on the docker backend) and the grader restores from it, avoiding a fresh cold start |
+| Prep instrumentation | n/a | Trajectory dump emits a fine-grained `prep` breakdown: `task` / `sandbox` / `snapshot` / `install` |
+
+### 5. Gotchas
+
+* **Node tarball ownership**: the official Node tarball is owned by
+  `iojs/iojs` (uid 1000). Extraction **must** use `--no-same-owner`, or
+  sandboxes that deny chown fail with `tar: Cannot change ownership … Operation
+  not permitted`.
+* **Wrapper vs. binary**: `claude-code.tgz` is only the wrapper package; the
+  actual binary arrives via npm's `optionalDependencies`. Never mount a "binary"
+  directly — keep the tarball/bake flow uniform.
+* **Snapshot reuse safety**: `clean_snapshot_compatible` only allows reuse when
+  the rollout sandbox has no content-bearing bind mounts the grader relies on
+  (harness tarball mounts are excluded), so repo-bind-mount configurations fall
+  back to a fresh grader.
+
+---
+
 ## Evaluation and Serving
 
 Standalone SWE-bench / SWE-smith evaluation and vLLM-based model serving live
@@ -534,17 +646,22 @@ which is written by `prepare_swebench.py`.
 | `sandbox_config.snapshot_verifier` | Infrastructure | Use a capability-gated clean verifier snapshot when its spec matches exactly |
 | `sandbox_config.collect_resource_metrics` | Infrastructure | Sample per-trajectory memory/CPU once; disabled by default |
 | `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node (`0` = unlimited) |
-| `agent.system_template` | Native required | Native mini-SWE-agent system prompt; harnesses use their adapter-specific system prompt |
+| `agent.system_template` | Native required | Native mini-SWE-agent system prompt; Claude Code harness training preserves the CLI stock prompt |
 | `agent.problem_template` | Native required | Native `instance_template`; harnesses preserve the same `<pr_description>` task boundary |
 | `agent.cost_limit` | Optional | LiteLLM cost limit per episode (`0.0` = unlimited) |
 
-Harness-specific Claude settings live under `harness`: `system_prompt` replaces
-Claude Code's large default CLI prompt, `tools` limits the tool catalog, and
-`compaction.context_window_tokens` is the CLI capacity. The compaction trigger
-defaults to `data.max_prompt_length + data.max_response_length`; set
-`safety_tokens: 0` when the trigger must be exact. The example uses a 32k CLI
-capacity and an exact 10,240-token training trajectory budget so Claude's
-system/tool overhead does not consume the native 2,048-token data prompt budget.
+Harness-specific Claude settings live under `harness`. The example leaves
+`system_prompt` unset so Claude Code keeps its stock prompt; task and integrity
+rules are rendered by `build_harness_prompt` as the user message. `tools` limits
+the tool catalog, and `compaction.context_window_tokens` is the CLI capacity.
+`max_output_tokens` is optional and defaults to the Claude Code behavior because
+neither the Dressage nor ProRL reference recipe sets
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS`. Thinking, interleaved thinking, the optional
+thinking budget, ProRL-style `reasoning_effort` (`--effort`), and advertised
+model capabilities are independently configurable. The example follows
+Dressage by enabling thinking/interleaving, leaving both the fixed budget and
+effort unset, and advertising `thinking`, `adaptive_thinking`, and
+`interleaved_thinking`.
 
 ---
 
@@ -606,14 +723,17 @@ FAIL_TO_PASS tests pass and all PASS_TO_PASS tests still pass):
 
 | Condition | `score` (→ loss) | `acc` (→ wandb) |
 |-----------|-----------------|-----------------|
-| All F2P pass, no P2P regressions | `+1.0` | `1.0` |
-| Patch modified test or config files | `0.0` (policy violation — not penalised) | `0.0` |
-| Not resolved (patch failed, tests failed) | `-1.0` | `0.0` |
+| All F2P pass, no P2P regressions | `1.0` | `1.0` |
+| Patch or trajectory integrity violation | `0.0` | `0.0` |
+| Not resolved (patch failed, tests failed) | `0.0` with `binary_01`; `-1.0` with legacy `binary` | `0.0` |
 | No patch submitted / 0 turns (aborted) | `0.0` | `0.0` |
 
-The `{-1, 0, +1}` convention. The `score` field drives the
-policy gradient loss; the `acc` field is a separate metric for tracking resolve
-rate. Both are visible in wandb as `train/score` and `train/acc`.
+The Claude Code recipe uses `binary_01` to match Dressage and ProRL. Existing
+Mini-SWE recipes keep the legacy signed `binary` mode, so GAE, REINFORCE, and
+non-normalized GRPO runs do not silently change scale. For normalized GRPO,
+`{0, 1}` and `{-1, +1}` are positive affine transforms and produce the same
+group-normalized advantages. The `score` field drives the policy-gradient loss;
+`acc` separately tracks resolve rate.
 
 **Patch policy rules** (configurable via environment variables):
 
@@ -621,7 +741,15 @@ rate. Both are visible in wandb as `train/score` and `train/acc`.
 |---------|---------|--------|
 | `SWE_STRICT_NO_TEST_PATCH` | `1` | Reject patches that modify FAIL_TO_PASS / PASS_TO_PASS test files |
 | `SWE_STRICT_NO_CONFIG_PATCH` | `1` | Reject patches that modify `pyproject.toml`, `setup.py`, etc. |
-| `SWE_TEST_PATCH_POLICY_SCOPE` | `eval_tests_only` | `all_tests` to also reject changes to non-eval test files |
+| `SWE_TEST_PATCH_POLICY_SCOPE` | `eval_tests_only` | `all_tests` to also reject changes to non-eval test files; the Claude Code launcher exports `all_tests` |
+
+The Claude Code path also scans its JSONL tool trace after rollout. Accessing
+the task repository or mirrors through network tools, or writing test/evaluator
+paths and later reverting them, marks the rollout as an integrity violation.
+An unavailable trace fails closed with zero reward instead of bypassing the
+check.
+Patch extraction stages all files and diffs against the task's declared
+`base_commit`, so untracked files and agent-created commits are both preserved.
 
 ---
 

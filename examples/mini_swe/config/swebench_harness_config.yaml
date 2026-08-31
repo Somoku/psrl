@@ -1,7 +1,7 @@
 - name: mini_swe_claude_code
   _target_: psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop.MiniSWEHarnessAgentLoop
   sandbox_config: &sandbox_config
-    max_parallel_tasks_per_worker: 8
+    max_parallel_tasks_per_worker: 256
     collect_resource_metrics: ${oc.decode:${oc.env:PSRL_SANDBOX_COLLECT_RESOURCE_METRICS,false}}
     snapshot_verifier: true
     environment:
@@ -23,17 +23,9 @@
     # Docker root available for task commands, and pre-allow the tools needed
     # by SWE-bench instead of using the root-incompatible bypass mode.
     permission_mode: default
-    # Keep Claude's task protocol aligned with swebench_agent_config.yaml while
-    # replacing mini-SWE-agent's one-command response protocol with Claude's
-    # native tools. Replacing the default CLI system prompt is important here:
-    # the full Claude Code prompt/tool catalog is ~20k tokens and cannot fit in
-    # the 2048 + 8192 rollout budget.
-    system_prompt: |
-      You are a helpful coding agent working in the current repository.
-      Solve the software task in <pr_description> by editing source files,
-      running relevant tests, and leaving the working tree with the fix applied.
-      Do not modify tests or project configuration unless the task explicitly
-      requires it. Inspect the repository before editing and verify the result.
+    # Preserve Claude Code's stock system prompt. Mini-SWE task and integrity
+    # constraints are supplied by `build_harness_prompt` as the user message.
+    setting_sources: user
     tools: "Bash,Read,Edit,Write,Glob,Grep"
     allowed_tools:
       - Bash
@@ -42,21 +34,50 @@
       - Write
       - Glob
       - Grep
-    # The training trigger is derived from rollout.prompt_length +
-    # rollout.response_length. The larger CLI capacity absorbs Claude's
-    # protocol overhead; safety_tokens=0 keeps the trigger exactly at 10240
-    # for this script.
+    # Dressage and ProRL do not set `CLAUDE_CODE_MAX_OUTPUT_TOKENS`; null keeps
+    # the Claude Code default. Set a positive value only for an explicit
+    # per-request cap, which is separate from PSRL's trajectory response budget.
+    max_output_tokens: null
+    # Dressage defaults: thinking and interleaved thinking enabled, no fixed
+    # thinking budget, and all three capabilities advertised to Claude Code.
+    thinking_enabled: true
+    thinking_budget_tokens: null
+    # ProRL exposes `--effort`; leave it unset for Dressage-style adaptive
+    # thinking, or set a CLI-supported effort level for a controlled ablation.
+    reasoning_effort: null
+    interleaved_thinking: true
+    supported_capabilities:
+      - thinking
+      - adaptive_thinking
+      - interleaved_thinking
+    disable_prompt_caching: true
+    disable_experimental_betas: false
+    subagents_enabled: false
+    # context_window_tokens is the CLI's context capacity and absorbs Claude's
+    # stock prompt and protocol overhead. safety_tokens
+    # reserves headroom so the CLI auto-compacts at ~85% of the window before
+    # the model context overflows. This CLI compaction trigger is distinct from
+    # the trainable trajectory budget (rollout.prompt_length +
+    # rollout.response_length, see HarnessAgentLoop.rollout_budget).
     compaction:
       enabled: true
-      context_window_tokens: 32768
-      safety_tokens: 4096
+      context_window_tokens: 65536
+      safety_tokens: 8192
     install:
+      # Uniform tarball install for every harness (slime-style): the base image
+      # should ship Node >= 18 + npm (baked base components); the install first
+      # ensures a usable npm (falling back to the mounted Node 22 tarball), then
+      # `npm install -g` the harness CLI tarball. No host-side binary mounts.
+      # The registry fetch relies on the proxy env (http(s)_proxy/no_proxy)
+      # forwarded from the launch host into the sandbox.
       strategy: npm_tarball
       check_command: /usr/local/bin/claude --version
       node_tarball_env: AGENT_NODE_TARBALL
       cli_tarball_env: AGENT_CC_TARBALL
       cli_tarball_path: /tmp/claude-code.tgz
-      timeout_s: 600
+      timeout_s: 1800
+      retries: 3
+      retry_backoff_s: 10.0
 
 - name: mini_swe_codex
   _target_: psrl.workers.agent_loop.loops.mini_swe_harness_agent_loop.MiniSWEHarnessAgentLoop
@@ -69,9 +90,12 @@
       context_window_tokens: 32000
       safety_tokens: 0
     install:
+      # Same uniform tarball install as the claude_code harness above.
       strategy: npm_tarball
       check_command: /usr/local/bin/codex --version
       node_tarball_env: AGENT_NODE_TARBALL
       cli_tarball_env: AGENT_CODEX_TARBALL
       cli_tarball_path: /tmp/codex.tgz
-      timeout_s: 600
+      timeout_s: 1800
+      retries: 3
+      retry_backoff_s: 10.0

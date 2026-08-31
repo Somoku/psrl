@@ -9,7 +9,7 @@ import json
 import os
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -24,14 +24,30 @@ from psrl.sandbox.core import (
     SandboxFeature,
     SandboxRef,
     SandboxSession,
+    SandboxSource,
     SandboxSourceKind,
     SandboxSpec,
     SandboxStatus,
+    SnapshotKind,
+    SnapshotRef,
 )
 from psrl.sandbox.metrics import SandboxMetrics, SandboxMetricsSnapshot
 from psrl.sandbox.utils.docker_utils import force_remove_containers_by_label, spawn_actor_reaper
 
-_DOCKER_CAPABILITIES = SandboxCapabilities(frozenset({SandboxFeature.FREEZE, SandboxFeature.HOST_MOUNT}))
+# FILESYSTEM_SNAPSHOT + RESTORE: a docker commit turns a container's writable
+# layer into a reusable image, and restore creates a container from it — the
+# cheap, self-contained "clean snapshot" used to seed the grader without a
+# fresh cold start.
+_DOCKER_CAPABILITIES = SandboxCapabilities(
+    frozenset(
+        {
+            SandboxFeature.FREEZE,
+            SandboxFeature.HOST_MOUNT,
+            SandboxFeature.FILESYSTEM_SNAPSHOT,
+            SandboxFeature.RESTORE,
+        }
+    )
+)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _PROXY_URL_ENV_KEYS = (
     "http_proxy",
@@ -396,6 +412,30 @@ class DockerBackend(SandboxBackend):
         self.metrics.session_started()
         return session
 
+    async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
+        """Create a session from a filesystem snapshot (a committed image)."""
+        if snapshot.kind != SnapshotKind.FILESYSTEM:
+            raise NotImplementedError(f"DockerBackend only restores FILESYSTEM snapshots, got {snapshot.kind.value}.")
+        image = snapshot.metadata.get("psrl.docker.image") or snapshot.snapshot_id
+        if not image:
+            raise ValueError(f"Snapshot {snapshot.snapshot_id!r} has no docker image reference.")
+        if spec is None:
+            raise ValueError("DockerBackend.restore requires a SandboxSpec.")
+        restored_spec = replace(spec, source=SandboxSource.image(str(image)))
+        return await self.create(restored_spec)
+
+    async def delete_snapshot(self, snapshot: SnapshotRef) -> None:
+        """Remove the committed image backing a filesystem snapshot."""
+        if snapshot.kind != SnapshotKind.FILESYSTEM:
+            return
+        image = snapshot.metadata.get("psrl.docker.image")
+        if image:
+            try:
+                await self.engine.remove_image(str(image))
+            except DockerEngineError as exc:
+                if exc.status != 404:
+                    raise
+
     async def shutdown(self) -> None:
         """Stop crash recovery and close the persistent Engine connection pool."""
         await asyncio.to_thread(self._shutdown_sync)
@@ -441,6 +481,20 @@ class DockerSession(SandboxSession):
     @property
     def capabilities(self) -> SandboxCapabilities:
         return self.backend.capabilities
+
+    async def snapshot(self, kind: SnapshotKind) -> SnapshotRef:
+        """Capture a filesystem snapshot by committing the container's writable layer."""
+        if kind != SnapshotKind.FILESYSTEM:
+            raise NotImplementedError(f"DockerSession only supports FILESYSTEM snapshots, got {kind.value}.")
+        repo = f"psrl/snapshot/{self.sandbox_id}"
+        image_id = await self.backend.engine.commit_container(self.sandbox_id, repo, "latest")
+        image_tag = f"{repo}:latest"
+        return SnapshotRef(
+            backend=self.backend.name,
+            snapshot_id=image_tag,
+            kind=SnapshotKind.FILESYSTEM,
+            metadata={"psrl.docker.image": image_tag, "psrl.docker.image_id": image_id},
+        )
 
     @property
     def spec(self) -> SandboxSpec | None:

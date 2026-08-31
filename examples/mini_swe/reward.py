@@ -12,18 +12,11 @@ Reward structure for mini_swe_agent data sources (toy / simple-test):
  -0.05      — long and fruitless (>=10 turns, no patch, no editor)
  -0.1       — premature submit without any tool usage (1-2 turns)
 
-Reward structure for swebench_verified / swe_smith_py data sources:
+Reward structure for swebench_verified / swe_smith_py / swe_gym data sources:
 
-  +1.0  — all FAIL_TO_PASS pass AND all PASS_TO_PASS still pass (resolved)
-   0.0  — aborted (0 turns / Docker failure / no messages)
-  -1.0  — all other cases: patch submitted but not resolved,
-           no patch submitted, policy violated
-
-``outcome_reward = 1.0 if reward else -1.0``
-  • reward=1  → resolved=True   → +1.0
-  • reward=0  → resolved=False  → -1.0 (covers no-patch, not-resolved,
-                                         policy-blocked)
-  • no msgs   → ABORTED         → score=0.0, remove_sample=True
+  binary_01: 1.0 resolved, 0.0 otherwise (Dressage / ProRL-compatible)
+  binary:   +1.0 resolved, -1.0 otherwise (legacy signed behavior)
+  aborted:   0.0 and removed from training when the agent loop produced no sample
 
 The `acc` field (0/1 float, set in agent_data.finalize_output) is emitted
 alongside `score` on wandb to track resolve_rate separately from the shaped
@@ -177,7 +170,8 @@ def _compute_swe_reward(
     """Compute SWE-bench reward with configurable granularity.
 
     Reward modes:
-        binary:         {+1, 0, -1} — original behavior.
+        binary_01:      {1, 0} — Dressage / ProRL-compatible outcome reward.
+        binary:         {+1, 0, -1} — legacy signed behavior.
         test_ratio:     Continuous based on f2p_pass / f2p_total.
         partial_credit: Multi-level: no_patch < apply_fail < no_progress < partial_fix < resolved.
         shaped:         partial_credit + efficiency bonus for fewer turns.
@@ -209,7 +203,18 @@ def _compute_swe_reward(
         psrl_logger.debug("[swe reward] score=+1.0, acc=1.0 (resolved).")
         return {"score": 1.0, "acc": 1.0}
 
-    # --- Binary mode: everything else is -1 ---
+    # With per-group mean and standard-deviation normalization, `binary_01`
+    # produces the same GRPO advantages as the legacy signed reward. Keeping a
+    # separate mode avoids changing GAE, REINFORCE, or non-normalized recipes.
+    if reward_mode == "binary_01":
+        psrl_logger.debug(
+            f"[swe reward] score=0.0, acc=0.0 (binary_01 mode, not resolved), "
+            f"apply_ok={grader_result.get('apply_ok')}, "
+            f"f2p={grader_result.get('f2p_pass')}/{grader_result.get('f2p_total')}."
+        )
+        return {"score": 0.0, "acc": 0.0}
+
+    # --- Legacy signed binary mode: everything else is -1 ---
     if reward_mode == "binary":
         psrl_logger.debug(
             f"[swe reward] score=-1.0, acc=0.0 (binary mode, not resolved), "
@@ -307,7 +312,8 @@ def compute_score(
 
     Args:
         reward_mode: Reward granularity for SWE-bench data sources.
-            - "binary": {+1, 0, -1} (original behavior)
+            - "binary_01": {1, 0} outcome reward compatible with Dressage / ProRL
+            - "binary": {+1, 0, -1} legacy signed behavior
             - "partial_credit": Multi-level rewards based on patch/test progress
             - "test_ratio": Continuous score based on f2p/p2p ratios
             - "shaped": partial_credit + efficiency bonus
@@ -323,6 +329,7 @@ def compute_score(
             Reward values follow:
               +1.0  resolved
                0.0  aborted (0 turns / Docker failure)
+               0.0  not resolved (binary_01 mode)
               -1.0  all other cases (binary mode)
               [-1.0, 0.95]  partial credit (partial_credit/test_ratio/shaped modes)
     """

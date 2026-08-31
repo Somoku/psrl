@@ -1,9 +1,12 @@
 """Run one mini-SWE-agent task through its standard Python bindings."""
 
+import functools
+import hashlib
 import logging
 import math
 import os
 import re
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -111,6 +114,42 @@ def parse_duration_seconds(value: str | int | float | None) -> float | None:
     return float(match.group(1)) * {"h": 3600, "m": 60, "s": 1, "": 1}[match.group(2)]
 
 
+def _resolve_harness_sandbox_image(configured_image: str) -> str:
+    """Prefer the pre-baked per-image harness derivative when present.
+
+    Each SWE task uses its own per-problem base image (from the parquet's
+    ``sandbox_overrides.environment.image``), so a single global baked image is
+    meaningless here. ``bake_harness_image.sh`` derives one image per base:
+    ``psrl/swebench-harness:<sha12(base)>``. When that derivative exists on this
+    host, sandboxes start from it (no per-sandbox install); otherwise we fall
+    back to the original image + the tarball install — correct, just slower. A
+    missing bake must never block the run.
+    """
+    baked = f"psrl/swebench-harness:{_image_digest(configured_image)}"
+    if _docker_image_exists(baked):
+        return baked
+    return configured_image
+
+
+def _image_digest(reference: str) -> str:
+    """Short deterministic digest of an image reference (matches the baker)."""
+    return hashlib.sha256(reference.encode()).hexdigest()[:12]
+
+
+@functools.lru_cache(maxsize=512)
+def _docker_image_exists(reference: str) -> bool:
+    """Whether ``reference`` is present in the local Docker daemon."""
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", reference],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
 def resolve_container_config(payload: dict[str, Any], *, grading: bool = False) -> dict[str, Any]:
     """Merge the shared container config with rollout- or grader-specific overrides."""
     sandbox_config = payload["runtime_config"]["sandbox_config"]
@@ -157,10 +196,13 @@ def build_sandbox_spec(
 
     sandbox_config = payload["runtime_config"]["sandbox_config"]
     selected_template = template or (container_config.get("template") if image is None else None)
+    # Prefer the per-image baked harness derivative (Node + CLI + npm cache,
+    # see prepare/docker_scripts/bake_harness_image.sh) so per-task installs are
+    # eliminated; falls back to the configured image when not baked. The grader
+    # keeps its explicit problem image (``image`` is non-None there).
+    resolved_image = image or _resolve_harness_sandbox_image(str(container_config["image"]))
     source = (
-        SandboxSource.template(str(selected_template))
-        if selected_template
-        else SandboxSource.image(image or str(container_config["image"]))
+        SandboxSource.template(str(selected_template)) if selected_template else SandboxSource.image(resolved_image)
     )
     sandbox_prefix = str(payload.get("sandbox_prefix", task_id))
     return SandboxSpec(

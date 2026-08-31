@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
 from examples.mini_swe.config import build_runtime_config
 from examples.mini_swe.harness_task import build_harness_prompt, collect_git_patch
+from examples.mini_swe.integrity import scan_claude_code_integrity
 from omegaconf import OmegaConf
 from psrl.sandbox import (
     ExecResult,
@@ -103,7 +105,6 @@ def _runtime(
     context_window_tokens: int | None = None,
     compaction_token_limit: int | None = None,
     max_turns: int | None = None,
-    max_output_tokens: int | None = None,
 ) -> HarnessRuntime:
     return HarnessRuntime(
         session_id="session-1",
@@ -113,7 +114,6 @@ def _runtime(
         context_window_tokens=context_window_tokens,
         compaction_token_limit=compaction_token_limit,
         max_turns=max_turns,
-        max_output_tokens=max_output_tokens,
     )
 
 
@@ -133,7 +133,10 @@ def test_harness_prompt_preserves_native_miniswe_task_boundary() -> None:
 
     assert prompt == (
         "<pr_description>\nFix the parser.\n</pr_description>\n\n"
-        "Implement the required changes in the current repository and verify the fix."
+        "Implement the required changes in the current repository and verify the fix.\n\n"
+        "Integrity rules:\n"
+        "- Do not modify tests, pytest configuration, or evaluation harness files.\n"
+        "- Do not retrieve a solution, patch, commit, or pull request from the task repository or its mirrors."
     )
 
 
@@ -164,6 +167,7 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     cli_command, cwd, env = next(item for item in sandbox.commands if item[0].startswith("claude "))
     assert "--output-format stream-json" in cli_command
     assert "--permission-mode default" in cli_command
+    assert "--model Qwen/Qwen3" in cli_command
     assert "--allowedTools Bash Read Edit" in cli_command
     assert "--system-prompt 'minimal system'" in cli_command
     assert "--tools Bash,Read,Edit" in cli_command
@@ -202,16 +206,82 @@ async def test_claude_code_receives_token_based_compaction_settings() -> None:
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in env
 
 
-def test_claude_code_receives_framework_turn_and_output_limits() -> None:
+def test_claude_code_receives_framework_turn_and_configured_output_limits() -> None:
     sandbox = FakeSandbox()
-    harness = create_harness(HarnessConfig(kind="claude_code", executable="claude"), sandbox)
-    runtime = _runtime(max_turns=12, max_output_tokens=2048)
+    harness = create_harness(
+        HarnessConfig(
+            kind="claude_code",
+            executable="claude",
+            max_output_tokens=4096,
+            reasoning_effort="high",
+        ),
+        sandbox,
+    )
+    runtime = _runtime(max_turns=12)
 
     command = harness.build_command("fix", runtime)
     env = harness.build_env(runtime)
 
     assert "--max-turns 12" in " ".join(command)
-    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "2048"
+    assert "--effort high" in " ".join(command)
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4096"
+
+
+@pytest.mark.asyncio
+async def test_claude_code_configures_dressage_thinking_capabilities() -> None:
+    sandbox = FakeSandbox()
+    harness = create_harness(
+        HarnessConfig(
+            kind="claude_code",
+            executable="claude",
+            thinking_budget_tokens=2048,
+            supported_capabilities=("thinking", "adaptive_thinking", "interleaved_thinking"),
+            disable_prompt_caching=True,
+            subagents_enabled=False,
+        ),
+        sandbox,
+    )
+
+    await harness.prepare(_runtime())
+    env = harness.build_env(_runtime())
+    settings = sandbox.writes["/root/.claude/settings.json"].decode()
+
+    assert env["MAX_THINKING_TOKENS"] == "2048"
+    assert env["DISABLE_PROMPT_CACHING"] == "1"
+    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"] == (
+        "thinking,adaptive_thinking,interleaved_thinking"
+    )
+    assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in env
+    assert '"deny": ["Agent"]' in settings
+
+
+def test_claude_code_integrity_scans_tool_calls_without_duplicate_events() -> None:
+    tool_call = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "input": {
+                        "command": "git clone https://github.com/example/project.git /tmp/solution",
+                    },
+                },
+                {
+                    "type": "tool_use",
+                    "name": "Write",
+                    "input": {"file_path": "/testbed/tests/test_fix.py"},
+                },
+            ]
+        },
+    }
+    log_bytes = (json.dumps(tool_call) + "\n" + json.dumps(tool_call)).encode()
+
+    result = scan_claude_code_integrity(log_bytes, "example/project")
+
+    assert result["violated"]
+    assert result["tool_calls"] == 2
+    assert result["reasons"] == ["blocked_repo_web_access", "write_to_test_or_harness_path"]
 
 
 @pytest.mark.asyncio
@@ -232,9 +302,13 @@ async def test_failed_trajectory_can_collect_output_after_successful_cli_exit() 
 async def test_patch_collection_includes_staged_and_untracked_changes() -> None:
     sandbox = FakeSandbox()
 
-    await collect_git_patch(sandbox, "/testbed")
+    await collect_git_patch(sandbox, "/testbed", base_commit="abc123")
 
-    assert ("git add -N . && git diff --binary HEAD -- .", "/testbed", None) in sandbox.commands
+    assert (
+        "git add -A && git diff --cached --binary --submodule=diff abc123 --",
+        "/testbed",
+        None,
+    ) in sandbox.commands
 
 
 @pytest.mark.asyncio
@@ -317,6 +391,15 @@ def test_example_config_selects_both_harnesses() -> None:
 
     assert [item.name for item in configs] == ["mini_swe_claude_code", "mini_swe_codex"]
     assert [HarnessConfig.from_value(item.harness).kind for item in configs] == ["claude_code", "codex"]
+    claude_config = HarnessConfig.from_value(configs[0].harness)
+    assert claude_config.system_prompt is None
+    assert claude_config.max_output_tokens is None
+    assert claude_config.reasoning_effort is None
+    assert claude_config.supported_capabilities == (
+        "thinking",
+        "adaptive_thinking",
+        "interleaved_thinking",
+    )
     assert all(item.sandbox_config.environment.cwd == "/testbed" for item in configs)
 
     runtime = build_runtime_config(

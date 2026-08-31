@@ -141,6 +141,23 @@ class DockerEngineClient:
     async def start_container(self, container_id: str) -> None:
         await self._request("POST", f"/containers/{container_id}/start", expected=(204, 304))
 
+    async def commit_container(self, container_id: str, repository: str, tag: str) -> str:
+        """Commit a running container's writable layer into a new image.
+
+        Used by the harness-image baker to turn a one-time provisioned sandbox
+        (base image + Node + CLI + seeded npm cache) into a reusable template
+        image, so every task starts from the provisioned state instead of
+        re-installing per sandbox. Returns the committed image ID.
+        """
+        path = (
+            f"/commit?container={quote(container_id, safe='')}&"
+            f"repo={quote(repository, safe='')}&"
+            f"tag={quote(tag, safe='')}"
+        )
+        # The Engine API rejects /commit unless Content-Type is application/json.
+        _, body, _ = await self._request("POST", path, expected=(201,), json={})
+        return str(json.loads(body)["Id"])
+
     async def inspect_container(self, container_id: str) -> Mapping[str, Any] | None:
         try:
             _, body, _ = await self._request("GET", f"/containers/{container_id}/json", expected=(200,))
@@ -149,6 +166,14 @@ class DockerEngineClient:
                 return None
             raise
         return json.loads(body)
+
+    async def remove_image(self, reference: str) -> None:
+        """Remove an image by reference (used to clean up committed snapshots)."""
+        try:
+            await self._request("DELETE", f"/images/{quote(reference, safe='')}", expected=(200,))
+        except DockerEngineError as exc:
+            if exc.status != 404:
+                raise
 
     async def remove_container(self, container_id: str) -> None:
         try:

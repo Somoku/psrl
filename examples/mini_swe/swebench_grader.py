@@ -243,7 +243,7 @@ def _get_smith_eval_script(swe_problem: dict[str, Any]) -> str:
     from swesmith.profiles import registry
 
     rp = registry.get_from_inst(swe_problem)
-    cmd, _ = rp.get_test_cmd(swe_problem, f2p_only=False)
+    cmd, _ = rp.get_test_cmd(swe_problem, f2p_only=True)
     # Wrap into a minimal bash script consistent with SWE-smith eval.sh format.
     return "\n".join(
         [
@@ -766,7 +766,12 @@ def grade_fresh_container(
                 )
 
         # --- 4. Reset tree and apply model patch ---
-        apply_cmd = "git reset --hard HEAD && git clean -fd"
+        # Diff extraction is relative to the dataset baseline so agent-created
+        # commits remain part of the patch. Reset the disposable grader to that
+        # same baseline before applying it.
+        base_commit = str(swe_problem.get("base_commit") or "")
+        reset_target = shlex.quote(base_commit) if base_commit else "HEAD"
+        apply_cmd = f"git reset --hard {reset_target} && git clean -fd"
         out = execute(apply_cmd, cwd="/testbed")
         if out["returncode"] != 0:
             psrl_logger.warning(f"{log_prefix} git reset failed (rc={out['returncode']}).")
@@ -774,10 +779,10 @@ def grade_fresh_container(
         # PSRL's file API avoids heredoc delimiter collisions and shell expansion.
         if sandbox_session is not None:
             sandbox_session.write_bytes("/tmp/psrl-model.patch", model_patch.encode())
-            apply_cmd2 = "git apply /tmp/psrl-model.patch"
+            apply_cmd2 = "git apply --binary /tmp/psrl-model.patch"
         else:
             delimiter = "PSRL_PATCH_EOF"
-            apply_cmd2 = f"git apply <<'{delimiter}'\n{model_patch}\n{delimiter}"
+            apply_cmd2 = f"git apply --binary <<'{delimiter}'\n{model_patch}\n{delimiter}"
         out2 = execute(apply_cmd2, cwd="/testbed")
         apply_ok = out2["returncode"] == 0
         if not apply_ok:

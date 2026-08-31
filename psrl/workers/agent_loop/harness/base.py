@@ -105,7 +105,18 @@ class HarnessConfig:
     permission_mode: str | None = None
     allowed_tools: tuple[str, ...] = ()
     system_prompt: str | None = None
+    system_prompt_mode: str = "replace"
+    setting_sources: str | None = None
     tools: str | None = None
+    max_output_tokens: int | None = None
+    thinking_enabled: bool = True
+    thinking_budget_tokens: int | None = None
+    reasoning_effort: str | None = None
+    interleaved_thinking: bool = True
+    supported_capabilities: tuple[str, ...] = ()
+    disable_prompt_caching: bool = False
+    disable_experimental_betas: bool = False
+    subagents_enabled: bool = True
     compaction: HarnessCompactionConfig = field(default_factory=HarnessCompactionConfig)
     install: HarnessInstallConfig = field(default_factory=HarnessInstallConfig)
 
@@ -114,6 +125,16 @@ class HarnessConfig:
             raise ValueError("Harness kind and executable cannot be empty.")
         if self.time_budget_s <= 0 or self.output_tail_chars <= 0:
             raise ValueError("Harness time_budget_s and output_tail_chars must be greater than zero.")
+        if self.system_prompt_mode not in ("append", "replace", "none"):
+            raise ValueError(f"Unsupported harness system_prompt_mode {self.system_prompt_mode!r}.")
+        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
+            raise ValueError("Harness max_output_tokens must be greater than zero when configured.")
+        if self.thinking_budget_tokens is not None and self.thinking_budget_tokens <= 0:
+            raise ValueError("Harness thinking_budget_tokens must be greater than zero when configured.")
+        if not self.thinking_enabled and self.thinking_budget_tokens is not None:
+            raise ValueError("Harness thinking_budget_tokens cannot be set when thinking is disabled.")
+        if self.reasoning_effort is not None and not self.reasoning_effort.strip():
+            raise ValueError("Harness reasoning_effort cannot be empty when configured.")
 
     @classmethod
     def from_value(cls, value: HarnessConfig | DictConfig | Mapping[str, Any]) -> HarnessConfig:
@@ -129,6 +150,9 @@ class HarnessConfig:
         normalized = dict(raw)
         normalized["args"] = tuple(str(item) for item in normalized.get("args", ()))
         normalized["allowed_tools"] = tuple(str(item) for item in normalized.get("allowed_tools", ()))
+        normalized["supported_capabilities"] = tuple(
+            str(item) for item in normalized.get("supported_capabilities", ())
+        )
         normalized["env"] = {str(key): str(item) for key, item in dict(normalized.get("env", {})).items()}
         compaction = normalized.get("compaction", {})
         normalized["compaction"] = (
@@ -154,7 +178,6 @@ class HarnessRuntime:
     context_window_tokens: int | None = None
     compaction_token_limit: int | None = None
     max_turns: int | None = None
-    max_output_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -252,21 +275,43 @@ class Harness(ABC):
         node_tarball = shlex.quote(install.node_tarball_path)
         cli_tarball = shlex.quote(install.cli_tarball_path)
         npm_prefix = shlex.quote(install.npm_prefix)
+        # Prefer the Tencent npm mirror (direct via no_proxy) so the platform
+        # package fetch never depends on reaching npmjs.org through the proxy;
+        # override with NPM_REGISTRY for other environments.
+        npm_registry = shlex.quote(os.environ.get("NPM_REGISTRY", "https://mirrors.tencent.com/npm/"))
+        # slime-style tarball install:
+        #   1) Ensure the base runtime (Node + npm) is present — prefer a base
+        #      image that ships Node >= 18 ("npm baked into the image"); fall
+        #      back to extracting the mounted Node 22 tarball when the image
+        #      lacks a usable npm.
+        #   2) Install the harness CLI from its npm tarball. `--prefer-offline`
+        #      uses a pre-seeded npm cache when one is baked into the image, so
+        #      only cache misses touch the registry.
+        # npm is a harness-agnostic path: adding a new CLI-style harness only
+        # needs a tarball + check_command, no host-side binary mounts.
         command = (
             "set -euo pipefail; "
-            f"if [ ! -x {node_dir}/bin/node ]; then "
+            # Step 1: base runtime.
+            "if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 "
+            "|| ! node -e \"process.exit(+process.versions.node.split('.')[0] >= 18 ? 0 : 1)\" >/dev/null 2>&1; then "
             f"mkdir -p {node_dir}; "
+            # `--no-same-owner`: the official Node tarball ships files owned by
+            # uid 1000 (iojs). Without it GNU tar (running as root) tries to
+            # chown every extracted file to uid 1000, which sandboxes that deny
+            # chown reject with EPERM → tar exits 2 and the install aborts.
             f"if tar -tf {node_tarball} >/dev/null 2>&1; then "
-            f"tar -xf {node_tarball} -C {node_dir} --strip-components=1; "
+            f"tar --no-same-owner -xf {node_tarball} -C {node_dir} --strip-components=1; "
             f"elif command -v xz >/dev/null 2>&1; then "
-            f"xz -dc {node_tarball} | tar -xf - -C {node_dir} --strip-components=1; "
+            f"xz -dc {node_tarball} | tar --no-same-owner -xf - -C {node_dir} --strip-components=1; "
             "else echo 'Node tarball is compressed but xz is unavailable.' >&2; exit 127; fi; "
-            "fi; "
             f"ln -sf {node_dir}/bin/node /usr/local/bin/node; "
             f"ln -sf {node_dir}/bin/npm /usr/local/bin/npm; "
             f"ln -sf {node_dir}/bin/npx /usr/local/bin/npx; "
             "hash -r; "
-            f"npm install -g --prefix={npm_prefix} --no-audit --no-fund {cli_tarball}; "
+            "fi; "
+            # Step 2: harness CLI via npm tarball.
+            f"npm install -g --prefix={npm_prefix} --no-audit --no-fund --prefer-offline "
+            f"--registry={npm_registry} {cli_tarball}; "
             f"{check_command}"
         )
         last_result = ExecResult(1, "", "")

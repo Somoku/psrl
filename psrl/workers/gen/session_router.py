@@ -667,6 +667,10 @@ class SessionRouter:
             "x-version-tag",
             "x-base-worker-id",
             "x-target-dp-rank",
+            # Session-scoped prompt-too-long budget: SMG returns an Anthropic
+            # `prompt_too_long` error (driving Claude Code's reactive compact)
+            # when the accumulated prompt reaches this value.
+            "x-smg-prompt-too-long-limit",
         }
         session_headers = {key.lower(): value for key, value in headers.items() if key.lower() in allowed}
         session_headers[SESSION_ID_HEADER] = sid

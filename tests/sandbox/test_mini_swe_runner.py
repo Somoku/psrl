@@ -196,7 +196,12 @@ def test_fresh_grader_uses_generic_sandbox_data_plane(monkeypatch) -> None:
     )
 
     result = swebench_grader.grade_fresh_container(
-        {"instance_id": "task", "FAIL_TO_PASS": ["test_a.py::test_a"], "eval_script": "pytest -q"},
+        {
+            "instance_id": "task",
+            "base_commit": "abc123",
+            "FAIL_TO_PASS": ["test_a.py::test_a"],
+            "eval_script": "pytest -q",
+        },
         "diff --git a/a.py b/a.py\n",
         "gym",
         "image",
@@ -208,5 +213,6 @@ def test_fresh_grader_uses_generic_sandbox_data_plane(monkeypatch) -> None:
     assert sandbox.specs == [spec]
     assert sandbox.session.writes["/tmp/psrl-model.patch"].startswith(b"diff --git")
     assert sandbox.session.writes["/tmp/psrl-eval.sh"] == b"pytest -q"
-    assert "git apply /tmp/psrl-model.patch" in sandbox.session.commands
+    assert "git reset --hard abc123 && git clean -fd" in sandbox.session.commands
+    assert "git apply --binary /tmp/psrl-model.patch" in sandbox.session.commands
     assert sandbox.session.released

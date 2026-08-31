@@ -157,18 +157,30 @@ def build_training_data(
             # Non-last turn: at most max_trim_tokens (typically 0 or 1).
             allowed = max_trim_tokens  # is_last already guarded above
             if trim_count > allowed:
-                raise ValueError(
-                    f"TITO trailing trim overflow at turn {i}: "
-                    f"trim_count={trim_count} exceeds allowed={allowed} "
-                    f"(max_trim_tokens={max_trim_tokens}). "
-                    f"output_ids[-3:]={output_ids[-3:]}, "
-                    f"accumulated[{prompt_len + matched}:{prompt_len + matched + 3}]="
-                    f"{accumulated_token_ids[prompt_len + matched : prompt_len + matched + 3]}"
+                # miles-style: a boundary divergence beyond the model's ceiling
+                # (e.g. a truncated turn, or a response that embeds a special
+                # token mid-stream) is a diagnostic condition, not a reason to
+                # discard the whole trajectory. Clamp the trim to the allowed
+                # ceiling and carry on instead of raising.
+                psrl_logger.warning(
+                    "[TITO turn %d] trailing trim overflow: trim_count=%d exceeds "
+                    "allowed=%d (max_trim_tokens=%d); clamping trim to %d. "
+                    "output_ids[-3:]=%s, accumulated[%d:%d]=%s",
+                    i,
+                    trim_count,
+                    allowed,
+                    max_trim_tokens,
+                    allowed,
+                    str(output_ids[-3:]),
+                    prompt_len + matched,
+                    prompt_len + matched + 3,
+                    str(accumulated_token_ids[prompt_len + matched : prompt_len + matched + 3]),
                 )
+                trim_count = allowed
 
             if trim_count > 0:
-                output_ids = output_ids[:matched]
-                output_logprobs = output_logprobs[:matched]
+                output_ids = output_ids[: len(output_ids) - trim_count]
+                output_logprobs = output_logprobs[: len(output_logprobs) - trim_count]
                 psrl_logger.debug(
                     "[TITO turn %d] trimmed %d tokens, remaining output_len=%d",
                     i,

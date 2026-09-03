@@ -1,13 +1,7 @@
 """
-Persistent-shell protocol for sandbox command execution.
+Execute commands through a persistent sandbox shell.
 
-A sandbox container runs one long-lived `bash -l` on stdin, so shell state such
-as the working directory, exported variables, and the active conda environment
-persists across commands. Because the shell never exits, command completion is
-detected by echoing a sentinel that carries the exit status.
-
-This mirrors the protocol MLGym implements internally, so that MLGym's own
-`communicate()` semantics are preserved when its container I/O is rerouted here.
+The completion sentinel preserves shell state while exposing each command's exit status.
 """
 
 from __future__ import annotations
@@ -98,20 +92,16 @@ def truncate_observation(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars * 2:
         return text
 
-    # Compute the notice first with a placeholder omitted count, then adjust.
-    # We need to know the notice length to compute the actual per-side budget.
-    # One iteration suffices because the notice length is stable once the omitted
-    # digit count is fixed.
+    # The notice length stabilizes once the omitted digit count is known.
     total_budget = max_chars * 2
     placeholder_notice = TRUNCATION_NOTICE.format(omitted=len(text))
     per_side = (total_budget - len(placeholder_notice)) // 2
     if per_side <= 0:
-        # Notice alone exceeds the budget. Fall back to showing only the notice.
         per_side = 0
 
     omitted = len(text) - per_side * 2
     notice = TRUNCATION_NOTICE.format(omitted=omitted)
-    psrl_logger.debug(f"Truncated a sandbox observation, omitting {omitted} characters.")
+    psrl_logger.debug(f"Truncated a sandbox observation. Omitted characters={omitted}.")
     head = text[:per_side] if per_side > 0 else ""
     tail = text[-per_side:] if per_side > 0 else ""
     return head + notice + tail

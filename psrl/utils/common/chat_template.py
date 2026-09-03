@@ -14,10 +14,8 @@ def resolve_chat_template_value(value: str | None) -> str | None:
     """
     Resolve a `custom_chat_template` config value to its jinja string.
 
-    If `value` points at an existing file, return the file's contents;
-    otherwise return `value` unchanged. This lets users either inline a
-    short template into hydra CLI or point to a `.jinja` file when the
-    template is too awkward to escape on the command line.
+    If `value` points at an existing file, return the file's contents.
+    Otherwise return `value` unchanged.
 
     Args:
         value (str | None): Raw config value. None passes through.

@@ -31,9 +31,7 @@ python -m uv pip install "transformers==5.10.1" accelerate datasets peft hf-tran
 
 python -m uv pip uninstall -y pynvml nvidia-ml-py
 python -m uv pip install --no-cache-dir "nvidia-ml-py>=12.560.30" "fastapi[standard]>=0.115.0" "optree>=0.13.0" "pydantic>=2.9" "grpcio>=1.62.1" "nvidia-cudnn-frontend>=1.13.0"
-# protobuf 7 runtime: smg-grpc-servicer pulls grpcio-reflection/health >=1.81.1,
-# and current 1.82+/1.83 wheels ship protobuf-7 gencode that needs runtime >=7.35.1.
-# Pre-install a matching grpcio-tools so --no-build-isolation SMG proto builds use it.
+# Match the protobuf 7 runtime before no-build-isolation generates SMG stubs.
 python -m uv pip install --no-cache-dir "grpcio-tools>=1.81.1" "protobuf>=7.35.1,<8"
 
 echo "4. Install FlashAttention and FlashInfer"

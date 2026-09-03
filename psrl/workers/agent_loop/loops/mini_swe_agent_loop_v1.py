@@ -119,10 +119,7 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
                 psrl_logger.error("mini-SWE-agent runner failed: %s.", result.get("error", "unknown error"))
                 return None, TerminateReason.ROLLOUT_ERROR
 
-            # A context-window overflow is not a fatal error: the turns produced
-            # before the overflow are valid training data. Recover them and treat
-            # the trajectory as a normal max-length termination so the group is
-            # not aborted.
+            # Completed turns remain valid training data after a context overflow.
             context_exceeded = result.get("exit_status") == "context_exceeded"
 
             training_data = await self.get_primary_training_data(session_id)

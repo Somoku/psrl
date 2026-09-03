@@ -46,25 +46,20 @@ class SessionState:
     trajectory_turns: dict[int, int] = field(default_factory=dict)
     base_worker_id: str | None = None
     target_dp_rank: str | None = None
-    # Version tag pinned by SMG on the first routed turn. Once set (non-`-1`),
-    # it is carried into every subsequent turn so re-routes filter on a version
-    # at least as fresh as the instance that first served this trajectory.
+    # Subsequent turns require a version at least as fresh as the first serving
+    # instance.
     version_tag: str | None = None
     # --- Hang/continue scheduling (ThunderAgent port) ---
     # Accumulated token footprint of the session (max prompt+completion observed).
     total_tokens: int = 0
     # "running" | "hung": whether the coordinator has hung this session.
     hang_state: str = SESSION_RUNNING
-    # Set by the coordinator when a hang is requested while a turn is in flight;
-    # converted to hung at the next turn boundary (deferred hang for generate).
+    # In-flight hang requests take effect at the next turn boundary.
     marked_for_hang: bool = False
     # Set means "may proceed". A hung session blocks at the next turn entry until
     # the coordinator continues it (sets the event). Initialized set in __post_init__.
     continue_event: asyncio.Event = field(default_factory=asyncio.Event)
-    # One-shot pin target set by /control/continue: (base_worker_id, target_dp_rank).
-    # When set, the session's NEXT turn is force-pinned to this instance (via the
-    # x-force-pin-once header) and the field is cleared immediately after injection,
-    # so only the first turn after continue is pinned. None means "let SMG route".
+    # A continue target pins only the next turn. `None` leaves routing to SMG.
     pin_once_instance: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
@@ -181,11 +176,7 @@ class SessionRouter:
             int(request.headers.get(TRAJECTORY_ID_HEADER, "0")) if self.trajectory_id_strategy == "manual" else None
         )
 
-        # Hang point: block at the entry of the next turn while the session is
-        # hung. Any in-flight turn (generate on SMG or an env step between turns)
-        # has already returned, so the whole session quiesces here without
-        # aborting in-flight work. Await the event OUTSIDE the lock so the
-        # coordinator can flip hang_state/continue_event concurrently.
+        # Wait outside the lock so the coordinator can resume a hung session.
         while True:
             async with state.lock:
                 if state.closing:
@@ -193,7 +184,7 @@ class SessionRouter:
                 if state.hang_state != SESSION_HUNG:
                     break
                 continue_event = state.continue_event
-            psrl_logger.debug(f"Session {sid!r} trajectory {trajectory_id} blocked at hang point, awaiting continue.")
+            psrl_logger.debug(f"Session blocked at hang point: session_id={sid!r}, trajectory_id={trajectory_id!r}.")
             await continue_event.wait()
 
         async with state.lock:
@@ -216,14 +207,12 @@ class SessionRouter:
             headers["x-target-dp-rank"] = target_dp_rank
         if version_tag is not None:
             headers["x-version-tag"] = version_tag
-        # Force-pin this turn's first worker selection to the continue target.
-        # SMG clears x-force-pin-once on the first loopback, so partial-rollout /
-        # preemption re-dispatch within this turn falls back to free routing.
+        # The one-shot pin expires before any partial-rollout redispatch.
         if pin_once_instance is not None:
             headers["x-base-worker-id"] = pin_once_instance[0]
             headers["x-target-dp-rank"] = pin_once_instance[1]
             headers["x-force-pin-once"] = "true"
-            psrl_logger.debug(f"Session {sid!r} turn force-pinned to instance {pin_once_instance!r} (one-shot).")
+            psrl_logger.debug(f"Force-pinned session turn: session_id={sid!r}, instance={pin_once_instance!r}.")
         body = await request.body()
         turn_index = state.get_trajectory_turn(trajectory_id or 0)
 
@@ -263,9 +252,8 @@ class SessionRouter:
                     if version_tag is not None:
                         state.version_tag = version_tag
 
-                    # Update the session token footprint from the usage block.
-                    # usage.prompt_tokens already includes the full accumulated
-                    # TITO context, so prompt+completion is the live footprint.
+                    # Prompt usage includes accumulated TITO context, so adding
+                    # completion usage yields the live footprint.
                     self._update_total_tokens(state, result)
 
                     if trajectory_id is not None:
@@ -278,7 +266,7 @@ class SessionRouter:
                     state.hang_state = SESSION_HUNG
                     state.continue_event.clear()
                     psrl_logger.debug(
-                        f"Session {sid!r} deferred hang applied at turn boundary (trajectory {trajectory_id})."
+                        f"Applied deferred session hang: session_id={sid!r}, trajectory_id={trajectory_id!r}."
                     )
 
         return self.build_response(result)
@@ -296,9 +284,7 @@ class SessionRouter:
         )
         return self.build_response(result)
 
-    # -------------------------------------------------------------------------
-    # Hang/continue control plane (coordinator-facing)
-    # -------------------------------------------------------------------------
+    # --- Hang and Continue Control Plane ---
 
     async def control_list_sessions(self) -> Response:
         """Return a snapshot of every live session for the coordinator scheduler."""
@@ -324,11 +310,11 @@ class SessionRouter:
         return JSONResponse(content={"sessions": sessions})
 
     async def control_hang(self, request: Request) -> Response:
-        """Hang the given sessions.
+        """
+        Hang the requested sessions.
 
-        Body: ``[{"session_id": ...}, ...]``. If a session is idle (env, no
-        in-flight turn) it is hung immediately; if a turn is in flight
-        (generate) the hang is deferred and applied at the next turn boundary.
+        Idle sessions hang immediately. In-flight sessions hang at the next turn
+        boundary.
         """
         payload = await self._read_control_ids(request)
         applied, deferred, missing = [], [], []
@@ -354,12 +340,11 @@ class SessionRouter:
         return JSONResponse(content={"hung": applied, "deferred": deferred, "missing": missing})
 
     async def control_continue(self, request: Request) -> Response:
-        """Continue (un-hang) the given sessions.
+        """
+        Continue the requested sessions.
 
-        Body: ``[{"session_id": ..., "base_worker_id": ..., "target_dp_rank": ...}, ...]``.
-        The two worker-id fields are optional: when present, the session's next
-        turn is force-pinned to that instance (one-shot); when absent, the next
-        turn is routed normally by SMG.
+        Optional worker IDs pin only the next turn. Without them, SMG selects the
+        next worker.
         """
         pins = await self._read_control_pins(request)
         applied, missing = [], []

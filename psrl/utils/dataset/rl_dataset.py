@@ -12,20 +12,12 @@ logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class PSRLRLHFDataset(RLHFDataset):
-    """RLHFDataset variant that loads PSRL native/function tool schemas.
-
-    The upstream verl dataset performs overlong-prompt filtering during
-    ``__init__``.  This wrapper computes PSRL tool schemas before entering the
-    parent constructor and injects them when filtering prompts, while keeping the
-    rest of verl's dataset implementation unchanged.
-    """
+    """Load PSRL tool schemas before the parent filters overlong prompts."""
 
     def __init__(self, *args, config, **kwargs):
         self._psrl_tool_schemas = _load_psrl_tool_schemas(config)
 
-        # Current PSRL may depend on a verl version whose RLHFDataset only knows
-        # verl-native tool configs.  Prevent that path from trying to import
-        # verl tools for PSRL configs; this wrapper supplies schemas instead.
+        # The parent understands only veRL-native tool configs, so supply resolved schemas directly.
         dataset_config = copy.deepcopy(config)
         with open_dict(dataset_config):
             dataset_config.tool_config_path = None

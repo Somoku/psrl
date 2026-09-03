@@ -79,19 +79,12 @@ class ToolAgentData(ConversationAgentData):
         videos: list[tuple[torch.Tensor, dict]] | None = None,
         is_init: bool = False,
     ) -> tuple[list[int], bool]:
-        """Encode tool-env conversation messages into token ids (async).
+        """
+        Encode tool environment messages into token IDs asynchronously.
 
-        For the first observation we include tool schemas and treat the result as
-        prompt ids.  For subsequent observations we re-encode incrementally,
-        stripping the system-prompt prefix, and treat the result as user-side
-        tokens (masked to 0 during training).
-
-        When a multimodal *processor* is configured (VLM path), the initial
-        observation is processed via ``processor(text=..., images=..., ...)`` so
-        that vision tokens are embedded correctly.  Subsequent incremental turns
-        are still text-only (tool responses are text) and use the tokenizer path.
-
-        All blocking CPU work is offloaded to the default thread-pool executor.
+        The initial observation includes tool schemas and yields prompt tokens.
+        Later observations omit the system prefix and yield masked response tokens.
+        Blocking processor work runs in the default thread pool.
 
         Returns:
             (token_ids, is_prompt) where is_prompt is True only for the initial
@@ -210,7 +203,6 @@ class ToolAgentData(ConversationAgentData):
 
     def _parse_tool_calls(self, tool_calls: list[dict]):
         """Extract tool call actions from OpenAI format tool_calls."""
-        # Return the tool_calls list directly — the environment handles the format
         return tool_calls
 
     async def update_from_model_chat_completion(self, output: dict, **kwargs) -> tuple:

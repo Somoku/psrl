@@ -1,7 +1,5 @@
 """Tests for sciaccel_rl config dataclass and factory."""
 
-import pytest
-
 
 class TestSciAccelRuntimeConfig:
     """Test config construction and merging."""
@@ -17,10 +15,12 @@ class TestSciAccelRuntimeConfig:
     def test_build_runtime_config_from_yaml_kwargs(self):
         from examples.sciaccel_rl.config import build_runtime_config
 
-        cfg = build_runtime_config({
-            "harbor": {"agent_name": "custom-agent", "jobs_dir": "/tmp/custom"},
-            "task_timeout_sec": 7200.0,
-        })
+        cfg = build_runtime_config(
+            {
+                "harbor": {"agent_name": "custom-agent", "jobs_dir": "/tmp/custom"},
+                "task_timeout_sec": 7200.0,
+            }
+        )
         assert cfg.harbor.agent_name == "custom-agent"
         assert cfg.harbor.jobs_dir == "/tmp/custom"
         assert cfg.task_timeout_sec == 7200.0

@@ -37,9 +37,7 @@ from psrl.utils.converter.modeling.hf_modeling import HFParameterMapping
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 from torch.nn import Parameter
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_config(
@@ -70,9 +68,7 @@ def _default_sharding() -> NIXLSharding:
     return NIXLSharding.default()
 
 
-# ---------------------------------------------------------------------------
 # ParameterMapping base class
-# ---------------------------------------------------------------------------
 
 
 class TestParameterMappingBase(unittest.TestCase):
@@ -109,9 +105,7 @@ class TestParameterMappingBase(unittest.TestCase):
         self.assertEqual(info["num_kv_heads"], 16)
 
 
-# ---------------------------------------------------------------------------
 # HFParameterMapping
-# ---------------------------------------------------------------------------
 
 
 class TestHFParameterMapping(unittest.TestCase):
@@ -137,9 +131,7 @@ class TestHFParameterMapping(unittest.TestCase):
         self.assertEqual(info["head_size"], 128)  # 2048 // 16
 
 
-# ---------------------------------------------------------------------------
 # FSDPParameterMapping
-# ---------------------------------------------------------------------------
 
 
 class TestFSDPParameterMapping(unittest.TestCase):
@@ -156,7 +148,6 @@ class TestFSDPParameterMapping(unittest.TestCase):
         self.assertIsInstance(mapping, FSDPParameterMapping)
 
     def test_model_info_same_as_hf_mapping(self):
-        # FSDP and HF use the same default get_model_info — both must agree
         config = _make_config(num_attention_heads=32, num_key_value_heads=8, hidden_size=4096, intermediate_size=11008)
         hf_info = HFParameterMapping(config).get_model_info()
         fsdp_info = FSDPParameterMapping(config).get_model_info()
@@ -167,9 +158,7 @@ class TestFSDPParameterMapping(unittest.TestCase):
         self.assertIsNot(HFParameterMapping, FSDPParameterMapping)
 
 
-# ---------------------------------------------------------------------------
-# ModelRegistry / create_parameter_mapping
-# ---------------------------------------------------------------------------
+# Model registry and parameter mapping creation
 
 
 class TestModelRegistry(unittest.TestCase):
@@ -197,9 +186,7 @@ class TestModelRegistry(unittest.TestCase):
             create_parameter_mapping("__NonExistentModel__", _make_config())
 
 
-# ---------------------------------------------------------------------------
-# reshape_qkv_to_3d
-# ---------------------------------------------------------------------------
+# QKV reshaping
 
 
 class TestReshapeQKVTo3D(unittest.TestCase):
@@ -212,17 +199,13 @@ class TestReshapeQKVTo3D(unittest.TestCase):
         return param, result
 
     def test_q_shape_dense(self):
-        # num_heads=8, num_kv_heads=8, head_size=64 → G=8, q_per_g=64
-        # Q 2D shape: (8*64, H) = (512, 256)
-        # Expected 3D: (8, 64, 256)
+        # Eight dense heads reshape into eight groups of 64 rows.
         H = 256
         param, result = self._run(512, H, num_heads=8, num_kv_heads=8, head_size=64)
         self.assertEqual(result.shape, (8, 64, H))
 
     def test_kv_shape_gqa(self):
-        # num_heads=32, num_kv_heads=8, head_size=128 → G=8, kv_per_g=128
-        # KV 2D shape: (8*128, H) = (1024, 4096)
-        # Expected 3D: (8, 128, 4096)
+        # Eight key-value heads reshape into eight groups of 128 rows.
         H = 4096
         param, result = self._run(1024, H, num_heads=32, num_kv_heads=8, head_size=128)
         self.assertEqual(result.shape, (8, 128, H))
@@ -234,7 +217,7 @@ class TestReshapeQKVTo3D(unittest.TestCase):
         self.assertEqual(result.shape, (8, 512, H))
 
     def test_storage_shared(self):
-        # reshape must produce a view, not a copy — same underlying storage
+        # Reshaping must return a view over the original storage.
         H = 256
         param, result = self._run(512, H, num_heads=8, num_kv_heads=8, head_size=64)
         self.assertEqual(
@@ -249,9 +232,7 @@ class TestReshapeQKVTo3D(unittest.TestCase):
         self.assertEqual(result.numel(), rows * H)
 
 
-# ---------------------------------------------------------------------------
-# slice_qkv_proj
-# ---------------------------------------------------------------------------
+# QKV projection slicing
 
 
 class TestSliceQKVProj(unittest.TestCase):
@@ -336,9 +317,7 @@ class TestSliceQKVProj(unittest.TestCase):
         self.assertTrue(torch.equal(v.data, data[12:16]))
 
 
-# ---------------------------------------------------------------------------
-# BaseConverter.maybe_reshape_qkv_to_3d
-# ---------------------------------------------------------------------------
+# Conditional QKV reshaping
 
 
 class _ConcreteConverter(BaseConverter):
@@ -359,9 +338,7 @@ def _make_converter(num_heads=32, num_kv_heads=8, head_size=128) -> _ConcreteCon
     return _ConcreteConverter(HFParameterMapping(config))
 
 
-# ---------------------------------------------------------------------------
-# BaseConverter.__init__ via super()
-# ---------------------------------------------------------------------------
+# Base converter initialization
 
 
 class TestBaseConverterInit(unittest.TestCase):
@@ -389,11 +366,9 @@ def _sharding(shard_dim: int, ws: int, rank: int) -> NIXLSharding:
 
 
 class TestMaybeReshapeQKVTo3D(unittest.TestCase):
-    """Tests for BaseConverter.maybe_reshape_qkv_to_3d — all three cases plus no-ops."""
+    """Test `BaseConverter.maybe_reshape_qkv_to_3d` across all paths."""
 
-    # -----------------------------------------------------------------------
     # No-op conditions
-    # -----------------------------------------------------------------------
 
     def test_noop_non_qkv_name(self):
         conv = _make_converter()
@@ -428,14 +403,10 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         self.assertIs(out_p, param)
         self.assertIs(out_s, sharding)
 
-    # -----------------------------------------------------------------------
-    # Case A: shard_dim == 1 (hidden sharded)
-    # -----------------------------------------------------------------------
+    # Case A with sharded hidden dimension
 
     def test_case_a_shape(self):
-        # num_heads=32, num_kv_heads=8 → G=8
-        # Q 2D: (32*128, H//ws) with shard_dim=1, ws=2
-        # After reshape: shard_dim moved 1→2, new shard_mesh={2: 2}
+        # Reshaping moves the sharded hidden dimension from axis 1 to axis 2.
         num_heads, num_kv_heads, head_size = 32, 8, 128
         H_shard = 2048  # half of hidden_size=4096 (tp-sharded)
         param = _make_param((num_heads * head_size, H_shard))
@@ -447,9 +418,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         self.assertEqual(out_s.shard_mesh, OrderedDict([(2, 2)]))
         self.assertEqual(out_s.shard_indices, [(1,)])
 
-    # -----------------------------------------------------------------------
-    # Case B: shard_dim == 0, ws <= G_global
-    # -----------------------------------------------------------------------
+    # Case B when world size does not exceed global groups
 
     def test_case_b_shape_ws_equals_G(self):
         # G=8, ws=8 → Case B (ws == G_global)
@@ -493,9 +462,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         self.assertEqual(out_p.shape, (G, num_heads // G * head_size, H))
         self.assertIs(out_s, sharding)
 
-    # -----------------------------------------------------------------------
-    # Case C: shard_dim == 0, ws > G_global
-    # -----------------------------------------------------------------------
+    # Case C when world size exceeds global groups
 
     def test_case_c_shape(self):
         # G=8, ws=16 → steps=2, Case C
@@ -539,9 +506,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
         with self.assertRaises(AssertionError):
             conv.maybe_reshape_qkv_to_3d("model.layers.0.self_attn.q_proj.weight", param, sharding)
 
-    # -----------------------------------------------------------------------
     # Storage sharing
-    # -----------------------------------------------------------------------
 
     def test_case_b_storage_shared(self):
         num_heads, num_kv_heads, head_size = 32, 8, 128
@@ -568,9 +533,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
             param.data.untyped_storage().data_ptr(),
         )
 
-    # -----------------------------------------------------------------------
-    # k_proj / v_proj name triggers reshape too
-    # -----------------------------------------------------------------------
+    # Key and value projection reshaping
 
     def test_kv_proj_names_trigger_reshape(self):
         num_heads, num_kv_heads, head_size = 32, 8, 128
@@ -583,9 +546,7 @@ class TestMaybeReshapeQKVTo3D(unittest.TestCase):
             self.assertEqual(out_p.ndim, 3, f"Expected 3D for {name}")
 
 
-# ---------------------------------------------------------------------------
-# HFConverter.convert_state_and_sharding_dict
-# ---------------------------------------------------------------------------
+# Hugging Face state and sharding conversion
 
 
 def _make_minimal_hf_model(num_heads=32, num_kv_heads=8, head_size=128, hidden=4096):
@@ -664,7 +625,7 @@ class TestHFConverter(unittest.TestCase):
         self.assertEqual(k.shape, (G, num_kv_heads // G * head_size, hidden))
 
     def test_sharding_is_default_for_all_params(self):
-        # HF model is not TP-sharded; all params get NIXLSharding.default()
+        # Hugging Face parameters are unsharded, so all use `NIXLSharding.default`.
         model = _make_minimal_hf_model()
         conv = self._converter()
         _, sharding = conv.convert_state_and_sharding_dict(model)
@@ -698,9 +659,7 @@ class TestHFConverter(unittest.TestCase):
         self.assertEqual(state["model.layers.0.self_attn.q_proj.weight"].ndim, 3)
 
 
-# ---------------------------------------------------------------------------
-# Subclass get_model_info via super()
-# ---------------------------------------------------------------------------
+# Subclass model information
 
 
 class TestSubclassGetModelInfo(unittest.TestCase):
@@ -729,14 +688,7 @@ class TestSubclassGetModelInfo(unittest.TestCase):
 
 
 class TestLoadStateDictNdimMismatchSlicing(unittest.TestCase):
-    """
-    Tests for the ndim-mismatch slicing path in load_state_dict_into_registered_tensors.
-
-    The scenario: a QKV weight is registered as 3D (after maybe_reshape_qkv_to_3d) but
-    the source checkpoint tensor is still 2D. The fix reconstructs the full 3D tensor and
-    slices each per-PS-worker shard with narrow() using the global shard_mesh, bypassing
-    get_local_sharded_tensors which relies on _local_shard_mesh (= 1, a no-op).
-    """
+    """Test loading a 2D QKV checkpoint into registered 3D worker shards."""
 
     def _make_sharding(self, shard_mesh: dict, shard_indices: list) -> NIXLSharding:
         return NIXLSharding(
@@ -801,10 +753,7 @@ class TestLoadStateDictNdimMismatchSlicing(unittest.TestCase):
             self.assertTrue(torch.equal(shard, expected), f"Shard {i} values mismatch.")
 
     def test_no_op_when_ndim_matches(self):
-        """
-        When src_tensor.ndim == dst_tensor_sample.ndim the mismatch branch is NOT taken;
-        get_local_sharded_tensors handles it instead.  Verify the condition is correct.
-        """
+        """Verify matching dimensions bypass the mismatch branch."""
         src_3d = torch.randn(1, 128, 2048)
         dst_sample = torch.empty(1, 128, 2048)
         # ndim matches → the branch condition is False

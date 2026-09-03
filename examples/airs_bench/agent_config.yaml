@@ -86,10 +86,8 @@ demonstration_template: |
   {demonstration}
   --- END OF DEMONSTRATION ---
 output_parser: MLGymThoughtActionParser
-# NOTE(claude): DefaultHistoryProcessor is mandatory. Last5Observations rewrites
-# older user messages in place, which invalidates TITO's message prefix hashes and
-# silently corrupts the training token stream. Context growth is bounded instead by
-# observation truncation plus turn and length guards.
+# NOTE(claude): `DefaultHistoryProcessor` preserves TITO prefix hashes. Context growth
+# is bounded by observation truncation and turn and length guards.
 history_processor: DefaultHistoryProcessor
 tools:
   state_command:

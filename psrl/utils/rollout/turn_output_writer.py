@@ -116,7 +116,7 @@ class TurnOutputWriter:
                 with open(path, mode) as f:
                     f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except (OSError, TypeError, ValueError) as e:
-            psrl_logger.warning(f"Failed to write turn {turn} of session {session_id!r} to {path!r}: {e}.")
+            psrl_logger.warning(f"Failed to write turn={turn}, session={session_id!r}, path={path!r}: {e}.")
 
 
 def _decode_body(body: bytes) -> object:

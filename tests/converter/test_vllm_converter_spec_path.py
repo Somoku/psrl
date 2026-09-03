@@ -248,10 +248,7 @@ class TestBuildFromSpec:
                 mock_qkv = MagicMock(spec=QKVParallelLinear)
                 mock_qkv.tp_size = 1
                 mock_qkv.weight = nn.Parameter(torch.zeros(24, 8))
-                # Expose the mock as a "named parameter" via a container approach:
-                # We store it so named_modules yields the mock, but named_parameters
-                # on the outer model won't find it. Instead, we put the weight directly
-                # on this module with the right suffix in its full qualified name.
+                # Register the weight here so its qualified name exposes the projection suffix.
                 self.register_parameter("qkv_proj_weight", nn.Parameter(torch.zeros(24, 8)))
 
             def get_weight_layout_spec(self) -> WeightLayoutSpec:
@@ -650,13 +647,10 @@ class TestConvertParameterSplitting:
         class FakeModel(nn.Module):
             def __init__(self):
                 super().__init__()
-                # We need get_sharding_for_param to not raise; use a simple Linear
-                # which has tp_size defaulting to 1 (attribute absent → getattr returns 1).
+                # A plain linear layer supplies the default TP size used by sharding lookup.
                 self.attn = nn.Linear(8, 24, bias=False)
 
-        # Rather than wrestling with named_modules, call convert_parameter directly via
-        # the ParameterMapping integration (this tests _build_from_parameter_mapping is
-        # wired through correctly).
+        # Exercise the `ParameterMapping` path directly without model traversal.
         conv = VllmConverter(parameter_mapping=QKVMapping(), tp_rank=0)
         fused, model_info = conv._build_from_parameter_mapping()
 
@@ -724,7 +718,7 @@ class TestConvertParameterSplitting:
         assert set(result.keys()) == expected_keys, f"Expected per-expert gate/up keys, got {set(result.keys())}"
         # Each slice should have shape (intermediate, in_features) = (4, 2)
         for key in expected_keys:
-            assert result[key].shape == (4, 2), f"{key} shape {result[key].shape} != (4, 2)"
+            assert result[key].shape == (4, 2), f"Shape for key={key!r} was {result[key].shape!r}. Expected (4, 2)."
 
     def test_fused_moe_w2_split_produces_per_expert_output(self):
         """Pattern A MoE: w2_weight is split into per-expert down_proj params."""
@@ -761,7 +755,7 @@ class TestConvertParameterSplitting:
 
 
 class TestGetShardingForParam:
-    """Tests for get_sharding_for_param — sharding dimension inference from module type."""
+    """Tests for `get_sharding_for_param` sharding dimension inference."""
 
     def _make_converter(self, tp_rank=0):
         return VllmConverter(parameter_mapping=None, tp_rank=tp_rank)

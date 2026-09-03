@@ -1,44 +1,10 @@
 #!/usr/bin/env bash
-# warm_repair.sh — re-warm the task images that failed a nop warm pass.
-#
-# A warm pass on a COLD node loses a few tasks to transient registry errors: the build
-# fails with a bare `EOF` on the metadata HEAD for a base image (observed on
-# `python:3.13-slim`, the verifier base), even though the same request succeeds 10/10
-# sequentially from that host. Those tasks are not broken, they just never finished
-# building, so the first training step that samples one pays a full cold build
-# (~1-3 min) instead of ~16 s.
-#
-# The trigger is a MISSING BASE IMAGE, not concurrency and not a cold task cache. The
-# mirror resolves to a link-local address (169.254.0.51), i.e. a node-local proxy, and it
-# intermittently drops metadata requests -- both `EOF` and `dial tcp ...: i/o timeout` --
-# while sequential curls to the same URL return 200. A node with env_setup already down
-# to 15 s still lost 13 of 129 tasks this way, because the verifier's base image is a
-# separate FROM that env-image layer caching never supplies.
-#
-# provision_docker_nodes.sh now pre-pulls python:3.13-slim, debian:bookworm-slim and
-# alpine:3.19, which removes the request entirely. Run it before a warm pass and this
-# script should find nothing to repair. Concurrency is at most a contributing factor and
-# is NOT sufficient on its own: two nodes running the identical 12-way pass lost 20 tasks
-# and 0 tasks respectively.
-#
-# This reads a completed pass's results.jsonl, picks out the tasks whose error_class is
-# not `ok`, and re-runs ONLY those at low concurrency. Idempotent: with nothing to
-# repair it exits 0 without launching anything.
-#
-# Usage:
-#   bash warm_repair.sh --results <nop_warm_dir>/results.jsonl
-#   bash warm_repair.sh --results <dir>/results.jsonl --host 28.49.195.154
-#   bash warm_repair.sh --results <dir>/results.jsonl --dry-run
-#
-# Options:
-#   --results PATH    results.jsonl from the warm pass to repair. (required)
-#   --host HOST       Run the repair on this host over ssh. Default: locally.
-#   --concurrency N   Tasks in flight (default: 4). Low on purpose: these builds are
-#                     the ones that already failed once, so the repair trades speed for
-#                     the best chance of completing.
-#   --dataset PATH    v2 parquet (default: examples/sciaccel_rl/data/v2/all.parquet).
-#   --dry-run         List the failed tasks and the command, run nothing.
-#   -h | --help       Print this help.
+# Retry failed image warmup tasks with low concurrency.
+# Usage: `warm_repair.sh --results PATH [options]`
+
+
+
+
 
 set -euo pipefail
 
@@ -99,9 +65,7 @@ echo
 
 OUT_DIR="$(dirname "${RESULTS}")_repair_$(date +%m%d_%H%M%S)"
 
-# One eval invocation per task. --task-glob takes a single fnmatch pattern, so a
-# combined run is not possible, and separate runs also mean one hard failure does not
-# abort the rest.
+# Run each task separately so one failure cannot abort the remaining repairs.
 run_one() {
     local task="$1" out="$2"
     cd "${PSRL_PATH}"
@@ -126,10 +90,7 @@ fi
 
 n_ok=0
 n_fail=0
-# Create the log directory once, up front. Both branches below redirect to
-# "${out}.log", and a missing parent makes the redirect itself fail -- which bash
-# reports as the command failing, so all 13 tasks looked like build failures when
-# nothing had even been attempted.
+# Create the log directory before redirects are opened.
 mkdir -p "${OUT_DIR}"
 for i in "${!FAILED[@]}"; do
     task="${FAILED[$i]}"

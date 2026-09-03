@@ -1,12 +1,4 @@
-"""
-Sandbox routing and capacity accounting.
-
-The coordinator is deliberately thin. It knows which workers exist, how loaded
-they are, and how to choose one for a `SandboxSpec`. Container mechanics live in
-`EnvWorker`, and placement decisions live in `EnvWorkerManager`. Keeping routing
-here is what allows locality-aware or dynamic policies to be added later without
-touching either neighbor.
-"""
+"""Route sandbox requests without owning container or placement mechanics."""
 
 from __future__ import annotations
 
@@ -23,9 +15,8 @@ from psrl.workers.env_worker.sandbox import ExecResult, SandboxSpec
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# NOTE(claude): This counter is a module-level singleton shared across all coordinator
-# instances in the same process. In heterogeneous-capacity pools, round-robin distributes
-# by counter index into the eligible subset, not globally, which is intentional.
+# NOTE(claude): `_ROUND_ROBIN_COUNTER` is shared by coordinators in one process, so
+# heterogeneous pools index each eligible subset independently.
 _ROUND_ROBIN_COUNTER = itertools.count()
 _SELECT_POLL_INTERVAL_S = 0.5
 
@@ -155,7 +146,8 @@ class EnvWorkerCoordinator:
                 node_ip=node_ip,
             )
         psrl_logger.info(
-            f"Registered env worker {worker_id} on {node_ip} with {cpu_slots} cpu slot(s) and {gpu_slots} gpu slot(s)."
+            f"Registered env worker={worker_id!r} on node={node_ip!r}. "
+            f"CPU slots={cpu_slots!r}, GPU slots={gpu_slots!r}."
         )
 
     async def select_worker(self, spec: SandboxSpec, timeout_s: float) -> tuple[Any, int]:
@@ -221,7 +213,7 @@ class EnvWorkerCoordinator:
             except Exception as error:  # noqa: BLE001
                 last_error = error
                 await self.release(worker_id, spec.gpus)
-                psrl_logger.warning(f"Sandbox creation attempt {attempt} failed on worker {worker_id}: {error}.")
+                psrl_logger.warning(f"Sandbox creation attempt={attempt!r} failed on worker={worker_id!r}: {error!r}.")
         raise RuntimeError(f"Failed to create a sandbox after two attempts: {last_error}.")
 
     async def release(self, worker_id: int, gpus: int) -> None:

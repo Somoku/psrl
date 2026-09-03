@@ -48,12 +48,7 @@ TRAIN_NGPUS_PER_NODE=8
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
-# dependency: vllm>=0.11.0, megatron-lm>=0.13, mbridge with qwen3vl_cp branch
-# environment option1: use a stable container later than docker://verlai/verl:vllm011.dev6 
-    # and install mbridge in it by following the instruction in the container
-            # pip remove mbridge if you have installed it
-            # pip install git+https://github.com/ISEEKYAN/mbridge.git@qwen3vl_cp # for correct mbridge
-# environment option2: use container docker://verlai/verl:vllm011.dev_qwenvl_cp
+# Requires vLLM 0.11 or newer, Megatron-LM 0.13 or newer, and the `qwen3vl_cp` MBridge branch.
  
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \

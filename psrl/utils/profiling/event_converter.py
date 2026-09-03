@@ -1,8 +1,4 @@
-"""
-Convert vLLM EngineCoreEvent streams into PrefillRecord / DecodeRecord dicts.
-
-Pure functions — no side effects, no vLLM imports beyond the event enum.
-"""
+"""Convert vLLM EngineCoreEvent streams into prefill and decode records."""
 
 import logging
 import os
@@ -98,9 +94,7 @@ def events_to_profiling_records(
     decode_records: list[dict] = []
 
     for seg_idx, seg in enumerate(segments):
-        # --- PrefillRecord ---
-        # First segment of an engine call gets RESUME (overwritten by router).
-        # Subsequent segments are INTERNAL_PREEMPT_RESUME.
+        # The router overwrites the first resume. Later segments resume after preemption.
         if seg_idx == 0:
             trigger = PrefillTrigger.RESUME
         else:
@@ -131,9 +125,7 @@ def events_to_profiling_records(
         )
         prefill_records.append(pr.to_dict())
 
-        # --- DecodeRecord ---
-        # Only create a DecodeRecord if this segment reached FIRST_TOKEN
-        # (i.e., actually produced output tokens before preemption or completion).
+        # Record decode only after the segment has produced its first token.
         if seg["first_token_ts"] is not None:
             if seg["preempted_ts"] is not None:
                 # Preempted after producing some tokens.
@@ -142,8 +134,7 @@ def events_to_profiling_records(
                 # Normal completion: use LAST_TOKEN for accurate decode duration.
                 decode_end_ts = seg["last_token_ts"]
             else:
-                # LAST_TOKEN not yet seen (e.g., partial rollout interrupted mid-decode).
-                # No reliable end timestamp — record 0 rather than a wrong value.
+                # A missing `LAST_TOKEN` has no reliable end timestamp. Record zero duration.
                 decode_end_ts = seg["first_token_ts"]
 
             decode_duration_s = max(decode_end_ts - seg["first_token_ts"], 0.0)

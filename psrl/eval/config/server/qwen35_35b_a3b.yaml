@@ -1,29 +1,11 @@
-# Qwen3.5-35B-A3B. MoE: 256 experts, 8 active per token, 40 layers, hidden 2048.
-# Multimodal (carries a vision_config), so it loads a vision tower even for text-only
-# serving. Trained window is 262144.
-#
-# Being ~4x the 9B in parameters does NOT mean less usable context. KV cost per token
-# scales with layers x kv_heads x head_dim, and this model's hidden size is 2048 versus
-# the 9B's 4096, so its KV footprint per token is smaller. The MoE weights are large
-# but they are weights, not cache. Whether that nets out to a bigger window has to be
-# measured, not assumed:
-#
-#   curl -s localhost:<port>/metrics | grep -o 'num_gpu_blocks="[0-9]*"'
-#   usable_context_per_sequence ~= blocks * 16 / desired_concurrency
-#
-# Reference points measured on H20 for Qwen3.5-9B: TP=2 gives 8,796 blocks
-# (140,736 KV tokens), TP=4 gives 18,743 (299,888).
-#
-# 98304 is a starting guess chosen to match the 9B's 2 x TP=4 configuration, which is
-# the one that makes a 50-turn cap meaningful (a 25-turn transcript already reaches
-# ~35.5k tokens). Re-measure and adjust before trusting a run.
+# Qwen3.5-35B-A3B is a multimodal MoE with a trained window of 262144.
+# KV cache capacity determines the usable context, so re-measure before a run.
 checkpoint: /apdcephfs_zwfy10/share_303541817/lhy/models/Qwen3.5-35B-A3B
 served_model_name: qwen35-35b-a3b
 max_model_len: 98304
 gpu_memory_utilization: 0.9
 
-# Empty on purpose; see server/qwen35_9b.yaml. terminus-2 parses its own text protocol
-# out of the assistant message, so vLLM tool-call extraction would strip what it needs.
+# Empty because `terminus-2` parses text that vLLM tool call extraction would strip.
 tool_call_parser: ""
 
 chat_template: ""

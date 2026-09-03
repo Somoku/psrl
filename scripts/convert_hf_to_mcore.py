@@ -1,12 +1,9 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -49,7 +46,7 @@ from verl.utils.megatron_utils import get_model
 
 
 def _init_args():
-    """
+    r"""
     Examples:
 
     1. single rank conversion for any model:
@@ -143,7 +140,7 @@ def convert_checkpoint_from_transformers_to_megatron(
         numel += safe_copy(hf_model.model.embed_tokens.weight, model.embedding.word_embeddings.weight)
 
     assert len(model.decoder.layers) == (layer_end - layer_start), (
-        f"Expected {len(model.decoder.layers)} layers, but got {layer_end - layer_start}"
+        f"Layer count mismatch: expected={len(model.decoder.layers)}, actual={layer_end - layer_start}."
     )
     for layer_idx, (layer, hf_layer) in enumerate(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True)
@@ -242,7 +239,7 @@ def convert_checkpoint_from_transformers_to_megatron_dense(
         numel += safe_copy(hf_model.model.embed_tokens.weight, model.embedding.word_embeddings.weight)
 
     assert len(model.decoder.layers) == (layer_end - layer_start), (
-        f"Expected {len(model.decoder.layers)} layers, but got {layer_end - layer_start}"
+        f"Layer count mismatch: expected={len(model.decoder.layers)}, actual={layer_end - layer_start}."
     )
     for layer_idx, (layer, hf_layer) in enumerate(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True)
@@ -313,7 +310,7 @@ def convert_checkpoint_from_transformers_to_megatron_mixtral(
         numel += safe_copy(hf_model.model.embed_tokens.weight, model.embedding.word_embeddings.weight)
 
     assert len(model.decoder.layers) == (layer_end - layer_start), (
-        f"Expected {len(model.decoder.layers)} layers, but got {layer_end - layer_start}"
+        f"Layer count mismatch: expected={len(model.decoder.layers)}, actual={layer_end - layer_start}."
     )
     for layer_idx, (layer, hf_layer) in enumerate(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True)
@@ -519,7 +516,7 @@ def convert_checkpoint_from_transformers_to_megatron_dpskv3(
         numel += safe_copy(hf_model.model.embed_tokens.weight, model.embedding.word_embeddings.weight)
 
     assert len(model.decoder.layers) == (layer_end - layer_start), (
-        f"Expected {len(model.decoder.layers)} layers, but got {layer_end - layer_start}"
+        f"Layer count mismatch: expected={len(model.decoder.layers)}, actual={layer_end - layer_start}."
     )
     for layer_idx, (layer, hf_layer) in enumerate(
         zip(model.decoder.layers, hf_model.model.layers[layer_start:layer_end], strict=True)
@@ -759,13 +756,11 @@ def convert_hf_to_mcore(
     elif use_cpu_initialization and any(
         arch in hf_config.architectures for arch in ("LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM")
     ):
-        # CPU-only path for dense models (e.g. Llama-70B). The GPU-resident path
-        # in ``load_state_dict_to_megatron_gptmodel`` would otherwise place the
-        # whole bf16 model on a single GPU and OOM.
+        # Use CPU because loading the entire dense bf16 model on one GPU can exhaust its memory.
         convert_checkpoint_from_transformers_to_megatron_dense(hf_model, model[0].module, hf_config)
     else:
         assert not use_cpu_initialization, (
-            f"use_cpu_initialization for this architecture is not implemented yet; got {hf_config.architectures}"
+            f"use_cpu_initialization is not implemented for architecture {hf_config.architectures!r}."
         )
         from verl.models.mcore.loader import load_state_dict_to_megatron_gptmodel
 

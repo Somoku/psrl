@@ -1,33 +1,5 @@
 """
-mini-SWE-agent Reward Function for PSRL.
-
-Reward structure for mini_swe_agent data sources (toy / simple-test):
-  1.0       — exact patch match
-  0.10-0.85 — partial patch match (file overlap + line similarity)
-  0.05      — patch generated but wrong files / no patch but edited correct file
-  0.03      — no patch, but ran tests or python verification
-  0.02      — no patch, but model made edits (bash edits on wrong file)
-  0.01      — no patch, but model explored code (cat/ls used)
-  0.0       — no patch and no meaningful tool usage / 0 turns (timeout)
- -0.05      — long and fruitless (>=10 turns, no patch, no editor)
- -0.1       — premature submit without any tool usage (1-2 turns)
-
-Reward structure for swebench_verified / swe_smith_py data sources:
-
-  +1.0  — all FAIL_TO_PASS pass AND all PASS_TO_PASS still pass (resolved)
-   0.0  — aborted (0 turns / Docker failure / no messages)
-  -1.0  — all other cases: patch submitted but not resolved,
-           no patch submitted, policy violated
-
-``outcome_reward = 1.0 if reward else -1.0``
-  • reward=1  → resolved=True   → +1.0
-  • reward=0  → resolved=False  → -1.0 (covers no-patch, not-resolved,
-                                         policy-blocked)
-  • no msgs   → ABORTED         → score=0.0, remove_sample=True
-
-The `acc` field (0/1 float, set in agent_data.finalize_output) is emitted
-alongside `score` on wandb to track resolve_rate separately from the shaped
-training signal.
+Compute patch and test based rewards for mini-SWE-agent trajectories.
 """
 
 import logging
@@ -39,9 +11,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-# ---------------------------------------------------------------------------
-# Patch comparison helpers
-# ---------------------------------------------------------------------------
+# --- Patch comparison ---
 
 
 def normalize_patch(patch: str) -> str:
@@ -91,12 +61,6 @@ def _extract_changed_lines(patch: str) -> set[str]:
 def compare_patches(generated: str, expected: str) -> float:
     """
     Fine-grained patch comparison with line-level similarity.
-
-    Scoring:
-    - 0.0:  no patch generated
-    - 0.05: patch generated but wrong files
-    - 0.10 - 0.85: partial match (file overlap + line similarity)
-    - 1.0:  exact match (after normalization)
     """
     if not generated:
         return 0.0
@@ -165,32 +129,22 @@ def _targeted_correct_file(solution_str: str, expected_patch: str) -> bool:
     return any(f in text for f in target_files)
 
 
-# ---------------------------------------------------------------------------
-# SWE-bench reward with configurable granularity
-# ---------------------------------------------------------------------------
+# --- SWE-bench reward ---
 
 
 def _compute_swe_reward(
     extra_info: dict[str, Any] | None,
     reward_mode: str = "binary",
 ) -> dict[str, Any]:
-    """Compute SWE-bench reward with configurable granularity.
+    """
+    Compute a SWE-bench reward with configurable granularity.
 
-    Reward modes:
-        binary:         {+1, 0, -1} — original behavior.
-        test_ratio:     Continuous based on f2p_pass / f2p_total.
-        partial_credit: Multi-level: no_patch < apply_fail < no_progress < partial_fix < resolved.
-        shaped:         partial_credit + efficiency bonus for fewer turns.
+    Args:
+        extra_info (dict[str, Any] | None): Grading and trajectory metadata.
+        reward_mode (str): Binary, test ratio, partial credit, or shaped mode.
 
-    Levels (partial_credit / shaped):
-        +1.0            Fully resolved (all F2P pass, all P2P maintained).
-        0.1 + 0.6×r    Partial fix: r = f2p_pass / f2p_total (range 0.1–0.7).
-        0.0             Patch applied, P2P maintained, but no F2P progress.
-       -0.2             Patch submitted but git apply failed.
-       -0.3             Patch applied but caused P2P regression (>5% tests broken).
-       -0.5             No patch submitted, but agent tried (>2 turns).
-       -1.0             Policy violated / no attempt (<=2 turns) / alignment failed.
-        0.0 (remove)    Aborted (0 turns / Docker failure).
+    Returns:
+        dict[str, Any]: Score and binary accuracy.
     """
     if extra_info is None:
         extra_info = {}
@@ -247,7 +201,7 @@ def _compute_swe_reward(
         psrl_logger.debug("[swe reward] score=-0.2, acc=0.0 (patch apply failed).")
         return {"score": -0.2, "acc": 0.0}
 
-    # Patch applied successfully — check test results
+    # Evaluate tests after successful patch application.
     f2p_pass = int(grader_result.get("f2p_pass", 0))
     f2p_total = max(int(grader_result.get("f2p_total", 1)), 1)
     p2p_pass = int(grader_result.get("p2p_pass", 0))
@@ -265,7 +219,7 @@ def _compute_swe_reward(
     # test_ratio mode: directly use f2p ratio as score
     f2p_ratio = f2p_pass / f2p_total
     if reward_mode == "test_ratio":
-        score = f2p_ratio  # range [0, 1)  (1.0 would be resolved, handled above)
+        score = f2p_ratio  # Resolved cases return earlier.
         psrl_logger.debug(f"[swe reward] score={score:.3f}, acc=0.0 (test_ratio: f2p={f2p_pass}/{f2p_total}).")
         return {"score": score, "acc": 0.0}
 
@@ -289,9 +243,7 @@ def _compute_swe_reward(
     return {"score": score, "acc": 0.0}
 
 
-# ---------------------------------------------------------------------------
-# PSRL-compatible compute_score entry point
-# ---------------------------------------------------------------------------
+# --- PSRL reward entry point ---
 
 
 def compute_score(
@@ -303,28 +255,18 @@ def compute_score(
     **kwargs,
 ) -> float | dict[str, Any]:
     """
-    Custom reward function for mini-SWE-agent with tool-use shaping.
+    Compute reward from trajectory output and grading metadata.
 
     Args:
+        data_source (str): Dataset family.
+        solution_str (str): Decoded trajectory text.
+        ground_truth (Any): Expected patch or grading metadata.
+        extra_info (dict[str, Any] | None): Trajectory and grader details.
         reward_mode: Reward granularity for SWE-bench data sources.
-            - "binary": {+1, 0, -1} (original behavior)
-            - "partial_credit": Multi-level rewards based on patch/test progress
-            - "test_ratio": Continuous score based on f2p/p2p ratios
-            - "shaped": partial_credit + efficiency bonus
+        **kwargs: Ignored framework arguments.
 
     Returns:
-        float: For toy data sources (``mini_swe_agent_simple``, ``mini_swe_agent``),
-            returns a plain float reward in the range [-0.1, 1.0].
-        dict[str, Any]: For SWE-bench data sources (``swebench_verified``,
-            ``swe_smith_py``), returns ``{"score": float, "acc": float}`` so that
-            `DAPORewardLoopManager` emits both the shaped training signal and the
-            0/1 resolve_rate metric to wandb separately.
-
-            Reward values follow:
-              +1.0  resolved
-               0.0  aborted (0 turns / Docker failure)
-              -1.0  all other cases (binary mode)
-              [-1.0, 0.95]  partial credit (partial_credit/test_ratio/shaped modes)
+        float | dict[str, Any]: Scalar toy reward or SWE score and accuracy.
     """
     # --- SWE-bench Verified / SWE-smith-py: test-execution reward ---
     if data_source in ("swebench_verified", "swe_smith_py", "swe_gym"):
@@ -365,7 +307,7 @@ def compute_score(
     tools = _detect_tool_usage(solution_str)
     hit_correct_file = _targeted_correct_file(solution_str, expected_patch)
 
-    # Patch was generated — use patch comparison.
+    # Compare generated patches against the expected patch.
     if generated_patch:
         score = compare_patches(generated_patch, expected_patch)
         psrl_logger.debug(
@@ -374,7 +316,7 @@ def compute_score(
         )
         return score
 
-    # No patch — shaped reward based on tool usage (graduated).
+    # Shape missing-patch rewards using observed tools.
     if tools["used_editor"] and hit_correct_file:
         score = 0.05
     elif tools["used_python"] or tools["used_test"]:

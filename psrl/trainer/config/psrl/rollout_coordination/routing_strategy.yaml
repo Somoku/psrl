@@ -1,35 +1,22 @@
-# Method for rollout routing
-# Available options: "random", "round_robin", "request_num_balance", "throughput_optimal",
-# "throughput_optimal_with_budget", "cache_aware", "cache_aware_v1"
-# If using "request_num_balance" or "throughput_optimal" or "throughput_optimal_with_budget",
-# you need to enable status collection.
+# Status-based routing methods require status collection.
 method: request_num_balance
 
 # SMG cache-aware routing hyperparameters (used when method is cache_aware or cache_aware_v1).
 cache_aware_policy:
 
-  # Approximate radix-tree -> minimum load routing.
-  # Minimum cache-hit ratio for the approximate radix-tree fallback path.
-  # If cache-hit ratio is less than cache_threshold, the request will be routed to the instance with the minimum load.
-  # Only used when KV events are unavailable; event-driven scoring ignores it. Range 0.0-1.0.
+  # The approximate radix tree uses minimum-load routing below this cache hit ratio.
+  # Event-driven scoring ignores this fallback threshold.
   cache_threshold: 0.0
 
-  # Weights for event-driven multi-tier overlap scoring.
-  # score(worker) = gpu_overlap_weight * gpu_hit_blocks
-  #               + lmcache_overlap_weight * lmcache_hit_blocks
-  # A GPU hit costs ~zero reload; an LMCache (off-GPU) hit must be loaded back to
-  # the GPU, so it is cheaper than re-prefill but not free. Keep gpu >= lmcache.
+  # Favor GPU hits because LMCache hits must be loaded back to the GPU.
   gpu_overlap_weight: 1.0
   lmcache_overlap_weight: 0
 
-  # Directly trigger the minimum load routing when both thresholds are met.
-  # max - min > balance_abs_threshold and (max - min) / min > balance_rel_threshold
+  # Use minimum-load routing when both spread thresholds are exceeded.
   balance_abs_threshold: 16
   balance_rel_threshold: 1.5
 
-  # KV-utilization triggers (>= 1.0 disables). Both cache_aware and cache_aware_v1
-  # read the backend engine token_usage snapshot for these triggers; the
-  # request-count spread (balance_abs/rel above) uses in-flight worker.load().
+  # KV utilization uses backend token snapshots. Request spread uses in-flight worker load.
   balance_token_usage_threshold: 0.75
   overload_token_usage_threshold: 1.0
 
@@ -38,43 +25,25 @@ cache_aware_policy:
   max_tree_size: 67108864  # 2**26
   block_size: 16           # KV block size for event-driven routing
 
-  # [cache_aware_v1 only] KV-capacity admission threshold.
-  # Reject when effective_kv_used + new_tokens > kv_capacity_threshold * max_model_len.
-  # Set below 1.0 to reserve headroom for response-token growth during decode
-  # (e.g. 0.85 leaves 15% buffer). 1.0 = reject only at full capacity.
+  # `cache_aware_v1` rejects requests above this effective KV capacity ratio.
   kv_capacity_threshold: 2.0
 
-# KV cache transfer: when a request is re-routed to a different rollout instance
-# (hint != selected; e.g. non-sticky partial loopback or coordinator-side mig),
-# transfer the accumulated KV cache (A_CPU --NIXL--> B_CPU via LMCache Controller)
-# so instance B can skip re-prefill. Independent of sync_and_mig_strategy.mig.enable.
-# Requires lmcache.enable and lmcache.enable_p2p.
+# Transfer accumulated KV when routing moves a request between rollout instances.
+# Requires `lmcache.enable` and `lmcache.enable_p2p`.
 kv_transfer:
 
   # Master switch for KV cache transfer.
   enable: False
 
-  # Transfer timing mode.
-  # "async"    -- (default) fire-and-forget: dispatch to B immediately while
-  #              transfer runs in background.  Lowest routing latency.
-  # "sync"     -- await transfer completion, NO pin.  If LRU evicts during
-  #              transfer, it fails gracefully and B re-prefills.  Moderate
-  #              latency, no CPU backend memory pressure from pinning.
-  # "pin_sync" -- pin → await transfer → unpin.  Strongest guarantee: prevents
-  #              LRU eviction during transfer.  Highest latency; risks CPU
-  #              backend pressure under high concurrency.
+  # `async` does not wait, `sync` waits, and `pin_sync` pins through completion.
+  # Pinning prevents eviction but increases backend memory pressure.
   transfer_mode: async
 
   # Timeout in milliseconds for "sync" and "pin_sync" modes.
   # On timeout the transfer is abandoned and B falls back to re-prefill.
   transfer_timeout_ms: 5000
 
-  # Interval in seconds between periodic KV-transfer stats log lines on
-  # each source instance. Each instance's VllmEngineServicer prints a
-  # "[KVTransfer] instance=... stats: ..." summary at most once per this
-  # interval, triggered by transfer activity. Only used when kv_transfer.enable
-  # is True; otherwise logging is disabled regardless of this value. Set to 0
-  # to suppress stats even when transfer is enabled.
+  # Minimum interval between transfer statistics logs. Zero suppresses them.
   stats_log_interval_s: 30
 
 # Check interval in millisecond for rollout routing
@@ -91,13 +60,10 @@ candidate_sort_indicator: version
 # Whether to enable multiple priority queues for routing requests
 enable_multi_priority_queue: False
 
-# Whether to enable group sticky routing: pin all rollout requests sharing a
-# prompt_id to the same rollout instance so their KV-cache prefixes are reused.
+# Pin each `prompt_id` group to one rollout instance for KV prefix reuse.
 enable_group_sticky: False
 
-# Whether to enable trajectory sticky routing: pin all generation calls within
-# a single trajectory (subsequent turns) to the same rollout instance that
-# served the first turn, so the per-trajectory KV-cache prefix is reused.
+# Pin every turn in one trajectory to the first rollout instance.
 enable_trajectory_sticky: False
 
 # Logging interval in milliseconds
@@ -117,12 +83,10 @@ request_budget: 1024
 # Here snapshot_staleness_threshold_ms is the time difference between the last time record and the snapshot time of the engine status.
 snapshot_staleness_threshold_in_ms: 1000
 
-# Max waiting requests per instance after preemption (vLLM preemption *notification*
-# threshold only; not an admission signal).
+# This vLLM preemption notification threshold is not an admission signal.
 max_num_waiting_reqs_after_preemption: 1024
 
-# Max concurrent sequences per instance. Also sets vLLM max_num_seqs (oc.select) and
-# is the admission gate's in-flight count cap. Lower to bound concurrency. 0 = no cap.
+# Maximum concurrent sequences and admission count per instance. Zero disables the cap.
 max_concurrent_seqs_per_instance: 1024
 
 # Whether to reject requests when the engine waiting queue is not empty

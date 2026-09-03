@@ -1,64 +1,17 @@
 """
-Worker-side probe extension for chunked prefill micro-benchmarks.
+Expose worker-side probes for chunked prefill micro-benchmarks.
 
-This module implements ``ChunkedPrefillProbeExtension``, a ``worker_extension_cls``
-that can be passed to ``LLM`` / ``AsyncLLM`` to expose three RPC-callable methods:
+`probe_step` measures one synthetic engine step, `probe_chunked_sequence` measures
+a complete chunked sequence, and `get_memory_breakdown` reports worker memory.
 
-- ``probe_step(q_lens, kv_lens, warmup, iters)`` — measure one synthetic engine step
-  with exactly the requested per-request ``(q_len, kv_len)`` geometry.
-- ``probe_chunked_sequence(total_len, chunk_size, ...)`` — measure a full chunked
-  prefill sequence split across multiple steps, reporting per-step timing.
-- ``get_memory_breakdown()`` — read back the engine's memory accounting.
-
-**Implementation notes**
-
-Three traps must be handled correctly:
-
-1. ``model_runner.execute_model()`` always returns ``None`` on the normal path
-   (deferred sampling). The caller must follow up with ``sample_tokens(None)`` to
-   clear ``execute_model_state`` before the next step.
-
-2. Requests accumulate in ``input_batch``.  After each probe we finish them
-   by sending a cleanup ``SchedulerOutput`` with
-   ``total_num_scheduled_tokens=0`` and the request IDs in ``finished_req_ids``.
-   The empty-step early-return path in ``execute_model`` runs ``_update_states``
-   and returns ``EMPTY_MODEL_RUNNER_OUTPUT`` (no ``sample_tokens`` needed).
-
-3. We bypass ``KVCacheManager``, so block IDs are self-managed.
-   Block 0 is the null block and must be skipped.  If the required
-   blocks exceed ``num_gpu_blocks`` the probe is skipped with a clear error.
-
-**Multi-step probe design (``probe_chunked_sequence``)**
-
-For a sequence of total length ``total_len`` chunked into ``chunk_size`` tokens per
-step, each step is driven like this:
-
-- Step 0 (first chunk): ``NewRequestData`` with ALL blocks for the full sequence
-  pre-allocated and ``num_computed_tokens = prefix_len``.
-- Steps 1..K-1: ``NewRequestData`` again (simplest correct path), but with
-  ``num_computed_tokens = prefix_len + step * chunk_size`` so that positions and
-  slot-mapping advance correctly.  All blocks pre-allocated in step 0 are reused.
-
-  Why ``NewRequestData`` every step and not ``CachedRequestData`` for steps 1+?
-  Because ``CachedRequestData`` requires the request to already be resident in
-  ``input_batch`` from the previous step, but we issue a cleanup after every step
-  to avoid request-state accumulation across trials.  Re-registering via
-  ``NewRequestData`` is the correct way to re-enter with updated ``num_computed_tokens``.
-
-- Between steps: the physical KV-cache blocks are NOT cleared by the cleanup step
-  (which only removes the request mapping).  So step k+1 correctly reads the KV
-  values written by step k when computing attention over the growing context.
-
-- Decode requests run in parallel are treated as independent ``NewRequestData``
-  entries with fixed context length (they represent requests already in flight
-  during the prefill phase), cleaned up after each step together with the prefill
-  chunk.
+The normal `execute_model` path defers sampling, so each call must be followed by
+`sample_tokens(None)`. Cleanup removes request mappings but preserves physical KV
+blocks, allowing later chunks to reuse earlier KV values.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 from typing import Any
 
@@ -113,8 +66,8 @@ def _build_scheduler_output(
         block_ids = list(range(cur_block, cur_block + n_blocks))
         cur_block += n_blocks
 
-        # NOTE(lhy): prompt_token_ids length must be >= kv_len so that
-        # _update_states can write the correct token ids into input_batch.
+        # NOTE(lhy): Prompt token IDs must cover `kv_len` so `_update_states` can
+        # write them into `input_batch`.
         prompt_token_ids = [_DUMMY_TOKEN_ID] * kv_len
 
         new_reqs.append(
@@ -153,11 +106,8 @@ def _build_cleanup_output(req_ids: list[str]) -> SchedulerOutput:
     """
     Build a zero-token ``SchedulerOutput`` that only marks requests finished.
 
-    This is used to flush request state from ``input_batch`` after a probe.
-    The early-return path in ``execute_model`` (``if not num_scheduled_tokens:``)
-    still calls ``_update_states``, which removes the finished requests —
-    and it returns ``EMPTY_MODEL_RUNNER_OUTPUT`` directly without needing
-    ``sample_tokens``.
+    The empty `execute_model` path calls `_update_states` and returns
+    `EMPTY_MODEL_RUNNER_OUTPUT` without deferred sampling.
     """
     return SchedulerOutput(
         scheduled_new_reqs=[],
@@ -183,9 +133,7 @@ class ChunkedPrefillProbeExtension:
     which vLLM injects automatically for any ``worker_extension_cls``.
     """
 
-    # -----------------------------------------------------------------------
-    # Public RPC-callable methods
-    # -----------------------------------------------------------------------
+    # --- Public RPC Methods ---
 
     def probe_step(
         self,
@@ -195,13 +143,7 @@ class ChunkedPrefillProbeExtension:
         iters: int = 10,
     ) -> dict[str, Any]:
         """
-        Run a synthetic engine step with the given per-request geometry and measure it.
-
-        The method:
-        1. Validates that the requested batch fits within engine limits.
-        2. Warms up ``warmup`` times (discarded).
-        3. Measures ``iters`` times using CUDA events.
-        4. Returns statistics for the measured runs.
+        Measure a synthetic engine step with the requested geometry.
 
         Args:
             q_lens (list[int]): Query lengths per request (tokens computed this step).
@@ -210,7 +152,7 @@ class ChunkedPrefillProbeExtension:
             iters (int): Number of measured iterations.
 
         Returns:
-            dict[str, Any]: Measurement results for this rank.  Keys:
+            dict[str, Any]: Measurement results for this rank. Keys:
                 - ``"rank"``: local rank index.
                 - ``"num_reqs"``: number of requests in the batch.
                 - ``"total_q_tokens"``: total query tokens.
@@ -244,9 +186,7 @@ class ChunkedPrefillProbeExtension:
             "skip_reason": "",
         }
 
-        # ------------------------------------------------------------------
-        # Validate batch fits within engine limits.
-        # ------------------------------------------------------------------
+        # --- Capacity Validation ---
         max_tokens = model_runner.max_num_tokens
         max_reqs = model_runner.max_num_reqs
         if total_q > max_tokens:
@@ -268,7 +208,6 @@ class ChunkedPrefillProbeExtension:
             base_result["skip_reason"] = msg
             return base_result
 
-        block_size = vllm_config.cache_config.num_gpu_blocks
         # Actual block size in tokens comes from the first KV cache group spec.
         kv_cache_config = getattr(model_runner, "kv_cache_config", None)
         if kv_cache_config and kv_cache_config.kv_cache_groups:
@@ -292,16 +231,12 @@ class ChunkedPrefillProbeExtension:
             base_result["skip_reason"] = msg
             return base_result
 
-        # ------------------------------------------------------------------
-        # Compute FLOPs via ModelMetrics (requires VLLM_DEBUG_MFU_METRICS=1).
-        # ------------------------------------------------------------------
+        # --- FLOPs Estimation ---
         flops = 0
         try:
             # Build a probe SchedulerOutput once for FLOPs computation.
             probe_ids_for_flops = [f"__flops_probe_{i}" for i in range(num_reqs)]
-            sched_flops, _ = _build_scheduler_output(
-                probe_ids_for_flops, q_lens, kv_lens, blk_sz, block_offset=1
-            )
+            sched_flops, _ = _build_scheduler_output(probe_ids_for_flops, q_lens, kv_lens, blk_sz, block_offset=1)
             model_metrics = ModelMetrics(vllm_config)
             if model_metrics.is_enabled():
                 perf = model_metrics.get_step_perf_stats_per_gpu(sched_flops)
@@ -309,9 +244,7 @@ class ChunkedPrefillProbeExtension:
         except Exception as exc:
             psrl_logger.debug("FLOPs estimation failed: %r.", exc)
 
-        # ------------------------------------------------------------------
-        # Run probe iterations.
-        # ------------------------------------------------------------------
+        # --- Probe Iterations ---
         latencies_ms: list[float] = []
         activation_deltas: list[int] = []
 
@@ -323,9 +256,7 @@ class ChunkedPrefillProbeExtension:
             # Wrap around if we exceed available blocks (safe because we measured above).
             block_start = (block_start % usable_blocks) + 1
 
-            sched_out, _ = _build_scheduler_output(
-                req_ids, q_lens, kv_lens, blk_sz, block_offset=block_start
-            )
+            sched_out, _ = _build_scheduler_output(req_ids, q_lens, kv_lens, blk_sz, block_offset=block_start)
             cleanup_out = _build_cleanup_output(req_ids)
 
             if measuring:
@@ -350,15 +281,11 @@ class ChunkedPrefillProbeExtension:
                 peak_alloc = torch.cuda.max_memory_allocated()
                 activation_deltas.append(max(0, peak_alloc - alloc_before))
 
-            # --- cleanup: remove requests from input_batch ---
             with torch.inference_mode():
                 model_runner.execute_model(cleanup_out)
-                # Cleanup step returns EMPTY_MODEL_RUNNER_OUTPUT directly,
-                # no sample_tokens needed.
+                # Cleanup returns EMPTY_MODEL_RUNNER_OUTPUT, so sampling is unnecessary.
 
-        # ------------------------------------------------------------------
-        # Aggregate results.
-        # ------------------------------------------------------------------
+        # --- Result Aggregation ---
         import statistics
 
         lat_sorted = sorted(latencies_ms)
@@ -376,8 +303,7 @@ class ChunkedPrefillProbeExtension:
         base_result["flops"] = flops
 
         psrl_logger.info(
-            "Probe result rank=%d total_q=%d num_reqs=%d "
-            "lat_ms=%.2f (p10=%.2f p90=%.2f) act_MB=%.1f.",
+            "Probe result rank=%d total_q=%d num_reqs=%d lat_ms=%.2f (p10=%.2f p90=%.2f) act_MB=%.1f.",
             rank,
             total_q,
             num_reqs,
@@ -400,57 +326,22 @@ class ChunkedPrefillProbeExtension:
         """
         Measure a full chunked prefill sequence across multiple engine steps.
 
-        Simulates how vLLM actually processes a long prefill when
-        ``max_num_batched_tokens < total_len``: the sequence is split into chunks
-        of ``chunk_size`` tokens and processed over ceil(total_len / chunk_size)
-        consecutive steps.  Optionally, ``decode_contexts`` decode requests run
-        in parallel with each chunk step (mimicking in-flight decode requests).
-
-        Each trial consists of running the full multi-step sequence once.
-        Timing is recorded per-step; across ``iters`` trials the per-step
-        latency distributions are aggregated separately.
-
-        ``warmup`` full sequences are run first and discarded (to fill cudagraph
-        caches, warm instruction caches, etc.) before the ``iters`` measured runs.
+        Each trial processes `total_len` in chunks of `chunk_size`. Optional
+        `decode_contexts` requests run beside every chunk.
 
         Args:
-            total_len (int): Total tokens to prefill (the full sequence length).
-            chunk_size (int): Tokens computed per step (must be <= max_num_batched_tokens
-                minus the token budget consumed by decode requests).
-            prefix_len (int): Tokens already in KV cache from prefix-cache hit
-                (not computed, but their KV must be "visible" to attention).
-                Defaults to 0.
-            decode_contexts (list[int] | None): Context lengths of in-flight decode
-                requests to run alongside each chunk step.  Each entry is the
-                ``kv_len`` of one decode request (query length = 1).
+            total_len (int): Total tokens to prefill.
+            chunk_size (int): Tokens computed per step. Must not exceed
+                `max_num_batched_tokens` minus the decode request budget.
+            prefix_len (int): Tokens already present in the KV cache.
+            decode_contexts (list[int] | None): Context lengths of concurrent decode
+                requests. Each entry uses query length one.
                 If None or empty, no decode requests are included.
-            warmup (int): Number of full-sequence warm-up trials (discarded).
+            warmup (int): Number of discarded warm-up trials.
             iters (int): Number of measured full-sequence trials.
 
         Returns:
-            dict[str, Any]: Measurement results for this rank.  Keys:
-
-            Per-sequence aggregates (across ``iters`` trials):
-
-            - ``"num_steps"``: number of steps in one sequence.
-            - ``"sequence_latency_ms_median"`` / ``"p10"`` / ``"p90"``:
-              total latency of one complete multi-step sequence.
-
-            Per-step detail (list of length ``num_steps``, index = step number):
-
-            - ``"step_latency_ms_median"``: list[float]
-            - ``"step_latency_ms_p10"``: list[float]
-            - ``"step_latency_ms_p90"``: list[float]
-            - ``"step_q_tokens"``: list[int] — query tokens in that step
-              (chunk_size for all but possibly the last step + decode count).
-            - ``"step_activation_bytes_median"``: list[float]
-
-            Metadata:
-
-            - ``"rank"``: local rank.
-            - ``"total_len"``, ``"chunk_size"``, ``"prefix_len"``,
-              ``"decode_contexts"``, ``"num_decode_reqs"``.
-            - ``"skipped"``, ``"skip_reason"``.
+            dict[str, Any]: Per-step and per-sequence latency, activation, and metadata.
         """
         assert hasattr(self, "vllm_config"), "vllm_config must be set on this extension."
         assert hasattr(self, "model_runner"), "model_runner must be set on this extension."
@@ -461,9 +352,7 @@ class ChunkedPrefillProbeExtension:
         dec_ctxs: list[int] = decode_contexts or []
         num_dec = len(dec_ctxs)
 
-        # ------------------------------------------------------------------
-        # Derive step plan: how many tokens per step.
-        # ------------------------------------------------------------------
+        # --- Step Plan ---
         remaining = total_len
         step_q_tokens_prefill: list[int] = []
         while remaining > 0:
@@ -493,9 +382,7 @@ class ChunkedPrefillProbeExtension:
             "skip_reason": "",
         }
 
-        # ------------------------------------------------------------------
-        # Validate capacity.
-        # ------------------------------------------------------------------
+        # --- Capacity Validation ---
         max_tokens = model_runner.max_num_tokens
         max_reqs = model_runner.max_num_reqs
 
@@ -511,10 +398,7 @@ class ChunkedPrefillProbeExtension:
                 return base_result
 
         if 1 + num_dec > max_reqs:
-            msg = (
-                f"num_reqs={1 + num_dec} (1 prefill + {num_dec} decode) exceeds "
-                f"max_num_seqs={max_reqs}."
-            )
+            msg = f"num_reqs={1 + num_dec} (1 prefill + {num_dec} decode) exceeds max_num_seqs={max_reqs}."
             psrl_logger.warning(msg)
             base_result["skipped"] = True
             base_result["skip_reason"] = msg
@@ -548,10 +432,7 @@ class ChunkedPrefillProbeExtension:
             base_result["skip_reason"] = msg
             return base_result
 
-        # ------------------------------------------------------------------
-        # Run trials.
-        # ------------------------------------------------------------------
-        # step_latencies[s] = list of measured latencies for step s across trials.
+        # --- Trials ---
         step_latencies: list[list[float]] = [[] for _ in range(num_steps)]
         step_activations: list[list[int]] = [[] for _ in range(num_steps)]
         sequence_latencies: list[float] = []
@@ -567,8 +448,7 @@ class ChunkedPrefillProbeExtension:
             dec_req_ids = [f"__cp_dec{d}_{trial}" for d in range(num_dec)]
             all_req_ids = [pf_req_id] + dec_req_ids
 
-            # Pre-allocate ALL blocks for the prefill sequence upfront so that
-            # attention in later steps can correctly address the KV cache positions
+            # Preallocate the full sequence so later steps can address KV positions
             # written by earlier steps.
             pf_all_blocks = list(range(pf_block_start, pf_block_start + blocks_for_prefill))
 
@@ -579,13 +459,9 @@ class ChunkedPrefillProbeExtension:
                 seq_t_start.record()
 
             for step_idx, pf_chunk in enumerate(step_q_tokens_prefill):
-                # KV length of the prefill request at the END of this step.
                 computed_so_far = prefix_len + sum(step_q_tokens_prefill[:step_idx])
-                pf_kv_len_this_step = computed_so_far + pf_chunk
 
-                # Build the SchedulerOutput for this step.
-                # Prefill request: registered fresh each step via NewRequestData
-                # with num_computed_tokens = computed_so_far.
+                # Re-register the prefill request with the current computed prefix.
                 pf_new_req = NewRequestData(
                     req_id=pf_req_id,
                     prompt_token_ids=[_DUMMY_TOKEN_ID] * (prefix_len + total_len),
@@ -672,9 +548,7 @@ class ChunkedPrefillProbeExtension:
                 torch.cuda.synchronize()
                 sequence_latencies.append(seq_t_start.elapsed_time(seq_t_end))
 
-        # ------------------------------------------------------------------
-        # Aggregate.
-        # ------------------------------------------------------------------
+        # --- Aggregation ---
         import statistics
 
         def _stats(lst: list[float]) -> tuple[float, float, float]:
@@ -694,13 +568,10 @@ class ChunkedPrefillProbeExtension:
             base_result["step_latency_ms_median"][s] = med
             base_result["step_latency_ms_p10"][s] = p10
             base_result["step_latency_ms_p90"][s] = p90
-            base_result["step_activation_bytes_median"][s] = statistics.median(
-                sorted(step_activations[s])
-            )
+            base_result["step_activation_bytes_median"][s] = statistics.median(sorted(step_activations[s]))
 
         psrl_logger.info(
-            "Chunked probe rank=%d total_len=%d chunk=%d prefix=%d "
-            "num_dec=%d num_steps=%d seq_ms=%.2f (steps: %s).",
+            "Chunked probe rank=%d total_len=%d chunk=%d prefix=%d num_dec=%d num_steps=%d seq_ms=%.2f (steps: %s).",
             rank,
             total_len,
             chunk_size,
@@ -716,24 +587,10 @@ class ChunkedPrefillProbeExtension:
         """
         Return a snapshot of this worker's GPU memory accounting.
 
-        All byte values are raw integers; callers may divide by 1024**3 for GiB.
+        All byte values are raw integers. Callers may divide by `1024**3` for GiB.
 
         Returns:
-            dict[str, Any]: Memory breakdown.  Keys:
-                - ``"rank"``: local rank.
-                - ``"total_gpu_bytes"``: total device memory.
-                - ``"requested_bytes"``: memory reserved for this vLLM instance
-                  (``total × gpu_memory_utilization``).
-                - ``"weights_bytes"``: model weight memory.
-                - ``"peak_activation_bytes"``: activation reservation
-                  (profiled at startup under ``max_num_batched_tokens``).
-                - ``"non_torch_bytes"``: non-torch GPU memory (NCCL, cuBLAS, etc.).
-                - ``"available_kv_bytes"``: bytes available for KV cache.
-                - ``"num_gpu_blocks"``: number of KV cache blocks allocated.
-                - ``"block_size_tokens"``: block size in tokens.
-                - ``"kv_token_capacity"``: maximum KV tokens this instance
-                  can hold simultaneously.
-                - ``"gpu_memory_utilization"``: the configured utilisation factor.
+            dict[str, Any]: Device, weight, activation, and KV-cache memory fields.
         """
         assert hasattr(self, "vllm_config"), "vllm_config must be set on this extension."
         assert hasattr(self, "model_runner"), "model_runner must be set on this extension."
@@ -785,8 +642,7 @@ class ChunkedPrefillProbeExtension:
             "gpu_memory_utilization": gpu_memory_utilization,
         }
         psrl_logger.info(
-            "Memory breakdown rank=%d total=%.1fGiB requested=%.1fGiB "
-            "weights=%.1fGiB peak_act=%.1fGiB kv_tokens=%dk.",
+            "Memory breakdown rank=%d total=%.1fGiB requested=%.1fGiB weights=%.1fGiB peak_act=%.1fGiB kv_tokens=%dk.",
             rank,
             total_gpu_bytes / 1024**3,
             requested_bytes / 1024**3,

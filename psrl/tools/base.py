@@ -17,12 +17,11 @@ from psrl.tools.utils import function_to_dict
 
 
 class ToolResponse(BaseModel):
-    """Structured response from a tool execution.
+    """
+    Store a structured response from a tool execution.
 
-    Mirrors verl's ``ToolResponse``: text/image/video are cleanly separated
-    so that callers (e.g. ToolEnvironment) can build multimodal messages
-    without re-interpreting raw dicts.  image and video must always be lists
-    when non-None — a ``@model_validator`` enforces this contract.
+    Separate `text`, `image`, and `video` values let callers construct
+    multimodal messages without interpreting raw dictionaries.
     """
 
     id: str | None = None

@@ -1,34 +1,11 @@
-"""Length invariants across the training-data flow, from TITO to the PPO loss.
-
-These tests exist because a distributed run died in `compute_policy_loss_vanilla` with
-"the size of tensor a (273) must match the size of tensor b (337)" on
-`log_prob - old_log_prob`. That error surfaces six frames below the mistake, so the point
-here is to pin the invariant at each stage that must hold it and make a violation name
-itself.
-
-The invariant chain:
-
-  1. `build_training_data` returns response_ids, response_mask and logprobs of EQUAL length.
-     Everything downstream slices them together, so a divergence here silently misaligns
-     every per-token quantity.
-  2. `session_agent_loop` truncates all three to `response_length` together, so equality
-     survives truncation.
-  3. `ppo_loss` derives its two padded widths from DIFFERENT fields -- log_prob from
-     `responses`, old_log_prob from `response_mask` -- so those two fields must agree
-     row-by-row or the widths diverge.
-"""
+"""Length invariants across the TITO training-data flow."""
 
 import torch
-
 from psrl.utils.tito.training_data import build_training_data
 
 
 def _record(prompt_token_count: int, output_token_ids: list[int], finish_reason: str = "stop") -> dict:
-    """Build one turn record in the shape build_training_data expects.
-
-    `output_logprobs` is a list of [logprob, token_id] pairs, matching what the SMG GET
-    endpoint returns.
-    """
+    """Build one SMG turn record."""
     return {
         "prompt_token_count": prompt_token_count,
         "output_logprobs": [[-0.5, tid] for tid in output_token_ids],
@@ -47,7 +24,7 @@ class TestTitoLengthInvariant:
             records=[_record(len(prompt), output)],
         )
         assert len(data["response_ids"]) == len(data["response_mask"]), (
-            f"ids {len(data['response_ids'])} vs mask {len(data['response_mask'])}"
+            f"Length mismatch. ids={len(data['response_ids'])!r}, mask={len(data['response_mask'])!r}."
         )
         assert len(data["logprobs"]) == len(data["response_ids"])
         # A single turn is all model output, so every position is trainable.
@@ -68,7 +45,7 @@ class TestTitoLengthInvariant:
         data = build_training_data(accumulated_token_ids=accumulated, records=records)
 
         assert len(data["response_ids"]) == len(data["response_mask"]), (
-            f"ids {len(data['response_ids'])} vs mask {len(data['response_mask'])}"
+            f"Length mismatch. ids={len(data['response_ids'])!r}, mask={len(data['response_mask'])!r}."
         )
         assert len(data["logprobs"]) == len(data["response_ids"])
         assert data["response_mask"] == [1, 1] + [0, 0, 0] + [1, 1, 1], (
@@ -103,8 +80,7 @@ class TestTitoLengthInvariant:
 
         data = build_training_data(accumulated_token_ids=accumulated, records=records)
         assert len(data["response_ids"]) == len(data["response_mask"]), (
-            f"drift after 25 turns: ids {len(data['response_ids'])} vs "
-            f"mask {len(data['response_mask'])}"
+            f"Length mismatch after 25 turns. ids={len(data['response_ids'])!r}, mask={len(data['response_mask'])!r}."
         )
         assert len(data["logprobs"]) == len(data["response_ids"])
         assert data["num_turns"] == 25
@@ -131,14 +107,7 @@ class TestResponseLengthTruncation:
 
 
 class TestPpoLossWidthSources:
-    """ppo_loss reads its two widths from different fields, so those fields must agree.
-
-    log_prob's width comes from `responses` (no_padding_2_padding falls back to
-    `responses.offsets().diff().max()` because `max_response_len` is never set on the
-    NO_PADDING path), while old_log_prob's comes from `response_mask` via
-    to_padded_tensor. This test states that dependency explicitly so a future change to
-    either field is caught here rather than in the loss.
-    """
+    """Require response and mask widths to agree before PPO loss padding."""
 
     def test_matching_fields_give_matching_widths(self):
         lens = [273, 150, 200]

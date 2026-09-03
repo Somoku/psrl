@@ -1,4 +1,3 @@
-# Modified from verl/experimental/reward/reward_loop/gdpo.py
 import inspect
 
 from tensordict import TensorDict

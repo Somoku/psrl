@@ -40,9 +40,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from psrl.bench.chunked_prefill.batch_spec import (
     BatchRequest,
-    blocks_needed,
     format_batch_spec,
-    parse_batch_spec,
     total_query_tokens,
 )
 from psrl.utils.logger import DualOutputHandler
@@ -51,9 +49,7 @@ from vllm import LLM
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---
 
 
 def _get_gpu_name() -> str:
@@ -214,9 +210,7 @@ def _probe_batch(
     )
 
 
-# ---------------------------------------------------------------------------
-# Experiment runners
-# ---------------------------------------------------------------------------
+# --- Experiment Runners ---
 
 
 def run_e1(
@@ -226,11 +220,9 @@ def run_e1(
     out_file: Path,
 ) -> None:
     """
-    E1: MFU vs total query tokens M.
+    Measure E1 MFU against total query tokens `M`.
 
-    Probes pure-prefill batches sweeping M.  For each M, optionally probes
-    both a single-request decomposition and a multi-request decomposition to
-    verify that GEMM efficiency is driven by M (not per-request q_len).
+    Each `M` can compare single-request and multiple-request decompositions.
     """
     m_values: list[int] = list(cfg.micro.e1.m_values)
     test_decomp: bool = bool(cfg.micro.e1.test_decompositions)
@@ -244,7 +236,10 @@ def run_e1(
         # Decomposition 1: single request of q_len = m (pure prefill).
         reqs_single = [BatchRequest(q_len=m, kv_len=m)]
         _probe_batch(
-            llm, reqs_single, warmup, iters,
+            llm,
+            reqs_single,
+            warmup,
+            iters,
             "e1",
             meta,
             {"m": m, "decomposition": "single"},
@@ -254,7 +249,7 @@ def run_e1(
 
         if test_decomp and m > 1:
             # Decomposition 2: split into multiple smaller requests.
-            # Prefer multi_chunk_size; grow chunk if num_reqs would exceed max_seqs.
+            # Grow `multi_chunk_size` when the request count would exceed `max_seqs`.
             target = max(1, multi_chunk_size)
             chunk = max(1, m // min(max_seqs, max(1, m // target)))
             num_reqs = math.ceil(m / chunk)
@@ -262,7 +257,10 @@ def run_e1(
             reqs_multi = [BatchRequest(q_len=chunk, kv_len=chunk)] * (num_reqs - 1)
             reqs_multi.append(BatchRequest(q_len=leftover, kv_len=leftover))
             _probe_batch(
-                llm, reqs_multi, warmup, iters,
+                llm,
+                reqs_multi,
+                warmup,
+                iters,
                 "e1",
                 meta,
                 {"m": m, "decomposition": "multi"},
@@ -307,21 +305,42 @@ def run_e2(
                 if d + 1 > 0:
                     mixed_reqs = dec_reqs + pf_reqs
                     _probe_batch(
-                        llm, mixed_reqs, warmup, iters, "e2",
-                        meta, {**extra, "variant": "mixed"}, out_file, peak_tflops,
+                        llm,
+                        mixed_reqs,
+                        warmup,
+                        iters,
+                        "e2",
+                        meta,
+                        {**extra, "variant": "mixed"},
+                        out_file,
+                        peak_tflops,
                     )
 
                 # Decode-only (skip if d == 0).
                 if d > 0:
                     _probe_batch(
-                        llm, dec_reqs, warmup, iters, "e2",
-                        meta, {**extra, "variant": "decode_only"}, out_file, peak_tflops,
+                        llm,
+                        dec_reqs,
+                        warmup,
+                        iters,
+                        "e2",
+                        meta,
+                        {**extra, "variant": "decode_only"},
+                        out_file,
+                        peak_tflops,
                     )
 
                 # Prefill-only.
                 _probe_batch(
-                    llm, pf_reqs, warmup, iters, "e2",
-                    meta, {**extra, "variant": "prefill_only"}, out_file, peak_tflops,
+                    llm,
+                    pf_reqs,
+                    warmup,
+                    iters,
+                    "e2",
+                    meta,
+                    {**extra, "variant": "prefill_only"},
+                    out_file,
+                    peak_tflops,
                 )
 
 
@@ -332,11 +351,11 @@ def run_e3a(
     out_file: Path,
 ) -> None:
     """
-    E3a: Per-step activation memory increment vs M.
+    Measure the E3a per-step activation increment against `M`.
 
-    Reuses ``probe_step``'s ``activation_bytes_median`` field.  The extension
-    measures ``max_memory_allocated() − allocated_before``, which captures
-    only the transient activation peak above the KV-cache baseline.
+    Reuse the `probe_step` field `activation_bytes_median`. The difference
+    between `max_memory_allocated()` and `allocated_before` captures only the
+    transient activation peak above the KV-cache baseline.
     """
     m_values: list[int] = list(cfg.micro.e3a.m_values)
     warmup = cfg.micro.warmup
@@ -346,8 +365,15 @@ def run_e3a(
     for m in m_values:
         reqs = [BatchRequest(q_len=m, kv_len=m)]
         _probe_batch(
-            llm, reqs, warmup, iters, "e3a",
-            meta, {"m": m}, out_file, peak_tflops,
+            llm,
+            reqs,
+            warmup,
+            iters,
+            "e3a",
+            meta,
+            {"m": m},
+            out_file,
+            peak_tflops,
         )
 
 
@@ -358,15 +384,11 @@ def run_e_chunked(
     out_file: Path,
 ) -> None:
     """
-    E_chunked: per-step timing of multi-step chunked prefill sequences.
+    Measure per-step timing for E_chunked prefill sequences.
 
-    For each (total_len, chunk_size, prefix_len, decode_scenario) combination,
-    this function calls ``probe_chunked_sequence`` on all workers and writes one
+    For each `(total_len, chunk_size, prefix_len, decode_scenario)` combination,
+    call `probe_chunked_sequence` on all workers and write one
     JSONL record containing the full per-step latency breakdown.
-
-    Key question answered: given a fixed total sequence length, how does latency
-    distribute across steps as chunk_size shrinks?  And how much does having
-    concurrent decode requests in each step change the per-step and total times?
     """
     ec = cfg.micro.e_chunked
     total_lens: list[int] = list(ec.total_lens)
@@ -375,7 +397,6 @@ def run_e_chunked(
     decode_scenarios: list[list[int]] = [list(s) for s in ec.decode_scenarios]
     warmup: int = ec.warmup
     iters: int = ec.iters
-    peak_tflops: float = cfg.micro.peak_tflops
 
     for total_len in total_lens:
         for chunk_size in chunk_sizes:
@@ -407,9 +428,7 @@ def run_e_chunked(
 
                     non_skipped = [r for r in per_rank if not r.get("skipped")]
                     if not non_skipped:
-                        reason = (
-                            per_rank[0].get("skip_reason", "unknown") if per_rank else "no ranks"
-                        )
+                        reason = per_rank[0].get("skip_reason", "unknown") if per_rank else "no ranks"
                         psrl_logger.warning(
                             "E_chunked skipped total=%d chunk=%d prefix=%d %s: %s.",
                             total_len,
@@ -437,29 +456,24 @@ def run_e_chunked(
                     num_steps = r0["num_steps"]
 
                     def _max_field_across_ranks(
-                        field: str, step_idx: int
+                        ranks: list[dict[str, Any]],
+                        field: str,
+                        step_idx: int,
                     ) -> float | None:
-                        vals = [
-                            r[field][step_idx]
-                            for r in non_skipped
-                            if r[field][step_idx] is not None
-                        ]
+                        vals = [r[field][step_idx] for r in ranks if r[field][step_idx] is not None]
                         return max(vals) if vals else None
 
                     step_lat_med = [
-                        _max_field_across_ranks("step_latency_ms_median", s)
-                        for s in range(num_steps)
+                        _max_field_across_ranks(non_skipped, "step_latency_ms_median", s) for s in range(num_steps)
                     ]
                     step_lat_p10 = [
-                        _max_field_across_ranks("step_latency_ms_p10", s)
-                        for s in range(num_steps)
+                        _max_field_across_ranks(non_skipped, "step_latency_ms_p10", s) for s in range(num_steps)
                     ]
                     step_lat_p90 = [
-                        _max_field_across_ranks("step_latency_ms_p90", s)
-                        for s in range(num_steps)
+                        _max_field_across_ranks(non_skipped, "step_latency_ms_p90", s) for s in range(num_steps)
                     ]
                     step_act = [
-                        _max_field_across_ranks("step_activation_bytes_median", s)
+                        _max_field_across_ranks(non_skipped, "step_activation_bytes_median", s)
                         for s in range(num_steps)
                     ]
                     seq_lat_med = max(
@@ -468,14 +482,10 @@ def run_e_chunked(
                         if r["sequence_latency_ms_median"] is not None
                     )
                     seq_lat_p10 = max(
-                        r["sequence_latency_ms_p10"]
-                        for r in non_skipped
-                        if r["sequence_latency_ms_p10"] is not None
+                        r["sequence_latency_ms_p10"] for r in non_skipped if r["sequence_latency_ms_p10"] is not None
                     )
                     seq_lat_p90 = max(
-                        r["sequence_latency_ms_p90"]
-                        for r in non_skipped
-                        if r["sequence_latency_ms_p90"] is not None
+                        r["sequence_latency_ms_p90"] for r in non_skipped if r["sequence_latency_ms_p90"] is not None
                     )
 
                     # Throughput: total compute tokens / sequence wall-clock.
@@ -507,8 +517,7 @@ def run_e_chunked(
                     }
                     _write_result(out_file, record)
                     psrl_logger.info(
-                        "E_chunked done: total=%d chunk=%d prefix=%d %s "
-                        "seq_ms=%.1f (%d steps: [%s]).",
+                        "E_chunked done: total=%d chunk=%d prefix=%d %s seq_ms=%.1f (%d steps: [%s]).",
                         total_len,
                         chunk_size,
                         prefix_len,
@@ -519,9 +528,7 @@ def run_e_chunked(
                     )
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+# --- Main Entry Point ---
 
 
 @hydra.main(
@@ -542,9 +549,7 @@ def main(config: DictConfig) -> None:
     # Set up logging.
     tp = config.rollout.tensor_parallel_size
     log_prefix = f"micro_TP{tp}"
-    psrl_logger.addHandler(
-        DualOutputHandler(config.psrl.logging_path, log_prefix)
-    )
+    psrl_logger.addHandler(DualOutputHandler(config.psrl.logging_path, log_prefix))
     psrl_logger.info("Starting chunked prefill micro-benchmark (experiment=%r).", config.micro.experiment)
 
     # Output directory.

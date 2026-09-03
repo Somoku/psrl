@@ -16,11 +16,10 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 def _run_smg(args):
-    """Entry point for the smg router subprocess.
+    """
+    Run the SMG router subprocess.
 
-    This function is the target of ``multiprocessing.Process`` and runs
-    ``launch_router()`` from the ``smg`` Python binding.  It must
-    be a module-level function so that it can be pickled by multiprocessing.
+    This target must remain at module scope for multiprocessing pickling.
     """
     try:
         from smg.launch_router import launch_router
@@ -117,9 +116,7 @@ class RolloutGateway:
 
         router_args = self._init_router_args()
 
-        # Set per-module Rust log filter for the SMG gateway subprocess.
-        # EnvFilter::try_from_default_env() in SMG's init_logging reads RUST_LOG
-        # before falling back to the configured log_level, so this takes precedence.
+        # `RUST_LOG` overrides the configured SMG log level.
         rust_log_filter = str(self._cfg_get("psrl.rollout_gateway.rust_log_filter", ""))
         if rust_log_filter:
             os.environ["RUST_LOG"] = rust_log_filter
@@ -130,9 +127,8 @@ class RolloutGateway:
             daemon=True,
         )
         self.router_process.start()
-        # Wait 3 seconds
         time.sleep(3)
-        assert self.router_process.is_alive()
+        assert self.router_process.is_alive(), "SMG router process exited during startup."
         psrl_logger.info("Router launched at %s:%s", self.smg_ip, self.smg_port)
         self.smg_url = f"http://{self.smg_ip}:{self.smg_port}"
         return self.smg_url

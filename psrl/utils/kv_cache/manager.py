@@ -12,16 +12,10 @@ psrl_logger = logging.getLogger(__file__)
 
 class KVCacheManager:
     """
-    KV cache manager for PSRL.
+    Manage PSRL KV cache operations across vLLM and LMCache.
 
-    Stateless with respect to trajectory identity — all public methods accept
-    `tokens: list[int]` directly.  Trajectory-to-token mapping is maintained
-    by the SMG rollout gateway.
-
-    Responsibilities:
-    - Orchestrate KV cache operations via `collective_rpc` and EngineCore utilities.
-    - Enforce a configurable GPU pin block budget (PSRL-side LRU eviction).
-    - Manage LMCache peer metadata for direct cross-instance P2P transfer.
+    Callers provide trajectory tokens, while this manager owns pin budgets and
+    peer metadata.
     """
 
     def __init__(self, config: LMCacheConfig) -> None:
@@ -43,23 +37,14 @@ class KVCacheManager:
         # peer discovery. Data movement itself uses direct worker ZMQ messages.
         self._controller_url: str | None = None
 
-        # Direct transfer bypass: peer registry maps lmcache_instance_id → per-rank
-        # peer_init_url list, indexed by global rank (list[rank] = that rank's NIXL
-        # endpoint). Populated by set_peer_registry() after P2P init. KV is sharded
-        # per rank (TP heads, PP layers), so transfer_direct() moves each local rank's
-        # shard to the destination's same-rank endpoint, bypassing the Controller
-        # HTTP round-trip.
+        # Rank ordered peer metadata lets each local shard target the matching remote rank.
         self.peer_registry: dict[str, list[str]] = {}
-        # This replica's local LMCacheWorker REP-socket URLs, indexed by local rank
-        # (one per vLLM worker / kv worker owned by this server actor).
+        # Rank ordered worker URLs support direct per shard transfers.
         self._worker_zmq_urls: list[str] = []
-        # Async ZMQ REQ sockets for direct transfer, keyed by local rank (created
-        # lazily on first use). One socket per rank because each rank talks to its
-        # own LMCacheWorker.
+        # Each rank owns a lazily initialized direct transfer socket.
         self._direct_zmq_sockets: dict[int, object] = {}
         self._direct_zmq_context = None
-        # Per-rank locks to serialize ZMQ REQ send/recv pairs (REQ pattern requires
-        # strict per-socket alternation); separate locks let ranks transfer in parallel.
+        # Per rank locks enforce strict REQ send and receive alternation.
         self._direct_zmq_locks: dict[int, asyncio.Lock] = {}
 
         self._log_init_status()
@@ -75,20 +60,20 @@ class KVCacheManager:
             return
 
         psrl_logger.info("[LMCache] KV cache offloading is ENABLED with the following parameters:")
-        psrl_logger.info(f"  backend                = {self.config.backend!r}")
-        psrl_logger.info(f"  offload_size_gb        = {self.config.offload_size_gb}")
-        psrl_logger.info(f"  chunk_size             = {self.config.chunk_size}")
-        psrl_logger.info(f"  cache_policy           = {self.config.cache_policy!r}")
-        psrl_logger.info(f"  save_decode_cache      = {self.config.save_decode_cache}")
-        psrl_logger.info(f"  save_unfull_chunk      = {self.config.save_unfull_chunk}")
-        psrl_logger.info(f"  enable_async_loading   = {self.config.enable_async_loading}")
-        psrl_logger.info(f"  clear_on_weight_update = {self.config.clear_on_weight_update}")
-        psrl_logger.info(f"  gpu_pin_block_budget   = {self.config.gpu_pin_block_budget}")
+        psrl_logger.info(f"backend = {self.config.backend!r}")
+        psrl_logger.info(f"offload_size_gb = {self.config.offload_size_gb}")
+        psrl_logger.info(f"chunk_size = {self.config.chunk_size}")
+        psrl_logger.info(f"cache_policy = {self.config.cache_policy!r}")
+        psrl_logger.info(f"save_decode_cache = {self.config.save_decode_cache}")
+        psrl_logger.info(f"save_unfull_chunk = {self.config.save_unfull_chunk}")
+        psrl_logger.info(f"enable_async_loading = {self.config.enable_async_loading}")
+        psrl_logger.info(f"clear_on_weight_update = {self.config.clear_on_weight_update}")
+        psrl_logger.info(f"gpu_pin_block_budget = {self.config.gpu_pin_block_budget}")
         if self.config.enable_p2p:
-            psrl_logger.info(f"  enable_p2p             = {self.config.enable_p2p}")
-            psrl_logger.info(f"  lmcache_instance_id    = {self.config.lmcache_instance_id!r}")
+            psrl_logger.info(f"enable_p2p = {self.config.enable_p2p}")
+            psrl_logger.info(f"lmcache_instance_id = {self.config.lmcache_instance_id!r}")
         if self.config.config_file:
-            psrl_logger.info(f"  config_file            = {self.config.config_file!r}")
+            psrl_logger.info(f"config_file = {self.config.config_file!r}")
         self._verify_lmcache_importable()
 
     def _verify_lmcache_importable(self) -> None:
@@ -127,7 +112,7 @@ class KVCacheManager:
         Set the per-instance LMCache identifier.
 
         Must be called once by the vLLM replica setup code after construction,
-        passing the numeric instance id assigned to this worker group.  Sets
+        passing the numeric instance id assigned to this worker group. Sets
         `lmcache_instance_id` to `"psrl_instance_{instance_id}"`, which the
         LMCache Controller uses to identify KV transfer sources and destinations.
 
@@ -176,17 +161,14 @@ class KVCacheManager:
                 (e.g. ["10.0.0.1:18200", "10.0.0.1:18201"]).
             worker_zmq_urls (list[str] | None): Rank-sorted ZMQ REP URLs of this
                 replica's local LMCacheWorkers (e.g. ["10.0.0.1:18100", ...]).
-                Supplied only by the authoritative broadcast/init path; when None
+                Supplied only by the authoritative broadcast/init path. When None
                 (e.g. the per-request servicer seed), this replica's own URLs and
                 live sockets are left untouched.
         """
-        # Merge so the authoritative broadcast (full peer set) and an incremental
-        # per-request seed (single instance) compose without clobbering each other.
+        # Merge full broadcasts and incremental seeds without clobbering peers.
         self.peer_registry.update(registry)
         if worker_zmq_urls is not None:
-            # Only the broadcast/init path supplies this replica's own worker URLs.
-            # Reset sockets here (not on the per-request seed path, which is hot) so
-            # they reconnect with the new URLs on next use.
+            # Reset sockets only when the authoritative worker URLs change.
             self._worker_zmq_urls = worker_zmq_urls
             self._reset_all_zmq_sockets()
         psrl_logger.info(
@@ -278,7 +260,7 @@ class KVCacheManager:
             object: The result from rank-0 worker.
         """
         results = await self._inference_engine.collective_rpc(method, args=args)
-        # `collective_rpc` returns a list[result]; take rank-0 value.
+        # `collective_rpc` returns a list, so use the rank zero value.
         return results[0] if isinstance(results, list) else results
 
     async def _utility(self, method: str, *args) -> object:
@@ -293,7 +275,7 @@ class KVCacheManager:
 
         Use this for GPU block-pool operations (`psrl_pin_gpu`,
         `psrl_pin_gpu`, `psrl_unpin_gpu`) which must run in the same process
-        as `block_pool` — the EngineCore process.  This is safe for TP>1 because
+        as `block_pool` in the EngineCore process. This is safe for TP>1 because
         the state is never copied across process boundaries.
 
         Args:
@@ -312,7 +294,7 @@ class KVCacheManager:
         Pin the cached prefix of a trajectory to prevent LRU eviction.
 
         Supported targets: `"gpu"` (vLLM block pool) and `"backend"` (LMCache).
-        GPU pinning is subject to `gpu_pin_block_budget`; if the budget is
+        GPU pinning is subject to `gpu_pin_block_budget`. If the budget is
         exceeded, the oldest-pinned entry is unpinned first (PSRL-side LRU).
 
         Args:
@@ -402,7 +384,7 @@ class KVCacheManager:
             psrl_logger.warning("[LMCache] transfer_direct() called but enable_p2p is False.")
             return False
 
-        # Prerequisites must be met — no silent fallback.
+        # Missing prerequisites are errors because no safe fallback exists.
         assert self.peer_registry, (
             "[LMCache] transfer_direct() called but peer_registry is empty. Call set_peer_registry() after P2P init."
         )
@@ -413,18 +395,13 @@ class KVCacheManager:
 
         dst_instance_id = dst[0]
         dst_urls = self.peer_registry.get(dst_instance_id)
-        # Same-rank pairing: local rank r moves its KV shard to the destination's
-        # rank r endpoint. Both this replica's worker_zmq_urls and dst_urls are
-        # rank-sorted (worker_id == global rank), so index r lines up. This is
-        # correct only for homogeneous layouts where src and dst share TP/PP (equal
-        # world_size). Heterogeneous layouts would need head/layer re-sharding, which
-        # LMCache cannot do; there the destination simply re-prefills, so skip.
+        # Rank pairing requires homogeneous layouts because LMCache cannot reshard KV data.
         num_ranks = len(self._worker_zmq_urls)
         if not dst_urls or len(dst_urls) != num_ranks:
             psrl_logger.warning(
                 f"[LMCache] Destination {dst_instance_id!r} has "
                 f"{0 if not dst_urls else len(dst_urls)} ranks but this replica has "
-                f"{num_ranks}; likely heterogeneous TP/PP layout. Skipping direct "
+                f"{num_ranks}. The TP/PP layout is likely heterogeneous. Skipping direct "
                 "transfer, destination will re-prefill."
             )
             return False
@@ -439,7 +416,7 @@ class KVCacheManager:
             if not dst_peer_init_url:
                 psrl_logger.warning(
                     f"[LMCache] No same-rank peer_init_url for {dst_instance_id!r} "
-                    f"rank {rank}; skipping that rank's shard."
+                    f"rank {rank}. Skipping that rank's shard."
                 )
                 return 0
             return await self._send_move_worker_msg(
@@ -462,7 +439,7 @@ class KVCacheManager:
             psrl_logger.info(
                 f"[LMCache] Direct transfer moved 0 tokens on some rank for "
                 f"{src!r} → {dst!r} (per-rank: {per_rank_tokens!r}). Source may have "
-                "evicted or layout mismatch; destination will re-prefill."
+                "evicted or have a layout mismatch. The destination will re-prefill."
             )
         return all_moved
 
@@ -511,18 +488,15 @@ class KVCacheManager:
 
         serialized_msg = msgspec.msgpack.encode(msg)
         lock = self._direct_zmq_locks.setdefault(rank, asyncio.Lock())
-        # ZMQ REQ socket requires strict send→recv alternation; the per-rank lock
-        # serializes concurrent calls to the same socket.
+        # The per rank lock enforces strict ZMQ REQ send and receive alternation.
         async with lock:
             socket = self._get_or_create_zmq_socket(rank)
             try:
                 await socket.send(serialized_msg)
                 serialized_resp = await socket.recv()
             except Exception:
-                # A REQ socket that fails mid send→recv (e.g. RCVTIMEO fires) is
-                # stuck in a bad EFSM state: every subsequent send() raises until
-                # the socket is rebuilt. Reset it here so the next call reconnects,
-                # otherwise one timeout cascades into a burst of transfer failures.
+                # A failed REQ exchange leaves the socket unusable, so rebuild it
+                # before the next call.
                 self._reset_zmq_socket(rank)
                 raise
         resp = msgspec.msgpack.decode(serialized_resp, type=Msg)
@@ -568,7 +542,7 @@ class KVCacheManager:
         Close and discard one rank's direct ZMQ socket so the next call rebuilds it.
 
         Called after a send/recv failure on the REQ socket. A REQ socket that
-        raised mid send→recv is stuck in a bad EFSM state and cannot be reused;
+        raised mid send→recv is stuck in a bad EFSM state and cannot be reused.
         dropping it here lets `_get_or_create_zmq_socket` reconnect cleanly.
 
         Caller must hold that rank's `_direct_zmq_locks[rank]`.
@@ -584,7 +558,7 @@ class KVCacheManager:
                 pass
             psrl_logger.warning(
                 f"[LMCache] Direct ZMQ socket for rank {rank} reset after transfer "
-                "failure; will reconnect on next transfer."
+                "failure. It will reconnect on the next transfer."
             )
 
     def _reset_all_zmq_sockets(self) -> None:

@@ -32,9 +32,8 @@ class SciAccelRuntimeConfig:
     """
 
     harbor: HarborConfig = field(default_factory=HarborConfig)
-    # Agent budget, enforced by Harbor from outside the container via
-    # `AgentConfig.override_timeout_sec`. This is the clock that actually stops a
-    # slow episode. PSRL's `asyncio.wait_for` is only a backstop above it.
+    # Harbor enforces this external agent budget.
+    # PSRL `wait_for` only provides a longer backstop.
     task_timeout_sec: float = 3600.0
     # Verifier budget. Only used to size that backstop, so it must be >= the task's
     # own `[verifier] timeout_sec` or the outer guard can pre-empt grading.

@@ -63,7 +63,7 @@ class SyncAndMigrateMixin:
                 *[self.server_handles[replica_id].resume_after_sync.remote() for replica_id in replica_ids]
             )
         except Exception:
-            psrl_logger.exception(f"Model sync failed for replicas {replica_ids}; keeping them unavailable")
+            psrl_logger.exception(f"Model sync failed for replicas {replica_ids!r}. Keeping them unavailable.")
             await asyncio.gather(
                 *[self.server_handles[replica_id].fail_sync.remote() for replica_id in replica_ids],
                 return_exceptions=True,
@@ -125,15 +125,7 @@ class SyncAndMigrateMixin:
         """
         Synchronize with PS for the given instance IDs.
         """
-        # Add batching SYNC command to the command queue to interrupt the instance
-        # This will stop the instance, pull the model weights from PS, and resume generation.
-        # But this will not block the current loop.
-        # NOTE(lhy): we don't need to update the instance version here because the version
-        # is updated in the `sync_with_ps` method of the GenWorker
-        # when calling `pull_model` or `pull_model_async` from the GenWorker, the ps manager
-        # will update the instance version.
-        # However, we need to update the latest stale model version here to avoid stale stats
-        # being handled after the synchronization.
+        # Update stale-version tracking before statistics can race with synchronization.
         with log_dual_events(
             f"Synchronize rollout instances {instance_ids} with PS "
             f"(model pull is {'non-blocking' if not wait_model_sync else 'blocking'} "
@@ -178,7 +170,8 @@ class SyncAndMigrateMixin:
                     self.instance_to_version_after_sync[instance_id] = self.ps_model_version
                 await self._set_routing_loop_running(True)
                 psrl_logger.info(
-                    f"Published version {self.ps_model_version} and resumed routing for replicas {replica_ids!r}."
+                    f"Published model version and resumed routing: version={self.ps_model_version}, "
+                    f"replicas={replica_ids!r}."
                 )
             except Exception:
                 await self._quarantine_failed_replicas(replica_ids, instance_ids)
@@ -230,9 +223,7 @@ class SyncAndMigrateMixin:
             filtered_request_meta = await self._fetch_filtered_request_meta(current_instance_version)
             filtered_request_ids = [request_meta[0] for request_meta in filtered_request_meta]
 
-        # 2. Check if there are any requests
-        # that can be RESERVED for the instance but no need to reserve new entry
-        # before synchronization
+        # Existing reservations may keep this instance useful before synchronization.
         if len(filtered_request_ids) > 0:
             is_aborted = await self.ps_manager.check_aborted_requests.remote(filtered_request_ids, remove=False)
             filtered_request_ids = [
@@ -249,9 +240,7 @@ class SyncAndMigrateMixin:
                 if can_reserve_without_new_reserve_entry[i] == [True]
             ]
 
-        # If there are requests that can still be routed to the instance
-        # before synchronization without new reserve entry
-        # we will not attempt to synchronize with PS
+        # Do not synchronize while an existing reservation remains routable.
         if (
             len(filtered_request_ids) > 0
             and self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.check_req_before_sync
@@ -263,9 +252,10 @@ class SyncAndMigrateMixin:
             # Check whether request num is above threshold
             request_num = instance_status.get_waiting_and_running_queue_size()
             psrl_logger.debug(
-                f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
-                f"request_num: {request_num}, "
-                f"threshold: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}"
+                f"Sync request indicator: instance_id={instance_id!r}, "
+                f"version={self.instance_to_version_after_sync[instance_id]}, "
+                f"request_num={request_num}, "
+                f"threshold={self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}."
             )
             if request_num > self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold:
                 return False
@@ -273,9 +263,10 @@ class SyncAndMigrateMixin:
             # Check whether throughput is above threshold
             throughput = self.instance_to_engine_status[instance_id].get_generation_throughput()
             psrl_logger.debug(
-                f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
-                f"throughput: {throughput}, "
-                f"threshold: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}"
+                f"Sync throughput indicator: instance_id={instance_id!r}, "
+                f"version={self.instance_to_version_after_sync[instance_id]}, "
+                f"throughput={throughput}, "
+                f"threshold={self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}."
             )
             if throughput > self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold:
                 return False
@@ -283,9 +274,10 @@ class SyncAndMigrateMixin:
             # Check whether KV Cache is above threshold
             kv_cache_utilization = instance_status.get_kv_cache_utilization()
             psrl_logger.debug(
-                f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
-                f"kv_cache_utilization: {kv_cache_utilization}, "
-                f"threshold: {self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}"
+                f"Sync KV-cache indicator: instance_id={instance_id!r}, "
+                f"version={self.instance_to_version_after_sync[instance_id]}, "
+                f"utilization={kv_cache_utilization}, "
+                f"threshold={self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold}."
             )
             if kv_cache_utilization > self.config.psrl.rollout_coordination.sync_and_mig_strategy.sync.threshold:
                 return False
@@ -327,8 +319,7 @@ class SyncAndMigrateMixin:
                 if wait_interrupted_partial_requests_loop_back:
                     await self._wait_interrupted_partial_requests_loop_back(migrate_instance_ids)
                     psrl_logger.info(
-                        f"All interrupted requests on the migrated instances "
-                        f"{migrate_instance_ids} have been looped back"
+                        f"Looped back interrupted migration requests: instance_ids={migrate_instance_ids!r}."
                     )
                 await self._set_routing_loop_running(True)
                 psrl_logger.info("Resumed routing after migration")
@@ -401,17 +392,10 @@ class SyncAndMigrateMixin:
                     )
 
                 if ratio > self.config.psrl.rollout_coordination.sync_and_mig_strategy.mig.threshold:
-                    # psrl_logger.info(
-                    #     f"Instance {instance_id} (version {self.instance_to_version_after_sync[instance_id]}) "
-                    #     f"has a ratio of {ratio} for migrating to instance {starved_instance_id} "
-                    #     f"(version {self.instance_to_version_after_sync[starved_instance_id]})"
-                    # )
                     candidate_migrate_instance_ids.append((instance_id, ratio))
 
-        # We choose the instance with the highest ratio to migrate
-        # TODO(lhy): support multiple instances to migrate and finer-grained migration strategy
-        # Currently, we only support one instance to migrate,
-        # and all the requests on the instance will be interrupted and looped back to the router.
+        # TODO(lhy): Support multiple simultaneous migration candidates.
+        # The highest-ratio instance is migrated and its requests are looped back.
         if len(candidate_migrate_instance_ids) > 0:
             candidate_migrate_instance_ids.sort(key=lambda x: x[1], reverse=True)
             migrate_instance_id = candidate_migrate_instance_ids[0][0]

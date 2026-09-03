@@ -1,4 +1,3 @@
-# Modified from verl/experimental/reward/reward_loop/base.py
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -17,7 +16,7 @@ class RewardManagerBase(ABC):
     _class_initialized = False
 
     def __init__(self, config: DictConfig, tokenizer: AutoTokenizer, compute_score: RawRewardFn):
-        """Initialize agent loop.
+        """Initialize reward loop state.
 
         Args:
             config (DictConfig): YAML config.
@@ -46,7 +45,7 @@ class RewardManagerBase(ABC):
         data_item: TensorDict,
         **runtime_info: Any,
     ) -> dict[str, Any]:
-        """Build the reward-facing metadata"""
+        """Build reward-facing metadata."""
         merged: dict[str, Any] = {}
         for field_name in ("extra_info", "agent_reward_info"):
             value = tu.get(data_item, field_name, None)

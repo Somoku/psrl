@@ -51,7 +51,7 @@ def test_gpu_sandbox_uses_device_passthrough_not_gpus_flag():
     assert "/dev/nvidia5" in argv
     assert "/dev/nvidia0" not in argv, "Must not leak devices that were not assigned."
     for control_device in NVIDIA_CONTROL_DEVICES:
-        assert control_device in argv, f"Control device {control_device} must be passed through."
+        assert control_device in argv, f"Missing required control device={control_device!r}."
 
 
 @pytest.mark.cpu_test

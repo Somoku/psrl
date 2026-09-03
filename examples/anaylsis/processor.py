@@ -334,27 +334,14 @@ def make_instance_kv_cache_indexed_by_time_processor() -> Processor:
     return processor
 
 
-# -------------------------
-# SMG-format processors (new flat stats schema)
-# -------------------------
-#
-# The new stats collector (psrl_smg StatsRecorder) writes one flat JSONL row per
-# (replica, dp_rank) snapshot, e.g.:
-#   {"ts": "2026-06-21T14:59:05.197+00:00", "total_elapsed_time": 12.3,
-#    "model_version": 0, "num_running_reqs": 0, "num_waiting_reqs": 0,
-#    "kv_cache_usage": 0.0, "generation_throughput": 0.0, ...}
-#
-# Differences from the old schema handled here:
-#  - metrics are top-level (not nested under "scheduler_stats")
-#  - x-axis: prefer top-level "total_elapsed_time"; fall back to deriving relative
-#    seconds from the absolute "ts" timestamp (per-file t0) for logs written before
-#    total_elapsed_time was added.
+# --- SMG flat schema processors ---
 
 
 def _smg_elapsed_seconds(obj: dict[str, Any], state: dict[str, Any]):
-    """Return relative seconds for the x-axis, or None if unavailable.
+    """
+    Return relative seconds for the x-axis, or None if unavailable.
 
-    Prefers the new top-level ``total_elapsed_time``; otherwise derives elapsed
+    Prefer `total_elapsed_time`. Otherwise, derive elapsed
     seconds from the absolute ``ts`` timestamp using this file's first row as t0.
     """
     if "total_elapsed_time" in obj:

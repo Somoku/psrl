@@ -32,9 +32,7 @@ def test_runtime_config_defaults_are_sane():
     config = build_runtime_config(None)
 
     assert config.image, "A default sandbox image must be set."
-    assert config.per_action_timeout_s >= 3600.0, (
-        "Per-action timeout must cover MLGym's 3600s training_timeout."
-    )
+    assert config.per_action_timeout_s >= 3600.0, "Per-action timeout must cover MLGym's 3600s training_timeout."
     assert config.max_observation_chars > 0, "Observation truncation must be on by default."
 
 

@@ -1,28 +1,5 @@
-# Point apt at the internal Tencent mirror during image builds.
-#
-# Why: this box has no direct internet route. Its only egress is
-# star-proxy.oa.com:3128, which buildkit picks up from ~/.docker/config.json.
-# `git clone` of the pinned LAPS commit is fast through it (2.6 s), but apt is
-# not: a single Packages.gz fetch times out, and the toolchain RUN layer ran
-# 3h30m through the proxy. With this mirror the same agent image builds in 54 s.
-#
-# How: `APT_MIRROR` is a build ARG declared by every apt stage of the generated
-# task Dockerfiles (see sciaccel-rl utils/adapters/to_harbor.py). Empty by
-# default, in which case the Dockerfiles behave exactly as upstream; when set,
-# each stage rewrites /etc/apt/sources.list.d/debian.sources to this host.
-# mirrors.tencentyun.com resolves to 169.254.0.3 inside build containers and
-# needs no proxy.
-#
-# NOTE(claude): Do NOT try to solve this with `build.extra_hosts` instead.
-# buildkit v0.13.2 on the classic `docker` driver SILENTLY IGNORES it: a probe
-# build declaring `deb.debian.org:169.254.0.3` still resolved the real Fastly
-# address, with and without `network: host`, and `docker compose config` shows
-# the entry as merged while the build container's /etc/hosts has none. Build
-# args are honored; extra_hosts is not.
-#
-# This only affects image builds. Task runtime needs no network and the repair
-# and implementation tasks pin `network_mode = "no-network"` on purpose, which
-# stays enforced.
+# Use the internal apt mirror during builds because external traffic times out.
+# Task runtime stays isolated from the network.
 services:
   main:
     build:

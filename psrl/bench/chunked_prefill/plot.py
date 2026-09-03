@@ -1,18 +1,11 @@
 """
 Plot micro-benchmark results from JSONL files.
 
-Produces three figures:
+The E1 figure shows throughput and MFU by token count. E2 shows mixed-batch
+overhead, E3 compares activation memory with KV capacity, and E_chunked shows
+per-step and total sequence latency.
 
-1. **E1** — ``throughput(M)`` and ``MFU(M)`` curves (one line per TP and
-   decomposition variant).  Marks the current default budget and the estimated
-   saturation point M*.
-2. **E2** — Mixed-batch overhead heat-map: ``overhead = t_mixed / (t_decode_only
-   + t_prefill_only)`` as a function of decode count and prefill chunk size,
-   for each context length.
-3. **E3** — Dual-axis: ``activation_bytes(M)`` (left) and ``kv_token_capacity``
-   (right) from E3b JSON probes, for each ``gpu_memory_utilization`` value found.
-
-Usage::
+Usage:
 
     python -m psrl.bench.chunked_prefill.plot --results-dir ./results --out plots/
 
@@ -30,7 +23,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -38,10 +30,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
+# --- Data Loading ---
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -78,9 +67,7 @@ def _load_e3b_dir(e3b_dir: Path) -> list[dict[str, Any]]:
     return records
 
 
-# ---------------------------------------------------------------------------
-# CSV export helpers
-# ---------------------------------------------------------------------------
+# --- CSV Export ---
 
 
 def _write_csv(records: list[dict[str, Any]], out_path: Path, fields: list[str]) -> None:
@@ -92,9 +79,7 @@ def _write_csv(records: list[dict[str, Any]], out_path: Path, fields: list[str])
             writer.writerow(rec)
 
 
-# ---------------------------------------------------------------------------
-# Plot helpers
-# ---------------------------------------------------------------------------
+# --- Plot Helpers ---
 
 _FIG_WIDTH = 9
 _FIG_HEIGHT_PER_ROW = 4
@@ -118,9 +103,7 @@ def _style_for_label(label: str) -> dict[str, Any]:
     return {"marker": markers[idx], "linestyle": linestyles[lsidx], "markersize": 5}
 
 
-# ---------------------------------------------------------------------------
-# E1 plot
-# ---------------------------------------------------------------------------
+# --- E1 Plot ---
 
 
 def plot_e1(records: list[dict[str, Any]], out_dir: Path) -> None:
@@ -150,8 +133,13 @@ def plot_e1(records: list[dict[str, Any]], out_dir: Path) -> None:
             ax_mfu.plot(mx, vy, label=lbl, **style)
 
     for ax in (ax_thr, ax_mfu):
-        ax.axvline(_DEFAULT_BUDGET_TOKENS, color="grey", linestyle=":", linewidth=1,
-                   label=f"default budget ({_DEFAULT_BUDGET_TOKENS})")
+        ax.axvline(
+            _DEFAULT_BUDGET_TOKENS,
+            color="grey",
+            linestyle=":",
+            linewidth=1,
+            label=f"default budget ({_DEFAULT_BUDGET_TOKENS})",
+        )
         ax.set_xscale("log", base=2)
         ax.grid(True, which="both", alpha=0.3)
         ax.legend(fontsize=8)
@@ -170,18 +158,24 @@ def plot_e1(records: list[dict[str, Any]], out_dir: Path) -> None:
 
     # CSV export.
     csv_fields = [
-        "run_id", "tensor_parallel_size", "decomposition", "m",
-        "num_reqs", "total_q_tokens",
-        "latency_ms_median", "latency_ms_p10", "latency_ms_p90",
-        "throughput_tok_per_s", "mfu", "flops",
+        "run_id",
+        "tensor_parallel_size",
+        "decomposition",
+        "m",
+        "num_reqs",
+        "total_q_tokens",
+        "latency_ms_median",
+        "latency_ms_p10",
+        "latency_ms_p90",
+        "throughput_tok_per_s",
+        "mfu",
+        "flops",
     ]
     _write_csv(e1, out_dir / "e1_results.csv", csv_fields)
     print(f"Saved E1 CSV to {out_dir / 'e1_results.csv'}.")
 
 
-# ---------------------------------------------------------------------------
-# E2 plot
-# ---------------------------------------------------------------------------
+# --- E2 Plot ---
 
 
 def plot_e2(records: list[dict[str, Any]], out_dir: Path) -> None:
@@ -251,18 +245,23 @@ def plot_e2(records: list[dict[str, Any]], out_dir: Path) -> None:
     print(f"Saved E2 plot to {out_path}.")
 
     csv_fields = [
-        "run_id", "tensor_parallel_size", "decode_count", "prefill_chunk",
-        "context_len", "variant",
-        "num_reqs", "total_q_tokens",
-        "latency_ms_median", "latency_ms_p10", "latency_ms_p90",
+        "run_id",
+        "tensor_parallel_size",
+        "decode_count",
+        "prefill_chunk",
+        "context_len",
+        "variant",
+        "num_reqs",
+        "total_q_tokens",
+        "latency_ms_median",
+        "latency_ms_p10",
+        "latency_ms_p90",
     ]
     _write_csv(e2, out_dir / "e2_results.csv", csv_fields)
     print(f"Saved E2 CSV to {out_dir / 'e2_results.csv'}.")
 
 
-# ---------------------------------------------------------------------------
-# E3 plot (combines E3a and E3b)
-# ---------------------------------------------------------------------------
+# --- E3 Plot ---
 
 
 def plot_e3(
@@ -305,20 +304,30 @@ def plot_e3(
             kv_ktok = [r.get("kv_token_capacity", 0) / 1000 for r in recs_sorted]
             col = colors[idx % len(colors)]
             ax_act.plot(
-                ns, resv_gib,
-                marker="s", linestyle="--",
+                ns,
+                resv_gib,
+                marker="s",
+                linestyle="--",
                 color=col,
                 label=f"util={util_lbl} reserved act. (GiB)",
             )
             ax_kv.plot(
-                ns, kv_ktok,
-                marker="^", linestyle=":",
-                color=col, alpha=0.7,
+                ns,
+                kv_ktok,
+                marker="^",
+                linestyle=":",
+                color=col,
+                alpha=0.7,
                 label=f"util={util_lbl} KV capacity (k tokens)",
             )
 
-    ax_act.axvline(_DEFAULT_BUDGET_TOKENS, color="grey", linestyle=":", linewidth=1,
-                   label=f"default budget ({_DEFAULT_BUDGET_TOKENS})")
+    ax_act.axvline(
+        _DEFAULT_BUDGET_TOKENS,
+        color="grey",
+        linestyle=":",
+        linewidth=1,
+        label=f"default budget ({_DEFAULT_BUDGET_TOKENS})",
+    )
     ax_act.set_xscale("log", base=2)
     ax_act.set_xlabel("max_num_batched_tokens N (log₂ scale)")
     ax_act.set_ylabel("Activation (GiB)")
@@ -338,31 +347,33 @@ def plot_e3(
 
     if e3b:
         csv_fields = [
-            "timestamp", "model_path", "tensor_parallel_size", "gpu_memory_utilization",
+            "timestamp",
+            "model_path",
+            "tensor_parallel_size",
+            "gpu_memory_utilization",
             "max_num_batched_tokens",
-            "total_gpu_bytes", "requested_bytes", "weights_bytes",
-            "peak_activation_bytes", "non_torch_bytes", "available_kv_bytes",
-            "num_gpu_blocks", "block_size_tokens", "kv_token_capacity",
+            "total_gpu_bytes",
+            "requested_bytes",
+            "weights_bytes",
+            "peak_activation_bytes",
+            "non_torch_bytes",
+            "available_kv_bytes",
+            "num_gpu_blocks",
+            "block_size_tokens",
+            "kv_token_capacity",
         ]
         _write_csv(e3b, out_dir / "e3b_results.csv", csv_fields)
         print(f"Saved E3b CSV to {out_dir / 'e3b_results.csv'}.")
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# --- E_chunked Plot ---
 
 
 def plot_e_chunked(records: list[dict[str, Any]], out_dir: Path) -> None:
     """
-    Plot per-step latency breakdown for chunked prefill sequences (E_chunked).
+    Plot E_chunked per-step and total sequence latency.
 
-    For each unique (total_len, prefix_len, num_decode_reqs) combination, produces
-    a grouped bar chart where each group is one chunk_size configuration, each bar
-    represents one step in that configuration, coloured by step index.
-
-    Separately also plots sequence_latency_ms_median vs chunk_size to show the
-    total cost trade-off.
+    Produce one figure per `(total_len, prefix_len, num_decode_reqs)` combination.
     """
     ec = [r for r in records if r.get("experiment") == "e_chunked" and not r.get("skipped")]
     if not ec:
@@ -394,9 +405,7 @@ def plot_e_chunked(records: list[dict[str, Any]], out_dir: Path) -> None:
         cmap = plt.get_cmap("tab10")
         step_colors = [cmap(s % 10) for s in range(max_steps)]
 
-        fig, (ax_bar, ax_total) = plt.subplots(
-            1, 2, figsize=(_FIG_WIDTH, _FIG_HEIGHT_PER_ROW)
-        )
+        fig, (ax_bar, ax_total) = plt.subplots(1, 2, figsize=(_FIG_WIDTH, _FIG_HEIGHT_PER_ROW))
         x_pos = np.arange(len(chunk_sizes))
         bar_width = 0.6
 
@@ -422,9 +431,7 @@ def plot_e_chunked(records: list[dict[str, Any]], out_dir: Path) -> None:
         ax_bar.set_xticklabels([str(c) for c in chunk_sizes])
         ax_bar.set_xlabel("Chunk size (tokens per step)")
         ax_bar.set_ylabel("Latency (ms)")
-        ax_bar.set_title(
-            f"E_chunked step breakdown\ntotal={total_len} prefix={prefix_len} dec={num_dec}"
-        )
+        ax_bar.set_title(f"E_chunked step breakdown\ntotal={total_len} prefix={prefix_len} dec={num_dec}")
         ax_bar.legend(fontsize=7, ncol=2)
         ax_bar.grid(True, axis="y", alpha=0.3)
 
@@ -457,16 +464,26 @@ def plot_e_chunked(records: list[dict[str, Any]], out_dir: Path) -> None:
 
     # CSV export.
     csv_fields = [
-        "run_id", "tensor_parallel_size", "total_len", "chunk_size", "prefix_len",
-        "num_decode_reqs", "num_steps",
-        "sequence_latency_ms_median", "sequence_latency_ms_p10", "sequence_latency_ms_p90",
+        "run_id",
+        "tensor_parallel_size",
+        "total_len",
+        "chunk_size",
+        "prefix_len",
+        "num_decode_reqs",
+        "num_steps",
+        "sequence_latency_ms_median",
+        "sequence_latency_ms_p10",
+        "sequence_latency_ms_p90",
         "sequence_throughput_tok_per_s",
     ]
     _write_csv(ec, out_dir / "e_chunked_results.csv", csv_fields)
     print(f"Saved E_chunked CSV to {out_dir / 'e_chunked_results.csv'}.")
 
 
+# --- Entry Point ---
 
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="Plot chunked prefill micro-benchmark results.")
     parser.add_argument(
         "--results-dir",

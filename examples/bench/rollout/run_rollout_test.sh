@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# Simplified rollout performance test script
-# This script runs a simplified rollout performance test using vLLM AsyncLLM directly
-
-# Set up environment
+# Run the synthetic rollout benchmark with vLLM AsyncLLM.
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
 HOME=${PSRL_WORKSPACE}
@@ -14,7 +11,7 @@ PSRL_PATH=$(python -c "import psrl; import os; print(os.path.dirname(os.path.dir
 # HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-Math-7B
 HF_MODEL_PATH=${PSRL_WORKSPACE}/models/Qwen2.5-32B-Instruct
 
-# vLLM configuration (simplified - no complex deployment)
+# Simplified vLLM configuration.
 GEN_TP=${1:-4}  # Tensor parallel size for generation
 GEN_PP=1  # Pipeline parallel size for generation
 

@@ -75,7 +75,7 @@ def test_truncate_observation_keeps_head_and_tail_with_marker():
     text = "".join(f"line{i}\n" for i in range(1000))
     result = truncate_observation(text, max_chars=200)
 
-    assert len(result) <= 400, f"Truncated output is too long: {len(result)} chars."
+    assert len(result) <= 400, f"Truncated output length={len(result)}. Expected at most 400 characters."
     assert "line0" in result, "Head of the output must be preserved."
     assert "line999" in result, "Tail of the output must be preserved."
     assert "omitted" in result, "An elision marker must tell the agent output was cut."

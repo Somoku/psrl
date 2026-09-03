@@ -265,16 +265,10 @@ class ConversationAgentData(AgentData[ConversationType, object]):
 
     def _is_overlong(self, trajectory: Trajectory) -> bool:
         """
-        Return True when the accumulated context has hit the token budget.
+        Return whether the accumulated context reached the model token limit.
 
-        Each turn feeds `prompt_ids + response_ids` to the engine, so the real
-        cap is `max_model_len = prompt_length + response_length`, not
-        `response_length` alone. Observation tokens are also appended into
-        `response_ids` (mask=0), so gating on `response_length` alone lets the
-        total context grow past `max_model_len` and crash the engine's block
-        table on the next submit. Gate on total context length instead;
-        finalize/truncation still caps prompt and response to their individual
-        limits when the trajectory is emitted.
+        Observation tokens are appended to `response_ids`, so the limit applies
+        to the combined prompt and response tokens.
 
         Args:
             trajectory (Trajectory): The trajectory whose accumulated context to check.

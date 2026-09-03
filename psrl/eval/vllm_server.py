@@ -177,14 +177,14 @@ class ServerHandle:
             try:
                 self.process.wait(timeout=10.0)
             except subprocess.TimeoutExpired:
-                psrl_logger.error(f"vLLM pid {self.pid} survived SIGKILL; its GPUs may stay occupied.")
+                psrl_logger.error(f"vLLM pid {self.pid} survived SIGKILL. Its GPUs may stay occupied.")
 
     def _signal_group(self, sig: int) -> None:
         """Send `sig` to the server's process group, tolerating a group already gone."""
         try:
             os.killpg(os.getpgid(self.pid), sig)
         except (ProcessLookupError, PermissionError):
-            # Already reaped, or not ours to signal; nothing left to clean up.
+            # The process group is already gone or cannot be signalled.
             pass
 
     def tail_log(self, n_lines: int = 40) -> str:
@@ -314,9 +314,7 @@ def build_shell_command(spec: ServerSpec, env_script: str = "") -> list[str]:
     Returns:
         argv of the form `["bash", "-lc", "..."]`.
     """
-    # Only MoE models under data parallelism need the async-scheduling override,
-    # and detecting that means reading config.json -- so it is resolved here
-    # rather than inside the pure command builder.
+    # Resolve the MoE async override here to keep the pure command builder free of checkpoint reads.
     disable_async = spec.dp > 1 and is_moe_checkpoint(spec.checkpoint)
     inner = f"exec {shlex.join(build_command(spec, disable_async_scheduling=disable_async))}"
     if env_script:

@@ -96,8 +96,8 @@ def reshape_qkv_to_3d(
     hidden = param.shape[1] if param.ndim == 2 else 1
     assert rows % num_groups_local == 0, f"rows={rows} is not divisible by num_groups_local={num_groups_local}."
     new_shape = (num_groups_local, rows // num_groups_local, hidden)
-    # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
-    # fused split), so reshape produces a view, not a copy.
+    # NOTE(lhy): The `param.data` storage comes from contiguous HF state or a vLLM
+    # fused split, so reshaping returns a view rather than a copy.
     reshaped_data = param.data.reshape(new_shape)
     return make_slice_parameter(reshaped_data, param)
 
@@ -181,8 +181,8 @@ def reshape_q_to_5d(
     )
     q_num_heads_per_group = num_heads_local // num_groups_local // 2
     new_shape = (num_groups_local, q_num_heads_per_group, 2, head_size, hidden)
-    # NOTE(lhy): param.data is always contiguous (it is directly from HF state_dict or vLLM
-    # fused split), so reshape produces a view, not a copy.
+    # NOTE(lhy): The `param.data` storage comes from contiguous HF state or a vLLM
+    # fused split, so reshaping returns a view rather than a copy.
     reshaped_data = param.data.reshape(new_shape)
     return make_slice_parameter(reshaped_data, param)
 
@@ -194,40 +194,27 @@ def slice_gate_up_proj(
     output_dim: int = 0,
 ) -> list[Parameter]:
     """
-    Split a fused gate_up_proj parameter into two shards:
-      - gate_proj_param (shard index 0)
-      - up_proj_param   (shard index 1)
+    Split a fused `gate_up_proj` parameter into gate and up projection views.
 
-    Args
-    ----------
-    fused_param : Parameter
-        The fused parameter of shape [..., sum(output_sizes), ...].
-    output_sizes : List[int]
-        List of two sizes [gate_size, up_size].
-    tp_size : int, optional
-        Tensor parallel size (default is 1).
-    output_dim : int, optional
-        Dimension along which to split (default is 0).
+    Args:
+        fused_param (Parameter): Fused parameter to split.
+        output_sizes (list[int]): Global gate and up projection sizes.
+        tp_size (int): Tensor parallel size.
+        output_dim (int): Dimension along which to split.
 
-    Returns
-    -------
-    List[Parameter]
-        A list of two parameters:
-        [
-          gate_proj_param, # view of shape [..., gate_size, ...]
-          up_proj_param, # view of shape [..., up_size, ...]
-        ]
+    Returns:
+        list[Parameter]: Gate and up projection views.
     """
-    assert len(output_sizes) == 2, "Expected exactly two shards for gate_up_proj"
+    assert len(output_sizes) == 2, "Expected exactly two shards for gate_up_proj."
     assert all([output_size % tp_size == 0 for output_size in output_sizes]), (
-        "Output sizes must be divisible by tensor parallel size"
+        "Output sizes must be divisible by tensor parallel size."
     )
     gate_size, up_size = [output_size // tp_size for output_size in output_sizes]
 
-    # Create views for gate and up projections without copying data
+    # Preserve storage sharing when splitting the fused parameter.
     assert fused_param.data.shape[output_dim] == (gate_size + up_size), (
         f"Dim {output_dim} of fused parameter shape {fused_param.data.shape} "
-        f"must match the sum of gate and up sizes {[gate_size, up_size]}"
+        f"must match the sum of gate and up sizes {[gate_size, up_size]}."
     )
     gate_data = fused_param.data.narrow(output_dim, 0, gate_size)
     up_data = fused_param.data.narrow(output_dim, gate_size, up_size)
@@ -456,16 +443,11 @@ def slice_qkv_proj_megatron(
 
     qkv_params: list[Parameter] = []
     for i, (offset, size) in enumerate(offset_and_sizes):
-        # NOTE(lhy): Keep as a 3D non-contiguous view to share storage with fused_param.
-        # Do NOT reshape to 2D here: reshape() on a non-contiguous tensor triggers an implicit
-        # copy, producing an independent tensor whose storage is separate from fused_param.
-        # NIXL pull would then write to the copy and never update the actual
-        # linear_qkv.weight used by Megatron forward, causing training_ppl to explode.
-        # The 3D non-contiguous path in NIXL handles this via a temp buffer and
-        # original_tensor.data.copy_() after transfer, correctly updating fused_param.
+        # NOTE(lhy): Keep the 3D noncontiguous view because flattening copies storage.
+        # NIXL updates must reach the original Megatron `linear_qkv.weight`.
         data = fused_param.data.narrow(output_dim, offset, size)
         if attn_output_gate and i == 0:
-            # NOTE(zym) For Qwen3.5, megatron q_weights need special handling
+            # NOTE(zym): Qwen3.5 Megatron query weights require a gated layout.
             q_num_heads_per_group = num_heads // num_split_heads // 2
             data = data.view(num_split_heads // tp_size, 2, q_num_heads_per_group, head_size, -1).transpose(1, 2)
         qkv_params.append(make_slice_parameter(data, fused_param))
@@ -548,16 +530,10 @@ def slice_in_proj_qkvz(
     output_dim: int = 0,
 ) -> list[Parameter]:
     """
-    Split Qwen3.5 GDN fused in_proj_qkvz into (in_proj_qkv, in_proj_z).
+    Split Qwen3.5 GDN `in_proj_qkvz` into `in_proj_qkv` and `in_proj_z`.
 
-    vLLM implements Qwen3.5 Gated DeltaNet (linear attention) with two fused
-    MergedColumnParallelLinear layers:
-      - in_proj_qkvz: output_sizes=[key_dim, key_dim, value_dim, value_dim]
-      - in_proj_ba:   output_sizes=[num_v_heads, num_v_heads]
-
-    The checkpoint provides in_proj_qkv (stack of K, K, V) and in_proj_z
-    separately, which correspond to the first three shards and the last shard
-    of the fused in_proj_qkvz parameter.
+    The checkpoint separates the first three projection shards from the final
+    value projection shard used by vLLM's fused parameter.
 
     Args:
         fused_param (Parameter): Fused parameter tensor.
@@ -567,7 +543,7 @@ def slice_in_proj_qkvz(
         output_dim (int): Dimension along which to split.
 
     Returns:
-        list[Parameter]: [in_proj_qkv, in_proj_z] views sharing storage with fused_param.
+        list[Parameter]: Projection views that share storage with `fused_param`.
     """
     assert tp_size >= 1, f"tp_size must be >= 1, got: {tp_size!r}."
     qkv_size = 2 * key_dim + value_dim

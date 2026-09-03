@@ -9,9 +9,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_test
 
-# ---------------------------------------------------------------------------
-# Bootstrap: load modules directly to avoid ray / torch transitive imports.
-# ---------------------------------------------------------------------------
+# --- Bootstrap Without Ray or Torch Imports ---
 
 _PSRL = os.path.join(os.path.dirname(__file__), "../../psrl")
 
@@ -46,9 +44,7 @@ ScalingPolicy = _sp_mod.ScalingPolicy
 ThroughputProfileLoader = _sp_mod.ThroughputProfileLoader
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---
 
 
 def _make_signal(instance_id: RolloutInstanceId, is_awaken: bool = True, kv: float = 0.5) -> InstanceSignal:
@@ -65,9 +61,7 @@ def _make_signal(instance_id: RolloutInstanceId, is_awaken: bool = True, kv: flo
     )
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# --- Tests ---
 
 
 def test_instance_signal_accepts_rollout_instance_id():
@@ -78,8 +72,7 @@ def test_instance_signal_accepts_rollout_instance_id():
 
 
 def test_instance_signal_rejects_bare_int():
-    """Bare int should no longer be the type — creating with int should still work at runtime
-    (dataclasses don't enforce types) but we verify tuple is accepted and round-trips correctly."""
+    """A tuple instance ID must retain its components unchanged."""
     iid: RolloutInstanceId = ("worker_xyz", 2)
     sig = _make_signal(iid)
     assert isinstance(sig.instance_id, tuple)
@@ -107,7 +100,6 @@ def test_build_mu_maps_uses_tuple_key():
     iid: RolloutInstanceId = ("worker_abc", 0)
     signals = [_make_signal(iid, is_awaken=True, kv=0.5)]
     instance_mu, role_total_mu = policy._build_mu_maps(signals)
-    # key should be ("Rollout", "test_model", ("worker_abc", 0))
     assert ("Rollout", "test_model", ("worker_abc", 0)) in instance_mu
 
 
@@ -121,7 +113,7 @@ def test_pick_scale_down_candidate_uses_tuple_instance_id():
     iid0: RolloutInstanceId = ("worker_abc", 0)
     iid1: RolloutInstanceId = ("worker_abc", 1)
     signals = [
-        _make_signal(iid0, is_awaken=True, kv=0.1),  # low KV — cede candidate
+        _make_signal(iid0, is_awaken=True, kv=0.1),  # low-KV cede candidate
         _make_signal(iid1, is_awaken=True, kv=0.8),
     ]
     instance_mu = {

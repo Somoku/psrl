@@ -18,12 +18,8 @@ def test_get_ref(ray_cluster):
     put_time = time.time() - start_time
     print(f"Put time: {put_time:.4f} seconds")
 
-    # Define a remote function that returns the original ObjectRef
-    # Tricky part: If you manually wrap ObjectRef in a container (like list/tuple),
-    # Ray will not recursively dereference all refs inside the container
-    # Only the top-level task/actor arguments are expanded to real values,
-    # and Ray will not traverse all nested structures to find ObjectRefs.
-    # This avoids unintentionally pulling large deeply nested objects to the local node.
+    # NOTE(lhy): Wrapping an `ObjectRef` prevents Ray from dereferencing it as a top-level argument
+    # and avoids transferring the nested array to the driver.
     @ray.remote
     def get_data_ref(obj_ref_list: list[ray.ObjectRef]):
         assert isinstance(obj_ref_list[0], ray.ObjectRef), "The first element of the list should be an ObjectRef"

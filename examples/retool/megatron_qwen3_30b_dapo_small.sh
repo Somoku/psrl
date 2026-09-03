@@ -90,8 +90,7 @@ filter_groups_metric=acc
 rollout_is=token
 rollout_is_threshold=2.0
 
-# NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
-# May support this in the future
+# NOTE(lhy): Actor parameters cannot be offloaded in `nixl_cpu` mode.
 offload=True
 use_dynamic_bsz=True
 

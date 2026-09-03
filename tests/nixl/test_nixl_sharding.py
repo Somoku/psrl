@@ -96,9 +96,7 @@ class TestNIXLSharding(unittest.TestCase):
         shard_mesh_list = [s.shard_mesh for s in sharding_list]
         finest_shard_mesh = NIXLSharding.find_finest_shard_mesh(shard_mesh_list)
 
-        # Expected: LCM of dimensions
-        # dim 0: LCM(2, 4, 1) = 4
-        # dim 1: LCM(4, 2, 8) = 8
+        # The finest mesh uses dimension-wise LCM values of 4 and 8.
         expected = OrderedDict([(0, 4), (1, 8)])
         self.assertEqual(finest_shard_mesh, expected)
 
@@ -122,11 +120,7 @@ class TestNIXLSharding(unittest.TestCase):
 
     def test_refactor_based_on_finer_shard_mesh_basic(self):
         """Test basic refactoring to finer sharding"""
-        # Test the example from comments:
-        # Current: {1: 2} with shard_indices [(1,)] (2nd shard in dim 1)
-        # Finer: {0: 2, 1: 4}
-        # Expected result: shard_mesh becomes {0: 2, 1: 4}
-        # shard_indices becomes [(0, 2), (0, 3), (1, 2), (1, 3)]
+        # Refinement expands the original shard into four positions on the finer mesh.
 
         current_sharding = NIXLSharding(
             shard_mesh=OrderedDict([(1, 2)]),
@@ -144,9 +138,7 @@ class TestNIXLSharding(unittest.TestCase):
 
     def test_refactor_based_on_finer_shard_mesh_expansion(self):
         """Test refactoring with dimension expansion"""
-        # Current: {0: 2} with shard_indices [(1,)] (2nd shard in dim 0)
-        # Finer: {0: 4, 1: 3}
-        # Expected: expand dim 0 from 2 to 4 shards, add new dim 1 with 3 shards
+        # Refinement expands dimension 0 and adds every index from dimension 1.
 
         current_sharding = NIXLSharding(
             shard_mesh=OrderedDict([(0, 2)]),
@@ -182,7 +174,7 @@ class TestNIXLSharding(unittest.TestCase):
         tensor = torch.arange(24, dtype=torch.float32).reshape(4, 6)[:, :3].contiguous()
 
         # Sharding: split dim 0 into 2 shards, dim 1 into 2 shards
-        # Take shards (0, 1) and (1, 0) - 1st shard in dim 0, 2nd shard in dim 1
+        # Take the first shard from dimension 0 and the second from dimension 1.
         sharding = NIXLSharding(
             shard_mesh=OrderedDict([(1, 2), (0, 2)]),
             shard_indices=[(0, 0), (0, 1)],  # all rows, 0-2 column

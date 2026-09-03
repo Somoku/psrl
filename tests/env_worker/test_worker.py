@@ -150,5 +150,7 @@ def test_exec_truncates_oversized_observations():
 
     result = asyncio.run(worker.exec("s-1", "cat big", timeout_s=5.0))
 
-    assert len(result.stdout) < 500, f"Observation was not truncated: {len(result.stdout)} chars."
+    assert len(result.stdout) < 500, (
+        f"Observation length after truncation={len(result.stdout)}. Expected fewer than 500 characters."
+    )
     assert "omitted" in result.stdout

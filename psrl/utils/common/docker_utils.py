@@ -1,25 +1,7 @@
 """
-Docker container management utilities.
+Manage labeled Docker containers and actor reaper sidecars.
 
-Provides reusable functions for Docker container lifecycle management,
-primarily cleanup of containers identified by labels.
-
-Two cleanup paths are exposed here:
-
-- ``cleanup_containers_by_label`` (async, ``docker stop``): the fast path used
-  by per-episode ``finally`` blocks while the trainer is alive.
-- ``force_remove_containers_by_label`` (sync, ``docker rm -f``): the last-resort
-  sweep used by the per-actor reaper sidecar after its parent process has died,
-  and as the synchronous belt-and-suspenders cleanup invoked from the actor's
-  ``atexit`` handler.
-
-The reaper sidecar itself is launched by ``spawn_actor_reaper`` as a small
-``bash`` process (NOT a Python child) so that it has no import phase during
-which a stray SIGTERM could kill it before its signal handlers and polling
-loop are ready. On this host the conda Python lives on a slow network
-filesystem and ``python -m psrl.utils.common.docker_utils`` takes 10-60 s to
-finish importing ``psrl/__init__.py``; bash starts in milliseconds and has
-no import phase at all.
+The reaper uses a shell process so cleanup remains available after its actor exits.
 """
 
 from __future__ import annotations
@@ -33,10 +15,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-# Default poll interval for the bash reaper sidecar (seconds).
-# A worst-case container leak after parent death is bounded by this value
-# plus the time taken by ``docker rm -f`` (typically <30 s for hundreds of
-# containers).
+# Upper bound on reaper polling latency after parent exit.
 _REAPER_POLL_INTERVAL_SECS = 5
 
 
@@ -77,7 +56,7 @@ async def cleanup_containers_by_label(
             psrl_logger.debug(f"No containers found with label {label_key}={label_value!r}.")
             return []
 
-        psrl_logger.info(f"Stopping {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
+        psrl_logger.info(f"Stopping count={len(container_ids)} container(s) with label {label_key}={label_value!r}.")
         stop_proc = await asyncio.create_subprocess_exec(
             "docker",
             "stop",
@@ -88,7 +67,7 @@ async def cleanup_containers_by_label(
             stderr=asyncio.subprocess.PIPE,
         )
         await asyncio.wait_for(stop_proc.communicate(), timeout=30.0)
-        psrl_logger.info(f"Stopped {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
+        psrl_logger.info(f"Stopped count={len(container_ids)} container(s) with label {label_key}={label_value!r}.")
         return container_ids
 
     except asyncio.TimeoutError:
@@ -105,18 +84,6 @@ def force_remove_containers_by_label(
 ) -> list[str]:
     """
     Force-remove Docker containers matching a specific label.
-
-    Synchronous sibling of :func:`cleanup_containers_by_label`. Uses
-    ``docker rm -f`` rather than ``docker stop`` so containers stuck on a
-    ``sleep`` or hung ``exec`` are reclaimed immediately, not after the
-    per-image ``stop`` grace period. Idempotent.
-
-    Called from two places:
-
-    - The actor's ``atexit`` hook (synchronous, in-process belt cleanup).
-    - The bash reaper sidecar runs the equivalent ``docker rm -f`` directly
-      via shell after detecting parent death; this Python helper is not used
-      there because the sidecar is a pure shell process.
 
     Args:
         label_key: Docker label key to filter by.
@@ -137,14 +104,18 @@ def force_remove_containers_by_label(
             psrl_logger.debug(f"No containers found with label {label_key}={label_value!r}.")
             return []
 
-        psrl_logger.info(f"Force-removing {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
+        psrl_logger.info(
+            f"Force-removing count={len(container_ids)} container(s) with label {label_key}={label_value!r}."
+        )
         subprocess.run(
             ["docker", "rm", "-f", *container_ids],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=120,
         )
-        psrl_logger.info(f"Force-removed {len(container_ids)} container(s) with label {label_key}={label_value!r}.")
+        psrl_logger.info(
+            f"Force-removed count={len(container_ids)} container(s) with label {label_key}={label_value!r}."
+        )
         return container_ids
 
     except subprocess.TimeoutExpired:
@@ -163,18 +134,10 @@ def spawn_actor_reaper(
     """
     Spawn the per-actor bash reaper sidecar.
 
-    Bash starts in milliseconds even from a slow network filesystem, so there
-    is no startup window during which a SIGTERM from the dying actor (e.g. via
-    the actor's own ``atexit.terminate()`` call, or Ray's process-group
-    teardown) could kill the reaper before it has a chance to install signal
-    handlers. The sidecar polls the spawning PID via ``kill -0`` every
-    ``poll_interval`` seconds; on parent death it ``docker rm -f``s every
-    container carrying ``psrl.actor_id=<actor_id>``. ``nohup setsid`` plus
-    ``start_new_session=True`` give three layers of protection so SIGHUP /
-    SIGTERM directed at the parent's process group will not propagate.
+    The sidecar polls the parent PID and removes matching containers after parent exit.
 
     Args:
-        actor_id: Stable identifier for the spawning actor; must match the
+        actor_id: Stable identifier for the spawning actor. Must match the
             ``psrl.actor_id`` label stamped on every container the actor spawns.
         log_dir: If given, append the reaper's stdout/stderr to
             ``<log_dir>/reaper_<actor_id>.log`` for post-mortem debugging.
@@ -190,17 +153,8 @@ def spawn_actor_reaper(
     """
     parent_pid = os.getpid()
     label = f"psrl.actor_id={actor_id}"
-    # NOTE(reaper): all variables that come from Python are interpolated into
-    # the script body via f-string at spawn time; the ``$$``, ``$(date ...)``
-    # and ``$ids`` references are evaluated by bash at runtime.
-    #
-    # The sweep is wrapped in a small retry loop (3 passes, 2s apart) and
-    # invokes ``docker rm -f`` per container ID rather than via a single
-    # ``xargs`` so a single-id failure does not mask the rest, and so we can
-    # log the actual stderr from docker. Without this, a single stuck
-    # container (e.g. one with active ``docker exec`` sessions on an
-    # overloaded host) could survive a one-shot sweep and we would never know
-    # which one or why.
+    # NOTE(reaper): Python interpolates actor values at spawn time. Shell variables
+    # such as `$$`, `$(date ...)`, and `$ids` remain for runtime expansion.
     script = f"""
 set -u
 echo "[reaper start] pid=$$ parent_pid={parent_pid} actor_id={actor_id} ts=$(date -Is)"
@@ -253,7 +207,9 @@ fi
             os.makedirs(log_dir, exist_ok=True)
             log_fd: int | object = open(os.path.join(log_dir, f"reaper_{actor_id}.log"), "ab")
         except OSError as e:
-            psrl_logger.warning(f"Could not open reaper log file under {log_dir!r}: {e}; discarding reaper output.")
+            psrl_logger.warning(
+                f"Could not open reaper log file under {log_dir!r}: {e}. Reaper output will be discarded."
+            )
             log_fd = subprocess.DEVNULL
     else:
         log_fd = subprocess.DEVNULL

@@ -5,25 +5,8 @@ defaults:
 # Use multi-dataset mode, fallback to veRL legacy mode if False.
 use_multi_dataset: False
 
-# Number of workers for filtering overlong prompts.
-# For large-scale datasets, filtering can be time-consuming.
-# Use multiprocessing to speed up. Default is 32.
+# Multiprocessing reduces filtering time for large datasets.
 filter_overlong_prompts_workers: 32
-
-# Each entry specifies one dataset with its file path, prompt key,
-# sample limit, and per-dataset reward model routing configuration.
-#
-# train_datas:
-#   - file: /path/to/data.parquet
-#     data_source_name: dataset/name
-#     prompt_key: prompt
-#     max_samples: -1           # -1 means use all samples
-#     reward_model_dicts:
-#       - reward_fn_key: data_source
-#         reward_loop_type: naive   # "naive" | "dapo" | "gen"
-#         reward_fn: default
-#         reward_model_name: null
-#         reward_coef: 1.0
 
 reward_model_dicts:
   - reward_fn_key: data_source
@@ -43,39 +26,11 @@ train_datas:
         reward_fn: default
         reward_model_name: null
         reward_coef: 1.0
-      # - reward_fn_key: data_source
-      #   reward_loop_type: gen
-      #   reward_fn: default
-      #   reward_model_name: Qwen3-8B
-      #   reward_coef: 1.0
-  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/dapo-math-17k.parquet
-  #   data_source_name: dapo/dapo-math-17k
-  #   prompt_key: prompt
-  #   max_samples: -1
-  #   reward_model_dicts:
-  #     - reward_fn_key: data_source
-  #       reward_loop_type: dapo
-  #       reward_fn: default
-  #       reward_model_name: null
-  #       reward_coef: 1.0
-  #     - reward_fn_key: data_source
-  #       reward_loop_type: gen
-  #       reward_fn: default
-  #       reward_model_name: Qwen3-8B
-  #       reward_coef: 1.0
-  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/full-hh-rlhf/data/train.parquet
-  #   data_source_name: full-hh-rlhf
-  #   prompt_key: prompt
-  #   reward_loop_type: gen
-  #   reward_fn: skywork
-  #   reward_model_name: Skywork-Reward-V2-Qwen3-8B
 
-# Sampling ratios for mixing multiple training datasets (must sum to ~1.0,
-# and must have the same length as train_datas).
+# Sampling ratios must align with `train_datas` and sum to approximately one.
 train_datasets_ratios: [1.0]
 
-# Validation datasets. Each entry has the same structure as train_datas entries,
-# but reward_model_dicts are used only for evaluation reward computation.
+# Validation entries share the training schema, but route rewards only during evaluation.
 val_datas:
   - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/gsm8k_verl/test.parquet
     prompt_key: prompt
@@ -86,12 +41,3 @@ val_datas:
         reward_fn: default
         reward_model_name: null
         reward_coef: 1.0
-  # - file: /jizhicfs/pkuhetu/yfzhao/psrl/data/dapo/aime-2024.parquet
-  #   prompt_key: prompt
-  #   max_samples: -1
-  #   reward_model_dicts:
-  #     - reward_fn_key: data_source
-  #       reward_loop_type: dapo
-  #       reward_fn: default
-  #       reward_model_name: null
-  #       reward_coef: 1.0

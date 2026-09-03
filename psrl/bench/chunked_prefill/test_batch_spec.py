@@ -1,7 +1,6 @@
-"""Unit tests for batch_spec.py — no GPU required."""
+"""Run CPU-only unit tests for `batch_spec.py`."""
 
 import pytest
-
 from psrl.bench.chunked_prefill.batch_spec import (
     BatchRequest,
     blocks_needed,

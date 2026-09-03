@@ -1,15 +1,5 @@
 """
-Harbor/terminus-2 failure classification for SciAccel-RL.
-
-Harbor reports a trial failure as data (`TrialResult.exception_info`) rather than by
-raising, and the message has already passed through litellm, which discards both the
-original exception class and SMG's `x-smg-error-code` header. So the markers below
-are the only signal left. Each one is anchored to where it comes from.
-
-Two Harbor failures look alike but are not: `AgentTimeoutError` means the agent used
-up its budget, which is a normal end with usable turns, while
-`AgentSetupTimeoutError` means the container never came up, so there is nothing to
-train on. Collapsing them loses that distinction.
+Classify Harbor failures after LiteLLM strips transport metadata.
 """
 
 from __future__ import annotations
@@ -26,10 +16,7 @@ class HarborExceptionClassifier(AgentExceptionClassifier):
     evaluation classify identically.
     """
 
-    # Harbor's own exception classes, from `harbor/trial/errors.py`. All four subclass
-    # `asyncio.TimeoutError`, so matching on the class name is the only way to tell
-    # them apart. Order matters: `AgentSetupTimeout` must precede `AgentTimeout`
-    # because the latter is a substring of the former.
+    # Timeout classes share a base, so names and ordering distinguish setup from runtime expiry.
     TYPE_MARKERS = (
         # The container or agent never started, so no turn was ever produced.
         ("AgentSetupTimeout", TerminateReason.ROLLOUT_ERROR),
@@ -43,12 +30,9 @@ class HarborExceptionClassifier(AgentExceptionClassifier):
         ("VerifierTimeout", TerminateReason.VERIFIER_ERROR),
     )
 
-    # Message markers, for failures litellm flattened into a bare `BadRequestError`.
+    # Message markers for failures flattened into a bare `BadRequestError`.
     MESSAGE_MARKERS = (
-        # SMG's `request_aborted` sentinel body, from
-        # third_party/smg/model_gateway/src/routers/grpc/routing_loop/runtime.rs.
-        # PSManager aborts a group's siblings when one member fails, and it clears the
-        # buffer entry itself, so no further group recovery should be requested here.
+        # SMG aborts are identified by sentinel body because headers are unavailable.
         ("Request aborted by PS Manager", TerminateReason.ABORTED),
         # Harbor's own wording for the externally enforced agent budget, which arrives
         # as text when `exception_type` is unavailable.

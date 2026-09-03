@@ -1,7 +1,5 @@
 """Tests for the SciAccelAgentLoop registration and basic contract."""
 
-import pytest
-
 
 class TestSciAccelAgentLoopRegistration:
     """Test the agent loop is properly registered."""
@@ -17,9 +15,11 @@ class TestSciAccelAgentLoopRegistration:
     def test_config_loading(self):
         from examples.sciaccel_rl.config import SciAccelRuntimeConfig, build_runtime_config
 
-        cfg = build_runtime_config({
-            "harbor": {"agent_name": "terminus-2"},
-            "task_timeout_sec": 7200.0,
-        })
+        cfg = build_runtime_config(
+            {
+                "harbor": {"agent_name": "terminus-2"},
+                "task_timeout_sec": 7200.0,
+            }
+        )
         assert isinstance(cfg, SciAccelRuntimeConfig)
         assert cfg.task_timeout_sec == 7200.0

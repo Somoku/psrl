@@ -1,10 +1,7 @@
 """Tests for sciaccel_rl Harbor runner."""
 
 import asyncio
-from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
 
 
 class TestHarborEpisodeResult:
@@ -59,12 +56,14 @@ class TestRunHarborEpisode:
 
         with patch("examples.sciaccel_rl.runner.Job") as mock_job_cls:
             mock_job_cls.create = AsyncMock(return_value=mock_job)
-            result = asyncio.run(run_harbor_episode(
-                task_path="/path/to/tasks/laps-cpu",
-                model_base_url="http://10.0.0.1:8000/sessions/abc/v1",
-                model_name="Qwen/Qwen3-8B",
-                config=config,
-            ))
+            result = asyncio.run(
+                run_harbor_episode(
+                    task_path="/path/to/tasks/laps-cpu",
+                    model_base_url="http://10.0.0.1:8000/sessions/abc/v1",
+                    model_name="Qwen/Qwen3-8B",
+                    config=config,
+                )
+            )
             job_config = mock_job_cls.create.await_args.args[0]
 
         assert isinstance(result, HarborEpisodeResult)
@@ -75,7 +74,7 @@ class TestRunHarborEpisode:
 
     def test_episode_with_exception(self):
         from examples.sciaccel_rl.config import SciAccelRuntimeConfig
-        from examples.sciaccel_rl.runner import HarborEpisodeResult, run_harbor_episode
+        from examples.sciaccel_rl.runner import run_harbor_episode
 
         mock_trial_result = MagicMock()
         mock_trial_result.task_name = "sciaccel/laps-cpu"
@@ -94,12 +93,14 @@ class TestRunHarborEpisode:
 
         with patch("examples.sciaccel_rl.runner.Job") as mock_job_cls:
             mock_job_cls.create = AsyncMock(return_value=mock_job)
-            result = asyncio.run(run_harbor_episode(
-                task_path="/path/to/tasks/laps-cpu",
-                model_base_url="http://10.0.0.1:8000/sessions/abc/v1",
-                model_name="Qwen/Qwen3-8B",
-                config=config,
-            ))
+            result = asyncio.run(
+                run_harbor_episode(
+                    task_path="/path/to/tasks/laps-cpu",
+                    model_base_url="http://10.0.0.1:8000/sessions/abc/v1",
+                    model_name="Qwen/Qwen3-8B",
+                    config=config,
+                )
+            )
 
         assert result.reward == 0.0
         assert result.exception == "build_failed"

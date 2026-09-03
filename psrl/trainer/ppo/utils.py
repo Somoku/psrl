@@ -70,10 +70,7 @@ class ResourcePoolManager:
         For Megatron backend, uses max_colocate_count>1 for different models.
         """
         for resource_pool_name, process_on_nodes in self.resource_pool_spec.items():
-            # max_colocate_count means the number of WorkerGroups (i.e. processes) in each RayResourcePool
-            # For FSDP backend, using max_colocate_count=3: actor_critic_ref, rollout, reward model (optional)
-            # For Megatron backend, we recommend using max_colocate_count>1
-            # that can utilize different WorkerGroup for differnt models
+            # PSRL assigns one worker group to each resource pool.
             resource_pool = RayResourcePool(
                 process_on_nodes=process_on_nodes,
                 use_gpu=True,
@@ -101,9 +98,7 @@ class ResourcePoolManager:
             for node, node_info in node_available_resources.items()
         }
 
-        # check total required gpus can be satisfied
-        # Use a small epsilon to avoid false failure from float precision (e.g. 64.0 vs 64.00000000000004)
-        # when resource_num_per_bundle has floats like 0.9/0.1; real shortages (e.g. 64.9) still fail.
+        # Tolerate floating-point noise in fractional bundle resources without masking real shortages.
         _GPU_EPS = 1e-9
         total_available_gpus = sum(node_available_gpus.values())
         total_required_gpus = sum(
@@ -157,10 +152,8 @@ def PSRL_compute_advantage(
     Returns:
         DataProto: The updated data with computed advantages and returns.
     """
-    # AGENT(VERL): PSRL use `parent_id` instead of `uid` to index the response group for GRPO
-    # and be the index for a single prompt.
-
-    # Back-compatible with trainers that do not compute response mask in fit
+    # AGENT(VERL): PSRL uses `parent_id` instead of `uid` to index each GRPO response group and prompt.
+    # Remain compatible with trainers that do not compute a response mask in fit.
     if "response_mask" not in data.batch:
         data.batch["response_mask"] = compute_response_mask(data)
     # prepare response group
@@ -220,7 +213,7 @@ def PSRL_compute_advantage(
                 "Please set actor.calculate_sum_pi_squared=True in config."
             )
             adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
-            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+            # `old_log_probs` provides the path variance proxy for the baseline.
             adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
             # Get pre-computed rollout IS weights if available
             rollout_is_weights = data.batch.get("rollout_is_weights", None)
@@ -267,8 +260,8 @@ def compute_advantage_for_multi_trajectories(
     final_sessions: dict[str, tuple[int, int]] = {}
     row_session_keys = []
     for i, key in enumerate(batch_keys):
-        # A padding key ends in a UUID, not a trajectory index. Treat it as a
-        # standalone sample; its unique parent_id and zero mask keep its advantage zero.
+        # A padding key ends in a UUID, not a trajectory index.
+        # Its unique `parent_id` and zero mask keep the standalone sample at zero advantage.
         fields = [key] if key.startswith("pad_") else key.rsplit("_", 1)
         if len(fields) == 2:
             uid, index = fields[0], int(fields[1])

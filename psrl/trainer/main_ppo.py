@@ -94,7 +94,7 @@ def _reserve_excess_nodes(config) -> list:
     cluster_nnodes = len(alive_gpu_nodes)
 
     if cluster_nnodes <= total_nnodes:
-        psrl_logger.info(f"Cluster has {cluster_nnodes} GPU nodes, job needs {total_nnodes}; no reservation needed.")
+        psrl_logger.info(f"Cluster has {cluster_nnodes} GPU nodes, job needs {total_nnodes}. No reservation needed.")
         return []
 
     excess_nodes = alive_gpu_nodes[total_nnodes:]
@@ -132,12 +132,7 @@ def run_ppo(config, task_runner_class=None) -> None:
                 model paths, and training hyperparameters.
         task_runner_class: For recipe to change TaskRunner.
     """
-    # Check if Ray is not initialized
     if not ray.is_initialized():
-        # Initialize Ray with a local cluster configuration
-        # Set environment variables in the runtime environment to control tokenizer parallelism,
-        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
-        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
@@ -153,7 +148,7 @@ def run_ppo(config, task_runner_class=None) -> None:
         psrl_logger.info(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
-    # NOTE(claude): keep the handle list alive for the entire job lifetime so Ray
+    # NOTE(claude): Keep the handle list alive for the entire job lifetime so Ray
     # does not garbage-collect the reservation actors before the job finishes.
     _slot_reservers = _reserve_excess_nodes(config)
 
@@ -241,11 +236,7 @@ class TaskRunner:
         resource_pool_spec = {
             train_pool_id: [deployment_config.train_ngpus_per_node] * deployment_config.train_nnodes,
         }
-        # Validation resource pool share with training pool by default.
-        # But the granularity of validation is per DP worker, while training is the whole training job.
-        # Thus we set different resource fraction to enable resource sharing between training and validation.
-        # The training pool gets higher fraction due to initialization order.
-        # Note that 50% is not safe because two bundle in one pool may share one GPU, which causes error.
+        # Unequal bundle fractions prevent two colocated workers from claiming one GPU.
         resource_num_per_bundle = {
             train_pool_id: train_bundle_resource_num,
         }
@@ -408,7 +399,7 @@ class TaskRunner:
             # AGENT(VERL): PSRL use reward model worker.
             self.add_reward_model_worker(config)
 
-            # NOTE(linsh): add a dummy worker to actor/critic/ref actors to avoid detected as async actor in Ray
+            # NOTE(linsh): Add a dummy worker so Ray does not classify fused workers as asynchronous.
             self.add_dummy_worker(config)
 
             tq_future.result()
@@ -417,7 +408,7 @@ class TaskRunner:
         try:
             resource_pool_manager = self.init_resource_pool_mgr(config)
 
-            # NOTE(linsh): lazily import `PSRL_RayPPOTrainer` here to avoid implicit ray.init()
+            # NOTE(linsh): Lazily import `PSRL_RayPPOTrainer` here to avoid implicit `ray.init()`
             # during initialization of nixl modules.
             from psrl.trainer.ppo.ray_trainer import PSRL_RayPPOTrainer
 

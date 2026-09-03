@@ -53,7 +53,7 @@ class TestServerGroup:
 
     @pytest.mark.parametrize("preset", ["qwen3_8b", "qwen35_9b"])
     def test_no_preset_enables_tool_call_extraction(self, preset):
-        """Agents parse their own text protocol; extraction would strip it."""
+        """Tool-call extraction would strip the agents' text protocol."""
         assert build_fleet_spec(_compose(f"server={preset}")).tool_call_parser == ""
 
 
@@ -63,7 +63,7 @@ class TestTopologyGroup:
         assert spec.replicas == 1
 
     def test_single_uses_port_not_base_port(self):
-        """single.yaml names the key `port`; the spec normalizes it to base_port."""
+        """The spec normalizes `single.yaml`'s `port` key to `base_port`."""
         spec = build_fleet_spec(_compose("topology=single", "topology.port=8005"))
         assert spec.base_port == 8005
 
@@ -82,7 +82,7 @@ class TestTopologyGroup:
         assert build_fleet_spec(_compose("topology=fleet")).min_healthy_frac == 1.0
 
     def test_multinode_tolerates_node_loss(self):
-        """At scale a wedged node is routine; degrade rather than abort."""
+        """Multinode serving degrades rather than aborts when a node is unresponsive."""
         assert build_fleet_spec(_compose("topology=multinode")).min_healthy_frac == 0.5
 
     def test_multinode_binds_all_interfaces(self):
@@ -101,6 +101,6 @@ class TestTopologyGroup:
         assert spec.gpus_per_replica == 8  # tp=2 * dp=4
 
     def test_dp_defaults_to_one_everywhere(self):
-        """Independent replicas are preferred; DP is broken in this patched vLLM."""
+        """DP remains disabled because the patched vLLM implementation cannot support it."""
         for topology in ("single", "fleet", "multinode"):
             assert build_fleet_spec(_compose(f"topology={topology}")).dp == 1

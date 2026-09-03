@@ -23,10 +23,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class RolloutScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Per-step prefill composition logging.
-        # Config is wired in by run_server() via scheduler_config attributes
-        # (psrl_prefill_composition_enable, psrl_logging_path, psrl_replica_idx),
-        # following the same pattern as preemption_notification_threshold.
+        # The server supplies prefill logging settings through scheduler attributes.
         sc = self.scheduler_config
         self._pcomp_enable: bool = bool(getattr(sc, "psrl_prefill_composition_enable", False))
         self._pcomp_logger: logging.Logger | None = None
@@ -114,7 +111,7 @@ class RolloutScheduler(AsyncScheduler):
         if not self.log_stats:
             return None
         prefix_cache_stats = self.kv_cache_manager.make_prefix_cache_stats()
-        assert prefix_cache_stats is not None
+        assert prefix_cache_stats is not None, "Prefix cache statistics are unavailable."
         connector_prefix_cache_stats: PrefixCacheStats | None = None
         if self.connector_prefix_cache_stats is not None:
             connector_prefix_cache_stats = self.connector_prefix_cache_stats
@@ -124,13 +121,8 @@ class RolloutScheduler(AsyncScheduler):
         connector_stats_payload = kv_connector_stats.data if kv_connector_stats else None
         req_id_to_prompt_token_num = {req_id: req.num_prompt_tokens for req_id, req in self.requests.items()}
         req_id_to_response_token_num = {req_id: req.num_output_tokens for req_id, req in self.requests.items()}
-        # NOTE(lhy): we need to patch the original vllm SchedulerStats to add:
-        # 1. `req_id_to_prompt_token_num` field. This is a dictionary of request ID to the number of prompt tokens.
-        # 2. `req_id_to_response_token_num` field. This is a dictionary of request ID to the number of response tokens.
-        # NOTE(claude): forward and clear `preemption_req_ids` exactly as the base
-        # `Scheduler.make_stats` does. This override previously dropped the field,
-        # so threshold-crossing preemptions never reached PreemptionStatLogger and
-        # the gateway loopback (return-to-router after preemption) never fired.
+        # NOTE(lhy): PSRL adds per-request prompt and response token counts to `SchedulerStats`.
+        # Preserve and clear `preemption_req_ids` after each statistics snapshot.
         preemption_req_ids = self.preemption_req_ids
         self.preemption_req_ids = []
         return SchedulerStats(
@@ -150,16 +142,7 @@ class RolloutScheduler(AsyncScheduler):
             preemption_req_ids=preemption_req_ids,
         )
 
-    # --- PSRL GPU block pool helpers (called via EngineCore.call_utility_async) ---
-    # These methods run in the EngineCore process where `self.kv_cache_manager.block_pool`
-    # is live and mutable.  They are intentionally NOT routed through `collective_rpc`
-    # (which dispatches to Worker processes) because `block_pool` state must only be
-    # mutated from a single process.  `KVCacheManager` in the PSRL coordinator calls
-    # these via `engine_core.call_utility_async("psrl_pin_gpu/psrl_unpin_gpu", tokens)`.
-    #
-    # NOTE(lhy): GPU prefix cache hit counts for routing are owned by SMG's
-    # event-driven cache-aware indexer. Only pin/unpin (which mutate block_pool
-    # ref_cnt) still require EngineCore RPC.
+    # --- PSRL GPU Block Pool ---
 
     def _psrl_get_caching_hash_fn(self):
         """
@@ -188,8 +171,7 @@ class RolloutScheduler(AsyncScheduler):
         block_pool = self.kv_cache_manager.block_pool
         block_size = block_pool.hash_block_size
         hash_fn = self._psrl_get_caching_hash_fn()
-        # `NONE_HASH` in `kv_cache_utils` must be initialised before calling
-        # `hash_block_tokens`.  `init_none_hash` is idempotent once called.
+        # `NONE_HASH` must be initialized before calling `hash_block_tokens`.
         init_none_hash(hash_fn)
 
         prev_hash = None
@@ -211,7 +193,7 @@ class RolloutScheduler(AsyncScheduler):
         """
         Pin GPU prefix-cache blocks for `tokens` by incrementing `ref_cnt`.
 
-        Only pins blocks with `ref_cnt == 0` (free queue).  Tracks pinned block
+        Only pins blocks with `ref_cnt == 0` in the free queue. Tracks pinned block
         IDs in `_psrl_pinned_block_ids` so `psrl_unpin_gpu` cannot decrement
         `ref_cnt` for blocks held by active vLLM requests.
 
@@ -234,17 +216,13 @@ class RolloutScheduler(AsyncScheduler):
                 self._psrl_pinned_block_ids.add(block.block_id)
                 pinned += 1
         if blocks_to_touch:
-            # NOTE(claude): `block_pool.touch()` expects a tuple of per-group block sequences.
-            # For standard (non-MLA) models there is one KV cache group, so we pass all
-            # blocks as a single-element tuple.
+            # NOTE(claude): Standard models pass one sequence because they have one KV-cache group.
             block_pool.touch((blocks_to_touch,))
             for block in blocks_to_touch:
                 assert block.ref_cnt > 0, (
-                    f"Block {block.block_id} ref_cnt is {block.ref_cnt} after touch(). Expected > 0."
+                    f"Invalid block reference count after touch: block_id={block.block_id}, ref_cnt={block.ref_cnt}."
                 )
-        psrl_logger.debug(
-            f"[LMCache] GPU pin (scheduler): {pinned} blocks pinned for token sequence of length {len(tokens)}."
-        )
+        psrl_logger.debug(f"[LMCache] Scheduler GPU pin: blocks={pinned}, token_count={len(tokens)}.")
         return pinned
 
     def psrl_unpin_gpu(self, tokens: list[int]) -> int:
@@ -269,15 +247,14 @@ class RolloutScheduler(AsyncScheduler):
         for block in self._psrl_iter_gpu_prefix_blocks(tokens):
             if block.block_id in self._psrl_pinned_block_ids:
                 assert block.ref_cnt > 0, (
-                    f"Block {block.block_id} ref_cnt is {block.ref_cnt} before free_blocks(). "
+                    f"Invalid block reference count before free_blocks: block_id={block.block_id}, "
+                    f"ref_cnt={block.ref_cnt}. "
                     "Cannot unpin a block with ref_cnt <= 0."
                 )
                 block_pool.free_blocks([block])
                 self._psrl_pinned_block_ids.discard(block.block_id)
                 freed += 1
-        psrl_logger.debug(
-            f"[LMCache] GPU unpin (scheduler): {freed} blocks released for token sequence of length {len(tokens)}."
-        )
+        psrl_logger.debug(f"[LMCache] Scheduler GPU unpin: blocks={freed}, token_count={len(tokens)}.")
         return freed
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
@@ -297,26 +274,18 @@ class RolloutScheduler(AsyncScheduler):
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
-        # NOTE(claude): Record QUEUED immediately after PREEMPTED to mark the
-        # moment the request re-enters the waiting queue. This gives
-        # `_split_into_segments` the QUEUED event it needs to open a new
-        # segment for the eventual re-schedule, so scheduler_wait_s for the
-        # resume segment is measured from this point rather than from the
-        # original submission.
+        # NOTE(claude): Record `QUEUED` immediately after `PREEMPTED` so resumed
+        # scheduler wait time starts at requeue.
         if self.log_stats:
             request.record_event(EngineCoreEventType.QUEUED, timestamp)
 
-        # NOTE(claude): Save the current output token count as the baseline for
-        # the next scheduling cycle. The FIRST_TOKEN event fires when
-        # `num_output_tokens` first exceeds this baseline, correctly identifying
-        # the prefill→decode boundary after a preemption even though
-        # `_output_token_ids` is not cleared on preemption.
+        # NOTE(claude): Save output count to detect the first decode token after preemption.
         request._psrl_cycle_output_token_baseline = request.num_output_tokens
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         # Notify external gateway if threshold is configured and waiting queue
-        # is already congested — local re-queuing would only worsen the load.
+        # is already congested. Local requeuing would only worsen the load.
         threshold = self.scheduler_config.preemption_notification_threshold
         if self.log_stats and threshold is not None and len(self.waiting) > threshold:
             self.preemption_req_ids.append(request.request_id)

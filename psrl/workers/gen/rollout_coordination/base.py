@@ -13,7 +13,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 class CoordinatorBase:
     """Shared HTTP gateway helpers and routing-loop control.
 
-    All ``self.*`` attributes are initialized by ``RolloutCoordinator.__init__``;
+    All `self.*` attributes are initialized by `RolloutCoordinator.__init__`.
     this class has no ``__init__`` of its own.
     """
 
@@ -28,7 +28,7 @@ class CoordinatorBase:
 
     async def _gateway_get_json(self, path: str, params: dict | None = None):
         url = f"{self.rollout_gateway_url}{path}"
-        psrl_logger.debug(f"Making GET request to {url} with params {params}")
+        psrl_logger.debug(f"Gateway GET request: url={url!r}, params={params!r}.")
         async with self.gateway_client.get(url, params=params) as resp:
             resp.raise_for_status()
             text = await resp.text()
@@ -38,12 +38,9 @@ class CoordinatorBase:
 
     async def _set_routing_loop_running(self, running: bool):
         path = "/routing_loop/resume" if running else "/routing_loop/pause"
-        # When pausing, pass wait=true so the call only returns after the routing loop
-        # drains in-flight worker selection (selecting becomes false). This prevents
-        # a race where update_currently_syncing_instances and the SYNC command are issued
-        # while the loop is still assigning requests using the pre-sync version.
+        # A synchronous pause prevents routing with the pre-sync model version.
         params = {"wait": "true"} if not running else {}
-        psrl_logger.info(f"Setting routing loop running state to {running} via {path}")
+        psrl_logger.info(f"Setting routing loop state: running={running}, path={path!r}.")
         data = await self._gateway_post_json(path, payload={}, params=params)
         expected_paused = not running
         actual_paused = data.get("paused")

@@ -1,92 +1,11 @@
 #!/usr/bin/env bash
-# run_eval.sh — end-to-end SciAccel-RL evaluation on one node.
-#
-# Serves a checkpoint as a fleet of vLLM replicas via psrl.eval.serve, runs Harbor
-# episodes over the v2 dataset with eval_sciaccel.py, prints the summary, and tears
-# the fleet down.
-#
-# Model-agnostic: pass --model / --served-model-name for any checkpoint.
-#
-# The anchor agents (oracle, nop) need no model, so --agent nop / --agent oracle
-# skip the vLLM launch entirely. Run those FIRST: the sciaccel-rl README requires
-# oracle = full score and nop = 0 on this machine before any agent number means
-# anything. The nop pass also warms every Docker image (it walks the full
-# env-build -> verifier-build -> grade path), which is what makes the subsequent
-# model run fast.
-#
-# Usage:
-#   # anchors + image warm-up (no GPU needed)
-#   bash run_eval.sh --agent nop
-#   bash run_eval.sh --agent oracle
-#
-#   # baseline a checkpoint over all tasks
-#   bash run_eval.sh --model /path/to/ckpt --served-model-name my-ckpt
-#
-#   # quick smoke over one task per family
-#   bash run_eval.sh --per-family 1 --families sign bounds accel --n-concurrent 3
-#
-# Options:
-#   --model PATH            HF checkpoint to serve (default: Qwen3.5-9B).
-#   --served-model-name N   Name the endpoint advertises (default: qwen35-9b).
-#   --agent NAME            terminus-2 (default) | oracle | nop.
-#   --dataset PATH          v2 Parquet (default: examples/sciaccel_rl/data/v2/all.parquet).
-#   --output-dir PATH       Artefact directory (default: outputs/sciaccel_rl/eval/<agent>_<ts>).
-#   --port N                Port of the first replica (default: 8000). A fleet of
-#                           R replicas uses ports N .. N+R-1.
-#   --replicas N            Independent vLLM servers to start (default: 4). Each
-#                           takes --tp GPUs, so replicas * tp must fit the host.
-#                           Endpoints are auto-discovered from the fleet's
-#                           endpoints.json, so --api-base is rarely needed.
-#   --tp N / --pp N         Per-replica parallelism (default: 2 / 1).
-#   --max-model-len N       Context window (default: 32768). Bounded by KV cache, not
-#                           by the model: Qwen3.5-9B is trained for 262144 but one
-#                           2xH20 replica holds only ~140k KV tokens, so 32768 is what
-#                           keeps ~4 sequences per replica running concurrently.
-#                           Verify with: curl -s localhost:8000/metrics | grep num_gpu_blocks
-#   --max-output-tokens N   Advisory output budget in terminus-2's model_info
-#                           (default: 8192). METADATA ONLY on the litellm chat path:
-#                           nothing sends it as a per-request max_tokens, so it does not
-#                           bound generation -- --max-model-len does. Measured per-turn
-#                           output was 219-549 tokens regardless of this value.
-#   --max-turns N           Cap agent turns per trial (default: 25). 0 = unbounded.
-#                           Every turn resends the whole transcript, so uncapped runs
-#                           tend to exhaust the context window and die UNGRADED; a cap
-#                           ends the loop cleanly so the verifier still scores it.
-#   --max-per-instance N    Concurrent tasks per vLLM endpoint (default: 32). Total in
-#                           flight is this times the endpoint count. Tasks are pulled
-#                           from a shared queue, so a finished slot takes the next one.
-#   --api-base URLS         Comma-separated endpoint list. Only needed with
-#                           --reuse-server; otherwise endpoints are discovered from
-#                           the fleet's endpoints.json.
-#   -k N                    Attempts per task (default: 1).
-#   -n N                    Concurrent Harbor trials (default: 8).
-#   --temperature F         Sampling temperature (default: 1.0).
-#   --categories A B        Category filter forwarded to eval_sciaccel.
-#   --families A B          Family filter forwarded to eval_sciaccel.
-#   --task-glob PATTERN     Task-name glob forwarded to eval_sciaccel.
-#   --per-family N          Cap per (category, family, tree) group.
-#   --limit N               Overall task cap.
-#   --timeout-multiplier F  Scales task-declared agent timeouts (default: 1.0).
-#   --build-timeout-multiplier F
-#                           Scales task-declared image build timeouts (default: 2.0).
-#   --skip-gpu-tasks        Drop tasks needing a GPU (default: on). Harbor's local
-#                           Docker provider rejects them, so they can only be errors.
-#   --with-gpu-tasks        Keep them, for a provider that does support GPUs.
-#   --no-apt-mirror         Don't redirect apt to the internal Debian mirror during
-#                           image builds. Only for hosts with a direct route to
-#                           deb.debian.org; see config/apt-mirror-override.yaml.
-#   --keep-server           Leave vLLM running after the eval (for a follow-up run).
-#   --reuse-server          Do not launch vLLM; assume one is already on --port.
-#   -h | --help             Print this help.
-#
-# NOTE(claude): No --tool-call-parser is passed to vLLM. Terminus-2 parses its own
-# JSON/XML text protocol out of the assistant message, so enabling vLLM's
-# tool-call extraction would strip the very text the agent needs.
-
+# Run SciAccel evaluation on one node, skipping model serving for anchor agents.
+# Usage: `run_eval.sh [options]`
 set -euo pipefail
 
 usage() { sed -n '2,74p' "$0"; }
 
+# NOTE(claude): Keep vLLM tool call parsing disabled for the Terminus text protocol.
 PSRL_PATH=${PSRL_PATH:-$(python3 -c "import os, psrl; print(os.path.dirname(os.path.dirname(psrl.__file__)))")}
 ENV_SCRIPT=${ENV_SCRIPT:-/apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh}
 
@@ -170,7 +89,7 @@ if [[ -z "${OUTPUT_DIR}" ]]; then
 fi
 mkdir -p "${OUTPUT_DIR}"
 
-# Anchor agents play the policy themselves; no endpoint is involved.
+# Anchor agents play the policy without an endpoint.
 NEEDS_MODEL=1
 if [[ "${AGENT}" == "oracle" || "${AGENT}" == "nop" ]]; then
     NEEDS_MODEL=0
@@ -179,9 +98,7 @@ fi
 LAUNCHED_SERVER=0
 SERVE_DIR="${OUTPUT_DIR}/serve"
 
-# Kill the process GROUP, not the pid. Each replica is a process-group leader and
-# its VLLM::Worker_TPn children join that group; signalling only the leader leaves
-# the workers alive still holding every GPU.
+# Signal each replica process group so worker children release their GPUs.
 cleanup() {
     if [[ "${LAUNCHED_SERVER}" -eq 1 && "${KEEP_SERVER}" -eq 0 && -f "${SERVE_DIR}/endpoints.json" ]]; then
         echo "[run_eval] Stopping the vLLM fleet..."
@@ -221,9 +138,7 @@ set -u
 if [[ "${NEEDS_MODEL}" -eq 1 && "${REUSE_SERVER}" -eq 0 ]]; then
     [[ -d "${MODEL}" ]] || { echo "ERROR: model directory not found: ${MODEL}" >&2; exit 2; }
     echo "[run_eval] Serving ${MODEL} as ${SERVED_NAME}: ${REPLICAS} replica(s) x TP=${TP} from port ${PORT}..."
-    # A fleet of independent servers, not one server with --data-parallel-size:
-    # DP is broken in this repo's patched vLLM, and eval_sciaccel spreads its work
-    # queue across every endpoint anyway.
+    # Use independent servers because evaluation distributes work across endpoints.
     (cd "${PSRL_PATH}" && python3 -m psrl.eval.serve \
         topology=fleet \
         topology.replicas="${REPLICAS}" \

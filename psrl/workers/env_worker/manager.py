@@ -1,10 +1,4 @@
-"""
-Env worker pool construction and placement policy.
-
-Placement is a configuration policy, not a structural property. Colocated and
-dedicated differ only in which node IPs receive workers, so switching between them
-never requires a code change.
-"""
+"""Construct env worker pools according to placement policy."""
 
 from __future__ import annotations
 
@@ -105,8 +99,8 @@ class EnvWorkerManager:
                 worker_id += 1
 
         psrl_logger.info(
-            f"Env worker pool ready with {len(self.workers)} worker(s) across "
-            f"{len(target_ips)} node(s) using placement {self.env_config.placement!r}."
+            f"Env worker pool is ready. Workers={len(self.workers)}, "
+            f"nodes={len(target_ips)}, placement={self.env_config.placement!r}."
         )
 
     def coordinator_handle(self) -> Any:

@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
-"""De-AI-ify markdown docs: remove em-dashes (—), en-dashes (–) and semicolons
-from prose, while leaving every form of code/math untouched.
+"""
+Normalize punctuation in Markdown prose without modifying code or math.
 
-Regions that are NEVER modified:
-  - Fenced code blocks delimited by ``` or ~~~ (any length)
-  - Inline code spans delimited by backticks ` `` ``` ...
-  - Block math delimited by $$ ... $$ (may span multiple lines)
-  - Inline math delimited by $ ... $ on a single line
-  - YAML front-matter at the very top of the file (--- ... ---)
+Protected regions:
+  - Fenced code blocks with backtick or tilde delimiters of any length.
+  - Inline code spans with backtick delimiters of any length.
+  - Block and inline math.
+  - YAML front matter at the top of the file.
 
-Replacement rules (prose only):
-  - en-dash  '–'  -> '-'                          (works for ranges and compounds)
-  - em-dash  '—'  -> ': '   if the preceding token looks like a label
-                            (heading line, list bullet, or closing backtick/bracket)
-                  -> ', '   otherwise
-  - ';\\n'        -> '.\\n' and capitalise the first letter of the next non-empty line
-  - '; '         -> ', '
-  - bare ';'     -> ','
+Replacement rules for prose:
+  - Convert en dashes to ASCII hyphens for ranges and compounds.
+  - Convert em dashes after labels to colons and all remaining em dashes to commas.
+  - Convert line-ending semicolons to periods and capitalize the next nonempty line.
+  - Convert all other semicolons to commas.
 
 Usage:
     python3 scripts/depunct_docs.py docs/ [docs2/ ...]
@@ -31,16 +27,12 @@ import re
 import sys
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Tokenisation
-# ---------------------------------------------------------------------------
+# --- Tokenization ---
 
 FENCE_RE = re.compile(r"^(\s*)(```+|~~~+)(.*)$")
 DIRECTIVE_INFO_RE = re.compile(r"^\s*\{([\w-]+)\}")
 
-# MyST directives whose body is human-readable prose (not code). When we see
-# one of these as a fenced directive, rewrite its body too — only the opening
-# and closing fence markers stay verbatim.
+# Rewrite prose-body MyST directives while preserving their opening and closing fences.
 PROSE_BODY_DIRECTIVES = {
     "admonition",
     "seealso",
@@ -138,9 +130,7 @@ def split_top_level(src: str) -> list[tuple[str, str]]:
     return chunks
 
 
-# ---------------------------------------------------------------------------
-# Prose tokenisation: protect inline code and math.
-# ---------------------------------------------------------------------------
+# --- Prose tokenization ---
 
 # Order matters: longest/most specific first.
 PROTECT_RE = re.compile(
@@ -175,16 +165,11 @@ def transform_prose(text: str) -> str:
     return _PH_RE.sub(_restore, rewritten)
 
 
-# ---------------------------------------------------------------------------
-# Core rewrites
-# ---------------------------------------------------------------------------
-
 # em-dash that follows a label-like token: heading, list bullet, closing
 # inline-code/link/bold. Captured group is kept verbatim.
 #
-# Note: plain trailing words are intentionally NOT treated as labels, because
-# in prose `X — Y` is much more often a parenthetical/contrast than a label.
-# A comma reads more natively in those cases (handled by the fall-through).
+# Plain trailing words are not labels because this punctuation usually marks a parenthetical or contrast.
+# A comma reads more naturally in those cases.
 LABEL_EMDASH_RE = re.compile(
     r"(?P<label>"
     r"^\s{0,3}#{1,6}\s+[^\n—]*?"  # heading line content
@@ -213,7 +198,7 @@ def _capitalize_first(line: str) -> str:
 
 
 def _semicolon_newline(match: re.Match[str]) -> str:
-    """Replace `; \n[ws]*<line>` with `.\n[ws]*<Line>` (capitalise first letter)."""
+    """Replace a line-ending semicolon with a period and capitalize the next nonempty line."""
     prefix_ws = match.group("pre") or ""
     next_line = match.group("next") or ""
     return f".\n{prefix_ws}{_capitalize_first(next_line)}"
@@ -223,41 +208,37 @@ def _rewrite(text: str) -> str:
     if not text:
         return text
 
-    # 1. en-dash everywhere -> ASCII hyphen
+    # 1. Replace en dashes with ASCII hyphens.
     text = text.replace("–", "-")
 
-    # 2. em-dash with label context -> ": "
-    #    Apply in a loop to catch nested/multiple per line.
+    # 2. Replace em dashes after labels with colons, including multiple occurrences per line.
     prev = None
     while prev != text:
         prev = text
         text = LABEL_EMDASH_RE.sub(_replace_em_after_label, text)
 
-    # 3. remaining em-dashes -> ", "
+    # 3. Replace remaining em dashes with commas.
     text = re.sub(r"\s*—\s*", ", ", text)
 
-    # 4. Semicolons.
-    #    4a. End-of-line / followed by blank line + new paragraph that starts uppercase:
+    # 4a. Replace line-ending semicolons and capitalize the next paragraph.
     text = re.sub(
         r";[ \t]*\n(?P<pre>[ \t]*)(?P<next>[^\n]*)",
         _semicolon_newline,
         text,
     )
-    #    4b. Mid-sentence "; " -> ", "
+    # 4b. Replace mid-sentence semicolons with commas.
     text = re.sub(r";[ \t]+", ", ", text)
-    #    4c. Bare ";" without trailing whitespace -> ","
+    # 4c. Replace bare semicolons with commas.
     text = text.replace(";", ",")
 
-    # 5. Tidy: collapse ", ," and ", ." which a bad input could produce.
+    # 5. Collapse redundant comma sequences from malformed input.
     text = re.sub(r",\s*,", ",", text)
     text = re.sub(r",\s*\.", ".", text)
 
     return text
 
 
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
+# --- Driver ---
 
 
 def process_file(path: Path) -> dict:

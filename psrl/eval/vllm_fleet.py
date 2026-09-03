@@ -46,10 +46,10 @@ class FleetSpec:
         pp: Pipeline-parallel size per replica.
         dp: Data-parallel size *inside* each replica, i.e. sub-replicas sharing
             one port and one process. Leave at 1 and raise `replicas` instead
-            unless a consumer can only accept a single URL; separate processes
+            unless a consumer can only accept a single URL. Separate processes
             fail separately, and this repo's patched vLLM has a broken DP
             coordinator.
-        base_port: Port of the first replica; subsequent ones increment by 1.
+        base_port: Port of the first replica. Subsequent ones increment by 1.
         gpu_ids: GPUs to distribute across replicas. Empty means "discover the
             local GPUs and use them all".
         host: Bind address for every replica.

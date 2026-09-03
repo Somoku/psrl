@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
 # AIRS-Bench RL recipe, Qwen3-4B on two nodes.
-#
-# Layout, per the design spec:
-#   28.49.16.220    env node, EnvWorker only, fenced off via total_nnodes=1
-#   29.162.247.148  compute node, rollout on GPU 0-3 and train on GPU 4-7
-#
-# AIRS-Bench grades on CPU, so gpu_slots_per_worker is 0. The env node's GPUs stay
-# idle until a GPU-needing task is added.
+# The environment node uses CPUs while the compute node runs rollout and training.
 set -xeuo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -46,8 +40,7 @@ PSRL_LOG_DIR="${OUTPUT_DIR}/psrl_logs/${experiment_name}"
 mkdir -p "${CKPTS_DIR}" "${PSRL_LOG_DIR}"
 
 # --- Cluster layout ---
-# Only the compute node belongs to the PSRL Ray pool. total_nnodes=1 tells the
-# excess-node reserver to fence PSRL workers off the env node.
+# `total_nnodes=1` keeps PSRL workers off the dedicated environment node.
 NNODES=1
 GEN_TP=2
 GEN_PP=1
@@ -68,8 +61,7 @@ VAL_INSTANCES=$(((TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / (VAL_TP * VAL_PP)))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$((VAL_TP * VAL_PP))
 
 # --- Algorithm ---
-# Only 14 training tasks exist, so the group size carries the advantage signal and
-# dynamic sampling drops zero-variance groups.
+# Grouped responses provide the advantage signal across the 14 training tasks.
 N_RESP_PER_PROMPT="${N_RESP_PER_PROMPT:-4}"
 MAX_TURNS="${MAX_TURNS:-40}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-30720}"

@@ -237,8 +237,7 @@ class TestBuildSpecs:
         assert all(s.max_model_len == 131072 for s in build_specs(fleet))
 
     def test_explicit_gpu_ids_must_match_exactly(self):
-        """An explicit list is a statement about which GPUs to use; silently
-        ignoring part of it would hide a mistake."""
+        """Explicit GPU lists must be consumed completely to expose configuration mistakes."""
         fleet = FleetSpec(checkpoint="/m", served_model_name="n", replicas=1, tp=1, gpu_ids=(0, 1, 2, 3))
         with pytest.raises(ValueError, match="Expected 1 GPU"):
             build_specs(fleet)

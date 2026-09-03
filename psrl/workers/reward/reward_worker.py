@@ -170,7 +170,7 @@ class RewardLoopWorker:
                 pass
             except Exception as e:
                 tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                psrl_logger.error(f"Reward task {task} failed with exception: {e}\nTraceback:\n{tb_str}")
+                psrl_logger.error(f"Reward task failed. Task={task!r}, error={e!r}.\nTraceback:\n{tb_str}")
             finally:
                 self.reward_tasks.discard(task)
                 for key in request_keys:
@@ -183,7 +183,6 @@ class RewardLoopWorker:
         error = None
         response_len = 1
 
-        # Extract fields
         uid = tu.get(request, "uid")[0]
         request_keys = tu.get(request, "request_keys")[0]
         is_validate = tu.get(request, "validate", False)
@@ -210,7 +209,6 @@ class RewardLoopWorker:
             error = traceback.format_exc()
             psrl_logger.error("Reward computation failed for uid=%s:\n%s", uid, error)
 
-        # Build result as plain dict
         reward_result = {
             "uid": uid,
             "request_keys": request_keys,

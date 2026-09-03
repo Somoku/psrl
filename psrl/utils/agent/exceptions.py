@@ -1,28 +1,8 @@
 """
-Map a black-box agent harness's failures onto PSRL terminate reasons.
+Classify agent harness failures as PSRL termination reasons.
 
-PSRL drives third-party harnesses (Harbor/terminus-2, mini-SWE-agent, MLGym) whose
-failures arrive as opaque exceptions, type names, or status strings.
-`TerminateReason` already encodes what the framework does about each outcome, so the
-only per-harness variable is *recognising* which outcome a failure represents. That
-is what a classifier does.
-
-Getting the mapping wrong is not cosmetic. `TerminateReason.needs_manager_retry()`
-makes the manager abort every sibling in a GRPO group and request a replacement
-prompt, so filing a deliberate abort under `ROLLOUT_ERROR` makes the system treat
-its own cleanup as a fresh fault and tear down healthy trajectories. The reasons
-that matter most:
-
-- `ABORTED`: PSRL/PSManager already ended this trajectory on purpose. No data, no
-  retry. The manager owns the cleanup.
-- `MAX_RESPONSE_LENGTH_EXCEEDED` / `MAX_TURNS_EXCEEDED`: a budget ran out, but the
-  turns produced so far are valid on-policy data. Keep them.
-- `ROLLOUT_ERROR`: an unexpected fault. The worker retries, then the group is
-  refilled.
-
-Subclass `AgentExceptionClassifier` per harness and put the subclass next to that
-harness's runner (see `examples/sciaccel_rl/exceptions.py`). The base class handles
-only what is harness-independent: PSRL's own sentinel exception types.
+Unknown failures remain distinct from `ROLLOUT_ERROR` so callers can surface new
+harness failures instead of silently retrying them.
 """
 
 from __future__ import annotations
@@ -33,9 +13,8 @@ from psrl.utils.common.http_utils import (
 )
 from psrl.workers.agent_loop.loops.utils import TerminateReason
 
-# vLLM's context-overflow wording. litellm's `ExceptionCheckers` and Harbor's
-# `LiteLLMModel._is_context_length_error` both miss it, so anything that proxies a
-# vLLM 400 through litellm has to match the text itself.
+# vLLM overflow wording bypasses the `litellm` and Harbor checks.
+# Match proxied vLLM 400 responses directly.
 VLLM_OVERFLOW_MARKERS = (
     "maximum model length",
     "decoder prompt",

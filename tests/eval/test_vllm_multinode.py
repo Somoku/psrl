@@ -36,7 +36,7 @@ class TestReadHostsFile:
         assert read_hosts_file(path) == ["29.162.247.148", "28.49.195.154"]
 
     def test_reads_the_repo_convention(self):
-        """hosts/<N>GPUs is the existing convention; multinode must consume it as-is."""
+        """Multinode deployment consumes the existing `hosts/<N>GPUs` convention unchanged."""
         hosts = read_hosts_file(REPO_HOSTS_FILE)
         assert "29.162.247.148" in hosts
         assert "28.49.195.154" in hosts
@@ -90,7 +90,7 @@ class TestCapacityAccounting:
         assert MultinodeSpec(hosts=[f"h{i}" for i in range(16)], fleet=fleet).n_expected == 64
 
     def test_default_quorum_tolerates_node_loss(self, fleet):
-        """At scale a wedged node is routine; a multi-hour eval should degrade."""
+        """A long multinode evaluation must tolerate an unresponsive node."""
         assert MultinodeSpec(hosts=["h1"], fleet=fleet).min_healthy_frac == 0.5
 
 

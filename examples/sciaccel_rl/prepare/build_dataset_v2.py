@@ -1,30 +1,5 @@
 """
-Build SciAccel-RL v2 datasets from the taxonomy-organized sciaccel-rl repo.
-
-The v2 repo layout is `envs/<env>/tasks/<category>/<task>/`, with per-task
-metadata in `task.toml` under `[metadata.taxonomy]` and canonical rows in
-`envs/<env>/tasks.jsonl`. This module reads both, derives the training reward
-key from the task category, and writes a single `all.parquet` plus a
-deterministic stratified train/val split.
-
-The predecessor `build_dataset.py` targets the flat two-task v1 layout and
-hard-codes its reward keys, GPU counts, and timeouts. It stays in place for the
-v1 dataset; nothing here is shared with it.
-
-Usage::
-
-    python -m examples.sciaccel_rl.prepare.build_dataset_v2 \
-        --repo /path/to/sciaccel-rl \
-        --out-dir examples/sciaccel_rl/data/v2
-
-Output artefacts::
-
-    <out-dir>/
-      all.parquet     one row per task, every category
-      train.parquet   all.parquet minus the val rows
-      val.parquet     one task per (category, family, tree) group
-      split.json      the val task names, for reproducibility
-      stats.json      per-group counts and floor distribution
+Build stratified SciAccel v2 datasets from taxonomy metadata.
 """
 
 from __future__ import annotations
@@ -33,12 +8,12 @@ import argparse
 import json
 import logging
 import os
-import tomllib
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import tomllib
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
@@ -48,22 +23,14 @@ if not psrl_logger.handlers:
     psrl_logger.addHandler(_handler)
     psrl_logger.propagate = False
 
-# Which verifier reward key is the training signal, per category. Sourced from the
-# sciaccel-rl README ("Running for agent RL TRAINING") and confirmed against the
-# per-category `grade.py`:
-#   repair / implementation  reward_repair = max(0, reward - floor) / (1 - floor),
-#                            so delivering the unfixed build scores exactly 0.
-#   acceleration             raw `reward` on the CPU task (needs budget forcing to
-#                            carry an acceleration signal), and reward_gpu =
-#                            reward * gpu_active on the CUDA task.
+# Map each category to its verifier training reward.
 _CATEGORY_REWARD_KEYS = {
     "repair": "reward_repair",
     "implementation": "reward_repair",
     "acceleration": "reward",
 }
 
-# The CUDA acceleration task is the one place where the reward key is per-task
-# rather than per-category: its telemetry gate lives in `reward_gpu`.
+# The CUDA acceleration task uses its telemetry-gated reward.
 _TASK_REWARD_KEY_OVERRIDES = {
     "laps-accel-cuda": "reward_gpu",
 }
@@ -80,7 +47,7 @@ def _load_canonical_rows(repo: Path, env: str) -> dict[str, dict[str, Any]]:
     """
     Load `tasks.jsonl` and index the canonical rows by task name.
 
-    Only generated tasks (repair, implementation) have rows; the hand-authored
+    Only generated tasks (repair, implementation) have rows. The hand-authored
     acceleration tasks are absent. The rows carry the in-situ measured floor and
     the graded check list, which the compiled `task.toml` only summarizes.
 
@@ -103,7 +70,7 @@ def _load_canonical_rows(repo: Path, env: str) -> dict[str, dict[str, Any]]:
                 continue
             row = json.loads(line)
             rows[row["task"]] = row
-    psrl_logger.info(f"Loaded {len(rows)} canonical rows from {jsonl_path}.")
+    psrl_logger.info(f"Loaded canonical rows from {jsonl_path!s}. Count: {len(rows)}.")
     return rows
 
 
@@ -134,7 +101,7 @@ def _discover_task_dirs(repo: Path, env: str, categories: list[str] | None) -> l
             continue
         task_dirs = sorted(p for p in category_dir.iterdir() if p.is_dir() and (p / "task.toml").exists())
         if not task_dirs:
-            psrl_logger.info(f"Category {category!r} has no compiled tasks, skipping.")
+            psrl_logger.info(f"No compiled tasks in category={category!r}. Skipping.")
             continue
         found.extend((category, task_dir) for task_dir in task_dirs)
 
@@ -174,8 +141,7 @@ def _build_row(
     task_name = manifest["task"]["name"]
     canonical = canonical_rows.get(task_dir.name, {})
 
-    # The category recorded in the manifest and the one implied by the directory
-    # must agree; a mismatch means the compiled tree is stale.
+    # Manifest and directory categories must agree.
     manifest_category = taxonomy.get("category")
     if manifest_category is not None and manifest_category != category:
         raise ValueError(
@@ -196,9 +162,7 @@ def _build_row(
     # `floor_native_estimate`, which the task factory documents as advisory.
     floor = float(canonical.get("funnel", {}).get("floor", taxonomy.get("floor_native_estimate", 0.0)))
 
-    # The graded checks: canonical row first, then the manifest, then the vendored
-    # `environment/checks/` directory. The acceleration tasks have neither a row nor
-    # a taxonomy section, so for them the directory is the only source.
+    # Resolve checks from canonical data, manifest metadata, then the checks directory.
     checks = list(canonical.get("checks") or taxonomy.get("affected_checks") or [])
     if not checks:
         checks_dir = task_dir / "environment" / "checks"
@@ -225,10 +189,7 @@ def _build_row(
     return {
         "prompt": [{"role": "user", "content": instruction}],
         "data_source": DATA_SOURCE,
-        # The reward comes from Harbor's verifier container at rollout time, not from a
-        # dataset label -- but every reward loop reads `reward_model["ground_truth"]`
-        # unconditionally, so the key must exist. Same convention as
-        # examples/airs_bench (also verifier-scored).
+        # Harbor supplies verifier reward while the schema still requires ground truth.
         "reward_model": {"style": "rule", "ground_truth": ""},
         "task_name": task_name,
         "category": category,
@@ -288,10 +249,7 @@ def _build_stats(df: pd.DataFrame) -> dict[str, Any]:
         "by_category": {k: int(v) for k, v in df["category"].value_counts().sort_index().items()},
         "by_reward_key": {
             k: int(v)
-            for k, v in pd.Series([row["reward_key"] for row in df["extra_info"]])
-            .value_counts()
-            .sort_index()
-            .items()
+            for k, v in pd.Series([row["reward_key"] for row in df["extra_info"]]).value_counts().sort_index().items()
         },
         "by_group": by_group,
     }
@@ -321,7 +279,7 @@ def build_datasets(
     repo = Path(repo_path).resolve()
     canonical_rows = _load_canonical_rows(repo, env)
     task_dirs = _discover_task_dirs(repo, env, categories)
-    psrl_logger.info(f"Discovered {len(task_dirs)} compiled tasks under {repo / 'envs' / env / 'tasks'}.")
+    psrl_logger.info(f"Discovered compiled tasks under {repo / 'envs' / env / 'tasks'!s}. Count: {len(task_dirs)}.")
 
     counts: dict[str, int] = defaultdict(int)
     rows: list[dict[str, Any]] = []
@@ -364,8 +322,8 @@ def build_datasets(
     (out / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
 
     psrl_logger.info(
-        f"Wrote {len(df)} tasks to {out / 'all.parquet'} "
-        f"({len(train_df)} train, {len(val_df)} val) with categories {dict(counts)}."
+        f"Wrote dataset={out / 'all.parquet'!s}. Total tasks: {len(df)}. "
+        f"Train: {len(train_df)}. Validation: {len(val_df)}. Categories: {dict(counts)!r}."
     )
     return stats
 

@@ -33,7 +33,6 @@ class DefaultGenRewardFunction(GenRewardFunctionBase):
         self.prompt_template = DEFAULT_GENRM_PROMPT_TEMPLATE
 
     def prompt_constructor(self, prompt_str: str, response_str: str) -> list[dict]:
-        # Use template to construct prompt (default: GENRM_PROMPT_TEMPLATE format)
         rm_prompt = DEFAULT_GENRM_PROMPT_TEMPLATE.format(problem=prompt_str, solution=response_str)
         return [
             {
@@ -52,7 +51,6 @@ class DefaultGenRewardFunction(GenRewardFunctionBase):
         extra_info: dict | None = None,
         **kwargs,
     ) -> float:
-        # Default gen_rm uses string output, ignore rm_output_value
         reward_score = 0.0
         try:
             boxed_result = last_boxed_only_string(rm_output)

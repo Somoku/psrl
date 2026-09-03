@@ -25,10 +25,8 @@ def phi(score: float, optimal: float, eps: float = PHI_EPS) -> float:
     """
     Apply the AIRS-Bench non-linear transform to one raw metric value.
 
-    The transform is `-log10(|s - s_opt|)`, which compresses the many decades that
-    separate a weak submission from a strong one. Because a metric can land exactly
-    on its optimum, for instance an accuracy of 1.0, the distance is floored at
-    `eps` so the result stays finite.
+    The transform takes the negative base 10 logarithm of the distance from the
+    optimum. The distance is floored at `eps` so the result stays finite.
 
     Args:
         score (float): Raw metric value.
@@ -68,9 +66,7 @@ def normalized_score(score: float, sota: float, worst: float, optimal: float) ->
         # NOTE(claude): A degenerate range means SOTA and the worst observation are
         # indistinguishable after the transform, so the only meaningful question is
         # whether the agent reached SOTA at all.
-        psrl_logger.warning(
-            f"Degenerate normalization range for sota={sota!r} and worst={worst!r}, falling back to a binary reward."
-        )
+        psrl_logger.warning(f"Using a binary reward for degenerate range sota={sota!r}, worst={worst!r}.")
         return 1.0 if phi_score >= phi_sota else 0.0
 
     return min(1.0, max(0.0, (phi_score - phi_worst) / denominator))
@@ -115,7 +111,7 @@ def compute_score(
 
     def zero(reason: str) -> dict:
         diagnostics["airs_zero_reason"] = reason
-        psrl_logger.info(f"Task {task_id!r} scored 0.0 because of {reason!r}.")
+        psrl_logger.info(f"Scored task={task_id!r} at 0.0. Reason: {reason!r}.")
         return {"score": 0.0, "reward_extra_info": diagnostics}
 
     eval_error = extra_info.get("airs_eval_error", "")

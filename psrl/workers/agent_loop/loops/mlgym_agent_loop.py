@@ -176,15 +176,15 @@ class MLGymAgentLoop(SessionAgentLoop):
                     result = await self._run_episode_logic(request, observation, session_id)
                 except asyncio.TimeoutError:
                     psrl_logger.warning(
-                        f"AIRS-Bench episode for {observation['airs_task_id']!r} exceeded "
-                        f"{self.runtime_config.episode_timeout_s}s."
+                        f"AIRS-Bench timeout: task={observation['airs_task_id']!r}, "
+                        f"limit={self.runtime_config.episode_timeout_s}s."
                     )
                     return None, TerminateReason.TRAJECTORY_TIMEOUT
 
                 psrl_logger.info(
-                    f"AIRS-Bench episode for {observation['airs_task_id']!r} finished with status "
-                    f"{result['exit_status']!r} after {result['turns']} turn(s) in "
-                    f"{result['timing'].get('episode_s', 0.0):.0f}s."
+                    f"AIRS-Bench episode: task={observation['airs_task_id']!r}, "
+                    f"status={result['exit_status']!r}, turns={result['turns']}, "
+                    f"elapsed={result['timing'].get('episode_s', 0.0):.0f}s."
                 )
 
                 training_data_list = await self.get_training_data(session_id)

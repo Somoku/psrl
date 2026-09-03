@@ -1,14 +1,8 @@
 #!/usr/bin/env python3
-"""Plot chunked-prefill microbench throughput vs m for multiple TP runs.
+"""
+Plot chunked prefill microbenchmark throughput by tensor parallel size.
 
-Only rows with decomposition == "multi" are plotted.
-Each TP is one line; x = m, y = throughput_tok_per_s.
-
-Example:
-  python plot_chunked_prefill_micro.py \\
-    --tp-file 1:/path/to/micro_TP1_....jsonl \\
-    --tp-file 2:/path/to/micro_TP2_....jsonl \\
-    --out multi_throughput.png
+Only rows whose decomposition is `multi` are plotted.
 """
 
 from __future__ import annotations
@@ -23,9 +17,7 @@ import matplotlib.pyplot as plt
 def parse_tp_file(spec: str) -> tuple[int, Path]:
     """Parse 'TP:/path/to/file.jsonl' into (tp, path)."""
     if ":" not in spec:
-        raise argparse.ArgumentTypeError(
-            f"expected TP:path, got {spec!r} (example: 1:/path/to/file.jsonl)"
-        )
+        raise argparse.ArgumentTypeError(f"expected TP:path, got {spec!r} (example: 1:/path/to/file.jsonl)")
     tp_str, path_str = spec.split(":", 1)
     try:
         tp = int(tp_str)

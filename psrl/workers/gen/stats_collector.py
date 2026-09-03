@@ -128,7 +128,7 @@ class DPLBStatCollector(StatLoggerBase):
             self.log_prefix = f"DPLBStatCollector_{self.role}_I{self.replica_idx}"
             psrl_logger.propagate = False
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
-            psrl_logger.info(f"Initialized DPLBStatCollector for replica {self.replica_idx} (role={self.role}).")
+            psrl_logger.info(f"Initialized DPLBStatCollector: replica={self.replica_idx}, role={self.role!r}.")
 
     def begin_record(self):
         """
@@ -262,10 +262,8 @@ class DPLBStatCollector(StatLoggerBase):
             snapshot["generation_throughput"] = num_generation_reqs / avg_itl if avg_itl > 0 else 0.0
             snapshot["iteration_stats"] = iteration_stats_entry
 
-            # Accumulate prefill/decode wall time for this step.
-            # `elapsed_time_since_last_record` is the wall time of this step
-            # (time since previous record() call). Skip abnormally large values
-            # (e.g. the very first record after engine init).
+            # Ignore abnormally long intervals when accumulating prefill and decode
+            # wall time.
             step_elapsed = snapshot["elapsed_time_since_last_record"]
             num_pt = iteration_stats_entry["num_prompt_tokens"]
             num_gt = iteration_stats_entry["num_generation_tokens"]
@@ -341,7 +339,6 @@ class DPLBStatCollector(StatLoggerBase):
             or curr_time - self.last_push_to_queue_time
             >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0
         ):
-            # psrl_logger.info(f"Putting snapshot to output queue (model version {self.model_version}, instance_id {(self.replica_idx, engine_idx)}): {snapshot}")  # noqa: E501
             self.output_queue.put_nowait(
                 EngineStats(
                     replica_idx=self.replica_idx,

@@ -151,12 +151,11 @@ class SessionAgentLoop(AgentLoopBase):
         multi_modal_data: dict | None = None,
         trajectory_id: int | str | None = None,
     ) -> dict:
-        """Send one chat-completion request through a session.
+        """
+        Send one chat completion request through a session.
 
-        ``trajectory_id`` is intentionally a request header rather than part of
-        the OpenAI payload.  With an unbound session this lets TITO preserve
-        independent model contexts without giving up session-level routing and
-        version pinning.
+        The `trajectory_id` request header preserves independent model contexts
+        while retaining session routing and version pinning.
         """
         messages = await normalize_messages(
             messages,

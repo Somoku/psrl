@@ -36,20 +36,18 @@ def test_budget_failures_keep_their_data():
     ]:
         reason = CLASSIFIER.classify(message, exc_type=exc_type)
         assert reason is not None, message
-        assert reason.is_successful, f"{message} -> {reason} would discard usable turns"
-        assert not reason.needs_manager_retry(), f"{message} -> {reason} kills the group"
+        assert reason.is_successful, (
+            f"Message={message!r}, reason={reason!r}: Classification would discard usable turns."
+        )
+        assert not reason.needs_manager_retry(), (
+            f"Message={message!r}, reason={reason!r}: Classification would terminate the group."
+        )
 
 
 def test_timeout_and_verifier_have_distinct_reasons():
     """A clock timeout is not a turn cap, and a grading failure is neither."""
-    assert (
-        CLASSIFIER.classify(AGENT_TIMEOUT_MSG, exc_type="AgentTimeoutError")
-        is TerminateReason.AGENT_TIMEOUT
-    )
-    assert (
-        CLASSIFIER.classify("x", exc_type="VerifierTimeoutError")
-        is TerminateReason.VERIFIER_ERROR
-    )
+    assert CLASSIFIER.classify(AGENT_TIMEOUT_MSG, exc_type="AgentTimeoutError") is TerminateReason.AGENT_TIMEOUT
+    assert CLASSIFIER.classify("x", exc_type="VerifierTimeoutError") is TerminateReason.VERIFIER_ERROR
     # Neither may be reported as MAX_TURNS_EXCEEDED, which means the turn cap was hit.
     assert TerminateReason.AGENT_TIMEOUT is not TerminateReason.MAX_TURNS_EXCEEDED
     assert TerminateReason.VERIFIER_ERROR is not TerminateReason.MAX_TURNS_EXCEEDED
@@ -73,9 +71,7 @@ def test_verifier_error_is_trainable_and_not_an_error_class():
 
 
 def test_overflow_maps_to_max_response_length():
-    assert (
-        CLASSIFIER.classify(OVERFLOW_MSG) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-    )
+    assert CLASSIFIER.classify(OVERFLOW_MSG) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
 
 def test_deliberate_abort_never_retries_the_group():
@@ -100,14 +96,8 @@ def test_setup_failures_are_faults_not_truncations():
 
 def test_agent_setup_timeout_is_not_shadowed_by_agent_timeout():
     """`AgentSetupTimeout` contains `AgentTimeout`, so marker order matters."""
-    assert (
-        CLASSIFIER.classify("x", exc_type="AgentSetupTimeoutError")
-        is TerminateReason.ROLLOUT_ERROR
-    )
-    assert (
-        CLASSIFIER.classify("x", exc_type="AgentTimeoutError")
-        is TerminateReason.AGENT_TIMEOUT
-    )
+    assert CLASSIFIER.classify("x", exc_type="AgentSetupTimeoutError") is TerminateReason.ROLLOUT_ERROR
+    assert CLASSIFIER.classify("x", exc_type="AgentTimeoutError") is TerminateReason.AGENT_TIMEOUT
 
 
 def test_a_discarded_train_slot_always_refills_the_group():
@@ -127,8 +117,7 @@ def test_a_discarded_train_slot_always_refills_the_group():
         if reason.is_successful or reason is TerminateReason.ABORTED:
             continue
         assert reason.needs_manager_retry(), (
-            f"{reason.value} yields no data but never refills the group, "
-            "so its siblings would wait forever"
+            f"{reason.value} yields no data but never refills the group, so its siblings would wait forever"
         )
     assert not TerminateReason.ABORTED.needs_manager_retry()
 
@@ -139,17 +128,12 @@ def test_data_bearing_reasons_never_refill_the_group():
         if not reason.is_successful:
             continue
         assert not reason.needs_manager_retry(), f"{reason.value} discards its own data"
-        assert not reason.needs_worker_retry(), (
-            f"{reason.value} would be re-run after its turns were already accepted"
-        )
+        assert not reason.needs_worker_retry(), f"{reason.value} would be re-run after its turns were already accepted"
 
 
 def test_exception_type_beats_message_text():
     """Harbor's class name is the reliable signal when both are present."""
-    assert (
-        CLASSIFIER.classify("some unrelated wording", exc_type="AgentTimeoutError")
-        is TerminateReason.AGENT_TIMEOUT
-    )
+    assert CLASSIFIER.classify("some unrelated wording", exc_type="AgentTimeoutError") is TerminateReason.AGENT_TIMEOUT
 
 
 def test_unrecognised_failure_returns_none():
@@ -162,14 +146,8 @@ def test_unrecognised_failure_returns_none():
 def test_psrl_sentinel_types_classify_without_text_matching():
     """The base class handles our own sentinels for every harness."""
     base = AgentExceptionClassifier()
-    assert (
-        base.classify(RequestAbortedByGatewayError(request_id="r", message="m"))
-        is TerminateReason.ABORTED
-    )
-    assert (
-        base.classify(PromptOverflowError("too long"))
-        is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
-    )
+    assert base.classify(RequestAbortedByGatewayError(request_id="r", message="m")) is TerminateReason.ABORTED
+    assert base.classify(PromptOverflowError("too long")) is TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
 
 def test_base_classifier_has_no_harness_knowledge():

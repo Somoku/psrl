@@ -176,11 +176,8 @@ class AgentLoopBase(ABC):
         if remove_system_prompt:
             prompt_ids = prompt_ids[len(self.system_prompt) :]
 
-        # Mirror the response-side ``response_ids[:response_length]`` cap on the prompt side:
-        # every prompt produced by the agent loop must fit in ``rollout.prompt_length`` so that
-        # ``_pad_token_ids`` (and downstream ``torch.cat``) can rely on uniform shapes.
-        # Multimodal prompts cannot be sliced here because placeholder tokens must remain
-        # aligned 1:1 with ``multi_modal_inputs`` features, so we fail loudly instead.
+        # Prompts must fit `rollout.prompt_length`. Multimodal prompts cannot be
+        # sliced without corrupting placeholder-to-feature alignment.
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
             if images or videos or audios:
@@ -193,7 +190,7 @@ class AgentLoopBase(ABC):
                     f"increase ``rollout.prompt_length``."
                 )
             psrl_logger.warning(
-                "Prompt of %d tokens exceeds rollout.prompt_length=%d; left-truncating.",
+                "Prompt of %d tokens exceeds rollout.prompt_length=%d. Left-truncating.",
                 len(prompt_ids),
                 prompt_length,
             )
@@ -270,10 +267,7 @@ class AgentLoopBase(ABC):
         with self.timer.generation():
             if not self.rollout_gateway_url:
                 raise RuntimeError("Rollout gateway address is empty.")
-            # All requests (text-only and multimodal) use /generate:
-            # - input_ids are pre-tokenized by apply_chat_template (no SMG re-tokenize)
-            # - image_data accepts URL strings (SMG fetches) or base64 (PIL fallback)
-            # - output_ids returned directly (no PSRL re-tokenize)
+            # `/generate` accepts pretokenized text and multimodal inputs.
             return await self._generate_via_generate_endpoint(request_input, sampling_params, is_sticky_session)
 
     async def _generate_via_generate_endpoint(
@@ -371,9 +365,7 @@ class AgentLoopBase(ABC):
         # token ids
         token_ids = first["output_ids"]
 
-        # logprobs: SMG returns output_token_logprobs as List[List[Optional[float]]].
-        # Each outer entry is one output token position; each inner list is top-k logprobs
-        # for that position. We take the first (top-1) entry at each position.
+        # Each SMG output position contains top-k log probabilities in descending order.
         log_probs = None
         if sampling_params.get("logprobs") is not None:
             raw_logprobs = meta_info.get("output_token_logprobs")
@@ -390,9 +382,8 @@ class AgentLoopBase(ABC):
         # Determine interrupted based on finish_reason
         interrupted = finish_reason == "abort"
 
-        # Routing replay: SMG returns routed_experts as a base64 .npy blob in
-        # meta_info (aligned to absolute positions [0, prompt_len + completion_len - 1)).
-        # Partial-rollout loopback is merged gateway-side.
+        # SMG aligns routed experts to prompt and completion token positions.
+        # Partial rollout loopback is merged by the gateway.
         routed_experts = None
         if self.rollout_config.enable_rollout_routing_replay:
             routed_experts = self._decode_routed_experts_payload(meta_info.get("routed_experts"))
@@ -501,9 +492,8 @@ class AgentLoopBase(ABC):
         is_validate = request.is_validate
         input_length = len(request.input_ids)
 
-        # In Rust multimodal mode these are unexpanded anchor IDs. Reserve the
-        # configured prompt budget until SMG returns the exact expanded IDs;
-        # using the shorter wire length here could overrun the model context.
+        # Rust multimodal inputs contain unexpanded anchors, so reserve the full
+        # prompt budget until SMG returns expanded IDs.
         mm_data = request.multi_modal_data or {}
         has_images = bool(mm_data.get("images")) or bool(
             request.raw_prompt and messages_contain_images(request.raw_prompt)
@@ -522,14 +512,10 @@ class AgentLoopBase(ABC):
         max_tokens = self.rollout_config.response_length + self.rollout_config.prompt_length - input_length
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
         assert max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
+            f"max_tokens={max_tokens} exceeds available context space={max_possible_tokens}."
         )
 
-        # top_k: -1 means "disabled" (consider all tokens) for both /generate and
-        # /v1/chat/completions. The /generate endpoint does not validate the nested
-        # SamplingParams, so 0 or -1 both work there; but /v1/chat/completions
-        # validates top_k as i32 and rejects 0 — only -1 or >=1 are accepted.
-        # Keep the raw config value; -1 is the correct wire representation.
+        # `top_k=-1` is the only disabled value accepted by both generation endpoints.
         top_k = int(self.rollout_config.top_k)
 
         sampling_params = dict(
@@ -566,14 +552,11 @@ class AgentLoopBase(ABC):
 
     @staticmethod
     def _decode_routed_experts_payload(routed_experts_b64: str | None) -> np.ndarray | None:
-        """Decode SMG's routed-experts payload into a numpy array.
+        """
+        Decode SMG's routed-expert payload into a NumPy array.
 
-        SMG serializes ``routed_experts`` as a base64-encoded NumPy ``.npy``
-        v1.0 file (see ``smg/crates/protocols/src/npy.rs``), identical to vLLM's
-        own HTTP response format. The decoded array has shape
-        ``[num_tokens, num_layers, top_k]`` with dtype ``uint8``/``uint16``,
-
-        ``num_tokens == (prompt_len - routed_experts_prompt_start) + completion_len - 1``
+        The result has shape `[num_tokens, num_layers, top_k]` and uses
+        an unsigned 8-bit or 16-bit integer dtype.
         """
         if not routed_experts_b64:
             return None
@@ -588,20 +571,14 @@ class AgentLoopBase(ABC):
         headers: dict[str, str],
         max_retries: int = 1,
     ) -> tuple[list[dict], str | None, str | None]:
-        """POST to SMG /generate and return (responses, base_worker_id, target_dp_rank).
+        """
+        POST to SMG `/generate` and return responses with routing headers.
 
-        SMG's /generate returns a JSON array of GenerateResponse objects alongside the
-        worker-instance headers.  This helper reads both in a single aiohttp call so
-        that the caller never has to deal with the mismatch between http_utils._post()
-        (which assumes a JSON dict body) and the array response shape.
-
-        HTTP I/O is handled by a dedicated background thread so that socket callbacks
-        do not contend with the Ray actor's event loop.
+        HTTP I/O runs in a dedicated thread because socket callbacks must not
+        contend with the Ray actor event loop.
 
         Returns:
-            - responses: list of GenerateResponse dicts (may be empty on error)
-            - base_worker_id: value of x-base-worker-id response header, or None
-            - target_dp_rank: value of x-target-dp-rank response header, or None
+            tuple: Response dictionaries, base worker ID, and target DP rank.
         """
         if is_distributed_post_enabled():
             response = await request_json_maybe_distributed(
@@ -624,7 +601,6 @@ class AgentLoopBase(ABC):
         target_dp_rank = response.headers.get("x-target-dp-rank", None)
 
         responses = response.data
-        # SMG /generate returns either a single dict or a list; normalise to list.
         if isinstance(responses, dict):
             responses = [responses]
         elif not isinstance(responses, list):
@@ -709,7 +685,7 @@ class AgentLoopBase(ABC):
                 elif isinstance(v, NonTensorData):
                     prompt[k] = v.data
                 else:
-                    psrl_logger.exception(f"Unsupported type {type(v)} for key {k}")
+                    psrl_logger.exception(f"Unsupported value: type={type(v)!r}, key={k!r}.")
 
             timeout = self.config.gen_actor_rollout_ref.rollout.agent.trajectory_timeout
             output, terminate_reason = await asyncio.wait_for(
@@ -747,8 +723,8 @@ class AgentLoopBase(ABC):
             # PS Manager has already taken ownership of cleaning the request's data
             # flow (TQ entry cleared, staleness inventory updated).
             psrl_logger.info(
-                "Request %s aborted by PS Manager (gateway returned `request_aborted`); "
-                "ending data flow without retry.",
+                "Request %s aborted by PS Manager because the gateway returned request_aborted. "
+                "Ending data flow without retry.",
                 e.request_id or "N/A",
             )
             return None, TerminateReason.ABORTED
@@ -783,14 +759,11 @@ class AgentLoopBase(ABC):
             psrl_logger.debug("Failed to attach loop timing.", exc_info=True)
 
     async def _resolve_version_for_dump(self, output: "TokenOutput | list[TokenOutput]", prompt: dict) -> None:
-        """Resolve the real served model version for trajectory bucketing.
+        """
+        Resolve the served model version for trajectory bucketing.
 
-        Dispatch tags train requests with ``version_tag == -1``; the real version
-        is only resolved server-side and stored in the PS, so the prompt's
-        ``version_tag`` would otherwise land trajectories in ``v-1/``. Look up the
-        instance's current version via the PS manager and stash it under
-        ``extra_fields['resolved_version']``. Never raises: falls back to the
-        current PS version, then to 0.
+        A dispatched `version_tag` of `-1` requires a manager lookup. Failures
+        fall back to the current parameter server version and then zero.
         """
         prompt_version = prompt.get("version_tag", 0)
         if prompt_version not in (None, -1):
@@ -809,7 +782,7 @@ class AgentLoopBase(ABC):
                     resolved = await self.ps_manager_handle.get_ps_model_version.remote(debug_info="trajectory_dump")
             except Exception:
                 psrl_logger.debug(
-                    "Failed to resolve served version for uid=%s; falling back to 0.",
+                    "Failed to resolve served version for uid=%s. Falling back to 0.",
                     prompt.get("uid", "N/A"),
                     exc_info=True,
                 )
@@ -834,7 +807,7 @@ class AgentLoopBase(ABC):
         if turns is None:
             turns = out.num_turns if out.num_turns is not None else 0
 
-        # Prefer the loop's wall-clock timing; mini-swe carries finer timing under
+        # Prefer the loop's wall-clock timing. Mini-SWE carries finer timing under
         # agent_reward_info['timing'] (assistant/env/prep/grading) measured in the runner.
         loop_timing = (out.extra_fields or {}).get("loop_timing", {})
         runner_timing = info.get("timing", {}) or {}
@@ -916,11 +889,11 @@ class AgentLoopBase(ABC):
         response_ids: list[int],
         response_mask: list[int],
     ) -> list[tuple[str, str]]:
-        """Split ``response_ids`` into ordered (role, text) runs by ``response_mask``.
+        """
+        Split `response_ids` into ordered role and text runs by `response_mask`.
 
-        Contiguous tokens with mask==1 are assistant-generated; mask==0 are
-        observation/tool tokens. Each run is decoded separately so turn
-        boundaries are preserved in the dumped text.
+        A mask of `1` marks assistant tokens, while `0` marks observation or tool
+        tokens. Each contiguous run is decoded separately.
 
         Args:
             response_ids (list[int]): Response token ids.

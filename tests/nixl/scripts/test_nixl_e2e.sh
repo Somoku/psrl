@@ -10,11 +10,10 @@ cd ${PSRL_PATH}/tests/nixl
 # Default is the original Qwen2.5-3B HSDP smoke case.
 CASE=${CASE:-0}
 
-# NOTE(lhy): HSDP/FSDP precision is not aligned with megatron, because we
-# use FSDP1 in the unit test. The all-ones init / pull-equality verification
-# does not depend on training-side precision, so this is fine.
+# NOTE(lhy): This unit test uses FSDP1, so HSDP/FSDP precision differs from Megatron.
+# The all-ones initialization and pull-equality verification are precision-independent.
 
-# CASE 0 — Qwen2.5-3B-Instruct, HSDP train (1×8) + vLLM gen (TP=2 PP=2), 16 GPU
+# CASE 0: Qwen2.5-3B-Instruct, HSDP train (1×8) and vLLM gen (TP=2 PP=2), 16 GPUs.
 if [ $CASE -eq 0 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \
@@ -28,7 +27,7 @@ if [ $CASE -eq 0 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 1 — Qwen2.5-32B, Megatron train (TP=4 PP=2) + vLLM gen (TP=4), 16 GPU
+# CASE 1: Qwen2.5-32B, Megatron train (TP=4 PP=2) and vLLM gen (TP=4), 16 GPUs.
 if [ $CASE -eq 1 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \
@@ -44,7 +43,7 @@ if [ $CASE -eq 1 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 2 — Qwen2.5-3B-Instruct, HSDP train (4×8) + vLLM gen (TP=2), 64 GPU
+# CASE 2: Qwen2.5-3B-Instruct, HSDP train (4×8) and vLLM gen (TP=2), 64 GPUs.
 if [ $CASE -eq 2 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=32 \
@@ -58,7 +57,7 @@ if [ $CASE -eq 2 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 3 — Qwen2.5-32B, Megatron train (TP=8 PP=2) + vLLM gen (TP=4), 64 GPU
+# CASE 3: Qwen2.5-32B, Megatron train (TP=8 PP=2) and vLLM gen (TP=4), 64 GPUs.
 if [ $CASE -eq 3 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         nixl.max_pinned_temp_memory_slots=4 \
@@ -75,9 +74,8 @@ if [ $CASE -eq 3 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 4 — Qwen3-1.7B (dense), HSDP train (2×4) + vLLM gen (TP=2 DP=4), 8 GPU.
-# Targets the Qwen3 build_weight_layout(): qkv_proj split + gate_up_proj split,
-# no MoE / no GDN.
+# CASE 4: Qwen3-1.7B dense, HSDP train (2×4) and vLLM gen (TP=2 DP=4), 8 GPUs.
+# Exercises dense Qwen3 projection splits without MoE or GDN.
 if [ $CASE -eq 4 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \
@@ -94,10 +92,8 @@ if [ $CASE -eq 4 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 5 — Qwen3-30B-A3B-Instruct-2507 (Qwen3-MoE, 128 routed experts).
-# Megatron train: TP=2 PP=1 DP=4 EP=4 (8 GPU); vLLM gen: TP=4 EP=4. Targets
-# the fused_moe transform inside qwen3_moe.build_weight_layout() alongside
-# qkv_proj / gate_up_proj splits, with EP > 1 on both sides.
+# CASE 5: Qwen3-30B-A3B-Instruct-2507 with 128 routed experts on 8 GPUs.
+# Exercises Qwen3-MoE projection splits with expert parallelism on both sides.
 if [ $CASE -eq 5 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \
@@ -117,10 +113,8 @@ if [ $CASE -eq 5 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 6 — Qwen3.5-4B (multimodal Qwen3.5 dense, hybrid full + linear attn).
-# Megatron train: TP=2 PP=2 DP=2 (8 GPU); vLLM gen: TP=2 DP=4. Targets the
-# qwen3_5 build_weight_layout(): qkv_proj + gate_up_proj + in_proj_qkvz /
-# in_proj_ba on the GDN layers.
+# CASE 6: Qwen3.5-4B dense, Megatron train (TP=2 PP=2 DP=2) and vLLM gen (TP=2 DP=4), 8 GPUs.
+# Exercises full and linear attention projection layouts on GDN layers.
 if [ $CASE -eq 6 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \
@@ -141,9 +135,8 @@ if [ $CASE -eq 6 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 7 — Qwen3.5-35B-A3B (multimodal Qwen3.5-MoE, 256 experts).
-# Megatron train: TP=4 PP=1 DP=2 EP=2 (8 GPU); vLLM gen: TP=8 EP=8. Targets
-# fused_moe + qkv_proj + GDN with EP active.
+# CASE 7: Qwen3.5-35B-A3B with 256 experts on 8 GPUs.
+# Exercises fused MoE, QKV, and GDN layouts with expert parallelism.
 if [ $CASE -eq 7 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \
@@ -165,11 +158,8 @@ if [ $CASE -eq 7 ]; then
         2>&1 | tee test_nixl_e2e.log
 fi
 
-# CASE 8 — Moonlight-16B-A3B (DeepseekV3 architecture via auto_map).
-# Megatron train: TP=2 PP=1 DP=4 EP=4 (8 GPU); vLLM gen: TP=4 DP=2 EP=4. Targets
-# deepseek_v2 build_weight_layout: MLA (q + kv_a + kv_b) + fused_moe with
-# shared experts, EP > 1 on both sides. trust_remote_code routes the auto_map
-# back to AutoModelForCausalLM.
+# CASE 8: Moonlight-16B-A3B, Megatron train (TP=2 PP=1 DP=4 EP=4) and vLLM gen (TP=4 DP=2 EP=4).
+# Exercises DeepSeek MLA and fused MoE layouts with shared experts.
 if [ $CASE -eq 8 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \

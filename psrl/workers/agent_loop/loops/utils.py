@@ -37,10 +37,7 @@ class TerminateReason(Enum):
     FINISHED = "finished"
     MAX_RESPONSE_LENGTH_EXCEEDED = "max_response_length_exceeded"
     MAX_TURNS_EXCEEDED = "max_turns_exceeded"
-    # The agent ran out of wall-clock budget, enforced from outside the container, but
-    # the turns it produced are usable. Distinct from `MAX_TURNS_EXCEEDED`, which means
-    # it ran out of *turns*: reporting a clock timeout as a turn cap makes truncation
-    # look like a configured limit in metrics.
+    # Wall-clock exhaustion is distinct from the configured turn cap in metrics.
     AGENT_TIMEOUT = "agent_timeout"
     # The agent finished normally but grading failed or timed out, so the trajectory is
     # complete and trainable while carrying no verifier reward.

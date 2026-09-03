@@ -11,11 +11,12 @@ class ToolParser(ABC):
 
     @property
     def stop_token_ids(self) -> list[int]:
-        """Token IDs that should stop generation so the parser can run.
+        """
+        Return token IDs that should stop generation before parsing.
 
         Models like Qwen3 naturally emit EOS after a tool call, so no extra stop
         tokens are needed. Models like Gemma4 emit <tool_call|> but continue
-        generating without EOS — they need the closing token as an explicit stop.
+        generating without EOS and need the closing token as an explicit stop.
 
         Returns empty list by default (rely on model's EOS behavior).
         """

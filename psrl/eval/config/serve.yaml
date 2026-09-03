@@ -7,9 +7,7 @@ defaults:
 # be on shared storage for topology=multinode, since every host writes into it.
 output_dir: ???
 
-# Sourced by each replica before exec'ing vLLM. It activates conda and sets the
-# NCCL / UCX / cudnn library paths vLLM needs, so an empty value only works if
-# the launching shell already has all of that.
+# Each replica sources this script for its runtime and required library paths.
 env_script: /apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh
 
 # Print what would launch, then exit without starting anything.
@@ -20,9 +18,7 @@ dry_run: false
 wait_forever: false
 
 hydra:
-  # Pin the run directory. By default Hydra creates outputs/<date>/<time>/ in the
-  # launch directory, which scatters artifacts away from the eval that produced
-  # them.
+  # Keep Hydra artifacts with the evaluation output.
   run:
     dir: ${output_dir}
   output_subdir: .hydra

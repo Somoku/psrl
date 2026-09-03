@@ -1,12 +1,6 @@
 #!/bin/bash
 # Build the AIRS-Bench agent sandbox image.
-#
-# Docker Hub is unreachable from this cluster, so the base image is pulled through
-# a working mirror. Verified reachable: mirror.ccs.tencentyun.com.
-#
-# The Miniconda installer and the mlgym_generic conda env tarball are pre-created
-# on the host because the docker build network blocks conda .conda package downloads
-# through the proxy. build_image.sh regenerates both artefacts if absent.
+# The build uses a reachable Docker mirror and host-created Conda artifacts.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

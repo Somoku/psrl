@@ -13,9 +13,8 @@ time_split:
   # Logging interval in seconds.
   interval_in_s: 60.0
 
-# Per-step prefill composition, written to Prefill_I{replica_idx}.log under
-# psrl.logging_path. Emits one entry for EVERY engine step that runs a prefill
-# kernel, with no sampling. High volume on long runs.
+# Per-step prefill composition is high volume because every prefill kernel is logged.
+# Output is written under `psrl.logging_path`.
 prefill_composition:
   # Whether to enable per-step prefill composition logging.
   enable: False

@@ -7,9 +7,7 @@ from fastapi.responses import Response as FastAPIResponse
 from httpx import ASGITransport
 from psrl.workers.gen.session_router import SessionRouter
 
-# ---------------------------------------------------------------------------
 # Mock SMG server
-# ---------------------------------------------------------------------------
 mock_smg = FastAPI()
 captured: dict = {}
 
@@ -56,9 +54,7 @@ async def mock_catchall(path: str, request: Request):
     return {"proxied": True}
 
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 @pytest.fixture(autouse=True)
 def _clear_captured():
     captured.clear()
@@ -91,9 +87,7 @@ def auto_client(auto_router):
     return httpx.AsyncClient(transport=ASGITransport(app=auto_router.app), base_url="http://testserver")
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_create_session(client, router):
     resp = await client.post(
@@ -238,7 +232,7 @@ async def test_chat_completions_pins_worker_for_session(client):
 @pytest.mark.asyncio
 async def test_chat_completions_pins_version_tag_for_session(client):
     payload = {"model": "m", "messages": []}
-    # First turn arrives unversioned; SMG echoes the pinned version in the
+    # The first turn arrives unversioned. SMG echoes the pinned version in the
     # response headers, which the SessionRouter records on the session.
     await client.post(
         "/sessions/sid-ver/v1/chat/completions",

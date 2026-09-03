@@ -41,30 +41,14 @@ rollout_N=8
 max_prompt_length=2048
 max_response_length=30720
 max_model_len=32768
-# Token-packing budget for the training/log-prob forward passes. `rearrange_micro_batches`
-# asserts `max_token_len >= max_seq_len`, where max_seq_len is the FULL packed sequence
-# (prompt + response) -- so this must cover both, not just the response. Same formula as
-# examples/mini_swe/fsdp_qwen_7b_swe_smith.sh:131.
+# The packing budget must cover the full prompt and response sequence.
 max_tokens_per_gpu=$(( max_prompt_length + max_response_length ))
 max_num_batched_tokens=32768
 max_turns=32
 
 # --- Chain-of-thought handling across turns ---
-# One of multi_traj / longest_traj / multi_thinking / disable_thinking. See
-# psrl/trainer/config/psrl/agentic_rl.yaml for what each one does and
-# examples/sciaccel_rl/knowledge.md for the measurements behind them.
-#
-# multi_thinking: the reasoning parser is turned off so the whole generation stays inline
-# in `content`, and the accumulating template below replays every prior turn's <think>
-# block. The history TITO stored and the history terminus-2 replays are then
-# byte-identical, so the episode stays ONE trajectory whose prompt carries several CoT
-# segments, which is what token-level on-policy training needs.
-#
-# This is the Qwen3 model, so it takes the Qwen3 template. The two are NOT
-# interchangeable: Qwen3 emits a matched '<think>...</think>' pair, so its template
-# replays `content` verbatim, while Qwen3.5 prefills '<think>\n' into the generation
-# prompt and emits only a closing '</think>', so its template has to re-emit the prefill.
-# Using qwen35_acc_thinking.jinja2 here would inject a spurious second '<think>'.
+
+# Qwen3's matched tags require its accumulated-thinking template.
 thinking_template=multi_thinking
 chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen3_acc_thinking.jinja2
 

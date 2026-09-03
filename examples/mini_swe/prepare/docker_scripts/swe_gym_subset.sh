@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 # Prefetch Docker images for the SWE-Gym Subset (100 instances, 2 repos).
-# Much faster than the full 2438 — only ~100 unique images to pull.
-#
-# Run from this directory (examples/mini_swe/prepare/docker_scripts/):
-#   bash swe_gym_subset.sh
+# The subset requires about 100 unique images.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

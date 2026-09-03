@@ -116,7 +116,7 @@ def main() -> None:
         ]
         out_path = args.out_dir / f"{name}.parquet"
         pd.DataFrame(rows).to_parquet(out_path)
-        psrl_logger.info(f"Wrote {len(rows)} row(s) to {out_path}.")
+        psrl_logger.info(f"Wrote rows to {out_path!s}. Count: {len(rows)}.")
 
 
 if __name__ == "__main__":

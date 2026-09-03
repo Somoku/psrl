@@ -1,22 +1,6 @@
 #!/usr/bin/env bash
-# start_distributed_training.sh — preflight the cluster, then launch the 3-node run.
-#
-# Everything expensive is already done as of 2026-08-31: all three nodes are Docker
-# provisioned, image-warmed, and nop-anchor verified. This script only checks that the
-# cluster is actually free, starts Ray, and launches training. It refuses rather than
-# proceeds when a check fails, because every failure mode below produces a hang or a
-# silently wrong run rather than a clean error.
-#
-# Usage:
-#   bash examples/sciaccel_rl/prepare/start_distributed_training.sh
-#   bash examples/sciaccel_rl/prepare/start_distributed_training.sh --check-only
-#
-# Options:
-#   --hosts FILE     Hostfile; FIRST line becomes the Ray head. Default: hosts/24GPUs.
-#   --check-only     Run the preflight checks and stop.
-#   --force          Skip the free-GPU check. Only if you know the residents are yours.
-#   -h | --help      Print this help.
-
+# Preflight the three-node cluster before distributed training.
+# Usage: `start_distributed_training.sh [options]`
 set -euo pipefail
 
 PSRL_PATH=${PSRL_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
@@ -47,9 +31,7 @@ mapfile -t HOSTS < <(grep -Ev '^[[:space:]]*(#|$)' "${HOSTS_FILE}")
 echo "=== preflight: ${#HOSTS[@]} hosts from ${HOSTS_FILE} ==="
 FAIL=0
 
-# 1. GPUs must be free. The script declares train_pool = [8] * 2 and four TP=2 rollout
-#    pools, committing all 24. If a node's GPUs are taken, Ray cannot place the bundles
-#    and waits forever instead of erroring -- so this is checked first and hard.
+# All GPUs must be free because placement commits all 24 devices.
 echo "-- free GPUs"
 for host in "${HOSTS[@]}"; do
     used="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${host}" \
@@ -64,9 +46,7 @@ for host in "${HOSTS[@]}"; do
     fi
 done
 
-# 2. No foreign Ray. ray_start.sh force-stops Ray on every host in the file, which would
-#    kill another user's cluster without asking. This happened here: a 2d12h old
-#    lgm-slime cluster was found on one node.
+# Refuse to stop Ray processes that may belong to another cluster.
 echo "-- no foreign Ray processes"
 for host in "${HOSTS[@]}"; do
     n="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${host}" \
@@ -81,11 +61,7 @@ for host in "${HOSTS[@]}"; do
     fi
 done
 
-# 3. Image cache warm. Probed directly on the node rather than inferred from local
-#    result files: a pass launched on the head node writes a directory with no IP in its
-#    name, so filename matching reported an already-warm node as cold. Judged by build
-#    time, never by cache directory size -- buildkit's GC shrank that dir from 18 GB to
-#    3.1 GB here while builds stayed at 16 s.
+# Probe image availability directly on each node.
 echo "-- image cache (base images present = the expensive layers are local)"
 for host in "${HOSTS[@]}"; do
     n="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${host}" \
@@ -117,8 +93,7 @@ echo "=== starting Ray (head = ${HOSTS[0]}) ==="
 cd "${PSRL_PATH}"
 bash examples/ray/ray_start.sh "${HOSTS_FILE}"
 
-# Ray reports resources asynchronously; a node that has joined but not yet registered
-# its GPUs makes the trainer see fewer than 24 and mis-place bundles.
+# Wait for asynchronous GPU registration before trainer placement.
 echo
 echo "=== waiting for 24 GPUs to register ==="
 for _ in $(seq 1 30); do

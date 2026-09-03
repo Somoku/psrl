@@ -1,7 +1,5 @@
 """Tests for the sciaccel_rl reward function."""
 
-import pytest
-
 
 class TestComputeScore:
     """Test compute_score extracts verifier reward correctly."""

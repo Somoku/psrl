@@ -50,8 +50,8 @@ class TokenOutput:
     """logprobs of response token ids"""
     routed_experts: Any | None = None
     """routed experts of response token ids"""
-    # NOTE(linsh): pooling_output carries the embedding/classification tensor returned by
-    # vLLM pooling models (e.g., reward models). It is None for generative models.
+    # NOTE(linsh): Pooling models return embedding or classification tensors in
+    # `pooling_output`, which remains `None` for generative models.
     pooling_output: Any | None = None
     """pooling output tensor for pooling/reward models (torch.Tensor or None)"""
     multi_modal_data: dict | None = None
@@ -105,10 +105,8 @@ class TokenOutput:
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
 
-        # These three describe the same token positions and every downstream stage assumes so:
-        # old_log_probs is cut to the response_mask length while the training forward is padded
-        # to the responses length, so a drift here only surfaces much later as a shape error
-        # inside the PPO loss, naming neither field. Fail at the source instead.
+        # Response tensors and masks must describe identical token positions or
+        # downstream PPO shapes diverge.
         if output["responses"].size(0) != output["response_mask"].size(0):
             raise AssertionError(
                 f"TokenOutput.as_dict: responses has {output['responses'].size(0)} tokens but "

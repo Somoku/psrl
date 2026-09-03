@@ -22,9 +22,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-# ---------------------------------------------------------------------------
-# Nested structured dataclasses
-# ---------------------------------------------------------------------------
+# --- Structured configuration ---
 
 
 @dataclass
@@ -56,11 +54,8 @@ class MiniEnvironmentConfig:
         ]
     )
     container_timeout: str = "2h"
-    # Memory limit for the fresh grading container (separate from the rollout
-    # container above).  Heavy repos (scikit-learn, xarray, matplotlib) run
-    # `pip install -e .` inside the grading container, which can temporarily
-    # require 15–25 GB.  Set higher than the rollout container to avoid
-    # cgroup OOM kills during grading.
+    # Installing heavy repositories can briefly exceed rollout memory during grading.
+    # A separate 30 GB limit prevents cgroup OOM failures.
     grader_memory: str = "30g"
 
 
@@ -89,9 +84,8 @@ class MiniAgentConfig:
     `AgentConfig` (no defaults in upstream). `problem_template` maps to
     mini-swe-agent's `instance_template` kwarg.
 
-    Both templates should be provided via simple_agent_config.yaml; the
-    empty-string defaults here are intentional -- `build_runtime_config` will
-    raise if they remain unset after YAML merge.
+    Both templates must come from `simple_agent_config.yaml`. Empty defaults make
+    `build_runtime_config` reject incomplete merged configurations.
     """
 
     cost_limit: float = 0.0
@@ -111,10 +105,10 @@ class MiniModelConfig:
     Fields:
         model_class: mini-swe-agent model implementation name or import path.
         action_regex: Regex applied to the model's text output to extract the
-            shell command.  Change this to switch action formats, e.g.
+            shell command. Change this to switch action formats, e.g.
             ``"```bash\\\\s*\\\\n(.*?)\\\\n```"`` for a plain bash block.
         observation_template: Jinja2 template that formats Docker command output
-            into the next user message.  Training and eval must use the same
+            into the next user message. Training and eval must use the same
             template or the model sees unfamiliar observation formatting.
         format_error_template: Message sent back to the model when
             ``action_regex`` finds 0 or >1 matches.
@@ -142,9 +136,7 @@ class MiniSWEAgentRuntimeConfig:
     model: MiniModelConfig = field(default_factory=MiniModelConfig)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---
 
 
 def _ensure_dict(val: Any) -> dict:
@@ -164,9 +156,7 @@ def _ensure_dict(val: Any) -> dict:
     return {}
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+# --- Factory ---
 
 
 def build_runtime_config(yaml_kwargs: dict[str, Any]) -> MiniSWEAgentRuntimeConfig:
@@ -192,9 +182,7 @@ def build_runtime_config(yaml_kwargs: dict[str, Any]) -> MiniSWEAgentRuntimeConf
     return cfg
 
 
-# ---------------------------------------------------------------------------
-# Per-SWE-problem overrides
-# ---------------------------------------------------------------------------
+# --- Per-problem overrides ---
 
 _SANDBOX_FIELDS = frozenset(MiniSandboxConfig.__dataclass_fields__)
 _AGENT_OVERRIDE_FIELDS = frozenset(("cost_limit", "system_template", "problem_template"))

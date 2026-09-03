@@ -22,7 +22,7 @@ def test_max_steps_maps_to_max_turns():
 def test_error_statuses_map_to_rollout_error():
     for status in ("exit_error", "exit_api", "exit_format"):
         assert classify_exit_status(status) is TerminateReason.ROLLOUT_ERROR, (
-            f"Status {status!r} must be treated as an infrastructure error."
+            f"Unexpected classification for status={status!r}. Expected an infrastructure error."
         )
 
 

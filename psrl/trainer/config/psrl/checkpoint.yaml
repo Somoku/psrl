@@ -1,7 +1,3 @@
-# Use DCP (verl's default dist_checkpointing) for save/load.
-# When False (default), uses PSRL's UCX-safe per-rank torch.save to avoid
-# NIXL background thread (enable_prog_thread) corruption during save.
-# When True: DCP is used with NCCL no-fork patch (applied automatically);
-# NIXL prog_thread is automatically disabled (enable_prog_thread=False)
-# to prevent UCX heap corruption from DCP's all_gather_object metadata gather.
+# False uses UCX-safe per-rank saves.
+# DCP disables NIXL progress threads and applies the NCCL no-fork patch.
 use_dcp_save: True

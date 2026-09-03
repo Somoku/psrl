@@ -1,14 +1,5 @@
-# Agent config for SWE-agent-LM-7B continued RL training.
-#
-# Faithfully reproduces the xml_function_calling format that SWE-agent-LM-7B
-# was fine-tuned with (source: third_party/SWE-smith/agent/swesmith_infer.yaml).
-#
-# The model has 3 tools: bash, str_replace_editor, submit.
-# All tool calls are parsed by psrl.tools.tool_parser.xml_fc_tool_parser and
-# translated into bash commands for execution in the Docker container.
-#
-# Key design: we do NOT restrict the model to bash-only. The str_replace_editor
-# tool calls are translated transparently into equivalent bash/python commands.
+# Configure continued RL with XML function calls.
+# Tool calls are translated into shell commands for the sandbox.
 - name: mini_swe_agent
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop_v1.MiniSWEAgentLoopV1
   sandbox_config:
@@ -20,7 +11,7 @@
       container_timeout: "45m"
       grader_memory: "30g"
   agent:
-    # System template: verbatim copy from swesmith_infer.yaml (the SFT training config).
+    # XML function calling system template.
     system_template: |
       You are a helpful assistant that can interact with a computer to solve tasks.
       <IMPORTANT>

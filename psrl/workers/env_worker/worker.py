@@ -1,10 +1,4 @@
-"""
-Sandbox-owning Ray actor.
-
-One `EnvWorker` runs on each placement unit and owns the containers scheduled to
-it, including each container's long-lived shell. The worker is the only component
-that shells out to Docker.
-"""
+"""Own sandbox containers and their persistent shells."""
 
 from __future__ import annotations
 
@@ -88,9 +82,7 @@ class ContainerShell:
                 break
             stale += chunk.decode(errors="replace")
         if stale.strip():
-            psrl_logger.warning(
-                f"Discarded {len(stale)} stale character(s) from a previously abandoned sandbox command."
-            )
+            psrl_logger.warning(f"Discarded stale sandbox output. Characters={len(stale)}.")
         return stale
 
     async def read_until(self, deadline: float, no_output_timeout_s: float) -> str:
@@ -162,7 +154,7 @@ class EnvWorker:
         self.max_observation_chars = max_observation_chars
         self.idle_sandbox_timeout_s = idle_sandbox_timeout_s
 
-        # NOTE(claude): Ray sets CUDA_VISIBLE_DEVICES to exactly the GPUs it granted
+        # NOTE(claude): Ray sets `CUDA_VISIBLE_DEVICES` to exactly the GPUs it granted
         # this actor. Deriving sandbox devices from it makes it impossible for a
         # sandbox to touch a training GPU.
         visible = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
@@ -233,7 +225,7 @@ class EnvWorker:
             idle_timeout_s=spec.idle_timeout_s,
         )
         argv = build_docker_run_argv(labelled_spec, container_name, gpu_indices)
-        psrl_logger.info(f"Starting sandbox {sandbox_id!r} with image {spec.image!r}.")
+        psrl_logger.info(f"Starting sandbox={sandbox_id!r} with image={spec.image!r}.")
 
         try:
             process = subprocess.Popen(
@@ -272,8 +264,7 @@ class EnvWorker:
         """
         Run one command in a sandbox's persistent shell.
 
-        A timeout is reported rather than raised, and the sandbox stays alive, which
-        matches MLGym's own behavior for long-running training commands.
+        Timeouts set `ExecResult.timed_out` while the sandbox stays alive for later commands.
 
         Args:
             sandbox_id (str): Sandbox to run in.
@@ -308,7 +299,7 @@ class EnvWorker:
         self._last_used_at[sandbox_id] = time.monotonic()
 
         if parsed is None:
-            psrl_logger.warning(f"Sandbox {sandbox_id!r} command timed out after {duration_s:.1f}s.")
+            psrl_logger.warning(f"Sandbox command timed out. Sandbox={sandbox_id!r}, duration={duration_s:.1f}s.")
             return ExecResult(
                 stdout=truncate_observation(buffer, self.max_observation_chars),
                 exit_code=None,

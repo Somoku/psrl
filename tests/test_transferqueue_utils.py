@@ -2,7 +2,6 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-
 from psrl.utils import transferqueue_utils
 from psrl.utils.transferqueue_utils import PayloadState
 

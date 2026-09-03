@@ -1,61 +1,6 @@
 #!/usr/bin/env bash
-# prefetch_images.sh — Pull per-SWE-problem Docker images referenced by a PSRL
-# parquet dataset.
-#
-# Default pull backend is `skopeo` (user-space, honours http(s)_proxy, streams
-# directly into the local docker daemon via docker.sock, so dockerd itself does
-# not need any proxy config).
-#
-# Usage:
-#   source ${PSRL_WORKSPACE}/env/psrl.sh       # sets http_proxy for skopeo
-#   bash examples/mini_swe/prepare/docker_scripts/prefetch_images.sh \
-#       --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet \
-#       --workers 4
-#
-# Options (exactly one of --parquet / --images / --only is required):
-#   --parquet PATH    Read unique images from a PSRL parquet file
-#                     (extra_info.sandbox_overrides.environment.image).
-#   --images FILE     Read images from FILE, one per line (blank lines and
-#                     lines starting with '#' are ignored). Use '-' for stdin.
-#   --only CSV        Comma-separated inline list of images to pull, e.g.
-#                     --only swebench/xxx:latest,swebench/yyy:latest
-#   --workers N       Max concurrent pulls (default: 4).
-#   --method M        Pull backend: skopeo|docker (default: skopeo if available,
-#                     else docker).
-#   --image-dir DIR   If set, save each image as a docker-archive tar under DIR
-#                     (skopeo only). Without --load, images are NOT imported
-#                     into the local dockerd (pure "download" mode).
-#   --load            After pulling to --image-dir, `docker load` each tar into
-#                     the local dockerd. Ignored when --image-dir is unset
-#                     (because then skopeo already writes straight to the
-#                     daemon).
-#   --mirror HOST     Single mirror host, e.g. docker.m.daocloud.io. Short
-#                     docker.io refs get rewritten to pull via the mirror.
-#   --mirrors LIST    Comma-separated list of mirror hosts to try in order.
-#                     If a pull fails on one mirror (e.g. blob 404 from lazy
-#                     mirror cache) the script transparently falls back to the
-#                     next, and finally to docker.io (disable with
-#                     --no-direct-fallback).
-#                     Example: --mirrors docker.1ms.run,dockerpull.org,hub.rat.dev
-#   --no-direct-fallback
-#                     Do not try plain docker.io after all mirrors fail. Useful
-#                     on clusters where docker.io is firewalled.
-#   --retries N       Retry count per (image, mirror) on transient failures
-#                     like "unexpected EOF" / blob 404 (default: 3).
-#   --log-dir DIR     Where to write per-image skopeo/docker logs. Defaults
-#                     to `<prepare>/_prefetch_logs/` (one level up from this
-#                     script's `docker_scripts/` directory).
-#   --force           Re-pull even if the tar / local image already exists.
-#   --dry-run         Print images that would be pulled without actually pulling.
-#
-# Behaviour matrix:
-#   method=skopeo, no --image-dir               : skopeo copy docker://IMG -> docker-daemon:IMG
-#   method=skopeo, --image-dir DIR              : skopeo copy docker://IMG -> docker-archive:DIR/FOO.tar  (no docker load)
-#   method=skopeo, --image-dir DIR, --load      : same as above, then `docker load -i DIR/FOO.tar` + `docker tag`
-#   method=docker                               : `docker pull IMG` (requires dockerd itself to reach the registry)
-#
-# The script deduplicates images, checks what is already cached (as tar or as a
-# local docker image), and pulls the rest in parallel with a concurrency guard.
+# Pull Docker images referenced by a PSRL dataset.
+# Usage: `prefetch_images.sh SOURCE [options]`
 set -euo pipefail
 
 PARQUET=""
@@ -107,12 +52,10 @@ if [[ "$SOURCES" -ne 1 ]]; then
     exit 1
 fi
 
-# Make sure http_proxy is set for skopeo (idempotent; ignore if the file is
-# missing so the script is still usable outside this environment).
+# Load proxy settings when the shared environment exists.
 source "${PSRL_WORKSPACE:-$HOME}/env/psrl.sh" 2>/dev/null || true
 
-# Default to skopeo when available — that is the method that works behind the
-# user-space proxy on this cluster.
+# Prefer `skopeo` because it supports user space proxying.
 if [[ -z "$METHOD" ]]; then
     if command -v skopeo >/dev/null 2>&1; then
         METHOD=skopeo
@@ -126,12 +69,8 @@ case "$METHOD" in
     *) echo "ERROR: --method must be skopeo or docker (got: $METHOD)" >&2; exit 1 ;;
 esac
 
-# Build the list of mirrors to try. Priority:
-#   1. --mirrors LIST  (comma-separated)
-#   2. --mirror HOST   (single)
-#   3. $DOCKERHUB_MIRROR env var
-# An empty string in the list means "pull from docker.io directly" and is
-# always appended at the end as the final fallback.
+# Mirror priority is the explicit list, single override, environment, then Docker Hub.
+# An empty entry selects direct Docker Hub access.
 MIRRORS_ARR=()
 if [[ -n "$MIRRORS_LIST" ]]; then
     IFS=',' read -r -a MIRRORS_ARR <<< "$MIRRORS_LIST"
@@ -239,10 +178,8 @@ else
     IMAGES=$(printf '%s\n' "$ONLY_LIST" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | awk 'NF && !seen[$0]++')
 fi
 
-# Normalize docker.io/ / index.docker.io/ prefixes so they dedupe cleanly with
-# bare refs and produce consistent tar filenames (e.g. the Verified parquet
-# often yields "docker.io/swebench/..." while the smith parquet yields bare
-# "swebench/..."; we want both to map to the same cache key).
+# Normalize Docker Hub prefixes before deduplication.
+# Equivalent references then share one cache key.
 IMAGES=$(printf '%s\n' "$IMAGES" | sed -E 's#^(docker\.io|index\.docker\.io)/##' | awk 'NF && !seen[$0]++')
 
 TOTAL=$(echo "$IMAGES" | grep -c . || true)
@@ -254,14 +191,9 @@ if [[ $DRY_RUN -eq 1 ]]; then
     exit 0
 fi
 
-# -----------------------------------------------------------------------------
-# Helpers used by the parallel workers.
-# -----------------------------------------------------------------------------
+# --- Parallel worker helpers ---
 
-# Rewrite a short Docker Hub reference to use DOCKERHUB_MIRROR as the host.
-# Strip the default-registry prefix. "docker.io/X" and "index.docker.io/X" both
-# just mean "X on Docker Hub"; dropping the prefix lets the mirror rewriter
-# treat them the same as bare refs (e.g. "swebench/foo").
+# Normalize default registry prefixes before mirror rewriting.
 normalize_image_ref() {
     local ref="$1"
     case "$ref" in
@@ -274,9 +206,7 @@ normalize_image_ref() {
 apply_dockerhub_mirror() {
     local ref="$1"
     local m="${DOCKERHUB_MIRROR:-}"
-    # Normalize away docker.io/ / index.docker.io/ BEFORE deciding whether to
-    # rewrite — otherwise a ref like "docker.io/swebench/foo:latest" would
-    # short-circuit past the mirror and end up hitting registry-1.docker.io.
+    # Normalize default registry prefixes before detecting custom registries.
     ref=$(normalize_image_ref "$ref")
     [[ -n "$m" ]] || { printf '%s' "$ref"; return 0; }
     m="${m#/}"; m="${m%/}"
@@ -296,7 +226,6 @@ apply_dockerhub_mirror() {
 }
 
 # Turn an image reference into a safe tar basename.
-#   swebench/sweb.eval.x86_64.foo:latest  ->  swebench__sweb.eval.x86_64.foo__latest.tar
 image_to_tar_name() {
     local img="$1"
     local name="${img//\//__}"
@@ -315,19 +244,10 @@ export SKOPEO_RETRY_FLAG
 
 export -f normalize_image_ref apply_dockerhub_mirror image_to_tar_name
 
-# Run a command with manual retry + proper exit-code handling. Stderr+stdout
-# are tee'd to $2 so we keep a persistent log for debugging. Returns the
-# underlying command's exit code (NOT tail/tee's).
+# Retry a command while appending output and returning the command's status.
 run_with_log() {
-    # usage: run_with_log LOG_FILE CMD...
-    # Appends to LOG_FILE (does NOT truncate) so that logs accumulate across
-    # retries and across mirror fall-backs. Retry count is $RETRIES (default 3).
-    #
-    # Optional env var $RW_PRE_CLEANUP — a path (e.g. a docker-archive tar)
-    # that will be `rm -f`'d before EACH attempt. This is needed for
-    # `skopeo copy docker-archive:<path>` because skopeo refuses to overwrite
-    # an existing archive ("docker-archive doesn't support modifying existing
-    # images"), so a failed partial write would poison every retry.
+    # Append all retries to `LOG_FILE`.
+    # Remove `RW_PRE_CLEANUP` before attempts so partial archives cannot poison retries.
     local log="$1"; shift
     local attempt rc
     local n="${RETRIES:-3}"
@@ -351,17 +271,11 @@ run_with_log() {
 }
 export -f run_with_log
 
-# Verify a docker-archive tar is structurally complete.
-#   - non-empty
-#   - valid tar stream (catches truncated / EOF / partial writes)
-#   - contains a "manifest.json" entry (docker-archive marker)
-# Returns 0 if valid, non-zero if missing/broken.
+# Require a nonempty Docker archive containing `manifest.json`.
 verify_docker_archive() {
     local tar="$1"
     [[ -s "$tar" ]] || return 1
-    # `tar -tf` streams through the archive and fails on truncated data
-    # ("Unexpected EOF in archive"). Grep short-circuits, but `tar -tf` keeps
-    # reading and can set SIGPIPE rc; we look at PIPESTATUS[0] (tar's rc).
+    # Read the full archive so truncation errors propagate from `tar`.
     local names
     names=$(tar -tf "$tar" 2>/dev/null) || return 1
     # Must contain the docker-archive manifest.
@@ -370,9 +284,7 @@ verify_docker_archive() {
 }
 export -f verify_docker_archive
 
-# Truncate a log file and write a header. Use this at the start of each fresh
-# pull_image invocation so that stale content from previous runs never leaks
-# into the current log (run_with_log only appends).
+# Reset the log before each `pull_image` invocation.
 init_log() {
     # usage: init_log LOG_FILE [HEADER_LINE...]
     local log="$1"; shift
@@ -410,16 +322,14 @@ pull_image() {
         tar_path="$IMAGE_DIR/$tar_name"
     fi
 
-    # Integrity-aware cached short-circuit (skopeo + --image-dir only):
-    #   - tar missing or empty            -> pull
-    #   - tar present but corrupt/EOF'd   -> delete + pull (verify via tar -tf)
-    #   - tar present and complete        -> skip, overwrite log with "already have"
+    # Reuse only structurally valid archives.
+    # Invalid archives are removed and pulled again.
     if [[ "$METHOD" == "skopeo" && -n "$tar_path" && -e "$tar_path" && "$FORCE" -ne 1 ]]; then
         if verify_docker_archive "$tar_path"; then
             echo "  [cached-tar] $img  ($tar_path)"
             init_log "$log_path" \
                 "========================================================" \
-                "  已经拥有了 $img" \
+                "Already cached $img." \
                 "  tar      : $tar_path ($(du -h "$tar_path" | cut -f1))" \
                 "  verified : tar -tf passed, manifest.json present" \
                 "  checked  : $(date -Iseconds)" \
@@ -437,15 +347,14 @@ pull_image() {
                     "  started @ $(date -Iseconds)" \
                     "========================================================"
                 if ! run_with_log "$log_path.load" docker load -i "$tar_path"; then
-                    echo "  [FAILED]  $img (docker load; log: $log_path.load)" >&2
+                    echo "[FAILED]: Docker load failed for $img. Log: $log_path.load." >&2
                     return 1
                 fi
                 echo "  [loaded]  $img"
             fi
             return 0
         else
-            echo "  [corrupt] $img  ($tar_path) — deleting and re-pulling" >&2
-            # Keep a note in the log before we overwrite it in the next step.
+            echo "[corrupt] $img ($tar_path). Deleting and pulling again." >&2
             local sz
             sz=$(du -h "$tar_path" 2>/dev/null | cut -f1)
             rm -f "$tar_path"
@@ -474,14 +383,10 @@ pull_image() {
     local mi=0 total_mirrors=${#mirrors[@]}
     echo "(attempting $total_mirrors mirror(s))" >> "$log_path"
 
-    # Safety trap: if the pull phase is interrupted (Ctrl-C, SIGTERM, or any
-    # uncaught error in this function), make sure we do NOT leave a partial
-    # tar on disk. The trap is cleared once we either (a) complete successfully
-    # so the tar is known-good, or (b) reach an explicit rm below.
+    # Remove partial archives if the worker is interrupted.
+    # Clear the trap after a successful or explicit cleanup.
     if [[ "$METHOD" == "skopeo" && -n "$tar_path" ]]; then
-        # On Ctrl-C / SIGTERM: wipe any partial tar, then actually exit the
-        # worker. Without the explicit `exit`, bash would just resume the next
-        # retry/mirror iteration, defeating the kill.
+        # Exit after cleaning an archive interrupted by a signal.
         # shellcheck disable=SC2064
         trap "rm -f '$tar_path'; echo '[interrupted] $img (tar cleaned)' >&2; exit 130" INT TERM
     fi
@@ -500,9 +405,7 @@ pull_image() {
             skopeo)
                 if [[ -n "$tar_path" ]]; then
                     echo "  [pulling] $img  $tag  ->  $tar_path"
-                    # RW_PRE_CLEANUP deletes any partial tar BEFORE each retry,
-                    # so skopeo won't bail out with
-                    # "docker-archive doesn't support modifying existing images".
+                    # Remove partial archives before each retry.
                     if RW_PRE_CLEANUP="$tar_path" run_with_log "$log_path" \
                             skopeo copy $SKOPEO_RETRY_FLAG \
                             "docker://$src" "docker-archive:$tar_path:$img"; then
@@ -533,22 +436,19 @@ pull_image() {
         echo "  [miss]    $img  via ${m:-docker.io}"
     done
 
-    # If we get here in skopeo+tar mode, the tar was (or wasn't) produced by the
-    # last successful iteration — check, verify integrity, then optionally load.
+    # Validate the archive before optional loading.
     if [[ "$METHOD" == "skopeo" && -n "$tar_path" ]]; then
         if [[ ! -s "$tar_path" ]] || ! verify_docker_archive "$tar_path"; then
-            # Defensive: if any mirror thought it succeeded but the tar is
-            # actually incomplete/corrupt, scrub it so future runs re-pull
-            # instead of treating it as cached.
+            # Remove incomplete archives so later runs cannot treat them as cached.
             if [[ -e "$tar_path" ]]; then
                 echo "  (scrubbing incomplete/corrupt tar $tar_path)" >> "$log_path"
                 rm -f "$tar_path"
             fi
             trap - INT TERM
-            echo "  [FAILED]  $img (all mirrors failed; log: $log_path)" >&2
+            echo "[FAILED]: All mirrors failed for $img. Log: $log_path." >&2
             return 1
         fi
-        # Pull succeeded & tar verified — no more need for the cleanup trap.
+        # The verified archive no longer needs a cleanup trap.
         trap - INT TERM
 
         if [[ "$DO_LOAD" -eq 1 ]]; then
@@ -561,7 +461,7 @@ pull_image() {
             if ! run_with_log "$log_path.load" docker load -i "$tar_path"; then
                 # docker load failed but the tar is known-good (verified
                 # above), so KEEP the tar for manual retry / inspection.
-                echo "  [FAILED]  $img (docker load; tar kept at $tar_path; log: $log_path.load)" >&2
+                echo "[FAILED]: Docker load failed for $img. Archive: $tar_path. Log: $log_path.load." >&2
                 return 1
             fi
             docker image inspect "$img" >/dev/null 2>&1 || \
@@ -571,14 +471,12 @@ pull_image() {
         return 0
     fi
 
-    echo "  [FAILED]  $img (all ${total_mirrors} mirrors failed; log: $log_path)" >&2
+    echo "[FAILED]: All ${total_mirrors} mirrors failed for $img. Log: $log_path." >&2
     return 1
 }
 export -f pull_image
 
-# -----------------------------------------------------------------------------
-# Dedup / cache check.
-# -----------------------------------------------------------------------------
+# --- Cache check ---
 
 is_cached() {
     local img="$1"
@@ -602,10 +500,7 @@ is_cached() {
     fi
 }
 
-# Pre-scan purely for the human-readable summary banner. Every image — cached
-# OR to-pull — is then dispatched through pull_image so each one gets a log
-# file (the cache short-circuit in pull_image writes a "已经拥有了" log and
-# exits quickly; no re-pull is done).
+# Dispatch every image through `pull_image` so cached items also receive logs.
 TO_PULL=()
 CACHED_IMAGES=()
 ALL_IMAGES=()

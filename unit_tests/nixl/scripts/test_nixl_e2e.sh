@@ -10,7 +10,7 @@ CASE=1
 
 # NOTE(lhy): HSDP/FSDP precision is not aligned, because we use FSDP1 in the unit test.
 
-# HSDP 16 GPUs Case
+# HSDP 16 GPUs Case.
 if [ $CASE -eq 0 ]; then
     PYTHONUNBUFFERED=1 python test_nixl_e2e.py \
         test.num_train=8 \

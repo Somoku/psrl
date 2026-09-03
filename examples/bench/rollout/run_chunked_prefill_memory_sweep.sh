@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
-# E3b memory sweep: one engine process per max_num_batched_tokens value N.
-#
-# Usage:
-#   bash run_chunked_prefill_memory_sweep.sh [TP] [MODEL_PATH] [GPU_UTIL]
-#
-# Positional arguments (all optional):
-#   TP           Tensor parallel size (default: 1)
-#   MODEL_PATH   Path to the HuggingFace model (default: ${PSRL_WORKSPACE}/models/SWE-agent-LM-7B)
-#   GPU_UTIL     gpu_memory_utilization (default: 0.90)
-#
-# For each N in N_VALUES, this script starts a fresh engine, reads the memory
-# breakdown (activation reservation + KV capacity), and exits.  Results are
-# written to individual JSON files under exp/chunked_prefill/e3b/.
-#
-# Because peak_activation is profiled once at engine startup under
-# max_num_batched_tokens and then frozen, a fresh process per N is the ONLY
-# way to observe the true reservation cost for each N value.
+# Probe memory with a fresh engine for each token budget.
+# Fresh processes expose startup activation reservation costs.
 set -euo pipefail
 
 source ${PSRL_WORKSPACE}/env/psrl.sh

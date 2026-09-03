@@ -111,12 +111,7 @@ def test_routed_experts_none_when_absent():
 
 
 def test_routed_experts_cross_turn_assembly():
-    """Per-turn RE blobs are placed at their absolute positions and tiled gap-free.
-
-    Two turns; assembled length = 3 prompt + 6 response = 9 tokens, but the final
-    sampled token has no RE, so the tensor has 8 rows.  Cross-turn prompt_start:
-    turn 1 covers [0, 5), turn 2 covers [5, 8) — together filling all 8 rows.
-    """
+    """Place per-turn routed-expert data at absolute positions without gaps."""
     accumulated = [1, 2, 3, 10, 11, 20, 21, 30, 31]
     num_layers, top_k = 2, 3
     t1 = np.arange(5 * num_layers * top_k, dtype=np.uint8).reshape(5, num_layers, top_k)

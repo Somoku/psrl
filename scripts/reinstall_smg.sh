@@ -13,9 +13,7 @@ fi
 
 python -m uv pip uninstall -y smg smg-grpc-proto smg-grpc-servicer psrl-state-grpc-proto
 
-# protobuf 7 runtime: smg-grpc-servicer pulls grpcio-reflection/health >=1.81.1,
-# and current 1.82+/1.83 wheels ship protobuf-7 gencode that needs runtime >=7.35.1.
-# Pre-install a matching grpcio-tools so --no-build-isolation proto builds use it.
+# Match the protobuf 7 runtime before no-build-isolation generates SMG stubs.
 python -m uv pip install --no-cache-dir "grpcio-tools>=1.81.1" "protobuf>=7.35.1,<8"
 
 (

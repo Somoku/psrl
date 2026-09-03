@@ -1,25 +1,7 @@
 """
-SWE-bench / SWE-smith-py Grader for PSRL RL Training.
+Grade SWE-bench patches in fresh Docker containers.
 
-Grades a model's patch against the SWE problem's FAIL_TO_PASS / PASS_TO_PASS
-tests by spinning up a fresh Docker container (isolated from the rollout
-container), applying the patch, running the per-SWE-problem test suite, and
-parsing the results with the official swebench / swesmith grading harness.
-
-Design is aligned with OpenClaw-RL's ``swe_exec_server.py::container_evaluate``
-(fresh container, git reset + git apply, eval script, harness grading with
-returncode fallback) and SWE-smith's ``swesmith/harness/utils.py``
-(git checkout HEAD~1 for F2P restore in smith images).
-
-Patch policy enforcement (disallow test / config file changes) mirrors
-OpenClaw-RL's ``_analyze_patch_policy`` with the same env-var configuration
-interface.
-
-Public API
-----------
-analyze_patch_policy(patch_text, swe_problem) -> dict
-grade_fresh_container(swe_problem, model_patch, grader_kind, image_name,
-                      timeout, swe_task_id) -> dict
+The grader enforces patch policy, runs tests, and parses official harness results.
 """
 
 from __future__ import annotations
@@ -38,9 +20,7 @@ from psrl.utils.common.docker_utils import force_remove_containers_by_label
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# --- Constants ---
 
 _DEFAULT_CONTAINER_TIMEOUT = "30m"
 _DEFAULT_EVAL_TIMEOUT = 900  # seconds
@@ -59,9 +39,7 @@ _BASE_RUN_ARGS: list[str] = [
     "host.docker.internal:host-gateway",
 ]
 
-# ---------------------------------------------------------------------------
-# Patch policy analysis  (mirrors OpenClaw-RL _analyze_patch_policy)
-# ---------------------------------------------------------------------------
+# --- Patch policy ---
 
 
 def _changed_files_from_patch(patch_text: str) -> list[str]:
@@ -164,7 +142,7 @@ def analyze_patch_policy(
     - ``SWE_STRICT_NO_CONFIG_PATCH=1``: disallow changes to config files.
     - ``SWE_TEST_PATCH_POLICY_SCOPE=eval_tests_only``: when enforcing the
       test-file rule, only flag files that appear in the FAIL_TO_PASS /
-      PASS_TO_PASS lists.  Set to ``all_tests`` to flag any test-like path.
+      PASS_TO_PASS lists. Set to ``all_tests`` to flag any test-like path.
 
     Args:
         patch_text (str): Unified diff produced by the agent.
@@ -209,9 +187,7 @@ def analyze_patch_policy(
     }
 
 
-# ---------------------------------------------------------------------------
-# Eval script resolution  (mirrors OpenClaw-RL _resolve_eval_script)
-# ---------------------------------------------------------------------------
+# --- Evaluation script resolution ---
 
 
 @lru_cache(maxsize=2048)
@@ -261,9 +237,7 @@ def _get_smith_eval_script(swe_problem: dict[str, Any]) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Grading helpers
-# ---------------------------------------------------------------------------
+# --- Grading helpers ---
 
 
 def _grade_verified(
@@ -318,9 +292,7 @@ def _grade_verified(
         with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as tf:
             tf.write(eval_output)
             log_path = tf.name
-        # swebench>=4.x returns a nested {instance_id: {resolved, tests_status, ...}} dict,
-        # not a flat one.
-        # Unwrap by instance_id before reading fields.
+        # Unwrap the instance entry returned by swebench 4 and newer.
         report_map = get_eval_report(ts, prediction, log_path, include_tests_status=True)
         report = report_map.get(swe_problem["instance_id"], {})
         resolved = bool(report.get("resolved", False))
@@ -420,9 +392,7 @@ def _grade_smith(
         }
 
 
-# ---------------------------------------------------------------------------
-# SWE-Gym eval script and grading
-# ---------------------------------------------------------------------------
+# --- SWE-Gym grading ---
 
 
 def _get_gym_eval_script(swe_problem: dict[str, Any]) -> str:
@@ -508,9 +478,7 @@ def _grade_gym(
         )
         from swebench.harness.log_parsers.python import parse_log_pytest
 
-        # parse_log_pytest returns {test_case: status_str} mapping.
-        # The second argument (test_spec) is only used for type hints
-        # and not accessed at runtime in the pytest parser.
+        # The pytest parser does not access its type-only `test_spec` argument.
         status_map = parse_log_pytest(eval_output, None)  # type: ignore[arg-type]
 
         # Build eval_ref for get_eval_tests_report.
@@ -545,9 +513,7 @@ def _grade_gym(
         }
 
 
-# ---------------------------------------------------------------------------
-# Main grader entry point
-# ---------------------------------------------------------------------------
+# --- Main grader entry point ---
 
 
 def grade_fresh_container(
@@ -562,19 +528,7 @@ def grade_fresh_container(
     """
     Grade a model patch in a fresh Docker container.
 
-    This is the primary grading entry point called from the PSRL agent loop
-    after a rollout completes.  It:
-
-    1. Runs ``analyze_patch_policy`` — returns immediately if violated.
-    2. Spawns a fresh ``DockerEnvironment`` from the same image used in the
-       rollout (so the image is always locally cached).
-    3. For SWE-smith SWE problems, runs ``git checkout HEAD~1`` to restore the
-       F2P test files removed on the HEAD commit.
-    4. Resets the working tree and applies the model patch via ``git apply``.
-    5. For SWE-smith, reverts any test-file modifications the patch introduced.
-    6. Runs the per-SWE-problem eval script with a timeout.
-    7. Grades the output with the appropriate harness.
-    8. Cleans up the container and returns a grading result dict.
+    Patch policy is checked before the isolated test harness runs.
 
     Args:
         swe_problem (dict[str, Any]): Full HF dataset row for one SWE problem.
@@ -583,25 +537,10 @@ def grade_fresh_container(
         image_name (str): Docker image used for the rollout.
         timeout (int): Eval script execution timeout in seconds.
         swe_task_id (str): PSRL rollout episode ID for container labelling.
-        memory (str): ``--memory`` limit for the grading container (e.g.
-            ``"30g"``).  When empty the module-level default
-            (``_BASE_RUN_ARGS``) is used unchanged.
+        memory (str): ``--memory`` limit for the grading container.
 
     Returns:
-        dict[str, Any]: Grading result with keys:
-            - ``policy_violated`` (bool)
-            - ``policy_reasons`` (list[str])
-            - ``resolved`` (bool)
-            - ``apply_ok`` (bool)
-            - ``f2p_pass`` (int)
-            - ``f2p_total`` (int)
-            - ``p2p_pass`` (int)
-            - ``p2p_total`` (int)
-            - ``timeout`` (bool)
-            - ``error`` (str | None)
-            - ``elapsed_s`` (float)
-            - ``output_tail`` (str)
-            - ``resolved_by`` (str)
+        dict[str, Any]: Test counts, policy state, and execution diagnostics.
     """
     from minisweagent.environments.docker import DockerEnvironment
 
@@ -690,10 +629,7 @@ def grade_fresh_container(
         run_args = [a for a in run_args if not a.startswith("--memory=")]
         run_args.append(f"--memory={memory}")
     run_args += ["--label", grader_label]
-    # Per-actor label consumed by the reaper sidecar in
-    # psrl.utils.common.docker_utils. The grader runs in the same Ray actor
-    # process as the agent loop (via _GRADER_THREAD_POOL), so PSRL_ACTOR_ID
-    # is the same value the rollout container was tagged with.
+    # The reaper uses the shared actor ID to find grader and rollout containers.
     _actor_id = os.environ.get("PSRL_ACTOR_ID", "")
     if _actor_id:
         run_args += ["--label", f"psrl.actor_id={_actor_id}"]
@@ -769,9 +705,7 @@ def grade_fresh_container(
         eval_cmd = f"bash <<'{eval_delim}'\n{eval_script}\n{eval_delim}"
         psrl_logger.info(f"{log_prefix} Running eval script (timeout={timeout}s)...")
 
-        # DockerEnvironment.execute honours the container_timeout but not
-        # a per-command timeout at the API level.  We use subprocess timeout
-        # by passing it as an override; if it raises, we catch below.
+        # Pass a per-command override because the environment timeout covers the container.
         try:
             out_eval = docker_env.execute(
                 {"command": eval_cmd},
@@ -796,10 +730,7 @@ def grade_fresh_container(
                 docker_env.cleanup()
             except Exception as cleanup_exc:
                 psrl_logger.warning(f"{log_prefix} Container cleanup failed: {cleanup_exc}.")
-        # Synchronous belt-and-suspenders sweep by label. ``docker_env.cleanup``
-        # is a fire-and-forget shell ``docker stop`` that has been observed to
-        # silently succeed without actually killing the container; ``docker rm
-        # -f`` here guarantees the eval container is gone before we return.
+        # Sweep by label because asynchronous cleanup may return before removal.
         try:
             force_remove_containers_by_label("psrl.grader_task_id", grader_label.split("=", 1)[1])
         except Exception as sweep_exc:

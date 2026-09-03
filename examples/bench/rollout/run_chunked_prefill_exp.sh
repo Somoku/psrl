@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
-# Top-level sweep: TP ∈ {1, 2} × experiments {e1, e2, e3a}.
-#
-# Usage:
-#   bash run_chunked_prefill_exp.sh [MODEL_PATH] [BUDGET] [GPU_UTIL]
-#
-# Positional arguments (all optional):
-#   MODEL_PATH   Path to the HuggingFace model (default: ${PSRL_WORKSPACE}/models/SWE-agent-LM-7B)
-#   BUDGET       max_num_batched_tokens for E1/E2/E3a engine (default: 65536)
-#   GPU_UTIL     gpu_memory_utilization (default: 0.90)
-#
-# After E1/E2/E3a completes, also runs the E3b memory sweep for both TP values.
+# Sweep chunked prefill experiments across tensor parallel sizes.
+# Optional arguments select the model, token budget, and GPU utilization.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

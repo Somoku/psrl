@@ -1,33 +1,9 @@
 #!/usr/bin/env bash
-# warm_status.sh — report how warm each node's task-image cache is, and skip the ones
-# that are already done.
-#
-# Re-running a warm pass on an already-warm node is safe but not free: buildkit still
-# resolves every layer, so it costs ~16 s per task (~5 min for 144) versus ~170 s per
-# task cold. This tells you which nodes actually need the work.
-#
-# There is no single "is it warm" flag to read. The signal is behavioural: build ONE
-# task and time it. Under ~40 s means the expensive layers (apt, git clone, make) were
-# reused; minutes means they were rebuilt. That probe is itself a partial warm, so it is
-# never wasted.
-#
-# Usage:
-#   bash warm_status.sh --hosts /tmp/newhosts
-#   bash warm_status.sh --hosts-list 28.49.55.40,28.49.36.157
-#   bash warm_status.sh --hosts /tmp/newhosts --warm      # probe, then warm the cold ones
-#
-# Options:
-#   --hosts FILE       Hosts file, one address per line; '#' and blanks ignored.
-#   --hosts-list LIST  Comma-separated addresses instead of a file.
-#   --warm             After probing, launch a full warm pass on every cold node.
-#   --threshold S      Seconds below which a node counts as warm (default: 40).
-#   --dataset PATH     v2 parquet (default: examples/sciaccel_rl/data/v2/all.parquet).
-#   --concurrency N    Concurrency for the full warm pass (default: 8). Lowered from 12
-#                      to reduce transient registry failures on cold nodes. The causal
-#                      link is NOT proven: two nodes running the identical 12-way pass
-#                      lost 20 tasks and 0 tasks. 8 trades ~50% more wall time for fewer
-#                      retries. Raise it if warm time matters more.
-#   -h | --help        Print this help.
+# Probe task image cache warmth and optionally warm cold nodes.
+# Usage: `warm_status.sh HOST_SOURCE [options]`
+
+
+
 
 set -euo pipefail
 
@@ -67,10 +43,7 @@ else
 fi
 [[ ${#HOSTS[@]} -gt 0 ]] || { echo "ERROR: no hosts." >&2; exit 2; }
 
-# One representative task. Its Dockerfile shares every expensive layer with the other
-# 144, so its build time is a faithful proxy for the whole bank. A cheap 2D repair task
-# is used so the probe itself is quick. Verified present in data/v2/all.parquet -- a name
-# that matches nothing makes run_eval exit with "No tasks matched the filters".
+# One representative task measures whether shared expensive layers are cached.
 PROBE_TASK='sciaccel/laps-repair-bounds-2d-mhdrhs-l264'
 
 echo "=== warm_status ==="
@@ -135,17 +108,14 @@ fi
 
 if [[ ${#COLD[@]} -eq 0 ]]; then
     echo
-    echo "Every node is already warm; nothing to do."
+    echo "Every node is already warm. Nothing to do."
     exit 0
 fi
 
 echo
 echo "=== warming ${#COLD[@]} cold node(s) ==="
 for host in "${COLD[@]}"; do
-    # Refuse to start a second pass on a node that is already running one. Two passes
-    # writing the same output directory is not merely wasteful: the second truncates the
-    # first's results.jsonl, so completed work is reported as never having happened.
-    # Observed here -- 131 finished trials were erased this way.
+    # Avoid concurrent warm passes that could truncate the same results file.
     if ssh -o BatchMode=yes -o ConnectTimeout=15 "${host}" \
            'pgrep -f "run_eval.sh --agent nop" >/dev/null 2>&1'; then
         echo "  SKIP ${host}: a nop pass is already running there"

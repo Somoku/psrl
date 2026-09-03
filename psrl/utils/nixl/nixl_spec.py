@@ -44,17 +44,11 @@ def gcd(a, b):
 class NIXLSharding:
     """Sharding of a global tensor"""
 
-    # Shard mesh from a global perspective, a dict of ints, key is the shard dimension, value is the number of shards
-    # e.g., {0: 2, 1: 8} for 2D sharding,
-    # meaning the first dimension has 2 shards and the second dimension has 8 shards
+    # Global shard counts keyed by tensor dimension.
     shard_mesh: OrderedDict[int, int]
-    # Shard mesh from a local perspective, a dict of ints, key is the shard dimension, value is the number of shards
-    # e.g., {0: 1, 1: 1} for 2D sharding,
-    # meaning the local tensor is already the finest-grained shard, no need to split
+    # Local shard counts after accounting for shards already owned by this tensor.
     _local_shard_mesh: OrderedDict[int, int]
-    # Shard indices from a global perspective, a list of tuples of ints
-    # e.g., [(0, 0), (0, 1), ..., (0, 7)] for 2D sharding,
-    # meaning it contains 8 shards in the first row
+    # Global shard coordinates owned by this tensor.
     shard_indices: list[tuple[int, ...]]
 
     def __init__(self, **kwargs):
@@ -525,9 +519,6 @@ class NIXLTensorInfo:
 class NIXLClientType(Enum):
     """NIXL client types for communication planning"""
 
-    # PS for both push and pull,
-    # now deprecated because PUSH and PULL
-    # have different types (i.e., PUSH: fp32, PULL: bf16)
     PS = "ps"
     PS_FOR_PUSH = "ps_for_push"
     PS_FOR_PULL = "ps_for_pull"

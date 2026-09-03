@@ -25,16 +25,11 @@ from psrl.environments.mlgym_env import AGENT_WORKSPACE, build_sandbox_spec
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "INFO"))
 
-# Full path to the mlgym_generic Python interpreter.
-# The container's login shell does not auto-activate the conda env because there
-# is no .bash_profile to source .bashrc, so conda shell functions are not
-# available. Using the absolute path is simpler and more reliable.
+# The container login shell does not activate Conda, so use the environment's
+# absolute Python path.
 _PYTHON = "/home/agent/miniconda3/envs/mlgym_generic/bin/python"
 
-# Source of the submission generator script that is written into the sandbox.
-# It auto-detects the task type from the data layout and writes a format-appropriate
-# dummy submission. The episode scores poorly but grades cleanly, proving the full
-# pipeline from container to grader is wired correctly.
+# This sandbox script infers the required submission shape from the task data.
 _MAKE_SUBMISSION_SRC = """\
 import csv, json, os
 from datasets import load_from_disk
@@ -111,7 +106,7 @@ SCRIPTED_ACTIONS: list[str] = [
     "ls -la",
     "ls -la data",
     (
-        f"{_PYTHON} -c \""
+        f'{_PYTHON} -c "'
         "from datasets import load_from_disk; import os; "
         f"ws = '{AGENT_WORKSPACE}'; "
         "qp = os.path.join(ws, 'data', 'test', 'queries'); "
@@ -162,12 +157,10 @@ async def run_scripted_episode(
                 fpath = os.path.join(task_config_dir, fname)
                 with open(fpath, "rb") as fh:
                     await handle.write_file(f"{AGENT_WORKSPACE}/{fname}", fh.read())
-                psrl_logger.info(f"[{task_id}] Uploaded {fname!r} to workspace.")
+                psrl_logger.info(f"[{task_id}] Uploaded workspace file: {fname!r}.")
 
         # Write the submission generator script before running the action sequence.
-        await handle.write_file(
-            f"{AGENT_WORKSPACE}/_make_submission.py", _MAKE_SUBMISSION_SRC.encode()
-        )
+        await handle.write_file(f"{AGENT_WORKSPACE}/_make_submission.py", _MAKE_SUBMISSION_SRC.encode())
 
         for action in SCRIPTED_ACTIONS:
             result = await handle.exec(action, runtime_config.per_action_timeout_s)
@@ -180,8 +173,7 @@ async def run_scripted_episode(
                 }
             )
             psrl_logger.info(
-                f"[{task_id}] action exit={result.exit_code} timed_out={result.timed_out}: "
-                f"{action[:70]!r}"
+                f"[{task_id}] action exit={result.exit_code} timed_out={result.timed_out}: {action[:70]!r}"
             )
             if result.timed_out:
                 raise RuntimeError(f"Scripted action timed out: {action!r}.")
@@ -205,9 +197,7 @@ async def run_scripted_episode(
             else:
                 score = json.loads(output.splitlines()[-1])
         except (json.JSONDecodeError, IndexError):
-            psrl_logger.error(
-                f"[{task_id}] evaluate.py did not emit JSON: {eval_result.stdout[-400:]!r}"
-            )
+            psrl_logger.error(f"[{task_id}] evaluate.py did not emit JSON: {eval_result.stdout[-400:]!r}")
             score = None
     finally:
         await handle.destroy()

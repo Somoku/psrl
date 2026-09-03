@@ -19,16 +19,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class RewardModelManager:
-    """
-    Manages reward model replicas for a single named reward model.
-
-    Lifecycle:
-    1. Creates a ``RewardModelCoordinator`` and retrieves its ZMQ status endpoint.
-    2. For each replica worker-group, creates a ``RewardModelReplica``,
-       calls ``init_model()`` to launch the vLLM HTTP server, then registers
-       the server to the smg gateway and to the coordinator.
-    3. Exposes ``get_gateway_url()`` for ``GenRewardManager`` to POST requests.
-    """
+    """Manage all replicas for one named reward model."""
 
     def __init__(
         self,
@@ -43,7 +34,6 @@ class RewardModelManager:
         self.reward_model_config = reward_model_config
         self.gateway_url = gateway_url
 
-        # ── Build model config and tokenizer ────────────────────────────────
         model_cfg = reward_model_config.model
         local_path = copy_to_local(model_cfg.path, use_shm=model_cfg.get("use_shm", False))
         self.reward_model_tokenizer = hf_tokenizer(
@@ -57,14 +47,12 @@ class RewardModelManager:
         )
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(reward_model_config.rollout)
 
-        # ── Coordinator ──────────────────────────────────────────────────────
         self.reward_model_coordinator = ray.remote(RewardModelCoordinator).remote(
             config,
             reward_model_config,
             rollout_gateway_url=self.gateway_url,
         )
 
-        # ── Replicas ─────────────────────────────────────────────────────────
         self.reward_model_wg_list = reward_model_wg_list
         self.replicas: list[RewardModelReplica] = []
 
@@ -105,11 +93,9 @@ class RewardModelManager:
         self._run_all(init_tasks)
 
     def _register_reward_servers(self, replicas: list[RewardModelReplica]):
-        # Register to gateway
         reg_futures = [replica.servers[0].register_server_to_gateway.remote(self.gateway_url) for replica in replicas]
         worker_ids: list[str] = ray.get(reg_futures)
 
-        # Register to coordinator
         coord_futures = [
             self.reward_model_coordinator.add_worker.remote(
                 replica,

@@ -1,25 +1,5 @@
-{#- Qwen3.5 accumulating-thinking template: keeps EVERY turn's <think> block in the
-    prompt so multi-turn history is strictly appending. Qwen3.5 counterpart of
-    qwen3_acc_thinking.jinja2. See examples/sciaccel_rl/knowledge.md.
-
-    Contract with the caller (both halves are required):
-      1. The reasoning parser must be OFF, so the full generated text -- including the
-         model's own '</think>' -- arrives inline in `content`. With SMG that means
-         sending `separate_reasoning: false`.
-      2. This template never parses `content`. It does not split on '</think>' and does
-         not read `reasoning_content`, so a literal '</think>' in the answer prose is
-         harmless and a CoT truncated before '</think>' still round-trips.
-
-    Why it differs from the Qwen3 version: Qwen3.5 PREFILLS '<think>\n' into the
-    generation prompt, so the model emits only a closing '</think>', never a matched
-    pair. Replaying such a `content` verbatim (what qwen3_acc_thinking.jinja2 does)
-    would leave an unmatched '</think>' and drop the prefill. This template therefore
-    re-emits '<think>\n' ahead of the stored content, reproducing the exact bytes the
-    model saw when it generated that turn.
-
-    Verified on Qwen3.5-9B: prompt(k) + response(k) is a strict token-level prefix of
-    prompt(k+1) for every turn. The stock 3.5 template fails this at token 10 -- its
-    `loop.index0 > ns.last_query_index` gate strips prior-turn CoT. -#}
+{#- Reinsert Qwen3.5's prefilled thinking opener when replaying assistant content.
+    Reasoning separation must stay disabled so stored content includes the closing tag. -#}
 {%- macro render_content(content) %}
     {%- if content is string %}{{- content }}
     {%- elif content is none or content is undefined %}{{- '' }}

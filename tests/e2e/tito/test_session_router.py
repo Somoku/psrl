@@ -7,9 +7,7 @@ from fastapi.responses import Response as FastAPIResponse
 from httpx import ASGITransport
 from psrl.workers.gen.session_router import SessionRouter
 
-# ---------------------------------------------------------------------------
-# Mock SMG server
-# ---------------------------------------------------------------------------
+# --- Mock SMG Server ---
 mock_smg = FastAPI()
 captured: dict = {}
 
@@ -56,9 +54,7 @@ async def mock_catchall(path: str, request: Request):
     return {"proxied": True}
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+# --- Fixtures ---
 @pytest.fixture(autouse=True)
 def _clear_captured():
     captured.clear()
@@ -68,7 +64,6 @@ def _clear_captured():
 def router():
     """Build a SessionRouter whose internal httpx client talks to mock_smg."""
     sr = SessionRouter(smg_url="http://mock-smg")
-    # Replace the real client with one backed by the mock ASGI app
     sr.client = httpx.AsyncClient(transport=ASGITransport(app=mock_smg), base_url="http://mock-smg")
     return sr
 
@@ -91,9 +86,7 @@ def auto_client(auto_router):
     return httpx.AsyncClient(transport=ASGITransport(app=auto_router.app), base_url="http://testserver")
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# --- Tests ---
 @pytest.mark.asyncio
 async def test_create_session(client, router):
     resp = await client.post("/sessions", headers={"x-request-id": "request-1", "x-unrelated": "ignored"})

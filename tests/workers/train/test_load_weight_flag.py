@@ -28,8 +28,6 @@ def test_fsdp_engine_load_weight_false_calls_from_config():
     engine_config.entropy_from_logits_with_chunking = False
     engine_config.use_torch_compile = False
 
-    # We only test the conditional logic — not the full engine init which needs GPU
-    # Verify that with load_weight=False, getattr returns False
     assert not engine_config.load_weight
 
     # Simulate what _build_module checks

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-
 SCIACCEL_RL_REPO = "/apdcephfs_zwfy10_303541817/share_303541817/lhy/science_infra/sciaccel-rl"
 
 

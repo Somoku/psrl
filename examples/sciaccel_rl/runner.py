@@ -20,7 +20,6 @@ from examples.sciaccel_rl.config import SciAccelRuntimeConfig
 from harbor.job import Job
 from harbor.models.job.config import AgentConfig, JobConfig, SourceJobConfig
 from harbor.models.trial.config import TaskConfig
-
 from psrl.utils.agent.thinking import MULTI_TRAJ, harness_extra_body
 
 psrl_logger = logging.getLogger("psrl.sciaccel_rl.runner")
@@ -191,28 +190,16 @@ async def run_harbor_episode(
                 name=config.harbor.agent_name,
                 model_name=f"openai/{model_name}",
                 env={"OPENAI_API_KEY": "EMPTY"},
-                # Let Harbor enforce the agent budget from OUTSIDE the container, the
-                # one clock the agent cannot forge. Without this, Harbor falls back to
-                # the task's own `[agent] timeout_sec` (3600s for laps-cpu) while the
-                # `asyncio.wait_for` below fires at task_timeout_sec + 600 -- so PSRL
-                # killed the Job before Harbor could stop the agent and grade it, and
-                # an honestly-slow episode became `trajectory_timeout` with no reward.
-                # Matches SkyRL's harbor_trial_config/default.yaml:34.
+                # Let Harbor enforce the external budget so timed-out jobs remain gradable.
                 override_timeout_sec=config.task_timeout_sec,
                 kwargs={
                     "api_base": model_base_url,
                     "enable_summarize": False,
                     "collect_rollout_details": True,
-                    # SciAccel task containers run without network access and their
-                    # images do not include asciinema. Terminus-2 otherwise retries
-                    # apt and pip in every episode before falling back to the tmux
-                    # pane, adding setup latency and one misleading error per trial.
-                    # TITO token capture and terminus_2.pane do not depend on this.
+                    # Disable terminal recording because offline task images omit asciinema.
                     "record_terminal_session": False,
                     "temperature": 1.0,
-                    # Without this terminus-2 falls back to max_episodes=1000000 and
-                    # runs until the context window overflows. Matches SkyRL's
-                    # harbor_trial_config/default.yaml (max_turns + suppression).
+                    # Bound turns before context overflow.
                     **({"max_turns": max_turns} if max_turns else {}),
                     "suppress_max_turns_warning": True,
                     "model_info": {
@@ -224,10 +211,7 @@ async def run_harbor_episode(
                     "llm_kwargs": {
                         "timeout": 900,
                         "max_retries": 0,
-                        # Whatever `thinking_template` requires of the gateway. Empty for
-                        # the `multi_traj` / `longest_traj` modes, which leave SMG's
-                        # defaults alone and accept the resulting trajectory forks.
-                        # See psrl/utils/agent/thinking.py.
+                        # Apply gateway overrides required by `thinking_template`.
                         **({"extra_body": extra_body} if extra_body else {}),
                     },
                 },
@@ -238,20 +222,11 @@ async def run_harbor_episode(
         **({"environment": env_kwargs} if env_kwargs else {}),
     )
 
-    # Backstop only: Harbor's own agent + verifier clocks (set above) should always
-    # fire first and still produce a graded result. This guard exists for the case
-    # where Harbor itself wedges, so it must be strictly larger than the sum of the
-    # budgets it supervises -- agent + verifier + container build/teardown slack.
+    # This Harbor backstop exceeds the agent and verifier budgets plus container slack.
     timeout = config.task_timeout_sec + config.verifier_timeout_sec + 600.0
 
-    # Single exception boundary. Harbor normally reports per-trial failures as data in
-    # `TrialResult.exception_info`, but `Job.create` and `Job.run` can still raise for
-    # job-level trouble (unreadable task.toml, docker unreachable, the backstop above).
-    # Letting those propagate would put raw Harbor/litellm exceptions in front of the
-    # agent loop, which is what forced the loop to string-match them one by one.
-    # Everything below returns a `HarborEpisodeResult` so the loop's input is a closed
-    # set. `CancelledError` is deliberately NOT caught: cancellation is control flow,
-    # and swallowing it would strand the Harbor event-loop thread.
+    # Convert job-level failures into `HarborEpisodeResult`.
+    # Let cancellation propagate as control flow.
     try:
         job = await Job.create(job_config)
         result = await asyncio.wait_for(job.run(), timeout=timeout)
@@ -276,19 +251,11 @@ async def run_harbor_episode(
 
     tr = result.trial_results[0]
     rewards = dict(tr.verifier_result.rewards) if tr.verifier_result and tr.verifier_result.rewards else {}
-    # Keep the exception type alongside the message. Harbor's own classes are the
-    # reliable signal (`AgentTimeoutError` vs `AgentSetupTimeoutError` mean opposite
-    # things for training), while the message has already been through litellm, which
-    # drops both the class and SMG's `x-smg-error-code` header.
+    # Preserve the Harbor exception type because LiteLLM strips transport metadata.
     exception = tr.exception_info.exception_message if tr.exception_info else None
     exception_type = tr.exception_info.exception_type if tr.exception_info else None
 
-    # An empty reward dict is a MISSING measurement, not a zero. Harbor's trial body
-    # is a bare sequence (`harbor/trial/single_step.py`): agent, collect artifacts,
-    # verify, with no try/except between them, so any agent-side exception -- a
-    # context overflow above all -- skips verification entirely. Training that as
-    # `reward=0` is an incorrect label, not merely a missing one: the episode may have
-    # delivered a partially-correct result that the ladder would have given credit for.
+    # Regrade missing verifier output because an agent exception may skip verification.
     if not rewards and regrade_unverified:
         rewards = await _regrade_from_artifacts(
             task_path=task_path,

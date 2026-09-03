@@ -1,20 +1,6 @@
 #!/bin/bash
-# The oracle: build the incumbent from the tree the agent was handed, with the
-# pinned flags, and run the three decks — writing exactly the artifacts
-# instruction.md asks a solver for.
-#
-#   harbor run -p tasks/laps-cpu -a oracle   -> reward 1.0, equivalence_pass 1
-#   harbor run -p tasks/laps-cpu -a nop      -> reward 0.0, equivalence_pass 0
-#
-# The first proves the task is solvable and the criteria accept a correct
-# answer (expect the byte-identity warning in the grading report: same base
-# image, same flags, same deterministic code as the reference build — that is
-# what the self-check produces by construction). The second proves the
-# criteria discriminate. An oracle speedup of ~1.0 is correct and expected:
-# the incumbent is exactly as fast as itself.
-#
-# This script is also executable documentation of the build recipe the
-# instruction states. If it drifts from instruction.md, one of them is wrong.
+# Build the incumbent and deliver requested artifacts as the oracle baseline.
+# Pinned flags and deterministic decks must match the verifier reference.
 
 set -euo pipefail
 

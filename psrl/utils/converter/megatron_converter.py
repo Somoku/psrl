@@ -78,16 +78,13 @@ class MegatronConverter(BaseConverter):
         for m in models:
             if hasattr(m, "config") and not hasattr(m.config, "share_embeddings_and_output_weights"):
                 m.config.share_embeddings_and_output_weights = getattr(m, "share_embeddings_and_output_weights", False)
-        # Detect attention_output_gate from the actual Megatron TransformerConfig.
-        # The HF config may not have this attribute, causing model_info to default
-        # to False. But if the Megatron model was built with attention_output_gate=True,
-        # the QKV weight layout includes the gate and we must account for it.
+        # The runtime Megatron config is authoritative because the HF config may omit
+        # `attention_output_gate`.
         if models and hasattr(models[0], "config"):
             tf_config = models[0].config
             actual_attn_output_gate = getattr(tf_config, "attention_output_gate", False)
             if actual_attn_output_gate and not self.model_info.get("attn_output_gate", False):
                 self.model_info["attn_output_gate"] = True
-                # num_heads must be doubled when attn_output_gate is True
                 self.model_info["num_heads"] = self.model_info["num_heads"] * 2
 
         conversion_tasks = self.bridge._model_bridge.build_conversion_tasks(self.parameter_mapping.config, models)
@@ -114,10 +111,8 @@ class MegatronConverter(BaseConverter):
                 for name, param in model.named_parameters():
                     existing_keys.add(name)
                     yield vpp_rank, name, param
-                # NOTE(megatron-bridge): there is a bug in megatron GPTModel
-                # decoder.layers[n].mlp.router.expert_bias" in GPTModel
-                # is not registered in named_parameter, but in state_dict().
-                # for now we patch it by adding those keys to extra_keys.
+                # NOTE(megatron-bridge): The `expert_bias` tensor lives only in
+                # `state_dict`, so include keys omitted by `named_parameters`.
                 extra_keys = [
                     x
                     for x in model.state_dict()
@@ -130,9 +125,7 @@ class MegatronConverter(BaseConverter):
             task = task_by_local_name.get((vpp_rank, name))
             if task is None:
                 if name.endswith("output_layer.weight"):
-                    # Skip output_layer.weight in the fallthrough — it's the lm_head
-                    # which is handled by the tied-weight alias workaround below
-                    # (exported from the embedding on the PP stage that has it).
+                    # Tied `lm_head` weights are exported from the embedding alias below.
                     continue
 
                 if name.startswith("vision_model."):
@@ -155,11 +148,8 @@ class MegatronConverter(BaseConverter):
             new_params = self.convert_parameter(global_name, param, task.mapping)
             sharding = self.get_sharding_for_param(global_name, param)
             for new_param_name, new_param in new_params.items():
-                # Each output param must own a SEPARATE sharding object because the server
-                # mutates shardings in-place during refactor_based_on_finer_shard_mesh.
-                # Without copy, Q/K/V from the same QKV split share one object, and
-                # refactoring Q's sharding (different unified mesh due to attn_output_gate)
-                # would corrupt K/V's sharding.
+                # Each output needs a distinct descriptor because server side refactoring
+                # mutates sharding objects in place.
                 param_sharding = NIXLSharding(
                     shard_mesh=OrderedDict(sharding.shard_mesh),
                     shard_indices=list(sharding.shard_indices),
@@ -168,13 +158,8 @@ class MegatronConverter(BaseConverter):
                 converted_state_dict[new_param_name] = new_param
                 sharding_dict[new_param_name] = sharding_for_param
 
-        # NOTE(lhy): a workaround for lm_head with tied word embeddings.
-        # When tie_word_embeddings=True, lm_head.weight == embed_tokens.weight.
-        # With PP=1: the last (only) stage has both → just alias.
-        # With PP>1: the embedding is on the FIRST stage but lm_head is logically
-        # on the LAST stage. LinearCrossEntropyModule on the last stage may not
-        # expose a separate .weight parameter. So whichever stage HAS the embedding
-        # should also export lm_head.weight (they're the same tensor).
+        # NOTE(lhy): Tied embeddings may live on a different pipeline stage from
+        # `lm_head`, so the embedding owner also exports `lm_head.weight`.
         if self.parameter_mapping.original_tie_word_embeddings:
             if embedding_hf_name is not None and embedding_hf_name in converted_state_dict:
                 converted_state_dict["lm_head.weight"] = converted_state_dict[embedding_hf_name]
@@ -235,9 +220,7 @@ class MegatronConverter(BaseConverter):
             return self._convert_chunked_parameter(full_name, param, mapping.hf_param)
 
         if isinstance(mapping, RMSNorm2ZeroCenteredRMSNormMapping):
-            # This norm is stored in Megatron as (γ-1). We keep the raw Megatron tensor in
-            # unified_state_dict (zero-centered format) and record the key so that push_model /
-            # nixl_pull_model can apply the ±1 correction without any string-matching heuristic.
+            # Keep the zero centered tensor and record its correction in the sync plan.
             assert isinstance(mapping.hf_param, str), (
                 f"RMSNorm2ZeroCenteredRMSNormMapping hf_param must be a resolved string, "
                 f"got {type(mapping.hf_param)} for {full_name}"
@@ -248,8 +231,7 @@ class MegatronConverter(BaseConverter):
         if isinstance(mapping, (AutoMapping, ReplicatedMapping)):
             return self._convert_auto_mapping_parameter(full_name, param, mapping.hf_param)
 
-        # Catch-all for remaining mapping types with string hf_param (DirectMapping,
-        # ColumnParallelMapping, RowParallelMapping, etc.) — treat as simple passthrough.
+        # Remaining string mappings are direct passthroughs.
         hf_param = mapping.hf_param
         if isinstance(hf_param, str):
             return self._convert_auto_mapping_parameter(full_name, param, hf_param)
@@ -364,7 +346,7 @@ class MegatronConverter(BaseConverter):
             )
         try:
             if "shared_experts" in full_name:
-                # NOTE(zym): shared_experts use tp_size, not etp_size
+                # NOTE(zym): Shared experts use `tp_size` rather than `etp_size`.
                 sliced_params = slice_gate_up_proj(
                     fused_param=param,
                     output_sizes=[
@@ -400,16 +382,10 @@ class MegatronConverter(BaseConverter):
         return out
 
     def _convert_fused_expert_parameter(self, full_name: str, param: Parameter, hf_name: str) -> dict:
-        """Handle FusedExpertMapping / FusedGatedExpertMapping.
+        """
+        Convert fused expert mappings whose HF prefix omits the expert index.
 
-        These mappings use a PREFIX-style hf_param with only one wildcard (layer index).
-        The expert index is NOT embedded in hf_name — it must be extracted from the
-        Megatron param name (e.g., ``...linear_fc2.weight64``) and inserted manually.
-
-        Example (DeepSeek / GLM45 fused-expert mode):
-            full_name = "decoder.layers.0.mlp.experts.linear_fc2.weight64"
-            hf_name   = "model.layers.0.mlp.experts.down_proj"  (prefix, no expert index)
-            result    → "model.layers.0.mlp.experts.64.down_proj.weight"
+        The expert suffix in `full_name` is inserted into the `hf_name` prefix.
         """
         if "mlp.experts.linear_fc1.weight" in full_name:
             name_prefix = hf_name.rsplit(".", 1)[0]
@@ -480,8 +456,6 @@ class MegatronConverter(BaseConverter):
                 tp_size=self.mpu.tp_size,
             )
             return dict(zip(new_param_names, new_params))
-        # Fallback for other ChunkedMapping subclasses (e.g. MambaConv1dMapping) —
-        # pass through as-is until specific handling is implemented.
         return {hf_name: param}
 
     def _convert_gdn_linear_parameter(self, full_name: str, param: Parameter, hf_param: dict) -> dict:
@@ -505,10 +479,6 @@ class MegatronConverter(BaseConverter):
                 f"got linear_key_dim={key_dim}, linear_value_dim={value_dim}, "
                 f"linear_num_value_heads={num_v_heads}."
             )
-        # QKVZ dim = key_dim + key_dim + value_dim + hidden_size (z = hidden_size)
-        # BA dim = num_v_heads * value_head_dim + num_v_heads * value_head_dim
-        # But simpler: split by ratio — the bridge concatenates QKVZ first, then BA
-        # The local shard is already TP-sliced, so we compute based on local sizes.
         hidden_size = self.model_info.get("hidden_size", 0)
         qkvz_size = (key_dim + key_dim + value_dim + hidden_size) // self.mpu.tp_size
         total_size = param.shape[0]
@@ -528,11 +498,10 @@ class MegatronConverter(BaseConverter):
         Returns a NIXLSharding object.
         """
         is_etp_param = "mlp.experts" in full_name and self.mpu.etp_size > 1
-        # NOTE(zym): When enabling both ep and tp, ep param also has attribute "tensor_model_parallel" which is True,
-        # so we need to exclude ep param when determining is_tp_param
+        # NOTE(zym): Expert parameters also set `tensor_model_parallel`, so exclude
+        # them from regular TP detection.
         is_tp_param = getattr(param, "tensor_model_parallel", False) and "mlp.experts" not in full_name
-        # NOTE(zym): etp param also has attribute "tensor_model_parallel" which is True,
-        # so we need to first determine is_etp_param
+        # NOTE(zym): ETP parameters also set `tensor_model_parallel`, so test ETP first.
         if is_etp_param:
             shard_size = self.mpu.etp_size
             shard_indices = [(self.mpu.etp_rank,)]

@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 """
-plot_prefill_step.py
+Plot prefill request tokens and host time from step logs.
 
-Parse Prefill_*.log step summary + per-request lines and plot:
-  1) Per-step scatter: x=step, y=each prefill request's compute tokens (q);
-     red marker = sum of prefill q for that step
-  2) Grouped bars over exponential bins [0,64), [64,128), [128,256), [256,512), ...:
-     - step count (left y-axis)
-     - sum of host_ms (right y-axis)
-
-Example log:
-  step=1 M=1837 nseq=1 host_ms=2143.0 ctx_reqs=1 ctx_tokens=1837 gen_reqs=0
-    [0] rid=..92371793 new    hit=0 q=1837
+The output combines a per-step scatter plot with grouped exponential-bin bars.
 """
 
 from __future__ import annotations
@@ -32,9 +23,7 @@ STEP_RE = re.compile(
 )
 
 # Prefill request lines: "new" or "chunk" (not decode). Capture q= tokens.
-REQ_RE = re.compile(
-    r"^\s*\[\d+\]\s+rid=\S+\s+(?:new|chunk)\b.*?q=(?P<q>\d+)"
-)
+REQ_RE = re.compile(r"^\s*\[\d+\]\s+rid=\S+\s+(?:new|chunk)\b.*?q=(?P<q>\d+)")
 
 
 @dataclass
@@ -50,9 +39,7 @@ class StepRecord:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Plot prefill step composition and latency from Prefill_*.log"
-    )
+    p = argparse.ArgumentParser(description="Plot prefill step composition and latency from Prefill_*.log")
     p.add_argument("input", help="Prefill log file path (e.g. Prefill_I1.log)")
     p.add_argument(
         "--out",
@@ -89,9 +76,7 @@ def parse_prefill_log(path: str) -> list[StepRecord]:
                 if ctx_tokens == 0:
                     current = None
                     continue
-                current = StepRecord(
-                    step=step, host_ms=host_ms, ctx_tokens=ctx_tokens
-                )
+                current = StepRecord(step=step, host_ms=host_ms, ctx_tokens=ctx_tokens)
                 steps.append(current)
                 continue
 
@@ -174,9 +159,7 @@ def main():
         base = os.path.splitext(os.path.basename(args.input))[0]
         out = f"{base}_prefill_step.png"
 
-    fig, (ax_scatter, ax_bar) = plt.subplots(
-        2, 1, figsize=(12, 10), gridspec_kw={"height_ratios": [1.0, 1.1]}
-    )
+    fig, (ax_scatter, ax_bar) = plt.subplots(2, 1, figsize=(12, 10), gridspec_kw={"height_ratios": [1.0, 1.1]})
 
     if len(req_qs_arr) > 0:
         ax_scatter.scatter(
@@ -208,9 +191,7 @@ def main():
 
     x = np.arange(n_bins)
     width = 0.38
-    bars1 = ax_bar.bar(
-        x - width / 2, counts, width, label="step count", color="C0"
-    )
+    bars1 = ax_bar.bar(x - width / 2, counts, width, label="step count", color="C0")
     ax_bar.set_ylabel("step count")
     ax_bar.set_xlabel("ctx_tokens bins")
     ax_bar.set_xticks(x)
@@ -219,9 +200,7 @@ def main():
     ax_bar.grid(True, axis="y", alpha=0.3)
 
     ax_bar2 = ax_bar.twinx()
-    bars2 = ax_bar2.bar(
-        x + width / 2, sum_ms, width, label="sum host_ms", color="C1"
-    )
+    bars2 = ax_bar2.bar(x + width / 2, sum_ms, width, label="sum host_ms", color="C1")
     ax_bar2.set_ylabel("sum host_ms")
 
     # Combined legend

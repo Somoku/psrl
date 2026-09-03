@@ -1,12 +1,9 @@
-# Sandbox execution service for agent environments.
-# Disabled by default so existing recipes are unaffected.
+# Sandbox execution is disabled by default so existing recipes are unaffected.
 
 # Whether to build the env worker pool at startup.
 enable: False
 
-# Where env workers run.
-# colocated: one worker set on every alive node, alongside train and rollout.
-# dedicated: workers only on the nodes listed in dedicated_node_ips.
+# `colocated` uses every alive node. `dedicated` uses only `dedicated_node_ips`.
 placement: colocated
 
 # Node IPs that host env workers. Required when placement is dedicated.

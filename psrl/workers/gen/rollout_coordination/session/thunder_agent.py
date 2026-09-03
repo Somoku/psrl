@@ -1,19 +1,7 @@
-"""Session hang/continue scheduler (ThunderAgent port).
+"""Capacity scheduler for TITO session hang and continue decisions.
 
-Pure, side-effect-free capacity logic. Given a snapshot of per-instance KV-cache
-capacity and the set of live TITO sessions (each pinned to one vLLM instance),
-decide which sessions to **hang** (evict from an over-capacity instance) and which
-hung sessions to **continue** (readmit once their pinned instance has room).
-
-This mirrors ThunderAgent's ``_pause_until_safe`` / ``_greedy_resume`` and its
-per-backend token capacity model, adapted to psrl_smg terminology:
-
-- ThunderAgent "program"  -> psrl_smg TITO "session"
-- ThunderAgent REASONING  -> "generate" (a trajectory is inferring on vLLM/SMG)
-- ThunderAgent ACTING     -> "env"      (a trajectory is calling the environment)
-- ThunderAgent pause/resume -> hang/continue
-
-The module imports nothing from Ray/HTTP so it can be unit-tested in isolation.
+The scheduler evicts sessions from over-capacity instances and readmits hung
+sessions when capacity permits.
 """
 
 from __future__ import annotations
@@ -37,26 +25,13 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class ThunderAgentScheduler(SessionScheduler):
-    """Decide session hang/continue from instance capacity + session footprints.
+    """
+    Decide session hang and continue actions from KV capacity.
 
     Args:
-        env_token_weight: Reservation coefficient for env-status (between-turns)
-            session tokens (ThunderAgent's ``tool_coefficient``). An env session's
-            KV has been freed from the engine pool, so it is absent from the
-            measured ``used_tokens``; this coefficient adds it back as a predictive
-            reservation for when the session returns from the environment.
-            ``< 1`` assumes not all env sessions return simultaneously.
+        env_token_weight: Reservation coefficient for environment-session tokens.
         buffer_per_session: Decode headroom (tokens) reserved per running session.
-        global_scope: Continue-instance selection scope. When False (default,
-            "bucketed"), a hung session is only readmitted on the instance it
-            currently occupies (the original ThunderAgent-port behavior, and the
-            correct choice under trajectory sticky). When True ("global"), continue
-            uses the original ThunderAgent global BFD across all instances and may
-            relocate a session onto a different (emptier) instance.
-
-    Note: this scheduler only *chooses* the continue instance; whether that
-    instance is force-pinned on the next turn is decided by the loop
-    (``continue_force_pin``), independent of ``global_scope``.
+        global_scope: Whether readmission may relocate a session.
     """
 
     def __init__(
@@ -99,19 +74,18 @@ class ThunderAgentScheduler(SessionScheduler):
         # Remaining KV capacity per instance AFTER this tick's hang decisions.
         remaining_by_instance: dict[RolloutInstanceId, int] = {}
 
-        # --- Hang phase (always per-instance): shed running sessions until the
-        # instance is within capacity. Priority: env-status first (off-GPU,
-        # cheapest to evict), then generate-status; smallest tokens first. ---
+        # Evict environment sessions before generation sessions, then prefer
+        # smaller footprints within each class.
         for inst in instances:
             running = running_by_instance.get(inst.instance_id, [])
             hung_now: set[str] = set()
             remaining = self._remaining_capacity(inst, running, hung_now)
             if remaining < 0:
                 psrl_logger.debug(
-                    f"Instance {inst.instance_id!r} over capacity: "
-                    f"total_kv={inst.total_kv_tokens} used={inst.used_tokens} remaining={remaining} "
-                    f"running={len(running)} hung={len(hung_by_instance.get(inst.instance_id, []))}; "
-                    f"shedding sessions."
+                    f"Instance over capacity: instance_id={inst.instance_id!r}, "
+                    f"total_kv={inst.total_kv_tokens}, used={inst.used_tokens}, "
+                    f"remaining={remaining}, running={len(running)}, "
+                    f"hung={len(hung_by_instance.get(inst.instance_id, []))}. Shedding sessions."
                 )
                 for sess in self._hang_order(running):
                     if remaining >= 0:
@@ -179,12 +153,8 @@ class ThunderAgentScheduler(SessionScheduler):
         all_hung = [sess for hung in hung_by_instance.values() for sess in hung]
         if not all_hung:
             return []
-        # A hung session always has inflight==0: control_hang only hangs idle
-        # (env-status) sessions, and a hang requested mid-turn is deferred to the
-        # next turn boundary where inflight has dropped to 0. So every hung
-        # session's status is "env" — there is no generate/env split to prioritize
-        # here (unlike ThunderAgent, whose paused REASONING programs kept pending
-        # requests). Selection is therefore purely smallest-tokens-first.
+        # Hung sessions have no in-flight turn, so token footprint alone
+        # determines admission order.
         candidates = sorted(all_hung, key=lambda s: s.total_tokens)
 
         # Step 1: select the max prefix (smallest first) fitting total capacity.
@@ -198,7 +168,7 @@ class ThunderAgentScheduler(SessionScheduler):
         if not resumable:
             return []
 
-        # Step 2: BFD placement — largest session onto the emptiest instance.
+        # Place the largest session on the emptiest instance first.
         resumable.sort(key=lambda s: -s.total_tokens)
         caps.sort(key=lambda row: -row[1])
         to_continue: list[tuple[str, RolloutInstanceId]] = []
@@ -212,8 +182,7 @@ class ThunderAgentScheduler(SessionScheduler):
             # instance → nothing more can be placed.
             if min_need > max_cap:
                 break
-            # This session is too large for the emptiest instance; a smaller
-            # following one may still fit.
+            # A smaller following session may still fit.
             if need > max_cap:
                 continue
             to_continue.append((sess.session_id, caps[0][0]))
@@ -230,34 +199,11 @@ class ThunderAgentScheduler(SessionScheduler):
         running: list[SessionInfo],
         hung_now: set[str],
     ) -> int:
-        """Remaining KV-token capacity on ``inst`` given the running set.
+        """
+        Return remaining KV-token capacity after planned hangs.
 
-        Faithful port of ThunderAgent's ``remaining_capacity`` (self-accounted,
-        verified against vLLM 0.22 ``KVCacheManager``):
-
-            active = Σ generate_tokens + env_token_weight * Σ env_tokens
-            shared = max(0, generate_tokens_full - measured_used)
-            buffer = buffer_per_session * running_session_count
-            used   = active - shared + buffer
-            remaining = total_kv_tokens - used
-
-        Where (ThunderAgent term -> ours): reasoning -> generate, acting -> env,
-        ``tool_coefficient`` -> ``env_token_weight``, ``shared_tokens`` -> shared.
-
-        - ``active`` sums self-tracked session footprints: generate at full weight,
-          env scaled by ``env_token_weight``. An env session (between turns) has
-          its request finished so its KV is freed from the pool and is absent from
-          ``measured_used`` — the weighted term is a predictive reservation for
-          when it returns. ``< 1`` assumes not all env sessions return at once.
-        - ``shared`` (prefix-cache savings) is computed from the FULL generate set
-          (ignoring ``hung_now``) so it stays FIXED across one hang loop, mirroring
-          ThunderAgent caching ``shared_tokens`` before ``_pause_until_safe``.
-          Subtracting it removes the prefix double-count in ``active``'s generate
-          part, leaving generate ≈ ``measured_used``.
-        - ``hung_now`` are sessions we plan to hang this tick; they are excluded
-          from ``active`` and ``count``, so hanging either an env (drops its
-          reservation) or a generate (drops its footprint) session raises
-          ``remaining`` self-consistently while ``shared`` stays fixed.
+        Prefix-cache savings use the full running set and remain fixed throughout
+        one hang pass.
         """
         generate_tokens_full = sum(s.total_tokens for s in running if s.status != STATUS_ENV)
         shared = max(0, generate_tokens_full - inst.used_tokens)
@@ -332,7 +278,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
                 continue
             total = self.instance_to_total_kv_tokens.get(instance_id)
             if not total:
-                # Capacity not resolved yet; skip until get_total_kv_cache_tokens lands.
+                # Skip until `get_total_kv_cache_tokens` resolves capacity.
                 continue
             used = int(round(engine_status.get_kv_cache_utilization() * total))
             capacities.append(InstanceCapacity(instance_id=instance_id, total_kv_tokens=total, used_tokens=used))
@@ -365,9 +311,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
     async def _thunder_agent_loop(self):
         """Periodically hang/continue sessions to keep instances within KV capacity."""
         cfg = self._thunder_agent_cfg
-        # Two independent switches (see session_strategy.yaml):
-        #   continue_scope: "bucketed" (per-instance, default/original) | "global" (BFD)
-        #   continue_force_pin: whether to force-pin the chosen instance next turn
+        # Scope controls relocation, while force pinning controls the next turn.
         global_scope = str(cfg.get("continue_scope", "bucketed")) == "global"
         force_pin = bool(cfg.get("continue_force_pin", False))
         self._thunder_scheduler = ThunderAgentScheduler(
@@ -395,20 +339,14 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
             to_hang, to_continue = self._thunder_scheduler.decide(instances, sessions)
             if to_hang:
                 resp = await self._session_post_json("/control/hang", [{"session_id": sid} for sid in to_hang])
-                # The router hangs idle sessions immediately but defers those with a
-                # turn in flight to the next turn boundary; surface both so the
-                # decision can be reconciled against SessionRouter.log.
+                # In-flight sessions defer hanging until their next turn boundary.
                 psrl_logger.info(
-                    f"Requested hang for {len(to_hang)} session(s): "
-                    f"hung={resp.get('hung', [])} deferred={resp.get('deferred', [])} "
+                    f"Requested session hangs: count={len(to_hang)}, "
+                    f"hung={resp.get('hung', [])}, deferred={resp.get('deferred', [])}, "
                     f"missing={resp.get('missing', [])}."
                 )
             if to_continue:
-                # When force_pin is on, pass the chosen instance so the readmitted
-                # session's next turn is force-pinned there (SessionRouter injects
-                # x-force-pin-once). When off, only the session id is sent and SMG
-                # routes the next turn normally. base_worker_id/target_dp_rank are
-                # the two halves of the (replica_id, dp_rank) instance id.
+                # Force pinning applies the selected instance only to the next turn.
                 if force_pin:
                     continue_payload = [
                         {
@@ -422,7 +360,7 @@ class ThunderAgentSessionMixin(SessionSchedulingBase):
                     continue_payload = [{"session_id": sid} for sid, _ in to_continue]
                 resp = await self._session_post_json("/control/continue", continue_payload)
                 psrl_logger.info(
-                    f"Requested continue for {len(to_continue)} session(s): "
-                    f"continued={resp.get('continued', [])} missing={resp.get('missing', [])}."
+                    f"Requested session continues: count={len(to_continue)}, "
+                    f"continued={resp.get('continued', [])}, missing={resp.get('missing', [])}."
                 )
         psrl_logger.info("Stopped thunder_agent loop.")

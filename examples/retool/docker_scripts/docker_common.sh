@@ -1,17 +1,11 @@
-# Shared helpers for docker_*.sh in this directory — source from those scripts; do not execute.
-# Cluster env (set directly or via script-specific positional args before use):
-#   DOCKER_NODE_IPS  — comma-separated ip:gpu_count, e.g. 192.168.1.1:8,192.168.1.2:8
-#   DOCKER_NODE_NUM  — optional; use only the first N hosts from the list (default: all entries)
-# After docker_cluster_init succeeds:
-#   DOCKER_CLUSTER_HOSTS   — bash array of plain IPs
-#   DOCKER_CLUSTER_MANAGER — first host
-#   DOCKER_CLUSTER_WORKERS — remaining hosts (array)
+# Provide shared Docker cluster helpers for sibling scripts.
+# `docker_cluster_init` populates the host array and manager and worker split.
 
 docker_cluster_ips_to_lines() {
   printf '%s' "$DOCKER_NODE_IPS" | sed "s/:.//g; s/,/\\n/g"
 }
 
-# Fills DOCKER_CLUSTER_* globals; returns 0 on success.
+# Populate Docker cluster globals and return success.
 docker_cluster_init() {
   if [ -z "$DOCKER_NODE_IPS" ]; then
     echo "Error: DOCKER_NODE_IPS is not set"

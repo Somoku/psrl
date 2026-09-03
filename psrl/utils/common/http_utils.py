@@ -78,7 +78,7 @@ DEFAULT_HTTP_CONCURRENCY = 256
 class HttpRuntimeConfig:
     """Runtime HTTP client configuration.
 
-    ``total_concurrency`` is the shared budget for all producers.  Each producer
+    ``total_concurrency`` is the shared budget for all producers. Each producer
     receives a fair share via ``producer_count`` so that multiple Ray workers do
     not multiply the intended gateway concurrency.
     """
@@ -94,15 +94,14 @@ class HttpRuntimeConfig:
         return max(1, (self.total_concurrency + self.producer_count - 1) // self.producer_count)
 
 
-# Global HTTP client for POST/GET requests.
 _http_client: aiohttp.ClientSession | None = None
 
-# Maximum concurrency for the global HTTP client.  Kept for compatibility with
+# Maximum concurrency for the global HTTP client. Kept for compatibility with
 # callers that use create_aiohttp_client(concurrency=None).
 _client_concurrency: int = DEFAULT_HTTP_CONCURRENCY
 _runtime_config = HttpRuntimeConfig()
 
-# Optional Ray-based distributed POST dispatch.  The actor pool is created by
+# Optional Ray-based distributed POST dispatch. The actor pool is created by
 # AgentLoopManager and installed into each AgentLoopWorker process.
 _distributed_post_enabled: bool = False
 _post_actors: list[Any] = []
@@ -243,7 +242,7 @@ async def _read_aiohttp_response(response) -> tuple[int, bytes, dict[str, str], 
 async def _read_generic_response(response) -> tuple[int, bytes, dict[str, str], Any]:
     """Read an aiohttp or httpx-style response.
 
-    Tests inject httpx.AsyncClient transports into SessionRouter.  Production
+    Tests inject httpx.AsyncClient transports into SessionRouter. Production
     code uses aiohttp, but supporting both here keeps the proxy helpers simple
     without adding a second HTTP utility path.
     """
@@ -350,7 +349,7 @@ def _smg_error_code(response_headers: Mapping[str, str] | None) -> str | None:
     code = response_headers.get("x-smg-error-code")
     if code is not None:
         return code
-    # Plain `dict` mocks are case-sensitive; scan manually.
+    # Plain `dict` mocks are case-sensitive. Scan manually.
     if not hasattr(response_headers, "getall"):
         for key, value in response_headers.items():
             if key.lower() == "x-smg-error-code":
@@ -365,10 +364,10 @@ def _classify_http_error(
     """Return a more specific exception when `exc` is a classifiable SMG 400.
 
     Otherwise returns `exc` unchanged. Callers should `raise` the returned
-    exception; chained `__cause__` is preserved when a translation occurs.
+    exception. Chained `__cause__` is preserved when a translation occurs.
 
     Only known sentinel codes (`request_aborted`, `prompt_overflow`) are
-    translated — other 400s stay as transport errors so real client mistakes
+    translated. Other 400s stay as transport errors so real client mistakes
     are not silently swallowed.
     """
     if not isinstance(exc, aiohttp.ClientResponseError):
@@ -428,7 +427,6 @@ async def request_raw(
                 _raise_for_status(status, body, response)
             return HttpResponse(status=status, body=body, headers=response_headers)
         except Exception as e:
-            # handle abort error
             translated = _classify_http_error(e, headers)
             if isinstance(translated, RequestAbortedByGatewayError):
                 raise translated from e
@@ -478,7 +476,6 @@ async def request_json(
             data, text = _parse_body(body)
             return JsonHttpResponse(status=status, data=data, headers=response_headers, text=text)
         except Exception as e:
-            # handle abort error
             translated = _classify_http_error(e, headers)
             if isinstance(translated, RequestAbortedByGatewayError):
                 raise translated from e
@@ -510,7 +507,7 @@ async def raw_request(
 ) -> HttpResponse:
     """Send one HTTP request and return a fully buffered response.
 
-    This helper is intentionally status-code agnostic.  It is suitable for
+    This helper is intentionally status-code agnostic. It is suitable for
     proxy paths where 4xx/5xx responses should be forwarded instead of raised.
     """
     return await request_raw(
@@ -567,7 +564,7 @@ def init_http_client(
 ) -> None:
     """Configure the process-local HTTP client budget.
 
-    ``server_concurrency * rollout_engine_num`` is the shared budget.  Dividing
+    ``server_concurrency * rollout_engine_num`` is the shared budget. Dividing
     by ``producer_count`` prevents each AgentLoopWorker from allocating a full
     copy of the gateway concurrency.
     """
@@ -748,9 +745,7 @@ async def delete(url, max_retries=1, headers: dict[str, str] | None = None) -> H
     return await raw_request("DELETE", url, headers=headers, max_retries=max_retries)
 
 
-# ---------------------------------------------------------------------------
-# HTTP Concurrency Profiler
-# ---------------------------------------------------------------------------
+# --- HTTP Concurrency Profiler ---
 
 
 @dataclass

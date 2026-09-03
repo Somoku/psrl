@@ -1,16 +1,7 @@
 """
-Plot per-request route/pop segment timeline + per-instance KV-cache scatter.
+Plot request route segments and per-instance KV cache use.
 
-Top panel:  each request_id on its own row; coloured horizontal segments show
-            which instance it was running on between a route event and the
-            matching pop event (one turn).  Gaps = env/tool execution time.
-            Incomplete turns (route without a matching pop) are omitted.
-Bottom panel: KV-cache utilisation per instance over time (route + pop events).
-
-Both panels share the same x-axis (relative minutes from the first log event).
-
-Usage:
-    python plot_request_route_timeline.py <log_path> -n 1024 -d 10 -o out.png
+Both panels use minutes relative to the first event. Incomplete route segments are omitted.
 """
 
 import argparse
@@ -151,7 +142,7 @@ def parse_log(
             events_captured += 1
             lines_read += 1
 
-    psrl_logger.info(f"Parsed {lines_read} relevant lines; {events_captured} route/pop events captured.")
+    psrl_logger.info(f"Parsed relevant lines: {lines_read}. Captured route and pop events: {events_captured}.")
 
     if t0 is None:
         raise ValueError("No parseable events found in the log file.")
@@ -182,7 +173,7 @@ def pair_segments(
 
         for t_min, kind, inst in events:
             if kind == "route":
-                # Previous route never got a pop — drop it, start the new one.
+                # A new route supersedes any unmatched route.
                 open_route = (t_min, inst)
             elif kind == "pop":
                 if open_route is not None:
@@ -190,9 +181,9 @@ def pair_segments(
                     t_end = max(t_min, t_r + _MIN_SEG_MIN)
                     segs.append((t_r, t_end, inst_r))
                     open_route = None
-                # pop with no open route: its route predates our window; skip.
+                # A pop without an open route predates the window.
 
-        # Trailing open route (no pop in window): drop, do not draw.
+        # Do not draw trailing routes without a pop in the window.
         if segs:
             segments[req_id] = segs
 
@@ -258,7 +249,7 @@ def plot(
         if title:
             ax_top.set_title(title, fontsize=14)
 
-        # Instance legend — sorted by instance id, placed outside right edge.
+        # Sort the instance legend outside the right edge.
         if legend_handles:
             sorted_handles = [legend_handles[k] for k in sorted(legend_handles)]
             ax_top.legend(
@@ -380,7 +371,7 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     psrl_logger.info(
-        f"Parsing {args.log_path!r} for requests 0..{args.num_requests - 1} over {args.duration_min} min window."
+        f"Parsing log={args.log_path!r} for request range=0..{args.num_requests - 1} over minutes={args.duration_min}."
     )
 
     t0, req_events, kv_events = parse_log(
@@ -390,11 +381,11 @@ def main() -> None:
     )
 
     psrl_logger.info(
-        f"Window t0={t0}, {len(req_events)} requests have events, {len(kv_events)} instances have KV data."
+        f"Parsed window t0={t0!s}. Requests with events: {len(req_events)}. Instances with KV data: {len(kv_events)}."
     )
 
     segments = pair_segments(req_events)
-    psrl_logger.info(f"Paired segments for {len(segments)} requests.")
+    psrl_logger.info(f"Paired request segments. Count: {len(segments)}.")
 
     n_instances = args.instances
     if n_instances is None:
@@ -404,7 +395,7 @@ def main() -> None:
             for _, _, inst in segs:
                 all_insts.add(inst)
         n_instances = max(all_insts) + 1 if all_insts else 8
-        psrl_logger.info(f"Auto-detected {n_instances} instances.")
+        psrl_logger.info(f"Auto-detected instance count: {n_instances}.")
 
     plot(
         segments=segments,

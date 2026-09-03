@@ -1,12 +1,10 @@
 """
-E3b memory probe: start one engine instance, read its memory breakdown, exit.
+Start one engine instance, record its E3b memory breakdown, and exit.
 
-This script is designed to be called once per ``max_num_batched_tokens`` value N
-from a shell loop.  Each invocation starts a fresh vLLM engine (necessary because
-``peak_activation`` is profiled at startup under ``max_num_batched_tokens`` and then
-frozen for the lifetime of the engine), reads the memory accounting, and exits.
+Run one process per `max_num_batched_tokens` value because vLLM fixes
+`peak_activation` during engine startup.
 
-Usage::
+Usage:
 
     # Probe N=8192
     PYTHONUNBUFFERED=1 python -m psrl.bench.chunked_prefill.memory_probe \\
@@ -17,11 +15,12 @@ Usage::
         --output results/e3b_N8192.json
 
     # Shell loop for E3b sweep (see run_chunked_prefill_memory_sweep.sh)
-    for N in 512 1024 2048 4096 8192 16384 32768 65536; do
+    for N in 512 1024 2048 4096 8192 16384 32768 65536
+    do
         python -m psrl.bench.chunked_prefill.memory_probe --max-batched-tokens $N ...
     done
 
-Each invocation writes a single JSON object to ``--output`` (or stdout if omitted)
+Each invocation writes one JSON object to `--output`, or stdout when omitted,
 with complete environment metadata and the memory breakdown from rank 0.
 """
 
@@ -135,13 +134,11 @@ def main() -> None:
         enable_prefix_caching=False,
         trust_remote_code=args.trust_remote_code,
         seed=0,
-        worker_extension_cls=(
-            "psrl.bench.chunked_prefill.vllm_extension.ChunkedPrefillProbeExtension"
-        ),
+        worker_extension_cls=("psrl.bench.chunked_prefill.vllm_extension.ChunkedPrefillProbeExtension"),
     )
     psrl_logger.info("Engine initialised.")
 
-    # Read memory breakdown from all ranks; report rank 0.
+    # Report rank zero while retaining every rank in the result.
     mem_per_rank: list[dict[str, Any]] = llm.collective_rpc("get_memory_breakdown")
     rank0 = mem_per_rank[0]
 

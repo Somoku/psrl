@@ -227,20 +227,15 @@ def verify_task(task_id: str, airs_repo: Path, data_root: Path) -> tuple[bool, s
     if not test_with_labels.exists():
         return False, "evaluate_prepare.py did not create test_with_labels."
 
-    # For tasks where test_with_labels has a different row count than prepared/test
-    # (e.g., time series tasks that reformat the data), rebuild the submission with
-    # the correct row count derived from the actual test_with_labels dataset.
-    # Time series tasks also need JSON-array predictions, not scalars.
+    # Rebuild submissions when `test_with_labels` changes the row count.
+    # Time series tasks also require JSON array predictions.
     ts_tasks = {
         "TimeSeriesForecastingKaggleWebTrafficMASE",
         "TimeSeriesForecastingRideshareMAE",
         "TimeSeriesForecastingSolarWeeklyMAE",
     }
     if task_id in ts_tasks:
-        # Each time series task has a specific forecast horizon and data layout.
-        # Kaggle: flat layout (one row = one series), label_len values per row.
-        # Solar: flat layout (one row = one series), 5-step forecast.
-        # Rideshare: nested layout (one row = 15 series), 48-step per series = 2304 total rows.
+        # Forecast horizons differ by task, and Rideshare nests 15 series per row.
         ts_forecast_horizon = {
             "TimeSeriesForecastingKaggleWebTrafficMASE": None,  # use label_len
             "TimeSeriesForecastingRideshareMAE": 48,

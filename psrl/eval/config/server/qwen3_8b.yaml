@@ -1,13 +1,11 @@
-# Qwen3-8B. Dense, text-only, and its 40960 window is the binding constraint on
-# multi-turn agent evals: every turn resends the whole transcript, so cumulative
-# prompt tokens grow quadratically in turn count. Cap agent turns when using this
-# checkpoint, or trials die ungraded rather than scoring zero.
+# Qwen3-8B is dense and text only.
+# Cap agent turns because each turn resends the transcript within the 40960 window.
 checkpoint: /apdcephfs_zwfy10/share_303541817/lhy/models/Qwen3-8B
 served_model_name: qwen3-8b
 max_model_len: 40960
 gpu_memory_utilization: 0.9
 
-# Empty on purpose; see server/qwen35_9b.yaml.
+# Empty because agent text protocols require the unmodified assistant message.
 tool_call_parser: ""
 
 chat_template: ""

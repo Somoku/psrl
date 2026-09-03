@@ -1,24 +1,17 @@
 """
-Batch composition DSL for chunked prefill micro-benchmarks.
+Parse compact batch descriptions for chunked prefill micro-benchmarks.
 
-Grammar (underscore-separated segments):
-  Format: (<count>?) q<q_len>(k?) (s<seq_len>(k?))?
+The grammar is `(<count>?)q<q_len>(k?)(s<seq_len>(k?))?`. The optional `count`
+defaults to one, and `k` multiplies a value by 1024.
 
-  - count:   Number of identical requests (optional, default=1)
-  - q_len:   Query length (new tokens this step)
-  - seq_len: Total KV-cache length (optional; defaults to q_len for prefill)
-  - 'k':     Multiplies value by 1024
+Examples:
+    `q2k` means one request with `q_len=2048` and `kv_len=2048`.
+    `q1s1k` means one request with `q_len=1` and `kv_len=1024`.
+    `8q1s1k` means eight identical decode requests.
+    `2q2k_32q1s1k` combines two prefill and 32 decode requests.
 
-Common patterns::
-
-  q2k              →  1 × (q=2048, kv=2048)        # pure prefill
-  q1s1k            →  1 × (q=1,    kv=1024)         # decode
-  8q1s1k           →  8 × (q=1,    kv=1024)         # 8 decode requests
-  2q2k_32q1s1k     →  2 × (q=2048, kv=2048) + 32 × (q=1, kv=1024)  # mixed
-
-Syntax is intentionally compatible with
-``third_party/vllm/benchmarks/attention_benchmarks/batch_spec.py``
-so specs can be shared across both harnesses.
+Specifications are compatible with
+`third_party/vllm/benchmarks/attention_benchmarks/batch_spec.py`.
 """
 
 from __future__ import annotations
@@ -43,9 +36,7 @@ class BatchRequest:
         if self.q_len <= 0:
             raise ValueError(f"q_len must be > 0, got {self.q_len!r}.")
         if self.kv_len < self.q_len:
-            raise ValueError(
-                f"kv_len must be >= q_len, got kv_len={self.kv_len!r}, q_len={self.q_len!r}."
-            )
+            raise ValueError(f"kv_len must be >= q_len, got kv_len={self.kv_len!r}, q_len={self.q_len!r}.")
 
     @property
     def context_len(self) -> int:
@@ -72,9 +63,7 @@ class BatchRequest:
         return (self.q_len, self.kv_len)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+# --- Internal Helpers ---
 
 _SEG_RE = re.compile(r"^(?:(\d+))?q(\d+)(k?)(?:s(\d+)(k?))?$")
 
@@ -85,9 +74,7 @@ def _parse_size(digits: str, k: str) -> int:
     return v * 1024 if k == "k" else v
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+# --- Public API ---
 
 
 def parse_batch_spec(spec: str) -> list[BatchRequest]:

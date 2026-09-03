@@ -23,7 +23,6 @@ async def single_compute_score(
 ):
     loop = asyncio.get_running_loop()
     try:
-        # Ensure process_completion is called properly
         future = loop.run_in_executor(
             executor,
             partial(evaluation_func, task, completion, reference, task_extra_info),
@@ -31,17 +30,15 @@ async def single_compute_score(
         return await asyncio.wait_for(future, timeout=timeout)
     except asyncio.TimeoutError:
         print(f"[Timeout] Task timeout: {completion}")
-        return None  # Default value for timed-out rows
+        return None
     except Exception as e:
         print(f"[Error] Task failed: {e}, completion: {completion[:80]}")
-        return None  # Default value for failed rows
+        return None
 
 
 @register("prime")
 class PrimeRewardManager(RewardManagerBase):
-    """
-    The Reward Manager used in https://github.com/PRIME-RL/PRIME
-    """
+    """Reward manager used by https://github.com/PRIME-RL/PRIME."""
 
     def __init__(
         self,
@@ -55,7 +52,6 @@ class PrimeRewardManager(RewardManagerBase):
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
-        # PRIME specific config
         self.num_examine = reward_kwargs.get("num_examine", 1)
         self.reward_fn_key = reward_kwargs.get("reward_fn_key", "data_source")
         self.num_processes = reward_kwargs.get("num_processes", 64)
@@ -95,10 +91,7 @@ class PrimeRewardManager(RewardManagerBase):
             lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True),
         )
 
-        # Use single_compute_score with ProcessPoolExecutor for PRIME's evaluation
-        # Check if compute_score is async or sync
         if self.is_async_reward_score:
-            # If it's async, call it directly without executor
             try:
                 result = await asyncio.wait_for(
                     self.compute_score(data_source, response_str, ground_truth, extra_info),
@@ -111,7 +104,6 @@ class PrimeRewardManager(RewardManagerBase):
                 print(f"[Error] PRIME scoring failed: {e}, completion: {response_str[:80]}")
                 result = None
         else:
-            # If it's sync, use ProcessPoolExecutor
             with ProcessPoolExecutor(max_workers=1) as executor:
                 try:
                     result = await single_compute_score(
@@ -127,7 +119,6 @@ class PrimeRewardManager(RewardManagerBase):
                     print(f"[Error] PRIME scoring failed: {e}, completion: {response_str[:80]}")
                     result = None
                 finally:
-                    # Clean up processes
                     for pid, proc in executor._processes.items():
                         try:
                             p = psutil.Process(pid)
@@ -141,7 +132,6 @@ class PrimeRewardManager(RewardManagerBase):
 
         reward_extra_info = {}
 
-        # Process result
         score: float
         if result is None or isinstance(result, Exception):
             score = 0.0
@@ -157,7 +147,6 @@ class PrimeRewardManager(RewardManagerBase):
         reward_extra_info["acc"] = score
         reward = score
 
-        # Logging for examination
         if data_source not in self.already_print_data_sources:
             self.already_print_data_sources[data_source] = 0
 

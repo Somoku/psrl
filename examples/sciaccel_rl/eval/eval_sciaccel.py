@@ -1,40 +1,7 @@
 """
-Standalone SciAccel-RL evaluation entry point.
+Evaluate SciAccel tasks through Harbor against OpenAI-compatible endpoints.
 
-Runs Harbor episodes over the v2 dataset against any OpenAI-compatible endpoint
-(typically a vLLM server holding the checkpoint under test), selects the correct
-per-category reward key, and writes evaluation artefacts to an output directory.
-
-This is intentionally decoupled from the PSRL training loop: it does not create
-a TITO session, does not go through `SessionRouter`, and collects no token IDs.
-It exists to measure a checkpoint (or the base model) before or outside RL.
-
-Why not `sciaccel-rl/utils/rl/rollout_harbor.py`: that collector hard-codes
-`reward = rewards["reward"]`, which for repair and implementation tasks is
-inflated by the straw floor. The signal there is `reward_repair`. It also does
-not read the dataset, so eval and training would drift apart.
-
-Usage::
-
-    # Anchors first: oracle must score 1.0, nop must score 0.0. No model needed.
-    python -m examples.sciaccel_rl.eval.eval_sciaccel \
-        --dataset examples/sciaccel_rl/data/v2/all.parquet \
-        --task-glob 'sciaccel/laps-repair-coef-2d-rktmod-l17k1' \
-        --agent oracle --output-dir output/eval/anchor_oracle
-
-    # Baseline a served checkpoint over the whole dataset
-    python -m examples.sciaccel_rl.eval.eval_sciaccel \
-        --dataset examples/sciaccel_rl/data/v2/all.parquet \
-        --agent terminus-2 --served-model-name qwen3-8b \
-        --api-base http://localhost:8000/v1 \
-        --k 3 --n-concurrent 16 --output-dir output/eval/qwen3_8b
-
-Output artefacts::
-
-    <output-dir>/
-      results.jsonl   one JSON per line per trial, appended as batches finish
-      summary.json    { overall, by_category, by_family, errors, config }
-      jobs/           Harbor job directories (agent trajectory, verifier reward.json)
+The evaluator selects each task's reward key and writes trial records plus summaries.
 """
 
 from __future__ import annotations
@@ -65,18 +32,15 @@ if not psrl_logger.handlers:
     psrl_logger.addHandler(_handler)
     psrl_logger.propagate = False
 
-# Agents that play the policy themselves and need no model endpoint. They are the
-# anchors the sciaccel-rl README requires before any agent number means anything:
-# oracle applies the reference solution, nop does nothing.
+# Anchor agents execute without a model endpoint.
+# Oracle applies the reference solution while nop does nothing.
 _ANCHOR_AGENTS = ("oracle", "nop")
 
 # Path to the GPU device passthrough overlay, reused from the training config so
 # the CUDA task sees the same devices in eval as in training.
 _GPU_COMPOSE_OVERRIDE = Path(__file__).resolve().parents[1] / "config" / "gpu-compose-override.yaml"
 
-# Redirects apt to the internal Debian mirror at image-build time. Needed on hosts
-# with no direct internet route, where apt over the corporate proxy is slow enough
-# to blow the task-declared build timeout. See the file's header for the details.
+# Redirect apt to an internal mirror on hosts without direct internet access.
 _APT_MIRROR_OVERRIDE = Path(__file__).resolve().parents[1] / "config" / "apt-mirror-override.yaml"
 
 
@@ -180,23 +144,11 @@ def _build_agent_config(
             # Terminus-2's proactive summarization rewrites the transcript, which
             # destroys the turn structure the eval is trying to measure.
             "enable_summarize": False,
-            # Bound the episode count. Terminus-2 defaults to 1_000_000, i.e.
-            # unbounded, and every turn resends the whole transcript, so a task
-            # that keeps exploring walks into the context window and dies with
-            # ContextLengthExceededError before the verifier ever runs (56 of 144
-            # tasks did exactly that, median 39 turns). Capping it lets the loop
-            # end normally, so whatever the agent has delivered still gets
-            # graded. The loop is a plain `for episode in range(max_turns)`, so
-            # hitting the cap raises nothing.
+            # Bound turns so the verifier can grade work before context exhaustion.
             "max_turns": max_turns,
             "suppress_max_turns_warning": True,
             "temperature": temperature,
-            # max_output_tokens must be a per-turn generation budget, NOT the full
-            # window: terminus-2 passes it through as `max_tokens`, so setting it
-            # to max_model_len asks for a completion as long as the entire context
-            # and the request is rejected once the transcript is non-trivial.
-            # Thinking-mode turns here measure ~1.1k completion tokens, so 4k is
-            # generous while leaving the rest of the window for the transcript.
+            # Keep the per-turn output budget below the full context window.
             "model_info": {
                 "max_input_tokens": max_model_len,
                 "max_output_tokens": max_output_tokens,
@@ -216,24 +168,7 @@ def _classify_exception(message: str | None, exc_type: str | None = None) -> str
     """
     Bucket a trial exception so model failures stay separable from harness failures.
 
-    A context-window overflow is a model-side outcome (the policy talked itself
-    out of budget), not a broken environment, so it gets its own bucket rather
-    than landing in the generic error count.
-
-    Both inputs matter: Harbor raises `ContextLengthExceededError` and
-    `OutputLengthExceededError` with an EMPTY message, so classifying on the
-    message alone silently reports a context blowout as a clean zero. The type
-    name is the reliable signal; the message is the fallback for the vLLM 400
-    that arrives as a generic `BadRequestError`.
-
-    `OutputLengthExceededError` belongs in the SAME bucket, despite its name. It is
-    raised on `finish_reason == "length"` (`harbor/llms/lite_llm.py`), and on the
-    litellm chat path nothing ever sends a per-request `max_tokens` --
-    `model_info.max_output_tokens` reaches only the Responses API and cost
-    accounting. So the boundary being hit is the server's own `--max-model-len`, i.e.
-    context exhaustion, and splitting the two invites "raise --max-output-tokens",
-    which changes nothing. Verified on the Qwen3.5-9B run: per-turn output was
-    219-549 tokens against a nominal 4096 cap, so that cap was never binding.
+    Exception types are authoritative when Harbor records an empty message.
 
     Args:
         message (str | None): The trial's exception message, if any.
@@ -330,14 +265,11 @@ async def _run_batch(
         exception_type = trial.exception_info.exception_type if trial.exception_info else None
         error_class = _classify_exception(exception, exception_type)
 
-        # An empty reward dict means the verifier never ran, so there is no
-        # measurement here. Scoring it 0.0 silently would put a harness failure
-        # in the same bucket as a policy that tried and failed.
+        # An empty reward dictionary means the verifier produced no measurement.
         if not rewards and error_class == "ok":
             error_class = "no_reward"
 
-        # Cost and effort accounting. `n_episodes` is terminus-2's own turn
-        # counter; token totals and phase timings come from the trial result.
+        # `n_episodes` is the Terminus turn counter.
         agent = trial.agent_result
         agent_meta = (agent.metadata or {}) if agent else {}
         n_input = agent.n_input_tokens if agent else None
@@ -714,17 +646,14 @@ async def _regrade_unverified(
     for record in records:
         if record.get("rewards") or not record.get("trial_uri"):
             continue
-        # No artifact check: the verifier grades an empty artifact dir happily
-        # (measured 31 s, full reward dict), and a graded 0.0 is a different fact from
-        # an empty reward dict. The graded result also carries `floor`, which
-        # `reward_repair` normalizes against and which differs per task.
+        # Regrade even empty artifact directories to distinguish a measured zero.
         if by_name.get(record["task_name"]):
             pending.append(record)
 
     if not pending:
         return 0
 
-    psrl_logger.info(f"Regrading {len(pending)} unverified trial(s) from their delivered artifacts...")
+    psrl_logger.info(f"Regrading unverified trials. Count: {len(pending)}...")
 
     n_regraded = 0
     for record in pending:
@@ -748,9 +677,7 @@ async def _regrade_unverified(
 
         for trial in result.trial_results or []:
             rewards = (
-                dict(trial.verifier_result.rewards)
-                if trial.verifier_result and trial.verifier_result.rewards
-                else {}
+                dict(trial.verifier_result.rewards) if trial.verifier_result and trial.verifier_result.rewards else {}
             )
             if not rewards:
                 continue
@@ -859,7 +786,7 @@ def run_eval(
         per_family (int): Cap per (category, family, tree) group.
         limit (int): Overall task cap.
         n_attempts (int): Attempts per task.
-        n_concurrent (int): Retained for reporting; concurrency is now set by
+        n_concurrent (int): Retained for reporting. Concurrency is set by
             `max_per_instance` times the endpoint count.
         max_per_instance (int): Concurrent tasks per model endpoint.
         temperature (float): Sampling temperature.
@@ -877,8 +804,8 @@ def run_eval(
             them fail on a provider without GPU support.
         regrade_unverified (bool): After the main pass, grade trials whose verifier
             never ran but which left `.dat` artifacts behind. An agent-side exception
-            skips Harbor's verifier entirely, so those trials carry no measurement at
-            all; regrading recovers the real ladder score from what was delivered.
+            skips Harbor's verifier entirely, so those trials carry no measurement.
+            Regrading recovers the ladder score from delivered artifacts.
 
     Returns:
         dict[str, Any]: The summary payload written to `summary.json`.
@@ -895,11 +822,7 @@ def run_eval(
     results_path.unlink(missing_ok=True)
     jobs_dir = output_dir / "jobs"
 
-    # One agent config per endpoint. Several independent vLLM servers are the
-    # practical way to use a whole node here: this build's data-parallel mode
-    # fails to start ("DP Coordinator process failed to report ZMQ addresses"),
-    # and N single-model servers saturate the GPUs just as well. Batches are
-    # dealt round-robin across them.
+    # Build one agent configuration per model endpoint.
     endpoints = [b.strip() for b in api_base.split(",") if b.strip()]
     agent_configs = [
         _build_agent_config(
@@ -915,21 +838,20 @@ def run_eval(
         for endpoint in endpoints
     ]
 
-    # A Job aborts as a unit and Harbor's local Docker provider rejects GPU
-    # tasks outright ("does not support GPU allocation"), so GPU tasks are only
-    # ever errors here. Drop them on request rather than logging noise.
+    # Drop GPU tasks when the local Docker provider cannot allocate GPUs.
     gpu_tasks = [t for t in tasks if int(t["extra_info"].get("gpus", 0)) > 0]
     if gpu_tasks and skip_gpu_tasks:
         psrl_logger.warning(
-            f"Skipping {len(gpu_tasks)} GPU task(s) that the local Docker provider "
-            f"cannot host: {[t['task_name'] for t in gpu_tasks]}."
+            f"Skipping GPU tasks unsupported by local Docker. Count: {len(gpu_tasks)}. "
+            f"Tasks: {[t['task_name'] for t in gpu_tasks]!r}."
         )
         tasks = [t for t in tasks if int(t["extra_info"].get("gpus", 0)) == 0]
 
     slots = max_per_instance * len(agent_configs)
     psrl_logger.info(
-        f"Evaluating {len(tasks)} tasks with agent {agent!r}, k={n_attempts}, "
-        f"{len(endpoints)} endpoint(s) x {max_per_instance} slots = {slots} in flight: {endpoints}."
+        f"Evaluating tasks={len(tasks)} with agent={agent!r}, attempts={n_attempts}, "
+        f"endpoints={len(endpoints)}, slots_per_endpoint={max_per_instance}, total_slots={slots}. "
+        f"Endpoint URLs: {endpoints!r}."
     )
 
     t_start = time.monotonic()
@@ -968,9 +890,7 @@ def run_eval(
             )
         )
         if n_regraded:
-            # results.jsonl was appended live, so it still holds the pre-regrade rows.
-            # Rewrite it rather than append, otherwise a task appears twice with
-            # different scores and every downstream count doubles.
+            # Rewrite live results after regrading to keep one row per task.
             with results_path.open("w", encoding="utf-8") as fh:
                 for record in records:
                     fh.write(json.dumps(record) + "\n")
@@ -1049,7 +969,7 @@ def _print_summary(summary: dict[str, Any], output_dir: Path) -> None:
     )
     print(
         f"Tokens  : {overall['mean_total_tokens']} billed (cumulative over turns, "
-        f"grows quadratically; not the trajectory length)"
+        f"grows quadratically and does not represent trajectory length)"
     )
 
     print("\n--- by category ---")

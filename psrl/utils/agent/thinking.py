@@ -1,47 +1,26 @@
-"""Chain-of-thought handling modes for multi-turn agentic rollouts.
+"""Configure chain-of-thought handling for multi-turn agentic rollouts.
 
-TITO chains a session's turns into a single trajectory by hashing each assistant
-message, ``reasoning_content`` included (smg ``crates/tito/src/normalizer.rs``).
-Harness clients such as terminus-2 replay history as ``{role, content}`` only, so
-once the gateway splits ``<think>`` out into ``reasoning_content`` the replayed
-prefix stops hashing onto the stored leaf and SMG forks a fresh trajectory on
-every turn (``crates/tito/src/store.rs`` ``resolve_trajectory_id``).
-
-This module is the single place that names the four coherent responses to that and
-the invariants each one implies, so the agent loop (which decides how many
-trajectories to keep) and the harness runner (which decides what to send the
-gateway) cannot drift apart. See ``psrl/trainer/config/psrl/agentic_rl.yaml`` for
-the user-facing description and ``examples/sciaccel_rl/knowledge.md`` for the
-measurements behind it.
+TITO hashes `reasoning_content` into each trajectory. Harnesses that omit it
+during replay can fork a new trajectory on every turn.
 """
 
 from __future__ import annotations
 
-# Accept the forks and train every trajectory. Each one is internally consistent
-# (its prompt and response come from the same request), so a fork costs cross-turn
-# context, not correctness.
+# Train every internally consistent trajectory when replay forks the session.
 MULTI_TRAJ = "multi_traj"
 
-# Same rollout as MULTI_TRAJ, but keep only the session's longest trajectory.
-# Trades data volume for one clean sample per episode.
+# Keep only the session's longest trajectory.
 LONGEST_TRAJ = "longest_traj"
 
-# Keep the CoT inline in `content` so nothing forks: reasoning parser OFF plus an
-# accumulating chat template that replays every prior turn's <think> block. One
-# session yields one trajectory whose prompt carries several CoT segments.
+# Keep CoT in `content` and replay prior `<think>` blocks to avoid forks.
 MULTI_THINKING = "multi_thinking"
 
 # Turn thinking off entirely. No CoT to split, so nothing forks.
 DISABLE_THINKING = "disable_thinking"
 
-SUPPORTED_THINKING_TEMPLATES = frozenset(
-    {MULTI_TRAJ, LONGEST_TRAJ, MULTI_THINKING, DISABLE_THINKING}
-)
+SUPPORTED_THINKING_TEMPLATES = frozenset({MULTI_TRAJ, LONGEST_TRAJ, MULTI_THINKING, DISABLE_THINKING})
 
-# Modes that guarantee a session produces exactly one trajectory, because the
-# assistant message the client replays is byte-identical to the one TITO stored.
-# The agent loop may keep every trajectory it is given under these modes: a fork
-# here means an invariant broke, not that forking is expected.
+# A fork in these modes violates the single-trajectory invariant.
 _SINGLE_TRAJECTORY_MODES = frozenset({MULTI_THINKING, DISABLE_THINKING})
 
 # Modes that require the gateway's reasoning parser to stay OFF so the full
@@ -56,8 +35,7 @@ def validate_thinking_template(mode: str) -> str:
     """Return ``mode`` if it names a supported policy, else raise ``ValueError``."""
     if mode not in SUPPORTED_THINKING_TEMPLATES:
         raise ValueError(
-            f"psrl.agentic_rl.thinking_template must be one of "
-            f"{sorted(SUPPORTED_THINKING_TEMPLATES)}, got {mode!r}."
+            f"psrl.agentic_rl.thinking_template must be one of {sorted(SUPPORTED_THINKING_TEMPLATES)}, got {mode!r}."
         )
     return mode
 
@@ -116,9 +94,7 @@ def select_trajectories(mode: str, training_data: list[dict]) -> list[dict]:
     """
     if not keeps_longest_trajectory_only(mode) or len(training_data) <= 1:
         return training_data
-    # Longest by trained tokens, not by turn count: a single long turn carries more
-    # signal than several truncated ones. `max` keeps the earliest on a tie, which
-    # prefers the trajectory that started at the session root.
+    # Token length is the training signal. `max` preserves the earliest trajectory on ties.
     return [max(training_data, key=lambda item: len(item.get("response_ids") or []))]
 
 

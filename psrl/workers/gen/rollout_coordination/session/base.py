@@ -1,9 +1,7 @@
 """Shared primitives for session hang/continue scheduling.
 
-Provides the constants, dataclasses, abstract base scheduler, and the
-generic HTTP mixin used by any concrete session strategy (e.g. ThunderAgent).
-The constants here are the source of truth; session_router.py keeps its own
-copies because it runs in a separate uvicorn process.
+The session router duplicates these constants because it runs in a separate
+Uvicorn process.
 """
 
 from __future__ import annotations
@@ -56,20 +54,17 @@ class SessionScheduler(ABC):
     ) -> tuple[list[str], list[tuple[str, RolloutInstanceId]]]:
         """Return ``(session_ids_to_hang, [(session_id, continue_instance), ...])``.
 
-        The continue list pairs each readmitted session with the instance it
-        should be routed to; ``None`` instances are not permitted here (a
-        strategy that defers routing to SMG should simply not emit the pair).
+        The continue list pairs each readmitted session with its target instance.
+        `None` instances are not permitted here because a strategy that defers
+        routing to SMG should simply not emit the pair.
         """
 
 
 class SessionSchedulingBase:
-    """Mixin providing generic session-router HTTP helpers.
+    """
+    Provide generic session-router HTTP helpers.
 
-    Concrete session scheduling mixins (e.g. ThunderAgentSessionMixin) inherit
-    from this class for the shared HTTP plumbing.  The mixin expects:
-      self.session_router_url (str | None)
-      self._session_client (aiohttp.ClientSession | None)
-    to be initialized in the host class (RolloutCoordinator.__init__).
+    The host class must initialize `session_router_url` and `_session_client`.
     """
 
     async def _ensure_session_client(self) -> aiohttp.ClientSession:

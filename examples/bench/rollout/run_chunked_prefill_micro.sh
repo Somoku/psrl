@@ -1,19 +1,6 @@
 #!/usr/bin/env bash
-# Run chunked prefill micro-benchmark (E1, E2, E3a).
-#
-# Usage:
-#   bash run_chunked_prefill_micro.sh [TP] [MODEL_PATH] [BUDGET] [EXPERIMENT] [GPU_UTIL]
-#
-# Positional arguments (all optional):
-#   TP           Tensor parallel size (default: 1)
-#   MODEL_PATH   Path to the HuggingFace model (default: ${PSRL_WORKSPACE}/models/SWE-agent-LM-7B)
-#   BUDGET       max_num_batched_tokens (default: 65536)
-#   EXPERIMENT   One of: e1, e2, e3a, all (default: all)
-#   GPU_UTIL     gpu_memory_utilization (default: 0.90)
-#
-# Examples:
-#   bash run_chunked_prefill_micro.sh 1
-#   bash run_chunked_prefill_micro.sh 4 /path/to/model 65536 e1
+# Run chunked prefill microbenchmarks.
+# Optional arguments select parallelism, model, budget, experiment, and GPU utilization.
 set -xeuo pipefail
 
 source ${PSRL_WORKSPACE}/env/psrl.sh

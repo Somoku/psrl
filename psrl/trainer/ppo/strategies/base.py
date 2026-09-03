@@ -1,9 +1,7 @@
-"""StepStrategy base class, STAGE_META tag table, and strategy factory.
+"""
+Define training step strategies and stage metadata.
 
-STAGE_META tags each training phase for the future routine-scheduler seam:
-  per_sample     — safe to run on a chunk as it arrives (old_log_prob, ref, values, reward)
-  batch_coupled  — must see the whole (or group-complete) batch (advantage)
-  optimizer_step — optimizer update
+`STAGE_META` distinguishes chunk-safe, batch-coupled, and optimizer stages.
 """
 
 from __future__ import annotations
@@ -73,7 +71,7 @@ class StepStrategy(ABC):
 
         Args:
             batch: Final full batch after all training phases.
-            metrics: Accumulator dict — validation metrics merged in-place.
+            metrics: Accumulator dict updated with validation metrics.
             timing_raw: Timing dict passed to ``marked_timer`` contexts.
             actor_updated: Whether the actor was updated this step.
                 Checkpoint save is gated on this flag to match the original

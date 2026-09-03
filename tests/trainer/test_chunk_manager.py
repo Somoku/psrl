@@ -15,9 +15,7 @@ from transfer_queue import KVBatchMeta
 pytestmark = pytest.mark.cpu_test
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_entry_info(
@@ -94,9 +92,7 @@ class FakeManager:
         self.train_accumulated_buffer_size[buffer_id] = self.train_accumulated_buffer_size.get(buffer_id, 0) + n_groups
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 
 
 class TestChunkEmission:
@@ -153,7 +149,6 @@ class TestChunkEmission:
             assert len(chunk_meta) == 2
             assert is_last is False
 
-            # Consumed; should be gone.
             assert (buf, 0) not in mgr._resolved_train_chunks, (
                 "Resolved chunk should have been consumed by wait_for_training_chunk."
             )
@@ -161,10 +156,7 @@ class TestChunkEmission:
         asyncio.run(_run())
 
     def test_is_last_on_exact_divisible(self):
-        """When total groups is exactly divisible by chunk_size, second chunk carries is_last=True.
-
-        4 groups, chunk_size=2 → 2 chunks; chunk index 1 must have is_last=True.
-        """
+        """Mark the second of two evenly sized chunks as final."""
 
         async def _run():
             mgr = FakeManager(chunk_size=2, ready_total=4)

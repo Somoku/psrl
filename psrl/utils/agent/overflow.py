@@ -1,18 +1,7 @@
-"""Detect vLLM prompt-overflow 400 errors and convert them to a terminal exception.
+"""Convert vLLM prompt-overflow HTTP 400 errors into terminal exceptions.
 
-litellm wraps vLLM's "prompt is too long" 400 as a generic ``BadRequestError``
-because the wording differs from what litellm expects (``"is longer than the
-model's context length"`` vs vLLM's ``"is longer than the maximum model length
-of"``). Without intervention, the ``tenacity`` retry loop in
-``minisweagent.models.LitellmModel.query`` retries indefinitely until the
-episode times out.
-
-This module provides:
-
-- ``PromptOverflowError`` — a terminal exception that aborts the retry loop.
-- ``is_prompt_overflow(exc)`` — whether an exception is a vLLM overflow 400.
-- ``ensure_overflow_handling(model)`` — instance-level patch (idempotent).
-- ``handle_prompt_overflow(cls)`` — class decorator equivalent.
+Litellm does not recognize vLLM's wording, so unclassified errors would retry
+until the episode times out.
 """
 
 from __future__ import annotations

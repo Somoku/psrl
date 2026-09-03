@@ -79,7 +79,7 @@ def rewrite_dataset_yaml(src_yaml: Path, dst_yaml: Path, new_data_path: str) -> 
     payload["data_path"] = new_data_path
     dst_yaml.parent.mkdir(parents=True, exist_ok=True)
     dst_yaml.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
-    psrl_logger.info(f"Wrote {dst_yaml} with data_path {new_data_path!r}.")
+    psrl_logger.info(f"Updated data_path={new_data_path!r} in {dst_yaml!s}.")
 
 
 def run_stage_one(airs_repo: Path, raw_dir: Path) -> None:
@@ -143,9 +143,8 @@ def run_stage_one(airs_repo: Path, raw_dir: Path) -> None:
     if completed.returncode != 0:
         raise RuntimeError(f"Stage 1 download failed with exit code {completed.returncode}.")
 
-    # The download script does not exit non-zero on partial failure.
-    # Cross-check the failed log against what is actually on disk: if the data
-    # is already present from a previous run, partial failure is benign.
+    # The download script can report a partial failure despite complete data on disk.
+    # Validate the expected directories before treating its failure log as fatal.
     failed_log = airs_repo / "failed_datasets.txt"
     if failed_log.exists() and failed_log.stat().st_size > 0:
         csv_path = airs_repo / "datasets" / "hf_datasets.csv"
@@ -215,10 +214,8 @@ def run_stage_two(
         if completed.returncode != 0:
             raise RuntimeError(f"prepare.py failed for task {task_id} with exit code {completed.returncode}.")
 
-        # evaluate_prepare.py needs a submission file to produce test_with_labels.
-        # Build a dummy single-constant submission to satisfy its input requirement.
-        # The labels it writes are what the in-container evaluate.py reads at episode time.
-        # evaluate_prepare.py reads from agent_log_dir (logs/submission.csv), so place it there.
+        # `evaluate_prepare.py` reads a placeholder submission from `agent_log_dir`
+        # before producing the labels used by the in-container evaluator.
         dummy_sub = log_dir / "submission.csv"
         if not dummy_sub.exists():
             build_dummy_submission = subprocess.run(
@@ -242,8 +239,7 @@ def run_stage_two(
             )
             if build_dummy_submission.returncode != 0:
                 psrl_logger.warning(
-                    f"Could not build a dummy submission for {task_id}: "
-                    f"{build_dummy_submission.stderr[:200]}."
+                    f"Could not build a dummy submission for {task_id}: {build_dummy_submission.stderr[:200]}."
                 )
 
         eval_prepare = rad_dir / "evaluate_prepare.py"
@@ -265,9 +261,7 @@ def run_stage_two(
                 text=True,
             )
             if completed.returncode != 0:
-                psrl_logger.warning(
-                    f"evaluate_prepare.py failed for {task_id}: {completed.stderr[:200]}."
-                )
+                psrl_logger.warning(f"evaluate_prepare.py failed for {task_id}: {completed.stderr[:200]}.")
 
         for required in ("train", "test", "test_with_labels"):
             if not (task_out / required).exists():
@@ -335,7 +329,7 @@ def main() -> None:
 
     rad_root = args.airs_repo / "airsbench" / "tasks" / "rad"
     task_ids = sorted(path.name for path in rad_root.iterdir() if path.is_dir())
-    psrl_logger.info(f"Preparing {len(task_ids)} AIRS-Bench task(s).")
+    psrl_logger.info(f"Preparing AIRS-Bench tasks. Count: {len(task_ids)}.")
 
     run_stage_one(args.airs_repo, raw_dir)
     run_stage_two(args.airs_repo, raw_dir, prepared_dir, task_ids)

@@ -26,8 +26,7 @@ DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-8B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path ${HF_MODEL_PATH} --output_path ${DIST_CKPT_PATH}
 
 # --- Data ---
-# Train: SWE-smith-py 1 000-problem repo-balanced subset.
-# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
@@ -77,9 +76,8 @@ VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / VAL_TP ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=${VAL_TP}
 
 # --- Algorithm (GRPO / DAPO) ---
-# Dynamic sampling filter: mirrors OpenClaw's check_reward_nonzero_std.
-# Drops rollout groups where all n=8 samples share the same reward (std=0),
-# preventing zero-gradient updates on batches where every rollout failed.
+
+# Drop groups with zero reward variance to avoid zero-gradient updates.
 enable_dynamic_sampling_filter=True
 adv_estimator=grpo
 use_kl_in_reward=False

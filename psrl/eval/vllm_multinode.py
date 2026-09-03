@@ -186,9 +186,7 @@ def _launch_one_host(
 
     command = build_remote_command(spec_json, str(host_dir), env_script)
     target = f"{ssh_user}@{host}" if ssh_user else host
-    # ssh joins its trailing arguments with spaces and the remote shell re-splits the
-    # result, so the command must be quoted as one word for that shell to see it as a
-    # single -c argument.
+    # SSH re-splits trailing arguments, so quote the command as one `-c` argument.
     argv = ["ssh", *_SSH_OPTS, target, "bash", "-lc", shlex.quote(command)]
 
     psrl_logger.info(f"Launching fleet on {host}...")
@@ -267,9 +265,7 @@ def launch_multinode(
         psrl_logger.info(f"  would run on each: {command}")
         return MultinodeResult(served_model_name=spec.fleet.served_model_name)
 
-    # ssh has to outlive the remote's own readiness wait, plus room for the model
-    # load itself; otherwise a slow host is reported as a timeout rather than as
-    # the slow-but-fine host it is.
+    # Keep SSH alive beyond the remote readiness wait so a slow model load is not reported as a timeout.
     timeout_sec = spec.fleet.wait_ready_sec + 600.0
     with ThreadPoolExecutor(max_workers=max(len(spec.hosts), 1)) as pool:
         outcomes = list(

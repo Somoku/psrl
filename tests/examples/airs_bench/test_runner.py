@@ -55,9 +55,7 @@ def test_model_config_points_litellm_at_the_session_url():
     assert completion_kwargs["max_tokens"] == 4096
     assert completion_kwargs["extra_body"]["top_k"] == 20
     headers = completion_kwargs["extra_headers"]
-    assert headers["x-smg-tito-trajectory-id"] == "0", (
-        "Manual trajectory id strategy requires the TITO header."
-    )
+    assert headers["x-smg-tito-trajectory-id"] == "0", "Manual trajectory id strategy requires the TITO header."
 
 
 @pytest.mark.cpu_test

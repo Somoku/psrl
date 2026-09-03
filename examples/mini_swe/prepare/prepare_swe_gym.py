@@ -1,47 +1,5 @@
 """
-SWE-Gym Dataset Converter.
-
-Converts the HuggingFace SWE-Gym dataset into the PSRL parquet format consumed
-by ``fsdp_qwen_7b_swe_gym.sh`` and related training scripts.
-
-Each output row contains:
-  - prompt:        minimal [user] message (framework appends agent templates).
-  - data_source:   "swe_gym".
-  - reward_model:  grounding truth for reward computation.
-  - extra_info:    per-SWE-problem overrides, grading metadata, and eval_script.
-  - agent_name:    "mini_swe_agent".
-
-Docker image convention (from OpenClaw-RL swe_utils.py):
-  SWE-Gym: xingyaoww/sweb.eval.x86_64.{instance_id.replace("__", "_s_").lower()}:latest
-
-Usage::
-
-    # Full SWE-Gym (2438 instances, requires swebench 2.0.13 / SWE-Bench-Fork)
-    python -m examples.mini_swe.prepare.prepare_swe_gym \\
-        --dataset gym \\
-        --output-dir examples/mini_swe/data/swe_gym_2438
-
-    # SWE-Gym Subset (100 instances, has eval_script pre-computed)
-    python -m examples.mini_swe.prepare.prepare_swe_gym \\
-        --dataset gym-subset \\
-        --output-dir examples/mini_swe/data/swe_gym_subset_100
-
-    # Full SWE-Gym, repo-balanced 500
-    python -m examples.mini_swe.prepare.prepare_swe_gym \\
-        --dataset gym \\
-        --total 500 \\
-        --repo-balanced \\
-        --output-dir examples/mini_swe/data/swe_gym_500
-
-Environment notes:
-    The full SWE-Gym dataset does NOT ship with eval_script. To generate them,
-    you need swebench 2.0.13 (the SWE-Bench-Fork) installed:
-        pip install git+https://github.com/SWE-Gym/SWE-Bench-Fork.git
-    After generating the parquet, restore swebench 4.1.0:
-        pip install swebench==4.1.0
-
-    The SWE-Gym Subset (gym-subset) already has eval_script in HuggingFace
-    and does NOT require the fork.
+Convert SWE-Gym datasets into PSRL parquet files.
 """
 
 from __future__ import annotations
@@ -61,9 +19,7 @@ from examples.mini_swe.prepare.swebench_subsets import (
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# ---------------------------------------------------------------------------
-# Dataset mappings
-# ---------------------------------------------------------------------------
+# --- Dataset mappings ---
 
 _DATASET_HF_MAP: dict[str, str] = {
     "gym": "SWE-Gym/SWE-Gym",
@@ -75,9 +31,7 @@ _DATASET_SPLIT_MAP: dict[str, str] = {
     "gym-subset": "train",
 }
 
-# ---------------------------------------------------------------------------
-# Image-name helpers (SWE-Gym convention: "__" → "_s_")
-# ---------------------------------------------------------------------------
+# --- Image name helpers ---
 
 
 def get_swegym_image_name(swe_problem: dict[str, Any]) -> str:
@@ -98,9 +52,7 @@ def get_swegym_image_name(swe_problem: dict[str, Any]) -> str:
     return f"xingyaoww/sweb.eval.x86_64.{id_compat}:latest"
 
 
-# ---------------------------------------------------------------------------
-# eval_script resolution
-# ---------------------------------------------------------------------------
+# --- Evaluation script resolution ---
 
 
 def _get_eval_script(row: dict[str, Any], has_eval_script_col: bool) -> str:
@@ -153,9 +105,7 @@ def _get_eval_script(row: dict[str, Any], has_eval_script_col: bool) -> str:
         return ""
 
 
-# ---------------------------------------------------------------------------
-# Row conversion
-# ---------------------------------------------------------------------------
+# --- Row conversion ---
 
 
 def _ensure_list(value: Any) -> list[str]:
@@ -260,9 +210,7 @@ def _build_row(
     }
 
 
-# ---------------------------------------------------------------------------
-# Main conversion logic
-# ---------------------------------------------------------------------------
+# --- Main conversion ---
 
 
 def convert_dataset(
@@ -290,7 +238,7 @@ def convert_dataset(
     Returns:
         pd.DataFrame: Converted dataset, ready to write as parquet.
     """
-    from datasets import load_dataset  # local import — heavy dep
+    from datasets import load_dataset  # Avoid loading the heavy dependency at module import.
 
     hf_path = _DATASET_HF_MAP.get(dataset_key)
     assert hf_path is not None, f"Unknown dataset key {dataset_key!r}. Valid keys: {sorted(_DATASET_HF_MAP.keys())}."
@@ -344,9 +292,7 @@ def convert_dataset(
     return df
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# --- CLI ---
 
 
 def main() -> None:

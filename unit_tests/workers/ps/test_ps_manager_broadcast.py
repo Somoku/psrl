@@ -1,11 +1,9 @@
 """
-Unit tests for PSManager broadcast_init integration.
+Test `PSManager` broadcast initialization integration.
 
 Tests cover:
-1. TestCoordinateBroadcastInit — _coordinate_broadcast_init builds plan internally and
-   drives the broadcast loop correctly.
-2. TestBindPsWorkerGroupBroadcast — bind_ps_worker_group registers PS agent names on
-   MetaServer when broadcast_init is enabled.
+1. `TestCoordinateBroadcastInit` builds a plan internally and drives the broadcast loop.
+2. `TestBindPsWorkerGroupBroadcast` registers PS agent names when broadcast initialization is enabled.
 """
 
 from unittest.mock import MagicMock, patch
@@ -53,7 +51,7 @@ class TestCoordinateBroadcastInit:
     """Tests for PSManager._coordinate_broadcast_init (no-arg version)."""
 
     def test_single_worker_no_rounds(self):
-        """With world_size=1 the broadcast plan has 0 rounds; workers still get transfer call."""
+        """Verify one worker receives the transfer call without broadcast rounds."""
         manager = _make_ps_manager()
         worker_mock = MagicMock()
         manager._ps_worker_handles_by_rank = [worker_mock]
@@ -67,7 +65,7 @@ class TestCoordinateBroadcastInit:
         worker_mock.broadcast_send_to_children.remote.assert_not_called()
 
     def test_two_workers_one_round(self):
-        """With world_size=2 there is 1 round; rank 0 sends to rank 1."""
+        """Verify rank zero sends to rank one in the only broadcast round."""
         manager = _make_ps_manager()
         worker0 = MagicMock()
         worker1 = MagicMock()
@@ -113,9 +111,8 @@ class TestCoordinateBroadcastInit:
         with patch("ray.get", side_effect=lambda x: ray_get_calls.append(x)):
             manager._coordinate_broadcast_init()
 
-        # binary_tree with world_size=3: ceil(log2(3)) = 2 rounds, but only round 0 has
-        # senders (rank 0 → ranks 1 and 2); round 1 has no senders since ranks 1 and 2
-        # have no children. So: 1 barrier call + 1 final transfer call = 2 ray.get calls.
+        # The binary tree has senders only in round zero for three workers.
+        # One barrier plus the final transfer produces two `ray.get` calls.
         assert len(ray_get_calls) == 2
 
 

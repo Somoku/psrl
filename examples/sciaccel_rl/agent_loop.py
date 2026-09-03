@@ -1,10 +1,5 @@
 """
-SciAccel-RL Agent Loop — Harbor-based episode runner for scientific code acceleration.
-
-This loop extends `SessionAgentLoop` to:
-1. Create a TITO session (for token capture).
-2. Spawn a Harbor Job with terminus-2 pointing at the session URL.
-3. Collect the verifier reward and TITO training data.
+Run SciAccel tasks through Harbor and return TITO training data.
 """
 
 import asyncio
@@ -15,7 +10,6 @@ import threading
 
 from examples.sciaccel_rl.config import SciAccelRuntimeConfig, build_runtime_config
 from examples.sciaccel_rl.runner import HarborEpisodeResult, run_harbor_episode
-
 from psrl.utils.agent.overflow import is_prompt_overflow
 from psrl.utils.agent.thinking import MULTI_TRAJ, select_trajectories
 from psrl.workers.agent_loop.context import AgentLoopContext
@@ -26,10 +20,7 @@ from psrl.workers.gen.utils import TokenOutput
 psrl_logger = logging.getLogger("psrl.sciaccel_rl.agent_loop")
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# SMG's `request_aborted` sentinel body, from
-# third_party/smg/model_gateway/src/routers/grpc/routing_loop/runtime.rs:604.
-# Matched on text because Harbor re-raises the 400 as a plain BadRequestError,
-# dropping the `x-smg-error-code` header that `_classify_http_error` would use.
+# Harbor drops SMG error headers, so classify request aborts by sentinel body text.
 _ABORT_MARKER = "Request aborted by PS Manager"
 
 
@@ -82,18 +73,12 @@ class SciAccelAgentLoop(SessionAgentLoop):
         **kwargs,
     ):
         super().__init__(context=context)
-        runtime_kwargs = {
-            k: kwargs[k]
-            for k in ("harbor", "task_timeout_sec", "verifier_timeout_sec")
-            if k in kwargs
-        }
+        runtime_kwargs = {k: kwargs[k] for k in ("harbor", "task_timeout_sec", "verifier_timeout_sec") if k in kwargs}
         self.runtime_config: SciAccelRuntimeConfig = build_runtime_config(runtime_kwargs)
 
         # Chosen once here so the trajectory-retention policy applied below and the
         # `extra_body` the runner sends the gateway are read from the same place.
-        self.thinking_template: str = context.config.psrl.agentic_rl.get(
-            "thinking_template", MULTI_TRAJ
-        )
+        self.thinking_template: str = context.config.psrl.agentic_rl.get("thinking_template", MULTI_TRAJ)
 
         multi_turn = context.config.gen_actor_rollout_ref.rollout.multi_turn
         if not getattr(multi_turn, "enable", False):
@@ -129,7 +114,10 @@ class SciAccelAgentLoop(SessionAgentLoop):
             model_name = self.model_config.path
             psrl_logger.info(
                 "[uid=%s] Starting Harbor episode: session=%s, task=%s, model_url=%s",
-                uid, session_id, task_path, model_base_url,
+                uid,
+                session_id,
+                task_path,
+                model_base_url,
             )
 
             harbor_result = await self._run_harbor_in_thread(
@@ -143,79 +131,56 @@ class SciAccelAgentLoop(SessionAgentLoop):
             if harbor_result.exception:
                 psrl_logger.warning(
                     "[uid=%s] Harbor episode exception: %s (rewards=%s).",
-                    uid, harbor_result.exception, harbor_result.rewards,
+                    uid,
+                    harbor_result.exception,
+                    harbor_result.rewards,
                 )
             else:
                 psrl_logger.info(
                     "[uid=%s] Harbor episode completed: reward=%.3f, rewards=%s.",
-                    uid, harbor_result.reward, harbor_result.rewards,
+                    uid,
+                    harbor_result.reward,
+                    harbor_result.rewards,
                 )
 
-            # A context-window overflow is an expected outcome, not a failure: the
-            # turns captured before it are valid on-policy data. Harbor cannot
-            # classify vLLM's wording (its `_is_context_length_error` phrase list
-            # misses "longer than the maximum model length"), so the 400 arrives
-            # here as a generic exception message. Mirror SkyRL's harbor_generator:
-            # keep the trajectory and train it rather than dropping the episode.
-            overflowed = bool(
-                harbor_result.exception and is_prompt_overflow(Exception(harbor_result.exception))
-            )
+            # Preserve valid on-policy turns captured before a context overflow.
+            overflowed = bool(harbor_result.exception and is_prompt_overflow(Exception(harbor_result.exception)))
             if overflowed:
-                # Only fall back to 0 when the verifier never produced a score. An
-                # agent exception propagates out of Harbor's `_run_agent`, which
-                # skips `_run_verifier` entirely, so `rewards` is usually empty here.
-                # But the task's reward is a graded ladder with partial credit for a
-                # delivered prefix, so when the verifier *did* run, its score is real
-                # signal and must not be overwritten with 0.
+                # Keep any verifier score produced before overflow.
                 psrl_logger.info(
-                    "[uid=%s] Episode hit context overflow, training partial trajectory "
-                    "(verifier rewards=%s).",
-                    uid, harbor_result.rewards or "none -> reward 0",
+                    "[uid=%s] Episode hit context overflow, training partial trajectory (verifier rewards=%s).",
+                    uid,
+                    harbor_result.rewards or "none -> reward 0",
                 )
 
-            # PSManager aborts a group's siblings whenever any member fails, and SMG
-            # answers their in-flight turns with the `request_aborted` sentinel. Harbor
-            # swallows that sentinel and re-raises a plain `BadRequestError`, so the only
-            # signal left here is the message text. Classify it explicitly: a deliberate
-            # abort must map to `ABORTED` (no data, no group retry), not fall through to
-            # `ROLLOUT_ERROR`, whose `needs_manager_retry()` would abort the group again.
+            # Map the SMG abort sentinel to `ABORTED` to prevent redundant group retries.
             if harbor_result.exception and _ABORT_MARKER in harbor_result.exception:
                 psrl_logger.info(
-                    "[uid=%s] Episode aborted by PSManager, discarding without group retry.", uid,
+                    "[uid=%s] Episode aborted by PSManager, discarding without group retry.",
+                    uid,
                 )
                 return None, TerminateReason.ABORTED
 
-            # A session yields one trajectory per TITO prefix-hash chain. Under
-            # `multi_thinking` / `disable_thinking` the client's replayed history hashes
-            # onto the stored leaf and the whole episode stays one chain. Under
-            # `multi_traj` / `longest_traj` the gateway splits <think> out, the hash
-            # misses, and SMG forks a fresh trajectory per turn
-            # (smg crates/tito/src/store.rs `resolve_trajectory_id`). Every trajectory is
-            # internally consistent either way -- its prompt and response come from the
-            # same request -- so a fork costs cross-turn context, not correctness.
-            # `thinking_template` decides which of them to keep, and
-            # `compute_advantage_for_multi_trajectories` then scores only the last one of
-            # each session and broadcasts the advantage to its siblings.
-            training_data = select_trajectories(
-                self.thinking_template, await self.get_training_data(session_id)
-            )
+            # SMG may fork one TITO trajectory per turn when thinking is split from content.
+            # Select with `thinking_template` before reward logic broadcasts the advantage.
+            training_data = select_trajectories(self.thinking_template, await self.get_training_data(session_id))
             num_turns = sum(item["num_turns"] for item in training_data)
             num_tokens = sum(len(item.get("response_ids", [])) for item in training_data)
             psrl_logger.info(
                 "[uid=%s] TITO data (%s): %d trajector%s, num_turns=%d, response_tokens=%d.",
-                uid, self.thinking_template, len(training_data),
-                "y" if len(training_data) == 1 else "ies", num_turns, num_tokens,
+                uid,
+                self.thinking_template,
+                len(training_data),
+                "y" if len(training_data) == 1 else "ies",
+                num_turns,
+                num_tokens,
             )
             if num_turns == 0:
-                # A train group is all-or-nothing: `manager.py` only occupies the buffer
-                # entry once all `alg_rollout_n` trajectories arrive, and
-                # `ps_manager.abort_requests` clears the whole entry when fewer remain.
-                # So a discarded slot must be reported as an error, which is what makes
-                # the manager purge the group and request a fresh prompt. Returning
-                # `ABORTED` here would leave the surviving siblings waiting forever
-                # unless PSManager's staleness check happened to clear the entry first.
+                # Training entries require every rollout slot.
+                # Report zero turns as an error so the manager refills the whole group.
                 psrl_logger.warning(
-                    "[uid=%s] Zero turns in TITO session, failing the group for refill.", uid,
+                    "[uid=%s] Zero turns in TITO session, failing the group for refill.",
+                    uid,
                 )
                 return None, TerminateReason.ROLLOUT_ERROR
 
@@ -223,9 +188,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 self.build_token_output(
                     item,
                     extra_fields={
-                        # Pass the verifier's rewards through verbatim. `reward.py` already
-                        # falls back to 0.0 when the dict is empty (the usual overflow case),
-                        # so no special-casing is needed and a real graded score is never lost.
+                        # Empty verifier rewards already map to zero in `reward.py`.
                         "harbor_rewards": harbor_result.rewards,
                         "reward_key": reward_key,
                         "task_name": harbor_result.task_name,
@@ -236,9 +199,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
 
             # `compute_reward_score` scores the last trajectory and broadcasts the result
             # to the rest, so the episode-level verifier reward reaches every sibling.
-            scored_output = await self.compute_reward_score(
-                outputs if len(outputs) > 1 else outputs[0], **request
-            )
+            scored_output = await self.compute_reward_score(outputs if len(outputs) > 1 else outputs[0], **request)
             if scored_output is None:
                 return None, TerminateReason.ABORTED
 
@@ -250,7 +211,9 @@ class SciAccelAgentLoop(SessionAgentLoop):
 
             psrl_logger.info(
                 "[uid=%s] Episode done: terminate=%s, reward=%.3f.",
-                uid, terminate_reason.value, harbor_result.reward,
+                uid,
+                terminate_reason.value,
+                harbor_result.reward,
             )
             return scored_output, terminate_reason
 
@@ -286,13 +249,14 @@ class SciAccelAgentLoop(SessionAgentLoop):
         if session_id is None:
             return None, TerminateReason.ROLLOUT_ERROR
         try:
-            training_data = select_trajectories(
-                self.thinking_template, await self.get_training_data(session_id)
-            )
+            training_data = select_trajectories(self.thinking_template, await self.get_training_data(session_id))
             num_turns = sum(item["num_turns"] for item in training_data)
             psrl_logger.info(
                 "[uid=%s] Recovering partial data: %d trajector%s, %d turns from TITO.",
-                uid, len(training_data), "y" if len(training_data) == 1 else "ies", num_turns,
+                uid,
+                len(training_data),
+                "y" if len(training_data) == 1 else "ies",
+                num_turns,
             )
             if num_turns == 0:
                 # Nothing to recover. Report an error so the manager purges the group and
@@ -310,17 +274,10 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 )
                 for item in training_data
             ]
-            scored_output = await self.compute_reward_score(
-                outputs if len(outputs) > 1 else outputs[0], **request
-            )
+            scored_output = await self.compute_reward_score(outputs if len(outputs) > 1 else outputs[0], **request)
             if scored_output is None:
                 return None, TerminateReason.ABORTED
-            # Recovery succeeded, so this slot is NOT wasted. `TRAJECTORY_TIMEOUT` would
-            # satisfy `needs_manager_retry()` and make the manager purge the group even
-            # though the data is fine. This path is reached only from the timeout handler,
-            # so `AGENT_TIMEOUT` names what happened: the clock ran out, and the turns
-            # captured before it are valid on-policy data scored 0 by the empty reward
-            # dict.
+            # Mark recovered turns as agent timeout data so the manager keeps this valid slot.
             return scored_output, TerminateReason.AGENT_TIMEOUT
         except Exception as recover_exc:
             psrl_logger.warning("[uid=%s] Partial recovery failed: %s.", uid, recover_exc)
@@ -355,8 +312,5 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 thinking_template=self.thinking_template,
             )
         )
-        # No timeout here: Harbor enforces the agent budget from outside the container
-        # and `run_harbor_episode`'s own `asyncio.wait_for` is the backstop above it.
-        # Wrapping this future in a third, shorter deadline is what turned honestly-slow
-        # episodes into `trajectory_timeout` with no verifier reward.
+        # Harbor owns the timeout budget. Another deadline could discard valid slow episodes.
         return await asyncio.wrap_future(future)

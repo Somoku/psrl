@@ -16,9 +16,7 @@ def test_scripted_actions_end_with_a_submission():
 def test_scripted_actions_exercise_state_persistence():
     """A later action relies on the cwd set by an earlier one, which docker exec cannot do."""
     cd_index = next(i for i, action in enumerate(SCRIPTED_ACTIONS) if action.startswith("cd "))
-    relative_index = next(
-        i for i, action in enumerate(SCRIPTED_ACTIONS) if action == "ls -la submission.csv"
-    )
+    relative_index = next(i for i, action in enumerate(SCRIPTED_ACTIONS) if action == "ls -la submission.csv")
 
     assert relative_index > cd_index, (
         "A relative-path action must come after the cd so persistence is actually tested."

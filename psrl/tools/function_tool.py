@@ -1,21 +1,18 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
+# Licensed under the Apache License, Version 2.0 (the "License").
+# You may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-#
 #     http://www.apache.org/licenses/LICENSE-2.0
-#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Lightweight function-based tool registration for PSRL.
+"""
+Register lightweight function-based tools for PSRL.
 
-Adapted from ``verl.tools.utils.function_tool``.  The registration and schema
-inference contract matches verl, while the runtime object conforms to PSRL's
-``Tool`` / ``ToolOutput`` interface.
+Registration and schema inference follow `verl.tools.utils.function_tool`, while
+runtime values use the PSRL `Tool` and `ToolOutput` interfaces.
 """
 
 from __future__ import annotations
@@ -144,8 +141,8 @@ def load_function_tools_from_path(path: str) -> list[FunctionTool]:
     new_names = sorted(set(FUNCTION_TOOL_REGISTRY) - before)
     if not new_names:
         psrl_logger.warning(
-            "function_tool_path '%s' loaded but no @function_tool decorators found; "
-            "did you forget to apply the decorator?",
+            "function_tool_path '%s' loaded without any @function_tool decorators. "
+            "Did you forget to apply the decorator?",
             path,
         )
     else:

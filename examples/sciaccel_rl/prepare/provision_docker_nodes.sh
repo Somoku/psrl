@@ -1,44 +1,9 @@
 #!/usr/bin/env bash
-# provision_docker_nodes.sh — make Docker on a set of hosts able to build images
-# here, in parallel, idempotently.
-#
-# A fresh node in this environment cannot build a Docker image at all:
-#
-#   1. There is no direct route to the internet. Registry pulls need Tencent's
-#      mirror, and apt inside a build needs the corporate HTTP proxy.
-#   2. buildkit does NOT inherit the shell's http_proxy. Only /root/.docker/config.json
-#      `proxies.default` reaches a build, which is why a build fails at
-#      `apt-get update` even when `curl` works in the same shell.
-#   3. harbor's `network_mode = "no-network"` needs dockerd's egress-control support,
-#      which in turn needs the registry mirror to be *loaded*. Editing daemon.json is
-#      not enough: dockerd only re-reads it on SIGHUP, so a node whose config was
-#      edited after dockerd started still reports `egress support: False` and every
-#      trial dies at init.
-#
-# Symptom without this: image builds take ~3.5 hours (apt at ~17 kB/s through the
-# proxy, often hitting the build timeout). With it: ~1 minute.
-#
-# Usage:
-#   bash provision_docker_nodes.sh --hosts ${PSRL_WORKSPACE}/hosts/32GPUs
-#   bash provision_docker_nodes.sh --hosts-list 28.49.195.154,28.49.55.40
-#   bash provision_docker_nodes.sh --hosts <file> --check    # report only, change nothing
-#
-# Options:
-#   --hosts FILE          Hosts file, one address per line; '#' and blanks ignored.
-#   --hosts-list LIST     Comma-separated addresses, instead of a file.
-#   --registry-mirror URL Registry mirror (default: https://mirror.ccs.tencentyun.com).
-#   --proxy URL           HTTP(S) proxy for builds (default: http://star-proxy.oa.com:3128).
-#   --apt-mirror URL      apt mirror asserted reachable from a build container
-#                         (default: http://mirrors.tencentyun.com). Only verified here;
-#                         it is applied by the sciaccel-rl Dockerfile generator.
-#   --check               Report each host's state and exit non-zero if any needs work.
-#   --no-verify           Skip the post-change build test (faster, less certain).
-#   --timeout S           Per-host timeout in seconds (default: 600).
-#   --user USER           ssh as USER.
-#   -h | --help           Print this help.
-#
-# Safe to re-run: every step is a no-op when already correct, and dockerd is only
-# reloaded when its live config actually differs from the target.
+# Configure Docker nodes for SciAccel image builds.
+# Usage: `provision_docker_nodes.sh --hosts FILE [options]`
+
+
+
 
 set -euo pipefail
 
@@ -82,10 +47,7 @@ else
 fi
 [[ ${#HOSTS[@]} -gt 0 ]] || { echo "ERROR: no hosts to provision." >&2; exit 2; }
 
-# The remote script. Written to a temp file and piped over ssh stdin rather than
-# interpolated into a command line: ssh concatenates its arguments and the remote
-# shell re-splits them, so embedding a multi-line script in an argument requires
-# two consistent layers of quoting and breaks on the first stray quote.
+# Pipe the remote script through standard input to avoid nested shell quoting.
 REMOTE_SCRIPT="$(mktemp /tmp/provision_docker_remote.XXXXXX.sh)"
 trap 'rm -f "${REMOTE_SCRIPT}"' EXIT
 
@@ -127,12 +89,7 @@ mirrors = cfg.get("registry-mirrors") or []
 if mirror not in mirrors:
     problems.append(f"registry-mirrors={mirrors}")
 
-# Docker's default pool is 172.17-172.31/16, i.e. only ~31 networks. Every harbor
-# trial creates TWO (the task network and its egress-control sidecar network), so
-# concurrency above ~15 trials dies with "could not find an available,
-# non-overlapping IPv4 address pool among the defaults". Observed at 32 networks
-# with 58 containers up. Carving /24s out of 172.16/12 and 10.128/9 yields
-# thousands of networks instead.
+# Use smaller subnets because each Harbor trial creates two networks.
 WANT_POOLS = [
     {"base": "172.16.0.0/12", "size": 24},
     {"base": "10.128.0.0/9", "size": 24},
@@ -148,7 +105,7 @@ if pools != WANT_POOLS:
             pass
     problems.append(f"default-address-pools gives ~{n or 31} networks")
 
-# harbor's GPU tasks need the nvidia runtime; never drop it if it is configured.
+# Preserve a configured NVIDIA runtime.
 runtimes = cfg.get("runtimes") or {}
 if "nvidia" in runtimes and not runtimes["nvidia"].get("path"):
     problems.append("nvidia runtime present but has no path")
@@ -213,15 +170,8 @@ elif [[ "$CLIENT_STATE" -ne 0 ]]; then
     fail "could not update $CLIENT_JSON"
 fi
 
-# --- 3. Make dockerd actually load the config ---
-# The step people miss: dockerd re-reads daemon.json only when signalled, so a node
-# edited after startup keeps serving the old config and harbor's no-network mode
-# stays unavailable.
-#
-# SIGHUP is enough for registry mirrors, but NOT for default-address-pools: those
-# are read once when the network controller initializes, so widening the pool needs
-# a full restart. Restarting is safe here only because no containers should be
-# running -- it is refused otherwise rather than killing someone's work.
+# --- Load Docker daemon configuration ---
+# Address pool changes require a restart, which is refused while containers run.
 LIVE_MIRRORS="$(docker info --format '{{.RegistryConfig.Mirrors}}' 2>/dev/null || echo '[]')"
 MIRROR_LIVE=0
 case "$LIVE_MIRRORS" in *"$MIRROR"*) MIRROR_LIVE=1 ;; esac
@@ -232,7 +182,7 @@ PROBE_NET="provision-pool-probe-$$"
 if docker network create "$PROBE_NET" >/dev/null 2>&1; then
     PROBE_SUBNET="$(docker network inspect "$PROBE_NET" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null || true)"
     docker network rm "$PROBE_NET" >/dev/null 2>&1 || true
-    # A /24 means the widened pool is live; the stock pool hands out /16.
+    # A live widened pool assigns a /24 subnet.
     case "$PROBE_SUBNET" in */24) POOL_LIVE=1 ;; esac
 else
     PROBE_SUBNET="(could not create probe network -- pool may be exhausted)"
@@ -244,7 +194,7 @@ else
     NEEDS=1
     if [[ "$CHECK_ONLY" -eq 1 ]]; then
         [[ "$MIRROR_LIVE" -eq 1 ]] || echo "LIVE_MIRROR_STALE (live: $LIVE_MIRRORS)"
-        [[ "$POOL_LIVE" -eq 1 ]] || echo "LIVE_POOL_NARROW (probe subnet $PROBE_SUBNET; needs dockerd RESTART)"
+        [[ "$POOL_LIVE" -eq 1 ]] || echo "LIVE_POOL_NARROW (probe subnet $PROBE_SUBNET). A dockerd restart is required."
     else
         if [[ "$POOL_LIVE" -eq 0 ]]; then
             RUNNING="$(docker ps -q | wc -l)"
@@ -254,9 +204,7 @@ else
             if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
                 systemctl restart docker || fail "systemctl restart docker failed"
             else
-                # No init supervisor here (this host is not systemd-booted), so a
-                # bare SIGTERM would stop dockerd with nothing to bring it back and
-                # take the whole node's Docker down. Relaunch it explicitly instead.
+                # Relaunch Docker explicitly when no init supervisor is available.
                 DOCKERD_PID="$(pgrep -o dockerd 2>/dev/null || true)"
                 [[ -n "$DOCKERD_PID" ]] || fail "cannot find dockerd to restart"
                 DOCKERD_BIN="$(command -v dockerd || echo /usr/bin/dockerd)"
@@ -304,24 +252,13 @@ else
     fi
 fi
 
-# --- 4. Report the capability harbor actually gates on ---
-# harbor rejects network_mode="no-network" unless dockerd reports egress support,
-# which is what makes repair/implementation tasks runnable at all.
+# --- Report Harbor egress capability ---
 if docker info 2>/dev/null | grep -qi "egress"; then
     docker info 2>/dev/null | grep -i "egress" | head -1 | sed 's/^[[:space:]]*/  /'
 fi
 
-# --- 4b. Pre-pull the base images every task Dockerfile starts FROM ---
-# Without this, each task build issues its own registry metadata HEAD, and the mirror
-# intermittently drops those: `dial tcp 169.254.0.51:443: i/o timeout` and bare `EOF`,
-# even while sequential curls to the same URL return 200 three times in a row. It
-# resolves to a link-local address (169.254.0.51), i.e. a node-local proxy, which is
-# what makes it flaky under load rather than cleanly unreachable.
-#
-# Warming the task images does NOT cover this. A node with env_setup down to 15 s still
-# lost 13 of 129 tasks to it, because the verifier base image is a separate FROM that no
-# amount of env-image layer caching supplies. Pulling once per node removes the request
-# entirely: a local image needs no registry round-trip.
+# --- Preload task base images ---
+# Local base images avoid transient registry metadata failures.
 if [[ "$CHECK_ONLY" -eq 0 ]]; then
     for img in python:3.13-slim debian:bookworm-slim alpine:3.19; do
         if docker image inspect "$img" >/dev/null 2>&1; then
@@ -347,12 +284,7 @@ if [[ "$VERIFY" -eq 1 && "$CHECK_ONLY" -eq 0 ]]; then
     # Pulls through the mirror AND resolves the apt mirror from inside a build.
     printf 'FROM alpine:3.19\nRUN wget -q --timeout=20 -O /dev/null %s/ && echo probe-ok\n' \
         "$APT_MIRROR" > "$BUILD_DIR/Dockerfile"
-    # Retry once. A dockerd that has just restarted answers `docker pull` fine while
-    # buildkit's own registry client still fails its metadata HEAD with a bare `EOF`.
-    # Observed on a freshly provisioned node: verification failed, `docker pull
-    # alpine:3.19` succeeded seconds later, and the identical verification then passed.
-    # Reporting that first failure as a config problem sends you hunting a proxy bug
-    # that is not there.
+    # Retry once while BuildKit settles after a Docker restart.
     BUILD_OK=0
     for attempt in 1 2; do
         if timeout 300 docker build --no-cache -t docker-provision-probe:latest "$BUILD_DIR" >"$BUILD_DIR/out" 2>&1; then
@@ -403,8 +335,7 @@ LOG_DIR="$(mktemp -d /tmp/provision_logs.XXXXXX)"
 PIDS=()
 declare -A HOST_BY_PID
 
-# Fan out in parallel: each host's dockerd reload is independent, and serially
-# reloading 16 nodes would take as long as the sum of their pulls.
+# Reload each host independently in parallel.
 for host in "${HOSTS[@]}"; do
     log="${LOG_DIR}/${host//[:\/]/_}.log"
     ssh "${SSH_OPTS[@]}" "${host}" \

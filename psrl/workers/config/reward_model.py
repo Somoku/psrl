@@ -23,7 +23,7 @@ def get_custome_process_fn(file_path, function_name):
     if not file_path:
         return None
 
-    assert function_name is not None
+    assert function_name is not None, "Custom reward function name is required."
     module_name = f"custom_reward_module_{function_name}"
     module = sys.modules.get(module_name, None)
 
@@ -32,11 +32,11 @@ def get_custome_process_fn(file_path, function_name):
             raise FileNotFoundError(f"Reward process function file '{file_path}' not found.")
 
         spec = importlib.util.spec_from_file_location(module_name, file_path)
-        assert spec is not None
+        assert spec is not None, f"Could not load a custom reward module from {file_path!r}."
         module = importlib.util.module_from_spec(spec)
         try:
             sys.modules[module_name] = module
-            assert spec.loader is not None
+            assert spec.loader is not None, f"Custom reward module {module_name!r} has no loader."
             spec.loader.exec_module(module)
         except Exception as e:
             raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
@@ -82,7 +82,6 @@ class RewardModelConfig(BaseConfig):
     free_cache_engine: bool = True
     tensor_model_parallel_size: int = 2
 
-    # for generative reward model
     sampling_config: SamplingConfig = field(default_factory=SamplingConfig)
     max_new_tokens: int = 4096
 
@@ -93,7 +92,6 @@ class RewardModelConfig(BaseConfig):
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     input_model_config: HFModelConfig = field(default_factory=HFModelConfig)
     model_config: HFModelConfig = field(default_factory=HFModelConfig)
-    # Server configuration for sglang server mode
     server_config: ServerConfig = field(default_factory=ServerConfig)
 
 

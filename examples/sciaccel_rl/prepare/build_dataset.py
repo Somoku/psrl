@@ -85,16 +85,16 @@ def build_dataset(
             "gpus": TASK_GPUS.get(task_name, 0),
         }
 
-        rows.append({
-            "prompt": prompt,
-            "extra_info": extra_info,
-            "data_source": "sciaccel_rl",
-            # The reward comes from Harbor's verifier container at rollout time, not
-            # from a dataset label -- but every reward loop reads
-            # `reward_model["ground_truth"]` unconditionally, so the key must exist.
-            # Same convention as examples/airs_bench (also verifier-scored).
-            "reward_model": {"style": "rule", "ground_truth": ""},
-        })
+        rows.append(
+            {
+                "prompt": prompt,
+                "extra_info": extra_info,
+                "data_source": "sciaccel_rl",
+                # Harbor supplies verifier reward at rollout time.
+                # Ground truth remains required by the reward loop schema.
+                "reward_model": {"style": "rule", "ground_truth": ""},
+            }
+        )
 
     df = pd.DataFrame(rows)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

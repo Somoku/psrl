@@ -105,12 +105,12 @@ def kv_batch_meta_update_tags(batch: KVBatchMeta, key: str, value) -> KVBatchMet
     """Return a new KVBatchMeta with ``key`` set to ``value`` in every tag.
 
     If ``value`` is a list it must have the same length as ``batch``, and
-    each element is assigned to the corresponding tag.  Otherwise the scalar
+    each element is assigned to the corresponding tag. Otherwise the scalar
     ``value`` is broadcast to all tags.
 
     Args:
         batch: Source ``KVBatchMeta``.
-        key:   Tag field name to set / overwrite.
+        key: Tag field name to set / overwrite.
         value: Scalar (broadcast) or list (per-sample) new value.
 
     Returns:

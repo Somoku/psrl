@@ -1,9 +1,4 @@
-"""
-Sandbox data types and Docker argument translation.
-
-This module is intentionally free of Ray and subprocess dependencies so that
-argument construction stays unit-testable without a container runtime.
-"""
+"""Define sandbox data and translate it into Docker arguments."""
 
 from __future__ import annotations
 
@@ -14,16 +9,14 @@ from dataclasses import dataclass, field
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# NOTE(claude): The --gpus flag requires nvidia-container-runtime, which is absent
-# on this cluster. We pass the character devices explicitly and bind-mount the
-# driver libraries instead. This was verified to work on an H20 node.
+# NOTE(claude): The `--gpus` flag requires unavailable `nvidia-container-runtime`,
+# so expose character devices and bind-mount the driver libraries.
 NVIDIA_CONTROL_DEVICES: tuple[str, ...] = (
     "/dev/nvidiactl",
     "/dev/nvidia-uvm",
     "/dev/nvidia-uvm-tools",
 )
 
-# Host driver libraries a container needs before CUDA can initialize.
 DEFAULT_DRIVER_LIB_GLOBS: tuple[str, ...] = (
     "/usr/lib64/libnvidia-ml.so.1",
     "/usr/lib64/libcuda.so.1",
@@ -109,7 +102,7 @@ def build_gpu_argv(
         if os.path.exists(control_device):
             argv.extend(["--device", control_device])
         else:
-            psrl_logger.warning(f"Control device {control_device!r} is absent, skipping passthrough.")
+            psrl_logger.warning(f"Control device={control_device!r} is absent, skipping passthrough.")
 
     for lib_path in driver_libs:
         if os.path.exists(lib_path):

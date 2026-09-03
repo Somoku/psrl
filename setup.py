@@ -9,6 +9,8 @@ setup(
         "psrl": [
             "trainer/config/*.yaml",
             "trainer/config/**/*.yaml",
+            "eval/config/*.yaml",
+            "eval/config/**/*.yaml",
         ],
     },
     include_package_data=True,

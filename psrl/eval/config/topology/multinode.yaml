@@ -1,0 +1,40 @@
+# One fleet per host, across every host in a hosts file. Total endpoints =
+# hosts x replicas.
+#
+# No replica spans a host boundary. Cross-node tensor parallelism needs a managed
+# Ray cluster and makes any single node failure kill a whole replica; node-local
+# replicas mean a wedged host costs only its own share of capacity.
+#
+# Scaling is a different hosts_file and nothing else: hosts/8GPUs (1 node) through
+# hosts/128GPUs (16 nodes) all work with the settings below.
+kind: multinode
+
+# One address per line; '#' comments and blank lines ignored.
+hosts_file: /apdcephfs_zwfy10/share_303541817/lhy/hosts/32GPUs
+
+# Per-host fleet shape, applied identically on every host.
+replicas: 4
+tp: 2
+pp: 1
+
+# Data parallelism inside each replica. Set replicas=1 dp=N when the consumer can
+# only be given one URL per host (mini-swe's eval reads a single OPENAI_API_BASE);
+# otherwise leave at 1 and use replicas.
+dp: 1
+
+base_port: 8000
+gpu_ids: []
+
+# Must bind all interfaces: the coordinator reaches each replica over the network,
+# not via loopback.
+host: 0.0.0.0
+
+wait_ready_sec: 4500
+
+# Optional ssh username. Empty uses the current user and ~/.ssh/config.
+ssh_user: ""
+
+# Proceed on half the expected endpoints. At 16 nodes a wedged host is routine,
+# and a multi-hour eval should lose capacity rather than abort. Failed hosts are
+# reported and excluded from endpoints.json, never silently counted.
+min_healthy_frac: 0.5

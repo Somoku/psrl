@@ -142,6 +142,8 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
             cfg_get(config, "psrl.rollout_gateway.multimodal_tensor_transport", "auto")
         ).lower(),
         multimodal_shm_min_bytes=int(cfg_get(config, "psrl.rollout_gateway.multimodal_shm_min_bytes", 64 * 1024)),
+        model_path=cfg_get(config, "train_actor_rollout_ref.model.path", None),
+        chat_template=cfg_get(config, "gen_actor_rollout_ref.rollout.chat_template", None),
         service_discovery=False,
         prometheus_port=None,
         request_timeout_secs=2**64 - 1,

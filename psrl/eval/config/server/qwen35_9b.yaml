@@ -1,0 +1,33 @@
+# Qwen3.5-9B. Multimodal (the config carries a vision_config), so it loads a vision
+# tower even when serving text only.
+#
+# Its trained window is 262144, but the usable window is set by KV cache, not by the
+# model. Measured on one 2x H20 replica at gpu_memory_utilization 0.9:
+# num_gpu_blocks=8796 x block_size 16 = 140736 KV tokens. Weights are only
+# 13.7 GiB/GPU yet 89.7 of 97.9 GiB is consumed, so the vision tower and activation
+# reserve take most of the budget. That capacity divides as:
+#
+#   131072 ctx -> 1.1 concurrent sequences   (serializes; a fleet gains nothing)
+#    65536 ctx -> 2.1
+#    32768 ctx -> 4.3                        (chosen)
+#
+# 32768 keeps a fleet genuinely parallel. It is below Qwen3-8B's 40960, so cap agent
+# turns (eval wrappers default to 25): every turn resends the transcript, so uncapped
+# runs exhaust the window and die UNGRADED rather than scoring zero.
+#
+# Re-measure with `curl -s localhost:<port>/metrics | grep num_gpu_blocks` after
+# changing tp, gpu_memory_utilization, or the checkpoint.
+checkpoint: /apdcephfs_zwfy10/share_303541817/lhy/models/Qwen3.5-9B
+served_model_name: qwen35-9b
+max_model_len: 32768
+gpu_memory_utilization: 0.9
+
+# Empty on purpose. Agents like terminus-2 and mini-swe-agent parse their own
+# text protocol out of the assistant message; enabling vLLM's tool-call
+# extraction would strip the very text they need.
+tool_call_parser: ""
+
+# Empty uses the tokenizer's own template.
+chat_template: ""
+
+extra: []

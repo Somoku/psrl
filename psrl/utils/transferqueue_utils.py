@@ -39,14 +39,27 @@ def _require_terminal_state(state: PayloadState) -> None:
         raise ValueError(f"Cannot clear payload in non-terminal state {state.value!r}.")
 
 
+def _existing_payload_keys(
+    keys: list[str] | str,
+    partition_id: str,
+    partitions: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return only keys currently registered in the target partition."""
+    requested_keys = [keys] if isinstance(keys, str) else keys
+    partition = partitions.get(partition_id, {})
+    return [key for key in requested_keys if key in partition]
+
+
 def clear_payload(
     keys: list[str] | str,
     partition_id: str,
     state: PayloadState,
 ) -> None:
-    """Synchronously clear payload storage after entering a terminal state."""
+    """Synchronously clear any present payload after entering a terminal state."""
     _require_terminal_state(state)
-    tq.kv_clear(keys=keys, partition_id=partition_id)
+    existing_keys = _existing_payload_keys(keys, partition_id, tq.kv_list(partition_id=partition_id))
+    if existing_keys:
+        tq.kv_clear(keys=existing_keys, partition_id=partition_id)
 
 
 async def async_clear_payload(
@@ -54,9 +67,12 @@ async def async_clear_payload(
     partition_id: str,
     state: PayloadState,
 ) -> None:
-    """Asynchronously clear payload storage after entering a terminal state."""
+    """Asynchronously clear any present payload after entering a terminal state."""
     _require_terminal_state(state)
-    await tq.async_kv_clear(keys=keys, partition_id=partition_id)
+    partitions = await tq.async_kv_list(partition_id=partition_id)
+    existing_keys = _existing_payload_keys(keys, partition_id, partitions)
+    if existing_keys:
+        await tq.async_kv_clear(keys=existing_keys, partition_id=partition_id)
 
 
 def validate_ready_payload(

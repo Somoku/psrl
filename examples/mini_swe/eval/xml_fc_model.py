@@ -19,7 +19,7 @@ from minisweagent.models.litellm_textbased_model import (
     LitellmTextbasedModel,
     LitellmTextbasedModelConfig,
 )
-from psrl.utils.rollout.overflow import PromptOverflowError, handle_prompt_overflow  # noqa: F401
+from psrl.utils.agent.overflow import PromptOverflowError, handle_prompt_overflow  # noqa: F401
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))

@@ -89,12 +89,10 @@ examples/mini_swe/
 │   ├── simple_agent_config.yaml          # Agent config for toy path
 │   ├── swebench_agent_config.yaml        # Agent config for SWE-smith / SWE-Gym / Verified
 │   └── swebench_agent_config_xml_fc.yaml # XML function-calling variant (newer models)
-├── eval/                                 # Standalone evaluation + vLLM serving (see eval/README.md)
+├── eval/                                 # Standalone evaluation (serving is in psrl/eval/)
 │   ├── README.md                         # Guide for gold-patch sanity, multi-node eval, serving your own checkpoint
 │   ├── eval_swebench.py                  # Single-node eval entry point
-│   ├── eval_swebench_multinode.py        # Hash-sharded cross-host eval launcher
-│   ├── serve_vllm.sh                     # Single-node vLLM OpenAI-compatible server (TP/PP/DP)
-│   └── serve_vllm_multinode.sh           # Cross-host DP fan-out + litellm proxy config generator
+│   └── eval_swebench_multinode.py        # Hash-sharded cross-host eval launcher
 └── prepare/
     ├── README.md                         # Data preparation guide (Path A, B, and C)
     ├── prepare_simple_data.py            # Toy dataset generator

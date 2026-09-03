@@ -13,7 +13,8 @@
       "Bash",
       "Bash(python3:*)",
       "WebSearch",
-      "WebFetch"
+      "WebFetch",
+      "Bash(cd *)"
     ],
     "deny": [
       "Bash(git reset --hard:*)"

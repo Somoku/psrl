@@ -291,13 +291,14 @@ class PSManager(RequestStatusTracker):
         n_trajectory: int,
         is_validate: bool = False,
     ):
-        """Update the number of trajectories of a specific request in the staleness inventory.
+        """Update a request's trajectory count in both PS metadata stores.
 
         Args:
             request_id (int): The unique identifier of the request
             n_trajectory (int): The number of trajectories to set for the request
             is_validate (bool): Whether to use the validation staleness inventory
         """
+        super().update_request_n_trajectory(request_id, n_trajectory)
         staleness_inventory = self.val_staleness_inventory if is_validate else self.staleness_inventory
         staleness_inventory.update_request_n_trajectory(
             request_id=request_id,

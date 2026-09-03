@@ -1,0 +1,36 @@
+# Agent loop config for the SciAccel-RL v2 task bank.
+#
+# Separate from sciaccel_agent_config.yaml so the v1 single-task setup keeps working
+# unchanged. The only substantive difference is the agent budget.
+- name: sciaccel
+  _target_: examples.sciaccel_rl.agent_loop.SciAccelAgentLoop
+  harbor:
+    # Per-episode Harbor job directories. These accumulate: one env container, one
+    # verifier container, and a trajectory per episode. /tmp is local disk (12 TB here),
+    # deliberately not the shared FUSE mount, which does not report free inodes and has
+    # caused ENOSPC failures under load.
+    jobs_dir: /tmp/sciaccel_jobs_v2
+    agent_name: terminus-2
+    override_gpus: null
+    gpu_compose_override: ""
+  # Enforced by Harbor from OUTSIDE the container, which is the one clock the agent
+  # cannot forge.
+  #
+  # 5400, not the eval's 1800. The eval measured agent_seconds median 622 / p90 854 /
+  # max 1203, but it served a single node's worth of tasks from 4 dedicated vLLM servers.
+  # Training runs 256 episodes at once (train_batch_size x rollout_n) against those same 4
+  # engines, so each episode gets only a slice of generation and needs more wall clock to
+  # reach the same 50 turns. At 1800 s episodes reached ~22 turns and died UNGRADED, which
+  # the ladder scores as "nothing usable" 0.0, a false negative rather than a real one.
+  #
+  # This assumes `max_concurrent_seqs_per_instance` bounds admission to a window the KV pool
+  # can actually decode (40, set in fsdp_qwen35_9b.sh). Without that gate each engine
+  # admitted up to 1024 sequences and the measured rate was 0.31 turns/min per episode, where
+  # 50 turns needs 161 min and no timeout is both safe and affordable. Re-derive if that gate,
+  # train_batch_size, or the engine count changes. Cutting max_turns is the wrong lever: the
+  # eval showed 25 -> 50 turns lifted delivery from 9% to 36%, and 106 of 124 trials still
+  # ended at the 50-turn cap.
+  task_timeout_sec: 5400.0
+  # Only sizes PSRL's outer backstop, so it must be >= the task's own
+  # [verifier] timeout_sec (900 for LAPS) or that guard can pre-empt grading.
+  verifier_timeout_sec: 900.0

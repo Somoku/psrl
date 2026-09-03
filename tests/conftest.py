@@ -44,10 +44,14 @@ if "psrl.utils.logger" not in sys.modules:
 
 # Provide only the names needed by staleness_controller without importing
 # gen.utils, which imports torch at module load time.
+# NOTE(lhy): TokenInput and TokenOutput are also stubbed so that agent-loop
+# modules that import base_agent_loop can be collected in cpu_test environments.
 _gen_utils = _fake_module(
     "psrl.workers.gen.utils",
     RolloutInstanceId=tuple[str, int],
     INVALID_ROLLOUT_INSTANCE_ID=("", -1),
+    TokenInput=MagicMock,
+    TokenOutput=MagicMock,
 )
 RolloutInstanceId = _gen_utils.RolloutInstanceId
 

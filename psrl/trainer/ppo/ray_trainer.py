@@ -313,6 +313,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.rollout_coordinator = None
         self.reward_manager = None
         self.reward_loop_workers = []
+        self.env_worker_manager = None
 
         self.reward_gateways: dict[str, ray.actor.ActorHandle] = {}
         self.reward_gateway_urls: dict[str, str] = {}
@@ -1850,6 +1851,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}.")
         psrl_logger.info(f"Session router launched at {self.session_router_url}.")
 
+        # Build env worker pool if enabled.
+        if self.config.psrl.env_worker.enable:
+            from psrl.workers.env_worker import EnvWorkerManager
+
+            self.env_worker_manager = EnvWorkerManager(self.config)
+            psrl_logger.info("Env worker pool built.")
+
         # create agent loop workers
         self.agent_loop_workers = []
         num_agent_workers = self.config.gen_actor_rollout_ref.rollout.agent.num_workers
@@ -3074,6 +3082,36 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
 
+        # `old_log_probs` takes its per-row lengths from `response_mask`, but at loss time
+        # `no_padding_2_padding` derives log_prob's padded width from `responses` instead
+        # (`max_response_len` is never assigned on the NO_PADDING path, so it falls back to
+        # `responses.offsets().diff().max()`). The two fields must therefore agree row by row,
+        # and nothing else in the pipeline checks it: a divergence surfaces much later as
+        # "the size of tensor a (273) must match the size of tensor b (337)" inside
+        # compute_policy_loss_vanilla, which says nothing about which field drifted.
+        response_lens = data["responses"].offsets().diff()
+        mask_lens = data["response_mask"].offsets().diff()
+        psrl_logger.info(
+            "[length-contract] old_log_prob stage: rows=%d responses[min=%d max=%d] "
+            "response_mask[min=%d max=%d] equal=%s",
+            len(response_lens),
+            int(response_lens.min()),
+            int(response_lens.max()),
+            int(mask_lens.min()),
+            int(mask_lens.max()),
+            bool(torch.equal(response_lens, mask_lens)),
+        )
+        if not torch.equal(response_lens, mask_lens):
+            bad = (response_lens != mask_lens).nonzero().flatten().tolist()
+            raise AssertionError(
+                f"responses and response_mask disagree on length for {len(bad)} of "
+                f"{len(response_lens)} rows. First offenders (row, responses, mask): "
+                f"{[(int(i), int(response_lens[i]), int(mask_lens[i])) for i in bad[:5]]}. "
+                "Both are written per trajectory by the agent loop and must stay in lockstep, "
+                "because old_log_probs is cut to the mask length while the training forward is "
+                "padded to the responses length."
+            )
+
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
         data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
@@ -3168,8 +3206,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps):
-        # 1. collect necessary fields from TransferQueue for computing metrics
-        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+        # 1. collect necessary fields from TransferQueue for computing metrics.
+        # Synthetic DP-padding rows are excluded from the fetch rather than filtered
+        # afterwards. They contribute nothing (they are `prompt_len=1/response_len=1`
+        # stubs with zeroed rewards), and their keys are minted from a per-call-site
+        # counter in `verl.trainer.ppo.padding_utils.upsample_batch_to_divisible_size`, so
+        # the names collide between the two padding sites: `_balance_batch` pads the batch,
+        # then `_prepare_scheduled_batch` pads its own view with the SAME names and clears
+        # them in its `finally`. Reading them here then raised
+        # `ValueError: keys or partition were not found!` for rows the trainer had already
+        # consumed. Fetching only real samples makes metrics independent of that lifetime.
+        real_keys = [key for key, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False)]
         fields = [
             "prompts",
             "responses",
@@ -3185,7 +3232,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
         if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
             fields.extend(gdpo_reward_keys)
-        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        data = tq.kv_batch_get(keys=real_keys, partition_id=batch.partition_id, select_fields=fields)
         num_turns = np.array(data.pop("num_turns").tolist())
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
@@ -3204,20 +3251,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "max_response_length": self.config.data.max_response_length,
             },
         )
-        metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
-
+        # `data` holds only real samples, so every metric below sees the same batch.
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps})
-        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
-        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
+        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
-        if non_padding_mask.any():
-            num_turns = num_turns[non_padding_mask]
         metrics.update(
             {
                 "training/num_turns/mean": num_turns.mean(),
@@ -3449,6 +3493,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.elastic_executor is not None:
             ray.get(self.elastic_executor.stop_busy_loop.remote())
             self.elastic_executor = None
+        if self.env_worker_manager is not None:
+            self.env_worker_manager.shutdown()
+            self.env_worker_manager = None
         self.stop_ps_manager()
         self._shutdown_dump_executor()
 

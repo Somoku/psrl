@@ -187,6 +187,18 @@ def build_training_data(
     )
     routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
 
+    # STAGE 0 of the length contract, upstream of TokenOutput.as_dict and the agent-loop
+    # worker. These three lists are extended together at every site above, so a divergence
+    # means one of those sites was edited without the others. Everything downstream indexes
+    # them interchangeably.
+    if not (len(all_response_ids) == len(all_response_mask) == len(all_logprobs)):
+        raise AssertionError(
+            f"[TITO build_training_data] length drift over {len(records)} turns: "
+            f"response_ids={len(all_response_ids)} response_mask={len(all_response_mask)} "
+            f"logprobs={len(all_logprobs)}. These are appended in lockstep per turn, so a "
+            "mismatch means one append site diverged from the others."
+        )
+
     psrl_logger.debug(
         "[TITO build_training_data] prompt_len=%d tito_prompt_len=%d response_len=%d "
         "mask_sum=%d logprobs_len=%d num_turns=%d total_acc_len=%d re_tokens=%s",

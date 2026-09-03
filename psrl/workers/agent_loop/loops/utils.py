@@ -37,6 +37,16 @@ class TerminateReason(Enum):
     FINISHED = "finished"
     MAX_RESPONSE_LENGTH_EXCEEDED = "max_response_length_exceeded"
     MAX_TURNS_EXCEEDED = "max_turns_exceeded"
+    # The agent ran out of wall-clock budget, enforced from outside the container, but
+    # the turns it produced are usable. Distinct from `MAX_TURNS_EXCEEDED`, which means
+    # it ran out of *turns*: reporting a clock timeout as a turn cap makes truncation
+    # look like a configured limit in metrics.
+    AGENT_TIMEOUT = "agent_timeout"
+    # The agent finished normally but grading failed or timed out, so the trajectory is
+    # complete and trainable while carrying no verifier reward.
+    VERIFIER_ERROR = "verifier_error"
+    # An environment step exceeded `agent.env.step_timeout`. Both call sites build a
+    # trajectory from the turns completed before the timeout, so this keeps its data.
     ENV_TIMEOUT = "env_timeout"
     TRAJECTORY_TIMEOUT = "trajectory_timeout"
     ABORTED = "aborted"
@@ -45,20 +55,33 @@ class TerminateReason(Enum):
 
     @property
     def is_successful(self) -> bool:
-        """Return whether the trajectory has usable training content."""
+        """Return whether the trajectory has usable training content.
+
+        Every member here is a *budget* that ran out (context window, turn cap, wall
+        clock, env step) or a post-run grading failure. In each case the turns produced
+        before the limit are valid on-policy data, so the trajectory is truncated and
+        trained rather than discarded.
+        """
         return self in (
             TerminateReason.FINISHED,
             TerminateReason.MAX_TURNS_EXCEEDED,
             TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
+            TerminateReason.AGENT_TIMEOUT,
+            TerminateReason.VERIFIER_ERROR,
+            TerminateReason.ENV_TIMEOUT,
         )
 
     @property
     def is_timeout(self) -> bool:
-        """Return whether a timeout stopped the trajectory."""
-        return self in (
-            TerminateReason.ENV_TIMEOUT,
-            TerminateReason.TRAJECTORY_TIMEOUT,
-        )
+        """Return whether a timeout stopped the trajectory before it produced data.
+
+        Only `TRAJECTORY_TIMEOUT` qualifies: it fires from
+        `run_with_termination_handling`, which owns no partial output. `AGENT_TIMEOUT`
+        and `ENV_TIMEOUT` are timeouts too, but their loops return a finalized
+        trajectory, and this property feeds `needs_worker_retry` -- re-running an
+        episode whose turns were already accepted would duplicate them.
+        """
+        return self is TerminateReason.TRAJECTORY_TIMEOUT
 
     @property
     def is_error(self) -> bool:
@@ -71,9 +94,26 @@ class TerminateReason(Enum):
         return self is TerminateReason.ABORTED
 
     def needs_worker_retry(self) -> bool:
-        """Return whether the worker should retry before manager recovery."""
+        """Return whether the worker should re-run the episode in place.
+
+        Only reasons that produced no usable data qualify, since `worker.py` nulls the
+        output for anything this returns True for. Retrying a data-bearing reason would
+        both discard the trajectory and duplicate the work.
+
+        Note this is inert at the default `rollout.agent.retry_limit=1`, which yields a
+        single attempt.
+        """
         return self.is_timeout or self.is_error
 
     def needs_manager_retry(self) -> bool:
-        """Return whether manager must refill a wasted buffer slot."""
-        return self.is_error or self is TerminateReason.TRAJECTORY_TIMEOUT
+        """Return whether manager must refill a wasted buffer slot.
+
+        A train buffer entry is all-or-nothing: `AgentLoopManager` occupies it only once
+        all `alg_rollout_n` trajectories arrive, and `PSManager.abort_requests` clears the
+        whole entry when fewer remain. So every reason that reaches the worker without
+        usable data must refill the group, or the surviving siblings wait forever.
+
+        `ABORTED` is the sole exception: PSManager raised it after already clearing the
+        entry, so requesting another refill would double-count the failure.
+        """
+        return not self.is_successful and not self.is_aborted

@@ -14,6 +14,7 @@ from psrl.utils.common.http_utils import (
     filter_http_headers,
     request_raw,
 )
+from psrl.utils.rollout.turn_output_writer import TurnOutputWriter
 from psrl.workers.gen.smg_adapter import TITO_SESSIONS_PATH, TRAJECTORY_ID_STRATEGIES
 
 psrl_logger = logging.getLogger(__file__)
@@ -95,6 +96,7 @@ class SessionRouter:
         smg_url: str,
         client_concurrency: int = 1024,
         trajectory_id_strategy: str = "manual",
+        turn_output_writer: TurnOutputWriter | None = None,
     ):
         trajectory_id_strategy = trajectory_id_strategy.lower()
         if trajectory_id_strategy not in TRAJECTORY_ID_STRATEGIES:
@@ -105,6 +107,7 @@ class SessionRouter:
         self.client: aiohttp.ClientSession | None = None
         self.client_concurrency = client_concurrency
         self.trajectory_id_strategy = trajectory_id_strategy
+        self.turn_output_writer = turn_output_writer
         self.states: dict[str, SessionState] = {}
         self.states_lock = asyncio.Lock()
         self.setup_routes()
@@ -221,15 +224,29 @@ class SessionRouter:
             headers["x-target-dp-rank"] = pin_once_instance[1]
             headers["x-force-pin-once"] = "true"
             psrl_logger.debug(f"Session {sid!r} turn force-pinned to instance {pin_once_instance!r} (one-shot).")
+        body = await request.body()
+        turn_index = state.get_trajectory_turn(trajectory_id or 0)
+
         result: HttpResponse | None = None
         try:
             result = await self._request_upstream(
                 "POST",
                 "v1/chat/completions",
-                content=await request.body(),
+                content=body,
                 headers=headers,
             )
         finally:
+            # Record the turn before bookkeeping so an upstream error (e.g. a
+            # context-overflow 400) is captured alongside the request that caused it.
+            if self.turn_output_writer is not None:
+                self.turn_output_writer.write_turn(
+                    session_id=sid,
+                    turn=turn_index,
+                    request_body=body,
+                    response_body=result.body if result is not None else None,
+                    trajectory_id=trajectory_id,
+                    status=result.status if result is not None else None,
+                )
             # Single combined critical section: close out inflight bookkeeping
             # and, on success, advance the trajectory's turn counter.
             async with state.lock:

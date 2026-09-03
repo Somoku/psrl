@@ -1,0 +1,27 @@
+# One server process. The simplest topology; use it to check a checkpoint loads
+# and to read its reported KV cache size before committing to a fleet.
+kind: single
+
+port: 8000
+tp: 1
+pp: 1
+
+# Replicas behind this one port. Raise it only when the consumer can accept just
+# one URL; topology=fleet is better otherwise. Broken in this repo's patched vLLM,
+# which is why fleet exists.
+dp: 1
+
+# Empty inherits CUDA_VISIBLE_DEVICES, or all local GPUs if that is unset.
+gpu_ids: []
+
+host: 0.0.0.0
+
+# 75 minutes. A first-time MoE load is the binding case, not dense torch.compile:
+# Qwen3.5-35B-A3B (256 experts) spent ~27 min in flashinfer's JIT build of the
+# CUTLASS fused-MoE kernel, with all TP workers serialized behind one filelock, and
+# a 1800s deadline killed the workers mid-compile. The compile caches under
+# ~/.cache/flashinfer, so only the first launch per kernel pays it.
+#
+# A high value is nearly free: a crashed load is detected immediately by polling the
+# process, so this only bounds the genuinely-still-working case.
+wait_ready_sec: 4500

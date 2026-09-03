@@ -7,6 +7,41 @@
 #          and sibling trajectories never cross optimizer steps.
 batch_agg_mode: trajectory
 
+# How a thinking model's chain-of-thought is carried across turns of a multi-turn
+# session, and what to do with the trajectories that fall out of it.
+#
+# Background: TITO chains a session's turns into one trajectory by hashing the
+# assistant message, `reasoning_content` included (smg crates/tito/src/normalizer.rs).
+# Harness clients such as terminus-2 replay history as {role, content} only, so as
+# soon as the gateway splits <think> out into `reasoning_content` the replayed prefix
+# stops hashing onto the stored leaf and SMG forks a fresh trajectory every turn.
+# The four modes below are the four coherent answers to that, from "accept the forks"
+# to "make sure there are none".
+#
+# multi_traj (default)
+#     Accept the forks and train each one. Every trajectory is internally consistent
+#     (its prompt and response come from the same request), so a fork costs cross-turn
+#     context, not correctness. Pair with batch_agg_mode=request so a session's
+#     trajectories never straddle an optimizer step. Reasoning parser left alone.
+# longest_traj
+#     Same rollout as multi_traj, but keep only the session's longest trajectory and
+#     drop the rest. Trades data volume for one clean sample per episode. This is what
+#     ROLL's MessageTracker does by default (enable_fork=False).
+# multi_thinking
+#     Keep the CoT inline in `content` so nothing forks: the reasoning parser is turned
+#     OFF (`separate_reasoning: false`) and an accumulating chat template replays every
+#     prior turn's <think> block. One session yields one trajectory whose prompt carries
+#     several CoT segments, which is what token-level on-policy training needs. Requires
+#     `gen_actor_rollout_ref.rollout.chat_template` to point at a template built for it
+#     (examples/sciaccel_rl/config/qwen3{,5}_acc_thinking.jinja2 -- the Qwen3 and Qwen3.5
+#     variants are NOT interchangeable, see that directory).
+# disable_thinking
+#     Turn thinking off entirely (`enable_thinking: false`), so there is no CoT to split
+#     and nothing forks. Cheapest in context and the least faithful to a reasoning
+#     model's trained behavior. ROLL's agentic pipeline runs its Qwen3.5 SWE examples
+#     this way.
+thinking_template: multi_traj
+
 # Error handling for terminations where TerminateReason.needs_manager_retry()
 # is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
 # (unclassified failure / zero turns produced). Timeouts and aborts are
@@ -26,5 +61,18 @@ trajectory_output:
   enable: True
   # Output directory. Empty -> <psrl.logging_path>/trajectories.
   dir: ""
+
+# Per-turn chat-completion dump written by the SessionRouter via TurnOutputWriter.
+# Files land at <dir>/{session_id}.jsonl (one per TITO session), appended turn by
+# turn as the episode runs. Unlike trajectory_output above -- which is written
+# only after a trajectory finishes -- this survives a crashed, hung, or
+# context-overflowed episode, so it is the tool for diagnosing rollout failures.
+turn_output:
+  # Whether to record raw session chat-completion traffic.
+  enable: False
+  # Output directory. Empty -> <psrl.logging_path>/session_turns.
+  dir: ""
+  # Whether to include the response body (roughly doubles the file size).
+  include_response: True
 
 # TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml

@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
+from psrl.utils.rollout.turn_output_writer import TurnOutputWriter
 from psrl.workers.gen.smg_adapter import build_rollout_router_args, get_trajectory_id_strategy
 
 psrl_logger = logging.getLogger(__file__)
@@ -158,6 +159,7 @@ class RolloutGateway:
             client_concurrency,
             trajectory_id_strategy,
             logging_path,
+            turn_output_kwargs,
         ):
             import uvicorn
 
@@ -171,13 +173,21 @@ class RolloutGateway:
             if logging_path:
                 session_logger.addHandler(DualOutputHandler(logging_path, "SessionRouter"))
 
+            # Built here rather than in the parent: the writer owns a
+            # threading.Lock, which cannot cross a process boundary.
+            turn_output_writer = TurnOutputWriter(**turn_output_kwargs) if turn_output_kwargs["enable"] else None
+            if turn_output_writer is not None:
+                session_logger.info("Session turn output enabled at %s", turn_output_writer.output_dir)
+
             router = SessionRouter(
                 smg_url=smg_url,
                 client_concurrency=client_concurrency,
                 trajectory_id_strategy=trajectory_id_strategy,
+                turn_output_writer=turn_output_writer,
             )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
+        turn_output_writer_template = TurnOutputWriter.from_config(self.config)
         self.session_router_process = multiprocessing.Process(
             target=_run_session_router,
             args=(
@@ -187,6 +197,11 @@ class RolloutGateway:
                 session_client_concurrency,
                 get_trajectory_id_strategy(self.config),
                 self.config.psrl.logging_path,
+                {
+                    "enable": turn_output_writer_template.enable,
+                    "output_dir": turn_output_writer_template.output_dir,
+                    "include_response": turn_output_writer_template.include_response,
+                },
             ),
         )
         self.session_router_process.daemon = True

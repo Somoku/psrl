@@ -52,6 +52,8 @@ include-package-data = true
 psrl = [
     "trainer/config/*.yaml",
     "trainer/config/**/*.yaml",
+    "eval/config/*.yaml",
+    "eval/config/**/*.yaml",
 ]
 
 [project.entry-points."hydra.searchpath"]

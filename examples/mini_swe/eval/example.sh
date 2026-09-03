@@ -50,45 +50,55 @@ mkdir -p "$SERVE_OUTDIR" "$EVAL_OUTDIR"
 # Step 1 — fan vLLM to every host (text-completion, no tool-call parser)
 # ---------------------------------------------------------------------------
 echo "=== Step 1: starting vLLM on all hosts ==="
-# serve_vllm_multinode.sh exits non-zero if ANY host fails readiness, but a
-# partial set of healthy replicas is still usable — let it through and gate
-# on endpoints.txt below instead.
+# One endpoint per host, with DP replicas behind it: Step 2 gives every eval shard
+# a single OPENAI_API_BASE, so topology.replicas must stay 1 and the parallelism
+# goes into topology.dp. (A fleet of N ports would need N URLs, which
+# eval_swebench_multinode cannot consume.)
+#
+# The launcher exits non-zero only when healthy endpoints drop below
+# topology.min_healthy_frac; a partial set is still usable, so the gate below reads
+# endpoints.json rather than trusting the exit code.
 set +e
-bash "$SCRIPT_DIR/serve_vllm_multinode.sh" \
-    --hosts "$HOSTS_FILE" \
-    --checkpoint "$MODEL" \
-    --served-model-name "$SERVED_MODEL_NAME" \
-    --port "$SERVE_PORT" \
-    --tp "$TP" \
-    --dp "$DP" \
-    --max-model-len 32768 \
-    --repo-root "$REPO_ROOT" \
-    --env-script "$ENV_SCRIPT" \
-    --outdir "$SERVE_OUTDIR" \
-    --wait-ready 1800
+python -m psrl.eval.serve \
+    topology=multinode \
+    topology.hosts_file="$HOSTS_FILE" \
+    topology.replicas=1 \
+    topology.tp="$TP" \
+    topology.dp="$DP" \
+    topology.base_port="$SERVE_PORT" \
+    topology.wait_ready_sec=1800 \
+    server.checkpoint="$MODEL" \
+    server.served_model_name="$SERVED_MODEL_NAME" \
+    server.max_model_len=32768 \
+    env_script="$ENV_SCRIPT" \
+    output_dir="$SERVE_OUTDIR"
 SERVE_RC=$?
 set -e
-# tool-call-parser is empty by default in serve_vllm_multinode.sh —
-# no override needed here. First-time torch.compile on Qwen3-30B can take
-# ~20min per host; --wait-ready 1800 gives a 30min ceiling.
+# server.tool_call_parser is empty in every preset — mini-swe-agent parses its own
+# bash blocks, so no override is needed. First-time torch.compile on Qwen3-30B can
+# take ~20min per host; wait_ready_sec=1800 gives a 30min ceiling.
 
-if [[ ! -s "$SERVE_OUTDIR/endpoints.txt" ]]; then
+ENDPOINTS_JSON="$SERVE_OUTDIR/endpoints.json"
+if [[ ! -s "$ENDPOINTS_JSON" ]]; then
     echo "ERROR: no healthy endpoints after serve step (rc=$SERVE_RC). Aborting." >&2
-    echo "Check per-host logs under $SERVE_OUTDIR/host_logs/ and remote /tmp/vllm_${SERVE_PORT}.log." >&2
+    echo "Check per-host logs under $SERVE_OUTDIR/hosts/ and remote /tmp/vllm_${SERVE_PORT}.log." >&2
     exit 1
 fi
 
-N_HEALTHY=$(wc -l < "$SERVE_OUTDIR/endpoints.txt")
+N_HEALTHY=$(python -c "import json,sys; print(json.load(open(sys.argv[1]))['n_endpoints'])" "$ENDPOINTS_JSON")
 N_HOSTS=$(grep -cEv '^[[:space:]]*(#|$)' "$HOSTS_FILE")
 echo
 echo "Healthy endpoints: $N_HEALTHY / $N_HOSTS"
-cat "$SERVE_OUTDIR/endpoints.txt"
+python -c "
+import json, sys
+for e in json.load(open(sys.argv[1]))['endpoints']:
+    print(f\"  {e['url']}\")
+" "$ENDPOINTS_JSON"
 if [[ "$N_HEALTHY" -lt "$N_HOSTS" ]]; then
     echo
-    echo "NOTE: continuing with $N_HEALTHY healthy host(s). Failed hosts:"
-    echo "  diff <(cut -d/ -f3 $SERVE_OUTDIR/endpoints.txt | cut -d: -f1) <(grep -Ev '^[[:space:]]*(#|$)' $HOSTS_FILE)"
-    echo "(tail the vLLM log on a failed host; if it is still in 'compilation.py'"
-    echo " it only needs more time — kill this script and bump --wait-ready.)"
+    echo "NOTE: continuing with $N_HEALTHY healthy host(s); the launcher logged which"
+    echo "hosts contributed nothing. (Tail the vLLM log on a failed host; if it is still"
+    echo " in 'compilation.py' it only needs more time — bump topology.wait_ready_sec.)"
 fi
 echo
 

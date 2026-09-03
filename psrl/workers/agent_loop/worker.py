@@ -543,14 +543,6 @@ class PSRL_AgentLoopWorker:
             }
         )
 
-        # Multi-trajectory outputs use suffixed keys, so the original input
-        # key is no longer owned by the resulting training payload.
-        if len(outputs) > 1:
-            await tq.async_kv_clear(
-                keys=[str(uid)],
-                partition_id=partition_id,
-            )
-
     def _build_output_fields(
         self,
         outputs: list,
@@ -598,6 +590,19 @@ class PSRL_AgentLoopWorker:
             field["multi_modal_inputs"] = multi_modal_inputs
             field["images_seqlens"] = images_seqlens
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+            # STAGE 2 of the length contract (stage 1 is TokenOutput.as_dict). Re-checked here
+            # because `field` is assembled from batch[0] merged with out.as_dict(), so a stale
+            # response_mask carried over from the batch would silently win over the trajectory's
+            # own. Downstream, old_log_probs is cut to the MASK length while the training
+            # forward is padded to the RESPONSES length.
+            mask_len = field["response_mask"].size(0)
+            if mask_len != response_len:
+                raise AssertionError(
+                    f"[uid={uid} trajectory={i}/{len(outputs)}] responses has {response_len} "
+                    f"tokens but response_mask has {mask_len} after merging the batch fields "
+                    f"with this trajectory's output (prompt_len={prompt_len}). The merge picked "
+                    "up a mask that does not belong to this trajectory."
+                )
             field["seq_len"] = prompt_len + response_len
             field["prompt_len"] = prompt_len
             field["response_len"] = response_len

@@ -105,9 +105,29 @@ class TokenOutput:
         output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
         output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
 
+        # These three describe the same token positions and every downstream stage assumes so:
+        # old_log_probs is cut to the response_mask length while the training forward is padded
+        # to the responses length, so a drift here only surfaces much later as a shape error
+        # inside the PPO loss, naming neither field. Fail at the source instead.
+        if output["responses"].size(0) != output["response_mask"].size(0):
+            raise AssertionError(
+                f"TokenOutput.as_dict: responses has {output['responses'].size(0)} tokens but "
+                f"response_mask has {output['response_mask'].size(0)} "
+                f"(stop_reason={self.stop_reason}, num_turns={self.num_turns}). "
+                "These are built together and must match."
+            )
+
         response_logprobs = output.pop("response_log_probs", None)
         if response_logprobs is not None:
             output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
+            if output["rollout_log_probs"].size(0) != output["responses"].size(0):
+                raise AssertionError(
+                    f"TokenOutput.as_dict: rollout_log_probs has "
+                    f"{output['rollout_log_probs'].size(0)} entries but responses has "
+                    f"{output['responses'].size(0)} tokens "
+                    f"(stop_reason={self.stop_reason}, num_turns={self.num_turns}). "
+                    "Importance sampling needs one logprob per response token."
+                )
 
         routed_experts = output.pop("routed_experts", None)
         if routed_experts is not None:

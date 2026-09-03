@@ -476,17 +476,11 @@ class PSRL_AgentLoopManager:
         state: PayloadState,
     ) -> None:
         """Clear the currently present subset of a terminal payload."""
-        if not state.is_terminal:
-            raise ValueError(f"Cannot clear payload in non-terminal state {state.value!r}.")
-        partitions = await tq.async_kv_list(partition_id=partition_id)
-        partition = partitions.get(partition_id, {})
-        existing_keys = [key for key in keys if key in partition]
-        if existing_keys:
-            await async_clear_payload(
-                keys=existing_keys,
-                partition_id=partition_id,
-                state=state,
-            )
+        await async_clear_payload(
+            keys=keys,
+            partition_id=partition_id,
+            state=state,
+        )
 
     async def _purge_tracker_group(
         self,
@@ -1071,10 +1065,26 @@ class PSRL_AgentLoopManager:
                 if isinstance(entry_info.n_trajectory, list)
                 else [entry_info.n_trajectory] * len(request_idxs)
             )
-            request_idxs, n_trajectories = zip(*sorted(zip(request_idxs, n_trajectories), key=lambda x: x[0]))
             model_versions = (
                 entry_info.model_version if isinstance(entry_info.model_version, list) else [entry_info.model_version]
             )
+            # `request_idx`, `n_trajectory` and `model_version` are appended in request
+            # ARRIVAL order by `StalenessInventory.occupy_data_*`, so all three must be
+            # reordered together. Sorting only the first two left `model_versions`
+            # indexed by arrival position while `j` below indexes sorted position, which
+            # tagged nearly every request with another request's version whenever
+            # completion order differed from index order.
+            if len(model_versions) == len(request_idxs):
+                request_idxs, n_trajectories, model_versions = (
+                    list(t)
+                    for t in zip(*sorted(zip(request_idxs, n_trajectories, model_versions), key=lambda x: x[0]))
+                )
+            else:
+                # A scalar `model_version` covers every request in the entry, so there is
+                # nothing to reorder and the `model_versions[-1]` fallback below applies.
+                request_idxs, n_trajectories = (
+                    list(t) for t in zip(*sorted(zip(request_idxs, n_trajectories), key=lambda x: x[0]))
+                )
 
             for j, (request_idx, n_trajectory) in enumerate(zip(request_idxs, n_trajectories)):
                 if n_trajectory == 1:

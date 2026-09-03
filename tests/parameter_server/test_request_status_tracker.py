@@ -16,6 +16,12 @@ class TestRequestLifecycleHappyPath:
         status = tracker.get_request_status(1)
         assert status == [PSRL_RequestStatus.PENDING]
 
+    def test_trajectory_count_updates_payload_keys(self, tracker):
+        tracker.add_request(request_id=34)
+        tracker.update_request_n_trajectory(request_id=34, n_trajectory=3)
+
+        assert tracker._request_tq_keys(34) == ["34_0", "34_1", "34_2"]
+
     def test_update_to_rollout_routing(self, tracker):
         tracker.add_request(1)
         tracker.update_request_status(1, PSRL_RequestStatus.ROLLOUT_ROUTING)

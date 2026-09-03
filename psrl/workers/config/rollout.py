@@ -100,6 +100,8 @@ class RolloutConfig(_VeRLRolloutConfig):
     - pooling-model support (runner, task, reward_kwargs) for gen reward/embedding models
     - enable_weights_cpu_backup for TMS-style level-1 CPU sleep
     - PSRL-specific agent config (AgentLoopConfig with env/data sub-configs)
+    - chat_template forwarded to the SMG router, which renders chat completions
+      for TITO sessions
     """
 
     # Whether disable attention in vLLM.
@@ -120,6 +122,10 @@ class RolloutConfig(_VeRLRolloutConfig):
 
     # Override veRL's AgentLoopConfig with PSRL's richer variant (env + data sub-configs).
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+
+    # Path to a custom Jinja2 chat template. Forwarded to the SMG router
+    # (`RouterArgs.chat_template`), which renders prompts for TITO sessions.
+    chat_template: str | None = None
 
 
 __all__ = [

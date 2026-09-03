@@ -36,6 +36,10 @@ tensorflow/my_graph/*
 !docs/_static/img/*.png
 !assets/*.png
 
+# AIRS-Bench pinned parquet dataset files (small metadata, not training data).
+!examples/airs_bench/data/
+!examples/airs_bench/data/*.parquet
+
 # Common artifact directories
 **/checkpoints
 **/wget-log
@@ -48,6 +52,8 @@ tensorflow/my_graph/*
 **/logs/
 **/log/
 **/*log*/
+# "topology" contains "log", so the rule above swallows this config group.
+!psrl/eval/config/topology/
 **/models/
 **/data/
 

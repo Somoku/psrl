@@ -26,10 +26,12 @@ def tracker_config(tmp_path):
         {
             "rollout_n": 4,
             "val_rollout_n": 1,
-            "redundant_rollout": {
-                "enable": False,
-                "redundant_rollout_n": 4,
-                "alg_rollout_n": 4,
+            "rollout_coordination": {
+                "redundant_rollout": {
+                    "enable": False,
+                    "redundant_rollout_n": 4,
+                    "alg_rollout_n": 4,
+                },
             },
             "logging_path": str(tmp_path / "psrl_test.log"),
         }

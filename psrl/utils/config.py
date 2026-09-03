@@ -6,6 +6,12 @@ from psrl.trainer.ppo.batch_schedule import (
     SUPPORTED_BATCH_AGG_MODES,
     TRAJECTORY_AGG_MODE,
 )
+from psrl.utils.agent.thinking import (
+    MULTI_THINKING,
+    MULTI_TRAJ,
+    keeps_single_trajectory,
+    validate_thinking_template,
+)
 
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
@@ -231,6 +237,29 @@ def validate_config(
 
     # ---- PSRL specific validation ----
 
+    thinking_template = config.psrl.agentic_rl.get("thinking_template", MULTI_TRAJ)
+    validate_thinking_template(thinking_template)
+    if keeps_single_trajectory(thinking_template):
+        # `multi_thinking` and `disable_thinking` earn their single trajectory from the
+        # rollout side: the assistant message the client replays hashes onto the leaf
+        # TITO stored, so the session never forks. `multi_thinking` gets there by keeping
+        # <think> inline in `content`, which only works if the chat template replays
+        # prior-turn CoT -- the stock Qwen3/Qwen3.5 templates strip it behind a
+        # `loop.index0 > ns.last_query_index` gate and would silently break the chain
+        # back into one trajectory per turn. Catch a missing template here rather than
+        # discovering it as a fork count mid-training.
+        if thinking_template == MULTI_THINKING and not config.gen_actor_rollout_ref.rollout.get(
+            "chat_template", None
+        ):
+            raise ValueError(
+                "psrl.agentic_rl.thinking_template='multi_thinking' requires "
+                "gen_actor_rollout_ref.rollout.chat_template to point at an accumulating "
+                "template that replays prior-turn <think> blocks (for example "
+                "examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2 for Qwen3.5). "
+                "The stock Qwen3/Qwen3.5 templates strip them and would fork the session "
+                "into one trajectory per turn."
+            )
+
     batch_agg_mode = config.psrl.agentic_rl.get("batch_agg_mode", TRAJECTORY_AGG_MODE)
     assert batch_agg_mode in SUPPORTED_BATCH_AGG_MODES, (
         f"psrl.agentic_rl.batch_agg_mode must be one of {sorted(SUPPORTED_BATCH_AGG_MODES)}, got {batch_agg_mode!r}."
@@ -434,6 +463,30 @@ def validate_config(
                 "WARNING: psrl.fine_grain_overlap with reward_normalization='batch': "
                 "per-chunk reward normalization uses chunk-level statistics, not full-batch statistics. "
                 "Use reward_normalization='group' for exact equivalence with the full-batch path."
+            )
+
+    # env worker checks
+    env_worker_config = config.psrl.env_worker
+    if env_worker_config.enable:
+        if env_worker_config.placement not in ("colocated", "dedicated"):
+            raise ValueError(
+                f"psrl.env_worker.placement must be colocated or dedicated, "
+                f"got {env_worker_config.placement!r}."
+            )
+        if env_worker_config.placement == "dedicated" and not env_worker_config.dedicated_node_ips:
+            raise ValueError(
+                "psrl.env_worker.placement=dedicated requires a non-empty "
+                "psrl.env_worker.dedicated_node_ips list."
+            )
+        if env_worker_config.routing.method not in ("least_loaded", "round_robin", "random"):
+            raise ValueError(
+                f"psrl.env_worker.routing.method must be least_loaded, round_robin, or random, "
+                f"got {env_worker_config.routing.method!r}."
+            )
+        if int(env_worker_config.cpu_slots_per_worker) <= 0:
+            raise ValueError(
+                f"psrl.env_worker.cpu_slots_per_worker must be positive, "
+                f"got {env_worker_config.cpu_slots_per_worker!r}."
             )
 
     print("[validate_config] All configuration checks passed successfully!")

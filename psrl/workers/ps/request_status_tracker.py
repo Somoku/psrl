@@ -57,14 +57,10 @@ class PSRL_RequestStatus(Enum):
     COMPLETED = enum.auto()
 
 
-# Statuses for which the request's payload has already been committed to the TransferQueue
-# (`tq.kv_batch_put` was issued before the status transition). Only requests currently in
-# one of these statuses are guaranteed to have an entry in the TQ partition, so only these
-# keys are safe targets for `tq.kv_clear` during abort/stale handling.
-#
-# Clearing keys that were never written triggers TQ controller errors
-# because `kv_retrieve_meta(create=False)` is all-or-nothing.
-TQ_COMMITTED_STATUSES: frozenset = frozenset(
+# Statuses in which a request may own TransferQueue payload. Status transitions and
+# payload commits happen in separate actors, so cleanup can race the commit; the shared
+# clear_payload helper therefore filters out keys that are not currently present.
+TQ_PAYLOAD_CLEANUP_STATUSES: frozenset = frozenset(
     {
         PSRL_RequestStatus.ROLLOUT_COMPLETED,
         PSRL_RequestStatus.REWARD_RUNNING,
@@ -192,7 +188,7 @@ class RequestStatusTracker:
                     )
                     request_update_success[i] = False
                     current_status = self._request_id_to_status.get(req_id)
-                    if current_status in TQ_COMMITTED_STATUSES:
+                    if current_status in TQ_PAYLOAD_CLEANUP_STATUSES:
                         abort_payload_keys.extend(self._request_tq_keys(req_id))
                     continue
             else:
@@ -371,6 +367,15 @@ class RequestStatusTracker:
         n_trajectory = self._request_infos[request_id].n_trajectory
         return request_payload_keys(request_id, n_trajectory)
 
+    @_state_locked
+    def update_request_n_trajectory(self, request_id: int, n_trajectory: int) -> None:
+        """Keep the status tracker's payload-key metadata in sync with TITO output."""
+        if n_trajectory < 1:
+            raise ValueError(f"n_trajectory must be positive, got {n_trajectory}.")
+        if request_id not in self._request_infos:
+            raise KeyError(f"Request ID {request_id} not found in request infos.")
+        self._request_infos[request_id].n_trajectory = n_trajectory
+
     def _abort_requests(self, request_ids: list[int] | int, blocking: bool = False):
         """
         Mark requests for abortion.
@@ -407,7 +412,7 @@ class RequestStatusTracker:
                 abort_requests_for_reward.update(req_ids)
             elif status in {PSRL_RequestStatus.COMPLETED}:
                 abort_requests_for_completed.update(req_ids)
-            if status in TQ_COMMITTED_STATUSES:
+            if status in TQ_PAYLOAD_CLEANUP_STATUSES:
                 for req_id in req_ids:
                     abort_payload_keys.extend(self._request_tq_keys(req_id))
 

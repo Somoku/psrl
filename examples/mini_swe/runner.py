@@ -158,7 +158,7 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.environments import get_environment
     from minisweagent.models import get_model
-    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
+    from psrl.utils.agent.overflow import PromptOverflowError, ensure_overflow_handling
 
     _silence_litellm()
 

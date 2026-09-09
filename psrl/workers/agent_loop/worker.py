@@ -88,6 +88,9 @@ class PSRL_AgentLoopWorker:
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+        self.overlong_filtering = bool(config.gen_actor_rollout_ref.rollout.agent.get("overlong_filtering", False))
+        if self.overlong_filtering:
+            psrl_logger.warning("Overlong filtering enabled: budget-truncated trajectories contribute no gradient.")
 
         # TransferQueue bootstrap (connects to controller/storage spun up by the driver).
         tq.init()
@@ -424,33 +427,25 @@ class PSRL_AgentLoopWorker:
                     )
                     output = None
 
-                # The manager must replace buffer slots lost to retryable failures.
+                # The manager must replace buffer slots lost to retryable failures. It is
+                # the only component that can purge the partial group and dispatch a
+                # replacement prompt, and it owns the refill breaker that ends the run
+                # when the failures turn out to be deterministic.
                 if terminate_reason.needs_manager_retry():
                     # `validate` must remain scalar or training failures enter the
                     # validation recovery branch.
                     failed_uid = tu.get(batch, "uid")[0]
                     parent_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else failed_uid
-                    if self.config.psrl.agentic_rl.get("manager_retry_on_error", True):
-                        psrl_logger.warning(
-                            "Group slot lost for uid=%s parent_id=%s "
-                            "(terminate_reason=%s, validate=%s), notifying manager.",
-                            failed_uid,
-                            parent_id,
-                            terminate_reason.value,
-                            validate,
-                        )
-                        await self.agent_loop_manager.notify_group_failed.remote(
-                            parent_id=parent_id,
-                            failed_uid=failed_uid,
-                            is_validate=validate,
-                        )
-                    else:
-                        raise RuntimeError(
-                            f"Agent loop for uid={request_ids} "
-                            f"failed with terminate_reason={terminate_reason.value} "
-                            f"after {retry_limit} attempt(s). "
-                            "Set psrl.agentic_rl.manager_retry_on_error=True to recover silently."
-                        )
+                    psrl_logger.warning(
+                        f"Group slot lost for uid={failed_uid} parent_id={parent_id} "
+                        f"(terminate_reason={terminate_reason.value}, validate={validate}), notifying manager."
+                    )
+                    await self.agent_loop_manager.notify_group_failed.remote(
+                        parent_id=parent_id,
+                        failed_uid=failed_uid,
+                        is_validate=validate,
+                        terminate_reason=terminate_reason,
+                    )
                 else:
                     psrl_logger.debug(
                         f"Agent loop terminated: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
@@ -478,7 +473,7 @@ class PSRL_AgentLoopWorker:
                         level=logging.DEBUG,
                         event_type=EventType.OTHER,
                     ):
-                        await self.postprocess_output(output, batch)
+                        await self.postprocess_output(output, batch, terminate_reason)
             elif terminate_reason != TerminateReason.ABORTED:
                 # Abort the reserved inventory entry after an unreported generation
                 # failure so the buffer can progress.
@@ -492,11 +487,23 @@ class PSRL_AgentLoopWorker:
             if raised_error is not None:
                 raise raised_error
 
-    async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: TensorDict):
+    async def postprocess_output(
+        self,
+        output: TokenOutput | list[TokenOutput],
+        batch: TensorDict,
+        terminate_reason: TerminateReason = TerminateReason.FINISHED,
+    ):
         """Commit generation output to TQ and notify the manager.
 
         Tensor payloads stay in TQ. Only compact request metadata is sent to the
         manager for group occupation.
+
+        Args:
+            output (TokenOutput | list[TokenOutput]): Trajectories to commit.
+            batch (TensorDict): The originating prompt batch.
+            terminate_reason (TerminateReason): Why the episode stopped. Carried into
+                the committed fields so the trainer can drop budget-truncated
+                trajectories from the loss.
         """
         uid = tu.get(batch, "uid")[0]
         is_validate = tu.get(batch, "validate")[0]
@@ -506,7 +513,7 @@ class PSRL_AgentLoopWorker:
 
         outputs = output if isinstance(output, list) else [output]
 
-        keys, fields = self._build_output_fields(outputs, batch, uid, version_tag)
+        keys, fields = self._build_output_fields(outputs, batch, uid, version_tag, terminate_reason)
 
         await tq.async_kv_batch_put(
             keys=keys,
@@ -533,6 +540,7 @@ class PSRL_AgentLoopWorker:
         batch: TensorDict,
         uid: int,
         version_tag: int,
+        terminate_reason: TerminateReason = TerminateReason.FINISHED,
     ) -> tuple[list[str], list[dict]]:
         """Build output keys and field dicts with tensor operations.
 
@@ -566,6 +574,16 @@ class PSRL_AgentLoopWorker:
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             field = {k: v for k, v in field.items() if v is not None}
+            # DAPO overlong filtering. A budget-truncated episode carries a reward that
+            # reports the cutoff rather than the quality of the model's choices, so its
+            # tokens must not steer the policy. Zeroing the mask keeps the trajectory in
+            # the batch, so `rm_scores` still lowers the GRPO group mean and the episodes
+            # that did finish keep an honest positive advantage, while contributing no
+            # gradient. `response_mask` also carries the nested per-row length contract
+            # (`offsets().diff()` in `response_from_nested`), so only the VALUES may be
+            # zeroed. Reshaping or dropping the row breaks that contract.
+            if self.overlong_filtering and terminate_reason.is_budget_truncated:
+                field["response_mask"] = torch.zeros_like(field["response_mask"])
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
@@ -591,6 +609,9 @@ class PSRL_AgentLoopWorker:
                 field["parent_id"] = tu.get(batch, "parent_id")[0]
             field["trajectory_index"] = i
             field["trajectory_num"] = len(outputs)
+            # Carried for metrics so the trainer can report reward and gradient share per
+            # termination without re-deriving them from the rollout logs.
+            field["terminate_reason"] = terminate_reason.value
             fields.append(field)
         return keys, fields
 

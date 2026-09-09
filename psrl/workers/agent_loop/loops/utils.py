@@ -69,6 +69,31 @@ class TerminateReason(Enum):
         )
 
     @property
+    def is_budget_truncated(self) -> bool:
+        """Return whether a harness budget cut the episode off mid-work.
+
+        These trajectories are still valid on-policy data, so `is_successful` keeps
+        them, but their reward reports the cutoff rather than the quality of the
+        model's choices. Grading a run that was never allowed to finish as a failure
+        makes the group-relative advantage penalise every token in it, and under
+        `token-mean` a long truncated trajectory outweighs many short ones. The
+        cheapest way for the policy to shed that penalty is to emit fewer tokens per
+        turn, which spends the turn cap faster and truncates more often.
+
+        Measured over 1983 episodes of GRPO-sciaccel-Qwen35-4B-v2_repair-L1: tokens
+        per turn fell 1125 to 327, `max_turns_exceeded` rose from 29% to 39%, and the
+        score collapsed from 0.573 at step 11 to 0.078 at step 16.
+
+        `AGENT_TIMEOUT` and `ENV_TIMEOUT` are excluded deliberately. They are
+        infrastructure faults rather than budget exhaustion, and `VERIFIER_ERROR`
+        means the agent did finish, so its turns remain honest training data.
+        """
+        return self in (
+            TerminateReason.MAX_TURNS_EXCEEDED,
+            TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
+        )
+
+    @property
     def is_timeout(self) -> bool:
         """Return whether a timeout stopped the trajectory before it produced data.
 

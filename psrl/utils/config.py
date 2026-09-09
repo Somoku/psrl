@@ -7,11 +7,13 @@ from psrl.trainer.ppo.batch_schedule import (
     TRAJECTORY_AGG_MODE,
 )
 from psrl.utils.agent.thinking import (
-    MULTI_THINKING,
     MULTI_TRAJ,
-    keeps_single_trajectory,
+    requires_accumulating_template,
+    template_prefills_assistant_think,
     validate_thinking_template,
+    wants_thinking_disabled,
 )
+from psrl.utils.common.chat_template import resolve_chat_template_value
 
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
@@ -231,17 +233,31 @@ def validate_config(
 
     thinking_template = config.psrl.agentic_rl.get("thinking_template", MULTI_TRAJ)
     validate_thinking_template(thinking_template)
-    if keeps_single_trajectory(thinking_template):
-        # Single-trajectory modes require replayed assistant messages to match TITO's stored leaf.
-        # `multi_thinking` also requires an accumulating template that retains prior `<think>` blocks.
-        if thinking_template == MULTI_THINKING and not config.gen_actor_rollout_ref.rollout.get("chat_template", None):
+    chat_template = config.gen_actor_rollout_ref.rollout.get("chat_template", None)
+    if requires_accumulating_template(thinking_template) and not chat_template:
+        raise ValueError(
+            "psrl.agentic_rl.thinking_template='multi_thinking' requires "
+            "gen_actor_rollout_ref.rollout.chat_template to point at an accumulating "
+            "template that replays prior-turn <think> blocks (for example "
+            "examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2 for Qwen3.5). "
+            "The stock Qwen3/Qwen3.5 templates strip them and would fork the session "
+            "into one trajectory per turn."
+        )
+    if wants_thinking_disabled(thinking_template) and chat_template:
+        # Reject only templates that actually prefill an unclosed `<think>` on history.
+        # An accumulating template that emits a bare `content` stays balanced with
+        # thinking off, which is what SkyRL runs in
+        # `examples/train/thunder_agent/scripts/r2egym_32b/run_trainer.sh`.
+        template_source = resolve_chat_template_value(chat_template)
+        if template_source and template_prefills_assistant_think(template_source):
             raise ValueError(
-                "psrl.agentic_rl.thinking_template='multi_thinking' requires "
-                "gen_actor_rollout_ref.rollout.chat_template to point at an accumulating "
-                "template that replays prior-turn <think> blocks (for example "
-                "examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2 for Qwen3.5). "
-                "The stock Qwen3/Qwen3.5 templates strip them and would fork the session "
-                "into one trajectory per turn."
+                f"psrl.agentic_rl.thinking_template={thinking_template!r} turns thinking off, but "
+                f"gen_actor_rollout_ref.rollout.chat_template={chat_template!r} opens a <think> on "
+                "historical assistant turns and relies on the generated text to close it. With "
+                "thinking off there is no closing tag, so every historical turn renders an "
+                "unterminated <think>. Use a template whose assistant branch emits a bare content "
+                "(examples/sciaccel_rl/config/qwen3_acc_thinking.jinja2), or unset the override to "
+                "use the model's own template, which emits a balanced empty <think> block."
             )
 
     batch_agg_mode = config.psrl.agentic_rl.get("batch_agg_mode", TRAJECTORY_AGG_MODE)

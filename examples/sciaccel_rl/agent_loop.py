@@ -56,6 +56,33 @@ class _HarborLoopThread:
 
 _harbor_loop = _HarborLoopThread()
 
+# Admission gate on concurrent Harbor episodes, created lazily on the Harbor loop
+# because an `asyncio.Semaphore` binds to the loop that first awaits it.
+_episode_gate: asyncio.Semaphore | None = None
+_episode_gate_limit = 0
+
+
+async def _acquire_episode_slot(limit: int) -> asyncio.Semaphore:
+    """
+    Return the shared episode gate, building it on first use.
+
+    Runs on the Harbor loop, so no lock is needed: that loop is single threaded and
+    this coroutine does not await before the assignment.
+
+    Args:
+        limit (int): Maximum concurrent episodes for this worker.
+
+    Returns:
+        asyncio.Semaphore: The gate, already acquired by the caller.
+    """
+    global _episode_gate, _episode_gate_limit
+    if _episode_gate is None or _episode_gate_limit != limit:
+        _episode_gate = asyncio.Semaphore(limit)
+        _episode_gate_limit = limit
+        psrl_logger.info("Harbor episode concurrency capped at %d per worker.", limit)
+    await _episode_gate.acquire()
+    return _episode_gate
+
 
 @register("sciaccel")
 class SciAccelAgentLoop(SessionAgentLoop):
@@ -100,6 +127,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
 
         task_path = extra_info.get("task_path", "")
         reward_key = extra_info.get("reward_key", "reward")
+        hint = extra_info.get("hint", "")
         needs_gpu = int(extra_info.get("gpus", 0)) > 0
         uid = request.get("uid", "?")
 
@@ -126,6 +154,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 model_name,
                 needs_gpu=needs_gpu,
                 session_id=session_id,
+                hint=hint,
             )
 
             if harbor_result.exception:
@@ -291,26 +320,41 @@ class SciAccelAgentLoop(SessionAgentLoop):
         *,
         needs_gpu: bool = False,
         session_id: str = "",
+        hint: str = "",
     ) -> HarborEpisodeResult:
         """
         Run the Harbor Job on the dedicated Harbor event loop thread.
 
         All Harbor Jobs share a single event loop to avoid subprocess race
         conditions (Harbor uses asyncio.subprocess internally).
+
+        The episode is admitted through a semaphore so a worker cannot hold more than
+        `harbor.max_concurrent_episodes` sets of containers at once. The gate is released
+        only after `run_harbor_episode` returns, and that function tears its containers
+        down in a `finally`, so a waiting episode starts against a cleaned daemon rather
+        than piling on top of one.
         """
-        future = _harbor_loop.run(
-            run_harbor_episode(
-                task_path=task_path,
-                model_base_url=model_base_url,
-                model_name=model_name,
-                config=self.runtime_config,
-                needs_gpu=needs_gpu,
-                session_id=session_id,
-                max_model_len=int(self.rollout_config.get("max_model_len", 40960)),
-                max_turns=self.max_turns,
-                actor_id=os.getenv("PSRL_ACTOR_ID", ""),
-                thinking_template=self.thinking_template,
-            )
-        )
+        limit = int(self.runtime_config.harbor.max_concurrent_episodes)
+
+        async def _gated() -> HarborEpisodeResult:
+            gate = await _acquire_episode_slot(limit)
+            try:
+                return await run_harbor_episode(
+                    task_path=task_path,
+                    model_base_url=model_base_url,
+                    model_name=model_name,
+                    config=self.runtime_config,
+                    needs_gpu=needs_gpu,
+                    session_id=session_id,
+                    max_model_len=int(self.rollout_config.get("max_model_len", 40960)),
+                    max_turns=self.max_turns,
+                    actor_id=os.getenv("PSRL_ACTOR_ID", ""),
+                    thinking_template=self.thinking_template,
+                    hint=hint,
+                )
+            finally:
+                gate.release()
+
+        future = _harbor_loop.run(_gated())
         # Harbor owns the timeout budget. Another deadline could discard valid slow episodes.
         return await asyncio.wrap_future(future)

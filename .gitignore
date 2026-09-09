@@ -56,6 +56,7 @@ tensorflow/my_graph/*
 !psrl/eval/config/topology/
 **/models/
 **/data/
+**/results/
 
 
 # =========================================================================

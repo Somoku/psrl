@@ -48,9 +48,17 @@ max_turns=32
 
 # --- Chain-of-thought handling across turns ---
 
-# Qwen3's matched tags require its accumulated-thinking template.
-thinking_template=multi_thinking
-chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen3_acc_thinking.jinja2
+# `multi_thinking` needs Qwen3's accumulated-thinking template to keep its matched
+# tags. `disable_thinking` and the trajectory modes must run on the model's own
+# template, so they leave the override empty. Deriving the path here keeps the two
+# settings from drifting apart, which renders a broken prompt.
+thinking_template=${thinking_template:-multi_thinking}
+if [ "${thinking_template}" = "multi_thinking" ]; then
+    chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen3_acc_thinking.jinja2
+    chat_template_arg="+gen_actor_rollout_ref.rollout.chat_template=${chat_template_path}"
+else
+    chat_template_arg=""
+fi
 
 # --- Deployment: single node, 8 GPU (4 gen + 4 train) ---
 NNODES=1
@@ -114,7 +122,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
-    +gen_actor_rollout_ref.rollout.chat_template=${chat_template_path} \
+    ${chat_template_arg} \
     gen_actor_rollout_ref.rollout.n=${rollout_N} \
     gen_actor_rollout_ref.rollout.temperature=1.0 \
     gen_actor_rollout_ref.rollout.top_p=1.0 \

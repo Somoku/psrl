@@ -1,5 +1,6 @@
 import enum
 import json
+from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -17,6 +18,59 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 
 # from verl.trainer.ppo.ray_trainer import compute_response_mask
+
+
+def _compute_termination_metrics(
+    terminate_reasons: list[str],
+    parent_ids: list[str],
+    scores: list[float],
+    trained_tokens: list[float],
+) -> dict[str, float]:
+    """Break the batch down by why each episode stopped, and by group degeneracy.
+
+    Two failure modes are invisible in the aggregate metrics and were only found by
+    post-hoc log parsing. Splitting the reward by termination separates "the policy
+    solved it" from "the harness cut it off", which move in opposite directions while
+    `critic/score/mean` reports a single blended number. The zero-variance group
+    fraction tracks how much of the batch produces no learning signal at all, since a
+    GRPO group whose rollouts all score alike yields an advantage of exactly zero.
+
+    Args:
+        terminate_reasons (list[str]): Per-sample `TerminateReason` values.
+        parent_ids (list[str]): Per-sample GRPO group key.
+        scores (list[float]): Per-sample sequence-level score.
+        trained_tokens (list[float]): Per-sample count of unmasked tokens, which is
+            zero for a trajectory dropped by overlong filtering.
+
+    Returns:
+        dict[str, float]: Metrics under the `termination/` and `group/` prefixes.
+    """
+    total = len(terminate_reasons)
+    if total == 0:
+        return {}
+
+    metrics: dict[str, float] = {}
+    by_reason: dict[str, list[float]] = defaultdict(list)
+    for reason, score in zip(terminate_reasons, scores, strict=True):
+        by_reason[reason].append(score)
+    for reason, reason_scores in by_reason.items():
+        metrics[f"termination/{reason}/fraction"] = len(reason_scores) / total
+        metrics[f"termination/{reason}/score_mean"] = float(np.mean(reason_scores))
+
+    # The share of the batch that reaches the optimiser. Overlong filtering removes the
+    # truncated episodes, so a collapse here means the batch is nearly all truncation
+    # and the step is learning from very little. `token-mean` divides by exactly this
+    # token count, so it also says how much the surviving tokens are being scaled up.
+    metrics["termination/trained_tokens"] = float(np.sum(trained_tokens))
+    metrics["termination/masked_sample_fraction"] = sum(1 for t in trained_tokens if t == 0) / total
+
+    groups: dict[str, list[float]] = defaultdict(list)
+    for parent_id, score in zip(parent_ids, scores, strict=True):
+        groups[parent_id].append(score)
+    degenerate = sum(1 for group in groups.values() if len(group) > 1 and float(np.std(group)) < 1e-6)
+    metrics["group/zero_variance_fraction"] = degenerate / len(groups) if groups else 0.0
+    metrics["group/count"] = float(len(groups))
+    return metrics
 
 
 def compute_response_mask(data: DataProto):

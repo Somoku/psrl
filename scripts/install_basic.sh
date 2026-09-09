@@ -21,6 +21,7 @@ python -m uv pip install --no-cache-dir "torch==2.11.0" "torchvision==0.26.0" "t
 python -m uv pip install --no-cache-dir "triton==3.6.0" "tensordict==0.12.4" torchdata
 
 # For ncclCommSuspend/ncclCommResume support
+# 2.28.9 is not enough
 python -m uv pip install nvidia-nccl-cu12==2.29.7
 
 echo "2. Install basic packages"

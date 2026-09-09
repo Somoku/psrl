@@ -603,24 +603,37 @@ class DataProcessor:
         Returns:
             TensorDict | None:
                 Ready-to-dispatch TensorDict, or `None` if the dataloader
-                was exhausted before any prompt could be sampled.
+                yielded no data even after starting a fresh epoch.
         """
         assert n_prompts > 0, f"n_prompts must be positive, got {n_prompts!r}."
         rollout_n = self.rollout_n
 
         chunks: list[dict] = []
         remaining = n_prompts
+        # `_get_train_next` rebuilds its iterators before re-raising, so the first
+        # `StopIteration` means this epoch ended rather than the dataset being finished.
+        # One rollover per call is allowed. A second consecutive raise means the
+        # dataloader yields nothing at all, and looping on that would spin forever.
+        rollover_used = False
         with self.dataloader_lock:
             while remaining > 0:
                 if self.retry_buffer is None or self._retry_buffer_size() == 0:
                     try:
                         self.retry_buffer = self._get_train_next()
+                        rollover_used = False
                     except StopIteration:
-                        psrl_logger.warning(
-                            f"sample_train_prompts: dataloader exhausted with sampled={n_prompts - remaining}, "
-                            f"requested={n_prompts}."
+                        if rollover_used:
+                            psrl_logger.warning(
+                                f"sample_train_prompts: dataloader yields no data across an epoch restart, "
+                                f"sampled={n_prompts - remaining}, requested={n_prompts}."
+                            )
+                            break
+                        rollover_used = True
+                        psrl_logger.info(
+                            f"sample_train_prompts: epoch boundary reached with sampled={n_prompts - remaining}, "
+                            f"requested={n_prompts}. Starting the next epoch."
                         )
-                        break
+                        continue
 
                 leftover_size = self._retry_buffer_size()
                 take = min(remaining, leftover_size)

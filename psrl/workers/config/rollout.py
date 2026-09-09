@@ -87,6 +87,21 @@ class AgentLoopConfig(_VeRLAgentLoopConfig):
     reward_bonus_coeff: float = 0.0
     traj_reward_mode: str = "traj"
     default_agent_loop: str = "generate_only_agent"
+    # Node IPs allowed to host agent loop workers. Empty means every alive node, which is
+    # the default round-robin placement. Naming a subset keeps container-backed rollout
+    # off a node whose Docker daemon has degraded, since such a node still accepts actors
+    # and then hangs every episode it is handed.
+    node_ips: list[str] = field(default_factory=list)
+    # DAPO Overlong Filtering. Zero the loss mask of every trajectory a harness budget
+    # cut off, so its tokens carry no gradient while its reward still moves the GRPO
+    # group baseline. This is the DAPO mechanism verl does NOT ship: its
+    # `overlong_buffer_cfg` is Soft Overlong Punishment, a length-proportional reward
+    # penalty that shapes the score rather than the mask. SkyRL enables the filtering
+    # variant for its Harbor recipes.
+    #
+    # Off by default because it discards real rollout tokens, which is the right call
+    # only for a workload whose truncation rate is high enough to distort the gradient.
+    overlong_filtering: bool = False
 
 
 @dataclass

@@ -321,7 +321,7 @@ Scalars still in `psrl.yaml`: `ps_manager_ip`, `reward_service_ip`, `staleness`,
 | `lmcache.yaml` → `psrl.lmcache` | LMCache KV offload (`enable`, `backend`, offload budget, prefix reuse) |
 | `tms.yaml` → `psrl.tms` | torch_memory_saver `range` (`null`/`train`/`all`), `enable_cuda_graph`, `enable_nixl` |
 | `nixl.yaml` → `psrl.nixl` | NIXL server IP/port, pinned temp-memory slots (used by `ps_mode: nixl_cpu`) |
-| `agentic_rl.yaml` → `psrl.agentic_rl` | `manager_retry_on_error`, per-trajectory text dump via `TrajectoryWriter` |
+| `agentic_rl.yaml` → `psrl.agentic_rl` | `refill_failure_threshold` (consecutive group-failure breaker, raised from the train waiters), per-trajectory text dump via `TrajectoryWriter` |
 | `checkpoint.yaml` → `psrl.checkpoint` | `use_dcp_save` (DCP vs PSRL's UCX-safe per-rank `torch.save`) |
 | `broadcast_init.yaml` → `psrl.broadcast_init` | Rank-0 PS worker reads ckpt and broadcasts via NIXL (`binary_tree`) |
 | `group_post_process.yaml` / `buffer_post_process.yaml` | Registered post-processors (`dynamic_sampling_filter`, `no_filter`) for group/buffer stages |

@@ -74,6 +74,7 @@ from psrl.trainer.ppo.batch_schedule import (
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
+    _compute_termination_metrics,
     compute_advantage_for_multi_trajectories,
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
@@ -1821,14 +1822,39 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         max_concurrency_per_worker = max(1, self.max_concurrency // num_agent_workers)
         # Distribute agent loop workers across cluster nodes round-robin so that
         # Docker containers are spread across machines instead of piling up on one.
-        alive_node_ids = [n["NodeID"] for n in ray.nodes() if n["Alive"]]
+        #
+        # `agent.node_ips` restricts placement to an explicit allow list. A node whose
+        # Docker daemon has degraded still accepts actors and then fails or hangs every
+        # episode it is given, so excluding it is the only way to keep training moving
+        # without waiting on a reboot. Empty means every alive node, the default.
+        allowed_ips = list(self.config.gen_actor_rollout_ref.rollout.agent.get("node_ips") or [])
+        alive_nodes = [n for n in ray.nodes() if n["Alive"]]
+        if allowed_ips:
+            selected = [n for n in alive_nodes if n["NodeManagerAddress"] in allowed_ips]
+            if not selected:
+                raise ValueError(
+                    f"agent.node_ips={allowed_ips} matched no alive node. "
+                    f"Alive: {sorted(n['NodeManagerAddress'] for n in alive_nodes)}."
+                )
+            psrl_logger.info(
+                "Agent loop workers restricted to %d of %d nodes: %s.",
+                len(selected),
+                len(alive_nodes),
+                sorted(n["NodeManagerAddress"] for n in selected),
+            )
+            alive_nodes = selected
+        alive_node_ids = [n["NodeID"] for n in alive_nodes]
         for i in range(num_agent_workers):
             node_id = alive_node_ids[i % len(alive_node_ids)]
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
                     max_concurrency=max_concurrency_per_worker,
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=True),
+                    # Hard affinity when an allow list is given, because a soft placement
+                    # lets Ray fall back to exactly the node being excluded.
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=node_id, soft=not allowed_ips
+                    ),
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
@@ -3126,6 +3152,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "rm_scores",
             "token_level_rewards",
             "num_turns",
+            "terminate_reason",
+            "parent_id",
         ]
         # GDPO per-component reward metrics
         gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
@@ -3133,6 +3161,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             fields.extend(gdpo_reward_keys)
         data = tq.kv_batch_get(keys=real_keys, partition_id=batch.partition_id, select_fields=fields)
         num_turns = np.array(data.pop("num_turns").tolist())
+        # Read before `to_padded_tensor`, which drops non-tensor columns.
+        terminate_reasons = [str(v) for v in tu.get(data, "terminate_reason")]
+        metric_parent_ids = [str(v) for v in tu.get(data, "parent_id")]
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -3167,6 +3198,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "training/num_turns/max": num_turns.max(),
                 "training/num_turns/min": num_turns.min(),
             }
+        )
+
+        metrics.update(
+            _compute_termination_metrics(
+                terminate_reasons=terminate_reasons,
+                parent_ids=metric_parent_ids,
+                scores=data["token_level_scores"].sum(dim=-1).tolist(),
+                trained_tokens=data["response_mask"].sum(dim=-1).tolist(),
+            )
         )
 
         # 4. GDPO per-component reward metrics

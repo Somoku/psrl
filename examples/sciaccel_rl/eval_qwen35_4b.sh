@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
-# Train Qwen3.5-9B on the SciAccel v2 task bank with GRPO.
-# Environment variables override model, sequence, topology, and checkpoint settings.
+# Evaluate a Qwen3.5-4B GRPO checkpoint on the SciAccel v2 repair tasks. No training.
+#
+# `trainer.val_only=True` returns straight after the initial validation, so the run
+# loads the checkpoint, scores the validation split once, and exits without building
+# the data processor or touching the optimizer.
+#
+# Validation is in-distribution by default: `${HINT_LEVEL}_val.parquet` carries the same
+# L1 hints the training split did. Point VAL_FILES at `val.parquet` to score unaided
+# localization instead, which is a different and much harder task for a hinted model.
+#
+# Set `EVAL_BASE=True` to score the untrained `HF_MODEL_PATH` weights, which is the
+# baseline every trained checkpoint is measured against. CKPT_PATH is then unused.
 
 set -xeuo pipefail
 
@@ -21,28 +31,73 @@ PSRL_PATH=${PSRL_PATH:-$(python3 -c "import os, psrl; print(os.path.dirname(os.p
 
 # --- Model and data ---
 
-# The 9B model uses the shorter context configured below.
-HF_MODEL_PATH=${HF_MODEL_PATH:-/apdcephfs_zwfy10/share_303541817/lhy/models/Qwen3.5-9B}
-train_files=${PSRL_PATH}/examples/sciaccel_rl/data/v2/train.parquet
-val_files=${PSRL_PATH}/examples/sciaccel_rl/data/v2/val.parquet
+# The 4B model leaves more activation memory for long contexts.
+HF_MODEL_PATH=${HF_MODEL_PATH:-/apdcephfs_zwfy10_303541817/share_303541817/lhy/models/Qwen3.5-4B}
+# Localization hint strength for the repair tasks. `L1` adds file, line, and defect
+# note, `L2` drops the line, and `L3` is the unhinted control. Validation is always
+# unhinted, so scores stay comparable across levels.
+HINT_LEVEL=${HINT_LEVEL:-L1}
+# `v2_repair` holds the 99 single edit repair tasks, every one of them hinted.
+# `v2_hint` adds the 44 excised routine tasks, which take a whole subroutine body
+# (median 32 lines, max 1020) and cannot be helped by a location hint.
+DATA_DIR=${DATA_DIR:-${PSRL_PATH}/examples/sciaccel_rl/data/v2_repair}
+# Score the untrained `HF_MODEL_PATH` weights instead of a checkpoint. With this on the
+# PS loads the HF weights straight from disk, exactly as step 0 of a training run does,
+# so the number is the step-0 baseline for that model on this split.
+EVAL_BASE=${EVAL_BASE:-True}
+# The checkpoint to score. Must be a `global_step_N` directory holding `actor/`, because
+# `resume_mode=resume_path` asserts on the `global_step_` prefix to recover the step
+# number for logging. Unused when EVAL_BASE=True.
+CKPT_PATH=${CKPT_PATH:-${PSRL_PATH}/examples/sciaccel_rl/results/laps-cpu_repair/GRPO-sciaccel-Qwen35-4B-v2_repair-L1/global_step_30}
+# `train_files` is still required by the config schema even though no training runs.
+# The dataset is built but the data processor never starts, so this file is only read
+# for its schema.
+train_files=${DATA_DIR}/${HINT_LEVEL}_train.parquet
+# Hinted validation, matching the training distribution. The unhinted `val.parquet`
+# measures something the model was never trained to do.
+val_files=${VAL_FILES:-${DATA_DIR}/${HINT_LEVEL}_val.parquet}
 
 if [[ ! -d "${HF_MODEL_PATH}" ]]; then
     echo "ERROR: model directory not found: ${HF_MODEL_PATH}" >&2
     exit 1
 fi
+if [ "${EVAL_BASE}" != "True" ]; then
+    if [[ ! -d "${CKPT_PATH}/actor" ]]; then
+        echo "ERROR: checkpoint actor directory not found: ${CKPT_PATH}/actor" >&2
+        echo "Pass CKPT_PATH=<...>/global_step_N pointing at a saved step, or EVAL_BASE=True." >&2
+        exit 1
+    fi
+    if [[ "${CKPT_PATH}" != *global_step_* ]]; then
+        echo "ERROR: CKPT_PATH must contain 'global_step_': ${CKPT_PATH}" >&2
+        exit 1
+    fi
+fi
 for f in "${train_files}" "${val_files}"; do
     if [[ ! -f "${f}" ]]; then
         echo "ERROR: parquet not found: ${f}" >&2
-        echo "Build it: python -m examples.sciaccel_rl.prepare.build_dataset_v2 --repo <sciaccel-rl> --out-dir $(dirname "${f}")" >&2
+        echo "Build it: python -m examples.sciaccel_rl.prepare.build_dataset_v2 --repo <sciaccel-rl> --out-dir $(dirname "${f}") --categories repair --hint-level all" >&2
         exit 1
     fi
 done
 
 # --- Experiment ---
 project_name=sciaccel_rl
-experiment_name=GRPO-sciaccel-v2-Qwen35-9B
+# The dataset directory is part of the identity, because a repair only run and a
+# mixed run at the same hint level are different experiments.
+# The eval prefix and the scored step keep this run's logs and wandb entries separate
+# from the training run they came from. A base eval is tagged `base`, not `global_step_0`,
+# because no such checkpoint directory exists and the name should not imply one.
+if [ "${EVAL_BASE}" = "True" ]; then
+    eval_tag=base
+else
+    eval_tag=$(basename "${CKPT_PATH}")
+fi
+experiment_name=EVAL-Qwen35-4B-$(basename "${DATA_DIR}")-${HINT_LEVEL}-${eval_tag}
 OUTPUT_DIR=${OUTPUT_DIR:-${PSRL_PATH}/examples/sciaccel_rl}
-CKPTS_DIR=${OUTPUT_DIR}/ckpts/${project_name}/${experiment_name}
+# Deliberately NOT the training run's checkpoint directory. `resume_mode=resume_path`
+# reads from `CKPT_PATH`, so this only ever receives eval bookkeeping, and pointing it
+# at the training tree would risk `save_freq` writing into it.
+CKPTS_DIR=${OUTPUT_DIR}/eval_ckpts/${project_name}/${experiment_name}
 PSRL_LOG_DIR=${OUTPUT_DIR}/psrl_logs/${experiment_name}
 mkdir -p "${CKPTS_DIR}" "${PSRL_LOG_DIR}"
 
@@ -53,21 +108,50 @@ reward_path=${PSRL_PATH}/examples/sciaccel_rl/reward.py
 # --- Batch and sequence lengths ---
 
 # Batch size controls requests and packed sequences per step.
-train_batch_size=${TRAIN_BATCH_SIZE:-8}
+train_batch_size=${TRAIN_BATCH_SIZE:-16}
 rollout_N=8
 # Keep prompts large enough for the longest task instruction.
 max_prompt_length=2048
-# Fit the response window within 9B activation memory.
-max_response_length=${MAX_RESPONSE_LENGTH:-64512}
+# Long terminal output requires most of the context budget.
+max_response_length=${MAX_RESPONSE_LENGTH:-65536}
+# The serving window must equal the training budget, not exceed it. `max_model_len` is
+# forwarded to terminus-2 as `max_input_tokens`, so any headroom here is headroom the
+# agent will actually use, and TITO then hands the trainer a response longer than
+# `max_response_length`. An earlier attempt to add 4096 slack to dodge a prompt overflow
+# instead moved the wall: overflow errors went from a handful to 3028, and 14% of
+# episodes exceeded the training budget.
 max_model_len=$(( max_prompt_length + max_response_length ))
-# The packing budget must cover the full prompt and response sequence.
-max_tokens_per_gpu=$(( max_prompt_length + max_response_length ))
+# The packing budget must cover the longest sequence without exceeding the window.
+max_tokens_per_gpu=${MAX_TOKENS_PER_GPU:-${max_model_len}}
+if (( max_tokens_per_gpu < max_model_len )); then
+    echo "ERROR: max_tokens_per_gpu (${max_tokens_per_gpu}) must be >= max_model_len (${max_model_len})." >&2
+    echo "rearrange_micro_batches requires max_token_len >= max_seq_len." >&2
+    exit 1
+fi
 max_num_batched_tokens=${max_model_len}
-# Cap turns so Harbor can grade before the shorter context window fills.
-max_turns=${MAX_TURNS:-25}
+# The turn cap lets Harbor grade delivered work before unbounded context growth.
+# Left at 50 deliberately. Measured cost is about 1104 response tokens per turn, so 50
+# turns already spends 55k of the 65536 response budget and 59 turns would exhaust it.
+# Raising the cap without also raising `max_response_length` just converts
+# `max_turns_exceeded` into `max_response_length_exceeded`, which grades no better. The
+# response budget cannot grow either: reserved memory peaked at 85 GB of 95 GB.
+max_turns=${MAX_TURNS:-50}
 
-# Spread Harbor containers across nodes with one agent loop worker per node.
-AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-3}
+# Nodes allowed to host agent loop workers, and therefore Docker containers. A node whose
+# daemon has degraded still accepts actors and then hangs every episode it is handed, so
+# excluding it is the only way to keep training moving without waiting on a reboot.
+# Measured: a healthy node starts 16 containers in 2 s, one carrying 89 orphaned
+# fuse-overlayfs mounts could not start 16 within 280 s. Empty means every alive node.
+AGENT_NODE_IPS=${AGENT_NODE_IPS:-28.58.246.40,28.59.83.117}
+
+# One agent loop worker per allowed node. Workers are placed round-robin, so more workers
+# than nodes stacks several on one node and multiplies its container count by exactly the
+# factor `harbor.max_concurrent_episodes` is there to bound.
+if [ -n "${AGENT_NODE_IPS}" ]; then
+    AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-$(awk -F, '{print NF}' <<< "${AGENT_NODE_IPS}")}
+else
+    AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-3}
+fi
 
 # Bound admitted sequences to the rollout engine's KV capacity.
 # Revisit this value when batch size, context length, or engine count changes.
@@ -104,10 +188,10 @@ GEN_NGPUS_PER_NODE=8
 GEN_INSTANCES=$(((GEN_NNODES * GEN_NGPUS_PER_NODE) / (GEN_TP * GEN_PP)))
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$((GEN_TP * GEN_PP))
 
-# Sequence parallelism remains disabled for incompatible VLM input shapes.
-TRAIN_SP=${TRAIN_SP:-1}
-# FSDP shards the model across all 16 training GPUs.
-TRAIN_FSDP=16
+# Sequence parallelism keeps long-context activations within device memory.
+TRAIN_SP=${TRAIN_SP:-4}
+# Hybrid sharding keeps all-gathers within each training node.
+TRAIN_FSDP=${TRAIN_FSDP:-8}
 TRAIN_NNODES=2
 TRAIN_NGPUS_PER_NODE=8
 
@@ -117,16 +201,33 @@ VAL_PP=1
 VAL_INSTANCES=2
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$((VAL_TP * VAL_PP))
 
+# --- Checkpoint loading ---
+
+# `resume_path` loads the named checkpoint instead of the latest under default_local_dir.
+# 'auto' would search the empty eval directory, find nothing, and silently score the base
+# model, which looks like a successful run with a bad number.
+#
+# `disable` is what makes a base eval a base eval: the trainer then skips the actor load
+# and push entirely, so PS keeps the HF weights it read from `HF_MODEL_PATH` at init and
+# every engine serves the untrained model. Saying `disable` rather than leaning on 'auto'
+# finding nothing keeps that intent explicit and immune to stale files in CKPTS_DIR.
+if [ "${EVAL_BASE}" = "True" ]; then
+    resume_args=(trainer.resume_mode=disable)
+else
+    resume_args=(trainer.resume_mode=resume_path "trainer.resume_from_path=${CKPT_PATH}")
+fi
+
 # --- GRPO and optimizer ---
+# The optimizer is never stepped, but these still have to parse: the actor and its
+# schedule are constructed during init_workers, before fit() reaches the val_only exit.
+# They are left equal to the training recipe so an eval never differs from the run it
+# is scoring by an accident of configuration.
 actor_lr=1e-6
-use_kl_loss=True
-kl_loss_coef=0.001
+use_kl_loss=False
+kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.3
 total_training_steps=${TOTAL_TRAINING_STEPS:-200}
-save_freq=25
-# Full agentic validation is expensive, so run it infrequently.
-test_freq=25
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.ps_manager_ip=${LOCAL_IP:-127.0.0.1} \
@@ -134,9 +235,15 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.rollout_n=${rollout_N} \
     `# 1, so rollout for step N+1 overlaps training for step N instead of the GPUs idling` \
     `# through each phase. It also doubles requests in flight, since max_concurrency is` \
-    `# rollout_n * staleness_buffer_entries * (staleness + 1), which is why the admission` \
-    `# gate above is load-bearing.` \
-    psrl.staleness=1 \
+    `# rollout_n * staleness_buffer_entries * (staleness + 1), which is why the admission gate` \
+    `# above is load-bearing.` \
+    `#` \
+    `# This needs the losses.py width-matching fix: no_padding_2_padding pads the model output` \
+    `# to this micro-batch's own max response length (max_response_len is only set on the` \
+    `# left-right padding path, never on NO_PADDING), while old_log_probs was padded under the` \
+    `# grouping it was stored with. Those groupings only differ once staleness > 0, which is` \
+    `# why step 1 passed and step 2 died on "size of tensor a (273) vs b (337)".` \
+    psrl.staleness=${STALENESS:-1} \
     psrl.staleness_buffer_entries=${train_batch_size} \
     psrl.rollout_gateway.trajectory_id_strategy=auto \
     psrl.rollout_gateway.server_max_concurrency=${SERVER_MAX_CONCURRENCY} \
@@ -169,7 +276,14 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     psrl.group_post_process.enable=${GROUP_FILTER:-False} \
     psrl.group_post_process.name=dynamic_sampling_filter \
     algorithm.filter_groups.metric=seq_final_reward \
+    `# Validation shares the training GPUs rather than reserving its own, which is what` \
+    `# the 3 node topology assumes. With it on, fuse_rollout_with_validate is free to` \
+    `# stay on too, and config validation only forces the fused path when it is off.` \
     psrl.colocate_validate_and_train=True \
+    `# Dispatch validation requests across both the rollout and validate engines. During` \
+    `# an eval the generation engines are otherwise idle, so this is the difference` \
+    `# between scoring 14 tasks on 2 engines and on all 6.` \
+    psrl.fuse_rollout_with_validate=True \
     \
     gen_actor_rollout_ref.rollout.name=vllm \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -187,11 +301,26 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=sciaccel \
     gen_actor_rollout_ref.rollout.agent.num_workers=${AGENT_LOOP_WORKERS} \
+    `# Restrict which nodes host agent loop workers, and therefore Docker containers.` \
+    `# Set AGENT_NODE_IPS='' to fall back to every alive node.` \
+    ${AGENT_NODE_IPS:+gen_actor_rollout_ref.rollout.agent.node_ips=[${AGENT_NODE_IPS}]} \
     gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
+    `# DAPO Overlong Filtering. 46% of episodes in the previous run ended on a harness` \
+    `# budget (838 max_turns_exceeded plus 81 max_response_length_exceeded of 1983), and` \
+    `# 724 of those scored exactly 0. Training them as failures penalises every token in` \
+    `# the longest trajectories, and under token-mean the cheapest way to shed that` \
+    `# penalty is to shorten each turn: measured 1125 to 327 tokens per turn over 16` \
+    `# steps, which spent the turn cap faster, pushed max_turns_exceeded from 29% to 39%` \
+    `# and collapsed the score from 0.573 at step 11 to 0.078 at step 16. Masking keeps` \
+    `# the reward in the GRPO baseline while removing the gradient. Set False to A/B.` \
+    gen_actor_rollout_ref.rollout.agent.overlong_filtering=${OVERLONG_FILTERING:-True} \
     \
     train_actor_rollout_ref.model.path=${HF_MODEL_PATH} \
     train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    `# Short warmup. At 10 steps the first 10 updates ran at 10% to 90% of the target lr,` \
+    `# so a run that only reached step 14 had barely trained and its reward curve was` \
+    `# almost pure sampling noise. 3 steps still eases in the first updates.` \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS:-3} \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_batch_size} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -246,13 +375,23 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     reward.active_managers='[dapo]' \
     reward.managers.dapo.reward_fn.0.path=${reward_path} \
     reward.managers.dapo.reward_fn.0.name=compute_score \
+    `# The overlong penalty is off. It fired on 28% of samples, but 119 of those 142 were` \
+    `# already-failing wall cases scoring ~0.07, so it mostly re-punished known failures.` \
+    `# Meanwhile it hit ~23 episodes that FINISHED, and those score 1.0 some 64% of the` \
+    `# time, so it was penalising successful repairs for taking a while. It also widened` \
+    `# reward to a 2.0 range, inflating advantage variance for a non-task reason. Length` \
+    `# is a symptom of failing to localize the defect here, not a cause worth shaping.` \
     reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.enable=False \
-    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.len=${max_response_length} \
     reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files=${train_files} \
     data.val_files=${val_files} \
     data.train_batch_size=${train_batch_size} \
+    `# The bank is grouped by category on disk, and verl's vendored legacy_data.yaml` \
+    `# defaults shuffle to False, so an unshuffled run spends its first two steps` \
+    `# entirely on restore tasks and never sees a hinted repair task.` \
+    data.shuffle=True \
+    data.seed=${DATA_SEED:-1} \
     data.prompt_key=prompt \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -264,7 +403,11 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    algorithm.norm_adv_by_std_in_grpo=True \
+    `# Dr. GRPO: center advantages within the group but do NOT divide by the group std.` \
+    `# Dividing amplifies noise in near-degenerate groups, where 7 of 8 rollouts score 0` \
+    `# and one scores 1, because the tiny std blows that single sample up. This task is` \
+    `# close to bimodal, so that case is common. SkyRL's Harbor recipes also set it off.` \
+    algorithm.norm_adv_by_std_in_grpo=False \
     `# Truncated importance sampling, matching the dapo_trainer convention (rollout_is=token,` \
     `# threshold 2.0). This is load-bearing rather than optional here because staleness=1` \
     `# means a step trains on trajectories generated by the PREVIOUS weights, so the rollout` \
@@ -281,9 +424,22 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     trainer.default_local_dir=${CKPTS_DIR} \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
     trainer.nnodes=${NNODES} \
-    trainer.save_freq=${save_freq} \
-    trainer.test_freq=${test_freq} \
-    trainer.val_before_train=False \
+    `# Never write a checkpoint. -1 disables periodic saves, which an eval must not do` \
+    `# anyway, and keeps this run from depositing anything into the training tree.` \
+    trainer.save_freq=-1 \
+    `# No in-training validation, because there is no training. The single scoring pass` \
+    `# comes from val_before_train below.` \
+    trainer.test_freq=-1 \
+    `# Score the checkpoint once, before any update.` \
+    trainer.val_before_train=True \
+    `# Return immediately after that first validation. fit() exits before starting the` \
+    `# data processor, so no rollout for training is ever requested and the optimizer is` \
+    `# never stepped. This is what makes the script an eval rather than a 1-step run.` \
+    trainer.val_only=True \
+    `# Still required by the schema. Unused because fit() returns first, but the actor` \
+    `# optimizer schedule is constructed from it during init.` \
     trainer.total_training_steps=${total_training_steps} \
-    trainer.resume_mode=auto \
+    `# resume_mode=resume_path for a checkpoint, resume_mode=disable for a base eval.` \
+    `# See the EVAL_BASE block above.` \
+    "${resume_args[@]}" \
     "$@" 2>&1 | tee "${OUTPUT_DIR}/${experiment_name}.log"

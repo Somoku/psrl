@@ -23,8 +23,20 @@ PSRL_PATH=${PSRL_PATH:-$(python3 -c "import os, psrl; print(os.path.dirname(os.p
 
 # The 4B model leaves more activation memory for long contexts.
 HF_MODEL_PATH=${HF_MODEL_PATH:-/apdcephfs_zwfy10_303541817/share_303541817/lhy/models/Qwen3.5-4B}
-train_files=${PSRL_PATH}/examples/sciaccel_rl/data/v2/train.parquet
-val_files=${PSRL_PATH}/examples/sciaccel_rl/data/v2/val.parquet
+# Localization hint strength for the repair tasks. `L1` adds file, line, and defect
+# note, `L2` drops the line, and `L3` is the unhinted control. Validation is always
+# unhinted, so scores stay comparable across levels.
+HINT_LEVEL=${HINT_LEVEL:-L1}
+# `v2_repair` holds the 99 single edit repair tasks, every one of them hinted.
+# `v2_hint` adds the 44 excised routine tasks, which take a whole subroutine body
+# (median 32 lines, max 1020) and cannot be helped by a location hint.
+DATA_DIR=${DATA_DIR:-${PSRL_PATH}/examples/sciaccel_rl/data/mitgcm-biogeo_repair_easy}
+train_files=${DATA_DIR}/${HINT_LEVEL}_train.parquet
+# Hinted validation, so the split matches the training distribution. Every dataset
+# also ships an unhinted `val.parquet` for measuring unaided localization, but a
+# hint-trained model scores near zero on it for the wrong reason. Override with
+# VAL_FILES to use it deliberately.
+val_files=${VAL_FILES:-${DATA_DIR}/${HINT_LEVEL}_val.parquet}
 
 if [[ ! -d "${HF_MODEL_PATH}" ]]; then
     echo "ERROR: model directory not found: ${HF_MODEL_PATH}" >&2
@@ -33,14 +45,16 @@ fi
 for f in "${train_files}" "${val_files}"; do
     if [[ ! -f "${f}" ]]; then
         echo "ERROR: parquet not found: ${f}" >&2
-        echo "Build it: python -m examples.sciaccel_rl.prepare.build_dataset_v2 --repo <sciaccel-rl> --out-dir $(dirname "${f}")" >&2
+        echo "Build it: python -m examples.sciaccel_rl.prepare.build_dataset_v2 --repo <sciaccel-rl> --out-dir $(dirname "${f}") --categories repair --hint-level all" >&2
         exit 1
     fi
 done
 
 # --- Experiment ---
-project_name=sciaccel_rl
-experiment_name=GRPO-sciaccel-v2-Qwen35-4B
+project_name=sciaccel_rl_mit
+# The dataset directory is part of the identity, because a repair only run and a
+# mixed run at the same hint level are different experiments.
+experiment_name=GRPO-sciaccel-Qwen35-4B-$(basename "${DATA_DIR}")-${HINT_LEVEL}
 OUTPUT_DIR=${OUTPUT_DIR:-${PSRL_PATH}/examples/sciaccel_rl}
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/${project_name}/${experiment_name}
 PSRL_LOG_DIR=${OUTPUT_DIR}/psrl_logs/${experiment_name}
@@ -58,7 +72,13 @@ rollout_N=8
 # Keep prompts large enough for the longest task instruction.
 max_prompt_length=2048
 # Long terminal output requires most of the context budget.
-max_response_length=${MAX_RESPONSE_LENGTH:-81920}
+max_response_length=${MAX_RESPONSE_LENGTH:-65536}
+# The serving window must equal the training budget, not exceed it. `max_model_len` is
+# forwarded to terminus-2 as `max_input_tokens`, so any headroom here is headroom the
+# agent will actually use, and TITO then hands the trainer a response longer than
+# `max_response_length`. An earlier attempt to add 4096 slack to dodge a prompt overflow
+# instead moved the wall: overflow errors went from a handful to 3028, and 14% of
+# episodes exceeded the training budget.
 max_model_len=$(( max_prompt_length + max_response_length ))
 # The packing budget must cover the longest sequence without exceeding the window.
 max_tokens_per_gpu=${MAX_TOKENS_PER_GPU:-${max_model_len}}
@@ -69,10 +89,28 @@ if (( max_tokens_per_gpu < max_model_len )); then
 fi
 max_num_batched_tokens=${max_model_len}
 # The turn cap lets Harbor grade delivered work before unbounded context growth.
+# Left at 50 deliberately. Measured cost is about 1104 response tokens per turn, so 50
+# turns already spends 55k of the 65536 response budget and 59 turns would exhaust it.
+# Raising the cap without also raising `max_response_length` just converts
+# `max_turns_exceeded` into `max_response_length_exceeded`, which grades no better. The
+# response budget cannot grow either: reserved memory peaked at 85 GB of 95 GB.
 max_turns=${MAX_TURNS:-50}
 
-# Spread Harbor containers across nodes with one agent loop worker per node.
-AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-3}
+# Nodes allowed to host agent loop workers, and therefore Docker containers. A node whose
+# daemon has degraded still accepts actors and then hangs every episode it is handed, so
+# excluding it is the only way to keep training moving without waiting on a reboot.
+# Measured: a healthy node starts 16 containers in 2 s, one carrying 89 orphaned
+# fuse-overlayfs mounts could not start 16 within 280 s. Empty means every alive node.
+AGENT_NODE_IPS=${AGENT_NODE_IPS:-28.49.55.85,28.49.196.175}
+
+# One agent loop worker per allowed node. Workers are placed round-robin, so more workers
+# than nodes stacks several on one node and multiplies its container count by exactly the
+# factor `harbor.max_concurrent_episodes` is there to bound.
+if [ -n "${AGENT_NODE_IPS}" ]; then
+    AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-$(awk -F, '{print NF}' <<< "${AGENT_NODE_IPS}")}
+else
+    AGENT_LOOP_WORKERS=${AGENT_LOOP_WORKERS:-3}
+fi
 
 # Bound admitted sequences to the rollout engine's KV capacity.
 # Revisit this value when batch size, context length, or engine count changes.
@@ -83,9 +121,17 @@ SERVER_MAX_CONCURRENCY=${SERVER_MAX_CONCURRENCY:-64}
 
 # --- Chain-of-thought handling across turns ---
 
-# Preserve accumulated thinking bytes across turns with the Qwen3.5 template.
-thinking_template=multi_thinking
-chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2
+# `multi_thinking` preserves accumulated thinking bytes across turns and needs the
+# accumulating Qwen3.5 template. `disable_thinking` and the trajectory modes must run
+# on the model's own template, so they leave the override empty. Deriving the path
+# here keeps the two settings from drifting apart, which renders a broken prompt.
+thinking_template=${thinking_template:-multi_thinking}
+if [ "${thinking_template}" = "multi_thinking" ]; then
+    chat_template_path=${PSRL_PATH}/examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2
+    chat_template_arg="+gen_actor_rollout_ref.rollout.chat_template=${chat_template_path}"
+else
+    chat_template_arg=""
+fi
 
 # --- Deployment: 3 nodes x 8 GPU = 24 (8 generation + 16 training) ---
 
@@ -116,8 +162,12 @@ VAL_NGPUS_PER_NODE_PER_INSTANCE=$((VAL_TP * VAL_PP))
 
 # --- GRPO and optimizer ---
 actor_lr=1e-6
-use_kl_loss=True
-kl_loss_coef=0.001
+# KL to the reference is off. Measured at 6e-4 it contributed nothing to the loss while
+# still paying for a reference forward pass every step. SkyRL's agentic recipes drop it
+# too. Turning it off also frees the memory the ref model held, which matters because
+# reserved memory peaked at 85 GB of the H20's 95 GB.
+use_kl_loss=False
+kl_loss_coef=0.0
 clip_ratio_low=0.2
 clip_ratio_high=0.3
 total_training_steps=${TOTAL_TRAINING_STEPS:-200}
@@ -181,7 +231,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
     gen_actor_rollout_ref.rollout.max_model_len=${max_model_len} \
     gen_actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
-    +gen_actor_rollout_ref.rollout.chat_template=${chat_template_path} \
+    ${chat_template_arg} \
     gen_actor_rollout_ref.rollout.n=${rollout_N} \
     gen_actor_rollout_ref.rollout.temperature=1.0 \
     gen_actor_rollout_ref.rollout.top_p=1.0 \
@@ -191,11 +241,26 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     gen_actor_rollout_ref.rollout.agent.agent_loop_config_path=${agent_loop_config_path} \
     gen_actor_rollout_ref.rollout.agent.default_agent_loop=sciaccel \
     gen_actor_rollout_ref.rollout.agent.num_workers=${AGENT_LOOP_WORKERS} \
+    `# Restrict which nodes host agent loop workers, and therefore Docker containers.` \
+    `# Set AGENT_NODE_IPS='' to fall back to every alive node.` \
+    ${AGENT_NODE_IPS:+gen_actor_rollout_ref.rollout.agent.node_ips=[${AGENT_NODE_IPS}]} \
     gen_actor_rollout_ref.rollout.agent.traj_reward_mode=traj \
+    `# DAPO Overlong Filtering. 46% of episodes in the previous run ended on a harness` \
+    `# budget (838 max_turns_exceeded plus 81 max_response_length_exceeded of 1983), and` \
+    `# 724 of those scored exactly 0. Training them as failures penalises every token in` \
+    `# the longest trajectories, and under token-mean the cheapest way to shed that` \
+    `# penalty is to shorten each turn: measured 1125 to 327 tokens per turn over 16` \
+    `# steps, which spent the turn cap faster, pushed max_turns_exceeded from 29% to 39%` \
+    `# and collapsed the score from 0.573 at step 11 to 0.078 at step 16. Masking keeps` \
+    `# the reward in the GRPO baseline while removing the gradient. Set False to A/B.` \
+    gen_actor_rollout_ref.rollout.agent.overlong_filtering=${OVERLONG_FILTERING:-True} \
     \
     train_actor_rollout_ref.model.path=${HF_MODEL_PATH} \
     train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
+    `# Short warmup. At 10 steps the first 10 updates ran at 10% to 90% of the target lr,` \
+    `# so a run that only reached step 14 had barely trained and its reward curve was` \
+    `# almost pure sampling noise. 3 steps still eases in the first updates.` \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=${LR_WARMUP_STEPS:-3} \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.ppo_mini_batch_size=${train_batch_size} \
     train_actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -250,13 +315,23 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     reward.active_managers='[dapo]' \
     reward.managers.dapo.reward_fn.0.path=${reward_path} \
     reward.managers.dapo.reward_fn.0.name=compute_score \
+    `# The overlong penalty is off. It fired on 28% of samples, but 119 of those 142 were` \
+    `# already-failing wall cases scoring ~0.07, so it mostly re-punished known failures.` \
+    `# Meanwhile it hit ~23 episodes that FINISHED, and those score 1.0 some 64% of the` \
+    `# time, so it was penalising successful repairs for taking a while. It also widened` \
+    `# reward to a 2.0 range, inflating advantage variance for a non-task reason. Length` \
+    `# is a symptom of failing to localize the defect here, not a cause worth shaping.` \
     reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.enable=False \
-    reward.managers.dapo.reward_kwargs.overlong_buffer_cfg.len=${max_response_length} \
     reward.managers.dapo.reward_kwargs.max_resp_len=${max_response_length} \
     \
     data.train_files=${train_files} \
     data.val_files=${val_files} \
     data.train_batch_size=${train_batch_size} \
+    `# The bank is grouped by category on disk, and verl's vendored legacy_data.yaml` \
+    `# defaults shuffle to False, so an unshuffled run spends its first two steps` \
+    `# entirely on restore tasks and never sees a hinted repair task.` \
+    data.shuffle=True \
+    data.seed=${DATA_SEED:-1} \
     data.prompt_key=prompt \
     data.max_prompt_length=${max_prompt_length} \
     data.max_response_length=${max_response_length} \
@@ -268,7 +343,11 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo \
     \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    algorithm.norm_adv_by_std_in_grpo=True \
+    `# Dr. GRPO: center advantages within the group but do NOT divide by the group std.` \
+    `# Dividing amplifies noise in near-degenerate groups, where 7 of 8 rollouts score 0` \
+    `# and one scores 1, because the tiny std blows that single sample up. This task is` \
+    `# close to bimodal, so that case is common. SkyRL's Harbor recipes also set it off.` \
+    algorithm.norm_adv_by_std_in_grpo=False \
     `# Truncated importance sampling, matching the dapo_trainer convention (rollout_is=token,` \
     `# threshold 2.0). This is load-bearing rather than optional here because staleness=1` \
     `# means a step trains on trajectories generated by the PREVIOUS weights, so the rollout` \

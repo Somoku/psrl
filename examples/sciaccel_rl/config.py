@@ -23,6 +23,24 @@ class HarborConfig:
     agent_name: str = "terminus-2"
     override_gpus: int | None = None
     gpu_compose_override: str = ""
+    # Byte cap on a single terminal observation. Harbor hardcodes 10000 in
+    # `Terminus2._limit_output_length`, so a lower value needs the local subclass
+    # in `agent.py`, which `agent_name` must point at for this to take effect.
+    max_observation_bytes: int = 10000
+    # Raise the task container memory above the 8192 MB the LAPS `task.toml` files
+    # declare. The solver was cgroup OOM-killed at 4.2 GB resident on 4 MPI ranks, and
+    # a verifier whose solver dies mid-run can hang instead of failing cleanly. Zero
+    # keeps whatever the task declares.
+    memory_mb_override: int = 0
+    # Hard ceiling on Harbor episodes running at once per agent loop worker. Nothing else
+    # bounds this: admission allows `rollout_n * staleness_buffer_entries * (staleness+1)`
+    # requests, and Harbor containers are invisible to Ray scheduling, so Ray's
+    # `--num-cpus` does not gate them. Each episode holds up to 4 containers (agent main
+    # plus egress sidecar, verifier main plus sidecar) and teardown is asynchronous, so
+    # containers outlive their episode. One node reached 182 containers this way, which
+    # wedged its Docker daemon and stalled training. Trading rollout throughput for a
+    # daemon that stays responsive is the right side of that trade.
+    max_concurrent_episodes: int = 8
 
 
 @dataclass

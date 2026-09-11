@@ -3,7 +3,7 @@ set -xeuo pipefail
 
 staleness=${1:-1}
 project_name=psrl_swe_gym_low_gpu_perf
-experiment_name=group_sticky_thunder_agent_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
+experiment_name=sticky_kv_aware_GRPO-SWE-agent-LM-7B-swe_gym-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/psrl.sh
 
@@ -51,8 +51,7 @@ DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/SWE-agent-LM-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path ${HF_MODEL_PATH} --output_path ${DIST_CKPT_PATH}
 
 # --- Data ---
-# Train: SWE-Gym full 2438 instances (11 repos, difficulty suitable for 7B models).
-# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_subset_100/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
@@ -114,8 +113,8 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths ---
-# SWE-Gym tasks are real-world bugs from 11 repos. Cap at 30 turns
-# which is sufficient for most resolvable instances.
+
+# Most resolvable SWE-Gym tasks fit within 30 turns.
 max_turns=30
 max_prompt_length=4096
 max_response_length=16384
@@ -139,8 +138,8 @@ top_k=-1
 val_top_p=0.7
 
 # --- Reward ---
-# SWE-Gym has moderate difficulty (7B model can resolve some instances),
-# so partial_credit provides useful gradient signal beyond binary {+1,-1}.
+
+# Partial credit provides signal beyond binary SWE-Gym outcomes.
 reward_mode=partial_credit
 
 # --- TIS ---
@@ -161,8 +160,8 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.lmcache.enable_p2p=False \
     psrl.rollout_coordination.routing_strategy.kv_transfer.enable=False \
     psrl.rollout_coordination.routing_strategy.kv_transfer.transfer_mode=async \
-    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=0 \
-    psrl.rollout_coordination.session_strategy.thunder_agent.enable=True \
+    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=1024 \
+    psrl.rollout_coordination.session_strategy.thunder_agent.enable=False \
     psrl.rollout_coordination.sync_and_mig_strategy.mig.enable=False \
     psrl.rollout_coordination.sync_and_mig_strategy.mig.indicator=request_num \
     psrl.rollout_coordination.sync_and_mig_strategy.mig.threshold=10 \
@@ -180,10 +179,11 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     psrl.deployment.train_ngpus_per_node=${TRAIN_NGPUS_PER_NODE} \
     psrl.deployment.total_nnodes=${NNODES} \
     psrl.nixl.server_port=23456 \
+    psrl.profile.prefill_composition.enable=True \
     psrl.rollout_coordination.routing_strategy.method=cache_aware_v1 \
     psrl.rollout_coordination.routing_strategy.cache_aware_policy.lmcache_overlap_weight=0.5 \
     psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky=True \
-    psrl.rollout_coordination.routing_strategy.enable_group_sticky=True \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
     \
     gen_actor_rollout_ref.rollout.gpu_memory_utilization=0.55 \
     gen_actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
@@ -228,7 +228,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     train_actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     train_actor_rollout_ref.actor.clip_ratio_c=10.0 \
     train_actor_rollout_ref.actor.optim.lr=${actor_lr} \
-    train_actor_rollout_ref.actor.optim.lr_warmup_steps=3 \
+    train_actor_rollout_ref.actor.optim.lr_warmup_steps=1 \
     train_actor_rollout_ref.actor.optim.weight_decay=0.1 \
     train_actor_rollout_ref.actor.optim.clip_grad=1.0 \
     train_actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
@@ -291,4 +291,4 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config --conf
     trainer.test_freq=100 \
     trainer.save_freq=50 \
     trainer.total_epochs=100 \
-    trainer.total_training_steps=5 2>&1 | tee ${experiment_name}.log
+    trainer.total_training_steps=2 2>&1 | tee ${experiment_name}.log

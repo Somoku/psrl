@@ -1,4 +1,3 @@
-# Modified from verl/experimental/reward/reward_loop/registry.py
 import asyncio
 import inspect
 from collections.abc import Callable
@@ -76,7 +75,7 @@ def get_custom_reward_fn(reward_fn_config: DictConfig) -> RawRewardFn | None:
         return None
 
     fn_name = reward_fn_config.get("name")
-    assert fn_name is not None
+    assert fn_name is not None, "Reward function name is required."
 
     from verl.utils.import_utils import load_extern_object
 
@@ -140,8 +139,6 @@ def load_reward_manager(
             **reward_kwargs,
         )
 
-    # Try to get a custom reward function based on the configuration
-    # user defined reward manager can be registered in custom_reward_fn
     compute_score = get_custom_reward_fn(reward_fn_config)
     final_compute_score = compute_score
 
@@ -152,9 +149,7 @@ def load_reward_manager(
         sandbox_url = sandbox_config.get("url") if sandbox_config else None
         memory_limit_mb = sandbox_config.get("memory_limit_mb", 1024) if sandbox_config else 1024
         if sandbox_url:
-            # Create an asyncio.Semaphore to control concurrent access to the sandbox
-            # Note: asyncio.Semaphore must be created in the same event loop where it will be used
-            # Therefore, we pass max_concurrent as a parameter and create the semaphore later
+            # The semaphore must be created in the event loop that uses it.
             max_concurrent = reward_kwargs.get("max_concurrent", 64)
             _concurrent_semaphore = asyncio.Semaphore(max_concurrent)
             final_compute_score = partial(

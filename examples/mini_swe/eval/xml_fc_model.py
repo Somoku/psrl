@@ -4,9 +4,6 @@ XML Function-Calling Model for standalone eval.
 Extends ``LitellmTextbasedModel`` to handle SWE-agent-LM's XML function calling
 format (``<function=NAME>...</function>``) by translating tool calls into bash
 commands via ``psrl.tools.tool_parser.xml_fc_tool_parser.parse_xml_fc_to_bash``.
-
-Usage in eval:
-    --model-class examples.mini_swe.eval.xml_fc_model.XmlFcModel
 """
 
 from __future__ import annotations
@@ -19,14 +16,16 @@ from minisweagent.models.litellm_textbased_model import (
     LitellmTextbasedModel,
     LitellmTextbasedModelConfig,
 )
-from psrl.utils.rollout.overflow import PromptOverflowError, handle_prompt_overflow  # noqa: F401
+from psrl.utils.agent.overflow import PromptOverflowError, handle_prompt_overflow  # noqa: F401
 
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 class XmlFcModelConfig(LitellmTextbasedModelConfig):
-    """Config for XmlFcModel — same as textbased but with XML fc defaults."""
+    """
+    Configure XML function call defaults.
+    """
 
     action_regex: str = "__XML_FUNCTION_CALLING__"
     format_error_template: str = (
@@ -59,13 +58,7 @@ class XmlFcModel(LitellmTextbasedModel):
 
     def _parse_actions(self, response) -> list[dict]:
         """
-        Parse XML function-calling format from model response.
-
-        Delegates to ``parse_xml_fc_to_bash`` which handles:
-        - ``<function=bash>`` — direct command passthrough
-        - ``<function=submit>`` — submission command
-        - ``<function=str_replace_editor>`` — translated to bash equivalents
-        - Degraded patterns (markdown fences, etc.)
+        Parse XML function calls into executable shell commands.
 
         Raises:
             FormatError: When no valid action is found.
@@ -78,7 +71,7 @@ class XmlFcModel(LitellmTextbasedModel):
         if cmd is not None:
             return [{"command": cmd}]
 
-        # No valid action found — raise FormatError so the agent retries.
+        # Raise `FormatError` when the parser finds no action.
         raise FormatError(
             {
                 "role": "user",

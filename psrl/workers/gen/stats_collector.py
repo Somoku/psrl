@@ -113,19 +113,22 @@ class DPLBStatCollector(StatLoggerBase):
         self._cumulative_prefill_computed_tokens: int = 0  # actual computed (cache miss)
         self._cumulative_decode_tokens: int = 0
         self._last_time_split_log_time: float | None = None
-        self._time_split_logger = logging.getLogger(f"psrl.time_split.I{self.replica_idx}")
-        self._time_split_logger.propagate = False
-        self._time_split_logger.setLevel(logging.INFO)
-        self._time_split_logger.addHandler(
-            FileOnlyHandler(self.psrl_config.logging_path, f"TimeSplit_I{self.replica_idx}")
-        )
+        self._time_split_enable: bool = bool(self.psrl_config.profile.time_split.enable)
+        self._time_split_interval_s: float = float(self.psrl_config.profile.time_split.interval_in_s)
+        if self._time_split_enable:
+            self._time_split_logger = logging.getLogger(f"psrl.time_split.I{self.replica_idx}")
+            self._time_split_logger.propagate = False
+            self._time_split_logger.setLevel(logging.INFO)
+            self._time_split_logger.addHandler(
+                FileOnlyHandler(self.psrl_config.logging_path, f"TimeSplit_I{self.replica_idx}")
+            )
 
         # Build logger
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             self.log_prefix = f"DPLBStatCollector_{self.role}_I{self.replica_idx}"
             psrl_logger.propagate = False
             psrl_logger.addHandler(FileOnlyHandler(self.psrl_config.logging_path, self.log_prefix))
-            psrl_logger.info(f"Initialized DPLBStatCollector for replica {self.replica_idx} (role={self.role}).")
+            psrl_logger.info(f"Initialized DPLBStatCollector: replica={self.replica_idx}, role={self.role!r}.")
 
     def begin_record(self):
         """
@@ -259,10 +262,8 @@ class DPLBStatCollector(StatLoggerBase):
             snapshot["generation_throughput"] = num_generation_reqs / avg_itl if avg_itl > 0 else 0.0
             snapshot["iteration_stats"] = iteration_stats_entry
 
-            # Accumulate prefill/decode wall time for this step.
-            # `elapsed_time_since_last_record` is the wall time of this step
-            # (time since previous record() call). Skip abnormally large values
-            # (e.g. the very first record after engine init).
+            # Ignore abnormally long intervals when accumulating prefill and decode
+            # wall time.
             step_elapsed = snapshot["elapsed_time_since_last_record"]
             num_pt = iteration_stats_entry["num_prompt_tokens"]
             num_gt = iteration_stats_entry["num_generation_tokens"]
@@ -287,22 +288,23 @@ class DPLBStatCollector(StatLoggerBase):
                     self._cumulative_prefill_time += step_elapsed * (num_pt / total_tokens)
                     self._cumulative_decode_time += step_elapsed * (num_gt / total_tokens)
 
-            # Log cumulative prefill/decode time every 60s.
-            if self._last_time_split_log_time is None:
-                self._last_time_split_log_time = curr_time
-            if curr_time - self._last_time_split_log_time >= 60.0:
-                total_tracked = self._cumulative_prefill_time + self._cumulative_decode_time
-                self._time_split_logger.info(
-                    f"[I{self.replica_idx}] "
-                    f"cumulative_prefill_s={self._cumulative_prefill_time:.2f}, "
-                    f"cumulative_decode_s={self._cumulative_decode_time:.2f}, "
-                    f"prefill_frac={self._cumulative_prefill_time / max(total_tracked, 1e-9):.4f}, "
-                    f"prefill_tokens={self._cumulative_prefill_tokens}, "
-                    f"prefill_computed_tokens={self._cumulative_prefill_computed_tokens}, "
-                    f"decode_tokens={self._cumulative_decode_tokens}, "
-                    f"wall_time_s={curr_time - self.start_time:.1f}"
-                )
-                self._last_time_split_log_time = curr_time
+            # Log cumulative prefill/decode time at configured interval.
+            if self._time_split_enable:
+                if self._last_time_split_log_time is None:
+                    self._last_time_split_log_time = curr_time
+                if curr_time - self._last_time_split_log_time >= self._time_split_interval_s:
+                    total_tracked = self._cumulative_prefill_time + self._cumulative_decode_time
+                    self._time_split_logger.info(
+                        f"[I{self.replica_idx}] "
+                        f"cumulative_prefill_s={self._cumulative_prefill_time:.2f}, "
+                        f"cumulative_decode_s={self._cumulative_decode_time:.2f}, "
+                        f"prefill_frac={self._cumulative_prefill_time / max(total_tracked, 1e-9):.4f}, "
+                        f"prefill_tokens={self._cumulative_prefill_tokens}, "
+                        f"prefill_computed_tokens={self._cumulative_prefill_computed_tokens}, "
+                        f"decode_tokens={self._cumulative_decode_tokens}, "
+                        f"wall_time_s={curr_time - self.start_time:.1f}"
+                    )
+                    self._last_time_split_log_time = curr_time
 
         if self.psrl_config.status_collection.dump_logging_to_file_level != "none":
             if (
@@ -337,7 +339,6 @@ class DPLBStatCollector(StatLoggerBase):
             or curr_time - self.last_push_to_queue_time
             >= self.psrl_config.status_collection.engine_sync_interval_in_ms / 1000.0
         ):
-            # psrl_logger.info(f"Putting snapshot to output queue (model version {self.model_version}, instance_id {(self.replica_idx, engine_idx)}): {snapshot}")  # noqa: E501
             self.output_queue.put_nowait(
                 EngineStats(
                     replica_idx=self.replica_idx,

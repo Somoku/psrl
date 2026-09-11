@@ -11,11 +11,7 @@ from omegaconf import OmegaConf
 
 pytestmark = pytest.mark.cpu_test
 
-# ---------------------------------------------------------------------------
-# Pre-import mocking: inject stubs for ray and other heavy deps so that
-# psrl.workers.reward.reward_model.gateway can be imported on a CPU-only
-# machine that has no ray / torch installed.
-# ---------------------------------------------------------------------------
+# Stub heavy runtime dependencies so the gateway can be imported in CPU tests.
 
 _MOCKED_MODULES = [
     "ray",

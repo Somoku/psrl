@@ -31,7 +31,7 @@ if command -v ucx_info >/dev/null 2>&1; then
         echo "UCX version $DETECTED_VERSION found at $UCX_PREFIX (< $REQUIRED_UCX_VERSION), will build UCX $REQUIRED_UCX_VERSION."
     fi
 else
-    echo "ucx_info not found; will build UCX $REQUIRED_UCX_VERSION."
+    echo "UCX info was not found. Building UCX $REQUIRED_UCX_VERSION."
 fi
 
 if $INSTALL_UCX; then

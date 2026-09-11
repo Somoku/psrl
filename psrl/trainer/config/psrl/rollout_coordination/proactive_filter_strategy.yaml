@@ -2,7 +2,5 @@
 # Available options: "null", "retry", "truncate"
 method: null
 
-# Threshold of retry/truncate requests per buffer
-# When the buffer is not ready but the training side is waiting for it
-# We will trigger the retry/truncate strategy when the number of remaining reserved entries is smaller than this value
+# Trigger retry or truncation when remaining reserved entries fall below this value.
 threshold: 0

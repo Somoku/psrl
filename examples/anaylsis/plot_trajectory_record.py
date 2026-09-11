@@ -21,9 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Optional matplotlib import (plots can be skipped with --no-plot).
-# ---------------------------------------------------------------------------
+# --- Optional plotting dependency ---
 try:
     import matplotlib.pyplot as plt
 
@@ -37,9 +35,7 @@ psrl_logger = logging.getLogger(__file__)
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
 
-# ---------------------------------------------------------------------------
-# I/O
-# ---------------------------------------------------------------------------
+# --- Input ---
 
 
 def load_records(path: str | Path) -> list[TrajectoryProfilingData]:
@@ -74,13 +70,11 @@ def load_records(path: str | Path) -> list[TrajectoryProfilingData]:
             except (json.JSONDecodeError, KeyError, TypeError) as exc:
                 psrl_logger.warning(f"Skipping malformed line {lineno}: {exc}.")
 
-    psrl_logger.info(f"Loaded {len(records)} records from {path}.")
+    psrl_logger.info(f"Loaded records from {path!s}. Count: {len(records)}.")
     return records
 
 
-# ---------------------------------------------------------------------------
-# Statistics
-# ---------------------------------------------------------------------------
+# --- Statistics ---
 
 
 def _stat_dict(values: list[float], *, include_percentiles: bool = True) -> dict:
@@ -92,7 +86,7 @@ def _stat_dict(values: list[float], *, include_percentiles: bool = True) -> dict
         include_percentiles (bool): Whether to include p50 / p90 / p99.
 
     Returns:
-        dict: Keys — min, max, mean, std, and optionally p50, p90, p99.
+        dict: Minimum, maximum, mean, standard deviation, and optional percentiles.
     """
     arr = np.array(values, dtype=float)
     result = {
@@ -202,9 +196,7 @@ def compute_stats(records: list[TrajectoryProfilingData]) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Console output
-# ---------------------------------------------------------------------------
+# --- Console output ---
 
 _COL_W = 11  # column width for the stats table
 
@@ -272,7 +264,7 @@ def print_stats(stats: dict) -> None:
 
     print()
     print("=" * len(header))
-    print(f"  Trajectory Profiling Statistics  —  {stats['num_trajectories']} trajectories")
+    print(f"Trajectory Profiling Statistics: {stats['num_trajectories']} trajectories")
     print("=" * len(header))
 
     print()
@@ -316,9 +308,7 @@ def print_stats(stats: dict) -> None:
     print()
 
 
-# ---------------------------------------------------------------------------
-# Plots
-# ---------------------------------------------------------------------------
+# --- Plots ---
 
 
 def _hist_ax(
@@ -418,7 +408,7 @@ def plot_stats(
             If ``None``, the figure is displayed interactively.
     """
     if not _MATPLOTLIB_AVAILABLE:
-        psrl_logger.warning("matplotlib is not available; skipping plot.")
+        psrl_logger.warning("Matplotlib is not available. Skipping plot.")
         return
     if not stats:
         psrl_logger.warning("No stats to plot.")
@@ -509,9 +499,7 @@ def plot_stats(
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# --- Entry point ---
 
 
 def main() -> None:
@@ -551,7 +539,7 @@ def main() -> None:
 
     if not args.no_plot:
         if not _MATPLOTLIB_AVAILABLE:
-            print("matplotlib is not installed; skipping plot.", file=sys.stderr)
+            print("Matplotlib is not installed. Skipping plot.", file=sys.stderr)
         else:
             out = args.out
             if out is None and not args.no_plot:

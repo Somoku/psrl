@@ -151,12 +151,11 @@ class SessionAgentLoop(AgentLoopBase):
         multi_modal_data: dict | None = None,
         trajectory_id: int | str | None = None,
     ) -> dict:
-        """Send one chat-completion request through a session.
+        """
+        Send one chat completion request through a session.
 
-        ``trajectory_id`` is intentionally a request header rather than part of
-        the OpenAI payload.  With an unbound session this lets TITO preserve
-        independent model contexts without giving up session-level routing and
-        version pinning.
+        The `trajectory_id` request header preserves independent model contexts
+        while retaining session routing and version pinning.
         """
         messages = await normalize_messages(
             messages,
@@ -224,17 +223,32 @@ class SessionAgentLoop(AgentLoopBase):
         training_data["finish_reason"] = records[-1].get("finish_reason") if records else None
         return training_data
 
-    @staticmethod
-    def build_token_output(training_data: dict, *, extra_fields: dict | None = None) -> TokenOutput:
-        """Convert one TITO trajectory into the canonical rollout output."""
+    def build_token_output(self, training_data: dict, *, extra_fields: dict | None = None) -> TokenOutput:
+        """Convert one TITO trajectory into the canonical rollout output.
+
+        The response side is clamped to `rollout.response_length`, mirroring
+        `AgentData.finalize_output` and `GenerateAgentLoop`. Without the clamp an
+        over-long trajectory reaches the trainer intact and trips
+        `rearrange_micro_batches`' `max_token_len >= max_seq_len` assertion, which
+        surfaces as a crash rather than a truncated sample.
+        """
+        response_length = int(self.rollout_config.response_length)
+        response_ids = training_data["response_ids"][:response_length]
+        response_mask = training_data["response_mask"][:response_length]
+        logprobs = training_data["logprobs"]
+        response_log_probs = logprobs[:response_length] if logprobs else None
+        routed_experts = training_data["routed_experts"]
+        if routed_experts is not None:
+            routed_experts = routed_experts[: len(training_data["prompt_ids"]) + response_length]
+
         trajectory_fields = dict(extra_fields or {})
         trajectory_fields["trajectory_id"] = training_data["trajectory_id"]
         return TokenOutput(
             prompt_ids=training_data["prompt_ids"],
-            response_ids=training_data["response_ids"],
-            response_mask=training_data["response_mask"],
-            response_log_probs=training_data["logprobs"] or None,
-            routed_experts=training_data["routed_experts"],
+            response_ids=response_ids,
+            response_mask=response_mask,
+            response_log_probs=response_log_probs,
+            routed_experts=routed_experts,
             stop_reason=training_data.get("finish_reason"),
             num_turns=training_data["num_turns"],
             rollout_instance_id=training_data.get("rollout_instance_id"),

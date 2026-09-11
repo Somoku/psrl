@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from collections import Counter
+from collections import Counter, OrderedDict
 
 import ray
 import transfer_queue as tq
@@ -28,12 +28,53 @@ from psrl.utils.transferqueue_utils import (
     request_payload_keys,
     validate_ready_payload,
 )
+from psrl.workers.agent_loop.loops.utils import TerminateReason
 from psrl.workers.gen.utils import RolloutInstanceId
 from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 from psrl.workers.ps.staleness_controller import EntryInfo
 
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
+
+
+class BoundedIdSet:
+    """Insertion-ordered id set that evicts the oldest entry once full.
+
+    Used for the training failed-group record, which has no safe clear-point. Train
+    prompt ids never repeat within a realistic run, so nothing requires the record to
+    be cleared, and no step boundary is a valid eviction point either: with
+    `staleness > 0` an in-flight prompt outlives several buffers. Bounding by size is
+    what keeps a long run from accumulating entries forever.
+
+    Eviction follows insertion order rather than access order on purpose. Membership is
+    tested for every late arrival, so refreshing on read would tie an entry's lifetime
+    to straggler traffic instead of to its age.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        """Build an empty set.
+
+        Args:
+            capacity (int): Maximum retained ids. Must be positive.
+        """
+        if capacity <= 0:
+            raise ValueError(f"BoundedIdSet capacity must be positive, got {capacity}.")
+        self.capacity = capacity
+        self._ids: OrderedDict[int, None] = OrderedDict()
+
+    def add(self, item: int) -> None:
+        """Record `item`, evicting the oldest id when already at capacity."""
+        if item in self._ids:
+            return
+        self._ids[item] = None
+        if len(self._ids) > self.capacity:
+            self._ids.popitem(last=False)
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._ids
+
+    def __len__(self) -> int:
+        return len(self._ids)
 
 
 class PSRL_AgentLoopManager:
@@ -142,9 +183,7 @@ class PSRL_AgentLoopManager:
             int, list[asyncio.Future]
         ] = {}  # Maps buffer IDs to a set of futures waiting for that buffer
 
-        # Chunk-yielding state (used only when fine_grain_overlap is active).
-        # train_chunk_size: number of prompt-groups per chunk (set by set_chunk_size remote call).
-        # None means chunk-yielding is off; full-batch path remains unchanged.
+        # Chunk size is measured in prompt groups. `None` preserves full-batch behavior.
         self.train_chunk_size: int | None = None
         # Maps buffer_id -> number of prompt-groups already handed out as chunks.
         self._train_chunk_consumed: dict[int, int] = {}
@@ -163,13 +202,35 @@ class PSRL_AgentLoopManager:
         ] = {}  # Maps parent request ids to "occupied" child entries
 
         # Track groups whose failure has already been processed to avoid duplicate handling
-        # when multiple siblings in the same group fail concurrently.
-        self._failed_group_ids: set[int] = set()
+        # when multiple siblings in the same group fail concurrently. Train and validation
+        # are kept apart because their lifetimes differ: the validation record is per-round
+        # and reset by `set_val_buffer_size`, while the train record must survive every
+        # validation round for the whole run. Sharing one set made a validation round
+        # forget which train groups had died, readmitting their stragglers.
+        #
+        # The train record is bounded instead of cleared. Train prompt ids never repeat
+        # within a realistic run, so it needs no clear-point for correctness, and no step
+        # boundary is a valid one: with `staleness > 0` an in-flight prompt outlives
+        # several buffers. The cap is sized well past the dispatch window that
+        # `_get_expected_ps_version` throttles to, so an id is only ever retired long
+        # after any request of that vintage could still arrive.
+        failed_id_capacity = max(4 * self.entries_per_buffer * (self.staleness + 1), 65536)
+        self._failed_train_group_ids: BoundedIdSet = BoundedIdSet(failed_id_capacity)
+        self._failed_val_group_ids: set[int] = set()
 
-        # Set when an entire validation round drains via failures (val_buffer_size
-        # reaches 0). Lets a waiter that registers after the last failure still
-        # observe the all-failed condition instead of blocking forever.
+        # Preserve an all-failed validation result for waiters that register late.
         self._val_round_all_failed: bool = False
+
+        # Refill breaker state (train only). A failed group is purged before it is
+        # replaced, so an unbounded refill loop is the run making no progress rather
+        # than recovering. Counted consecutively and cleared by any occupied group, so
+        # sporadic failures over a long run never accumulate into a trip.
+        self.refill_failure_threshold = self.config.psrl.agentic_rl.get("refill_failure_threshold", 32)
+        self._consecutive_group_failures = 0
+        self._group_failure_reasons: Counter = Counter()
+        # Set once the breaker trips. `wait_for_training_batch` turns it into the
+        # exception that ends the run.
+        self._refill_breaker_diagnosis: str | None = None
 
         # Build logger
         self.log_prefix = "AgentLoopManager"
@@ -237,9 +298,15 @@ class PSRL_AgentLoopManager:
         self.distributed_post_actors = []
 
     def set_val_buffer_size(self, val_buffer_size: int):
-        """Set the validation buffer size."""
+        """Set the validation buffer size and reset per-round validation state.
+
+        Args:
+            val_buffer_size (int): Number of prompt groups this validation round expects.
+        """
         self.val_buffer_size = val_buffer_size
-        self._failed_group_ids.clear()
+        # Validation-only: prompt ids repeat across rounds, so a stale record would drop
+        # a fresh group as already-failed. The train record is deliberately untouched.
+        self._failed_val_group_ids.clear()
         self._val_round_all_failed = False
 
     def set_reward_manager(self, reward_manager: ray.actor.ActorHandle):
@@ -448,13 +515,120 @@ class PSRL_AgentLoopManager:
             return 0
 
         tu.assign_non_tensor_stack(data, "version_tag", [-1] * len(data))
-        psrl_logger.info(f"Retry {len(data)} requests ({len(data) // rollout_n} prompts).")
+        psrl_logger.info(f"Retry dispatch: requests={len(data)}, prompts={len(data) // rollout_n}.")
         await self._inner_dispatch_data(data, is_validate=False)
 
         # Account retry dispatches in the staleness throttle so that
         # `_train_dispatch_data` doesn't over-dispatch on top of retry bursts.
         self._request_counter += len(data)
         return len(data)
+
+    def _reset_group_failure_streak(self) -> None:
+        """Clear the refill breaker's failure streak after a group is occupied.
+
+        One occupied group proves the rollout pipeline can still produce trainable
+        data, so the preceding failures were sporadic rather than deterministic.
+        Resetting here is what keeps a long run from tripping on accumulated noise.
+        """
+        if self._consecutive_group_failures:
+            self._consecutive_group_failures = 0
+            self._group_failure_reasons.clear()
+
+    def _record_group_failure(self, terminate_reason: TerminateReason | None) -> None:
+        """Account one failed training group against the refill breaker.
+
+        Args:
+            terminate_reason (TerminateReason | None): Why the rollout produced no
+                data. Recorded so the breaker can name the dominant cause instead of
+                reporting a bare count.
+        """
+        self._consecutive_group_failures += 1
+        reason = terminate_reason.value if terminate_reason is not None else TerminateReason.UNKNOWN.value
+        self._group_failure_reasons[reason] += 1
+
+        if self._consecutive_group_failures >= self.refill_failure_threshold:
+            breakdown = ", ".join(f"{reason}={count}" for reason, count in self._group_failure_reasons.most_common())
+            self._trip_refill_breaker(
+                f"{self._consecutive_group_failures} consecutive rollout group failures with no group "
+                f"succeeding in between (threshold={self.refill_failure_threshold}). "
+                f"Terminate reasons: {breakdown}. Every failed group was replaced by a fresh prompt, so "
+                f"the buffer never filled and training made no progress. This is an environment or task "
+                f"harness fault rather than a transient error. Raise "
+                f"psrl.agentic_rl.refill_failure_threshold only if these failures are genuinely sporadic."
+            )
+
+    def _trip_refill_breaker(self, diagnosis: str) -> None:
+        """Latch a refill failure and fail every training waiter with it.
+
+        Raising from the caller cannot stop the run: `notify_group_failed` is invoked
+        as a fire-and-forget task in the agent loop worker, whose done-callback logs
+        exceptions and discards them. The driver's only blocking calls into this actor
+        are `wait_for_training_batch` and `wait_for_training_chunk`, so the diagnosis is
+        latched here and converted into an exception there. Both waiter maps are failed
+        directly as well, because the trainer usually blocks before the breaker trips.
+
+        Args:
+            diagnosis (str): Human-readable explanation carried to the driver.
+        """
+        if self._refill_breaker_diagnosis is not None:
+            return
+        self._refill_breaker_diagnosis = diagnosis
+        psrl_logger.error(f"Refill breaker tripped: {diagnosis}")
+
+        # A fresh exception per future: Ray serializes each one separately, and sharing
+        # a single instance makes every waiter report the same reused traceback.
+        for buffer_id in list(self._train_buffer_waiters.keys()):
+            for fut in self._train_buffer_waiters[buffer_id]:
+                if not fut.done():
+                    fut.set_exception(self._refill_breaker_error())
+            del self._train_buffer_waiters[buffer_id]
+
+        # The chunk path is a separate waiter map. `fine_grain_overlap` blocks only
+        # here, so skipping it would leave that strategy livelocked.
+        for chunk_key in list(self._train_chunk_waiters.keys()):
+            for fut in self._train_chunk_waiters[chunk_key]:
+                if not fut.done():
+                    fut.set_exception(self._refill_breaker_error())
+            del self._train_chunk_waiters[chunk_key]
+        self._resolved_train_chunks.clear()
+
+    def _refill_breaker_error(self) -> RuntimeError:
+        """Build the exception that reports a tripped refill breaker."""
+        return RuntimeError(f"Training aborted, rollout groups cannot be refilled. {self._refill_breaker_diagnosis}")
+
+    def _raise_if_refill_breaker_tripped(self) -> None:
+        """Convert a latched refill failure into an exception for the driver.
+
+        Raises:
+            RuntimeError: When `_trip_refill_breaker` has latched a diagnosis.
+        """
+        if self._refill_breaker_diagnosis is not None:
+            raise self._refill_breaker_error()
+
+    async def _refill_failed_group(self, n_prompts: int, context: str) -> int:
+        """Replace `n_prompts` lost training slots and treat a zero refill as fatal.
+
+        Every caller reaches this only after the affected entries were already purged
+        and their siblings aborted, so there is no state left to retry from. A refill
+        that dispatches nothing therefore leaves the buffer permanently short, which
+        the trainer experiences as an unexplained hang.
+
+        Args:
+            n_prompts (int): Number of prompts to dispatch as replacements.
+            context (str): Which recovery path is refilling, used in the diagnosis.
+
+        Returns:
+            int: Number of requests dispatched.
+        """
+        dispatched = await self._retry_data(n_prompts=n_prompts)
+        if dispatched == 0:
+            self._trip_refill_breaker(
+                f"{context} could not dispatch a replacement for {n_prompts} lost buffer slot(s). "
+                "The failed entries were already purged, so the buffer is permanently short and no "
+                "further rollout can complete it. Check that the training dataloader still yields "
+                "data and that the agent loop manager is running."
+            )
+        return dispatched
 
     def _entry_info_tq_keys(self, entry_info: EntryInfo, rollout_n: int) -> list[str]:
         request_idxs = entry_info.request_idx if isinstance(entry_info.request_idx, list) else [entry_info.request_idx]
@@ -476,17 +650,11 @@ class PSRL_AgentLoopManager:
         state: PayloadState,
     ) -> None:
         """Clear the currently present subset of a terminal payload."""
-        if not state.is_terminal:
-            raise ValueError(f"Cannot clear payload in non-terminal state {state.value!r}.")
-        partitions = await tq.async_kv_list(partition_id=partition_id)
-        partition = partitions.get(partition_id, {})
-        existing_keys = [key for key in keys if key in partition]
-        if existing_keys:
-            await async_clear_payload(
-                keys=existing_keys,
-                partition_id=partition_id,
-                state=state,
-            )
+        await async_clear_payload(
+            keys=keys,
+            partition_id=partition_id,
+            state=state,
+        )
 
     async def _purge_tracker_group(
         self,
@@ -528,19 +696,15 @@ class PSRL_AgentLoopManager:
         prompt_entry_infos: list[EntryInfo] = []
         for model_version in sorted(list(accumulated_buffers[buffer_id].keys())):
             prompt_entry_infos.extend(accumulated_buffers[buffer_id][model_version])
-        # NOTE(linsh): sort by prompt_id to ensure the order of prompt_entry_infos
-        # is the same as the order of prompt_ids in the buffer
+        # Sort by `prompt_id` to match the buffer prompt order.
         prompt_entry_infos.sort(key=lambda ei: ei.prompt_id)
 
         batch = self.entry_infos_to_kv_batch_meta(prompt_entry_infos, is_validate)
         partitions = await tq.async_kv_list(partition_id=batch.partition_id)
         validate_ready_payload(batch.keys, batch.partition_id, partitions)
 
-        # Chunk path (train only): skip the full-batch waiter machinery.
-        # Chunks are emitted progressively by `_emit_pending_chunks`; this call
-        # flushes the tail chunk and cleans up accumulated state.  Bypassing
-        # `maybe_add_buffer` and `handle_ready_buffer` prevents a spurious
-        # "No waiters found" warning and the `train_data_buffers` resource leak.
+        # The chunk path bypasses full-batch waiters to avoid duplicate publication
+        # and retained `train_data_buffers` entries.
         if not is_validate and self.train_chunk_size is not None:
             psrl_logger.info(
                 "Training buffer %d is READY with %d entries (chunk path).",
@@ -550,9 +714,7 @@ class PSRL_AgentLoopManager:
             self.log_ready_buffer(buffer_id, is_validate=False)
             await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id)
             self._emit_pending_chunks(buffer_id)
-            # Clean up accumulated state; resolved chunks in
-            # `_resolved_train_chunks` are consumed lazily by
-            # `wait_for_training_chunk`.
+            # Resolved chunks remain available for late waiters.
             self._train_chunk_consumed.pop(buffer_id, None)
             self._train_chunk_emitted_entry_ids.pop(buffer_id, None)
             accumulated_buffers.pop(buffer_id, None)
@@ -575,19 +737,32 @@ class PSRL_AgentLoopManager:
             accumulated_buffer_size.pop(buffer_id, None)
         return add_buffer
 
-    async def notify_group_failed(self, parent_id: int, failed_uid: int, is_validate: bool):
-        """Recover a rollout group after one child fails without producing data."""
+    async def notify_group_failed(
+        self,
+        parent_id: int,
+        failed_uid: int,
+        is_validate: bool,
+        terminate_reason: TerminateReason | None = None,
+    ):
+        """Recover a rollout group after one child fails without producing data.
+
+        Args:
+            parent_id (int): Prompt id of the group that lost a child.
+            failed_uid (int): Child request id that failed.
+            is_validate (bool): Whether the group belongs to a validation round.
+            terminate_reason (TerminateReason | None): Why the child produced no data.
+                Recorded on the train path so the refill breaker can name the cause.
+        """
         async with AsyncBusyPollingRayLock(self.ps_manager_handle):
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
-            if parent_id in self._failed_group_ids:
+            failed_group_ids = self._failed_val_group_ids if is_validate else self._failed_train_group_ids
+            if parent_id in failed_group_ids:
                 psrl_logger.warning(
-                    "notify_group_failed: parent_id=%s is_validate=%s already handled; skip duplicate failed_uid=%s.",
-                    parent_id,
-                    is_validate,
-                    failed_uid,
+                    f"Duplicate group failure: parent_id={parent_id}, "
+                    f"is_validate={is_validate}, failed_uid={failed_uid}. Skipping."
                 )
                 return
-            self._failed_group_ids.add(parent_id)
+            failed_group_ids.add(parent_id)
 
             all_child_uids = [parent_id * rollout_n + i for i in range(rollout_n)]
             sibling_uids = [uid for uid in all_child_uids if uid != failed_uid]
@@ -626,12 +801,8 @@ class PSRL_AgentLoopManager:
                         )
                         await self._flush_ready_buffer(buffer_id, is_validate=True)
 
-                # When every group in this validation round fails, val_buffer_size
-                # shrinks to 0 while no accumulated buffer was ever created (occupy
-                # never succeeded, so accumulated sizes are always >= 1). The firing
-                # loop above then matches nothing and the trainer's waiter would block
-                # forever. Resolve any still-pending val waiter with an empty batch so
-                # validation completes with empty metrics instead of deadlocking.
+                # Wake pending waiters with an empty batch when every validation group
+                # fails, preventing a permanent wait.
                 if self.val_buffer_size <= 0:
                     # Latch the all-failed state so a waiter registering after this
                     # last failure (race) still observes it instead of blocking.
@@ -639,7 +810,7 @@ class PSRL_AgentLoopManager:
                     empty_batch = KVBatchMeta(keys=[], tags=[], partition_id="val")
                     for waiter_buffer_id in list(self._val_buffer_waiters.keys()):
                         psrl_logger.warning(
-                            "notify_group_failed (val): all groups failed (val_buffer_size=0); "
+                            "notify_group_failed (val): all groups failed (val_buffer_size=0). "
                             "waking waiter for buffer_id=%d with an empty batch to avoid deadlock.",
                             waiter_buffer_id,
                         )
@@ -648,24 +819,19 @@ class PSRL_AgentLoopManager:
                                 fut.set_result(empty_batch)
                         del self._val_buffer_waiters[waiter_buffer_id]
             else:
-                # Refill the vacated slot with ONE fresh prompt from the dataset,
-                # regardless of dispatch-loop state. A failed group must be
-                # compensated by one extra prompt to keep the dispatched-success
-                # count whole; popping the pre-dispatch queue (the old behavior)
-                # does NOT add a group, it only consumes a future one early, so the
-                # deficit is merely deferred to the final buffer, which then hangs.
-                # `_retry_data` dispatches directly to workers (bypassing the queue
-                # and its END signal), and the collect task stays alive post-END, so
-                # the refill's result is still accumulated into the waiting buffer.
-                # `sample_train_prompts` cycles epochs without bound (total_epochs is
-                # enforced only in the busy loop), so the only way this returns 0 in
-                # training is a full manager shutdown — there is no "dataset
-                # exhausted" deadlock to recover from here, unlike validation.
-                dispatched = await self._retry_data(n_prompts=1)
+                # Replace each failed training group directly so the target success
+                # count remains unchanged. Dataset sampling cycles until shutdown.
+                self._record_group_failure(terminate_reason)
+                dispatched = await self._refill_failed_group(
+                    n_prompts=1,
+                    context="notify_group_failed (train)",
+                )
                 psrl_logger.info(
-                    "notify_group_failed (train): dispatched %d fresh replacement request(s) for parent_id=%s.",
+                    "notify_group_failed (train): dispatched %d fresh replacement request(s) for parent_id=%s "
+                    "(consecutive failures=%d).",
                     dispatched,
                     parent_id,
+                    self._consecutive_group_failures,
                 )
 
     def _get_expected_ps_version(self):
@@ -696,7 +862,7 @@ class PSRL_AgentLoopManager:
         """
         self.initial_ps_version = version
         self.curr_ps_version_tag = version
-        psrl_logger.info(f"Set initial PS version to {version} (resume)")
+        psrl_logger.info(f"Initialized resume PS version: version={version}.")
 
     async def _inner_dispatch_data(self, data: TensorDict, is_validate: bool = False):
         """Update request status to RUNNING in PSManager, then fan out to workers."""
@@ -789,6 +955,7 @@ class PSRL_AgentLoopManager:
             rollout_n = self.val_rollout_n if is_validate else self.rollout_n
             alg_rollout_n = self.val_rollout_n if is_validate else self.alg_rollout_n
             partition_id = "val" if is_validate else "train"
+            failed_group_ids = self._failed_val_group_ids if is_validate else self._failed_train_group_ids
 
             ready_buffer_ids: set[int] = set()
             dispositions = [PayloadState.PENDING_GROUP for _ in request_ids]
@@ -800,7 +967,7 @@ class PSRL_AgentLoopManager:
             for position, (request_id, prompt_id, rollout_instance_id, version_tag, n_trajectory) in enumerate(
                 zip(request_ids, prompt_ids, rollout_instance_ids, version_tags, n_trajectories)
             ):
-                if prompt_id in self._failed_group_ids:
+                if prompt_id in failed_group_ids:
                     psrl_logger.warning(
                         "occupy_requests: discarding late arrival request_id=%s from failed "
                         "group parent_id=%s is_validate=%s.",
@@ -836,8 +1003,8 @@ class PSRL_AgentLoopManager:
                     )
                     self.rollout_request_tracker.setdefault(prompt_id, []).append(entry_info)
                     psrl_logger.debug(
-                        f"Store data for prompt {prompt_id} with info {entry_info}, "
-                        f"request num: {len(self.rollout_request_tracker[prompt_id])}"
+                        f"Stored rollout entry: prompt_id={prompt_id}, entry={entry_info!r}, "
+                        f"count={len(self.rollout_request_tracker[prompt_id])}."
                     )
 
                     if len(self.rollout_request_tracker[prompt_id]) >= alg_rollout_n:
@@ -871,7 +1038,9 @@ class PSRL_AgentLoopManager:
                         # Notify the request status manager to abort the child requests
                         if abort_child_ids:
                             assert not is_validate, "Abort child requests should not happen in validation."
-                            psrl_logger.info(f"Aborting child requests {abort_child_ids} for sample {prompt_id}.")
+                            psrl_logger.info(
+                                f"Aborting child requests: request_ids={abort_child_ids!r}, prompt_id={prompt_id}."
+                            )
                             with log_dual_events(
                                 f"Abort {len(abort_child_ids)} requests",
                                 psrl_logger,
@@ -912,7 +1081,13 @@ class PSRL_AgentLoopManager:
                             # Clear the reserved entries for the group entry.
                             await self.ps_manager_handle.clear_reserved_entries.remote(prompt_id, is_validate)
                             # Notify agent loop manager to retry new requests.
-                            await self._retry_data(n_prompts=1)
+                            # Not counted against the refill breaker: the filter dropped
+                            # this group on purpose, so it is an algorithmic decision
+                            # rather than a rollout fault.
+                            await self._refill_failed_group(
+                                n_prompts=1,
+                                context="Group post-processing filter",
+                            )
                         else:
                             child_request_ids = [
                                 prompt_id * rollout_n + entry_info.request_idx for entry_info in alg_entry_infos
@@ -976,10 +1151,13 @@ class PSRL_AgentLoopManager:
                     continue
                 for job_position in job_positions:
                     dispositions[job_position] = PayloadState.OCCUPIED
+                if not is_validate:
+                    # A group reaching OCCUPIED is the only proof that rollouts can
+                    # still produce trainable data, so it is the breaker's reset point.
+                    self._reset_group_failure_streak()
 
                 psrl_logger.debug(
-                    f"Successfully occupied prompt {prompt_entry_info} into "
-                    f"buffer {buffer_id} with occupy_num {occupy_num}."
+                    f"Occupied prompt: entry={prompt_entry_info!r}, buffer_id={buffer_id}, occupy_num={occupy_num}."
                 )
 
                 # Accumulate data
@@ -996,7 +1174,8 @@ class PSRL_AgentLoopManager:
                 accumulated_buffers[buffer_id].setdefault(model_version, []).append(prompt_entry_info)
                 accumulated_buffer_size[buffer_id] += 1
                 psrl_logger.info(
-                    f"Accumulated buffer {buffer_id} size: {accumulated_buffer_size[buffer_id]}/{expected_buffer_size}"
+                    f"Accumulated buffer: buffer_id={buffer_id}, "
+                    f"size={accumulated_buffer_size[buffer_id]}/{expected_buffer_size}."
                 )
                 # Emit pending chunks if chunk-yielding is active (train path only).
                 if not is_validate:
@@ -1011,7 +1190,7 @@ class PSRL_AgentLoopManager:
 
                 # Check for READY buffers
                 if accumulated_buffer_size[buffer_id] == expected_buffer_size and buffer_id not in ready_buffer_ids:
-                    psrl_logger.info(f"Add buffer {buffer_id} to ready_buffer_ids")
+                    psrl_logger.info(f"Adding ready buffer: buffer_id={buffer_id}.")
                     ready_buffer_ids.add(buffer_id)
 
             # 4. Release TQ state for explicitly dropped entries beyond alg_rollout_n.
@@ -1040,7 +1219,7 @@ class PSRL_AgentLoopManager:
         """
         if is_validate:
             self.val_data_buffers[buffer_id] = batch
-            psrl_logger.debug(f"Buffer {buffer_id} is added to val_data_buffers without post-processing.")
+            psrl_logger.debug(f"Added validation buffer without post-processing: buffer_id={buffer_id}.")
             return True
 
         add_buffer = True
@@ -1049,7 +1228,7 @@ class PSRL_AgentLoopManager:
 
         if add_buffer:
             self.train_data_buffers[buffer_id] = batch
-            psrl_logger.debug(f"Buffer {buffer_id} is added to train_data_buffers after post-processing.")
+            psrl_logger.debug(f"Added post-processed training buffer: buffer_id={buffer_id}.")
         return add_buffer
 
     def entry_infos_to_kv_batch_meta(
@@ -1071,10 +1250,22 @@ class PSRL_AgentLoopManager:
                 if isinstance(entry_info.n_trajectory, list)
                 else [entry_info.n_trajectory] * len(request_idxs)
             )
-            request_idxs, n_trajectories = zip(*sorted(zip(request_idxs, n_trajectories), key=lambda x: x[0]))
             model_versions = (
                 entry_info.model_version if isinstance(entry_info.model_version, list) else [entry_info.model_version]
             )
+            # Arrival-correlated fields must be reordered together by `request_idx`
+            # to preserve each request's model version.
+            if len(model_versions) == len(request_idxs):
+                request_idxs, n_trajectories, model_versions = (
+                    list(t)
+                    for t in zip(*sorted(zip(request_idxs, n_trajectories, model_versions), key=lambda x: x[0]))
+                )
+            else:
+                # A scalar `model_version` covers every request in the entry, so there is
+                # nothing to reorder and the `model_versions[-1]` fallback below applies.
+                request_idxs, n_trajectories = (
+                    list(t) for t in zip(*sorted(zip(request_idxs, n_trajectories), key=lambda x: x[0]))
+                )
 
             for j, (request_idx, n_trajectory) in enumerate(zip(request_idxs, n_trajectories)):
                 if n_trajectory == 1:
@@ -1134,15 +1325,11 @@ class PSRL_AgentLoopManager:
                 for i in range(entry_info.n_trajectory):
                     keys.append(f"{entry_info.prompt_id * self.rollout_n + entry_info.request_idx}_{i}")
 
-        # Wait for async reward computation to complete before filtering.
-        # When launch_reward_fn_async=True, the reward is computed in the background
-        # and may not yet be written to TQ when this method is called.
-        # The resulting batch metadata marks these keys as reward ready so the trainer
-        # can skip writing the same reward fields to TQ again.
+        # Async reward fields must be present in TQ before filtering.
         if self.config.reward.launch_reward_fn_async:
             await self.reward_manager.wait_for_reward_ready.remote(keys)
 
-        # TODO(linsh): optimize by only fetching necessary columns for post-processing instead of the full TD.
+        # TODO(linsh): Fetch only columns required for post-processing.
         meta = KVBatchMeta(
             keys=keys,
             tags=[{} for _ in keys],
@@ -1182,7 +1369,7 @@ class PSRL_AgentLoopManager:
         assert self.buffer_post_process_fn is not None, "Buffer post-processing function is not set."
 
         original_keys = batch_meta.keys
-        # TODO(linsh): optimize by only fetching necessary columns for post-processing instead of the full TD.
+        # TODO(linsh): Fetch only columns required for post-processing.
         data = tq.kv_batch_get_by_meta(batch_meta)
         processed_data = self.buffer_post_process_fn(data)
 
@@ -1382,7 +1569,7 @@ class PSRL_AgentLoopManager:
         psrl_logger.info(f"Checking staleness and aborting requests for buffer {buffer_id}.")
         if not is_validate:
             await self.ps_manager_handle.handle_ready_buffer.remote(buffer_id)
-            # NOTE(linsh): the aborted requests have been cleared from tq in ps manager
+            # The PS manager clears aborted request data from TQ.
 
         data_buffers = self.val_data_buffers if is_validate else self.train_data_buffers
         _buffer_waiters = self._val_buffer_waiters if is_validate else self._train_buffer_waiters
@@ -1407,7 +1594,7 @@ class PSRL_AgentLoopManager:
             if is_validate:
                 await self.ps_manager_handle.maybe_delete_buffer.remote(min_ready_buffer_id, is_validate)
         else:
-            psrl_logger.warning(f"No waiters found for buffer {buffer_id} when trying to awake.")
+            psrl_logger.warning(f"No waiter found: buffer_id={buffer_id}.")
 
     async def handle_waiting_buffer(self, buffer_id: int):
         """Handle the waiting buffer."""
@@ -1420,10 +1607,7 @@ class PSRL_AgentLoopManager:
                 return
             assert gap > 0, f"Gap should be greater than 0, but got {gap}"
             if gap <= self.config.psrl.rollout_coordination.proactive_filter_strategy.threshold:
-                psrl_logger.info(
-                    f"Trying to abort the rest {gap} entries in buffer {buffer_id} "
-                    f"and move some occupied entries from other buffers to make it ready."
-                )
+                psrl_logger.info(f"Preparing buffer recovery: buffer_id={buffer_id}, gap={gap}.")
                 # Guarantee other buffers have enough entries to make it ready
                 total_available_entries = 0
                 for other_buffer_id in sorted(list(self.train_accumulated_buffers.keys()), reverse=True):
@@ -1435,23 +1619,16 @@ class PSRL_AgentLoopManager:
                     )
                 if total_available_entries < gap:
                     psrl_logger.info(
-                        f"Not enough entries in other buffers to make buffer {buffer_id} ready, "
-                        f"the gap is {gap}, but only {total_available_entries} entries are available"
+                        f"Insufficient recovery entries: buffer_id={buffer_id}, "
+                        f"gap={gap}, available={total_available_entries}."
                     )
                     if not self.stop_train_dispatch_task:
-                        # More data may still arrive; keep waiting.
+                        # More data may still fill the gap.
                         return
-                    # Dispatch has stopped — no more data will ever arrive.
-                    # Fall through to the force-ready logic below.
+                    # Dispatch has stopped, so force readiness below.
                 else:
-                    psrl_logger.info(
-                        f"Aborting the rest {gap} entries in buffer {buffer_id} "
-                        f"and moving some occupied entries from other buffers to make it ready."
-                    )
-                    # First, abort the reserved requests in the buffer
+                    psrl_logger.info(f"Recovering buffer with occupied entries: buffer_id={buffer_id}, gap={gap}.")
                     aborted_entry_num, _ = await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
-                    # NOTE(linsh): the aborted requests have been cleared from tq in ps manager
-                    # Then, move the occupied entries from other buffers to the buffer
                     total_moved_entries = 0
                     moved_occupied_entry_infos: list[EntryInfo] = []
                     for other_buffer_id in sorted(list(self.train_accumulated_buffers.keys()), reverse=True):
@@ -1485,22 +1662,24 @@ class PSRL_AgentLoopManager:
                     # Finally, notify the PS manager to move the occupied entries to the buffer
                     await self.ps_manager_handle.move_occupied_entries.remote(moved_occupied_entry_infos, buffer_id)
                     psrl_logger.info(
-                        f"Moved {total_moved_entries} occupied entries (the total gap is {gap}) "
-                        f"from other buffers to buffer {buffer_id}."
+                        f"Moved occupied entries: count={total_moved_entries}, "
+                        f"gap={gap}, destination_buffer_id={buffer_id}."
                     )
-                    await self._retry_data(n_prompts=aborted_entry_num)
-                    return  # Move succeeded; buffer will reach target via normal accumulation path.
+                    if aborted_entry_num > 0:
+                        await self._refill_failed_group(
+                            n_prompts=aborted_entry_num,
+                            context="Buffer recovery compensation",
+                        )
 
-            # When the dispatch task has stopped, no new data will ever arrive to fill the remaining
-            # gap. Force the buffer ready with whatever has accumulated so far by aborting any
-            # still-reserved (in-flight) entries and overriding the accumulated-size counter so that
-            # the caller's readiness check passes with partial data.
+                    return  # Normal accumulation completes the recovered buffer.
+
+            # A partial buffer must be forced ready after dispatch stops or waiters block.
             remaining_gap = self.ready_entries_per_buffer - self.train_accumulated_buffer_size[buffer_id]
             if self.stop_train_dispatch_task and remaining_gap > 0:
                 psrl_logger.warning(
-                    f"Train dispatch stopped: buffer {buffer_id} is stuck at "
-                    f"{self.train_accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer} entries "
-                    f"(gap={remaining_gap}). Aborting reserved entries and forcing buffer ready with partial data."
+                    f"Forcing partial buffer ready: buffer_id={buffer_id}, "
+                    f"size={self.train_accumulated_buffer_size[buffer_id]}/{self.ready_entries_per_buffer}, "
+                    f"gap={remaining_gap}."
                 )
                 await self.ps_manager_handle.abort_reserved_requests.remote(buffer_id)
                 # Override the counter so the caller's equality check sees the buffer as full.
@@ -1509,19 +1688,11 @@ class PSRL_AgentLoopManager:
             raise NotImplementedError("Truncate strategy is not implemented yet.")
 
     def _emit_pending_chunks(self, buffer_id: int) -> None:
-        """Resolve any pending chunk waiters for buffer_id using accumulated data.
+        """
+        Resolve pending chunk waiters from accumulated data.
 
-        Called from occupy_requests (after each group accumulates) and from
-        _flush_ready_buffer (when the full buffer is READY, to flush the tail).
-
-        Emits chunks sequentially: chunk_index=0, 1, ...  Each chunk contains
-        exactly train_chunk_size prompt-groups, except the final chunk which
-        carries whatever remains.  is_last=True on the last chunk.
-
-        Entries are sliced in stable accumulation order (not re-sorted by
-        prompt_id across emits). Re-sorting the full list on every emit shifts
-        which groups fall into the already-consumed prefix and can emit the
-        wrong / duplicate groups for later chunks.
+        Chunks preserve accumulation order across emissions and sort by `prompt_id`
+        only within each chunk. The final chunk may be smaller.
         """
         if self.train_chunk_size is None:
             return
@@ -1557,7 +1728,6 @@ class PSRL_AgentLoopManager:
                 # is_last if this chunk reaches the total.
                 is_last = consumed + emit_count >= ready_total
             else:
-                # Not enough accumulated yet; stop.
                 break
 
             # Slice by accumulation order, then sort within the chunk for
@@ -1580,9 +1750,8 @@ class PSRL_AgentLoopManager:
                 ready_total,
             )
 
-            # Wake waiters if present; otherwise keep a durable resolved entry for
-            # late wait_for_training_chunk callers. Do not leave a resolved entry
-            # after waking waiters — that would double-deliver the same chunk.
+            # Keep a resolved result for late waiters. Remove it after waking
+            # registered waiters to prevent duplicate delivery.
             if key in self._train_chunk_waiters:
                 for fut in self._train_chunk_waiters[key]:
                     if not fut.done():
@@ -1600,17 +1769,23 @@ class PSRL_AgentLoopManager:
                 break
 
     async def wait_for_training_batch(self, buffer_id: int) -> KVBatchMeta:
-        """Await a training batch for a specific buffer ID."""
+        """Await a training batch for a specific buffer ID.
+
+        Raises:
+            RuntimeError: When the refill breaker has tripped. This is the driver's
+                only blocking call into the manager, so it is where an unfillable
+                buffer becomes a visible failure instead of a hang.
+        """
+        self._raise_if_refill_breaker_tripped()
+
         await self.ps_manager_handle.ensure_train_buffer_exists.remote(buffer_id)
 
         if buffer_id in self.train_data_buffers:
             # If the buffer is ready, return immediately
-            psrl_logger.info(f"Buffer {buffer_id} is ready, returning immediately.")
+            psrl_logger.info(f"Training buffer ready: buffer_id={buffer_id}.")
             return self.consume_buffer(buffer_id)
 
-        # WIP(lhy): Support more consumption strategies
-        # 1. Truncate if buffer status is STUCK
-        # 2. Abort the RESERVED entry if buffer status is STUCK and move some OCCUPIED entries from other buffers
+        # TODO(lhy): Support additional stuck-buffer consumption strategies.
         if buffer_id in self.train_accumulated_buffers:
             async with AsyncBusyPollingRayLock(self.ps_manager_handle):
                 await self.handle_waiting_buffer(buffer_id)
@@ -1620,25 +1795,29 @@ class PSRL_AgentLoopManager:
                     # emission, and accumulator cleanup stay consistent.
                     add_buffer = await self._flush_ready_buffer(buffer_id, is_validate=False)
                     if add_buffer:
-                        psrl_logger.info(
-                            f"Buffer {buffer_id} is ready after the abort "
-                            f"and truncate strategy, returning immediately."
-                        )
+                        psrl_logger.info(f"Recovered training buffer: buffer_id={buffer_id}.")
                         return self.consume_buffer(buffer_id)
 
         # If the buffer is still not ready after the abort and truncate strategy, wait for it to be ready
-        psrl_logger.info(f"Buffer {buffer_id} is not ready, waiting for it to be ready.")
+        psrl_logger.info(f"Waiting for training buffer: buffer_id={buffer_id}.")
         fut = asyncio.get_event_loop().create_future()
         self._train_buffer_waiters.setdefault(buffer_id, []).append(fut)
         batch_meta = await fut
         return batch_meta
 
     async def wait_for_training_chunk(self, buffer_id: int, chunk_index: int) -> tuple["KVBatchMeta", bool]:
-        """Await a specific chunk (by index) for a given buffer.
-
-        Returns (chunk_meta, is_last).  is_last=True means this chunk
-        completes the full batch and no more chunks will be emitted.
         """
+        Await a specific indexed chunk for a buffer.
+
+        The returned boolean is true only for the final chunk.
+
+        Raises:
+            RuntimeError: When the refill breaker has tripped. `fine_grain_overlap`
+                blocks only here, so this guard is what ends the run under that
+                strategy.
+        """
+        self._raise_if_refill_breaker_tripped()
+
         key = (buffer_id, chunk_index)
         if key in self._resolved_train_chunks:
             result = self._resolved_train_chunks.pop(key)
@@ -1686,32 +1865,28 @@ class PSRL_AgentLoopManager:
 
         if buffer_id in self.val_data_buffers:
             # If the buffer is ready, return immediately
-            psrl_logger.info(f"Validate buffer {buffer_id} is ready, returning immediately.")
+            psrl_logger.info(f"Validation buffer ready: buffer_id={buffer_id}.")
             return self.consume_buffer(buffer_id, is_validate=True)
 
-        # Race guard: the entire validation round may have already drained via
-        # failures before this waiter registered. In that case no buffer will
-        # ever be assembled, so return an empty batch instead of blocking.
+        # An all-failed validation round cannot assemble a buffer, so return an
+        # empty batch for late waiters.
         if self._val_round_all_failed:
             psrl_logger.warning(
-                "Validate buffer %d: all groups in this round already failed; "
+                "Validate buffer %d: all groups in this round already failed. "
                 "returning an empty batch to avoid deadlock.",
                 buffer_id,
             )
             return KVBatchMeta(keys=[], tags=[], partition_id="val")
 
-        # TODO(lhy): support more consumption strategies, now only support waiting for the buffer to be ready
-        # 1. Partial rollout if buffer status is STUCK
-        # 2. Truncate if buffer status is STUCK
-        # 3. Drop the RESERVED entry if buffer status is STUCK and move some OCCUPIED entries from other buffers
+        # TODO(lhy): Support partial, truncate, and relocation strategies.
 
-        psrl_logger.info(f"Validate buffer {buffer_id} is not ready, waiting for it to be ready.")
+        psrl_logger.info(f"Waiting for validation buffer: buffer_id={buffer_id}.")
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
         self._val_buffer_waiters.setdefault(buffer_id, []).append(fut)
         return await fut
 
     async def generate_validate_sequences(self) -> int:
-        """Dispatch a validation batch; returns the val buffer id."""
+        """Dispatch a validation batch and return its buffer ID."""
         test_batch: TensorDict = await self.data_processor.get_single_controller_batch.remote(
             DatasetType.val, return_meta=False
         )
@@ -1732,7 +1907,7 @@ class PSRL_AgentLoopManager:
         """Log a histogram of ``version_tag`` values for the given buffer."""
         data_buffer = self.val_data_buffers if is_validate else self.train_data_buffers
         assert buffer_id in data_buffer, (
-            f"Buffer {buffer_id} not found in {'val' if is_validate else 'train'} buffers."
+            f"Missing buffer: buffer_id={buffer_id}, partition={('val' if is_validate else 'train')!r}."
         )
 
         version_tags = [tag.get("version_tag", -1) for tag in data_buffer[buffer_id].tags]
@@ -1747,7 +1922,10 @@ class PSRL_AgentLoopManager:
             for version_tag in version_tag_counts.keys()
         }
 
-        psrl_logger.info(f"{'VALIDATION' if is_validate else 'TRAINING'} Buffer {buffer_id} version tag distribution:")
+        psrl_logger.info(
+            f"Buffer version distribution: partition={('validation' if is_validate else 'training')!r}, "
+            f"buffer_id={buffer_id}."
+        )
         for version_tag in sorted(version_tag_counts.keys()):
             count = version_tag_counts[version_tag]
             percentage = (count / total_count) * 100
@@ -1771,10 +1949,8 @@ class PSRL_AgentLoopManager:
         buffer = (
             self.val_data_buffers.pop(buffer_id, None) if is_validate else self.train_data_buffers.pop(buffer_id, None)
         )
-        assert buffer is not None, f"Buffer {buffer_id} not found or already consumed."
-        # NOTE(linsh): we will delete buffer during aborting requests of specific versions
-        # This is because the inflight requests of the remaining entries
-        # in the buffer can still be utilized for training
+        assert buffer is not None, f"Missing or consumed buffer: buffer_id={buffer_id}."
+        # NOTE(linsh): Delay PS-side deletion because remaining in-flight requests stay trainable.
         if not is_validate:
             # Clear chunk-yielding bookkeeping for this buffer.
             self._train_chunk_consumed.pop(buffer_id, None)

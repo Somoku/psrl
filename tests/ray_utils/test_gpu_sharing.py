@@ -1,4 +1,4 @@
-"""GPU sharing test — requires at least one GPU and Ray with GPU resources.
+"""GPU sharing test requiring at least one GPU and Ray with GPU resources.
 
 This test allocates GPU memory across two Ray actors sharing the same GPU
 and verifies memory allocation is reported correctly.
@@ -9,8 +9,7 @@ import ray
 
 
 def test_gpu_sharing(ray_cluster):
-    # Skip check is inside the test body — ray_cluster fixture must be initialized first
-    # before ray.cluster_resources() can be queried correctly.
+    # Initialize the cluster before checking its GPU resources.
     if ray.cluster_resources().get("GPU", 0) < 1:
         pytest.skip("Requires Ray cluster with at least 1 GPU")
 

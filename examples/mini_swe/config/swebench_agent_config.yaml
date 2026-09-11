@@ -7,16 +7,13 @@
     # Per-turn timeout forwarded to mini-swe-agent's model client.
     rollout_turn_timeout: 2400
     environment:
-      # NOTE(lhy): image is intentionally left as a sentinel here.
-      # Each SWE problem overrides it via extra_info.sandbox_overrides.environment.image,
-      # which is merged in by apply_data_overrides at rollout time.
+      # NOTE(lhy): The sentinel image is replaced per problem by
+      # `apply_data_overrides`.
       image: "swebench-sentinel-override-per-instance"
       cwd: "/testbed"
       container_timeout: "2h"
-      # Memory limit for the fresh grading container (separate from the
-      # rollout container). Heavy repos (scikit-learn, xarray, matplotlib)
-      # run `pip install -e .` during grading and can temporarily need
-      # 15-25 GB. Set higher than the rollout container to avoid OOM kills.
+      # Grading heavy repositories can briefly require more memory than rollout.
+      # The separate limit prevents cgroup OOM failures.
       grader_memory: "30g"
   agent:
     # System / problem / observation / format-error templates copied verbatim from
@@ -192,9 +189,7 @@
       You cannot continue working (reading, editing, testing) in any way on this task after submitting.
       </instructions>
   model:
-    # Action format used during training and eval.
-    # Both session-routed training and standalone eval (eval_swebench.py) read
-    # from this section, so editing one place changes both.
+    # Training and standalone evaluation share this action format.
     action_regex: "```bash\\s*\\n(.*?)\\n```"
     observation_template: |
       <returncode>{{output.returncode}}</returncode>

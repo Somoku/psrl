@@ -150,16 +150,16 @@ class SandboxFusionTool(Tool):
         Execute code using the Sandbox Fusion service.
 
         Args:
-            code: The code string to execute
-            stdin_data: Optional stdin data for code execution
-            expected_output: Optional expected output for correctness check
-            language: Programming language (overrides default if provided)
-            timeout: Execution timeout (overrides default if provided)
-            return_score: If True, return numerical score; if False, return text output
-            **kwargs: Additional arguments
+            code: The code string to execute.
+            stdin_data: Optional stdin data for code execution.
+            expected_output: Optional expected output for correctness check.
+            language: Programming language, overriding the default when provided.
+            timeout: Execution timeout, overriding the default when provided.
+            return_score: Whether to return a numerical score instead of text output.
+            **kwargs: Additional arguments.
 
         Returns:
-            ToolOutput containing either text output or score with metadata
+            ToolOutput: Text output or a score with metadata.
         """
         lang = language or self.language
         exec_timeout = timeout or self.timeout
@@ -168,7 +168,6 @@ class SandboxFusionTool(Tool):
             code = str(code)
 
         try:
-            # Case 1: No test cases - just execute the code
             if stdin_data is None:
                 result_status, metadata = await self._process_single_case(
                     case_index=case_index,
@@ -209,7 +208,6 @@ class SandboxFusionTool(Tool):
                         },
                         metadata=metadata,
                     )
-            # Case 2: With test cases - run correctness check
             else:
                 try:
                     result_status, metadata = await self._process_single_case(
@@ -225,7 +223,7 @@ class SandboxFusionTool(Tool):
                         fn_name=fn_name,
                     )
                 except Exception as exc:
-                    psrl_logger.error(f"Test case {case_index} generated an exception: {exc}")
+                    psrl_logger.error(f"Test case={case_index} raised {exc}.")
                     traceback.print_exc()
                     result_status = -1  # Mark as API/internal error
                     metadata = {
@@ -618,7 +616,7 @@ class SandboxFusionTool(Tool):
                             psrl_logger.warning(last_error)
                             if attempt < MAX_RETRIES - 1:  # Don't sleep after the last attempt
                                 delay = INITIAL_RETRY_DELAY * (attempt + 1)
-                                psrl_logger.info(f"{log_prefix} Retrying after {delay} seconds...")
+                                psrl_logger.info(f"{log_prefix}: Retrying after {delay}s...")
                                 await asyncio.sleep(delay)
                             continue  # Go to the next retry attempt
 
@@ -643,7 +641,7 @@ class SandboxFusionTool(Tool):
                 psrl_logger.error(last_error)
                 if attempt < MAX_RETRIES - 1:
                     delay = INITIAL_RETRY_DELAY * (attempt + 1)
-                    psrl_logger.info(f"{log_prefix} Retrying after timeout in {delay} seconds...")
+                    psrl_logger.info(f"{log_prefix}: Retrying after timeout in {delay}s...")
                     await asyncio.sleep(delay)
                     continue
                 break

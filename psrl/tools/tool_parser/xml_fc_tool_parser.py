@@ -1,19 +1,11 @@
 """
-XML Function Calling Tool Parser.
+Parse XML function calls into executable shell commands.
 
-Parses SWE-agent-style ``<function=NAME>...</function>`` tool calls and
-translates them into bash commands executable in a Docker environment.
+The parser accepts SWE-agent-style `<function=NAME>...</function>` calls for
+`bash`, `submit`, and `str_replace_editor`.
 
-Supported tools:
-- ``bash``    — direct bash command passthrough
-- ``submit``  — translated to SWE-bench submission command
-- ``str_replace_editor`` / ``str_replace`` — file operations (create, view,
-  str_replace, insert, undo_edit) translated into equivalent bash commands
-
-Primary entry point for mini-SWE-agent integration:
-    ``parse_xml_fc_to_bash(text) -> str | None``
-
-Also provides ``XmlFcToolParser(ToolParser)`` for future structured-tool usage.
+`parse_xml_fc_to_bash` supports direct mini-SWE-agent integration.
+`XmlFcToolParser` returns structured `ToolCall` values.
 """
 
 from __future__ import annotations
@@ -28,21 +20,15 @@ from psrl.tools.tool_parser.base import ToolParser
 psrl_logger = logging.getLogger(__name__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# --- Constants ---
 
 # Submission command injected when the model calls <function=submit>.
 _SUBMIT_COMMAND = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached"
 
-# Heredoc delimiter for file creation.  Chosen to be unlikely to appear in
-# source code.  If the file content contains this literal string, we append a
-# random suffix (handled in _translate_create).
+# `_translate_create` adds a random suffix if this uncommon delimiter collides with file content.
 _HEREDOC_DELIM = "PSRL_EOF"
 
-# ---------------------------------------------------------------------------
-# Regex patterns
-# ---------------------------------------------------------------------------
+# --- Regex Patterns ---
 
 # Canonical: <function=NAME>\n...\n</function>
 _FN_PATTERN = re.compile(r"<function=([^>]+)>\s*\n?(.*?)\s*</function>", re.DOTALL)
@@ -61,9 +47,7 @@ _DEGRADED_PATTERNS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Parameter extraction helpers
-# ---------------------------------------------------------------------------
+# --- Parameter Extraction ---
 
 
 def _extract_params(fn_body: str) -> dict[str, str]:
@@ -71,12 +55,9 @@ def _extract_params(fn_body: str) -> dict[str, str]:
     return {m.group(1): m.group(2) for m in _PARAM_PATTERN.finditer(fn_body)}
 
 
-# ---------------------------------------------------------------------------
-# Function name classification
-# ---------------------------------------------------------------------------
+# --- Function Name Classification ---
 
-# Sets of function name variants that map to canonical tools.
-# The model hallucinates many variants during RL exploration; we map them back.
+# Map function name variants produced during exploration back to canonical tools.
 _BASH_NAMES = frozenset(
     {
         "bash",
@@ -186,9 +167,7 @@ def _get_new_str(params: dict[str, str]) -> str:
     return ""
 
 
-# ---------------------------------------------------------------------------
-# str_replace_editor translation
-# ---------------------------------------------------------------------------
+# --- `str_replace_editor` Translation ---
 
 
 def _translate_create(path: str, content: str) -> str:
@@ -279,10 +258,10 @@ def _translate_str_replace_editor(fn_body: str) -> str | None:
     command = params.get("command", "").strip()
     path = _get_path(params)
 
-    # --- Handle cases where "command" param is actually a path ---
-    # e.g. <function=read_file><parameter=command>/testbed/file.py</parameter></function>
+    # Handle a `command` parameter that contains a path.
+    # Example: `<function=read_file><parameter=command>/testbed/file.py</parameter></function>`.
     if command.startswith("/") or command.startswith("./"):
-        # The "command" param is a path — infer intent from context.
+        # Infer the operation from the remaining parameters.
         inferred_path = command
         content = _get_content(params)
         if content:
@@ -319,9 +298,8 @@ def _translate_str_replace_editor(fn_body: str) -> str | None:
             return None
         return f"cd /testbed && git checkout -- {path}"
 
-    # --- Fallback: no recognized command but we have path + content ---
-    # Covers cases like <function=file><parameter=filename>X</parameter>
-    #                    <parameter=file_content>Y</parameter></function>
+    # Fall back when path and content are present without a recognized command, as in
+    # `<function=file><parameter=filename>X</parameter><parameter=file_content>Y</parameter></function>`.
     if not command and path:
         content = _get_content(params)
         if content:
@@ -344,20 +322,15 @@ def _translate_str_replace_editor(fn_body: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
+# --- Main Entry Point ---
 
 
 def parse_xml_fc_to_bash(text: str) -> str | None:
     """
     Parse an XML function-calling model response and return a bash command.
 
-    Handles:
-    - ``<function=submit>``        → SWE-bench submission command
-    - ``<function=bash>``          → direct command passthrough
-    - ``<function=str_replace*>``  → translated to equivalent bash
-    - Degraded patterns            → fallback extraction
+    Canonical `submit`, `bash`, and `str_replace` calls are preferred. Degraded
+    patterns provide fallback extraction.
 
     Args:
         text: Raw model output text.
@@ -397,9 +370,7 @@ def parse_xml_fc_to_bash(text: str) -> str | None:
                 return result
             # Fall through to degraded patterns.
 
-        # tool == "unknown" or str_replace_editor translation failed:
-        # Try to extract a command parameter anyway (some degraded names
-        # like <function=file> still carry valid parameters).
+        # Degraded names such as `<function=file>` may still contain valid parameters.
         if tool == "unknown":
             params = _extract_params(fn_body)
             # If it has a 'command' param that's a bash command, use it.
@@ -432,9 +403,7 @@ def parse_xml_fc_to_bash(text: str) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# ToolParser subclass (for structured tool pipeline integration)
-# ---------------------------------------------------------------------------
+# --- Structured Tool Parser ---
 
 
 @ToolParser.register("xml_fc")

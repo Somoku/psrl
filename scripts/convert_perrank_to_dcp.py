@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Convert per-rank checkpoint format back to DCP (dist_checkpointing) format.
+r"""Convert per-rank checkpoint format back to DCP (dist_checkpointing) format.
 
 Our training save uses per-rank torch.save() to avoid UCX heap corruption.
 This script converts those checkpoints back to verl's standard DCP format.
@@ -17,7 +17,7 @@ Usage:
         --tp_size 4 --pp_size 1 --cp_size 1 --ep_size 1
 
     # world_size must exactly match the value in parallel_config.json.
-    # 'per_rank_torch_save' format only — 'per_rank_plain_tensors' (new format)
+    # The 'per_rank_torch_save' format is required. The 'per_rank_plain_tensors' format
     # lacks ShardedBase metadata and cannot be converted to DCP.
 """
 
@@ -69,24 +69,24 @@ def main():
     # Validate checkpoint metadata
     metadata_path = os.path.join(args.input_dir, "parallel_config.json")
     assert os.path.exists(metadata_path), (
-        f"Metadata file not found: {metadata_path!r}.  Is {args.input_dir!r} a valid per-rank checkpoint directory?"
+        f"Missing metadata file at {metadata_path!r}. Checkpoint directory={args.input_dir!r}."
     )
     with open(metadata_path) as f:
         metadata = json.load(f)
 
     fmt = metadata.get("format")
     assert fmt == "per_rank_torch_save", (
-        f"Unsupported checkpoint format {fmt!r}.  "
+        f"Unsupported checkpoint format {fmt!r}. "
         f"Only 'per_rank_torch_save' checkpoints contain ShardedBase metadata needed "
-        f"to reconstruct DCP sharding.  'per_rank_plain_tensors' checkpoints (saved by "
+        f"to reconstruct DCP sharding. 'per_rank_plain_tensors' checkpoints (saved by "
         f"the current megatron_saver.py) have plain tensors with no sharding metadata "
         f"and cannot be converted to DCP with this script."
     )
 
     saved_ws = metadata.get("world_size")
     assert saved_ws == world_size, (
-        f"Checkpoint world_size={saved_ws} != current world_size={world_size}.  "
-        f"Run with exactly {saved_ws} processes (torchrun --nproc_per_node=... --nnodes=...)."
+        f"World size mismatch: checkpoint={saved_ws}, runtime={world_size}. "
+        f"Required process count={saved_ws}. Configure torchrun with --nproc_per_node and --nnodes."
     )
 
     if rank == 0:
@@ -114,35 +114,12 @@ def main():
 
     save_strategy = FullyParallelSaveStrategyWrapper(
         get_default_save_sharded_strategy("torch_dist"),
-        parallelization_group=None,  # defaults to WORLD — all ranks coordinate shard assignment
+        parallelization_group=None,  # all ranks coordinate shard assignment in WORLD
         do_cache_distribution=False,  # one-shot conversion, no need to cache
     )
 
-    # === Fix: prevent NCCL corruption from forked DCP writer processes ================
-    # Root cause (confirmed by nccl_experiment.py tests 1–4):
-    #   TorchDistSaveShardedStrategy.async_save() returns an AsyncRequest whose async_fn
-    #   is FileSystemWriterAsync.write_preloaded_data_multiproc() (filesystem_async.py).
-    #   execute_sync() calls it synchronously in the main process.  That function forks N
-    #   worker child processes via mp.get_context("fork") — one per write bucket.  The
-    #   forked children inherit the parent's ProcessGroupNCCL objects (live NCCL comms).
-    #   When each child finishes and exits normally, Python's __del__ finalizers call
-    #   ncclCommAbort / ncclCommDestroy on the inherited (shared) communicator handles,
-    #   corrupting the parent's NCCL state.  The dist.barrier() at execute_sync:97 is then
-    #   enqueued on a broken communicator, its CUDA kernel never fires, and NCCL reports
-    #   "the scheduled collective, for some reason, didn't run" → 600 s timeout → SIGABRT.
-    #
-    # Attempted fix (os._exit on write_preloaded_data): FAILED — same SeqNum=3 timeout.
-    #   os._exit alone is insufficient; CUDA device cleanup at child process exit still
-    #   corrupts NCCL IPC state even when Python __del__ finalizers are bypassed.
-    #
-    # Correct fix: replace write_preloaded_data_multiproc with a sequential no-fork version
-    #   that calls write_preloaded_data directly in the main process — one bucket at a time.
-    #   No child process is ever spawned, so NCCL communicator handles are never inherited
-    #   and corruption is impossible.  stdlib queue.SimpleQueue / queue.Queue are drop-in
-    #   replacements for mp.SimpleQueue / mp.JoinableQueue: write_preloaded_data calls
-    #   results_queue.put(), count_queue.get(), and count_queue.task_done() — all present
-    #   on the stdlib types.  The dict written to global_results_queue is identical in
-    #   format to what the original multiproc version produced.
+    # DCP forks writers that inherit live NCCL communicators and corrupt the parent.
+    # Run each write bucket sequentially in the main process to preserve NCCL state.
     import queue as _stdlib_queue
 
     from megatron.core.dist_checkpointing.strategies import filesystem_async as _fsa

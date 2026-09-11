@@ -1,58 +1,7 @@
 """
-Standalone SWE-bench Evaluation Entry Point.
+Evaluate SWE-bench problems with a local model.
 
-Runs rollouts on a SWE-bench Verified (or SWE-smith-py) subset using a vLLM-served
-model, grades each prediction with `swebench_grader.grade_fresh_container`, and
-writes evaluation artefacts to an output directory.
-
-This is intentionally decoupled from the PSRL training loop so it can be run
-independently on any checkpoint (or on the base model for baselines).
-
-Usage::
-
-    # Evaluate a trained checkpoint on 100 Verified SWE problems
-    python -m examples.mini_swe.eval.eval_swebench \\
-        --model /path/to/checkpoint \\
-        --dataset verified \\
-        --split test \\
-        --subset-spec "0:100" \\
-        --output-dir output/eval/my_run \\
-        --workers 8
-
-    # Gold-patch sanity check (every SWE problem should resolve)
-    python -m examples.mini_swe.eval.eval_swebench \\
-        --gold-patches \\
-        --dataset verified \\
-        --split test \\
-        --subset-spec "0:20" \\
-        --output-dir output/eval/gold_sanity
-
-    # SWE-smith-py subset eval
-    python -m examples.mini_swe.eval.eval_swebench \\
-        --model /path/to/checkpoint \\
-        --dataset smith \\
-        --split train \\
-        --subset-spec "0:50" \\
-        --output-dir output/eval/smith_run
-
-    # Eval against a pre-prepared parquet (recommended when you've only pre-fetched
-    # Docker images for a curated subset — the eval will run exactly on the
-    # SWE problems in the parquet).
-    python -m examples.mini_swe.eval.eval_swebench \\
-        --gold-patches \\
-        --dataset examples/mini_swe/data/verified_subset_80/test.parquet \\
-        --output-dir output/eval/gold_sanity_80
-
-Output artefacts::
-
-    <output-dir>/
-      preds.json          — { instance_id: {instance_id, model_patch, model_name_or_path} }
-      summary.json        — { resolved, total, resolve_rate, avg_turns, elapsed_s, ... }
-      results.jsonl       — one JSON per line, per-SWE-problem result
-      <instance_id>/      — per-SWE-problem directory (named after the HF instance_id)
-        traj.json         — conversation trajectory
-        patch.diff        — submitted patch
-        grading.json      — raw grade_fresh_container result
+Run agent rollouts, grade them in fresh containers, and write per-problem artifacts.
 """
 
 from __future__ import annotations
@@ -76,13 +25,10 @@ if not psrl_logger.handlers:
     psrl_logger.addHandler(_h)
     psrl_logger.propagate = False
 
-# Snapshot cwd at import time; libraries in the call chain can chdir before
-# worker threads dispatch, so relative paths like --config must be anchored here.
+# Anchor relative configuration paths before libraries can change the working directory.
 _MODULE_LOAD_CWD = os.getcwd()
 
-# ---------------------------------------------------------------------------
-# Rollout helpers
-# ---------------------------------------------------------------------------
+# --- Rollout helpers ---
 
 
 def _run_agent_on_swe_problem(
@@ -105,10 +51,10 @@ def _run_agent_on_swe_problem(
         config_path (str): Path to the agent config YAML.
         max_turns (int): Maximum agent turns per episode.
         temperature (float): Sampling temperature.
-        model_class (str): mini-swe-agent model class.  ``'litellm_textbased'``
+        model_class (str): mini-swe-agent model class. ``'litellm_textbased'``
             (default) matches the ``mswea_bash_command`` format used during
             PSRL training and requires a plain text-completion endpoint
-            (no ``--tool-call-parser`` on vLLM).  Use ``'litellm'`` only for
+            (no ``--tool-call-parser`` on vLLM). Use ``'litellm'`` only for
             external models (GPT-4, Claude, etc.) that natively support
             OpenAI tool-calling.
 
@@ -121,7 +67,7 @@ def _run_agent_on_swe_problem(
     from minisweagent.config import get_config_from_spec
     from minisweagent.models import get_model
     from minisweagent.utils.serialize import recursive_merge
-    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
+    from psrl.utils.agent.overflow import PromptOverflowError, ensure_overflow_handling
 
     image_name = get_swebench_image_name(swe_problem)
     problem = swe_problem.get("problem_statement", "")
@@ -147,9 +93,8 @@ def _run_agent_on_swe_problem(
     sb = yaml_cfg.pop("sandbox_config", None)
     if isinstance(sb, dict) and "environment" in sb and "environment" not in yaml_cfg:
         yaml_cfg["environment"] = sb["environment"]
-    # PSRL training hardcodes DockerEnvironment; mini-swe-agent's
-    # `get_environment` requires `environment_class` to dispatch.  Default to
-    # 'docker' here so the standalone eval picks the same backend training uses.
+    # `get_environment` requires an explicit class while training selects Docker directly.
+    # Use Docker here to keep rollout behavior consistent.
     env_block = yaml_cfg.setdefault("environment", {})
     if isinstance(env_block, dict):
         env_block.setdefault("environment_class", "docker")  # training hardcodes Docker
@@ -169,10 +114,8 @@ def _run_agent_on_swe_problem(
                 "model_name": f"openai/{model_path}",
                 "model_class": model_class,
                 "model_kwargs": {"temperature": temperature},
-                # Self-served / locally-trained checkpoints aren't in
-                # litellm's pricing table; default `cost_tracking="default"`
-                # raises on every call -> turns=0 / resolved=False for every
-                # task.  Match what training does in `_PSRLModel`.
+                # Local checkpoints may be absent from LiteLLM's pricing table.
+                # Ignore pricing lookup errors so they cannot abort rollout.
                 "cost_tracking": "ignore_errors",
             },
         },
@@ -181,9 +124,7 @@ def _run_agent_on_swe_problem(
     from minisweagent.environments import get_environment
 
     env = get_environment(cfg.get("environment", {}))
-    # `get_model(input_model_name, config)`: pass the model dict as the
-    # `config=` kwarg, otherwise it gets treated as a string `input_model_name`
-    # and downstream `.lower()` calls explode.
+    # Pass the model dictionary through `config` so it is not treated as a model name.
     model = get_model(config=cfg.get("model", {}))
     ensure_overflow_handling(model)
     agent = DefaultAgent(model, env, **cfg.get("agent", {}))
@@ -220,9 +161,7 @@ def _run_agent_on_swe_problem(
             pass
 
 
-# ---------------------------------------------------------------------------
-# Per-SWE-problem evaluation
-# ---------------------------------------------------------------------------
+# --- Per-problem evaluation ---
 
 
 def _evaluate_swe_problem(
@@ -251,10 +190,10 @@ def _evaluate_swe_problem(
         gold_patches (bool): Use the gold patch from the dataset instead of
             running the agent (useful for sanity checks).
         grader_timeout (int): Grading eval script timeout in seconds.
-        model_class (str): mini-swe-agent model class (passed through to
-            ``_run_agent_on_swe_problem``).  See that function for details.
+        model_class (str): mini-swe-agent model class passed to
+            ``_run_agent_on_swe_problem``.
         grader_memory (str): ``--memory`` limit for the fresh grading
-            container (e.g. ``"30g"``).  Empty string uses the
+            container (e.g. ``"30g"``). Empty string uses the
             ``swebench_grader`` module default.
 
     Returns:
@@ -351,9 +290,7 @@ def _evaluate_swe_problem(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Main evaluation loop
-# ---------------------------------------------------------------------------
+# --- Main evaluation loop ---
 
 
 def _looks_like_path(dataset: str) -> bool:
@@ -412,17 +349,9 @@ def _to_plain_python(obj: Any) -> Any:
 
 def _load_swe_problems_from_path(path: str) -> list[dict[str, Any]]:
     """
-    Load a list of HF-shaped SWE problems from a prepared parquet / jsonl /
-    json file.
+    Load HF-shaped SWE problems from parquet, JSONL, or JSON.
 
-    Supports two formats:
-
-    - PSRL-prepared parquet produced by ``prepare_swebench.py`` — each row
-      carries the full HF row inside ``extra_info.swe_problem``; that nested
-      dict is unwrapped and returned.
-    - Raw HF-style table (parquet / json / jsonl) — each row already has
-      ``instance_id``, ``patch``, ``FAIL_TO_PASS``, ``PASS_TO_PASS``, etc.
-      and is returned unchanged.
+    Prepared rows are unwrapped from `extra_info`. Raw rows are retained.
 
     Args:
         path (str): Filesystem path to the prepared dataset.
@@ -449,9 +378,7 @@ def _load_swe_problems_from_path(path: str) -> list[dict[str, Any]]:
     else:
         raise ValueError(f"Unsupported dataset file extension: {path!r}. Expected .parquet, .json, or .jsonl.")
 
-    # PSRL-prepared rows nest the HF row inside extra_info; unwrap.  Support
-    # both the current schema (``extra_info.swe_problem``) and the older one
-    # (``extra_info.instance``).
+    # Prepared rows may nest the HF row under either supported key.
     _NESTED_HF_ROW_KEYS = ("swe_problem", "instance")
     swe_problems: list[dict[str, Any]] = []
     for row in rows:
@@ -498,8 +425,7 @@ def run_eval(
 
     Args:
         dataset (str): Dataset key (``verified``, ``lite``, ``smith``, etc.)
-            *or* a path to a prepared parquet / jsonl / json file produced by
-            ``prepare_swebench.py``.  When a path is given, ``split`` is
+            or a path to a prepared parquet, JSONL, or JSON file. When a path is given, ``split`` is
             ignored.
         split (str): HF split name (unused when ``dataset`` is a path).
         subset_spec (str): Slice or regex filter on the SWE problem's
@@ -512,9 +438,9 @@ def run_eval(
         temperature (float): Sampling temperature.
         gold_patches (bool): Use gold patches instead of running the agent.
         grader_timeout (int): Grading eval script timeout in seconds.
-        model_class (str): mini-swe-agent model class.  ``'litellm_textbased'``
+        model_class (str): mini-swe-agent model class. ``'litellm_textbased'``
             (default) matches the ``mswea_bash_command`` format used during
-            PSRL training.  Use ``'litellm'`` for external models that
+            PSRL training. Use ``'litellm'`` for external models that
             natively support OpenAI tool-calling.
     """
     from examples.mini_swe.prepare.swebench_subsets import filter_by_spec
@@ -527,12 +453,12 @@ def run_eval(
         from examples.mini_swe.prepare.prepare_swebench import _DATASET_HF_MAP
 
         hf_path = _DATASET_HF_MAP.get(dataset, dataset)
-        psrl_logger.info(f"Loading HF dataset {hf_path!r} split={split!r}...")
+        psrl_logger.info(f"Loading HF dataset={hf_path!r}, split={split!r}...")
         swe_problems = list(load_dataset(hf_path, split=split))
 
     if subset_spec:
         swe_problems = filter_by_spec(swe_problems, subset_spec)
-    psrl_logger.info(f"Evaluating {len(swe_problems)} SWE problems with {workers} workers.")
+    psrl_logger.info(f"Evaluation problem count: {len(swe_problems)}. Worker count: {workers}.")
     # One-time diagnostics so config / dataset path issues are visible up-front.
     psrl_logger.info(
         f"Eval context: cwd={os.getcwd()!r}, config_path={config_path!r} "
@@ -565,10 +491,8 @@ def run_eval(
             try:
                 results.append(future.result())
             except Exception as exc:
-                # Log the full traceback so per-task config / model / harness
-                # bugs are visible immediately rather than hidden behind a
-                # single-line "X raised: <msg>" summary.
-                psrl_logger.exception(f"[eval] {swe_problem_id} raised:")
+                # Preserve the traceback for per-problem infrastructure failures.
+                psrl_logger.exception(f"[eval] Problem raised an exception. Instance: {swe_problem_id!r}.")
                 results.append(
                     {
                         "instance_id": swe_problem_id,
@@ -621,9 +545,7 @@ def run_eval(
     print(f"Output   : {output_dir}")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# --- CLI ---
 
 
 def main() -> None:
@@ -704,9 +626,9 @@ def main() -> None:
         default="",
         help=(
             "Docker --memory limit for the fresh grading container "
-            "(e.g. '30g').  Heavy repos (scikit-learn, xarray, matplotlib) "
+            "(e.g. '30g'). Heavy repos (scikit-learn, xarray, matplotlib) "
             "run `pip install -e .` inside the grader container and can "
-            "temporarily need 15–25 GB.  Empty string uses the "
+            "temporarily need 15 to 25 GB. Empty string uses the "
             "swebench_grader module default (currently 30g)."
         ),
     )
@@ -715,10 +637,8 @@ def main() -> None:
     if not args.gold_patches and not args.model:
         parser.error("--model is required unless --gold-patches is set.")
 
-    # Resolve --config to an absolute path *before* spawning worker threads.
-    # Use the module-load cwd snapshot: even if `argparse` parses long after
-    # some import chain has chdir'd, the snapshot still points at the
-    # launcher's original directory.
+    # Resolve configuration paths before worker threads can observe a changed
+    # working directory.
     if args.config and not os.path.isabs(args.config):
         candidate = os.path.normpath(os.path.join(_MODULE_LOAD_CWD, args.config))
         if os.path.isfile(candidate):

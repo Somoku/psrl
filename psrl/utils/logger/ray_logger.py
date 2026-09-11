@@ -40,15 +40,12 @@ class EventType(Enum):
 
 def _log_with_caller_info(psrl_logger: logging.Logger, level: int, message: str):
     """Log a message with the caller's file and line information."""
-    # Check if the logger is enabled for the given level
     if not psrl_logger.isEnabledFor(level):
         return
 
-    # Try to use stacklevel to get the caller's file and line information
     try:
         psrl_logger.log(level, message, stacklevel=3)
     except TypeError:
-        # If the Python version does not support stacklevel, fall back to the old method
         frame = inspect.currentframe()
         try:
             caller_frame = frame.f_back.f_back
@@ -68,12 +65,12 @@ def log_dual_events(
     event_type: EventType = EventType.OTHER,
 ):
     start_time = time.time()
-    log_begin_event(message, psrl_logger, level, event_type)  # Log with label when entering
+    log_begin_event(message, psrl_logger, level, event_type)
     try:
-        yield  # Execute code within the with block
+        yield
     finally:
         end_time = time.time()
-        log_end_event(message, psrl_logger, level, event_type, end_time - start_time)  # Log end tag when exiting
+        log_end_event(message, psrl_logger, level, event_type, end_time - start_time)
 
 
 def log_single_event(
@@ -117,30 +114,22 @@ class DualOutputHandler(logging.Handler):
     def __init__(self, log_dir, log_prefix):
         super().__init__()
         self.log_prefix = log_prefix
-        # Create log file
         log_dir = os.path.expanduser(log_dir)
         os.makedirs(log_dir, exist_ok=True)
         self.file_path = os.path.join(log_dir, log_prefix + ".log")
-        # Create handler
         self.file_handler = logging.FileHandler(self.file_path, mode="w")
         self.stream_handler = logging.StreamHandler()
-        # Define file log formats
         file_log_format = "%(asctime)s - %(filename)s - %(lineno)d - %(message)s"
         self.file_formatter = logging.Formatter(file_log_format)
         self.file_handler.setFormatter(self.file_formatter)
 
     def emit(self, record):
-        # formatted_message = self.file_formatter.format(record)
-        # print(formatted_message, file=open(self.file_path, "a"))
-        # Emit the original log record to file handler
         self.file_handler.emit(record)
 
-        # For stream handler, create a copy of the record and modify the message
         stream_record = logging.makeLogRecord(record.__dict__)
         stream_record.msg = f"<{self.log_prefix}> - {record.getMessage()}"
-        stream_record.args = ()  # Clear args since we already formatted the message
+        stream_record.args = ()
 
-        # Emit the modified record to stream handler
         self.stream_handler.emit(stream_record)
 
 
@@ -150,17 +139,13 @@ class FileOnlyHandler(logging.Handler):
     def __init__(self, log_dir, log_prefix):
         super().__init__()
         self.log_prefix = log_prefix
-        # Create log file
         log_dir = os.path.expanduser(log_dir)
         os.makedirs(log_dir, exist_ok=True)
         self.file_path = os.path.join(log_dir, log_prefix + ".log")
-        # Create handler
         self.file_handler = logging.FileHandler(self.file_path, mode="w")
-        # Define file log formats
         file_log_format = "%(asctime)s - %(filename)s - %(lineno)d - %(message)s"
         self.file_formatter = logging.Formatter(file_log_format)
         self.file_handler.setFormatter(self.file_formatter)
 
     def emit(self, record):
-        # Emit the log record to file handler only
         self.file_handler.emit(record)

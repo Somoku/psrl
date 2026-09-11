@@ -7,11 +7,7 @@ import pytest
 
 pytestmark = pytest.mark.cpu_test
 
-# ---------------------------------------------------------------------------
-# Pre-import mocking: inject stubs for every heavy dependency so that
-# psrl.workers.gen.vllm_async_server can be imported on a CPU-only
-# machine that has no ray / torch / vllm installed.
-# ---------------------------------------------------------------------------
+# Stub heavy runtime dependencies so `vllm_async_server` can be imported in CPU tests.
 
 _MOCKED_MODULES = [
     "ray",
@@ -103,15 +99,13 @@ import psrl.workers.gen as _gen_pkg  # noqa: E402
 sys.modules["psrl.workers.gen.rollout_coordinator"] = MagicMock()
 _gen_pkg.RolloutCoordinator = MagicMock()
 
-# Now import GenInterface — the module may already be cached; force a fresh load.
+# Force a fresh module load before importing `GenInterface`.
 _target = "psrl.workers.gen.vllm_async_server"
 sys.modules.pop(_target, None)
 
 from psrl.workers.gen.vllm_async_server import GenInterface  # noqa: E402
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 
 
 def test_gen_interface_with_ps_manager():

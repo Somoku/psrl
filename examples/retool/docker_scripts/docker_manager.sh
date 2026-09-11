@@ -1,21 +1,7 @@
 #!/bin/bash
 # set -v
 
-# Docker daemon on cluster nodes (pssh).
-#
-# Required env vars:
-#   DOCKER_NODE_IPS — comma-separated list of ip:gpu_count pairs (e.g. 192.168.1.1:8,192.168.1.2:8)
-#
-# Optional env vars:
-#   DOCKER_NODE_NUM — limit to first N nodes (default: all)
-#
-# Positional args:
-#   $1 — ACTION: start | stop | restart | status | logs  (default: status)
-#   $2 — HOST: specific IP or "all"                      (default: all)
-#
-# Example:
-#   DOCKER_NODE_IPS=192.168.1.1:8,node-b:8 DOCKER_NODE_NUM=8 ./docker_manager.sh start all
-#   DOCKER_NODE_IPS=192.168.1.1:8 ./docker_manager.sh status 192.168.1.1
+# Manage configured Docker daemons through parallel SSH.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=docker_common.sh

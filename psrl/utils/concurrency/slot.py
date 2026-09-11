@@ -1,10 +1,4 @@
-"""Cross-process slot-based concurrency limiter using fcntl file locks.
-
-Provides a fixed number of "slots" backed by lock files in a temp directory.
-Multiple processes on the same machine coordinate by attempting non-blocking
-exclusive locks on the slot files.  Only one process can hold a given slot
-at a time; if all slots are taken the caller polls until one becomes free.
-"""
+"""Limit cross-process concurrency with `fcntl`-locked slot files."""
 
 from __future__ import annotations
 
@@ -43,7 +37,7 @@ class SlotManager:
         """Acquire one cross-process run slot via fcntl file lock.
 
         Args:
-            max_slots: Maximum number of parallel slots.  If <= 0,
+            max_slots: Maximum number of parallel slots. If <= 0,
                 returns ``None`` immediately (no limiting).
             output_dir: Directory used to derive the lock file location.
             prefix: Prefix for the lock directory name.

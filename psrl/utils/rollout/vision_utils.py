@@ -70,7 +70,7 @@ async def pil_images_to_base64(images: list[PILImage.Image]) -> list[str]:
         images: List of PIL.Image.Image objects.
 
     Returns:
-        List of ``"data:image/jpeg;base64,<b64>"`` strings, one per image.
+        List of base64 image data URLs, one per image.
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: [_encode_single_image(img) for img in images])
@@ -95,7 +95,7 @@ def resolve_message_image_refs(
     """Resolve image refs in prompt order without discarding original URLs.
 
     Vision preprocessors usually return one decoded image for every image part,
-    but some return only the images for bare placeholders.  Support both
+    but some return only the images for bare placeholders. Support both
     contracts explicitly and reject ambiguous counts instead of silently
     shifting images onto the wrong prompt positions.
     """

@@ -1,8 +1,7 @@
-"""Dedicated HTTP I/O thread for PSRL agent loop workers.
+"""Run agent-loop HTTP connections on a dedicated I/O thread.
 
-A background daemon thread with its own asyncio event loop handles all
-HTTP connections to the SMG gateway.  The Ray actor's event loop
-only sees lightweight ``asyncio.Future`` completions — zero socket I/O callbacks.
+The Ray actor's event loop sees only lightweight `asyncio.Future` completions
+and no socket callbacks.
 """
 
 import asyncio
@@ -39,7 +38,7 @@ class HttpIOThread:
         self._started = threading.Event()
 
     def start(self) -> None:
-        """Start the background I/O thread.  Blocks until the loop is ready."""
+        """Start the background I/O thread and block until its loop is ready."""
         if self._thread is not None and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._run_loop, name="psrl-http-io", daemon=True)
@@ -112,7 +111,6 @@ class HttpIOThread:
                     data, text = _parse_body(body)
                     return JsonHttpResponse(status=status, data=data, headers=resp_headers, text=text)
                 except Exception as e:
-                    # handle abort error
                     http_error = _classify_http_error(e, headers)
                     if isinstance(http_error, RequestAbortedByGatewayError):
                         raise http_error from e
@@ -139,9 +137,8 @@ class HttpIOThread:
     ) -> JsonHttpResponse:
         """Submit an HTTP request and await the result from the caller's event loop.
 
-        The actual socket I/O executes on the dedicated I/O thread.  The caller
-        only awaits a lightweight ``Future`` completion — no socket callbacks
-        pollute the caller's event loop.
+        The actual socket I/O executes on the dedicated thread. The caller
+        awaits only a lightweight `Future` completion.
         """
         assert self._loop is not None, "HttpIOThread not started."
         thread_future = asyncio.run_coroutine_threadsafe(
@@ -157,7 +154,7 @@ _http_io_thread: HttpIOThread | None = None
 def get_http_io_thread() -> HttpIOThread:
     """Return the global ``HttpIOThread`` singleton."""
     if _http_io_thread is None:
-        raise RuntimeError("HttpIOThread not initialized.  Call init_http_io_thread() first.")
+        raise RuntimeError("HttpIOThread not initialized. Call init_http_io_thread() first.")
     return _http_io_thread
 
 

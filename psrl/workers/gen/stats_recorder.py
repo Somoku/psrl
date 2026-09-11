@@ -124,9 +124,7 @@ class StatsRecorder:
                 logger.warning(f"StatsRecorder: error closing {filename}: {e}")
         self._file_handles.clear()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # --- Internal Helpers ---
 
     def _get_filename(self, replica_idx: int, dp_rank: int) -> str:
         return os.path.join(self._logging_path, f"stats_r{replica_idx}_dp{dp_rank}.jsonl")

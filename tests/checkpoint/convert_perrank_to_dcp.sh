@@ -1,14 +1,6 @@
 #!/bin/bash
-# Convert per-rank checkpoint to DCP format (all nodes launch in parallel via ssh).
-#
-# Usage:
-#   INPUT_DIR=<path> OUTPUT_DIR=<path> bash scripts/convert_perrank_to_dcp.sh [hostfile]
-#
-#   hostfile defaults to ${PSRL_WORKSPACE}/hosts/16GPUs.
-#   TP/PP/CP/EP must match the training run that produced the checkpoint.
-#   Only 'per_rank_torch_save' format is supported (checkpoints saved before
-#   the megatron_saver.py rewrite).  New-format 'per_rank_plain_tensors'
-#   checkpoints will fail with a clear error from convert_perrank_to_dcp.py.
+# Convert a per-rank checkpoint to DCP across all hosts. The hostfile defaults to `${PSRL_WORKSPACE}/hosts/16GPUs`, and TP, PP, CP, and EP must match training with `per_rank_torch_save`.
+# Usage: INPUT_DIR=<path> OUTPUT_DIR=<path> bash scripts/convert_perrank_to_dcp.sh [hostfile]
 
 set -e
 
@@ -65,9 +57,7 @@ echo "Nodes (${NNODES}): ${hosts[*]}"
 echo "MASTER_ADDR=${MASTER_ADDR}:${MASTER_PORT}"
 echo ""
 
-# Launch torchrun on every node in parallel via ssh.
-# ssh streams stdout/stderr in real-time; awk prefixes each line with [host_ip]
-# so interleaved output from multiple nodes stays readable.
+# Prefix interleaved `torchrun` output with its source host.
 for i in "${!hosts[@]}"; do
     host="${hosts[$i]}"
     echo "Launching on ${host} (NODE_RANK=${i})..."

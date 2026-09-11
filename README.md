@@ -131,6 +131,8 @@ Production-ready training recipes demonstrating PSRL's capabilities across diffe
 | [GRPO](https://psrl.readthedocs.io/en/latest/examples/rlvr/grpo.html) | Math / Reasoning | Verifiable | FSDP / Megatron | [`examples/grpo_trainer/`](examples/grpo_trainer/) | ✅ Ready |
 | [ReTool](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/retool/index.html) | Math + Code Interpreter | Verifiable | FSDP / Megatron | [`examples/retool/`](examples/retool/) | ✅ Ready |
 | [SWE-agent](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/swe/index.html) | Software Engineering | Test execution (F2P/P2P) | FSDP / Megatron | [`examples/mini_swe/`](examples/mini_swe/) | ✅ Ready |
+| SciAccel-RL | Scientific Computing (LAPS / MITgcm / Athena++) | Numerical equivalence vs reference | FSDP | [`examples/sciaccel_rl/`](examples/sciaccel_rl/) | ✅ Ready |
+| MemAgent | Long-context QA | Exact-match answer | Megatron | [`examples/mem_agent/`](examples/mem_agent/) | ✅ Ready |
 | [LLM-as-a-Judge](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/llm_as_a_judge.html) | Open-ended | Judge LLM score | — | — | 🚧 TBD |
 | [On-Policy Distillation](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/on_policy_distillation.html) | Open-ended | Teacher token-level supervision | — | — | 🚧 TBD |
 

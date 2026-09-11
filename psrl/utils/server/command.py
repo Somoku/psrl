@@ -177,9 +177,8 @@ class CommandExtension:
                 You can use `synchronize_command` to wait for the command result later.
         """
         psrl_logger.debug(
-            f"Received command: {command.type} with args: "
-            f"{command.get_args()} and kwargs: {command.get_kwargs()}, "
-            f"blocking={blocking}, timeout={timeout}"
+            f"Received command type={command.type}, args={command.get_args()}, "
+            f"kwargs={command.get_kwargs()}, blocking={blocking}, timeout={timeout}."
         )
 
         command_id = self._command_counter
@@ -192,12 +191,10 @@ class CommandExtension:
         command._kwargs["id"] = command_id
         self.command_queue.put_nowait(command)
 
-        # If not blocking, return the command event immediately
         if not blocking:
-            psrl_logger.debug(f"Command {command.type} with ID {command_id} is non-blocking, returning command ID.")
+            psrl_logger.debug(f"Command type={command.type}, id={command_id} is non-blocking. Returning command ID.")
             return command_id
 
-        # Wait for the command to complete
         success = await command_event.wait(timeout=timeout)
         if not success:
             if command_id in self._command_results:
@@ -207,7 +204,7 @@ class CommandExtension:
             return None
 
         result = self._command_results.get(command_id, None)
-        psrl_logger.debug(f"Command {command_id} completed with result: {result}")
+        psrl_logger.debug(f"Command id={command_id} completed with result={result}.")
         if command_id in self._command_results:
             del self._command_results[command_id]
         if command_id in self._command_events:
@@ -226,13 +223,13 @@ class CommandExtension:
         Returns:
             Any: The result of the command if it was completed, otherwise None.
         """
-        assert command_id in self._command_events, f"Command ID {command_id} not found in command events."
+        assert command_id in self._command_events, f"Command id={command_id} not found in command events."
 
         command_event = self._command_events[command_id]
 
         success = await command_event.wait(timeout=timeout)
         if not success:
-            psrl_logger.warning(f"Command event {command_id} timed out after {timeout} seconds.")
+            psrl_logger.warning(f"Command event id={command_id} timed out after seconds={timeout}.")
             return None
 
         result = self._command_results.get(command_id, None)
@@ -247,8 +244,7 @@ class CommandExtension:
         """Set the command result, mark it as completed and notify the event waiter."""
         if command_id in self._command_results:
             self._command_results[command_id] = result
-            psrl_logger.debug(f"Command ID {command_id} completed with result: {result}")
-            # Set event to notify that the command has completed
+            psrl_logger.debug(f"Command id={command_id} completed with result={result}.")
             if command_id in self._command_events:
                 self._command_events[command_id].set()
         else:

@@ -7,9 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-# Tracks which JSONL paths have already been opened for writing in this
-# process. The first write truncates any existing file; subsequent writes
-# append. This ensures each process run starts with a clean output file.
+# Track initialized paths so each process truncates once, then appends.
 _jsonl_initialized_paths: set[str] = set()
 
 psrl_logger = logging.getLogger(__file__)
@@ -49,7 +47,7 @@ class PrefillTrigger(StrEnum):
     """
 
     INITIAL = "initial"
-    RESUME = "resume"  # transient — see docstring
+    RESUME = "resume"  # transient placeholder
     PREEMPT_RESUME = "preempt_resume"
     INTERNAL_PREEMPT_RESUME = "internal_preempt_resume"
     PARTIAL_ROLLOUT_RESUME = "partial_rollout_resume"
@@ -232,7 +230,6 @@ class ModelTurnRecord:
             "total_seq_len": self.total_seq_len,
             "prefill_records": [r.to_dict() for r in self.prefill_records],
             "decode_records": [r.to_dict() for r in self.decode_records],
-            # Computed properties serialized for offline analysis.
             "num_generated_tokens": self.num_generated_tokens,
             "router_wait_time_s": self.router_wait_time_s,
             "scheduler_wait_time_s": self.scheduler_wait_time_s,

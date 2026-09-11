@@ -74,6 +74,7 @@ from psrl.trainer.ppo.batch_schedule import (
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
+    _compute_termination_metrics,
     compute_advantage_for_multi_trajectories,
 )
 from psrl.utils.common.nixl_names import NIXL_META_SERVER_NAME
@@ -298,12 +299,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
         self.batch_schedule_strategy = get_batch_schedule_strategy(self.batch_agg_mode)
 
-        # AGENT(VERL): skip legacy worker impl and dataloader in PSRL
-        # PSRL's dataloader is moved to `data_processor`.
-
-        # ---- PSRL specific initialization ----
-
-        # Load post-processor from configuration
+        # AGENT(VERL): skip legacy workers and use PSRL's `data_processor` instead of veRL's dataloader.
+        # Load PSRL post-processors from configuration.
         self.group_post_process_fn = load_group_post_processor(config)
         self.buffer_post_process_fn = load_buffer_post_processor(config)
 
@@ -313,6 +310,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.rollout_coordinator = None
         self.reward_manager = None
         self.reward_loop_workers = []
+        self.env_worker_manager = None
 
         self.reward_gateways: dict[str, ray.actor.ActorHandle] = {}
         self.reward_gateway_urls: dict[str, str] = {}
@@ -323,13 +321,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         self.elastic_executor = None
 
         self.rollout_replicas = []
-        # Guards the read-length-then-append sequence in `init_rollout_servers`,
-        # which runs concurrently: once in a background thread for the "rollout"
-        # tag (dispatched early to overlap with actor/validate init) and once on
-        # the caller's thread for the "validate" tag. Without this lock both can
-        # read the same `len(self.rollout_replicas)` and assign the same
-        # `rollout_replica_idx` (-> worker_id) to two different replicas, which
-        # the gateway then rejects with 409 Conflict on the second registration.
+        # Serialize rollout and validation index allocation to prevent duplicate gateway registrations.
         self._rollout_replica_alloc_lock = threading.Lock()
         self.tag_to_server_handles = {}
         self.tag_to_base_worker_ids = {}
@@ -409,28 +401,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Cache IP-to-Ray-node-ID mapping for scheduling actors to specific nodes.
         self.ip_to_node_id: dict[str, str] = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
 
-        # Create per-node PortScanner actors for NIXL/LMCache port allocation.
-        # Each scanner is pinned to its node via NodeAffinitySchedulingStrategy,
-        # so port checks always reflect the correct node's state.
-        # Non-detached: auto-cleaned by Ray if the driver exits (Ctrl+C / crash).
+        # Pin each port scanner to its node so availability checks use the correct network namespace.
         from psrl.utils.nixl.port_scanner import create_port_scanners
 
         self.port_scanner_handles = create_port_scanners(self.ip_to_node_id)
 
         self._init_ps_manager()
 
-        # NOTE(linsh): Create the rollout gateway early so it can boot
-        # during the remaining __init__ work (tokenizer, data processor, etc.).
-        # This overlaps gateway cold-boot with other initialization,
-        # reducing router wait in init_workers.
+        # NOTE(linsh): Launch the gateway early to overlap its startup with remaining initialization.
         self.rollout_gateway = self.init_rollout_gateway()
         self._launch_gateway_future = self.rollout_gateway.launch_router.remote()
 
-        # initialize data processor
-        # NOTE(lhy): data processor must be initialized before initializing other workers
-        # so that the total_training_steps can be obtained and the optimizer config
-        # (related to weight decay, lr schedule, etc.) can be set
-        # otherwise, it will cause error when running Megatron backend
+        # Initialize data first so worker optimizer schedules receive `total_training_steps`.
         self._init_tokenizer()
         self._init_data_processor()
         self._init_dump_executor()
@@ -897,7 +879,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # ── Start monitor loop ──
         ray.get(self.elastic_executor.start_busy_loop.remote())
-        psrl_logger.info("Elastic_RM: ElasticExecutor busy loop started; runtime ready.")
+        psrl_logger.info("Elastic_RM: ElasticExecutor busy loop started. Runtime ready.")
 
     def _build_reward_model_runtime_infos(self) -> dict[str, RewardModelRuntimeInfo]:
         runtime_infos = {}
@@ -1135,25 +1117,19 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
                 self.replay_buffer.sample(test_result.keys, test_result.partition_id)
 
-            # An empty batch means every group in this validation round failed
-            # (e.g. all sandboxes failed to launch). There is nothing to score or
-            # log; skip it so validation completes with whatever metrics remain
-            # instead of crashing on empty-key TQ reads.
+            # Skip empty batches so validation retains metrics from successful rounds.
             if len(test_result.keys) == 0:
                 psrl_logger.warning(
-                    "Validation batch %s is empty (all groups failed); skipping.",
+                    "Validation batch %s is empty because all groups failed. Skipping.",
                     val_buffer_id,
                 )
                 continue
 
-            # 3. Score the batch via TQ-native compute_score_for_validation.
             if self.config.reward.launch_reward_fn_async:
                 with log_dual_events("Wait for reward of validate", psrl_logger, event_type=EventType.WAIT):
                     ray.get(self.reward_manager.wait_for_reward_of_requests.remote(test_result))
 
-            # 4. collect necessary data for logging
-            # For multi-output agent loops, only use the final output per session for metrics.
-            # Keys have format {uid}_{index}; keep only the highest index per session.
+            # Use only the highest-indexed output in each session for metrics.
             session_max: dict[str, tuple[int, int]] = {}  # session_key -> (max_index, position)
             for pos, key in enumerate(test_result.keys):
                 parts = key.rsplit("_", 1)
@@ -1196,9 +1172,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_infos = tu.get(data, "reward_extra_info", [{}] * len(final_keys))
             for reward_extra_info in reward_extra_infos:
-                # reward_extra_info is now {loop_key: per_loop_info_dict, ...}.
-                # Merge all per-loop dicts into a single flat dict so downstream
-                # code can access keys like "acc" regardless of which loop produced them.
+                # Flatten per-loop reward details so downstream metrics use a common key space.
                 extra_info = {}
                 for per_loop_info in reward_extra_info.values():
                     extra_info.update(per_loop_info)
@@ -1423,9 +1397,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             world_size = worker_group.world_size
             num_replicas = world_size // rollout_world_size
             psrl_logger.info(f"[{tag}]: {world_size=}, {rollout_world_size=}, {num_replicas=}")
-            # Allocate replica indices atomically: this runs concurrently for the
-            # "rollout" (background thread) and "validate" (caller thread) tags,
-            # and both read-then-append `self.rollout_replicas`.
+            # Allocate replica indices atomically across rollout and validation initialization.
             with self._rollout_replica_alloc_lock:
                 curr_replica_num = len(self.rollout_replicas)
                 new_rollout_replicas = []
@@ -1721,16 +1693,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
         wg_kwargs["device_name"] = self.device_name
 
-        # NOTE(verl): if you want to use a different resource pool for each role,
-        # which can support different parallel size,
-        # you should not use `create_colocated_worker_cls_fused`.
-        # Instead, directly pass different resource pool to different worker groups.
-        # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+        # NOTE(verl): Use separate worker groups when roles need distinct resource pools or parallel sizes.
         def create_worker_group(resource_pool, class_dict, wg_kwargs=wg_kwargs):
-            # if there is only one worker class in the resource pool, we can directly create a worker group
-            # so that we can use 'execute_all_async' and other low-level APIs
-            # NOTE(lhy): in newest verl, we can use `create_colocated_worker_cls_fused`
-            # to create a fused worker group and low-level APIs can also be used
+            # A single class can use a direct worker group and its low-level APIs.
             if len(class_dict) == 1:
                 role = next(iter(class_dict.keys()))
                 return {
@@ -1751,13 +1716,13 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 return wg_dict.spawn(prefix_set=class_dict.keys())
 
         def _run_worker_group_tasks(tasks, label: str):
-            """Create worker groups with a thread pool; safely handle empty task lists."""
+            """Create worker groups with a thread pool. Safely handle empty task lists."""
 
             if not tasks:
-                psrl_logger.info(f"No {label} worker group to create; skipping.")
+                psrl_logger.info(f"No {label} worker group to create. Skipping.")
                 return
 
-            # We create one thread per task; ThreadPoolExecutor requires max_workers > 0
+            # One thread per task requires a nonempty task list.
             with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
                 futures = {}
                 for resource_pool, class_dict, task_wg_kwargs in tasks:
@@ -1787,8 +1752,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 assert len(class_dict) == 1, "Reward model resource pool should only have one worker class."
                 reward_model_tasks.append((resource_pool, class_dict, wg_kwargs))
             else:
-                # NOTE(linsh): adapt wg_kwargs for fused train worker
-                # if want to add specific env args.
+                # NOTE(linsh): Adapt `wg_kwargs` for fused train workers that need environment arguments.
                 if self.config.psrl.tms.range in ["train", "all"] or self.config.psrl.tms.enable_nixl:
                     # add tms config to train workers
                     import torch_memory_saver
@@ -1804,17 +1768,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                         "LD_PRELOAD": dynlib_path,
                         "TMS_INIT_ENABLE": "1",
                         "TMS_INIT_ENABLE_CPU_BACKUP": "0",
-                        # NOTE(linsh): torch_memory_saver is not compatible with expandable segments
+                        # NOTE(linsh): Torch memory saver is incompatible with expandable segments.
                         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
                         "PSRL_TMS_ENABLE": "1" if self.config.psrl.tms.range in ["train", "all"] else "",
                     }
                 else:
                     train_wg_kwargs = wg_kwargs
-                    # NOTE(lhy): Still cannot use expandable segments, will cause NIXL error
-                    # train_wg_kwargs["worker_env"] = {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+                    # NOTE(lhy): Expandable segments cause NIXL errors.
                 train_tasks.append((resource_pool, class_dict, train_wg_kwargs))
-        # We must execute train tasks first because rollout instances may occupy
-        # the resources randomly and no structured resources are available for training
+        # Initialize train tasks first so rollout instances cannot consume their resources.
         _run_worker_group_tasks(train_tasks, label="train")
         _run_worker_group_tasks(reward_model_tasks, label="reward_model")
         _run_worker_group_tasks(gen_tasks, label="gen")
@@ -1835,10 +1797,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 all_wg[f"reward_model_{reward_model_name}_{i}"] for i in range(reward_model.num_replicas)
             ]
 
-        # Dispatch actor NIXL early ONLY in the is_rollout_mode_in_actor branch.
-        # In that branch, actor inits first (before validate), so there's no GPU contention.
-        # In the else branch, validate inits first on the shared GPUs, so actor NIXL
-        # must be deferred until after validate sleeps to avoid GPU memory contention.
+        # Dispatch actor NIXL early only when actor initialization precedes validation on shared GPUs.
         if self.is_rollout_mode_in_actor:
             actor_nixl_futures = all_wg["actor"].execute_all_async("init_nixl_client")
             psrl_logger.info("Dispatched actor NIXL init early (overlapping with router wait)")
@@ -1850,20 +1809,48 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         psrl_logger.info(f"Rollout gateway launched at {self.rollout_gateway_url}.")
         psrl_logger.info(f"Session router launched at {self.session_router_url}.")
 
+        # Build env worker pool if enabled.
+        if self.config.psrl.env_worker.enable:
+            from psrl.workers.env_worker import EnvWorkerManager
+
+            self.env_worker_manager = EnvWorkerManager(self.config)
+            psrl_logger.info("Env worker pool built.")
+
         # create agent loop workers
         self.agent_loop_workers = []
         num_agent_workers = self.config.gen_actor_rollout_ref.rollout.agent.num_workers
         max_concurrency_per_worker = max(1, self.max_concurrency // num_agent_workers)
         # Distribute agent loop workers across cluster nodes round-robin so that
         # Docker containers are spread across machines instead of piling up on one.
-        alive_node_ids = [n["NodeID"] for n in ray.nodes() if n["Alive"]]
+        #
+        # `agent.node_ips` restricts placement to an allow list, because a node with a
+        # degraded Docker daemon accepts actors and then hangs. Empty means every node.
+        allowed_ips = list(self.config.gen_actor_rollout_ref.rollout.agent.get("node_ips") or [])
+        alive_nodes = [n for n in ray.nodes() if n["Alive"]]
+        if allowed_ips:
+            selected = [n for n in alive_nodes if n["NodeManagerAddress"] in allowed_ips]
+            if not selected:
+                raise ValueError(
+                    f"agent.node_ips={allowed_ips} matched no alive node. "
+                    f"Alive: {sorted(n['NodeManagerAddress'] for n in alive_nodes)}."
+                )
+            psrl_logger.info(
+                "Agent loop workers restricted to %d of %d nodes: %s.",
+                len(selected),
+                len(alive_nodes),
+                sorted(n["NodeManagerAddress"] for n in selected),
+            )
+            alive_nodes = selected
+        alive_node_ids = [n["NodeID"] for n in alive_nodes]
         for i in range(num_agent_workers):
             node_id = alive_node_ids[i % len(alive_node_ids)]
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
                     max_concurrency=max_concurrency_per_worker,
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=True),
+                    # Hard affinity when an allow list is given, because a soft placement
+                    # lets Ray fall back to exactly the node being excluded.
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=not allowed_ips),
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
@@ -1877,19 +1864,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # start rollout coordinator
         self.init_rollout_coordinator()
-        # set_rollout_coordinator must happen before push and pull from PS so that
-        # push_model (called inside the NIXL resume path) can notify the
-        # rollout coordinator of the new model version.
+        # Bind the coordinator before PS transfers so `push_model` can publish new versions.
         ray.get(self.ps_manager_handle.set_rollout_coordinator.remote(self.rollout_coordinator))
         # Start the LMCache Controller BEFORE init_model() so that LMCache workers
         # inside EngineCore can register immediately when they start.
         if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
             ray.get(self.rollout_coordinator.start_lmcache_controller.remote())
 
-        # Launch rollout server init in a background thread BEFORE PS init.
-        # Rollout servers use entirely separate GPUs (rollout_pool_*) from actor/validate (train_pool).
-        # By starting this before PS init, vLLM model loading begins as soon as rollout workers boot,
-        # overlapping with PS init's blocking wait for actor workers to cold-start.
+        # Rollout uses separate GPUs, so overlap its model loading with PS and actor initialization.
         rollout_init_executor = ThreadPoolExecutor(max_workers=1)
         rollout_init_future = rollout_init_executor.submit(self.init_rollout_servers, self.rollout_wg_list, "rollout")
         psrl_logger.info("Launched rollout server init in background thread (before PS init)")
@@ -1911,9 +1893,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             # No need to create PS WorkerGroup
             pass
         elif self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
-            # PSManager is only used to build the nixl meta server
-            # The PS WorkerGroup is used to store the model state dict
-            # It is colocate with the rollout instances
+            # PSManager hosts metadata while colocated PS workers store model state.
             assert self.config.psrl.nixl.server_ip == self.config.psrl.ps_manager_ip, (
                 "PSManager IP and NIXL server IP must be the same"
             )
@@ -1921,9 +1901,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # ps is deployed on both generation and (maybe) actor nodes
                 ps_node_ids = set()
 
-                # Get node IDs from placement group metadata (GCS query, <1s)
-                # instead of execute_all_sync("get_node_id") which blocks ~430s
-                # waiting for actor workers to cold-boot.
+                # Read node IDs from placement metadata to avoid waiting for cold actor workers.
                 def _get_node_ids_from_wg(wg: RayWorkerGroup) -> list[str]:
                     """Extract node IDs from placement group GCS metadata without calling actors."""
                     resource_pool = wg.resource_pool
@@ -1993,11 +1971,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 )
                 if self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu":
                     ps_nixl_futures = self.ps_wg.execute_all_async("init_nixl_client")
-                # Init model skeleton on meta device; weights are loaded after NIXL protocol completes.
+                # Initialize the model skeleton on meta device. Load weights after NIXL setup.
                 model_init_futures.extend(self.ps_wg.execute_all_async("init_model"))
-                # NOTE(claude): dispatch preload immediately into each PS actor's serial queue; it will
-                # start as soon as that actor's init_model completes, overlapping with gen/val/train
-                # model initialization and NIXL protocol to hide disk I/O latency.
+                # NOTE(claude): Queue checkpoint preload to overlap disk I/O with worker initialization.
                 if self._resolve_resume_checkpoint_paths() is None:
                     preload_futures = self.ps_wg.execute_all_async("preload_checkpoint_to_cpu")
                 psrl_logger.info("PS model initialized successfully!")
@@ -2026,11 +2002,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self.ref_policy_wg.init_model()
 
         if not (self.use_critic or (self.use_reference_policy and not self.ref_in_actor)):
-            # NOTE(linsh): when not using critic or reference policy,
-            # if we directly call `init_model` of actor_wg, Ray will view the fused worker
-            # as an async actor and run `run_async_func_or_coro_in_event_loop`, which will
-            # make it invalid to call async function such as `trainer_mode` in `init_model`.
-            # So here we create a dummy worker group and call its dummy method to avoid this issue.
+            # NOTE(linsh): A dummy worker prevents Ray from treating the fused worker as asynchronous.
             self.dummy_wg = all_wg["dummy"]
             self.dummy_wg.init_model()
 
@@ -2050,7 +2022,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         # AGENT(VERL): skip `async_rollout_manager`, `checkpoint_manager` in PSRL.
 
-        # ---- Step 5: Initialize NIXL clients, convert parameters format and execute NIXL protocol  ---
+        # --- Step 5: Initialize NIXL clients and parameters ---
 
         if self.is_rollout_mode_in_actor:
             assert self.config.psrl.ps_mode == "nixl_cpu" or self.config.psrl.ps_mode == "nixl_gpu", (
@@ -2081,9 +2053,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             if self.config.psrl.lmcache.get("enable", False) and self.config.psrl.lmcache.get("enable_p2p", False):
                 ray.get(self.rollout_coordinator.init_lmcache_p2p.remote())
         else:
-            # init validate wg -> offload -> init actor wg
-            # Validate and actor share the same GPUs, so they must be sequential.
-            # Rollout is on separate GPUs and runs in background throughout.
+            # Validate and actor share GPUs and initialize sequentially while rollout initializes elsewhere.
             psrl_logger.info("Initializing validation model")
             self.init_rollout_servers(self.validate_wg_list, tag="validate")
             ray.get(self.rollout_coordinator.sleep.remote("validate"))
@@ -2106,7 +2076,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ray.get(actor_nixl_futures)
             ray.get(self.actor_wg.execute_all_async("nixl_convert_params"))
 
-            # Wait for rollout to complete — actor init overlapped with rollout in background.
+            # Wait for rollout to complete. Actor initialization overlapped with it.
             # Coordinator NIXL ops need rollout registered, so we must wait here.
             rollout_init_future.result()
             rollout_init_executor.shutdown(wait=False)
@@ -2149,35 +2119,25 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ray.get(self.ps_manager_handle.bind_ps_worker_group.remote(self.ps_wg))
             psrl_logger.info("PS worker group bound successfully!")
 
-            # NOTE(lhy): Two paths are supported:
-            # 1. New training: load checkpoint directly to PS (may broadcast init)
-            # 2. Resume training: load checkpoint into actor and push to PS
+            # NOTE(lhy): New runs load PS directly, while resumed runs load the actor and push to PS.
             if self._resolve_resume_checkpoint_paths() is None:
                 # Now that all NIXL buffers are allocated (meta tensors replaced),
                 # write the preloaded checkpoint tensors into the PS registered buffers.
                 with log_dual_events("Loading PS checkpoint weights", psrl_logger, event_type=EventType.INIT):
-                    # Ensure prefetch finished (likely already done; blocks only if preload
-                    # outlasted NIXL protocol, which would be unusual).
+                    # Wait only if checkpoint prefetch outlasted the NIXL protocol.
                     ray.get(preload_futures)
                     ray.get(self.ps_wg.execute_all_async("write_checkpoint_to_registered_tensors"))
-                # When broadcast_init is enabled, rank-0's checkpoint weights are broadcast to
-                # all other PS workers via NIXL GPU-Direct using a binary-tree topology, avoiding
-                # N independent disk reads. Skip this block on the existing path (enabled=False).
+                # Broadcast rank zero weights to avoid independent checkpoint reads on every PS worker.
                 if self.config.psrl.broadcast_init.enabled:
                     with log_dual_events(
                         "Broadcast init: PS rank-0 → all workers", psrl_logger, event_type=EventType.INIT
                     ):
                         ray.get(self.ps_manager_handle._coordinate_broadcast_init.remote())
             else:
-                # If resuming from a checkpoint, load it into the actor and push to PS now,
-                # before initial_pull_from_ps, so gen/val workers get the resume weights on
-                # their first pull instead of the base HF checkpoint weights.
+                # Push resumed actor weights before the initial pull so all workers receive them first.
                 self._resume_load_and_push_to_ps()
 
-            # Pull checkpoint weights from PS into gen and actor workers via NIXL.
-            # NOTE(lhy): gen/val/actor workers are now empty-initialized and must pull from PS on startup.
-            # When is_rollout_mode_in_actor is True, the actor is sleeping (meta mode) at this point
-            # and will pull from PS later in switch_to_trainer_mode, so skip here.
+            # Pull initial PS weights now. A sleeping colocated actor pulls later in `switch_to_trainer_mode`.
             initial_pull_tag = "all" if self.is_rollout_mode_in_actor else "rollout"
             with log_dual_events("Initial pull: PS → gen/actor workers", psrl_logger, event_type=EventType.INIT):
                 initial_pull_futures = []
@@ -2213,18 +2173,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
         psrl_logger.warning("Switching to rollout mode...")
 
-        psrl_logger.info("Step 1 - Deregistering actor clients from NIXL...")
+        psrl_logger.info("Step 1: Deregistering actor clients from NIXL...")
         # actor_wg nixl client deregister weight memory
         release_futures = self.actor_wg.execute_all_async("nixl_sleep", "full")
         ray.get(release_futures)
 
-        psrl_logger.info("Step 2 - Waking up validation instances...")
+        psrl_logger.info("Step 2: Waking up validation instances...")
         # Allocate rollout space and register
         ray.get(
             [self.tag_to_server_handles["validate"][i].nixl_wake_up.remote() for i in range(self.n_validate_instances)]
         )
 
-        psrl_logger.info("Step 3 - Syncing with ps manager...")
+        psrl_logger.info("Step 3: Syncing with PS manager...")
         # sync with server
         updated_client_names = []  # to collect all updated client names for broadcasting
         futures = []
@@ -2242,10 +2202,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         ray.get(futures)
 
         # broadcast to other clients
-        psrl_logger.info("Step 4 - PS manager broadcasting updated client infos...")
+        psrl_logger.info("Step 4: PS manager broadcasting updated client infos...")
         self._broadcast_updated_client_infos_from_ps_manager(updated_client_names)
 
-        psrl_logger.info("Step 5 - Syncing validation instances' model weights & status with PS...")
+        psrl_logger.info("Step 5: Syncing validation instances' model weights and status with PS...")
         # sync validation instances with ps
         # the generation will be resumed in the rollout coordinator
         resumed_instance_ids = []
@@ -2255,7 +2215,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         ray.get(self.rollout_coordinator.sync_with_ps.remote(resumed_instance_ids))
 
-        psrl_logger.info("Step 6 - Resuming validation instances...")
+        psrl_logger.info("Step 6: Resuming validation instances...")
         # resume validation instances in router and coordinator
         resumed_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
         self._post_gateway_worker_routing_control("resume", resumed_base_worker_ids)
@@ -2286,12 +2246,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             return
         psrl_logger.info("Switching to trainer mode...")
 
-        psrl_logger.info("Step 1 - Pausing validation instances...")
+        psrl_logger.info("Step 1: Pausing validation instances...")
         # pause validation instances in router and coordinator
         paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
         self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
 
-        psrl_logger.info("Step 2 - Interrupting generation of validation instances...")
+        psrl_logger.info("Step 2: Interrupting generation of validation instances...")
         # interrupt generation and sleep
         ray.get(
             [
@@ -2300,7 +2260,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ]
         )
 
-        psrl_logger.info("Step 3 - Putting validation instances to sleep...")
+        psrl_logger.info("Step 3: Putting validation instances to sleep...")
         # sleep validation instances and deregister from NIXL
         ray.get(
             [
@@ -2309,11 +2269,11 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             ]
         )
 
-        psrl_logger.info("Step 4 - Waking up training actor...")
+        psrl_logger.info("Step 4: Waking up training actor...")
         # Allocate trainer space and register
         ray.get(self.actor_wg.execute_all_async("nixl_wake_up"))
 
-        psrl_logger.info("Step 5 - Syncing with ps manager...")
+        psrl_logger.info("Step 5: Syncing with PS manager...")
         # sync with server
         update_client_names = []  # to collect all updated client names for broadcasting
         futures = []
@@ -2325,16 +2285,14 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         futures.append(self.ps_manager_handle.nixl_wait_for_update_infos.remote(self.actor_wg.world_size))
         ray.get(futures)
 
-        psrl_logger.info("Step 6 - PS manager broadcasting updated client infos...")
+        psrl_logger.info("Step 6: PS manager broadcasting updated client infos...")
         self._broadcast_updated_client_infos_from_ps_manager(update_client_names)
 
-        psrl_logger.info("Step 7 - Pulling actor model from PS...")
+        psrl_logger.info("Step 7: Pulling actor model from PS...")
         # pull actor model
         ray.get(self.actor_wg.execute_all_async("pull_model"))
 
-        # If a checkpoint load was deferred (NIXL resume path), apply it now.
-        # Actor is awake with valid NIXL connections; overwrite the PS-pulled HF weights
-        # with the checkpoint weights.
+        # Apply a deferred checkpoint after actor wakeup and NIXL reconnection.
         deferred_path = getattr(self, "_deferred_actor_ckpt_path", None)
         if deferred_path is not None:
             psrl_logger.info(f"Resume (NIXL): loading deferred actor checkpoint from {deferred_path}...")
@@ -2345,11 +2303,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             self._deferred_actor_ckpt_path = None
             psrl_logger.info("Resume (NIXL): deferred actor checkpoint loaded.")
 
-        # Re-pause validate instances in the gateway AFTER all updates are done.
-        # The workers/update_weight_version update (Step 5-6) goes through UpdateWorkerPropertiesStep
-        # which replaces worker objects, resetting their paused state to False.
-        # We must re-pause here to ensure validate workers don't receive rollout requests.
-        psrl_logger.info("Step 7.5 - Re-pausing validation instances in gateway after version sync...")
+        # Worker property replacement clears paused state, so restore it after version synchronization.
+        psrl_logger.info("Step 7.5: Re-pausing validation instances in gateway after version sync...")
         paused_base_worker_ids = self.tag_to_base_worker_ids.get("validate", [])
         if paused_base_worker_ids:
             self._post_gateway_worker_routing_control("pause", paused_base_worker_ids)
@@ -2365,9 +2320,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         Returns:
             dict: A dictionary mapping each source agent to a list of destination agents.
         """
-        # simple round-robin broadcast plan
-        # NOTE(linsh): currently only PS manager broadcasting is implemented.
-        # This method can be extended for more complex plans if needed.
         broadcast_plan = {src_agent: [] for src_agent in src_agent_names}
         for i, dst_agent in enumerate(dst_agent_names):
             src_agent = src_agent_names[i % len(src_agent_names)]
@@ -2558,12 +2510,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         their very first pull.
 
         Two cases:
-        - Path A (is_rollout_mode_in_actor=False): actor already has a live NIXL
-          connection and real GPU memory; load directly then push.
-        - Path B (is_rollout_mode_in_actor=True): actor is in meta-sleep with only
+        - Path A (is_rollout_mode_in_actor=False): Actor already has a live NIXL
+          connection and real GPU memory. Load directly, then push.
+        - Path B (is_rollout_mode_in_actor=True): Actor is in meta-sleep with only
           meta-tensor NIXL descriptors. We perform a mini wake → load → push → sleep
           cycle. switch_to_trainer_mode() will do a proper wake later with a full
-          info-broadcast; the sleep here uses "full" mode (deregister NIXL) so
+          info broadcast. The sleep here uses "full" mode so
           switch_to_trainer_mode re-registers with fresh addresses.
 
         Sets self._actor_resume_loaded = True when a checkpoint was applied, which
@@ -2580,7 +2532,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         resume_version = int(actor_path.split("global_step_")[-1].split("/")[0])
 
         if not self.is_rollout_mode_in_actor:
-            # Path A: actor NIXL is live; load checkpoint then push.
+            # Path A has live actor NIXL, so load the checkpoint and push.
             with log_dual_events(
                 "Resume (Path A): load actor ckpt + push to PS", psrl_logger, event_type=EventType.INIT
             ):
@@ -2595,9 +2547,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 ray.get(self.actor_wg.execute_all_async("push_model"))
                 psrl_logger.info("Resume (Path A): PS now holds resume checkpoint weights.")
         else:
-            # Path B: actor is in meta-sleep; perform mini wake → load → push → sleep.
-            # nixl_push_model is a WRITE from actor to PS
-            # PS does not need to know actor's new addresses, so no info-broadcast step is required here.
+            # Path B wakes the sleeping actor for a load, push, and sleep cycle.
+            # The actor writes to PS without an information broadcast.
             with log_dual_events(
                 "Resume (Path B): mini wake-load-push-sleep cycle", psrl_logger, event_type=EventType.INIT
             ):
@@ -2615,7 +2566,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 # Sleep with "full" mode: release GPU memory AND deregister NIXL.
                 # switch_to_trainer_mode() will re-register with fresh addresses.
                 ray.get(self.actor_wg.execute_all_async("nixl_sleep", "full"))
-                psrl_logger.info("Resume (Path B): actor re-sleeping; PS holds resume weights.")
+                psrl_logger.info("Resume (Path B): actor re-sleeping. PS holds resume weights.")
 
         self._actor_resume_loaded = True
 
@@ -2658,16 +2609,12 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
 
-        # Actor weights were already loaded and pushed to PS inside init_workers()
-        # (see _resume_load_and_push_to_ps).  Skip re-loading here to avoid
-        # overwriting the correct state with a redundant disk read.
+        # Skip actor reload when initialization already pushed the checkpoint to PS.
         if getattr(self, "_actor_resume_loaded", False):
-            psrl_logger.info("Resume: actor checkpoint was already loaded in init_workers(); skipping actor re-load.")
+            psrl_logger.info("Resume: actor checkpoint was already loaded in init_workers(). Skipping actor reload.")
         else:
-            # In nixl_cpu/nixl_gpu + is_rollout_mode_in_actor: actor is in meta-sleep.
-            # load_checkpoint() would hit a CUDA invalid-argument error (TMS.pause() active).
-            # Defer actor loading until after switch_to_trainer_mode() wakes the actor and
-            # re-establishes NIXL connections; store the path for use there.
+            # Defer loading while the NIXL actor is in meta sleep because its CUDA storage is unavailable.
+            # Apply the checkpoint after `switch_to_trainer_mode` restores NIXL connections.
             is_nixl_mode = self.config.psrl.ps_mode in ["nixl_cpu", "nixl_gpu"]
             need_nixl_resume = is_nixl_mode and self.is_rollout_mode_in_actor
             if need_nixl_resume:
@@ -2718,9 +2665,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
     def _get_required_batch_multiple(self, dp_size: int) -> int:
         """Return the global batch multiple required by downstream train steps(e.g. critics, actors)."""
         if self.batch_schedule_strategy.dispatch_steps_individually:
-            # Controller-scheduled steps are padded independently. The full
-            # physical batch only needs to satisfy DP dispatch for preprocessing
-            # and inference.
+            # Independently padded steps require only DP divisibility for preprocessing and inference.
             return dp_size
 
         required_multiple = dp_size
@@ -2847,9 +2792,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         global_seqlen_lst = torch.tensor(tu.get(data, "seq_len"), dtype=torch.int64)
         workload_lst = calculate_workload(global_seqlen_lst)
 
-        # Use group-level balancing for PrefixGrouper to keep same-uid samples together
-        # AGENT(VERL): PSRL use `parent_id` to group samples from the same episode,
-        # while VERL use `uid` for the same purpose.
+        # Keep samples with the same `parent_id` together for `PrefixGrouper`.
         if getattr(self, "use_prefix_grouper", False) and "parent_id" in batch.tags[0]:
             from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
@@ -2959,9 +2902,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
 
-        # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
-        # Only runs in decoupled mode (computes once per batch using stable π_old)
-        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+        # Compute rollout correction once per batch against a stable old policy.
+        # Bypass mode leaves the evolving policy comparison to the actor.
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         rollout_correction = (
@@ -3015,7 +2957,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             output = self.actor_wg.compute_log_prob(batch)
         else:
             output = self.ref_policy_wg.compute_ref_log_prob(batch)
-        assert len(output) == len(batch)
+        assert len(output) == len(batch), (
+            f"Reference log-probability output size {len(output)} does not match batch size {len(batch)}."
+        )
 
         # 2. write ref_log_prob and entropy back to TransferQueue
         data = tq.kv_batch_get(
@@ -3028,10 +2972,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
-        # Operating Mode Selection:
-        # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
-        # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
-        #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
+        # Bypass uses rollout log probabilities. Decoupled mode recomputes a stable proximal anchor.
         rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
@@ -3061,7 +3002,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             }
         )
         output: KVBatchMeta = self.actor_wg.compute_log_prob(batch)
-        assert len(output) == len(batch)
+        assert len(output) == len(batch), (
+            f"Actor log-probability output size {len(output)} does not match batch size {len(batch)}."
+        )
 
         fields = [
             "entropy",
@@ -3073,6 +3016,31 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "metrics",
         ]
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+
+        # Training pads log probabilities to `responses` but slices them by `response_mask`.
+        # Enforce equal row lengths here so drift fails near its source.
+        response_lens = data["responses"].offsets().diff()
+        mask_lens = data["response_mask"].offsets().diff()
+        psrl_logger.info(
+            "[length-contract] old_log_prob stage: rows=%d responses[min=%d max=%d] "
+            "response_mask[min=%d max=%d] equal=%s",
+            len(response_lens),
+            int(response_lens.min()),
+            int(response_lens.max()),
+            int(mask_lens.min()),
+            int(mask_lens.max()),
+            bool(torch.equal(response_lens, mask_lens)),
+        )
+        if not torch.equal(response_lens, mask_lens):
+            bad = (response_lens != mask_lens).nonzero().flatten().tolist()
+            raise AssertionError(
+                f"responses and response_mask disagree on length for {len(bad)} of "
+                f"{len(response_lens)} rows. First offenders (row, responses, mask): "
+                f"{[(int(i), int(response_lens[i]), int(mask_lens[i])) for i in bad[:5]]}. "
+                "Both are written per trajectory by the agent loop and must stay in lockstep, "
+                "because old_log_probs is cut to the mask length while the training forward is "
+                "padded to the responses length."
+            )
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
@@ -3168,8 +3136,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps):
-        # 1. collect necessary fields from TransferQueue for computing metrics
-        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+        # Fetch only real samples because schedule-local padding keys can collide after cleanup.
+        real_keys = [key for key, tag in zip(batch.keys, batch.tags) if not tag.get("is_padding", False)]
         fields = [
             "prompts",
             "responses",
@@ -3180,13 +3148,18 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "rm_scores",
             "token_level_rewards",
             "num_turns",
+            "terminate_reason",
+            "parent_id",
         ]
         # GDPO per-component reward metrics
         gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
         if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
             fields.extend(gdpo_reward_keys)
-        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        data = tq.kv_batch_get(keys=real_keys, partition_id=batch.partition_id, select_fields=fields)
         num_turns = np.array(data.pop("num_turns").tolist())
+        # Read before `to_padded_tensor`, which drops non-tensor columns.
+        terminate_reasons = [str(v) for v in tu.get(data, "terminate_reason")]
+        metric_parent_ids = [str(v) for v in tu.get(data, "parent_id")]
         prompt_length = data["prompts"].offsets().diff()
         response_length = data["responses"].offsets().diff()
         global_token_num = (prompt_length + response_length).tolist()
@@ -3204,26 +3177,32 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 "max_response_length": self.config.data.max_response_length,
             },
         )
-        metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
-
+        # `data` holds only real samples, so every metric below sees the same batch.
         # 2. compute metrics
         metrics.update({"training/global_step": global_steps})
-        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self.resource_pool_manager.get_n_gpus()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
         gradient_norm = metrics.get("actor/grad_norm", None)
-        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
+        metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
 
         # 3. other auxiliary metrics
-        if non_padding_mask.any():
-            num_turns = num_turns[non_padding_mask]
         metrics.update(
             {
                 "training/num_turns/mean": num_turns.mean(),
                 "training/num_turns/max": num_turns.max(),
                 "training/num_turns/min": num_turns.min(),
             }
+        )
+
+        metrics.update(
+            _compute_termination_metrics(
+                terminate_reasons=terminate_reasons,
+                parent_ids=metric_parent_ids,
+                scores=data["token_level_scores"].sum(dim=-1).tolist(),
+                trained_tokens=data["response_mask"].sum(dim=-1).tolist(),
+            )
         )
 
         # 4. GDPO per-component reward metrics
@@ -3264,7 +3243,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
         # Record starting step so buffer_id is always relative to this run's step 0.
-        # (buffer_id = global_steps - 1 - _start_global_steps, so first buffer is always 0)
+        # Subtracting the starting step keeps the first `buffer_id` at zero.
         self._start_global_steps = self.global_steps
         # AGENT(VERL): ignore checkpoint manager in PSRL
 
@@ -3331,10 +3310,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                 self._shutdown_dump_executor()
                 return
 
-        # AGENT(VERL): skip RolloutSkip part in PSRL
-
-        # Start data processor to handle data preprocessing and batching
-        # AGENT(VERL): PSRL specific data processor start
+        # AGENT(VERL): skip RolloutSkip and start PSRL's data processor for preprocessing and batching.
         psrl_logger.info("Starting data processor...")
         self.start_data_processor()
         psrl_logger.info("Data processor started successfully.")
@@ -3364,9 +3340,6 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         )
         next_step_profile = False
 
-        # busy loop for training
-        # AGENT(VERL): PSRL use a busy loop for training,
-        # while verl use epoch and iteration based loop.
         while True:
             if hasattr(self.actor_wg, "async_calls_finalize_fn_exec"):
                 self.actor_wg.async_calls_finalize_fn_exec(blocking=False)
@@ -3375,10 +3348,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             is_last_step = self.global_steps == self.total_training_steps
 
             with marked_timer("step", timing_raw):
-                # AGENT(VERL): in PSRL's async RL the strategy owns batch acquisition.
-                # FullBatchStepStrategy blocks on wait_for_training_batch (timed under
-                # "wait_for_gen"). FineGrainOverlapStrategy switches to trainer mode
-                # immediately and pulls chunks as rollout progresses.
+                # The strategy owns batch acquisition and may start before the full batch is ready.
                 buffer_id = self.global_steps - 1
 
                 with marked_timer("start_profile", timing_raw):
@@ -3418,7 +3388,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
             # AGENT(VERL): skip curriculum sampler processing here in PSRL.
 
-            # TODO(verl): make a canonical logger that supports various backend
+            # TODO(verl): Make a canonical logger that supports every backend.
             logger.log(data=metrics, step=self.global_steps)
 
             progress_bar.update(1)
@@ -3449,6 +3419,9 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         if self.elastic_executor is not None:
             ray.get(self.elastic_executor.stop_busy_loop.remote())
             self.elastic_executor = None
+        if self.env_worker_manager is not None:
+            self.env_worker_manager.shutdown()
+            self.env_worker_manager = None
         self.stop_ps_manager()
         self._shutdown_dump_executor()
 

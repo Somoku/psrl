@@ -1,4 +1,3 @@
-# Modified from verl/experimental/reward/reward_loop/__init__.py
 from .dapo import DAPORewardManager
 from .gdpo import GDPORewardManager
 from .gen import GenRewardManager

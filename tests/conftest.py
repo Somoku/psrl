@@ -7,10 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Load ray-dependent modules without triggering package __init__.py files.
-# This keeps conftest importable in cpu_test environments (no ray / torch).
-# ---------------------------------------------------------------------------
+# Load Ray-dependent modules directly so CPU tests can collect without Ray or Torch.
 
 
 def _load_module_direct(dotted_name: str, file_path: str) -> object:
@@ -42,12 +39,13 @@ _PSRL = os.path.join(_HERE, "../psrl")
 if "psrl.utils.logger" not in sys.modules:
     sys.modules["psrl.utils.logger"] = MagicMock()
 
-# Provide only the names needed by staleness_controller without importing
-# gen.utils, which imports torch at module load time.
+# NOTE(lhy): Stub agent-loop types so CPU tests do not import Torch during collection.
 _gen_utils = _fake_module(
     "psrl.workers.gen.utils",
     RolloutInstanceId=tuple[str, int],
     INVALID_ROLLOUT_INSTANCE_ID=("", -1),
+    TokenInput=MagicMock,
+    TokenOutput=MagicMock,
 )
 RolloutInstanceId = _gen_utils.RolloutInstanceId
 
@@ -81,7 +79,7 @@ def ray_cluster():
 
 @pytest.fixture(scope="function")
 def ray_cluster_fn(ray_cluster):
-    """Function-scoped Ray fixture — reuses session cluster, kills named actors after each test."""
+    """Reuse the session Ray cluster and kill named actors after each test."""
     import warnings
 
     import ray
@@ -99,7 +97,7 @@ def ray_cluster_fn(ray_cluster):
 
 @pytest.fixture
 def dummy_rollout_instance_id() -> RolloutInstanceId:
-    """RolloutInstanceId is tuple[str, int] — a type alias, NOT a class."""
+    """Return a `tuple[str, int]` because `RolloutInstanceId` is a type alias."""
     return ("worker", 0)
 
 

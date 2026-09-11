@@ -1,52 +1,7 @@
 """
-Multi-node launcher for SWE-bench / SWE-smith-py evaluation.
+Launch SWE-bench evaluation across SSH hosts.
 
-Shards a prepared parquet across a set of hosts (one shard per host,
-bucketed by ``hash(instance_id)``), fans out :mod:`examples.mini_swe.eval.eval_swebench`
-to every host over ssh in parallel, then merges the per-shard artefacts into
-one combined output directory.
-
-Prerequisites (same as the single-node ``eval_swebench`` entry point):
-
-- The repository (``--repo-root``) lives on a *shared* filesystem that every
-  target host can read.
-- The output directory (``--output-dir``) is on the same shared FS — each
-  worker writes its shard artefacts there directly, no rsync needed.
-- The env script (``--env-script``, default ``${PSRL_WORKSPACE}/env/psrl.sh``)
-  is readable from every host and contains the same ``conda activate`` and
-  NCCL / UCX / vLLM / LD_LIBRARY_PATH setup that PSRL training uses.
-- Every host has the Docker images required by its shard already loaded
-  (use ``prepare/docker_scripts/load_all_nodes.sh`` first).
-- Passwordless ssh from the launch host to every target host.
-
-Output layout::
-
-    <output-dir>/
-      input_shards/             — per-shard parquet files fed to each host
-        shard_000.parquet
-        shard_001.parquet
-      host_output/              — raw per-host eval_swebench output dirs
-        <host>/
-          preds.json
-          results.jsonl
-          summary.json
-          <instance_id>/...
-      host_logs/
-        <host>.stdout
-        <host>.stderr
-      preds.json                — merged preds across all hosts
-      results.jsonl             — merged per-problem results
-      summary.json              — merged summary (resolved / total / ...)
-
-Usage::
-
-    python -m examples.mini_swe.eval.eval_swebench_multinode \\
-        --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \\
-        --dataset examples/mini_swe/data/verified_subset_80/train.parquet \\
-        --output-dir examples/mini_swe/output/eval/gold_sanity_mn \\
-        --gold-patches \\
-        --workers-per-node 8 \\
-        --grader-timeout 1800
+Shard a prepared dataset, run one evaluator per host, and merge artifacts.
 """
 
 from __future__ import annotations
@@ -68,7 +23,7 @@ from typing import Any
 
 import pandas as pd
 
-# Env vars forwarded to every remote host.  NO_PROXY / no_proxy are included
+# Env vars forwarded to every remote host. NO_PROXY / no_proxy are included
 # to prevent corporate HTTP proxies from intercepting LLM requests.
 _DEFAULT_FORWARD_ENV: tuple[str, ...] = (
     "OPENAI_API_BASE",
@@ -90,9 +45,7 @@ if not psrl_logger.handlers:
     _h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
     psrl_logger.addHandler(_h)
 
-# ---------------------------------------------------------------------------
-# Host-list parsing
-# ---------------------------------------------------------------------------
+# --- Host list parsing ---
 
 
 def _read_hosts(path: str) -> list[str]:
@@ -118,9 +71,7 @@ def _read_hosts(path: str) -> list[str]:
     return hosts
 
 
-# ---------------------------------------------------------------------------
-# Parquet sharding
-# ---------------------------------------------------------------------------
+# --- Parquet sharding ---
 
 
 def _extract_instance_id(row: dict[str, Any]) -> str:
@@ -198,9 +149,7 @@ def _shard_parquet(src: Path, out_dir: Path, n_shards: int) -> list[Path]:
     return shard_paths
 
 
-# ---------------------------------------------------------------------------
-# Per-host command assembly
-# ---------------------------------------------------------------------------
+# --- Remote command assembly ---
 
 
 def _build_remote_command(
@@ -308,7 +257,7 @@ def _stream_to_file_and_terminal(
     the launcher's stderr (when ``live`` is True), prefixing every line
     with ``prefix`` so output from concurrent hosts stays distinguishable.
 
-    Lines from different hosts can interleave; the lock keeps individual
+    Lines from different hosts can interleave. The lock keeps individual
     line writes atomic on the launcher side.
     """
     try:
@@ -352,13 +301,13 @@ def _run_on_host(
     Args:
         host (str): Hostname / IP, optionally ``IP:port`` (port is stripped and
             passed via ``-p``).
-        remote_cmd (str): Bash command to run; wrapped in ``bash -lc``.
+        remote_cmd (str): Bash command wrapped in ``bash -lc``.
         stdout_path (Path): File to write remote stdout into.
         stderr_path (Path): File to write remote stderr into.
         ssh_user (str): Optional ssh username (``-l``).
         ssh_opts (list[str] | None): Additional ssh options (default:
             :data:`_SSH_DEFAULT_OPTS`).
-        timeout_s (int | None): Local subprocess timeout in seconds.  ``None``
+        timeout_s (int | None): Local subprocess timeout in seconds. ``None``
             waits indefinitely.
         live_logs (bool): When True, also tee remote stdout/stderr to the
             launcher's stderr with ``[host]`` / ``[host !]`` prefixes.
@@ -426,9 +375,7 @@ def _run_on_host(
         se.close()
 
 
-# ---------------------------------------------------------------------------
-# Merge per-host output into a single directory
-# ---------------------------------------------------------------------------
+# --- Output merge ---
 
 
 def _merge_outputs(
@@ -448,8 +395,8 @@ def _merge_outputs(
     Args:
         host_dirs (list[Path]): List of per-host output directories.
         final_dir (Path): Top-level output directory (created if missing).
-        link_instance_dirs (bool): When True, per-instance subdirs are
-            symlinked; when False, copied.  Symlinks are fine on shared FS.
+        link_instance_dirs (bool): When True, symlink per-instance subdirectories.
+            When False, copy them.
 
     Returns:
         dict[str, Any]: Merged summary dict (also written to
@@ -482,7 +429,7 @@ def _merge_outputs(
             try:
                 combined_preds.update(json.loads(pj.read_text()))
             except json.JSONDecodeError:
-                psrl_logger.warning(f"preds.json in {d!r} is not valid JSON; skipping.")
+                psrl_logger.warning(f"Skipping invalid preds.json in directory={d!r}.")
 
         for sub in d.iterdir():
             if not sub.is_dir():
@@ -518,9 +465,7 @@ def _merge_outputs(
     return summary
 
 
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
+# --- Orchestrator ---
 
 
 def _collect_forwarded_env(
@@ -578,14 +523,14 @@ def run_multinode(
     model_class: str = "litellm_textbased",
 ) -> int:
     """
-    Orchestrate the full multi-node evaluation run.  Returns the number of
+    Orchestrate the full multi-node evaluation run. Returns the number of
     hosts that exited non-zero (0 means every host succeeded).
 
     See module docstring for argument semantics.
     """
     hosts = _read_hosts(hosts_file)
     n = len(hosts)
-    psrl_logger.info(f"[multinode] {n} host(s): {hosts}")
+    psrl_logger.info(f"[multinode] Host count: {n}. Hosts: {hosts!r}.")
 
     forward_names = list(forward_env) if forward_env else list(_DEFAULT_FORWARD_ENV)
     # Guarantee at least a logging knob is forwarded so remote stdout is legible.
@@ -626,8 +571,7 @@ def run_multinode(
     host_logs_dir.mkdir(parents=True, exist_ok=True)
     host_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Sanity: dataset must be readable; if it's a file path we shard it,
-    # otherwise (HF dataset key) we bail because sharding requires a file.
+    # Sharding requires a readable dataset file.
     if not os.path.isfile(dataset_path):
         raise ValueError(
             f"--dataset must be a filesystem path for multi-node mode "
@@ -636,7 +580,7 @@ def run_multinode(
     dataset_abs = os.path.abspath(dataset_path)
     repo_root_abs = os.path.abspath(repo_root)
 
-    psrl_logger.info(f"[multinode] Sharding {dataset_abs} into {n} parts...")
+    psrl_logger.info(f"[multinode] Sharding dataset={dataset_abs!r} into parts={n}...")
     shard_paths = _shard_parquet(Path(dataset_abs), input_shards_dir, n)
     shard_sizes = [len(pd.read_parquet(p)) for p in shard_paths]
     psrl_logger.info(
@@ -671,14 +615,14 @@ def run_multinode(
         host_cmds.append((host, remote_cmd, stdout_path, stderr_path, host_out))
 
     if dry_run:
-        print("=== DRY RUN — commands that would execute ===")
+        print("=== DRY RUN: commands that would execute ===")
         for host, cmd, so, se, ho in host_cmds:
             print(f"\n[{host}]  (stdout→{so}, out→{ho})")
             print(f"  ssh {host} bash -lc {shlex.quote(cmd)}")
         return 0
 
     t0 = time.monotonic()
-    psrl_logger.info(f"[multinode] Launching {n} ssh worker(s) in parallel...")
+    psrl_logger.info(f"[multinode] Launching SSH worker count: {n}...")
     failures: dict[str, int] = {}
     with ThreadPoolExecutor(max_workers=n) as pool:
         futs = {
@@ -722,9 +666,7 @@ def run_multinode(
     return len(failures)
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# --- CLI ---
 
 
 def main() -> None:

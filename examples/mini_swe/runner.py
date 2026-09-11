@@ -158,7 +158,7 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.environments import get_environment
     from minisweagent.models import get_model
-    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
+    from psrl.utils.agent.overflow import PromptOverflowError, ensure_overflow_handling
 
     _silence_litellm()
 
@@ -192,9 +192,8 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
     environment = None
     agent = None
     run_start = time.time()
-    # `timing` is mutated in the finally block, and every return dict below holds a
-    # reference to this same object, so assistant/env/elapsed are captured on ALL
-    # paths -- including PromptOverflowError / other exceptions raised mid-run.
+    # Return dictionaries share `timing`, so the finalizer records elapsed values
+    # for success and exception paths.
     timing: dict[str, float] = {"prep_s": 0.0, "assistant_s": 0.0, "env_s": 0.0, "grading_s": 0.0, "elapsed_s": 0.0}
     try:
         environment = get_environment(_build_environment_config(payload))
@@ -223,10 +222,7 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
             "timing": timing,
         }
     except PromptOverflowError as exc:
-        # The turn prompt exceeded the engine context window. Turns generated
-        # before the overflow are valid; the loop recovers them from the TITO
-        # session and treats this as a normal max-length termination instead of
-        # a fatal rollout error.
+        # Preserve turns generated before context overflow and terminate normally.
         psrl_logger.warning("mini-SWE-agent stopped on context overflow: %s.", exc)
         return {
             "exit_status": "context_exceeded",
@@ -244,8 +240,7 @@ def run_agent(payload: dict[str, Any]) -> dict[str, Any]:
             "timing": timing,
         }
     finally:
-        # Capture accumulated timing regardless of how we exit (success, overflow,
-        # or error). Runs before control leaves; the return dicts share `timing`.
+        # Shared return dictionaries receive final timing before control leaves.
         if agent is not None:
             timing["assistant_s"] = agent.assistant_s
             timing["env_s"] = agent.env_s

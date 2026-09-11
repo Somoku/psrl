@@ -43,12 +43,7 @@ TRAIN_NGPUS_PER_NODE=8
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
-# dependency: vllm>=0.11.0, megatron-lm>=0.13, mbridge with qwen3vl_cp branch
-# environment option1: use a stable container later than docker://verlai/verl:vllm011.dev6 
-    # and install mbridge in it by following the instruction in the container
-            # pip remove mbridge if you have installed it
-            # pip install git+https://github.com/ISEEKYAN/mbridge.git@qwen3vl_cp # for correct mbridge
-# environment option2: use container docker://verlai/verl:vllm011.dev_qwenvl_cp
+# Requires vLLM 0.11 or newer, Megatron-LM 0.13 or newer, and the `qwen3vl_cp` MBridge branch.
 
 PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config \
     --config-name='ppo_megatron_trainer' \
@@ -89,7 +84,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.actor.kl_loss_coef=0.01 \
     train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
-    +train_actor_rollout_ref.actor.rollout_n=$rollout_N \
+    train_actor_rollout_ref.actor.rollout_n=$rollout_N \
     train_actor_rollout_ref.actor.use_dynamic_bsz=True \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=22528 \
     +train_actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=0 \
@@ -134,7 +129,7 @@ PYTHONUNBUFFERED=1 python -m psrl.trainer.main_ppo --config-path=./config \
     train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     \
     psrl.rollout_coordination.routing_strategy.method="request_num_balance" \
-    psrl.rollout_coordination.routing_strategy.enable_group_sampling_on_multi_instances=True \
+    psrl.rollout_coordination.routing_strategy.enable_group_sticky=True \
     psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
     psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \

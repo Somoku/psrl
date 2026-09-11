@@ -26,8 +26,7 @@ DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/Qwen3-4B-Instruct-2507
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path ${HF_MODEL_PATH} --output_path ${DIST_CKPT_PATH}
 
 # --- Data ---
-# Train: SWE-smith-py 1 000-problem repo-balanced subset.
-# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
@@ -53,9 +52,6 @@ default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_agent_config.yaml
 
 # --- Cluster layout (32 GPUs total: 16 for rollout, 16 for train) ---
-# Rollout: TP=2 (4B is small, TP=2 is sufficient for inference)
-# Train: TP=4, PP=1 (4B fits easily without pipeline parallelism; DP=4)
-# Val: TP=2 (matches rollout engine, 8 instances)
 GEN_TP=4
 GEN_PP=1
 
@@ -80,9 +76,8 @@ VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / VAL_TP ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=${VAL_TP}
 
 # --- Algorithm (GRPO / DAPO) ---
-# Aligned with OpenClaw swe-rl 4B defaults:
-#   GRPO + DAPO asymmetric clip (0.2/0.28), KL effectively off, entropy=0.
-# Dynamic sampling filter: drops rollout groups with std=0 reward.
+
+# Drop groups with zero reward variance.
 enable_dynamic_sampling_filter=True
 adv_estimator=grpo
 use_kl_in_reward=False

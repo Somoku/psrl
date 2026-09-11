@@ -1,25 +1,8 @@
-"""FineGrainOverlapStrategy: overlap per-sample stages with ongoing rollout.
+"""
+Overlap chunk-safe training stages with ongoing rollout.
 
-recompute scope: per-sample stages (old_log_prob/ref/values/reward) run
-  per chunk as chunks arrive; advantage + updates run on the full batch.
-  Math is IDENTICAL to FullBatchStepStrategy for all advantage estimators.
-
-pre_step + mini_batch scope: each chunk IS one mini-batch; advantage and
-  one optimizer step run per chunk.  Exact for GRPO (group-local normalization);
-  approximate for GAE/REINFORCE++/GDPO (masked_whiten scope changes).
-  PS weight push is deferred until the last chunk so ``maybe_delete_buffer``
-  does not tear down the current buffer mid-step.
-
-``run_step`` switches to trainer mode immediately, then pulls chunks from the
-manager as they become available, so per-sample GPU work on chunk N overlaps
-with rollout generating chunk N+1.
-
-TODO (future): pre_step + micro_batch scope — true cross-chunk gradient
-  accumulation where optimizer.step() fires at mini-batch boundaries.
-  Requires: (1) new actor_grad_zero/actor_accumulate_grad/actor_optimizer_step
-  RPCs on engine_train_worker; (2) batch_num_tokens_override in veRL's FSDP
-  forward_backward_batch to share the full-mini-batch loss denominator across
-  chunks; (3) ppo_epochs == 1 constraint.  Currently guarded by ValueError.
+`recompute` applies advantages and updates to the full batch. `pre_step` updates
+each mini-batch chunk and is exact only for group-local GRPO normalization.
 """
 
 from __future__ import annotations
@@ -39,17 +22,11 @@ if TYPE_CHECKING:
 
 
 class FineGrainOverlapStrategy(StepStrategy):
-    """Overlap training stages with rollout using chunk-level pipelining.
+    """
+    Overlap training stages with rollout using chunk-level pipelining.
 
-    ``run_step`` switches to trainer mode immediately (no blocking on the
-    full batch), then iterates over chunks yielded by the manager, running
-    per_sample stages on each chunk concurrently with the rollout generating
-    the next chunk.
-
-    overlap_scope:
-      recompute  — only per_sample stages overlap; advantage+update on full batch.
-      pre_step   — advantage+update also per chunk (mini_batch granularity only;
-                   micro_batch is a future phase).
+    `recompute` updates the concatenated batch. `pre_step` updates each
+    mini-batch chunk.
     """
 
     def __init__(self, trainer: PSRL_RayPPOTrainer, cfg) -> None:
@@ -68,7 +45,7 @@ class FineGrainOverlapStrategy(StepStrategy):
         if self.overlap_scope == "pre_step" and self.effective_granularity != "mini_batch":
             raise ValueError(
                 f"pre_step scope requires mini_batch granularity (micro_batch pre_step is Phase 4, "
-                f"not yet implemented); got effective_granularity={self.effective_granularity!r}. "
+                f"not yet implemented). Got effective_granularity={self.effective_granularity!r}. "
                 "Use overlap_scope=recompute with micro_batch, or reduce multiplier so chunk "
                 "clamps to mini_batch."
             )
@@ -84,10 +61,10 @@ class FineGrainOverlapStrategy(StepStrategy):
     def run_step(self, buffer_id: int, metrics: dict, timing_raw: dict):
         """Pipeline per_sample stages over chunks, then run full-batch updates.
 
-        For ``recompute`` scope: per_sample stages run per chunk; advantage
+        For `recompute` scope, per-sample stages run per chunk. Advantage
         and optimizer updates run once on the concatenated full batch.
 
-        For ``pre_step + mini_batch`` scope: advantage and one optimizer step
+        For `pre_step + mini_batch` scope, advantage and one optimizer step
         also run per chunk immediately after per_sample stages.
 
         Args:
@@ -100,8 +77,7 @@ class FineGrainOverlapStrategy(StepStrategy):
         """
         t = self.trainer
 
-        # Switch to trainer mode before any GPU work. Unlike FullBatchStepStrategy,
-        # we do not block on the full batch here — chunks arrive as rollout progresses.
+        # Switch before GPU work so chunks can arrive while rollout progresses.
         t.switch_to_trainer_mode()
 
         chunks: list[KVBatchMeta] = []
@@ -116,7 +92,7 @@ class FineGrainOverlapStrategy(StepStrategy):
             )
             chunk_meta, is_last = ray.get(t.agent_loop_manager.wait_for_training_chunk.remote(buffer_id, chunk_idx))
             psrl_logger.warning(
-                "FineGrainOverlap: got buffer=%d chunk=%d size=%d is_last=%s; sampling replay buffer",
+                "FineGrainOverlap: got buffer=%d chunk=%d size=%d is_last=%s. Sampling replay buffer",
                 buffer_id,
                 chunk_idx,
                 len(chunk_meta),
@@ -178,10 +154,7 @@ class FineGrainOverlapStrategy(StepStrategy):
                             )
 
                 if t.config.trainer.critic_warmup <= t.global_steps:
-                    # Push only on the last chunk. Intermediate pushes advance the
-                    # PS version and trigger maybe_delete_buffer(version-1), which
-                    # tears down the current training buffer before remaining
-                    # chunks are consumed (deadlock / silent stall).
+                    # Push only the final chunk because advancing the PS version can delete this buffer early.
                     with marked_timer("update_actor", timing_raw, color="red"):
                         with log_dual_events(
                             f"Update actor (chunk {chunk_idx}, push={is_last})",

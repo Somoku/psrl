@@ -1,26 +1,5 @@
 """
-Transform Execution for Weight Layout Plans
-
-Implements executors for all built-in weight transform types, converting
-vLLM runtime tensors to HuggingFace checkpoint format according to
-declarative WeightTransform specifications.
-
-Transform kinds implemented:
-- identity          : passthrough (no-op)
-- qkv               : split fused QKV, GQA-aware
-- merged_column     : split merged gate/up, in_proj, etc.
-- split             : generic split with optional explicit lengths
-- qkv_interleaved   : reorder interleaved QKV (BLOOM/GPT-NeoX/Falcon)
-- fused_moe         : decompose fused MoE w13/w2 to per-expert HF tensors
-- expert_matrix     : reshape flat expert matrix (bert_with_rope)
-- transpose         : swap two dimensions
-- reshape           : reshape with expression evaluation
-- permute_qk_rotary : Llama/Mistral Q/K rotary weight permutation
-- scalar_extract    : extract single element from batched scalar
-- index_select      : row/element index selection
-- alias             : passthrough with renamed HF name
-- derive            : compute derived tensor from source (LongCat etc.)
-- custom            : delegate to ModelWeightTransform.vllm_to_hf()
+Execute declarative weight layout transforms for vLLM tensors.
 """
 
 from __future__ import annotations
@@ -109,9 +88,7 @@ class TransformExecutor:
         else:
             raise ValueError(f"Unknown transform kind: {kind!r}")
 
-    # ------------------------------------------------------------------
-    # identity
-    # ------------------------------------------------------------------
+    # --- Identity ---
 
     def _transform_identity(
         self,
@@ -119,7 +96,7 @@ class TransformExecutor:
         param: torch.Tensor,
         module: nn.Module | None,
     ) -> Iterable[TransformFragment]:
-        """Passthrough — tensor is yielded unchanged.
+        """Yield the tensor unchanged.
 
         If pieces is non-empty, the first piece's hf_name is used as the output
         name. If pieces is empty, the parameter name is not remapped (the caller
@@ -129,14 +106,12 @@ class TransformExecutor:
             piece = transform.pieces[0]
             name = piece.hf_name
         else:
-            # No rename specified — name stays as-is (caller will apply name_map)
-            name = None  # Sentinel: caller handles None by keeping original name
+            # Preserve the source name when no rename is configured.
+            name = None
 
         yield TransformFragment(name=name, param=param)
 
-    # ------------------------------------------------------------------
-    # qkv (GQA-aware)
-    # ------------------------------------------------------------------
+    # --- QKV with GQA ---
 
     def _transform_qkv(
         self,
@@ -192,9 +167,7 @@ class TransformExecutor:
         yield TransformFragment(name=transform.pieces[1].hf_name, param=k_param, shard_id="k")
         yield TransformFragment(name=transform.pieces[2].hf_name, param=v_param, shard_id="v")
 
-    # ------------------------------------------------------------------
-    # merged_column / split (generic)
-    # ------------------------------------------------------------------
+    # --- Merged column and split ---
 
     def _transform_merged_column(
         self,
@@ -202,16 +175,11 @@ class TransformExecutor:
         param: torch.Tensor,
         module: nn.Module | None,
     ) -> Iterable[TransformFragment]:
-        """Split a merged column weight into named pieces.
+        """
+        Split a merged column weight into named pieces.
 
-        Supports:
-        - Explicit lengths per piece (WeightPiece.length)
-        - Equal split (all lengths None → param.shape[axis] / num_pieces)
-        - Mixed: some pieces have explicit lengths, rest filled equally
-
-        Examples:
-        - gate_up_proj → gate_proj (half), up_proj (half)  [equal split]
-        - in_proj_qkvz → in_proj_qkv (3/4), in_proj_z (1/4)  [explicit]
+        Explicit lengths are honored, and unspecified pieces divide the
+        remaining width equally.
         """
         if not transform.pieces:
             raise ValueError("merged_column/split transform requires at least one piece")
@@ -251,9 +219,7 @@ class TransformExecutor:
 
         return [(x if x is not None else auto_len) for x in explicit]
 
-    # ------------------------------------------------------------------
-    # qkv_interleaved (BLOOM/GPT-NeoX/Persimmon/Falcon → vLLM)
-    # ------------------------------------------------------------------
+    # --- Interleaved QKV ---
 
     def _transform_qkv_interleaved(
         self,
@@ -261,14 +227,8 @@ class TransformExecutor:
         param: torch.Tensor,
         module: nn.Module | None,
     ) -> Iterable[TransformFragment]:
-        """Reorder interleaved per-head QKV layout to vLLM packed layout.
-
-        HF checkpoint stores: [Q0,K0,V0, Q1,K1,V1, ..., Qn,Kn,Vn]
-        vLLM wants:           [Q0..Qn,  K0..Kn,  V0..Vn ]
-
-        This is the vLLM→HF direction: we are *undoing* the reorder that
-        load_weights does when reading from a vLLM model, so we need to produce
-        the interleaved form.
+        """
+        Convert packed vLLM QKV heads to the interleaved HF layout.
         """
         if not transform.pieces:
             raise ValueError("qkv_interleaved requires at least one output piece")
@@ -310,9 +270,7 @@ class TransformExecutor:
 
         # For GQA: repeat K/V heads to match Q heads if needed
         if num_kv_heads != num_heads:
-            # Each Q head group shares one KV head; interleave at KV-head granularity
-            # We still produce per-Q-head interleaving for compatible models
-            # For true GQA, just return in vLLM format (no interleaving)
+            # GQA retains vLLM layout because shared KV heads cannot be interleaved per query head.
             yield TransformFragment(name=transform.pieces[0].hf_name, param=param)
             return
 
@@ -324,9 +282,7 @@ class TransformExecutor:
 
         yield TransformFragment(name=transform.pieces[0].hf_name, param=result)
 
-    # ------------------------------------------------------------------
-    # fused_moe
-    # ------------------------------------------------------------------
+    # --- Fused MoE ---
 
     def _transform_fused_moe(
         self,
@@ -335,15 +291,8 @@ class TransformExecutor:
         module: nn.Module | None,
         full_name: str | None,
     ) -> Iterable[TransformFragment]:
-        """Decompose fused MoE w13/w2 tensors to per-expert HF tensors.
-
-        vLLM fused layout:
-          w13_weight: [num_local_experts, 2 * intermediate_size, hidden_size]
-                      where each expert row stores [gate_proj; up_proj]
-          w2_weight:  [num_local_experts, hidden_size, intermediate_size]
-                      where index i is down_proj expert i
-
-        HF layout (example): experts.{i}.gate_proj.weight, etc.
+        """
+        Decompose fused MoE `w13` and `w2` tensors into per-expert HF tensors.
         """
         meta = transform.metadata
         if full_name is None:
@@ -412,14 +361,8 @@ class TransformExecutor:
         module: nn.Module | None,
         full_name: str | None,
     ) -> Iterable[TransformFragment]:
-        """Handle fused_moe from expert_params_mapping format.
-
-        expert_mapping: [(packed_suffix, hf_name, expert_id, shard_id), ...]
-        where shard_id in {"w1", "w2", "w3"}.
-
-        w1 = gate_proj (first half of each w13 expert row)
-        w3 = up_proj   (second half of each w13 expert row)
-        w2 = down_proj (rows of w2)
+        """
+        Convert fused MoE weights described by `expert_params_mapping`.
         """
         expert_mapping = transform.metadata.get("expert_mapping", [])
 
@@ -456,9 +399,7 @@ class TransformExecutor:
                 raise ValueError(f"Unknown expert shard_id: {shard_id!r}; expected 'w1', 'w2', or 'w3'")
             yield TransformFragment(name=hf_name, param=slice_tensor)
 
-    # ------------------------------------------------------------------
-    # expert_matrix
-    # ------------------------------------------------------------------
+    # --- Expert matrix ---
 
     def _transform_expert_matrix(
         self,
@@ -493,9 +434,7 @@ class TransformExecutor:
 
         yield TransformFragment(name=transform.pieces[0].hf_name, param=reshaped)
 
-    # ------------------------------------------------------------------
-    # transpose
-    # ------------------------------------------------------------------
+    # --- Transpose ---
 
     def _transform_transpose(
         self,
@@ -514,9 +453,7 @@ class TransformExecutor:
         transposed = param.transpose(int(dims[0]), int(dims[1]))
         yield TransformFragment(name=transform.pieces[0].hf_name, param=transposed)
 
-    # ------------------------------------------------------------------
-    # reshape
-    # ------------------------------------------------------------------
+    # --- Reshape ---
 
     def _transform_reshape(
         self,
@@ -556,9 +493,7 @@ class TransformExecutor:
             param=param.reshape(new_shape),
         )
 
-    # ------------------------------------------------------------------
-    # permute_qk_rotary (Llama / Mistral / Fairseq2 / Llama4)
-    # ------------------------------------------------------------------
+    # --- QK rotary permutation ---
 
     def _transform_permute_qk_rotary(
         self,
@@ -598,19 +533,14 @@ class TransformExecutor:
         n_heads = original_shape[0] // head_dim
         rest = original_shape[1:]  # e.g. (hidden_size,) for weight matrices
 
-        # In vLLM layout (post-load permutation):
-        #   shape[0] = n_heads * head_dim, organised as (n_heads, 2, half, ...)
-        # Reshape to (n_heads, 2, half, ...) then transpose dim 1 and 2 to get
-        # back to HF layout (n_heads, half, 2, ...) then flatten to original shape.
+        # Reverse the loaded layout by swapping its pair and half head dimensions.
         reshaped = param.reshape(n_heads, 2, half, *rest)
         permuted = reshaped.transpose(1, 2)  # (n_heads, half, 2, ...)
         result = permuted.reshape(original_shape)
 
         yield TransformFragment(name=transform.pieces[0].hf_name, param=result)
 
-    # ------------------------------------------------------------------
-    # scalar_extract
-    # ------------------------------------------------------------------
+    # --- Scalar extraction ---
 
     def _transform_scalar_extract(
         self,
@@ -626,9 +556,7 @@ class TransformExecutor:
         extracted = param[int(index)]
         yield TransformFragment(name=transform.pieces[0].hf_name, param=extracted)
 
-    # ------------------------------------------------------------------
-    # index_select
-    # ------------------------------------------------------------------
+    # --- Index selection ---
 
     def _transform_index_select(
         self,
@@ -658,9 +586,7 @@ class TransformExecutor:
         selected = torch.index_select(param, dim, indices)
         yield TransformFragment(name=transform.pieces[0].hf_name, param=selected)
 
-    # ------------------------------------------------------------------
-    # alias
-    # ------------------------------------------------------------------
+    # --- Alias ---
 
     def _transform_alias(
         self,
@@ -673,9 +599,7 @@ class TransformExecutor:
             raise ValueError("alias requires an output piece")
         yield TransformFragment(name=transform.pieces[0].hf_name, param=param)
 
-    # ------------------------------------------------------------------
-    # derive
-    # ------------------------------------------------------------------
+    # --- Derivation ---
 
     def _transform_derive(
         self,
@@ -714,9 +638,7 @@ class TransformExecutor:
         else:
             yield TransformFragment(name=transform.pieces[0].hf_name, param=result)
 
-    # ------------------------------------------------------------------
-    # custom (ModelWeightTransform delegation)
-    # ------------------------------------------------------------------
+    # --- Custom transforms ---
 
     def _transform_custom(
         self,
@@ -744,9 +666,7 @@ class TransformExecutor:
         ):
             yield TransformFragment(name=name, param=tensor)
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
+    # --- Utilities ---
 
     @staticmethod
     def _get_module_attr(

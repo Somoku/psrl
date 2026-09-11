@@ -1,23 +1,20 @@
-# Agentic RL feature toggles.
-
-# Batch aggregation unit: request or trajectory (default).
-# trajectory: Treat every trajectory as one entry in the mini-batch
-# request: Treat all trajectories emitted by one request as one entry,
-#          multiple trajectories in one request only adds engine micro-batches,
-#          and sibling trajectories never cross optimizer steps.
+# `trajectory` treats each trajectory independently.
+# `request` keeps sibling trajectories in one optimizer step.
 batch_agg_mode: trajectory
 
-# Error handling for terminations where TerminateReason.needs_manager_retry()
-# is True -- i.e. ROLLOUT_ERROR (rollout call raised) and UNKNOWN
-# (unclassified failure / zero turns produced). Timeouts and aborts are
-# handled by their own paths and do NOT route through this switch.
-# True  (default): on training failure, worker notifies manager to dispatch a
-#                  replacement request so the buffer slot is eventually filled;
-#                  on validation failure, manager shrinks val_buffer_size by 1
-#                  so the waiter is unblocked (result has fewer rows).
-# False           : raise RuntimeError immediately, crashing the worker so the
-#                   failure is visible rather than silently stalling training.
-manager_retry_on_error: True
+# How a harness that drops `reasoning_content` on replay is handled.
+# `multi_traj` trains every fork, `longest_traj` keeps the deepest one.
+# `multi_thinking` keeps CoT inline and requires rollout.chat_template to be an
+# accumulating template. `disable_thinking` turns CoT off and forbids that override,
+# because an accumulating template renders an unterminated `<think>` without CoT.
+thinking_template: multi_traj
+
+# How many rollout groups may fail back to back, with none succeeding in between,
+# before training aborts. Each failure is replaced by a fresh prompt, so a
+# deterministic fault (unreachable registry, broken task image) otherwise churns
+# refills forever at zero progress instead of failing. Any group that completes
+# resets the count, so sporadic failures never accumulate into a trip.
+refill_failure_threshold: 32
 
 # Per-trajectory text dump written by all agent loops via TrajectoryWriter.
 # Files land at <dir>/v{version}/{uid}.txt (one per rollout trajectory).
@@ -27,4 +24,13 @@ trajectory_output:
   # Output directory. Empty -> <psrl.logging_path>/trajectories.
   dir: ""
 
-# TODO(lhy): move multi-turn agent settings from rollout.yaml to psrl.yaml
+# Write each session turn immediately so diagnostics survive unfinished trajectories.
+turn_output:
+  # Whether to record raw session chat-completion traffic.
+  enable: False
+  # Output directory. Empty -> <psrl.logging_path>/session_turns.
+  dir: ""
+  # Whether to include the response body (roughly doubles the file size).
+  include_response: True
+
+# TODO(lhy): Move multi-turn agent settings from `rollout.yaml` to `psrl.yaml`.

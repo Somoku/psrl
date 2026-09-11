@@ -90,7 +90,6 @@ def test_no_logprobs():
 
 def test_trailing_trim_within_max_allowed():
     """trim_count=1 with max_trim_tokens=1 should succeed without ValueError."""
-    # Turn 1 output: [10, 11, 99] where 99 does not match accumulated → trim_count=1
     accumulated = [1, 2, 10, 11, 20, 30, 31]
     records = [
         {
@@ -104,7 +103,6 @@ def test_trailing_trim_within_max_allowed():
             "finish_reason": "stop",
         },
     ]
-    # max_trim_tokens=1: trim_count=1 <= allowed=1 → no ValueError
     result = build_training_data(accumulated, records, max_trim_tokens=1)
     assert result["response_ids"] == [10, 11, 20, 30, 31]
     assert result["response_mask"] == [1, 1, 0, 1, 1]
@@ -125,14 +123,12 @@ def test_trailing_trim_exceeds_max_raises():
             "finish_reason": "stop",
         },
     ]
-    # max_trim_tokens=0: trim_count=1 > allowed=0 → ValueError
     with pytest.raises(ValueError, match="trailing trim overflow"):
         build_training_data(accumulated, records, max_trim_tokens=0)
 
 
 def test_last_turn_trim_never_occurs():
     """Last turn output is never trimmed even if it doesn't match accumulated tail."""
-    # accumulated ends before the last turn's output — trim logic is skipped for is_last
     accumulated = [1, 2, 10, 11]
     records = [
         {
@@ -141,7 +137,6 @@ def test_last_turn_trim_never_occurs():
             "finish_reason": "stop",
         }
     ]
-    # Single-turn (is_last=True from the start): no trim attempted, no ValueError
     result = build_training_data(accumulated, records, max_trim_tokens=0)
     assert result["response_ids"] == [10, 11]
     assert result["response_mask"] == [1, 1]

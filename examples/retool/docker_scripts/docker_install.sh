@@ -1,27 +1,7 @@
 #!/bin/bash
 # set -v
 
-# Save a Docker image as a tar (for docker load / docker_copy.sh).
-#
-# Required env vars:
-#   DOCKER_IMAGE_DIR   — output directory for the tar file
-#   DOCKER_IMAGE_FILE  — tar filename (basename, e.g. python_3.11-slim.tar)
-#   DOCKER_IMAGE_TAG   — image tag (e.g. python:3.11-slim)
-#
-# Optional env vars:
-#   DOCKER_INSTALL_METHOD — pull method: docker (default), skopeo, or crane
-#   DOCKERHUB_MIRROR      — registry mirror host (e.g. docker.m.daocloud.io)
-#   SKOPEO                — explicit path to skopeo binary
-#
-# Example:
-#   DOCKER_IMAGE_DIR=/data/docker_images DOCKER_IMAGE_FILE=python_3.11-slim.tar \
-#     DOCKER_IMAGE_TAG=python:3.11-slim ./docker_install.sh
-#
-#   DOCKER_INSTALL_METHOD=skopeo DOCKERHUB_MIRROR=docker.m.daocloud.io \
-#     DOCKER_IMAGE_DIR=/data DOCKER_IMAGE_FILE=img.tar DOCKER_IMAGE_TAG=python:3.11-slim \
-#     ./docker_install.sh
-
-# If DOCKERHUB_MIRROR is set, rewrite short Docker Hub refs to pull from that host (skopeo/docker/crane).
+# Save the configured Docker image as a distributable archive.
 apply_dockerhub_mirror() {
     local ref="$1"
     local m="${DOCKERHUB_MIRROR:-}"

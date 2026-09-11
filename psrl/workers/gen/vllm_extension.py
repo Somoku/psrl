@@ -93,7 +93,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         try:
             return get_ep_group().rank_in_group
         except AssertionError:
-            # EP group not initialized (non-MoE model) — default to 0
+            # Non-MoE models do not initialize an EP group.
             return 0
 
     def init_nixl_client(
@@ -228,9 +228,6 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
                     key,
                     f"gen_pull_{self.pull_times}",
                 )
-                # shards_to_transfer = self.nixl_storage_client.client_read(
-                #     target_agent_name, target_client_name, key, "gen_pull", merge_and_cache_xfer=False
-                # )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, target_client_name, shards_to_transfer))
         # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
@@ -241,7 +238,6 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
                 "READ",
                 target_client=target_client_name,
             )
-            # self.nixl_storage_client.wait(key, "gen_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         self.cuda_synchronize()
         self.nixl_storage_client.clear_intermediate_cached_data()
@@ -280,9 +276,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         Return the `LMCacheEngine` from the active KV transfer group.
 
-        The KV transfer group is initialised by vLLM during startup when
-        `kv_transfer_config` is set.  `get_kv_transfer_group()` returns the
-        `LMCacheConnectorV1` instance, which holds `._lmcache_engine`.
+        vLLM initializes the transfer group when `kv_transfer_config` is set.
 
         Returns:
             LMCacheEngine: The `lmcache_engine` from the active KV transfer group.
@@ -292,8 +286,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             "KV transfer group is None. Ensure kv_transfer_config is set during vLLM engine initialization."
         )
         assert hasattr(connector, "_lmcache_engine"), (
-            f"Connector {type(connector).__name__} does not have _lmcache_engine attribute. "
-            "Expected LMCacheConnectorV1."
+            f"Connector lacks _lmcache_engine: type={type(connector).__name__!r}. Expected LMCacheConnectorV1."
         )
         engine = connector._lmcache_engine.lmcache_engine
         assert engine is not None, "LMCacheEngine lmcache_engine is None."
@@ -313,7 +306,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         engine = self._get_lmcache_engine()
         triples = engine.token_database.process_tokens(tokens)
-        # `process_tokens` returns `(start, end, key)` triples; extract the keys.
+        # `process_tokens` returns `(start, end, key)` triples. Extract the keys.
         return [key for _, _, key in triples]
 
     def _get_lmcache_total_bytes(self) -> int:
@@ -333,26 +326,8 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         Pin the cached backend chunks for `tokens` to prevent LRU eviction.
 
-        Uses `LocalCPUBackend.get_blocking()` rather than `batched_contains(pin=True)`.
-
-        The `pin=True` path increments `MemoryObjMetadata.pin_count`, which
-        `PinMonitor` **force-zeros** after `pin_timeout_sec` — making it
-        unsuitable for long-lived PSRL holds that span multiple turns.
-
-        `get_blocking()` instead increments `ref_count` from its hot-cache
-        steady-state of 1 to 2.  `MemoryObj.can_evict` requires
-        `ref_count == 1`, so holding `ref_count == 2` permanently blocks LRU
-        candidate selection without involving `PinMonitor`.
-
-        Side effects on backend capacity: if PSRL-pinned chunks leave no
-        evictable candidates in `hot_cache`, new `store()` calls with
-        `busy_loop=False` return `None` (no spin), while `retrieve()` calls
-        with `busy_loop=True` spin at 0.1 s intervals.  A warning is logged
-        when pinned chunks exceed 80 % of `hot_cache`.
-
-        Pinned `MemoryObj` references are stored in `_psrl_pinned_memory_objs`
-        on the worker instance, keyed by `CacheEngineKey`.  Re-pinning an
-        already pinned key is a no-op (idempotent; `ref_count` stays balanced).
+        A held chunk has `ref_count == 2` and cannot be evicted. Exhausting all
+        evictable chunks can block retrievals and reject new stores.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
@@ -362,7 +337,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         assert tokens, "tokens must be a non-empty list."
         if not hasattr(self, "_psrl_pinned_memory_objs"):
-            # Map from CacheEngineKey → MemoryObj for all PSRL-pinned backend chunks.
+            # Map each PSRL-pinned cache key to its memory object.
             self._psrl_pinned_memory_objs: dict = {}
 
         engine = self._get_lmcache_engine()
@@ -372,11 +347,9 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         pinned = 0
         for key in keys:
             if key in self._psrl_pinned_memory_objs:
-                # Already pinned by PSRL — skip to keep ref_count balanced.
+                # Repeated pins must not increment `ref_count`.
                 continue
-            # `get_blocking` acquires `cpu_lock`, checks `hot_cache`, and calls
-            # `ref_count_up()` before returning.  This raises ref_count to 2,
-            # making can_evict=False for the returned object.
+            # `get_blocking` raises `ref_count` to make the object ineligible for eviction.
             memory_obj = backend.get_blocking(key)
             if memory_obj is None:
                 # Chunk not present in backend (prefix may be shorter than key list).
@@ -384,10 +357,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
             self._psrl_pinned_memory_objs[key] = memory_obj
             pinned += 1
 
-        # Warn when PSRL-pinned chunks are a large fraction of hot_cache —
-        # LMCache store() calls return None (busy_loop=False path) and
-        # retrieve() calls spin (busy_loop=True path) when no evictable candidate
-        # exists.
+        # High pin pressure can reject stores and block retrievals.
         hot_cache_size = len(backend.hot_cache)
         if hot_cache_size > 0:
             psrl_pinned_total = len(self._psrl_pinned_memory_objs)
@@ -405,10 +375,8 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         Unpin the cached backend chunks for `tokens`, allowing LRU eviction.
 
-        Decrements `ref_count` on each `MemoryObj` that PSRL previously pinned
-        via `lmcache_pin_backend`.  Only chunks tracked in
-        `_psrl_pinned_memory_objs` are released, preventing interference with
-        active vLLM request references.
+        Only chunks tracked in `_psrl_pinned_memory_objs` are released, preventing
+        interference with active request references.
 
         Args:
             tokens (list[int]): Full token sequence for the trajectory.
@@ -425,12 +393,11 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         for key in keys:
             memory_obj = self._psrl_pinned_memory_objs.pop(key, None)
             if memory_obj is None:
-                # Not pinned by PSRL — skip.
                 continue
-            # PSRL's ref is live: hot_cache holds 1, PSRL holds 1 → ref_count >= 2.
+            # The hot cache and PSRL each hold one reference.
             assert memory_obj.get_ref_count() > 1, (
-                f"Backend chunk ref_count is {memory_obj.get_ref_count()} before "
-                "ref_count_down(). Expected > 1 (PSRL hold + hot_cache hold). "
+                f"Invalid backend reference count before unpin: ref_count={memory_obj.get_ref_count()}. "
+                "Expected more than one reference. "
                 "Possible double-unpin or external ref_count corruption."
             )
             memory_obj.ref_count_down()
@@ -441,13 +408,7 @@ class vLLMWorkerExtension(vLLMColocateWorkerExtension):
         """
         Remove all cached KV chunks from the LMCache CPU backend.
 
-        Called after a model weight update (NIXL pull or CPU pull) to ensure
-        that stale KV cache entries from the previous model version are not
-        reused by subsequent requests.  Corresponds to the
-        `lmcache.clear_on_weight_update` config flag.
-
-        Invoked via `collective_rpc("lmcache_clear_all_from_backend")` after a
-        weight pull completes (NIXL pull or CPU pull).
+        Weight updates must clear stale KV entries before subsequent requests.
         """
         engine = self._get_lmcache_engine()
         engine.clear()

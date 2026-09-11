@@ -77,7 +77,7 @@ class RolloutTraceConfig:
         """Initialize the tracing configuration with the specified backend.
 
         Sets up the tracing backend (Weave or MLflow) and initializes the client.
-        This method is idempotent - calling it multiple times has no effect after
+        This method is idempotent. Calling it multiple times has no effect after
         the first initialization.
 
         Args:

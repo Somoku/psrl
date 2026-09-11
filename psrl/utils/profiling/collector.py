@@ -18,11 +18,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 class TurnProfilingCollector:
     """
-    Encapsulates all turn-level profiling state for one trajectory.
-
-    Replaces the scattered _profiling_* fields previously in AgentData.
-    Call on_turn_submit() before each generation request, on_turn_complete()
-    after each generation output, and finalize() at trajectory end.
+    Encapsulate turn-level profiling state for one trajectory.
     """
 
     def __init__(self):
@@ -69,15 +65,11 @@ class TurnProfilingCollector:
             self._turn_index += 1
             return
 
-        # Compute router_wait_s for the first segment of this turn.
-        # This is the wall-clock gap between the turn-submit timestamp (recorded by
-        # on_turn_submit in the AgentData loop) and the moment the engine started
-        # processing the request (the preserved first generation_start_wall_ts).
+        # Router wait spans submission to engine execution for the first segment.
         router_wait_s = 0.0
         if self._turn_submit_ts > 0 and generation_start_wall_ts > 0:
             router_wait_s = generation_start_wall_ts - self._turn_submit_ts
 
-        # Compute env duration (time between last generation end and this turn's submit).
         if self._turn_index > 0 and self._last_generation_end_ts > 0:
             env_duration_s = self._turn_submit_ts - self._last_generation_end_ts
             self._env_records.append(
@@ -87,11 +79,9 @@ class TurnProfilingCollector:
                 )
             )
 
-        # Update last generation end timestamp.
         if generation_end_wall_ts > 0:
             self._last_generation_end_ts = generation_end_wall_ts
 
-        # Extract PrefillRecords and DecodeRecords.
         raw_prefill = ntb.get("profiling_prefill_records", [None])[0]
         raw_decode = ntb.get("profiling_decode_records", [None])[0]
 
@@ -108,7 +98,6 @@ class TurnProfilingCollector:
         if prefill_records and prefill_records[0].trigger != "internal_preempt_resume":
             prefill_records[0].router_wait_s = max(router_wait_s, 0.0)
 
-        # Set instance_id on all records from output metadata.
         instance_id = int(ntb.get("rollout_instance_id", [0])[0] or 0)
         total_seq_len = prefill_records[-1].total_seq_len if prefill_records else 0
 

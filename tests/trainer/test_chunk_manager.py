@@ -15,9 +15,7 @@ from transfer_queue import KVBatchMeta
 pytestmark = pytest.mark.cpu_test
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_entry_info(
@@ -56,8 +54,14 @@ class FakeManager:
         self.train_accumulated_buffers: dict[int, dict[int, list]] = {}
         self.train_accumulated_buffer_size: dict[int, int] = {}
 
+        # The refill breaker is latch-free here: these tests cover the healthy
+        # chunk path, so the guard must read as "not tripped".
+        self._refill_breaker_diagnosis = None
+
         # Bind real methods from the production class.
         self._emit_pending_chunks = PSRL_AgentLoopManager._emit_pending_chunks.__get__(self)
+        self._refill_breaker_error = PSRL_AgentLoopManager._refill_breaker_error.__get__(self)
+        self._raise_if_refill_breaker_tripped = PSRL_AgentLoopManager._raise_if_refill_breaker_tripped.__get__(self)
         self.wait_for_training_chunk = PSRL_AgentLoopManager.wait_for_training_chunk.__get__(self)
 
     def entry_infos_to_kv_batch_meta(self, entries, is_validate: bool = False) -> KVBatchMeta:
@@ -94,9 +98,7 @@ class FakeManager:
         self.train_accumulated_buffer_size[buffer_id] = self.train_accumulated_buffer_size.get(buffer_id, 0) + n_groups
 
 
-# ---------------------------------------------------------------------------
 # Tests
-# ---------------------------------------------------------------------------
 
 
 class TestChunkEmission:
@@ -153,7 +155,6 @@ class TestChunkEmission:
             assert len(chunk_meta) == 2
             assert is_last is False
 
-            # Consumed; should be gone.
             assert (buf, 0) not in mgr._resolved_train_chunks, (
                 "Resolved chunk should have been consumed by wait_for_training_chunk."
             )
@@ -161,10 +162,7 @@ class TestChunkEmission:
         asyncio.run(_run())
 
     def test_is_last_on_exact_divisible(self):
-        """When total groups is exactly divisible by chunk_size, second chunk carries is_last=True.
-
-        4 groups, chunk_size=2 → 2 chunks; chunk index 1 must have is_last=True.
-        """
+        """Mark the second of two evenly sized chunks as final."""
 
         async def _run():
             mgr = FakeManager(chunk_size=2, ready_total=4)

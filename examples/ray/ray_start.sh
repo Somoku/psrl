@@ -27,7 +27,6 @@ workers=( "${hosts[@]:1}" )
 # unset http_proxy && \
 # unset https_proxy && \
 
-# Clean up leftover Ray processes on all nodes to prevent GPU resource conflicts from multiple raylets
 echo "Stopping any existing Ray processes on all nodes..."
 for host in "${hosts[@]}"; do
     pssh -H "${host}" -i "source ${env_file} && ray stop --force 2>/dev/null || true" &

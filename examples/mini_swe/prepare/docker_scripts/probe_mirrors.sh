@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
-# probe_mirrors.sh — sanity-check public Docker Hub mirrors against a real
-# swebench image.
-#
-# Usage:
-#   bash probe_mirrors.sh IMG
-#   bash probe_mirrors.sh                       # uses $PROBE_DEFAULT_IMG env var
-#
-# For each mirror, runs `skopeo inspect docker://<mirror>/<img>` with a
-# timeout and prints OK / FAIL / TIMEOUT. Only inspects (fast), doesn't pull.
+# Check Docker Hub mirrors with `skopeo inspect`.
+# The image comes from the first argument or `PROBE_DEFAULT_IMG`.
 
 set -u
 

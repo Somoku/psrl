@@ -1,7 +1,6 @@
 #!/bin/bash
 # Run FSDP2 converter integration test with torchrun (2 GPUs).
-# Tests: FSDP2 → HuggingFace state dict conversion and sharding info.
-# Requires: GPU node with psrl environment, model checkpoint at PSRL_WORKSPACE.
+# Requires a GPU node, the PSRL environment, and a checkpoint at `PSRL_WORKSPACE`.
 #
 # Usage:
 #   PSRL_WORKSPACE=/path/to/workspace bash tests/state_dict/scripts/test_fsdp2_converter.sh

@@ -7,8 +7,7 @@ def ensure_reward_attention_mask(inputs: TensorDict) -> TensorDict:
     """Add the all-valid mask expected by reward loops when it is absent.
 
     Agent-loop reward requests contain unpadded prompt and response tensors, so
-    every token is valid. Existing masks are preserved for compatibility with
-    callers that provide padded inputs.
+    every token is valid. Callers may provide an existing mask for padded inputs.
     """
     if tu.get(inputs, "attention_mask", default=None) is not None:
         return inputs

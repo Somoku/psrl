@@ -114,8 +114,8 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         Returns:
             (images, videos):
-                images - list of PIL.Image.Image, or None if none found.
-                videos - list of (video_tensor, metadata) tuples, or None.
+                images: List of `PIL.Image.Image` objects, or None if none are found.
+                videos: List of `(video_tensor, metadata)` tuples, or None.
         """
         if self.processor is None:
             return None, None
@@ -123,8 +123,8 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         image_processor = getattr(self.processor, "image_processor", None)
         if image_processor is None:
             psrl_logger.warning(
-                "AgentData.process_vision_info: processor %s has no image_processor attribute; "
-                "skipping vision extraction.",
+                "AgentData.process_vision_info: processor %s has no image_processor attribute. "
+                "Skipping vision extraction.",
                 type(self.processor).__name__,
             )
             return None, None
@@ -179,14 +179,12 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         Takes a tool action (one or more tool calls) from the agent, executes
         the requested tools asynchronously, and returns the results as observations.
 
-        Each tool result is a ``ToolResponse`` with ``text``, ``image``, and
-        ``video`` fields.  Multimodal responses produce structured content lists
-        (``[{"type": "image"}, ..., {"type": "text", "text": ...}]``); text-only
-        responses produce a plain string.  Video responses are not yet supported
-        and raise ``NotImplementedError``.
+        Each tool result is a `ToolResponse` with `text`, `image`, and `video`
+        fields. Multimodal responses use structured content, while text-only
+        responses use plain strings. Video responses are not supported.
 
         Args:
-            action: Tool action - either a single tool call dict or list of tool calls
+            action: A single tool call dict or a list of tool calls.
 
         Returns:
             EnvStepOutput: Dictionary containing:
@@ -284,7 +282,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
         Args:
             tool_call: Dictionary containing tool call information with structure:
                       {"function": {"name": str, "arguments": str (JSON)}}
-            tools_kwargs: Optional per-sample kwargs keyed by tool name.  When
+            tools_kwargs: Optional per-sample kwargs keyed by tool name. When
                 present, the matching entry is merged into the keyword arguments
                 passed to the tool.
 
@@ -337,7 +335,7 @@ class ToolEnvironment(Environment[ConversationType, ToolAction]):
 
         # Log each tool invocation with its input arguments and (possibly truncated) output.
         psrl_logger.info(
-            f"Tool call - name: {tool_name}, id: {tool_call['id']}, args: {tool_args}, "
+            f"Tool call. Name: {tool_name}, id: {tool_call['id']}, args: {tool_args}, "
             f"response: {tool_response_text}, reward: {tool_reward}"
         )
         return ToolResponse(**tool_response_kwargs), tool_reward

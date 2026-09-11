@@ -1,3 +1,50 @@
+diff --git a/verl/models/transformers/qwen3_5.py b/verl/models/transformers/qwen3_5.py
+index c4fda481..dd3feb2b 100644
+--- a/verl/models/transformers/qwen3_5.py
++++ b/verl/models/transformers/qwen3_5.py
+@@ -228,9 +228,25 @@ def forward_with_torch_backend(
+     vocab_weights = self.lm_head.weight
+     if isinstance(vocab_weights, DTensor):
+         vocab_weights = vocab_weights.full_tensor()
++    # Pin the weights to the activations' device. `full_tensor()` on an FSDP DTensor returns
++    # whatever device the local shard lives on, and with CPU offload or TMS reclaiming the
++    # trainer's memory that is the host, while hidden_states stay on GPU. The `.to(dtype)`
++    # below converts dtype only, so the mismatch survived to the matmul in
++    # `_fused_linear_for_ppo_fwd` and raised "mat2 is on cpu, different from other tensors on
++    # cuda:0". Moving the weights (a single 1.89 GiB lm_head) is cheaper than moving the
++    # activations and keeps this path independent of the offload configuration.
++    if vocab_weights.device != hidden_states.device:
++        vocab_weights = vocab_weights.to(hidden_states.device)
+ 
+     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
+-    if ulysses_sequence_parallel_size > 1:
++    if ulysses_sequence_parallel_size > 1 and shift_labels is None:
++        # Only slice labels we rolled ourselves. `shift_labels` arrives from
++        # transformer_impl.py:1108 as `input_ids_rmpad_rolled`, which the engine already padded
++        # AND sliced at :1032, so slicing again leaves the labels at 1/sp^2 while the hidden
++        # states are sliced once, after embedding, and stay at 1/sp. The fused kernel then
++        # compared unequal row counts, seen as 512 logits rows against 447 and then 315 labels.
++        # `dense_common.py` never slices, for exactly this reason: 575d5a8a defined
++        # `shift_labels` to mean "the engine already prepared these, do not touch them".
+         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
+             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
+         )
+@@ -272,7 +288,14 @@ def forward_with_triton_backend(
+     else:
+         raise RuntimeError("To use forward_with_triton_backend, either labels or input_ids must be provided.")
+     ulysses_sequence_parallel_size = get_ulysses_sequence_parallel_world_size()
+-    if ulysses_sequence_parallel_size > 1:
++    if ulysses_sequence_parallel_size > 1 and shift_labels is None:
++        # Only slice labels we rolled ourselves. `shift_labels` arrives from
++        # transformer_impl.py:1108 as `input_ids_rmpad_rolled`, which the engine already padded
++        # AND sliced at :1032, so slicing again leaves the labels at 1/sp^2 while the hidden
++        # states are sliced once, after embedding, and stay at 1/sp. The fused kernel then
++        # compared unequal row counts, seen as 512 logits rows against 447 and then 315 labels.
++        # `dense_common.py` never slices, for exactly this reason: 575d5a8a defined
++        # `shift_labels` to mean "the engine already prepared these, do not touch them".
+         rolled_labels, _, _ = ulysses_pad_and_slice_inputs(
+             rolled_labels, position_ids_rmpad=None, sp_size=ulysses_sequence_parallel_size
+         )
 diff --git a/verl/protocol.py b/verl/protocol.py
 index 59f91d83..2a67859f 100644
 --- a/verl/protocol.py
@@ -212,7 +259,7 @@ index 946f7611..b0dbb4d5 100644
  
                  # compute mean and std
 diff --git a/verl/trainer/ppo/padding_utils.py b/verl/trainer/ppo/padding_utils.py
-index 436e17bc..011a0c76 100644
+index 436e17bc..a5de3c3b 100644
 --- a/verl/trainer/ppo/padding_utils.py
 +++ b/verl/trainer/ppo/padding_utils.py
 @@ -71,6 +71,7 @@ def construct_minimal_padding_template(
@@ -223,33 +270,108 @@ index 436e17bc..011a0c76 100644
  ) -> tuple[dict, dict]:
      """Construct a minimal text-only padding template of one prompt token and one response token.
  
-@@ -101,6 +102,7 @@ def construct_minimal_padding_template(
+@@ -82,6 +83,14 @@ def construct_minimal_padding_template(
+     Returns:
+         A tuple of (template_sample, template_tag) ready for padding.
+     """
++    # Build minimal sequence
++    prompts = torch.full((1,), eos_token_id, dtype=torch.int64)
++    input_ids = prompts.repeat(2)
++    attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
++    response_mask = torch.zeros_like(prompts)
++    position_ids = build_padding_position_ids(source_td.get("position_ids"), attention_mask)
++    routed_experts = build_padding_routed_experts(source_td.get("routed_experts"), input_ids.size(0))
++
+     # Copy the sample template from an existing sample.
+     template_sample = {}
+     for key in source_td.keys():
+@@ -91,16 +100,9 @@ def construct_minimal_padding_template(
+     # Deep copy the template tag from an existing sample.
+     template_tag = copy.deepcopy(source_tag)
  
+-    # Build minimal sequence
+-    prompts = torch.full((1,), eos_token_id, dtype=torch.int64)
+-    input_ids = prompts.repeat(2)
+-    attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+-    response_mask = torch.zeros_like(prompts)
+-    position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
+-    routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+-
      # Update the fields and remove redundant parts
      template_sample.update(
 +        uid=pad_uid,
          prompts=prompts,
          responses=prompts.clone(),
          input_ids=input_ids,
-@@ -112,6 +114,8 @@ def construct_minimal_padding_template(
+@@ -112,6 +114,38 @@ def construct_minimal_padding_template(
          rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
          rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
      )
++
++    # One entry per response token, so they must shrink with response_mask. This function runs at
++    # two points in the step and the later one, per-schedule-step DP padding, only exists when
++    # pipelining is on: by then the old_log_prob, advantage, and rollout-correction phases have
++    # filled these in, so cloning the source sample carried a full-length tensor into a row whose
++    # response_mask is length 1. ppo_loss then failed with "the size of tensor a (188) must match
++    # the size of tensor b (441)", because to_padded_tensor pads each field to its own max.
++    #
++    # Grepped from the writers rather than assembled by hand, because guessing missed
++    # `old_log_probs` and then `rollout_is_weights` on consecutive attempts: `response_from_nested`
++    # call sites give values/ref_log_prob/old_log_probs/entropy/sum_pi_squared, and
++    # rollout_corr_helper plus the advantage phase give the rest. A field added upstream later must
++    # be added here too.
++    per_response_token_fields = (
++        "old_log_probs",
++        "ref_log_prob",
++        "entropy",
++        "values",
++        "sum_pi_squared",
++        "advantages",
++        "returns",
++        "token_level_rewards",
++        "token_level_scores",
++        "rollout_is_weights",
++        "token_kept_mask",
++    )
++    for field_name in per_response_token_fields:
++        value = template_sample.get(field_name)
++        if isinstance(value, torch.Tensor):
++            template_sample[field_name] = torch.zeros_like(response_mask, dtype=value.dtype)
 +    if "parent_id" in template_sample:
 +        template_sample["parent_id"] = pad_uid
      if "multi_modal_inputs" in template_sample:
          template_sample["multi_modal_inputs"] = {}
      if routed_experts is not None:
-@@ -120,7 +124,7 @@ def construct_minimal_padding_template(
+@@ -120,7 +154,27 @@ def construct_minimal_padding_template(
          template_sample.pop("routed_experts", None)
  
      # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
 -    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2)
 +    template_tag.update(is_padding=True, prompt_len=1, response_len=1, seq_len=2, parent_id=pad_uid)
++
++    # The list above is the fix; this is the net under it. A tensor still holding one entry per
++    # SOURCE response token is the defect, and left alone it resurfaces deep in ppo_loss as an
++    # opaque "size of tensor a must match size of tensor b" with no hint that padding caused it.
++    # Only the source response length is evidence: the source sequence length is excluded because
++    # a prompt-side field legitimately keeps it, and shapes with no token axis (a scalar, an empty
++    # per-image list) are not this function's business.
++    source_response_len = source_td["response_mask"].shape[0]
++    if source_response_len not in (1, input_ids.size(0)):
++        unshrunk = {
++            key: tuple(value.shape)
++            for key, value in template_sample.items()
++            if isinstance(value, torch.Tensor) and source_response_len in value.shape
++        }
++        if unshrunk:
++            raise AssertionError(
++                f"padding sample kept per-response-token fields at the source length "
++                f"{source_response_len}: {unshrunk}. Add them to per_response_token_fields in "
++                "construct_minimal_padding_template."
++            )
      return template_sample, template_tag
  
  
-@@ -154,26 +158,18 @@ def upsample_batch_to_divisible_size(
+@@ -154,26 +208,18 @@ def upsample_batch_to_divisible_size(
      source_key = batch.keys[source_idx]
      source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
  
@@ -482,6 +604,38 @@ index b6c2948a..3076e954 100644
          row_dict["interaction_kwargs"] = interaction_kwargs
          return row_dict
  
+diff --git a/verl/utils/experimental/torch_functional.py b/verl/utils/experimental/torch_functional.py
+index a558c029..15ab7b5f 100644
+--- a/verl/utils/experimental/torch_functional.py
++++ b/verl/utils/experimental/torch_functional.py
+@@ -38,8 +38,25 @@ def _fused_linear_for_ppo_fwd(
+     entropy = torch.logsumexp(logits, dim=-1) - torch.sum(probs * logits, dim=-1)
+ 
+     if _FLASH_ATTN_CROSS_ENTROPY_AVAILABLE:
+-        per_token_entropy_loss = cross_entropy_loss(logits, input_ids)[0]
+-        token_log_probs = -per_token_entropy_loss
++        # flash-attn's Triton kernel does `n_rows, n_cols = logits.shape` and then asserts
++        # `labels.shape == (n_rows,)`, so it accepts ONLY 2D logits with 1D labels, while the
++        # lm_head here produces a batched `(1, seq, vocab)`. Flatten for the kernel and
++        # restore the caller's shape afterwards.
++        #
++        # This assumes hidden_states and input_ids describe the SAME number of tokens. They
++        # do not under Ulysses SP on a model whose config carries `vision_config`:
++        # transformer_impl.py:997 takes the VLM path that only pads the hidden states, while
++        # qwen3_5.py:233 still slices the labels to 1/sp, so the row counts disagree and this
++        # assert fires. Keep SP off on such models rather than reshaping around the mismatch,
++        # which would silently score tokens against the wrong labels.
++        flat_logits = logits.reshape(-1, logits.shape[-1])
++        flat_labels = input_ids.reshape(-1)
++        assert flat_logits.shape[0] == flat_labels.shape[0], (
++            f"token count mismatch: {flat_logits.shape[0]} logits rows vs {flat_labels.shape[0]} "
++            "labels. Ulysses SP slices labels but not VLM hidden states -- disable SP."
++        )
++        per_token_entropy_loss = cross_entropy_loss(flat_logits, flat_labels)[0]
++        token_log_probs = -per_token_entropy_loss.view(input_ids.shape)
+     else:
+         # Fallback to original PyTorch implementation
+         log_probs = logits.log_softmax(dim=-1)
 diff --git a/verl/utils/megatron/dist_checkpointing.py b/verl/utils/megatron/dist_checkpointing.py
 index 08139661..f2af2f08 100644
 --- a/verl/utils/megatron/dist_checkpointing.py
@@ -553,6 +707,75 @@ index 08139661..f2af2f08 100644
  
  def save_dist_checkpointing(
      sharded_state_dict,
+diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
+index ae91290f..fdbb149f 100644
+--- a/verl/utils/megatron_utils.py
++++ b/verl/utils/megatron_utils.py
+@@ -47,6 +47,9 @@ from verl.utils.model import normalize_model_name
+ from verl.utils.torch_dtypes import PrecisionType
+ from verl.workers.config import HFModelConfig, McoreEngineConfig
+ 
++# Megatron-LM@c049020 removed encoder_and_decoder; keep compat with older enum names.
++_MODEL_TYPE_ENCODER_AND_DECODER = getattr(ModelType, "encoder_and_decoder", None)
++
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+ 
+@@ -69,7 +72,7 @@ def get_model(
+         mpu.get_pipeline_model_parallel_world_size() > 1
+         and mpu.get_virtual_pipeline_model_parallel_world_size() is not None
+     ):
+-        assert model_type != ModelType.encoder_and_decoder, (
++        assert model_type != _MODEL_TYPE_ENCODER_AND_DECODER, (
+             "Interleaved schedule not supported for model with both encoder and decoder"
+         )
+         model = []
+@@ -89,8 +92,8 @@ def get_model(
+         post_process = mpu.is_pipeline_last_stage()
+         add_encoder = True
+         add_decoder = True
+-        assert model_type != ModelType.encoder_and_decoder, "Model type encoder_and_decoder is not supported"
+-        if model_type == ModelType.encoder_and_decoder:
++        assert model_type != _MODEL_TYPE_ENCODER_AND_DECODER, "Model type encoder_and_decoder is not supported"
++        if model_type == _MODEL_TYPE_ENCODER_AND_DECODER:
+             if mpu.get_pipeline_model_parallel_world_size() > 1:
+                 assert mpu.get_pipeline_model_parallel_split_rank() is not None, (
+                     "Split rank needs to be specified for model with both encoder and decoder"
+diff --git a/verl/utils/tokenizer.py b/verl/utils/tokenizer.py
+index 812b1f0e..158eda11 100644
+--- a/verl/utils/tokenizer.py
++++ b/verl/utils/tokenizer.py
+@@ -13,7 +13,6 @@
+ # limitations under the License.
+ """Utils for tokenization."""
+ 
+-import types
+ import warnings
+ 
+ __all__ = [
+@@ -227,10 +226,20 @@ def hf_processor(name_or_path, **kwargs):
+             case _:
+                 raise ValueError(f"Unsupported processor type: {processor.__class__.__name__}")
+ 
++        # Attach to the CLASS, not the instance. `types.MethodType(f, processor)` puts a
++        # bound method in `processor.__dict__`, and pickling that stores it as
++        # `(processor, "get_rope_index")` -- so unpickling calls `getattr` on a freshly
++        # reconstructed processor that has not been through this function yet and raises
++        # `AttributeError: 'Qwen3VLProcessor' object has no attribute 'get_rope_index'`.
++        # That kills vLLM's EngineCore `process_input_sockets` thread, which then waits
++        # forever on an input queue nothing can fill: the whole cluster deadlocks with no
++        # traceback on the driver. A class attribute is not part of instance state, so the
++        # processor pickles cleanly and every consumer still reaches it via `processor.x`.
+         if model_class is not None:
+-            processor.get_rope_index = types.MethodType(model_class.get_rope_index, processor)
++            processor_class = type(processor)
++            processor_class.get_rope_index = model_class.get_rope_index
+             if hasattr(model_class, "get_vision_position_ids"):
+-                processor.get_vision_position_ids = types.MethodType(model_class.get_vision_position_ids, processor)
++                processor_class.get_vision_position_ids = model_class.get_vision_position_ids
+     except Exception as e:
+         processor = None
+         # TODO(haibin.lin): try-catch should be removed after adding transformer version req to setup.py to avoid
 diff --git a/verl/workers/config/engine.py b/verl/workers/config/engine.py
 index 0bcf14a2..5a47a4da 100644
 --- a/verl/workers/config/engine.py
@@ -574,10 +797,18 @@ index 0bcf14a2..5a47a4da 100644
      dist_checkpointing_prefix: str = ""
      dist_ckpt_optim_fully_reshardable: bool = False
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
-index 991ccdb2..0b0d62be 100644
+index 991ccdb2..ad5258f2 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
 +++ b/verl/workers/engine/fsdp/transformer_impl.py
-@@ -76,6 +76,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+@@ -29,6 +29,7 @@ from tensordict import TensorDict
+ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+ from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConfig, StateDictType
+ from torch.distributed.tensor import DTensor
++from tqdm import tqdm
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl.models.transformers.monkey_patch import apply_monkey_patch
+@@ -76,6 +77,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
  from .utils import create_device_mesh, get_sharding_strategy
  
@@ -591,7 +822,7 @@ index 991ccdb2..0b0d62be 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -249,12 +256,19 @@ class FSDPEngine(BaseEngine):
+@@ -249,12 +257,19 @@ class FSDPEngine(BaseEngine):
              if self.model_config.model_type == "language_model":
                  auto_class = get_hf_auto_model_class(hf_config=self.model_config.hf_config)
  
@@ -617,7 +848,7 @@ index 991ccdb2..0b0d62be 100644
              else:
                  from verl.utils.model import load_valuehead_model
  
-@@ -265,12 +279,20 @@ class FSDPEngine(BaseEngine):
+@@ -265,12 +280,20 @@ class FSDPEngine(BaseEngine):
                  self.model_config.hf_config.classifier_dropout = 0.0
                  self.model_config.hf_config.hidden_dropout = "0"
                  self.model_config.hf_config.summary_dropout_prob = 0.0
@@ -644,7 +875,7 @@ index 991ccdb2..0b0d62be 100644
  
              use_liger = self.model_config.use_liger
              # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
-@@ -543,32 +565,36 @@ class FSDPEngine(BaseEngine):
+@@ -543,32 +566,36 @@ class FSDPEngine(BaseEngine):
      def _build_model_optimizer(self):
          from verl.utils.model import print_model_size
  
@@ -705,8 +936,36 @@ index 991ccdb2..0b0d62be 100644
          else:
              optimizer = None
              lr_scheduler = None
+@@ -638,7 +665,26 @@ class FSDPEngine(BaseEngine):
+         # and _build_fsdp_module, so self.scaler may not be set.
+         scaler = getattr(self, "scaler", None)
+ 
+-        for micro_batch in micro_batches:
++        # Micro-batch progress, rank 0 only so the 16 training workers do not interleave.
++        # This loop is where a step spends most of its time (measured: update_actor was 2069 s
++        # of a 3210 s step) and it was previously silent, so a slow step looked identical to a
++        # hung one and had to be told apart with py-spy.
++        micro_batch_iter = micro_batches
++        if getattr(self, "rank", -1) == 0:
++            phase = "recompute log_prob" if forward_only else "actor training"
++            step = tu.get(data, "global_steps", None)
++            if isinstance(step, (list, tuple)):
++                step = step[0] if step else None
++            desc = f"step {step} | {phase}" if step is not None else phase
++            micro_batch_iter = tqdm(
++                micro_batches,
++                desc=desc,
++                total=len(micro_batches),
++                dynamic_ncols=True,
++                leave=False,
++            )
++
++        for micro_batch in micro_batch_iter:
+             with ctx:
+                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+ 
 diff --git a/verl/workers/engine/megatron/transformer_impl.py b/verl/workers/engine/megatron/transformer_impl.py
-index 918d85ef..66a1f586 100644
+index 918d85ef..b05d3db7 100644
 --- a/verl/workers/engine/megatron/transformer_impl.py
 +++ b/verl/workers/engine/megatron/transformer_impl.py
 @@ -15,6 +15,7 @@
@@ -717,7 +976,15 @@ index 918d85ef..66a1f586 100644
  from functools import partial
  from typing import Any, Callable, ContextManager, Iterator, Optional
  
-@@ -69,6 +70,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
+@@ -25,6 +26,7 @@ from megatron.core.package_info import __version__
+ from megatron.core.pipeline_parallel import get_forward_backward_func
+ from omegaconf import OmegaConf
+ from tensordict import TensorDict
++from tqdm import tqdm
+ 
+ import verl.utils.torch_functional as verl_F
+ from verl.models.mcore import get_mcore_weight_converter
+@@ -69,6 +71,13 @@ from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
  from ..utils import postprocess_batch_func, prepare_micro_batches
  from .utils import set_random_seed
  
@@ -731,7 +998,7 @@ index 918d85ef..66a1f586 100644
  logger = logging.getLogger(__file__)
  logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
  
-@@ -293,20 +301,21 @@ class MegatronEngine(BaseEngine):
+@@ -293,20 +302,21 @@ class MegatronEngine(BaseEngine):
          self.tf_config = updated_tf_config
          print(f"module: {len(module)}")
  
@@ -766,7 +1033,7 @@ index 918d85ef..66a1f586 100644
  
          if torch.distributed.get_rank() == 0:
              print_model_size(module[0])
-@@ -370,83 +379,89 @@ class MegatronEngine(BaseEngine):
+@@ -370,83 +380,89 @@ class MegatronEngine(BaseEngine):
      def initialize(self):
          self._build_tf_config()
  
@@ -930,11 +1197,64 @@ index 918d85ef..66a1f586 100644
  
      def train_mode(self, **kwargs):
          """
+@@ -669,17 +685,43 @@ class MegatronEngine(BaseEngine):
+         # batch should be a list of batches inside micro-batches
+         batch_generator = make_batch_generator(micro_batches, vpp_size=len(self.module))
+ 
++        # Track one iterator on global rank 0. Under VPP every model chunk owns an
++        # iterator over the same logical micro-batches, so tracking all of them would
++        # multiply the displayed total by the number of virtual pipeline stages.
++        progress_bar = None
++        if torch.distributed.get_rank() == 0:
++            phase = "recompute log_prob" if forward_only else "actor training"
++            step = tu.get(data, "global_steps", None)
++            if isinstance(step, (list, tuple)):
++                step = step[0] if step else None
++            desc = f"step {step} | {phase}" if step is not None else phase
++            progress_bar = tqdm(total=n_micro_batch, desc=desc, dynamic_ncols=True, leave=False)
++
++            def track_micro_batches(batch_iter):
++                for micro_batch in batch_iter:
++                    progress_bar.update(1)
++                    yield micro_batch
++
++            if isinstance(batch_generator, list):
++                batch_generator[0] = track_micro_batches(batch_generator[0])
++            else:
++                batch_generator = track_micro_batches(batch_generator)
++
+         # TODO: we may use the new schedule instead
+         # for flash-attn: (seq_len, batch_size, hidden_size) = (mbs*seq_len, 1, hidden_size)
+-        losses_reduced = forward_backward_func(
+-            forward_step_func=forward_step,
+-            data_iterator=batch_generator,
+-            model=self.module,
+-            num_microbatches=n_micro_batch,
+-            seq_length=1,  # the communication shape is obtained via p2p comm
+-            micro_batch_size=1,  # the communication shape is obtained via p2p comm
+-            forward_only=forward_only,
+-        )
++        try:
++            losses_reduced = forward_backward_func(
++                forward_step_func=forward_step,
++                data_iterator=batch_generator,
++                model=self.module,
++                num_microbatches=n_micro_batch,
++                seq_length=1,  # the communication shape is obtained via p2p comm
++                micro_batch_size=1,  # the communication shape is obtained via p2p comm
++                forward_only=forward_only,
++            )
++        finally:
++            if progress_bar is not None:
++                progress_bar.close()
+ 
+         if self.model_config.mtp.enable and mpu.is_pipeline_last_stage(ignore_virtual=True):
+             # All CP ranks must participate in the all_reduce inside get_megatron_mtp_loss,
 diff --git a/verl/workers/engine_workers.py b/verl/workers/engine_workers.py
 index bf379b49..882e9f0b 100644
 --- a/verl/workers/engine_workers.py
 +++ b/verl/workers/engine_workers.py
-@@ -85,10 +85,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
+@@ -85,8 +85,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
  
          from verl.workers.engine import BaseEngine, EngineRegistry
  
@@ -943,8 +1263,6 @@ index bf379b49..882e9f0b 100644
          set_numa_affinity()
  
          self.config = config
-         self.model_config = self.config.model_config
-         self.engine_config = self.config.engine_config
 @@ -499,6 +497,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
      @register(dispatch_mode=Dispatch.ONE_TO_ALL)
      def init_model(self):
@@ -953,38 +1271,91 @@ index bf379b49..882e9f0b 100644
  
          # 1. build reference model
          if "ref" in self.role:
-diff --git a/verl/utils/megatron_utils.py b/verl/utils/megatron_utils.py
-index ae91290f..fdbb149f 100644
---- a/verl/utils/megatron_utils.py
-+++ b/verl/utils/megatron_utils.py
-@@ -47,6 +47,9 @@ from verl.utils.model import normalize_model_name
- from verl.utils.torch_dtypes import PrecisionType
- from verl.workers.config import HFModelConfig, McoreEngineConfig
+diff --git a/verl/workers/utils/losses.py b/verl/workers/utils/losses.py
+index c865b9dd..21b0e2e8 100644
+--- a/verl/workers/utils/losses.py
++++ b/verl/workers/utils/losses.py
+@@ -88,9 +88,82 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
+         fields.append("rollout_is_weights")
+     if "ref_log_prob" in data:
+         fields.append("ref_log_prob")
+-    data = data.select(*fields).to_padded_tensor()
++    # Capture the per-row lengths BEFORE padding. to_padded_tensor pads every field to its
++    # OWN max independently (verified: a dict holding rows of 188 and 441 yields widths 188
++    # and 441, not a shared width), so once padded the evidence of which row was too long is
++    # gone. These lengths are the only way to tell a genuine per-row disagreement from a
++    # harmless difference in maxima.
++    selected = data.select(*fields)
++    row_lens = {}
++    for name in fields:
++        field_value = selected[name]
++        if field_value.is_nested:
++            row_lens[name] = field_value.offsets().diff()
++    data = selected.to_padded_tensor()
  
-+# Megatron-LM@c049020 removed encoder_and_decoder; keep compat with older enum names.
-+_MODEL_TYPE_ENCODER_AND_DECODER = getattr(ModelType, "encoder_and_decoder", None)
+     response_mask = data["response_mask"].to(bool)
++    # Final stage of the length contract. `log_prob` was padded by no_padding_2_padding using
++    # the `responses` field, while everything selected above was padded from `response_mask`.
++    # Those two fields are written together per trajectory and psrl asserts their equality at
++    # three earlier stages, so reaching this point unequal means the drift happened between the
++    # old_log_prob phase and here. Report which side moved rather than letting the subtraction
++    # below fail with two bare numbers.
++    if log_prob.shape != response_mask.shape:
++        raise AssertionError(
++            f"padded width mismatch in ppo_loss: log_prob {tuple(log_prob.shape)} came from the "
++            f"`responses` field, response_mask {tuple(response_mask.shape)} from `response_mask`. "
++            f"Valid tokens per row range {int(response_mask.sum(dim=1).min())}..."
++            f"{int(response_mask.sum(dim=1).max())}. The two fields disagreed after the "
++            "old_log_prob phase, where they were still equal."
++        )
 +
- logger = logging.getLogger(__file__)
- logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
- 
-@@ -69,7 +72,7 @@ def get_model(
-         mpu.get_pipeline_model_parallel_world_size() > 1
-         and mpu.get_virtual_pipeline_model_parallel_world_size() is not None
-     ):
--        assert model_type != ModelType.encoder_and_decoder, (
-+        assert model_type != _MODEL_TYPE_ENCODER_AND_DECODER, (
-             "Interleaved schedule not supported for model with both encoder and decoder"
-         )
-         model = []
-@@ -89,8 +92,8 @@ def get_model(
-         post_process = mpu.is_pipeline_last_stage()
-         add_encoder = True
-         add_decoder = True
--        assert model_type != ModelType.encoder_and_decoder, "Model type encoder_and_decoder is not supported"
--        if model_type == ModelType.encoder_and_decoder:
-+        assert model_type != _MODEL_TYPE_ENCODER_AND_DECODER, "Model type encoder_and_decoder is not supported"
-+        if model_type == _MODEL_TYPE_ENCODER_AND_DECODER:
-             if mpu.get_pipeline_model_parallel_world_size() > 1:
-                 assert mpu.get_pipeline_model_parallel_split_rank() is not None, (
-                     "Split rank needs to be specified for model with both encoder and decoder"
-
++    # Every selected field describes the same tokens, so their per-row lengths must be equal.
++    # A difference here is real corruption, not a padding artifact: whichever field is longer
++    # on some row carries values that do not belong to this batch, and training on them would
++    # silently use another step's log-probs. Name the offending rows.
++    if "response_mask" in row_lens:
++        reference = row_lens["response_mask"]
++        for name, lens in row_lens.items():
++            if name == "response_mask":
++                continue
++            if lens.shape != reference.shape:
++                raise AssertionError(
++                    f"ppo_loss: `{name}` has {lens.shape[0]} rows but `response_mask` has "
++                    f"{reference.shape[0]}. The batch was assembled from inconsistent key sets."
++                )
++            if not torch.equal(lens, reference):
++                bad = (lens != reference).nonzero().flatten().tolist()
++                # Sorting separates the two causes, which per-row comparison alone cannot.
++                # Same multiset in a different order means the ROWS were permuted -- the fields
++                # are all present and correct but landed against the wrong trajectories, which
++                # is what a shuffle applied to one field and not another looks like, and it
++                # matters here because one session emits many trajectories. A different
++                # multiset means some row's data came from outside this batch entirely.
++                permuted = torch.equal(torch.sort(lens).values, torch.sort(reference).values)
++                diagnosis = (
++                    "SAME multiset in a DIFFERENT order: the rows are permuted, so a reordering "
++                    "was applied to one field and not the other. Every value is present but "
++                    "attached to the wrong trajectory."
++                    if permuted
++                    else "DIFFERENT multiset: at least one row holds data that is not in this "
++                    "batch at all, so it came from another step or another key set."
++                )
++                uids = tu.get_non_tensor_data(data=data, key="uid", default=None)
++                traj_idx = tu.get_non_tensor_data(data=data, key="trajectory_index", default=None)
++                identity = ""
++                if uids is not None:
++                    identity = f" Offending rows map to uid={[uids[i] for i in bad[:5]]}"
++                    if traj_idx is not None:
++                        identity += f" trajectory_index={[traj_idx[i] for i in bad[:5]]}"
++                    identity += "."
++                raise AssertionError(
++                    f"ppo_loss: `{name}` disagrees with `response_mask` on per-row length for "
++                    f"{len(bad)} of {reference.shape[0]} rows. First offenders "
++                    f"(row, {name}, response_mask): "
++                    f"{[(int(i), int(lens[i]), int(reference[i])) for i in bad[:5]]}. "
++                    f"`{name}` max={int(lens.max())} vs response_mask max={int(reference.max())}, "
++                    f"sums {int(lens.sum())} vs {int(reference.sum())}. {diagnosis}{identity}"
++                )
+     # compute policy loss
+     old_log_prob = data["old_log_probs"]
+     advantages = data["advantages"]

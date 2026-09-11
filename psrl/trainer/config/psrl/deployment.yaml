@@ -15,17 +15,14 @@ elastic_rm:
   # Monitor interval for elastic policy loop
   monitor_interval_ms: 1000
 
-  # Max seconds per monitor tick to wait on coordinator Ray RPCs (engine snapshot + router backlog).
-  # Prevents the monitor from hanging silently if a coordinator/router blocks; <=0 disables the cap.
+  # Bound each monitor tick so a blocked coordinator or router cannot stall scaling.
   coordinator_sync_timeout_s: 10
 
   # Max seconds for each SLEEP/WAKE_UP/ABORT exec_command from ElasticExecutor to a coordinator.
   # Omit or 0 = wait indefinitely. When set, avoids pending stuck forever if a worker/router hangs.
   coordinator_command_timeout_s: 300
 
-  # Consecutive monitor ticks while policy is blocked by an unfinished scale decision; at this
-  # count, clear local in-flight decision state so new scaling decisions can run. 0 = never abandon.
-  # Rough wall time ≈ ticks * (monitor_interval_ms / 1000), e.g. 180 ticks @ 1000ms ≈ 3 minutes.
+  # Abandon a stalled in-flight scaling decision after this many ticks. Zero waits forever.
   decision_execution_abandon_stall_ticks: 180
 
   # KV cache utilization threshold below which an instance can cede resources
@@ -44,13 +41,10 @@ elastic_rm:
   # Set to 0 to allow one side to fully sleep.
   min_awake_per_role: 1
 
-  # Priority-3 scale-down guard: even if KV cache is below theta_low, do not shrink if the
-  # selected scale-down candidate still has too many requests waiting in its local queue.
-  # 0 means: candidate must have no waiting requests to be shrinkable.
+  # Block scale-down when the selected instance exceeds this waiting queue limit.
   max_waiting_queue_for_scale_down: 64
 
-  # After scale-up: fraction [0,1] of each instance's waiting-queue uids to ABORT for
-  # load rebalancing. FIFO (head of req_id_in_waiting, queue order): k = floor(n * ratio). 0 disables; 1 aborts all.
+  # Abort this fraction of each waiting queue after scale-up for FIFO load rebalancing.
   post_scale_up_abort_waiting_ratio: 0.8
 
   # Optional map {model_name: profile_json_path} for new throughput profile schema
@@ -65,10 +59,7 @@ elastic_rm:
   # EWMA alpha for arrival rate estimation
   lambda_ewma_alpha: 0.2
 
-  # Full load mode for scaling policy
-  # Available options: "all", "any"
-  # "all": all instances must be full load to scale up
-  # "any": any instance can be full load to scale up
+  # `all` requires every instance at full load. `any` requires one.
   full_load_mode: any
 
 # Number for rollout instances
@@ -95,11 +86,8 @@ train_nnodes: 1
 # GPU number for trainer in every node
 train_ngpus_per_node: 1
 
-# Total number of GPU nodes this job needs across all roles.
-# When set, excess nodes in the Ray cluster are blocked from scheduling
-# so that colocated validate workers cannot spill onto idle nodes.
-# Set to the same value as NNODES in the launch script.
-# null means no restriction (default).
+# Restrict scheduling to this many GPU nodes across all roles.
+# Use null for no restriction.
 total_nnodes: null
 
 # Rollout with heterogeneous strategies across different instances

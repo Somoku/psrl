@@ -91,7 +91,7 @@ class ElasticExecutor:
         # Fraction [0,1] of waiting uids to ABORT per instance after scale-up (FIFO / queue head).
         _r = float(self.elastic_rm_config.get("post_scale_up_abort_waiting_ratio", 1.0))
         self._post_scale_up_abort_waiting_ratio = max(0.0, min(1.0, _r))
-        # Per-tick timeout for coordinator Ray RPCs; avoids monitor loop hanging forever when coordinators stall.
+        # Per tick timeout prevents stalled coordinators from blocking the monitor loop.
         self._coordinator_sync_timeout_s = float(self.elastic_rm_config.get("coordinator_sync_timeout_s", 60.0))
         # Optional timeout for SLEEP/WAKE_UP/ABORT issued during elastic scale (None = wait forever).
         _cmd_to = self.elastic_rm_config.get("coordinator_command_timeout_s", None)
@@ -147,8 +147,8 @@ class ElasticExecutor:
 
         The topology derives the occupied GPU set from all currently-AWAKEN
         instances, so successive calls for different roles automatically avoid
-        GPUs already claimed by earlier calls (as long as selected instances are
-        marked AWAKEN before the next call — which this method does).
+        GPUs already claimed by earlier calls because this method marks each
+        selection AWAKEN before returning.
 
         Returns:
             list of RolloutInstanceId that should be woken up.
@@ -238,9 +238,9 @@ class ElasticExecutor:
                         and self._execution_in_progress_stall_ticks % 120 == 0
                     ):
                         psrl_logger.warning(
-                            "elastic_rm: policy blocked by in-flight scaling for %d monitor ticks; "
+                            "elastic_rm: policy blocked by in-flight scaling for %d monitor ticks. "
                             "pending=%s. Likely causes: (1) coordinator.exec_command stuck inside "
-                            "SLEEP/WAKE_UP/ABORT (gen/RM workers or router not returning); "
+                            "SLEEP/WAKE_UP/ABORT (gen/RM workers or router not returning). "
                             "(2) another client's command ahead in the same coordinator queue never finishes "
                             "(head-of-line blocking). Check ElasticExecutor.log for the last "
                             "coordinator_cmd START line without matching END.",
@@ -296,9 +296,8 @@ class ElasticExecutor:
                             )
                             self._mark_decision_action_finished(decision_id)
             except Exception:
-                # Without this, a single Ray/sync/decide exception kills the monitor task forever
-                # (see start_busy_loop done_callback calling task.result()).
-                psrl_logger.exception("elastic_rm _monitor_loop iteration failed; will retry after sleep.")
+                # Keep transient sync and policy failures from terminating the monitor task.
+                psrl_logger.exception("elastic_rm _monitor_loop iteration failed. Retrying after sleep.")
             await asyncio.sleep(max(self.scaling_policy.monitor_interval_ms / 1000, 0.01))
 
     async def _scale_up_handler_loop(self):
@@ -342,7 +341,7 @@ class ElasticExecutor:
                 )
                 await asyncio.gather(*[self._scale_up_instance(instance) for instance in instances_to_scaled_up])
                 psrl_logger.info(
-                    "elastic_rm scale_up_handler decision_id=%s wake_targets done; post_scale_up_abort",
+                    "elastic_rm scale_up_handler decision_id=%s wake_targets done. post_scale_up_abort",
                     decision_id,
                 )
                 await self._interrupt_waiting_after_scale_up(
@@ -384,16 +383,16 @@ class ElasticExecutor:
     def _abandon_in_flight_decision(self, *, reason: str, stall_ticks: int) -> None:
         """Clear local decision bookkeeping so scaling policy is no longer blocked.
 
-        Scale handler tasks may still complete later; their _mark_decision_action_finished
+        Scale handler tasks may still complete later. Their _mark_decision_action_finished
         calls become no-ops if the decision was already cleared here. Cluster state may
-        diverge from ElasticExecutor flags until the next sync — same as coordinator timeouts.
+        diverge from ElasticExecutor flags until the next synchronization.
         """
         if not self._decision_execution_in_progress and not self._decision_pending_action_counts:
             return
         pending = dict(self._decision_pending_action_counts)
         psrl_logger.error(
             "elastic_rm: abandoning in-flight scaling decision (%s): stall_ticks=%d >= threshold=%d, "
-            "pending_action_counts=%s. Policy will accept new decisions; handlers may still finish RPCs.",
+            "pending_action_counts=%s. Policy will accept new decisions. Handlers may still finish RPCs.",
             reason,
             stall_ticks,
             self._decision_abandon_stall_ticks,
@@ -507,8 +506,8 @@ class ElasticExecutor:
         )
         if result is None and self._coordinator_command_timeout_s is not None:
             psrl_logger.error(
-                "elastic_rm coordinator_cmd got None (timeout or failure) stage=%s — "
-                "ElasticExecutor local flags may diverge from cluster; consider coordinator_command_timeout_s "
+                "elastic_rm coordinator_cmd got None (timeout or failure) stage=%s. "
+                "ElasticExecutor local flags may diverge from cluster. Consider coordinator_command_timeout_s "
                 "and check coordinator logs for stuck SLEEP/WAKE_UP/ABORT.",
                 stage,
             )
@@ -537,7 +536,7 @@ class ElasticExecutor:
         self.topology.set_status(instance_role, instance_model_name, instance_id, InstanceStatus.AWAKEN)
 
     def _waiting_uids_for_abort_by_ratio(self, normalized_waiting_uids: list[int]) -> list[int]:
-        """Take the first k waiting uids (FIFO vs queue order); k = floor(n * ratio)."""
+        """Take the first k waiting uids in queue order, where k = floor(n * ratio)."""
         if not normalized_waiting_uids:
             return []
         r = self._post_scale_up_abort_waiting_ratio
@@ -616,7 +615,7 @@ class ElasticExecutor:
             )
             if interrupted_request_num is None:
                 psrl_logger.warning(
-                    "elastic_rm post-scale-up ABORT returned None (timeout?); role=%s model=%s",
+                    "elastic_rm post-scale-up ABORT returned None (timeout?). role=%s model=%s",
                     role_name,
                     model_name,
                 )
@@ -661,9 +660,7 @@ class ElasticExecutor:
             )
             return
 
-        # When min_awake_per_role==0 only: do not sleep the last awake instance if the engine
-        # still has running/waiting work. When min_awake_per_role>0, allow shrinking straight
-        # down to the configured floor without this queue gate.
+        # With no minimum, retain the last awake instance while it has queued work.
         if min_awake_per_role == 0 and awaken_count == 1:
             running_n, waiting_n = self.get_instance_running_waiting(
                 InstanceIdentifier(role=instance_role, model_name=instance_model_name, instance_id=instance_id)
@@ -709,8 +706,7 @@ class ElasticExecutor:
         ]
         if not all_asleep_ids:
             return None
-        # Prefer the suggested instances; if none are available (e.g. already awake due to state race),
-        # fall back to any asleep instance rather than failing the entire scale-up.
+        # Fall back to any asleep instance when preferred instances are unavailable.
         if preferred_instance_ids:
             preferred_available = [
                 instance_id for instance_id in all_asleep_ids if instance_id in preferred_instance_ids
@@ -735,9 +731,7 @@ class ElasticExecutor:
             if not self.topology.has_other_role_awaken_on_shared_gpu(role_name, model_name, instance_id)
         ]
 
-        # Fallback: when preferred candidates are all filtered out by conflict guard,
-        # try all asleep instances. This avoids force-wake starvation where policy
-        # keeps requesting a fixed preferred instance id that is temporarily conflicted.
+        # Retry all asleep instances when preferred candidates conflict with awake peers.
         if not filtered_ids and preferred_instance_ids:
             fallback_filtered_ids = [
                 instance_id
@@ -747,7 +741,7 @@ class ElasticExecutor:
             if fallback_filtered_ids:
                 psrl_logger.info(
                     (
-                        "Preferred instances %s are conflict-filtered for role=%s model=%s; "
+                        "Preferred instances %s are conflict-filtered for role=%s model=%s. "
                         "fallback to non-conflicting asleep instances %s."
                     ),
                     preferred_instance_ids,
@@ -815,9 +809,7 @@ class ElasticExecutor:
         min_awake_per_role = max(0, int(getattr(self.scaling_policy, "min_awake_per_role", 0)))
         preferred_instance_ids = list(role_need_to_scale_down.get("preferred_instance_ids", []))
         role_status = self.instances_status_flags.get(role_name, {}).get(model_name, {})
-        # Compute max_scalable_down from the TOTAL awake count, not the preferred-filtered subset.
-        # Previously this was computed after preferred filtering, which caused max_scalable_down=0
-        # whenever only 1 preferred instance was awake (e.g. 1 preferred out of 8 awake total).
+        # Use the total awake count so preferred candidates cannot reduce the removable budget.
         all_awake_ids = [instance_id for instance_id, status in role_status.items() if status == InstanceStatus.AWAKEN]
         if not all_awake_ids:
             return None
@@ -831,8 +823,7 @@ class ElasticExecutor:
                 len(all_awake_ids),
             )
             return None
-        # Prefer the suggested instances; if none are awake (e.g. already asleep due to state race),
-        # fall back to all awake instances rather than failing the entire scale-down.
+        # Fall back to all awake instances when preferred instances are unavailable.
         if preferred_instance_ids:
             preferred_available = [
                 instance_id for instance_id in all_awake_ids if instance_id in preferred_instance_ids
@@ -876,7 +867,7 @@ class ElasticExecutor:
         """Await each coordinator Ray ObjectRef with its own timeout (parallel).
 
         Wrapping a single ``asyncio.gather`` in one ``wait_for`` lets the slowest
-        RPC drop every other result for that tick; elastic_rm then mis-reads load.
+        RPC drop every other result for that tick. Elastic RM then misreads load.
         """
         timeout_s = self._coordinator_sync_timeout_s
 
@@ -906,7 +897,7 @@ class ElasticExecutor:
                 return out
             except asyncio.TimeoutError:
                 psrl_logger.warning(
-                    "elastic_rm: %s RPC timed out after %.1fs for key=%s; skipped for this tick. "
+                    "elastic_rm: %s RPC timed out after %.1fs for key=%s. Skipped for this tick. "
                     "(If PSRL_ELASTIC_RM_BACKLOG_DIAG=1, compare coordinator/router stages above.)",
                     op_label,
                     timeout_s,
@@ -1013,7 +1004,7 @@ class ElasticExecutor:
             .get(instance_identifier.model_name, {})
             .get(instance_identifier.instance_id, {})
         )
-        # TODO(linsh): why use 1.0 instead of 0.0 as the default?
+        # TODO(linsh): Determine whether unavailable snapshots should default to full utilization.
         if not isinstance(snapshot, dict):
             return 1.0
         scheduler_stats = snapshot.get("scheduler_stats", {})

@@ -4,7 +4,7 @@ import pytest
 # (nixl C library not installed or not the right branch).
 pytest.importorskip(
     "psrl.utils.nixl.server_client",
-    reason="test_nixl_meta_server_comm requires nixl server_client — skipping",
+    reason="NIXL server_client is unavailable, so test_nixl_meta_server_comm is skipped.",
 )
 
 import ray

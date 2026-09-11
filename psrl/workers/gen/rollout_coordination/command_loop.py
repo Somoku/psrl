@@ -57,8 +57,8 @@ class CommandHandlerMixin:
                         raise ValueError("ABORT command must contain 'instance_to_uids' or 'instance_ids' in args.")
 
                     psrl_logger.info(
-                        f"Received ABORT command with instance_to_uids: "
-                        f"{instance_to_uids} and instance_ids: {instance_ids}"
+                        f"Received ABORT command: instance_to_uids={instance_to_uids!r}, "
+                        f"instance_ids={instance_ids!r}."
                     )
                     futures = []
 
@@ -77,7 +77,7 @@ class CommandHandlerMixin:
                             futures.append(self.server_handles[replica_id].abort_requests.remote(abort_requests))
                     if instance_ids is not None:
                         for instance_id in instance_ids:
-                            # TODO(linsh): merge dp ranks of the same replica to reduce RPC calls
+                            # TODO(linsh): Merge DP ranks of the same replica to reduce RPC calls.
                             replica_id, data_parallel_rank = instance_id
                             futures.append(self.server_handles[replica_id].abort_all_requests.remote())
 
@@ -92,7 +92,7 @@ class CommandHandlerMixin:
                         interrupted_request_num = np.sum(interrupted_request_nums)
 
                     result = interrupted_request_num
-                    psrl_logger.info(f"Received ABORT command, interrupted {interrupted_request_num} requests")
+                    psrl_logger.info(f"Completed ABORT command: interrupted={interrupted_request_num}.")
                     # Post process the command result
                     self._complete_command(command_id, result)
 
@@ -108,8 +108,8 @@ class CommandHandlerMixin:
                             "SYNC command must contain 'instance_ids' and 'curr_ps_model_version' in args."
                         )
                     psrl_logger.info(
-                        f"Received SYNC command for instances {instance_ids} "
-                        f"with PS model version {curr_ps_model_version}"
+                        f"Received SYNC command: instance_ids={instance_ids!r}, "
+                        f"ps_model_version={curr_ps_model_version}."
                     )
 
                     # Skip instances that are sleeping
@@ -132,7 +132,7 @@ class CommandHandlerMixin:
                         sync_futures = []
 
                         for instance_id in instance_ids:
-                            # NOTE(linsh): ignore dp rank for now
+                            # NOTE(linsh): Ignore DP rank for now.
                             replica_id, _ = instance_id
                             sync_future = self.server_handles[replica_id].sync_with_ps.remote(
                                 curr_ps_model_version,
@@ -145,7 +145,7 @@ class CommandHandlerMixin:
                             await asyncio.gather(*sync_futures)
                             self._complete_command(command_id, None)
                         else:
-                            # NOTE(linsh): sometimes it's not necessary for the caller to wait for pulling from PS
+                            # NOTE(linsh): Callers need not always wait for the parameter server pull.
                             self._complete_command(command_id, None)
                             await asyncio.gather(*sync_futures)  # Wait for the sync to complete
                 elif command_type == CommandType.SLEEP:
@@ -161,7 +161,7 @@ class CommandHandlerMixin:
 
                     sleep_futures = []
                     for instance_id in instance_ids:
-                        # NOTE(linsh): ignore dp rank for now
+                        # NOTE(linsh): Ignore DP rank for now.
                         replica_id, _ = instance_id
                         sleep_futures.append(self._do_sleep_instance(replica_id))
                     await asyncio.gather(*sleep_futures)
@@ -176,7 +176,7 @@ class CommandHandlerMixin:
 
                     wake_up_futures = []
                     for instance_id in instance_ids:
-                        # NOTE(linsh): ignore dp rank for now
+                        # NOTE(linsh): Ignore DP rank for now.
                         replica_id, _ = instance_id
                         wake_up_futures.append(self._do_wake_up_instance(replica_id))
                     await asyncio.gather(*wake_up_futures)

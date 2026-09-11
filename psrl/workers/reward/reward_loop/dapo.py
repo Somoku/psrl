@@ -1,4 +1,3 @@
-# Modified from verl/experimental/reward/reward_loop/dapo.py
 import inspect
 
 from tensordict import TensorDict
@@ -24,7 +23,6 @@ class DAPORewardManager(RewardManagerBase):
         self.compute_score = compute_score or default_compute_score_async
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
 
-        # DAPO Reward Config
         overlong_buffer_cfg = reward_kwargs.get("overlong_buffer_cfg", None)
         self.overlong_buffer_cfg = overlong_buffer_cfg
         self.max_resp_len = reward_kwargs.get("max_resp_len", None)

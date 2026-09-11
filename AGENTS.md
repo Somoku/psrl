@@ -11,12 +11,20 @@
 
 ## Coding Guidelines
 
-Two reference files live under `.claude/`:
+Three reference files live under `.claude/`:
 
 - **`.claude/coding-style.md`** — formatting rules, naming conventions, docstrings, logging, and annotation markers. Ordered by risk (silent-bug rules first).
 - **`.claude/codebase-map.md`** — system architecture, directory tree, configuration hierarchy, quick-lookup indices, and import dependency graphs.
+- **`.claude/readme-style.md`** — what belongs in a README and what does not. Read it before writing or editing any user-facing `.md`.
 
 Claude must read and apply these guides when writing or modifying code.
+
+## Documentation
+
+- A README tells a reader what to do and what will bite them. It is not the lab notebook that proves how we learned it.
+- Do not paste measured forensics into documentation. Keep a number only if the reader acts on it, and drop the run-specific evidence that merely justifies a past decision. Experiment results belong in a `Results` section or a `FINDINGS.md`, tied to the script that reproduces them.
+- Never write history into documentation or comments. `git log` owns what the code used to be.
+- Everything here is published. No absolute paths, real hostnames, cluster IPs, or internal mirrors, and every command must run exactly as written.
 
 ## Compact Instructions
 

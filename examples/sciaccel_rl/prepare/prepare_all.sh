@@ -1,68 +1,36 @@
 #!/usr/bin/env bash
-# Run the SciAccel-RL preparation pipeline in dependency order.
+# Run the SciAccel-RL preparation pipeline: compile, lines, dataset, warm, in order.
+# Usage: `prepare_all.sh --repo PATH [--envs a,b,c] [--hosts ip1,ip2] [--stages ...] [--dry-run]`
 #
-# The four stages must happen in this sequence, and each one fails loudly rather
-# than producing a half-usable artifact:
-#
-#   1. compile   authored task sources into Harbor tasks (build/<env>)
-#   2. lines     resolve defect line numbers from pinned upstream source
-#   3. dataset   build the L1/L2/L3 hinted parquets, train and val splits
-#   4. warm      populate each node's buildkit cache so episodes do not cold build
-#
-# Order is not cosmetic. A dataset built before `compile` points at task
-# directories with no `environment/`, which Harbor cannot build: every episode
-# then dies about two seconds in with `unable to prepare context`. A dataset
-# built before `lines` silently drops the line number from every L1 hint for an
-# env that records only the file, which quietly turns L1 into L2.
-#
-# Stages are skippable so a re-run after a failure does not redo slow work:
-#   prepare_all.sh --stages dataset,warm
-#
-# Usage:
-#   prepare_all.sh [--repo PATH] [--envs a,b,c] [--hosts ip1,ip2]
-#                  [--stages compile,lines,dataset,warm] [--difficulty easy]
-#                  [--dry-run]
+# A dataset built before `compile` points at tasks with no `environment/`, and one
+# built before `lines` silently turns L1 into L2.
 
 set -euo pipefail
 
 PSRL_PATH=${PSRL_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
 
-REPO=${REPO:-/apdcephfs_zwfy10_303541817/share_303541817/lhy/science_infra/sciaccel-rl}
-# `laps` is stored already compiled and its tasks carry no difficulty field, so it
-# is handled as a special case inside each stage rather than excluded here.
+# Path to the sciaccel-rl task bank checkout. No default: it lives outside this repo.
+REPO=${REPO:-}
 ENVS=${ENVS:-laps,mitgcm-biogeo,athena-gr}
-HOSTS=${HOSTS:-28.58.246.40,28.59.83.117}
+# Nodes that will host Harbor episodes, comma separated. No default, because a wrong
+# host silently warms the wrong machine and training then cold builds.
+HOSTS=${HOSTS:-}
 STAGES=${STAGES:-compile,lines,dataset,warm}
 DIFFICULTY=${DIFFICULTY:-easy}
 CATEGORIES=${CATEGORIES:-repair}
 DATA_ROOT=${DATA_ROOT:-${PSRL_PATH}/examples/sciaccel_rl/data}
+# Baked into the generated Dockerfiles at compile time, so it cannot be corrected
+# later without recompiling. Leave empty to use the upstream Debian mirrors.
+APT_MIRROR=${APT_MIRROR:-}
 DRY_RUN=0
 
-# Concurrent warm episodes per host, per environment. This is a per-env number
-# because the envs differ by an order of magnitude in what one episode costs.
-#
-# `laps` compiles a small Fortran tree and its reference check runs in 1 to 6
-# seconds, so 12 at once is comfortable: measured 99 of 99 tasks succeeding on two
-# separate nodes.
-#
-# `mitgcm-biogeo` and `athena-gr` each compile a full scientific codebase, and
-# `rowtool.py build --jobs 4` fans every episode out to 4 more processes. At 12 the
-# result was a load average of 3616 with 1769 runnable threads on a 384 core node,
-# which starved the containers' own 1 to 6 second reference runs past their 120 s
-# `--strict` timeout and failed a third of the bank. The daemon stayed responsive
-# throughout, so this is scheduler oversubscription rather than a Docker fault, and
-# the fix belongs here rather than in the timeout.
-WARM_CONCURRENCY_DEFAULT=${WARM_CONCURRENCY_DEFAULT:-4}
-WARM_CONCURRENCY_LAPS=${WARM_CONCURRENCY_LAPS:-12}
+# Concurrent warm episodes per host. Each compiles a full scientific codebase and fans
+# out to 4 more processes, so a higher value oversubscribes the node and times out builds.
+WARM_CONCURRENCY=${WARM_CONCURRENCY:-4}
 
-warm_concurrency() {
-    case "$1" in
-        laps) echo "${WARM_CONCURRENCY_LAPS}" ;;
-        *)    echo "${WARM_CONCURRENCY_DEFAULT}" ;;
-    esac
-}
+usage() { sed -n '2,3p' "$0"; }
 
-usage() { sed -n '2,25p' "$0"; }
+has_stage() { [[ ",${STAGES}," == *",$1,"* ]]; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -73,34 +41,34 @@ while [[ $# -gt 0 ]]; do
         --difficulty)  DIFFICULTY="$2"; shift 2 ;;
         --categories)  CATEGORIES="$2"; shift 2 ;;
         --data-root)   DATA_ROOT="$2"; shift 2 ;;
+        --apt-mirror)  APT_MIRROR="$2"; shift 2 ;;
         --dry-run)     DRY_RUN=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
+[[ -n "${REPO}" ]] || {
+    echo "ERROR: set --repo (or REPO) to the sciaccel-rl task bank checkout." >&2
+    exit 2
+}
 [[ -d "${REPO}" ]] || { echo "ERROR: repo not found: ${REPO}" >&2; exit 2; }
+if has_stage warm && [[ -z "${HOSTS}" ]]; then
+    echo "ERROR: set --hosts (or HOSTS) to the nodes that will run episodes." >&2
+    exit 2
+fi
 
 IFS=',' read -r -a ENV_LIST <<< "${ENVS}"
 IFS=',' read -r -a HOST_LIST <<< "${HOSTS}"
 
-has_stage() { [[ ",${STAGES}," == *",$1,"* ]]; }
 run() {
     echo "+ $*"
     if [[ "${DRY_RUN}" -eq 0 ]]; then "$@"; fi
 }
 
-# `laps` predates the difficulty tiers, so filtering it to `easy` matches nothing
-# and `_discover_task_dirs` raises rather than silently emitting an empty dataset.
-env_difficulty() {
-    if [[ "$1" == "laps" ]]; then echo ""; else echo "${DIFFICULTY}"; fi
-}
-
-# The directory name records what the dataset actually is, because a repair-only
-# easy bank and a mixed one are different experiments that must not share a path.
-env_out_dir() {
-    if [[ "$1" == "laps" ]]; then echo "${DATA_ROOT}/v2_repair"; else echo "${DATA_ROOT}/$1_${CATEGORIES}_${DIFFICULTY}"; fi
-}
+# One directory per (env, category, tier), because a repair-only easy bank and a
+# mixed one are different experiments that must not share a path.
+env_out_dir() { echo "${DATA_ROOT}/$1/${CATEGORIES}_${DIFFICULTY}"; }
 
 echo "=============================================================="
 echo " repo    : ${REPO}"
@@ -110,7 +78,7 @@ echo " hosts   : ${HOSTS}"
 echo "=============================================================="
 
 # --- 1. Compile authored sources into Harbor tasks ---------------------------
-# Skipped for an env that is already compiled in place, which is how `laps` ships.
+# Skipped for an env whose `build/<env>/index.jsonl` already exists.
 if has_stage compile; then
     echo; echo "### [1/4] compile"
     for env in "${ENV_LIST[@]}"; do
@@ -118,18 +86,14 @@ if has_stage compile; then
             echo "  ${env}: already compiled at build/${env}, skipping"
             continue
         fi
-        if compgen -G "${REPO}/envs/${env}/tasks/*/*/environment" > /dev/null 2>&1 \
-           || compgen -G "${REPO}/envs/${env}/tasks/*/environment" > /dev/null 2>&1; then
-            echo "  ${env}: compiled in place, skipping"
-            continue
-        fi
-        run python "${REPO}/utils/harbor/to_harbor.py" --env "${REPO}/envs/${env}"
+        cmd=(python "${REPO}/utils/harbor/to_harbor.py" --env "${REPO}/envs/${env}")
+        [[ -n "${APT_MIRROR}" ]] && cmd+=(--apt-mirror "${APT_MIRROR}")
+        run "${cmd[@]}"
     done
 fi
 
 # --- 2. Resolve defect line numbers -----------------------------------------
-# Writes envs/<env>/factory/DEFECT_LINES.json. A recorded `candidate.meta.line`
-# always wins and is never cached, so this only fills genuine gaps.
+# Writes DEFECT_LINES.json, filling only the gaps a recorded line leaves.
 if has_stage lines; then
     echo; echo "### [2/4] resolve defect lines"
     args=()
@@ -143,25 +107,22 @@ if has_stage dataset; then
     echo; echo "### [3/4] build datasets"
     for env in "${ENV_LIST[@]}"; do
         out=$(env_out_dir "${env}")
-        diff_arg=$(env_difficulty "${env}")
-        cmd=(python -m examples.sciaccel_rl.prepare.build_dataset_v2
+        cmd=(python -m examples.sciaccel_rl.prepare.build_dataset
              --repo "${REPO}" --out-dir "${out}"
-             --env "${env}" --categories "${CATEGORIES}" --hint-level all)
-        [[ -n "${diff_arg}" ]] && cmd+=(--difficulty "${diff_arg}")
+             --env "${env}" --categories "${CATEGORIES}" --hint-level all
+             --difficulty "${DIFFICULTY}")
         ( cd "${PSRL_PATH}" && run "${cmd[@]}" )
     done
 fi
 
 # --- 4. Warm each node's image cache ----------------------------------------
-# The `nop` agent builds the environment and edits nothing, so it populates
-# /var/lib/docker/buildkit without a GPU or a served model. The cache is
-# node-local, which is why every node that will host episodes needs its own pass.
+# The cache is node-local, so every node that hosts episodes needs its own pass.
 if has_stage warm; then
     echo; echo "### [4/4] warm image caches"
     # Datasets are checked up front so a missing one fails before any host is touched.
     datasets=()
     for env in "${ENV_LIST[@]}"; do
-        dataset="$(env_out_dir "${env}")/L1_all.parquet"
+        dataset="$(env_out_dir "${env}")/all/L1.parquet"
         if [[ ! -f "${dataset}" ]]; then
             echo "  ${env}: no dataset at ${dataset}, run the dataset stage first" >&2
             exit 2
@@ -184,7 +145,7 @@ if has_stage warm; then
             env="${entry%%:*}"
             dataset="${entry#*:}"
             outdir="${PSRL_PATH}/examples/sciaccel_rl/outputs/warm/${env}_${host//./_}"
-            conc=$(warm_concurrency "${env}")
+            conc=${WARM_CONCURRENCY}
             remote_script+="echo \"[warm] ${env} start \$(date +%T) conc=${conc}\"; "
             remote_script+="bash examples/sciaccel_rl/eval/run_eval.sh --agent nop "
             remote_script+="--dataset ${dataset} --output-dir ${outdir} "
@@ -193,9 +154,8 @@ if has_stage warm; then
         remote_script+="echo \"[warm] all envs done \$(date +%T)\";"
         echo "  ${host}: ${#datasets[@]} envs, sequential"
         if [[ "${DRY_RUN}" -eq 0 ]]; then
-            # `-n` and the redirects matter: without them ssh keeps the channel open
-            # waiting on the remote's inherited stdout, so this loop blocks on host 1
-            # and never dispatches host 2.
+            # `-n` and the redirects matter: without them ssh waits on the remote's
+            # inherited stdout, so this loop blocks on the first host.
             ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "${host}" \
                 "cd ${PSRL_PATH} && nohup setsid bash -c '${remote_script}' > /tmp/warm_all.log 2>&1 < /dev/null & disown" \
                 > /dev/null 2>&1 </dev/null

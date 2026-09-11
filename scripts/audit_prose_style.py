@@ -105,9 +105,7 @@ def _requires_assert_message(path: Path) -> bool:
     except ValueError:
         relative_path = path
     return bool(
-        relative_path.parts
-        and relative_path.parts[0] == "psrl"
-        and not relative_path.name.startswith("test_")
+        relative_path.parts and relative_path.parts[0] == "psrl" and not relative_path.name.startswith("test_")
     )
 
 

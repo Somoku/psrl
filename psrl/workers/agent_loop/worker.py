@@ -427,10 +427,8 @@ class PSRL_AgentLoopWorker:
                     )
                     output = None
 
-                # The manager must replace buffer slots lost to retryable failures. It is
-                # the only component that can purge the partial group and dispatch a
-                # replacement prompt, and it owns the refill breaker that ends the run
-                # when the failures turn out to be deterministic.
+                # Only the manager can purge the partial group and dispatch a replacement
+                # prompt, and it owns the breaker that ends a deterministically failing run.
                 if terminate_reason.needs_manager_retry():
                     # `validate` must remain scalar or training failures enter the
                     # validation recovery branch.
@@ -574,15 +572,10 @@ class PSRL_AgentLoopWorker:
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             field = {k: v for k, v in field.items() if v is not None}
-            # DAPO overlong filtering. A budget-truncated episode carries a reward that
-            # reports the cutoff rather than the quality of the model's choices, so its
-            # tokens must not steer the policy. Zeroing the mask keeps the trajectory in
-            # the batch, so `rm_scores` still lowers the GRPO group mean and the episodes
-            # that did finish keep an honest positive advantage, while contributing no
-            # gradient. `response_mask` also carries the nested per-row length contract
-            # (`offsets().diff()` in `response_from_nested`), so only the VALUES may be
-            # zeroed. Reshaping or dropping the row breaks that contract.
-            if self.overlong_filtering and terminate_reason.is_budget_truncated:
+            # NOTE(lhy): DAPO overlong filtering. A truncated reward reports the cutoff
+            # and an ungraded one was never measured, so neither may steer the policy.
+            # Zero only the VALUES: the mask carries the nested per-row length contract.
+            if self.overlong_filtering and (terminate_reason.is_budget_truncated or terminate_reason.is_ungraded):
                 field["response_mask"] = torch.zeros_like(field["response_mask"])
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids

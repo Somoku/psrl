@@ -1823,10 +1823,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Distribute agent loop workers across cluster nodes round-robin so that
         # Docker containers are spread across machines instead of piling up on one.
         #
-        # `agent.node_ips` restricts placement to an explicit allow list. A node whose
-        # Docker daemon has degraded still accepts actors and then fails or hangs every
-        # episode it is given, so excluding it is the only way to keep training moving
-        # without waiting on a reboot. Empty means every alive node, the default.
+        # `agent.node_ips` restricts placement to an allow list, because a node with a
+        # degraded Docker daemon accepts actors and then hangs. Empty means every node.
         allowed_ips = list(self.config.gen_actor_rollout_ref.rollout.agent.get("node_ips") or [])
         alive_nodes = [n for n in ray.nodes() if n["Alive"]]
         if allowed_ips:
@@ -1852,9 +1850,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     max_concurrency=max_concurrency_per_worker,
                     # Hard affinity when an allow list is given, because a soft placement
                     # lets Ray fall back to exactly the node being excluded.
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=not allowed_ips
-                    ),
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=not allowed_ips),
                 ).remote(
                     self.config,
                     self.ps_manager_handle,

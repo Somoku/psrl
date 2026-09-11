@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PSRL_PATH=${PSRL_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
-HOSTS_FILE="${PSRL_WORKSPACE:-/apdcephfs_zwfy10/share_303541817/lhy}/hosts/24GPUs"
+HOSTS_FILE="${PSRL_WORKSPACE:-}/hosts/24GPUs"
 CHECK_ONLY=0
 FORCE=0
 
@@ -52,7 +52,7 @@ for host in "${HOSTS[@]}"; do
     n="$(ssh -o BatchMode=yes -o ConnectTimeout=15 "${host}" \
         'pgrep -af "gcs_server|raylet" 2>/dev/null | grep -v "bash -c" | wc -l' 2>/dev/null || echo -1)"
     if [[ "${n}" -gt 0 ]]; then
-        printf '   %-18s %s Ray process(es) present -- CONFIRM THEY ARE YOURS\n' "${host}" "${n}"
+        printf '   %-18s %s Ray process(es) present, CONFIRM THEY ARE YOURS\n' "${host}" "${n}"
         ssh -o BatchMode=yes "${host}" \
             'pgrep -af "gcs_server|raylet" 2>/dev/null | grep -v "bash -c" | sed "s|/lib/python3.*||" | head -3' 2>/dev/null | sed 's/^/       /'
         FAIL=1
@@ -71,9 +71,9 @@ for host in "${HOSTS[@]}"; do
     if [[ "${n}" -lt 0 ]]; then
         printf '   %-18s UNREACHABLE\n' "${host}"; FAIL=1
     elif [[ "${n}" -lt 3 ]]; then
-        printf '   %-18s only %s/3 base images -- run provision_docker_nodes.sh\n' "${host}" "${n}"; FAIL=1
+        printf '   %-18s only %s/3 base images, run provision_docker_nodes.sh\n' "${host}" "${n}"; FAIL=1
     elif [[ "${layers}" -lt 50 ]]; then
-        printf '   %-18s base images ok but only %s images cached -- run a nop warm pass\n' "${host}" "${layers}"; FAIL=1
+        printf '   %-18s base images ok but only %s images cached, run a nop warm pass\n' "${host}" "${layers}"; FAIL=1
     else
         printf '   %-18s warm (3/3 base images, %s images cached)\n' "${host}" "${layers}"
     fi
@@ -81,7 +81,7 @@ done
 
 echo
 if [[ "${FAIL}" -ne 0 ]]; then
-    echo "PREFLIGHT FAILED -- not starting. Fix the items above, or pass --force for the GPU check only."
+    echo "PREFLIGHT FAILED, not starting. Fix the items above, or pass --force for the GPU check only."
     exit 1
 fi
 echo "PREFLIGHT OK"

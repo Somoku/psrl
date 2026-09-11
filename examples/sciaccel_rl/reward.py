@@ -27,19 +27,19 @@ def compute_score(
     Score one SciAccel-RL trajectory.
 
     The shaped reward is computed by Harbor's verifier inside a separate
-    container and delivered via ``extra_info["harbor_rewards"]``. This function
+    container and delivered via `extra_info["harbor_rewards"]`. This function
     selects the task-appropriate reward key and returns it.
 
     Args:
-        data_source: Dataset tag (``sciaccel_rl``).
+        data_source: Dataset tag (`sciaccel_rl`).
         solution_str: Unused.
         ground_truth: Unused.
-        extra_info: Per-row metadata containing ``harbor_rewards`` (dict from
-            the verifier), ``reward_key`` (which key to train on), and
-            ``task_name``.
+        extra_info: Per-row metadata containing `harbor_rewards` (dict from
+            the verifier), `reward_key` (which key to train on), and
+            `task_name`.
 
     Returns:
-        Dict with ``score`` in [0, 1] and ``reward_extra_info`` diagnostics.
+        Dict with `score` in [0, 1] and `reward_extra_info` diagnostics.
     """
     reward_key = extra_info.get("reward_key", "reward")
     harbor_rewards = extra_info.get("harbor_rewards") or {}

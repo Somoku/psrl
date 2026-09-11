@@ -43,6 +43,27 @@ _GPU_COMPOSE_OVERRIDE = Path(__file__).resolve().parents[1] / "config" / "gpu-co
 # Redirect apt to an internal mirror on hosts without direct internet access.
 _APT_MIRROR_OVERRIDE = Path(__file__).resolve().parents[1] / "config" / "apt-mirror-override.yaml"
 
+# The shipped override carries a placeholder URL, which would fail the build several
+# layers in with a DNS error rather than at the point the mistake was made.
+_APT_MIRROR_PLACEHOLDER = "your-apt-mirror.example.com"
+
+
+def _require_usable_apt_mirror() -> None:
+    """
+    Refuse to run with the unedited apt mirror placeholder.
+
+    Raises:
+        SystemExit: If the override file is missing or still holds the placeholder.
+    """
+    if not _APT_MIRROR_OVERRIDE.is_file():
+        raise SystemExit(f"--apt-mirror needs {_APT_MIRROR_OVERRIDE}, which is missing.")
+    if _APT_MIRROR_PLACEHOLDER in _APT_MIRROR_OVERRIDE.read_text(encoding="utf-8"):
+        raise SystemExit(
+            f"--apt-mirror was passed but {_APT_MIRROR_OVERRIDE} still holds the "
+            f"placeholder URL. Replace it with a reachable mirror, or drop the flag "
+            f"to build against the upstream Debian mirrors."
+        )
+
 
 def _load_tasks(
     dataset: str,
@@ -53,7 +74,7 @@ def _load_tasks(
     limit: int,
 ) -> list[dict[str, Any]]:
     """
-    Load and filter task rows from a v2 Parquet built by `build_dataset_v2`.
+    Load and filter task rows from a Parquet built by `build_dataset`.
 
     Args:
         dataset (str): Path to `all.parquet` (or train/val).
@@ -111,11 +132,8 @@ def _build_agent_config(
     """
     Build the Harbor agent config for either an anchor agent or terminus-2.
 
-    The terminus-2 branch mirrors the parameters already proven in
-    `examples.sciaccel_rl.runner.run_harbor_episode`, minus the training-only
-    pieces: no `collect_rollout_details` (token IDs and logprobs are for the
-    trainer) and `api_base` points at the vLLM server rather than a
-    `SessionRouter` session URL.
+    Anchors take no model endpoint. The terminus-2 branch drops the training-only
+    `collect_rollout_details` and points `api_base` at the vLLM server.
 
     Args:
         agent (str): Harbor agent name.
@@ -238,6 +256,18 @@ async def _run_batch(
     if compose_overlays:
         environment["extra_docker_compose"] = compose_overlays
 
+    # NOTE(lhy): Harbor re-reads `instruction.md`, so `extra_instructions` is the only
+    # path that delivers the hint. It is job-level rather than per-task, so a mixed
+    # batch would hand every task the first task's hint.
+    hints = {row["extra_info"].get("hint", "") for row in batch}
+    if len(hints) > 1:
+        raise ValueError(
+            f"_run_batch received {len(batch)} tasks with differing hints. "
+            "`extra_instructions` is job-level, so a mixed batch would deliver the "
+            "wrong hint. Dispatch one task per job, or move the hint per task."
+        )
+    hint = next(iter(hints), "")
+
     job_config = JobConfig(
         job_name=job_name,
         jobs_dir=jobs_dir,
@@ -248,6 +278,7 @@ async def _run_batch(
         timeout_multiplier=timeout_multiplier,
         environment_build_timeout_multiplier=build_timeout_multiplier,
         quiet=True,
+        **({"extra_instructions": [hint]} if hint else {}),
         **({"environment": environment} if environment else {}),
     )
     job = await Job.create(job_config)
@@ -320,8 +351,8 @@ def _trial_dir(trial_uri: str) -> Path:
     """Resolve a Harbor trial URI to a local directory.
 
     Harbor reports trial locations as `file://` URIs. Passing one straight to
-    `Path()` yields the literal relative path `file:/apdcephfs/...`, which never
-    exists -- so every derived measurement silently came back None instead of
+    `Path()` yields the literal relative path `file:/path/to/trial`, which never
+    exists, so every derived measurement silently came back None instead of
     failing loudly.
 
     Args:
@@ -603,8 +634,8 @@ async def _regrade_unverified(
 
     Harbor's trial body is a bare sequence (`harbor/trial/single_step.py`):
     `_run_agent()` then `_collect_artifacts()` then `_run_verifier()`, with no
-    try/except between them. So any agent-side exception -- a context overflow is
-    the common one -- skips verification entirely and the trial reports an empty
+    try/except between them. So any agent-side exception, usually a context overflow,
+    skips verification entirely and the trial reports an empty
     reward dict. In the Qwen3.5-9B baseline that was 44 of 144 trials: not scored
     zero, but never measured at all.
 
@@ -617,7 +648,7 @@ async def _regrade_unverified(
 
     This turns "the harness lost the measurement" into a real ladder score. An
     episode that delivered and then overflowed on a later turn gets the partial
-    credit it earned instead of a false zero -- which matters most for RL, where a
+    credit it earned instead of a false zero, which matters most for RL, where a
     false zero is an incorrect label rather than merely a missing datapoint.
 
     Every unverified trial is regraded, including ones that delivered nothing. An
@@ -646,7 +677,6 @@ async def _regrade_unverified(
     for record in records:
         if record.get("rewards") or not record.get("trial_uri"):
             continue
-        # Regrade even empty artifact directories to distinguish a measured zero.
         if by_name.get(record["task_name"]):
             pending.append(record)
 
@@ -822,7 +852,6 @@ def run_eval(
     results_path.unlink(missing_ok=True)
     jobs_dir = output_dir / "jobs"
 
-    # Build one agent configuration per model endpoint.
     endpoints = [b.strip() for b in api_base.split(",") if b.strip()]
     agent_configs = [
         _build_agent_config(
@@ -1068,8 +1097,7 @@ def main() -> None:
             "the litellm chat path this is METADATA ONLY: nothing sends it as a "
             "per-request max_tokens, so it does not bound generation. Only the Responses "
             "API and cost accounting read it. Generation is bounded by the server's "
-            "--max-model-len. Measured on Qwen3.5-9B: per-turn output was 219-549 "
-            "tokens regardless of this value."
+            "--max-model-len."
         ),
     )
     parser.add_argument(
@@ -1100,17 +1128,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--no-apt-mirror",
+        "--apt-mirror",
         dest="apt_mirror",
-        action="store_false",
+        action="store_true",
         help=(
-            "Do not redirect apt to the internal Debian mirror during image builds. "
-            "Only pass this on a host with a direct route to deb.debian.org: without "
-            "the redirect, apt goes through the corporate proxy and the toolchain "
-            "install can overrun the build timeout."
+            "Redirect apt to a local Debian mirror during image builds, using the URL in "
+            "`config/apt-mirror-override.yaml`. Edit that file to point at your own mirror "
+            "first. Worth doing only where the route to deb.debian.org is slow."
         ),
     )
-    parser.set_defaults(apt_mirror=True)
+    parser.set_defaults(apt_mirror=False)
     parser.add_argument(
         "--skip-gpu-tasks",
         action="store_true",
@@ -1126,13 +1153,17 @@ def main() -> None:
         help=(
             "Skip the post-pass that grades trials whose verifier never ran. An "
             "agent-side exception (usually a context overflow) makes Harbor skip "
-            "verification entirely, leaving no measurement -- 44 of 144 trials in the "
+            "verification entirely, leaving no measurement. The post-pass re-verifies "
             "Qwen3.5-9B baseline. The post-pass re-verifies those from the artifacts "
             "they delivered, with no agent and no GPU (~50s each). Only trials that "
             "actually delivered .dat files are regraded."
         ),
     )
     args = parser.parse_args()
+
+    # Fail here rather than several Docker layers into every task's build.
+    if args.apt_mirror:
+        _require_usable_apt_mirror()
 
     run_eval(
         dataset=args.dataset,

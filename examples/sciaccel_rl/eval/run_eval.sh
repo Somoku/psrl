@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Run SciAccel evaluation on one node, skipping model serving for anchor agents.
-# Usage: `run_eval.sh [options]`
+# Serve a model as a vLLM fleet, run the SciAccel eval against it, then tear it down.
+# Usage: `run_eval.sh [--model PATH] [--dataset PATH] [--agent nop|oracle|terminus-2] [--replicas N] [-n N]`
 set -euo pipefail
 
-usage() { sed -n '2,74p' "$0"; }
+# The `nop` and `oracle` anchors need no model, so they skip serving entirely.
+usage() { sed -n '2,3p' "$0"; }
 
-# NOTE(claude): Keep vLLM tool call parsing disabled for the Terminus text protocol.
 PSRL_PATH=${PSRL_PATH:-$(python3 -c "import os, psrl; print(os.path.dirname(os.path.dirname(psrl.__file__)))")}
-ENV_SCRIPT=${ENV_SCRIPT:-/apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh}
+ENV_SCRIPT=${ENV_SCRIPT:-${PSRL_WORKSPACE:-}/env/psrl.sh}
 
-MODEL=${HF_MODEL_PATH:-/apdcephfs_zwfy10/share_303541817/lhy/models/Qwen3.5-9B}
+MODEL=${HF_MODEL_PATH:-${PSRL_WORKSPACE:-}/models/Qwen3.5-9B}
 SERVED_NAME="qwen35-9b"
 AGENT="terminus-2"
-DATASET="${PSRL_PATH}/examples/sciaccel_rl/data/v2/all.parquet"
+DATASET="${PSRL_PATH}/examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/all/L1.parquet"
 OUTPUT_DIR=""
 PORT=8000
 TP=2
@@ -28,7 +28,7 @@ N_CONCURRENT=8
 TEMPERATURE=1.0
 TIMEOUT_MULTIPLIER=1.0
 BUILD_TIMEOUT_MULTIPLIER=2.0
-APT_MIRROR=1
+APT_MIRROR=0
 SKIP_GPU_TASKS=1
 KEEP_SERVER=0
 REUSE_SERVER=0
@@ -59,7 +59,7 @@ while [[ $# -gt 0 ]]; do
         --temperature)         TEMPERATURE="$2"; shift 2 ;;
         --timeout-multiplier)  TIMEOUT_MULTIPLIER="$2"; shift 2 ;;
         --build-timeout-multiplier) BUILD_TIMEOUT_MULTIPLIER="$2"; shift 2 ;;
-        --no-apt-mirror)       APT_MIRROR=0; shift ;;
+        --apt-mirror)          APT_MIRROR=1; shift ;;
         --skip-gpu-tasks)      SKIP_GPU_TASKS=1; shift ;;
         --with-gpu-tasks)      SKIP_GPU_TASKS=0; shift ;;
         --keep-server)         KEEP_SERVER=1; shift ;;
@@ -80,7 +80,7 @@ done
 
 [[ -f "${DATASET}" ]] || {
     echo "ERROR: dataset not found: ${DATASET}" >&2
-    echo "Build it first: python -m examples.sciaccel_rl.prepare.build_dataset_v2 --repo <sciaccel-rl> --out-dir $(dirname "${DATASET}")" >&2
+    echo "Build it first: python -m examples.sciaccel_rl.prepare.build_dataset --repo <sciaccel-rl> --out-dir $(dirname "${DATASET}")" >&2
     exit 2
 }
 
@@ -130,9 +130,14 @@ for gid in groups:
 }
 trap cleanup EXIT
 
+# Optional shared env script, absent on a machine already in the right environment.
 set +u
-# shellcheck disable=SC1090
-source "${ENV_SCRIPT}"
+if [[ -f "${ENV_SCRIPT}" ]]; then
+    # shellcheck disable=SC1090
+    source "${ENV_SCRIPT}"
+else
+    echo "[run_eval] No env script at ${ENV_SCRIPT}, using the current environment."
+fi
 set -u
 
 if [[ "${NEEDS_MODEL}" -eq 1 && "${REUSE_SERVER}" -eq 0 ]]; then
@@ -185,7 +190,7 @@ if [[ "${NEEDS_MODEL}" -eq 1 ]]; then
     )
 fi
 [[ ${#CATEGORIES[@]} -gt 0 ]] && EVAL_ARGS+=(--categories "${CATEGORIES[@]}")
-[[ "${APT_MIRROR}" -eq 0 ]]     && EVAL_ARGS+=(--no-apt-mirror)
+[[ "${APT_MIRROR}" -eq 1 ]]     && EVAL_ARGS+=(--apt-mirror)
 [[ "${SKIP_GPU_TASKS}" -eq 1 ]] && EVAL_ARGS+=(--skip-gpu-tasks)
 [[ ${#FAMILIES[@]} -gt 0 ]]   && EVAL_ARGS+=(--families "${FAMILIES[@]}")
 [[ -n "${TASK_GLOB}" ]]       && EVAL_ARGS+=(--task-glob "${TASK_GLOB}")

@@ -69,6 +69,22 @@ class TerminateReason(Enum):
         )
 
     @property
+    def is_ungraded(self) -> bool:
+        """Return whether the episode ran but never received a verifier score.
+
+        The trajectory is real on-policy data, so `is_successful` keeps it, but no
+        grader ever looked at it. A reward of 0 here is the absence of a measurement,
+        not a measured failure, and nothing downstream can tell the two apart once the
+        empty reward dict has defaulted to 0.0.
+
+        Training it as a zero is worse than dropping it: siblings of the same task in
+        the same GRPO group split 0.0 against 1.0 purely on whether a container timed
+        out, which is a gradient of pure infrastructure noise pointing in a direction
+        the policy cannot influence.
+        """
+        return self is TerminateReason.VERIFIER_ERROR
+
+    @property
     def is_budget_truncated(self) -> bool:
         """Return whether a harness budget cut the episode off mid-work.
 
@@ -84,9 +100,10 @@ class TerminateReason(Enum):
         per turn fell 1125 to 327, `max_turns_exceeded` rose from 29% to 39%, and the
         score collapsed from 0.573 at step 11 to 0.078 at step 16.
 
-        `AGENT_TIMEOUT` and `ENV_TIMEOUT` are excluded deliberately. They are
-        infrastructure faults rather than budget exhaustion, and `VERIFIER_ERROR`
-        means the agent did finish, so its turns remain honest training data.
+        `AGENT_TIMEOUT` and `ENV_TIMEOUT` are excluded deliberately, because they are
+        infrastructure faults rather than budget exhaustion. `VERIFIER_ERROR` is
+        excluded too and handled by `is_ungraded`, which masks it for a different
+        reason: its tokens are honest, but its reward was never measured.
         """
         return self in (
             TerminateReason.MAX_TURNS_EXCEEDED,

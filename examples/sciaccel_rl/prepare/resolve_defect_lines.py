@@ -1,26 +1,14 @@
 """
 Resolve the source line of each injected defect, and cache it per environment.
 
-`_build_hint` needs a line number for the strongest hint level. Envs disagree on
-whether they carry one: `laps` and `mitgcm-biogeo` record `candidate.meta.line`,
-while `athena-gr` records only the file. Rather than fabricate the missing ones or
-degrade the level, this resolves them from the pinned upstream source, which is the
-same tree the task containers build.
+`_build_hint` needs a line number for the strongest hint level, and not every env
+records one. `authoring/provenance.json` stores the defect as a literal `old` text
+block, so locating that block in the pinned upstream file gives the line exactly.
 
-The method is exact rather than heuristic. `authoring/provenance.json` stores the
-defect as a literal `old` text block, so locating that block in the pinned file gives
-the line directly. Validated against the envs that already record a line: all 87
-mitgcm-biogeo easy repair tasks resolve to exactly their recorded `meta.line`, with
-zero disagreements, and every one of the 87 matches uniquely.
-
-A recorded line always wins and is never written to the cache, so the cache holds only
-the lines the env itself is missing. That ordering matters for `laps`, whose build
-inserts a 10 line instrumentation patch into `mhd.f90`: its recorded lines are
-post-patch, which is what the agent navigates, while this script reads the pristine
-upstream tree and lands 10 lines earlier for the 8 tasks in that file.
-
-Output is written to `envs/<env>/factory/DEFECT_LINES.json` so `build_dataset_v2.py`
-stays offline and deterministic. Re-run this only when the task bank changes.
+A recorded `candidate.meta.line` always wins and is never written to the cache, so the
+cache holds only the lines the env itself is missing. Output goes to
+`envs/<env>/factory/DEFECT_LINES.json` to keep `build_dataset.py` offline. Re-run this
+only when the task bank changes.
 """
 
 from __future__ import annotations
@@ -47,9 +35,8 @@ if not psrl_logger.handlers:
 
 CACHE_NAME = "DEFECT_LINES.json"
 
-# Where each env's pinned source comes from. A bundled archive is preferred because it
-# needs no network. The remote entries name the pin the env's own factory config uses,
-# so a mismatch in sha256 means the env moved and this table is stale.
+# Where each env's pinned source comes from, preferring a bundled archive that needs
+# no network. A sha256 mismatch means the env moved and this table is stale.
 _SOURCES: dict[str, dict[str, Any]] = {
     "mitgcm-biogeo": {
         "bundled": "env/source/mitgcm-853761d8f46926cd8042d6e0ad252050561fd6fa.tar.gz",
@@ -61,10 +48,8 @@ _SOURCES: dict[str, dict[str, Any]] = {
         ),
         "sha256": "226e81620cbcabbbeff81b2989312c13163db64667aca1a1b3778aab9921ebfe",
     },
-    # LAPS is cloned rather than fetched as an archive, so its factory pins a commit
-    # and not a digest. GitHub's codeload tarballs are not byte-stable across time,
-    # so this entry pins the commit and skips the digest check. The commit is what
-    # guarantees the file contents, which is all a line lookup depends on.
+    # Pins a commit and skips the digest check, because codeload tarballs are not
+    # byte-stable. The commit guarantees the contents, which is all a lookup needs.
     "laps": {
         "url": "https://github.com/chenshihelio/LAPS/archive/a625806931a82ba3342f35906955e6806081d219.tar.gz",
         "sha256": None,
@@ -230,18 +215,14 @@ def resolve_env(repo: Path, env: str, allow_network: bool = True) -> dict[str, A
             if recorded is None:
                 lines[task_name] = line
                 continue
-            # A recorded line always wins, and is not written to the cache at all:
-            # `_build_hint` reads `meta.line` first, so storing a second value could
-            # only ever disagree with the one actually used.
+            # A recorded line wins and is never cached, because `_build_hint` reads
+            # `meta.line` first and a second value could only disagree.
             span = old_text.count("\n")
             if line == int(recorded) or line + span == int(recorded):
                 agreements += 1
             else:
-                # laps applies a 10-line instrumentation patch to `mhd.f90` before the
-                # agent sees it, so its recorded lines are post-patch while this reads
-                # the pristine upstream tree. A constant offset across every task in
-                # one file is that, not corruption, and the recorded line is the one
-                # the agent can actually navigate to.
+                # A constant offset across every task in one file means the build
+                # patches that file, so the recorded line is the navigable one.
                 disagreements += 1
                 psrl_logger.info(
                     f"Line offset for {task_name}: upstream {line} (span {span}) "

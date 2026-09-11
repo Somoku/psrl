@@ -17,10 +17,28 @@ class TestBudgetTruncatedClassification:
     def test_a_finished_episode_is_never_truncated(self):
         assert not TerminateReason.FINISHED.is_budget_truncated
 
-    def test_verifier_error_keeps_its_gradient(self):
-        # The agent DID finish here and only grading failed, so its turns reflect real
-        # policy choices and remain honest training data.
+    def test_verifier_error_is_not_a_budget_cutoff(self):
+        # It is masked by `is_ungraded` instead, because the agent did finish and its
+        # turns are honest. What is missing is the measurement, not the work.
         assert not TerminateReason.VERIFIER_ERROR.is_budget_truncated
+        assert TerminateReason.VERIFIER_ERROR.is_ungraded
+
+    def test_only_verifier_error_is_ungraded(self):
+        # A graded 0.0 must stay trainable, so nothing else may claim to be ungraded.
+        for reason in (
+            TerminateReason.FINISHED,
+            TerminateReason.MAX_TURNS_EXCEEDED,
+            TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED,
+            TerminateReason.AGENT_TIMEOUT,
+            TerminateReason.ENV_TIMEOUT,
+            TerminateReason.ROLLOUT_ERROR,
+        ):
+            assert not reason.is_ungraded, f"{reason} would be dropped from the gradient"
+
+    def test_ungraded_episodes_still_carry_trainable_data(self):
+        # Masking decides the loss mask, not whether the row is committed. The row must
+        # survive so its score still moves the GRPO group baseline.
+        assert TerminateReason.VERIFIER_ERROR.is_successful
 
     def test_infrastructure_timeouts_are_not_budget_cutoffs(self):
         # These are faults rather than an exhausted budget, and conflating them would
@@ -64,9 +82,8 @@ class TestMaskZeroing:
     """Test the mask rewrite applied to a budget-truncated trajectory."""
 
     def test_zeroing_preserves_length(self):
-        # `response_mask` doubles as the nested per-row length contract via
-        # `offsets().diff()`, so only the VALUES may change. A shorter row would make
-        # `response_from_nested` slice another trajectory's log-probs.
+        # `response_mask` doubles as the per-row length contract, so only the VALUES may
+        # change. A shorter row would slice another trajectory's log-probs.
         mask = torch.ones(37, dtype=torch.int64)
         zeroed = torch.zeros_like(mask)
         assert zeroed.size(0) == mask.size(0)
@@ -188,9 +205,8 @@ class TestGroupBaselineIsPreserved:
     """Test that filtering removes gradient without biasing the GRPO baseline."""
 
     def test_truncated_zeros_still_lower_the_group_mean(self):
-        # This is the whole point of masking rather than dropping the row: the finishers
-        # must keep a large positive advantage, which only holds if the truncated zeros
-        # remain in the mean.
+        # The whole point of masking rather than dropping: finishers keep a positive
+        # advantage only if the truncated zeros remain in the mean.
         scores = np.array([1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
         advantages = scores - scores.mean()
         assert advantages[0] == pytest.approx(0.75)

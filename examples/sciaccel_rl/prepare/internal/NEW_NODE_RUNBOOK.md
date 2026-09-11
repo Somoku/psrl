@@ -3,7 +3,7 @@
 Run this on any fresh IP before it can serve rollout or training. Two independent
 things have to be true: Docker must be able to build (step 2) and the task images
 must already be in that node's build cache (step 4). A node that passes step 2 but
-skips step 4 still works -- it just pays ~1 min per task on first touch instead of
+skips step 4 still works, it just pays ~1 min per task on first touch instead of
 ~16 s.
 
 Everything below was verified against five fresh nodes on 2026-08-31.
@@ -13,25 +13,25 @@ Everything below was verified against five fresh nodes on 2026-08-31.
 ```bash
 # From any node that can reach the others.
 cat > /tmp/newhosts <<'EOF'
-28.49.55.40
-28.49.36.157
-28.49.53.113
-28.59.83.232
-29.162.224.39
+192.168.1.1
+192.168.1.2
+192.168.1.3
+192.168.1.4
+192.168.1.5
 EOF
 
 pssh -h /tmp/newhosts -t 30 -i '
   hostname -s
   nvidia-smi --query-gpu=count --format=csv,noheader | head -1
-  test -d /apdcephfs_zwfy10_303541817/share_303541817/lhy/psrl && echo REPO_OK || echo REPO_MISSING
-  test -f /apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh && echo ENV_OK || echo ENV_MISSING
-  test -d /apdcephfs_zwfy10_303541817/share_303541817/lhy/science_infra/sciaccel-rl/envs/laps/tasks \
+  test -d ${PSRL_PATH} && echo REPO_OK || echo REPO_MISSING
+  test -f ${PSRL_WORKSPACE}/env/psrl.sh && echo ENV_OK || echo ENV_MISSING
+  test -d ${SCIACCEL_REPO}/envs/laps/tasks \
     && echo TASKS_OK || echo TASKS_MISSING'
 ```
 
 You need `SUCCESS` for every host plus `REPO_OK` / `ENV_OK` / `TASKS_OK`. The repo,
 the env script, and the compiled task directories all live on the shared FS, so
-nothing is copied per node -- but if the mount is missing, later steps fail in
+nothing is copied per node. If the mount is missing, later steps fail in
 confusing ways rather than cleanly.
 
 Passwordless ssh is assumed (`pssh` and plain `ssh` both need it).
@@ -39,9 +39,9 @@ Passwordless ssh is assumed (`pssh` and plain `ssh` both need it).
 ## 1. Audit before changing anything
 
 ```bash
-cd /apdcephfs_zwfy10_303541817/share_303541817/lhy/psrl
+cd ${PSRL_PATH}
 
-bash examples/sciaccel_rl/prepare/provision_docker_nodes.sh \
+bash examples/sciaccel_rl/prepare/internal/provision_docker_nodes.sh \
     --hosts /tmp/newhosts --check
 ```
 
@@ -58,7 +58,7 @@ RESULT: needs provisioning
 ## 2. Provision Docker
 
 ```bash
-bash examples/sciaccel_rl/prepare/provision_docker_nodes.sh --hosts /tmp/newhosts
+bash examples/sciaccel_rl/prepare/internal/provision_docker_nodes.sh --hosts /tmp/newhosts
 ```
 
 Runs all hosts in parallel, is idempotent, and fixes three independent things. Each
@@ -82,7 +82,7 @@ Two behaviours worth knowing:
 Expected result:
 
 ```
-28.49.55.40        OK    provisioned (dockerd reloaded)
+192.168.1.1        OK    provisioned (dockerd reloaded)
 ...
 ok: 5   needs-provisioning: 0   failed: 0
 ```
@@ -95,18 +95,19 @@ The task directories and the parquet live on the shared FS, so this is a one-tim
 step for the whole cluster:
 
 ```bash
-source /apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh
-cd /apdcephfs_zwfy10_303541817/share_303541817/lhy/psrl
+source ${PSRL_WORKSPACE}/env/psrl.sh
+cd ${PSRL_PATH}
 
-python -m examples.sciaccel_rl.prepare.build_dataset_v2 \
-    --repo /apdcephfs_zwfy10_303541817/share_303541817/lhy/science_infra/sciaccel-rl \
-    --out-dir examples/sciaccel_rl/data/v2
+python -m examples.sciaccel_rl.prepare.build_dataset \
+    --repo ${SCIACCEL_REPO} \
+    --out-dir examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy \
+    --env mitgcm-biogeo --categories repair --difficulty easy --hint-level all
 ```
 
-Produces `all.parquet` (145 tasks), `train.parquet` (128), `val.parquet` (17),
-plus `split.json` and `stats.json`.
+Produces `train/`, `eval/`, `all/`, and `stats/` under the output directory, plus
+`split.json`.
 
-## 4. Warm the image cache -- on EVERY node
+## 4. Warm the image cache, on EVERY node
 
 This is the step people skip. **Harbor containers run wherever the agent-loop process
 runs**, and rollout is spread across the cluster, so any node can be asked to build a
@@ -114,15 +115,15 @@ task environment. The cache lives in that node's `/var/lib/docker/buildkit` and 
 not transfer.
 
 ```bash
-R=/apdcephfs_zwfy10_303541817/share_303541817/lhy/psrl
+R=${PSRL_PATH}
 
 for H in $(grep -Ev '^\s*(#|$)' /tmp/newhosts); do
   OUT=$R/outputs/sciaccel_rl/eval/nop_warm_${H//./_}
   ssh -o BatchMode=yes "$H" "cd $R && nohup setsid bash examples/sciaccel_rl/eval/run_eval.sh \
       --agent nop \
-      --dataset examples/sciaccel_rl/data/v2/all.parquet \
+      --dataset examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/all/L1.parquet \
       --output-dir $OUT \
-      --skip-gpu-tasks --max-per-instance 12 -n 12 \
+      --skip-gpu-tasks --max-per-instance 4 -n 4 \
       > /tmp/nop_warm.log 2>&1 < /dev/null &"
   sleep 2   # stagger; launching all at once has raced and silently dropped a host
 done
@@ -132,12 +133,12 @@ Runs in parallel across nodes, ~40-60 min each, no GPU needed. Watch it:
 
 ```bash
 for H in $(grep -Ev '^\s*(#|$)' /tmp/newhosts); do
-  echo "$H: $(wc -l < $R/outputs/sciaccel_rl/eval/nop_warm_${H//./_}/results.jsonl 2>/dev/null || echo 0)/144"
+  echo "$H: $(wc -l < $R/outputs/sciaccel_rl/eval/nop_warm_${H//./_}/results.jsonl 2>/dev/null || echo 0)"
 done
 ```
 
-144, not 145: `--skip-gpu-tasks` drops `laps-accel-cuda`, which the local Docker
-provider cannot host.
+`--skip-gpu-tasks` drops any task declaring `gpus > 0`, which the local Docker
+provider cannot host, so the total is below the bank size.
 
 ### What "warm" actually means
 
@@ -154,12 +155,12 @@ builds first and runs second. Warming is that build happening once per task; `no
 an agent that does nothing inside the container but still walks
 env-build -> verifier-build -> grade.
 
-It pays off because the 145 task Dockerfiles are 63 lines that differ **only in line
-1's comment**. Docker hashes each instruction plus everything before it, so
-`apt-get install gfortran`, `git clone LAPS`, and `make` are byte-identical across
-tasks and get reused; only the final `COPY defect/` layer (~675 KB) is per-task.
+It pays off because a task's Dockerfiles are nearly identical across the bank. Docker
+hashes each instruction plus everything before it, so the apt toolchain, the upstream
+clone, and the build are byte-identical across tasks and get reused. Only the final
+`COPY defect/` layer is per-task.
 
-Measured cost per task environment:
+Cost per task environment, which is why step 4 is worth the wall time:
 
 | state | time |
 |---|---|
@@ -168,16 +169,16 @@ Measured cost per task environment:
 | **warm** | **~16 s** |
 
 The cache is in `/var/lib/docker/buildkit`. What `docker images` shows is *not* the
-cache -- those are Harbor's per-trial tags, which become `<none>` when the trial ends
-(954 of them had accumulated here). So:
+cache. Those are Harbor's per-trial tags, which become `<none>` when the trial ends
+which accumulate in the thousands. So:
 
 - `docker image prune` clears the `<none>` tags and does **not** hurt the cache
 - `docker builder prune` **destroys** the cache
 
-Do not judge the cache by directory size. It dropped 18 GB -> 3.1 GB here from
-buildkit's own GC while build times stayed at 16 s. Judge it by `env_setup_seconds`.
+Do not judge the cache by directory size. Buildkit's own GC shrinks it without
+slowing builds. Judge it by `env_setup_seconds`.
 
-## 5. Confirm the nop anchor -- do not skip this
+## 5. Confirm the nop anchor, do not skip this
 
 The warm pass doubles as the anchor, and it is the one check that says whether a
 training run can mean anything.
@@ -197,7 +198,7 @@ print('ANCHOR HELD:', ok)
 
 `nop` does nothing inside the container, so it MUST score a strict 0. A non-zero score
 means the reward ladder credits a non-delivery, and every reward the policy sees would
-be inflated -- training on it is meaningless. `floor_mismatch` must be empty too: it is
+be inflated, so training on it is meaningless. `floor_mismatch` must be empty too: it is
 the denominator of `reward_repair = max(0, reward - floor) / (1 - floor)`.
 
 Verified on this cluster:

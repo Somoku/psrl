@@ -23,7 +23,7 @@ Artifacts under `outputs/sciaccel_rl/eval/`: `q35_v4_0830_2344` (baseline),
 | `timeout` | 1 | 1 | **0** |
 | median turns | 25 (at cap) | 25 (at cap) | 50 (at cap) |
 
-The third run reports `errors: {}` — not one trial failed for any reason across 144.
+The third run reports `errors: {}`. Not one trial failed for any reason across 144.
 
 Per category, `reward_repair`: acceleration 1.0 (1 task), repair 0.0516,
 implementation 0.0239. Repair now scores 5x its baseline; implementation, which
@@ -57,7 +57,7 @@ delivered-but-unfixed at exactly the straw floor. Now 23 trials land strictly be
 surface and a climbable one, and it matters more for training than the mean does.
 
 Also note 9 clear the floor but only 7 reach full equivalence, so 2 sit in genuine
-partial credit (0.60, 0.65) — the ladder is discriminating, not pass/fail.
+partial credit (0.60, 0.65), so the ladder is discriminating rather than pass/fail.
 
 ### Still turn-bound, with diminishing returns
 
@@ -109,13 +109,13 @@ give a trainable gradient, but the 35B's mass sits at the top.
 
 ### It is not running out of budget
 
-The 9B pinned the 50-turn cap on 85% of trials — it never finished, mean 48.7 of a
+The 9B pinned the 50-turn cap on 85% of trials. It never finished, mean 48.7 of a
 possible 50. The 35B averages 42.5 and hits the cap on roughly half its trials, so a
 substantial share of its episodes terminate because the work is done. Same cap,
 different relationship to it.
 
 One 35B trial did overflow (`prompt_overflow: 1`, `n_unmeasured: 1`) against zero for
-the 9B — expected, since the 35B is served with 0.66x the KV headroom. Regrade did not
+the 9B, expected, since the 35B is served with 0.66x the KV headroom. Regrade did not
 recover it (`n_regraded: 0`), meaning that trial had delivered nothing before dying.
 
 ### Serving cost, measured not assumed
@@ -131,7 +131,7 @@ token scales with `layers x kv_heads x head_dim`, not `hidden_size`:
 
 So the 35B's cache is *cheaper* per token. The smaller budget is its MoE weights
 (67 GB, 256 experts) consuming the memory the cache would otherwise use. At 98304 that
-is 2.0 concurrent sequences per replica against the 9B's 3.1 — the 35B wins on
+is 2.0 concurrent sequences per replica against the 9B's 3.1, the 35B wins on
 capability while being served worse.
 
 ### Operational cost of MoE
@@ -139,7 +139,7 @@ capability while being served worse.
 First launch on a node spends ~27 minutes in flashinfer's JIT build of the CUTLASS
 fused-MoE kernel: 166 nvcc processes, all TP workers serialized behind one filelock
 (`flashinfer/jit/core.py:313 _poll_until_acquired`). It caches under
-`~/.cache/flashinfer`, so only the first launch per node pays it — but a 1800s
+`~/.cache/flashinfer`, so only the first launch per node pays it, but a 1800s
 readiness deadline kills the load mid-compile, which is why `wait_ready_sec` is now
 4500.
 
@@ -245,7 +245,7 @@ Harbor's trial body is a bare sequence (`harbor/trial/single_step.py:41-52`):
     await self._run_verifier()       # never reached
 
 No try/except between them, so any agent-side exception skips verification and the
-trial reports an empty reward dict — no measurement at all, which `reward.py:48`
+trial reports an empty reward dict, no measurement at all, which `reward.py:48`
 then floors to 0.0.
 
 But `_recover_outputs()` collects artifacts even on the failure path, and harbor
@@ -255,7 +255,7 @@ container). LAPS tasks qualify because they declare
 
 Verified end-to-end on a hardened-run trial that delivered `.dat` but had no rewards:
 recovered `reward=0.5` on both checks in 39 s. (`reward_repair` stays 0.0 because 0.5
-is exactly the straw floor — the ladder behaving correctly.)
+is exactly the straw floor, the ladder behaving correctly.)
 
 Wired into both paths, on by default, skipping instantly when no `.dat` exists so no
 verifier build is wasted confirming a zero:
@@ -324,7 +324,7 @@ activation reserve take most of it.
 ## Reward key
 
 Use `reward_repair`, never raw `reward`. Two hardened trials scored `raw_reward = 0.5`
-— exactly the straw floor — which `reward_repair` correctly normalizes to 0. Reporting
+,  exactly the straw floor, which `reward_repair` correctly normalizes to 0. Reporting
 raw would have claimed 3 successes where there was 1. `floor_mismatch` was empty in
 both runs, so the ladder is wired correctly.
 

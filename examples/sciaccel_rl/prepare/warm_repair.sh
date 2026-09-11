@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# Retry failed image warmup tasks with low concurrency.
-# Usage: `warm_repair.sh --results PATH [options]`
-
-
-
-
+# Re-run the tasks that errored in a warm pass, at low concurrency.
+# Usage: `warm_repair.sh --results PATH [--host IP] [--concurrency N] [--dataset PATH] [--dry-run]`
 
 set -euo pipefail
 
@@ -13,10 +9,10 @@ PSRL_PATH=${PSRL_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}
 RESULTS=""
 HOST=""
 CONCURRENCY=4
-DATASET="${PSRL_PATH}/examples/sciaccel_rl/data/v2/all.parquet"
+DATASET="${PSRL_PATH}/examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/all/L1.parquet"
 DRY_RUN=0
 
-usage() { sed -n '2,41p' "$0"; }
+usage() { sed -n '2,3p' "$0"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -90,7 +86,6 @@ fi
 
 n_ok=0
 n_fail=0
-# Create the log directory before redirects are opened.
 mkdir -p "${OUT_DIR}"
 for i in "${!FAILED[@]}"; do
     task="${FAILED[$i]}"

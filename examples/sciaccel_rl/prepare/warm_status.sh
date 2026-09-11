@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Probe task image cache warmth and optionally warm cold nodes.
-# Usage: `warm_status.sh HOST_SOURCE [options]`
-
-
-
+# Probe each host's task image cache, and optionally warm the cold ones.
+# Usage: `warm_status.sh (--hosts FILE | --hosts-list IP,IP) [--warm] [--threshold N] [--dataset PATH]`
 
 set -euo pipefail
 
@@ -13,10 +10,10 @@ HOSTS_FILE=""
 HOSTS_LIST=""
 DO_WARM=0
 THRESHOLD=40
-DATASET="${PSRL_PATH}/examples/sciaccel_rl/data/v2/all.parquet"
+DATASET="${PSRL_PATH}/examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/all/L1.parquet"
 CONCURRENCY=8
 
-usage() { sed -n '2,30p' "$0"; }
+usage() { sed -n '2,3p' "$0"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

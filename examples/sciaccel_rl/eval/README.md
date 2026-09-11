@@ -1,13 +1,13 @@
 # Standalone SciAccel-RL Evaluation
 
-Measures a model on the sciaccel-rl v2 task bank **outside** the training loop:
+Measures a model on the sciaccel-rl task bank **outside** the training loop:
 serve a checkpoint with vLLM, let Harbor's own `terminus-2` harness drive it
 through the containerized episodes, and report the per-category and per-family
 reward. Use it for the pre-RL baseline and for evaluating saved checkpoints.
 
 | File | Purpose |
 |------|---------|
-| [`eval_sciaccel.py`](eval_sciaccel.py) | Evaluation entry point. Reads a v2 Parquet, runs batched Harbor Jobs, aggregates metrics. |
+| [`eval_sciaccel.py`](eval_sciaccel.py) | Evaluation entry point. Reads a dataset Parquet, runs batched Harbor Jobs, aggregates metrics. |
 | [`run_eval.sh`](run_eval.sh) | End-to-end wrapper: launch a vLLM fleet, run the eval, tear it down. Model-agnostic via `--model`. |
 
 vLLM serving is **not** reimplemented here: the wrapper calls
@@ -17,41 +17,44 @@ with `--data-parallel-size`, because DP is broken in this repo's patched vLLM an
 `eval_sciaccel` spreads its work queue across every endpoint anyway.
 
 The wrapper then reads `<output_dir>/serve/endpoints.json` to build `--api-base`,
-so the eval is always pointed at exactly the replicas that came up healthy — no
-hand-maintained URL list.
+so the eval is always pointed at exactly the replicas that came up healthy, with
+no hand-maintained URL list.
 
 ---
 
 ## Prerequisite: build the dataset
 
 ```bash
-source /apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh
-python -m examples.sciaccel_rl.prepare.build_dataset_v2 \
-    --repo /apdcephfs_zwfy10_303541817/share_303541817/lhy/science_infra/sciaccel-rl \
-    --out-dir examples/sciaccel_rl/data/v2
+python -m examples.sciaccel_rl.prepare.build_dataset \
+    --repo ${SCIACCEL_REPO} \
+    --out-dir examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy \
+    --env mitgcm-biogeo --categories repair --difficulty easy --hint-level all
 ```
 
-145 tasks: 2 acceleration + 99 repair + 44 implementation. See
-[`../prepare/build_dataset_v2.py`](../prepare/build_dataset_v2.py) for the schema.
+See [`../prepare/build_dataset.py`](../prepare/build_dataset.py) for the schema,
+and [`../README.md`](../README.md) for the full preparation pipeline, including
+the compile step this depends on.
 
 ---
 
-## Anchor first — this is not optional
+## Anchor first: this is not optional
 
-The sciaccel-rl README is explicit: **oracle must score full marks and nop must
-score 0 on your machine before any agent number means anything.** Neither needs
-a GPU or a model.
+**`oracle` must score full marks and `nop` must score 0 on your machine before
+any agent number means anything.** Neither needs a GPU or a model.
 
 ```bash
+D=examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/all/L1.parquet
+T=$(python -c "import pandas as pd,sys; print(pd.read_parquet(sys.argv[1])['task_name'][0])" $D)
+
 # One task, fastest possible end-to-end signal
-python -m examples.sciaccel_rl.eval.eval_sciaccel \
-    --task-glob 'sciaccel/laps-repair-coef-2d-rktmod-l17k1' \
-    --agent oracle --output-dir output/eval/anchor_oracle
+python -m examples.sciaccel_rl.eval.eval_sciaccel --dataset $D \
+    --task-glob "$T" \
+    --agent oracle --output-dir examples/sciaccel_rl/outputs/anchor_oracle
 # expect: score 1.0 (reward_repair), raw reward 1.0
 
-python -m examples.sciaccel_rl.eval.eval_sciaccel \
-    --task-glob 'sciaccel/laps-repair-coef-2d-rktmod-l17k1' \
-    --agent nop --output-dir output/eval/anchor_nop
+python -m examples.sciaccel_rl.eval.eval_sciaccel --dataset $D \
+    --task-glob "$T" \
+    --agent nop --output-dir examples/sciaccel_rl/outputs/anchor_nop
 # expect: score 0.0, and `floor` reported matching the dataset's floor
 ```
 
@@ -60,7 +63,7 @@ against a broken verifier is worse than no number.
 
 `summary.json` carries a `floor_mismatch` list for exactly this reason: the
 verifier measures the straw floor in situ at image-build time, and it should
-agree with what `tasks.jsonl` recorded. Drift means the compiled task tree and
+agree with what the task's provenance recorded. Drift means the compiled task tree and
 the dataset disagree.
 
 ---
@@ -68,12 +71,12 @@ the dataset disagree.
 ## Which key is the score
 
 `score` in `results.jsonl` is **not** raw `reward`. It is the per-category
-training signal, chosen by `build_dataset_v2` and carried in
+training signal, chosen by `build_dataset` and carried in
 `extra_info["reward_key"]`:
 
 | category | score key | why |
 |---|---|---|
-| repair, implementation | `reward_repair` | Floor-normalized. Delivering the unfixed build scores exactly 0; raw `reward` is inflated to the floor (0.1–0.65) by doing nothing. |
+| repair, implementation | `reward_repair` | Floor-normalized. Delivering the unfixed build scores exactly 0; raw `reward` is inflated to the floor (0.1 to 0.65) by doing nothing. |
 | acceleration / laps-accel-cuda | `reward_gpu` | `reward × gpu_active`. The CPU shortcut scores 0. |
 | acceleration / laps-accel-cpu | `reward` | Carries no acceleration signal unless you tighten `[agent] timeout_sec` (budget forcing). |
 
@@ -83,42 +86,40 @@ training signal, chosen by `build_dataset_v2` and carried in
 
 ## Docker images: what gets built, and how much it costs
 
-Every v2 task ships its own `environment/Dockerfile` and `tests/Dockerfile` and
-**no task declares a prebuilt `docker_image`** — Harbor builds from the task's
-build context and tags the result `hb__<content-hash>`. The v1 images
-(`sciaccel-laps-cpu-env` and friends, plus the tarballs under
-`lhy/docker_images/sciaccel/`) are **not reusable**: v1 referenced them by name
-from an empty build context, and the v2 repair environments must contain an
-injected defect that the v1 images do not have. Leave them in place for the v1
-training path; nothing here touches them.
+Every task ships its own `environment/Dockerfile` and `tests/Dockerfile` and
+**no task declares a prebuilt `docker_image`**. Harbor builds from the task's
+build context and tags the result `hb__<content-hash>`. Prebuilt images cannot be
+shared across tasks here, because each repair environment must contain its own
+injected defect.
 
-That means 145 distinct image tags, but **not** 145 independent builds. Measured
-on this task tree:
-
-- **4 distinct agent `Dockerfile` bodies** and **3 distinct verifier bodies**
-  across all 145 tasks (85 in the 2D group, 58 in the 3D group, plus the two
-  acceleration tasks).
-- Everything before `COPY defect/` is byte-identical within a group, so the
-  expensive layers are built once and cached: the apt toolchain, the LAPS clone
-  at the pin, the patches, and — critically — the verifier's whole `reference`
-  stage, which is what runs the clean build and the reference decks.
-- Only **675 KB total** across all 145 tasks is genuinely per-task build input
-  (the defect specs). The per-task unique layer holds a ~2.6 MB source tree.
+That means one image tag per task, but **not** one independent build per task.
+A bank shares only a handful of distinct Dockerfile bodies, and everything before
+`COPY defect/` is byte-identical within a group. The expensive layers are built
+once and cached: the apt toolchain, the upstream clone at the pin, the patches,
+and the verifier's whole `reference` stage. Only the defect specs are genuinely
+per-task input.
 
 What is irreducibly per-task is the verifier's `straw` stage: recompile with
-*this* task's defect, rerun the graded decks, grade the result to produce
-`floor.json`. That is by design — the floor is a per-defect quantity. Budget
-roughly 1–2 min per task for it, once, and expect the whole bank to land around
-10–15 GB of Docker storage rather than 145 × 8 GB.
+*this* task's defect, rerun the graded decks, and grade the result to produce
+`floor.json`. That is by design, because the floor is a per-defect quantity.
+Budget roughly 1 to 2 min per task for it, once.
 
 **Warm-up strategy:** run the full `nop` pass. `nop` does nothing inside the
-container but still walks env-build → verifier-build → grade, so it warms every
+container but still walks env-build, verifier-build, grade, so it warms every
 image *and* serves as the full-bank nop anchor. One cost, two results.
 
 ```bash
-bash examples/sciaccel_rl/eval/run_eval.sh --agent nop --n-concurrent 16
+bash examples/sciaccel_rl/eval/run_eval.sh --agent nop \
+    --dataset examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/all/L1.parquet \
+    --output-dir examples/sciaccel_rl/outputs/warm_biogeo \
+    --skip-gpu-tasks -n 4
 # expect: every by_category mean score ~= 0, errors empty
 ```
+
+Keep `-n` low for the MITgcm and Athena++ envs: each episode compiles a full
+scientific codebase and fans out to 4 more processes, so a high value starves the
+containers' own reference runs past their timeout. See the warm section of
+[`../README.md`](../README.md).
 
 `harbor` has no standalone build command; `--install-only` only warms the agent
 environment, not the verifier, so it is not enough here.
@@ -130,39 +131,52 @@ environment, not the verifier, so it is not enough here.
 ```bash
 # Full baseline: 4 replicas x TP=2 over 8 GPUs, 3 attempts per task
 bash examples/sciaccel_rl/eval/run_eval.sh \
-    --model /apdcephfs_zwfy10/share_303541817/lhy/models/Qwen3.5-9B \
+    --model ${PSRL_WORKSPACE}/models/Qwen3.5-9B \
     --served-model-name qwen35-9b \
-    --replicas 4 --tp 2 -k 3 -n 16
+    --dataset examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/eval/L1.parquet \
+    --output-dir examples/sciaccel_rl/outputs/eval_biogeo_9b \
+    --replicas 4 --tp 2 -k 3 -n 4
 ```
 
-`--replicas` is the endpoint count; the eval's work queue is spread across all of
-them. Endpoints come from `endpoints.json`, so `--api-base` is only needed when
+`--replicas` is the endpoint count, and the eval's work queue is spread across
+all of them. Endpoints come from `endpoints.json`, so `--api-base` is only needed when
 pointing at a server this wrapper did not start (with `--reuse-server`).
 
-**Set `--max-model-len` to match the checkpoint.** The default 131072 suits
-Qwen3.5-9B. Qwen3-8B tops out at 40960, and that window is why 56 of 144 trials
-died `ContextLengthExceededError` — *ungraded*, so not even a zero. Keep
-`--max-turns` capped (default 25) for the same reason: every turn resends the whole
-transcript, so cumulative prompt tokens grow quadratically.
+**Set `--max-model-len` to match the checkpoint.** A window wider than the model
+supports makes trials die `ContextLengthExceededError`, which is *ungraded* and so
+not even a zero. Keep `--max-turns` capped (default 25) for the same reason: every
+turn resends the whole transcript, so cumulative prompt tokens grow quadratically.
 
 Thinking is left **enabled** (Qwen3's default): no `chat_template_kwargs` is
 passed, so the model reasons as it would out of the box. Note this differs from
-the current training script, which disables thinking — compare curves with that
-in mind.
+the current training script, which disables thinking, so compare curves with
+that in mind.
 
 Smoke a small slice first:
 
 ```bash
 bash examples/sciaccel_rl/eval/run_eval.sh \
-    --families sign bounds accel --per-family 1 -n 3
+    --model ${PSRL_WORKSPACE}/models/Qwen3.5-9B \
+    --dataset examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy/eval/L1.parquet \
+    --output-dir examples/sciaccel_rl/outputs/eval_smoke \
+    --per-family 1 -n 3
 ```
 
 ### Filters
 
 `--categories`, `--families`, `--task-glob`, `--per-family`, `--limit`. Prefer
-`--per-family` over `--limit` for representative subsets: 57 of the 99 repair
-tasks are sign flips, so a flat head of the list is dominated by one debugging
-shape. `--per-family 1` covers all 17 (category, family, tree) groups in 17 tasks.
+`--per-family` over `--limit` for representative subsets: families are very
+unevenly sized, so a flat head of the list is dominated by one debugging shape.
+`--per-family 1` covers every (category, family, tree) group in as many tasks as
+there are groups.
+
+### Image builds behind a slow mirror
+
+`--apt-mirror` redirects apt to the URL in
+[`../config/apt-mirror-override.yaml`](../config/apt-mirror-override.yaml) during
+image builds. It is **off** by default. Edit that file to point at your own mirror
+before using it, and only bother where the route to `deb.debian.org` is slow: the
+symptom is builds that crawl rather than fail.
 
 ---
 
@@ -176,7 +190,7 @@ tmux and `environment.exec()`.
 This is why `network_mode = "no-network"` on every repair and implementation
 task does **not** block the agent from reaching a vLLM server on the host. The
 policy exists to stop the agent from `git clone`-ing the public upstream and
-diffing out the answer; it constrains the container, not the harness.
+diffing out the answer. It constrains the container, not the harness.
 
 ---
 

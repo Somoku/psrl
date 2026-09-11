@@ -28,10 +28,9 @@ class _HarborLoopThread:
     """
     A single dedicated thread running its own asyncio event loop for Harbor Jobs.
 
-    Harbor uses asyncio.subprocess internally. Running multiple asyncio.run()
-    from separate threads causes "Racing with another loop to spawn a process"
-    errors. This class provides one shared event loop that serializes subprocess
-    creation while still allowing concurrent Harbor I/O (network waits etc.).
+    Harbor uses `asyncio.subprocess` internally, and concurrent `asyncio.run()` from
+    separate threads races on process spawn. One shared loop serializes that while
+    still allowing concurrent Harbor I/O.
     """
 
     def __init__(self):
@@ -89,7 +88,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
     """
     Harbor-based episode runner for SciAccel-RL tasks.
 
-    Each call to ``run()`` launches one Harbor Job (agent + verifier containers)
+    Each call to `run()` launches one Harbor Job (agent + verifier containers)
     with the model endpoint pointed at this session's TITO URL, then assembles
     the training data from TITO and the reward from the verifier.
     """
@@ -237,6 +236,17 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 terminate_reason = TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
             elif num_turns >= self.max_turns:
                 terminate_reason = TerminateReason.MAX_TURNS_EXCEEDED
+            elif harbor_result.exception and not harbor_result.rewards:
+                # NOTE(lhy): An infrastructure failure leaves the reward dict empty, which
+                # `reward.py` cannot tell from a graded 0.0. Reporting FINISHED would split
+                # siblings of one task 0.0 against 1.0 on container luck alone.
+                terminate_reason = TerminateReason.VERIFIER_ERROR
+                psrl_logger.warning(
+                    "[uid=%s] Verifier produced no reward (%s), reporting verifier_error "
+                    "so the ungraded trajectory does not train as a real zero.",
+                    uid,
+                    harbor_result.exception_type or "unknown",
+                )
 
             psrl_logger.info(
                 "[uid=%s] Episode done: terminate=%s, reward=%.3f.",
@@ -269,11 +279,8 @@ class SciAccelAgentLoop(SessionAgentLoop):
         """
         Attempt to recover partial training data from TITO after timeout/error.
 
-        Even if Harbor timed out, the LLM turns captured by TITO before the
-        timeout are valid training data. No verifier score exists on this path
-        (the exception escaped before Harbor returned a result), so the reward
-        is 0 -- unlike the overflow path in `run`, which forwards whatever the
-        verifier produced.
+        Turns captured by TITO before the timeout are valid training data. No verifier
+        score exists on this path, so the reward is 0.
         """
         if session_id is None:
             return None, TerminateReason.ROLLOUT_ERROR
@@ -325,14 +332,9 @@ class SciAccelAgentLoop(SessionAgentLoop):
         """
         Run the Harbor Job on the dedicated Harbor event loop thread.
 
-        All Harbor Jobs share a single event loop to avoid subprocess race
-        conditions (Harbor uses asyncio.subprocess internally).
-
-        The episode is admitted through a semaphore so a worker cannot hold more than
-        `harbor.max_concurrent_episodes` sets of containers at once. The gate is released
-        only after `run_harbor_episode` returns, and that function tears its containers
-        down in a `finally`, so a waiting episode starts against a cleaned daemon rather
-        than piling on top of one.
+        All Harbor Jobs share one event loop to avoid `asyncio.subprocess` races. The
+        episode is admitted through a semaphore released only after `run_harbor_episode`
+        tears its containers down, so a waiting episode starts against a clean daemon.
         """
         limit = int(self.runtime_config.harbor.max_concurrent_episodes)
 

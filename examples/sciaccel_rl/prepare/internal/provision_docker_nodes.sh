@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # Configure Docker nodes for SciAccel image builds.
 # Usage: `provision_docker_nodes.sh --hosts FILE [options]`
-
-
-
+#
+# SITE-SPECIFIC defaults. Override with --registry-mirror, --apt-mirror, --proxy.
 
 set -euo pipefail
 
 HOSTS_FILE=""
 HOSTS_LIST=""
 REGISTRY_MIRROR="https://mirror.ccs.tencentyun.com"
-PROXY_URL="http://star-proxy.oa.com:3128"
+# No default: a proxy is only needed where the nodes have no direct route out, and
+# a wrong one silently breaks every build. Pass --proxy to set it.
+PROXY_URL=""
 APT_MIRROR="http://mirrors.tencentyun.com"
 CHECK_ONLY=0
 VERIFY=1
@@ -136,7 +137,13 @@ elif [[ "$DAEMON_STATE" -ne 0 ]]; then
 fi
 
 # --- 2. Client config: the only proxy buildkit actually honors ---
+
+# Skipped without --proxy, because empty entries break a node with a direct route.
 CLIENT_JSON=/root/.docker/config.json
+if [[ -z "$PROXY" ]]; then
+    echo "CLIENT_SKIPPED (no --proxy given)"
+    CLIENT_STATE=0
+else
 python3 - "$CLIENT_JSON" "$PROXY" "$CHECK_ONLY" <<'PY'
 import json, os, sys
 
@@ -164,6 +171,7 @@ with open(path, "w") as fh:
 print("CLIENT_WROTE")
 PY
 CLIENT_STATE=$?
+fi
 if [[ "$CLIENT_STATE" -eq 10 ]]; then
     NEEDS=1
 elif [[ "$CLIENT_STATE" -ne 0 ]]; then
@@ -185,7 +193,7 @@ if docker network create "$PROBE_NET" >/dev/null 2>&1; then
     # A live widened pool assigns a /24 subnet.
     case "$PROBE_SUBNET" in */24) POOL_LIVE=1 ;; esac
 else
-    PROBE_SUBNET="(could not create probe network -- pool may be exhausted)"
+    PROBE_SUBNET="(could not create probe network, pool may be exhausted)"
 fi
 
 if [[ "$MIRROR_LIVE" -eq 1 && "$POOL_LIVE" -eq 1 ]]; then

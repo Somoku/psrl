@@ -1,15 +1,10 @@
 """
 A terminus-2 variant whose terminal observations are truncated more aggressively.
 
-Harbor caps observations at 10000 bytes inside `Terminus2._limit_output_length`,
-as a hardcoded default that `AgentConfig.kwargs` cannot reach. The LAPS sources
-run 15 KB to 40 KB, so a single `cat` never fits either way, and the cap mostly
-decides how much of the context window one careless read consumes. Measured over
-the 4B run, terminal output was 57% of the trajectory bytes and 96% of episodes
-died at a budget wall before delivering anything.
-
-Subclassing keeps the override in this repository. Editing the installed harbor
-package would be invisible to the run script and lost on the next reinstall.
+Harbor caps observations at 10000 bytes inside `Terminus2._limit_output_length`, as a
+hardcoded default that `AgentConfig.kwargs` cannot reach. Graded sources run 15 KB to
+40 KB, so the cap decides how much of the context window one careless read consumes.
+Subclassing keeps the override in this repository.
 """
 
 from __future__ import annotations
@@ -24,7 +19,6 @@ from psrl.utils.agent.overflow import is_prompt_overflow
 psrl_logger = logging.getLogger("psrl.sciaccel_rl.agent")
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# Harbor's own default, kept here so the override is legible against it.
 HARBOR_DEFAULT_MAX_OBS_BYTES = 10000
 
 
@@ -32,11 +26,8 @@ class ContextWindowExhausted(Exception):
     """
     Raised when the served prompt no longer fits the model window.
 
-    Terminus-2 does not recognize vLLM's 400 wording, so it treats the rejection as a
-    transient error and keeps issuing turns. Every turn re-sends a transcript that is
-    already too long, so every turn fails the same way and the episode grinds until its
-    wall-clock budget expires. One run logged 5040 rejections, one identical request
-    repeated 1733 times, with episodes burning 80+ minutes to deliver nothing.
+    Terminus-2 does not recognize vLLM's 400 wording, so it treats the rejection as
+    transient and keeps issuing turns that re-send an already-too-long transcript.
     """
 
 

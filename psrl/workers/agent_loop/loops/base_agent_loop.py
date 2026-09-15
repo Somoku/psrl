@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import traceback
@@ -861,13 +862,17 @@ class AgentLoopBase(ABC):
             breakdown.append(f"grading: {runner_timing['grading_s']:.1f}s")
         if runner_timing.get("prep_s"):
             # Fine-grained prep breakdown (task prep / sandbox cold start /
-            # clean snapshot / harness install+config) to locate bottlenecks.
+            # clean snapshot / sandbox init / git sanitization / harness
+            # prepare+config) to locate bottlenecks.
             prep_parts = [f"total={runner_timing['prep_s']:.1f}s"]
             for key, label in (
                 ("task_prepare_s", "task"),
                 ("sandbox_create_s", "sandbox"),
                 ("snapshot_s", "snapshot"),
-                ("install_s", "install"),
+                ("sandbox_init_s", "sandbox_init"),
+                ("git_probe_s", "git_probe"),
+                ("git_purge_s", "git_purge"),
+                ("harness_prepare_s", "harness_prepare"),
             ):
                 value = runner_timing.get(key)
                 if value:
@@ -894,6 +899,14 @@ class AgentLoopBase(ABC):
                 "trigger_tokens: "
                 f"{compaction_limit if compaction_limit is not None else 'disabled'} | "
                 f"trajectory_count: {info.get('trajectory_count', 1)}\n"
+            )
+        leaf = (out.extra_fields or {}).get("tito_leaf")
+        if isinstance(leaf, dict):
+            text += (
+                f"[TITO Leaf] trajectory_id={leaf.get('trajectory_id')} | "
+                f"node_id={leaf.get('node_id')} | parent={leaf.get('parent')} | "
+                f"finish_reason={leaf.get('finish_reason')} | truncated={leaf.get('truncated')} | "
+                f"num_tokens={leaf.get('num_tokens')} | path={leaf.get('path_node_ids')}\n"
             )
         return text
 
@@ -940,6 +953,16 @@ class AgentLoopBase(ABC):
                 parts.append(self._build_summary_text(out, terminate_reason))
                 traj_id = str(uid) if len(outs) == 1 else f"{uid}_{idx}"
                 self.traj_writer.write(version, traj_id, "".join(parts))
+                # Persist the raw SMG TITO prefix-tree snapshot once per request for offline analysis.
+                if idx == 0:
+                    tree = (out.extra_fields or {}).get("tito_tree")
+                    if isinstance(tree, dict):
+                        self.traj_writer.write(
+                            version,
+                            f"{uid}.tree",
+                            json.dumps(tree, ensure_ascii=False, sort_keys=True, indent=1),
+                            suffix=".json",
+                        )
         except Exception:
             psrl_logger.warning(
                 "Failed to dump trajectory text for uid=%s.",

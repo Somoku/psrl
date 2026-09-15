@@ -48,5 +48,18 @@ enable_kv_event_replay: False
 # Enale TITO debug in SMG
 tito_debug: False
 
+# Harness-specific tool-input canonicalizer for TITO prefix hashing.
+# "none" disables it; "claude_code" mirrors Claude Code's normalizeToolInput
+# so replayed, normalized histories keep matching the stored prefix
+# instead of forking duplicate trajectories.
+tito_tool_normalization: claude_code
+tito_workdir: /testbed
+
+# Drop "dead" (rollback) leaves from TITO session snapshots. Abandoned branches
+# that forked from a state the session later continued past are then never
+# down-streamed to the agent loop as training data. Compaction branches that
+# carry fresh context are ordinary leaves and are kept.
+tito_drop_dead_leaves: true
+
 # Tool call parser for the SMG gateway
 tool_call_parser: null

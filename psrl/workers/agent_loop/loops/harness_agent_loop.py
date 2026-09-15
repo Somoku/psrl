@@ -135,11 +135,14 @@ class HarnessAgentLoop(SessionAgentLoop):
         """Resolve per-request turn budget and context compaction settings."""
         rollout_config = (
             self.config.train_actor_rollout_ref.rollout
-            if request.get("validate", False) else self.config.gen_actor_rollout_ref.rollout
+            if request.get("validate", False)
+            else self.config.gen_actor_rollout_ref.rollout
         )
-        
+
         self.max_turns = rollout_config.multi_turn.max_turns
-        context_window = rollout_config.max_model_len or (rollout_config.prompt_length + rollout_config.response_length)
+        context_window = rollout_config.max_model_len or (
+            rollout_config.prompt_length + rollout_config.response_length
+        )
         if context_window > self.rollout_budget:
             psrl_logger.warning(
                 f"Harness context window ({context_window}) exceeds the trainable budget "

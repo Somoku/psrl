@@ -37,7 +37,7 @@ class SessionAgentLoop(AgentLoopBase):
         self.session_router_url = context.session_router_url.rstrip("/")
         self.trajectory_id_strategy = get_trajectory_id_strategy(context.config)
         self.max_turns = context.config.gen_actor_rollout_ref.rollout.multi_turn.max_turns
-        self.session_snapshot = None # TITO session snapshot for offline analysis
+        self.session_snapshot = None  # TITO session snapshot for offline analysis
 
     def get_generate_fields(self) -> list[str]:
         fields = super().get_generate_fields()

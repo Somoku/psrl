@@ -161,6 +161,9 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         tito_debug=bool(cfg_get(config, "psrl.rollout_gateway.tito_debug", False)),
         tito_gc_threshold=cfg_get(config, "psrl.rollout_gateway.tito_gc_threshold", None),
         trajectory_id_strategy=get_trajectory_id_strategy(config),
+        tito_tool_normalization=str(cfg_get(config, "psrl.rollout_gateway.tito_tool_normalization", "none")),
+        tito_workdir=str(cfg_get(config, "psrl.rollout_gateway.tito_workdir", "/testbed")),
+        tito_drop_dead_leaves=bool(cfg_get(config, "psrl.rollout_gateway.tito_drop_dead_leaves", False)),
         multimodal_tensor_transport=str(
             cfg_get(config, "psrl.rollout_gateway.multimodal_tensor_transport", "auto")
         ).lower(),

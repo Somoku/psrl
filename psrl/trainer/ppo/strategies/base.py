@@ -59,6 +59,18 @@ class StepStrategy(ABC):
             KVBatchMeta: The final full batch (used for metrics and cleanup).
         """
 
+    def maybe_collect_pmr(self, batch, metrics: dict, timing_raw: dict) -> None:
+        """Collect the Prefix Match Rate of the global batch when enabled.
+
+        Strategies call this once the full global batch is available (before
+        advantage/update phases). Gated by ``trainer.enable_pmr_analysis``;
+        a no-op otherwise so non-PMR runs pay zero cost.
+        """
+        if not self.trainer.config.trainer.get("enable_pmr_analysis", False):
+            return
+        with marked_timer("pmr", timing_raw, color="magenta"):
+            self.trainer.collect_prefix_match_rate(batch, metrics)
+
     def _run_ckpt_and_validate(
         self,
         batch,

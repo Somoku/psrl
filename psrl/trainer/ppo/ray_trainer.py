@@ -3026,6 +3026,26 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
 
         return batch
 
+    def collect_prefix_match_rate(self, batch: KVBatchMeta, metrics: dict) -> None:
+        """Compute and log prefix-tree compression metrics of the current global batch.
+
+        Records the AReaL-DTA compression ratio ``C`` and sharing ratio
+        ``S = 1 - 1/C`` (arXiv:2602.00482) for the full global batch, plus the
+        within-group / cross-group compression distributions. Computed before
+        mini-batch splitting and logged under ``pmr/*``. Gated by
+        ``trainer.enable_pmr_analysis``. All samples in the batch are included.
+        """
+        from psrl.utils.metrics.prefix_match_rate import compute_pmr_metrics, sequences_from_batch
+
+        data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["input_ids", "parent_id"],
+        )
+        seqs, group_ids = sequences_from_batch(data)
+        pmr = compute_pmr_metrics(seqs, group_ids=group_ids)
+        metrics.update({key: value for key, value in pmr.items() if value is not None})
+
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
         # Operating Mode Selection:

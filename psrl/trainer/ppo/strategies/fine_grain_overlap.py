@@ -22,8 +22,6 @@ TODO (future): pre_step + micro_batch scope — true cross-chunk gradient
   chunks; (3) ppo_epochs == 1 constraint.  Currently guarded by ValueError.
 """
 
-from __future__ import annotations
-
 import ray
 from transfer_queue.metadata import KVBatchMeta
 from verl.utils.debug import marked_timer
@@ -200,6 +198,10 @@ class FineGrainOverlapStrategy(StepStrategy):
                 break
 
         full_batch = KVBatchMeta.concat(chunks)
+
+        # Prefix Match Rate of the full global batch (after chunk concat),
+        # logged under pmr/*.
+        self.maybe_collect_pmr(full_batch, metrics, timing_raw)
 
         # --- recompute scope: advantage + updates run on the full batch ---
         if self.overlap_scope == "recompute":

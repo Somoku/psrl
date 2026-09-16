@@ -71,6 +71,7 @@ from psrl.trainer.ppo.batch_schedule import (
     get_batch_schedule_strategy,
     resolve_sample_keys,
 )
+from psrl.trainer.ppo.session_loss import compute_session_loss_weights
 from psrl.trainer.ppo.utils import (
     PSRL_Role,
     ResourcePoolManager,
@@ -2983,7 +2984,7 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             config=self.config.algorithm,
         )
 
-        # 4. write nested advantages and returns back to TransferQueue
+        # 4. Write response fields and dense session weights back to TransferQueue.
         fields = ["advantages", "returns"]
         if self.config.algorithm.use_kl_in_reward:
             fields.append("token_level_rewards")
@@ -2995,6 +2996,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         output = {}
         for field in fields:
             output[field] = response_to_nested(data.batch[field], response_mask)
+        if self.config.train_actor_rollout_ref.actor.loss_agg_mode == "session-mean-token-mean":
+            output["session_loss_weights"] = compute_session_loss_weights(data.batch["response_mask"], uids)
         output = TensorDict(output, batch_size=len(batch))
         tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
 
@@ -3083,6 +3086,8 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         output: KVBatchMeta = self.actor_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
+        actor_config = self.config.train_actor_rollout_ref.actor
+        use_session_mean = actor_config.loss_agg_mode == "session-mean-token-mean"
         fields = [
             "entropy",
             "log_probs",
@@ -3092,7 +3097,10 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
             "rollout_log_probs",
             "metrics",
         ]
+        if use_session_mean:
+            fields.append("uid")
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        uids = tu.pop(data, "uid") if use_session_mean else None
 
         # 2. write old_log_probs and entropy back to TransferQueue
         data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
@@ -3108,12 +3116,16 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         data = DataProto(batch=data.to_padded_tensor())
 
         # 3. calculate actor entroy metrics
-        actor_config = self.config.train_actor_rollout_ref.actor
+        session_loss_weights = None
+        if use_session_mean:
+            # Diagnostic masks and chunk boundaries can differ from the later training window.
+            session_loss_weights = compute_session_loss_weights(data.batch["response_mask"], uids)
         entropy_agg = agg_loss(
             loss_mat=data.batch["entropy"],
             loss_mask=data.batch["response_mask"],
             loss_agg_mode=actor_config.loss_agg_mode,
             loss_scale_factor=actor_config.loss_scale_factor,
+            session_loss_weights=session_loss_weights,
         )
         old_log_prob_metrics = {
             "actor/entropy": entropy_agg.detach().item(),

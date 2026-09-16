@@ -44,6 +44,11 @@ class FineGrainOverlapStrategy(StepStrategy):
       recompute  — only per_sample stages overlap; advantage+update on full batch.
       pre_step   — advantage+update also per chunk (mini_batch granularity only;
                    micro_batch is a future phase).
+
+    Session-mean-token-mean loss (``actor.loss_agg_mode=session-mean-token-mean``)
+    requires window-level normalization, so it is only allowed with
+    ``overlap_scope=recompute`` (pre_step's chunk-local normalization would change
+    the per-session denominator per chunk).  This is enforced in ``__init__``.
     """
 
     def __init__(self, trainer: PSRL_RayPPOTrainer, cfg) -> None:
@@ -65,6 +70,22 @@ class FineGrainOverlapStrategy(StepStrategy):
                 f"not yet implemented); got effective_granularity={self.effective_granularity!r}. "
                 "Use overlap_scope=recompute with micro_batch, or reduce multiplier so chunk "
                 "clamps to mini_batch."
+            )
+
+        # Session-mean-token-mean loss computes session weights once per scheduled batch
+        # (L_rho x session count). pre_step trains chunk-by-chunk, so the denominator would
+        # become chunk-local and per-session weights would depend on chunk composition.
+        # Require the recompute scope (advantage + update on the concatenated full batch),
+        # which is mathematically identical to the full-batch path.
+        loss_agg_mode = t.config.train_actor_rollout_ref.actor.get("loss_agg_mode", "token-mean")
+        if self.overlap_scope == "pre_step" and loss_agg_mode == "session-mean-token-mean":
+            raise ValueError(
+                "overlap_scope=pre_step is not compatible with actor.loss_agg_mode="
+                "session-mean-token-mean: pre_step applies chunk-local per-session normalization, "
+                "which is inconsistent with window-level session normalization. "
+                "Use overlap_scope=recompute (advantage + updates run on the "
+                "concatenated full batch; per-sample stages still overlap) or set "
+                "psrl.fine_grain_overlap.granularity=none for the full-batch path."
             )
 
         ray.get(t.agent_loop_manager.set_chunk_size.remote(self.chunk_groups))

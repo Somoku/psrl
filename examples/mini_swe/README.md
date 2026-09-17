@@ -82,9 +82,10 @@ examples/mini_swe/
 │   ├── runtime.py                        # Host orchestration: write payload, run, read scorecard
 │   ├── freeze.py                         # Prepare-time SWE-smith eval_script / parser freezing
 │   └── _vendor/                          # Vendored swebench parsers + grading logic (see PROVENANCE.md)
-├── harness_task.py                       # Harness prompt + patch collection helpers
-├── integrity.py                          # Post-rollout integrity scan (format-dispatched: Claude stream-json / Codex JSONL)
-├── git_sanitize.py                       # Runtime git-leak probe + fallback purge for harness sandboxes
+├── utils/                                # Helpers kept out of the example's core modules
+│   ├── harness_task.py                   # Harness prompt + patch collection helpers
+│   ├── integrity.py                      # Post-rollout integrity scan (format-dispatched: Claude stream-json / Codex JSONL)
+│   └── git_sanitize.py                   # Runtime git-leak probe + fallback purge for harness sandboxes
 ├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset (FSDP, 7B)
 ├── fsdp_qwen_14b_dapo.sh                 # Launch script — toy / DAPO path (FSDP, 14B)
 ├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (FSDP, 7B)
@@ -614,7 +615,7 @@ docker run --rm "$tag" bash -lc \
   `runner.py:_IMAGE_BAKE_REVISION` together to invalidate old derivatives after
   changing the bake steps; a test asserts the two stay in sync.
 * **Runtime fallback**: on a host without the derivative, the harness loop runs
-  a cheap git probe (`examples/mini_swe/git_sanitize.py`) before the agent
+  a cheap git probe (`examples/mini_swe/utils/git_sanitize.py`) before the agent
   starts and purges only when it detects a leak. Probe/purge timings show up in
   the trajectory `[Time Breakdown]` as `sandbox_init` / `git_probe` / `git_purge`
   (raw metrics `git_leak_detected` / `git_sanitize_error` are on the reward

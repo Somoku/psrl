@@ -16,76 +16,46 @@ from urllib.parse import urlsplit
 from omegaconf import DictConfig, OmegaConf
 
 from psrl.sandbox import ExecResult, SandboxSession
+from psrl.workers.agent_loop.harness.runtime import executable_path
 
-
-@dataclass(frozen=True)
-class HarnessInstallConfig:
-    """Optional in-sandbox installation policy for one harness executable."""
-
-    strategy: str = "command"
-    check_command: str | None = None
-    command: str | None = None
-    timeout_s: float = 300.0
-    node_tarball_env: str | None = None
-    cli_tarball_env: str | None = None
-    node_tarball_path: str = "/tmp/node22.tarball"
-    cli_tarball_path: str = "/tmp/harness-cli.tgz"
-    node_install_dir: str = "/opt/node22"
-    npm_prefix: str = "/usr/local"
-    retries: int = 3
-    retry_backoff_s: float = 2.0
-
-    def __post_init__(self) -> None:
-        if self.timeout_s <= 0:
-            raise ValueError("Harness install timeout_s must be greater than zero.")
-        if self.strategy not in ("command", "npm_tarball"):
-            raise ValueError(f"Unsupported harness install strategy {self.strategy!r}.")
-        if self.retries <= 0:
-            raise ValueError("Harness install retries must be greater than zero.")
-        if self.retry_backoff_s < 0:
-            raise ValueError("Harness install retry_backoff_s cannot be negative.")
+# Trajectory output formats the post-rollout integrity scanner can dispatch on.
+# `auto` is a convenience that resolves to the kind default below; the actual
+# scan dispatch key is always a concrete format string.
+SUPPORTED_TRAJECTORY_FORMATS = (
+    "auto",
+    "claude_code_stream_json",
+    "codex_jsonl",
+    "plain_text",
+)
+_KIND_DEFAULT_TRAJECTORY_FORMATS: dict[str, str] = {
+    "claude_code": "claude_code_stream_json",
+    "codex": "codex_jsonl",
+}
 
 
 @dataclass(frozen=True)
 class HarnessCompactionConfig:
     """Context-compaction policy shared by external coding harnesses.
 
-    ``trigger_tokens`` defaults to the rollout prompt plus response budget
-    (minus ``safety_tokens``). ``context_window_tokens`` is the actual CLI
-    context capacity and may be larger when a harness adds system/tool text.
-    Set ``safety_tokens=0`` for the exact rollout-budget threshold.
+    The CLI context capacity is the effective rollout ``max_model_len`` (the
+    harness adds no separate window knob). ``compact_percent`` is the share of
+    that window at which the harness triggers compaction, and is forwarded
+    verbatim as Claude Code's ``CLAUDE_AUTOCOMPACT_PCT_OVERRIDE``.
     """
 
     enabled: bool = True
-    context_window_tokens: int | None = None
-    trigger_tokens: int | None = None
-    safety_tokens: int = 512
+    compact_percent: float = 75.0
 
-    def resolve(self, default_context_window_tokens: int) -> tuple[int, int] | None:
-        """Resolve CLI capacity and the rollout-budget compaction trigger."""
+    def resolve(self, context_window_tokens: int) -> tuple[int, int] | None:
+        """Resolve CLI capacity and the absolute compaction trigger."""
         if not self.enabled:
             return None
-        rollout_budget = int(default_context_window_tokens)
-        if rollout_budget <= 0:
-            raise ValueError("Default harness rollout budget must be greater than zero.")
-        if self.safety_tokens < 0:
-            raise ValueError("Harness compaction safety_tokens cannot be negative.")
-
-        window = int(self.context_window_tokens or rollout_budget)
+        window = int(context_window_tokens)
         if window <= 0:
-            raise ValueError("Harness compaction context_window_tokens must be greater than zero.")
-        trigger = int(
-            self.trigger_tokens if self.trigger_tokens is not None else (rollout_budget - self.safety_tokens)
-        )
-        if trigger <= 0:
-            raise ValueError(
-                "Harness compaction trigger_tokens must be greater than zero; "
-                "reduce safety_tokens or increase the context window."
-            )
-        if trigger > window:
-            raise ValueError(
-                f"Harness compaction trigger_tokens ({trigger}) cannot exceed context_window_tokens ({window})."
-            )
+            raise ValueError("Harness compaction context window must be greater than zero.")
+        if not 0 < self.compact_percent <= 100:
+            raise ValueError(f"Harness compaction compact_percent must be in (0, 100], got {self.compact_percent!r}.")
+        trigger = max(1, (window * self.compact_percent) // 100)
         return window, trigger
 
 
@@ -99,11 +69,12 @@ class HarnessConfig:
     args: tuple[str, ...] = ()
     env: Mapping[str, str] = field(default_factory=dict)
     home_dir: str = "/root"
+    runtime_mount: str = "/opt/harness"
     time_budget_s: float = 7200.0
     output_tail_chars: int = 16_384
     callback_base_url: str | None = None
     permission_mode: str | None = None
-    allowed_tools: tuple[str, ...] = ()
+    allowed_permissions: tuple[str, ...] = ()
     system_prompt: str | None = None
     system_prompt_mode: str = "replace"
     setting_sources: str | None = None
@@ -118,11 +89,13 @@ class HarnessConfig:
     disable_experimental_betas: bool = False
     subagents_enabled: bool = True
     compaction: HarnessCompactionConfig = field(default_factory=HarnessCompactionConfig)
-    install: HarnessInstallConfig = field(default_factory=HarnessInstallConfig)
+    trajectory_format: str = "auto"
 
     def __post_init__(self) -> None:
         if not self.kind or not self.executable:
             raise ValueError("Harness kind and executable cannot be empty.")
+        if not self.runtime_mount.startswith("/"):
+            raise ValueError(f"Harness runtime_mount must be an absolute path, got {self.runtime_mount!r}.")
         if self.time_budget_s <= 0 or self.output_tail_chars <= 0:
             raise ValueError("Harness time_budget_s and output_tail_chars must be greater than zero.")
         if self.system_prompt_mode not in ("append", "replace", "none"):
@@ -135,6 +108,17 @@ class HarnessConfig:
             raise ValueError("Harness thinking_budget_tokens cannot be set when thinking is disabled.")
         if self.reasoning_effort is not None and not self.reasoning_effort.strip():
             raise ValueError("Harness reasoning_effort cannot be empty when configured.")
+        if self.trajectory_format not in SUPPORTED_TRAJECTORY_FORMATS:
+            raise ValueError(
+                f"Unsupported harness trajectory_format {self.trajectory_format!r}; "
+                f"expected one of {SUPPORTED_TRAJECTORY_FORMATS}."
+            )
+
+    def resolved_trajectory_format(self) -> str:
+        """Return the concrete format the integrity scanner should dispatch on."""
+        if self.trajectory_format != "auto":
+            return self.trajectory_format
+        return _KIND_DEFAULT_TRAJECTORY_FORMATS.get(self.kind, "plain_text")
 
     @classmethod
     def from_value(cls, value: HarnessConfig | DictConfig | Mapping[str, Any]) -> HarnessConfig:
@@ -149,7 +133,7 @@ class HarnessConfig:
             raise TypeError("Harness configuration must be a mapping.")
         normalized = dict(raw)
         normalized["args"] = tuple(str(item) for item in normalized.get("args", ()))
-        normalized["allowed_tools"] = tuple(str(item) for item in normalized.get("allowed_tools", ()))
+        normalized["allowed_permissions"] = tuple(str(item) for item in normalized.get("allowed_permissions", ()))
         normalized["supported_capabilities"] = tuple(
             str(item) for item in normalized.get("supported_capabilities", ())
         )
@@ -159,10 +143,6 @@ class HarnessConfig:
             compaction
             if isinstance(compaction, HarnessCompactionConfig)
             else HarnessCompactionConfig(**dict(compaction or {}))
-        )
-        install = normalized.get("install", {})
-        normalized["install"] = (
-            install if isinstance(install, HarnessInstallConfig) else HarnessInstallConfig(**dict(install or {}))
         )
         return cls(**normalized)
 
@@ -223,105 +203,32 @@ class Harness(ABC):
         self._active_exec: asyncio.Task[ExecResult] | None = None
         self._log_dir = str(PurePosixPath(config.home_dir) / ".psrl-harness")
 
+    def config_dir(self) -> str | None:
+        """Harness-specific config directory created during preparation."""
+        return None
+
     async def prepare(self, runtime: HarnessRuntime) -> None:
-        """Verify or install the CLI, then write harness-specific configuration."""
-        check_command = self.config.install.check_command or f"command -v {shlex.quote(self.config.executable)}"
-        check = await self.sandbox.exec(check_command, timeout_s=30)
+        """Verify the mounted executable and write harness-specific configuration.
+
+        The executable comes from the read-only runtime tree mounted at
+        ``config.runtime_mount``; there is no in-sandbox installation, no
+        network fetch and no mutation of the task image's global toolchain. All
+        directories are created in the same probe, so per-trajectory setup stays
+        to one round trip.
+        """
+        exe = executable_path(self.config.runtime_mount, self.config.executable)
+        directories = [self._log_dir, self.config_dir()]
+        mkdir = "mkdir -p " + " ".join(shlex.quote(d) for d in directories if d)
+        check = await self.sandbox.exec(f"{mkdir} && {shlex.quote(exe)} --version", timeout_s=60)
         if check.exit_code != 0:
-            installed = await self._install_cli(check_command)
-            if installed.exit_code != 0:
-                raise RuntimeError(
-                    f"Harness installation failed with exit code {installed.exit_code}: "
-                    f"stdout={installed.stdout[-self.config.output_tail_chars :]!r}, "
-                    f"stderr={installed.stderr[-self.config.output_tail_chars :]!r}."
-                )
-            check = await self.sandbox.exec(check_command, timeout_s=30)
-            if check.exit_code != 0:
-                raise RuntimeError(
-                    f"Harness executable {self.config.executable!r} is unavailable after installation. "
-                    f"check_stdout={check.stdout[-self.config.output_tail_chars :]!r}, "
-                    f"check_stderr={check.stderr[-self.config.output_tail_chars :]!r}, "
-                    f"install_stdout={installed.stdout[-self.config.output_tail_chars :]!r}, "
-                    f"install_stderr={installed.stderr[-self.config.output_tail_chars :]!r}."
-                )
-        mkdir = await self.sandbox.exec(f"mkdir -p {shlex.quote(self._log_dir)}", timeout_s=30)
-        if mkdir.exit_code != 0:
-            raise RuntimeError(f"Could not create harness state directory: {mkdir.stderr.strip()}")
+            raise RuntimeError(
+                f"Harness executable {exe!r} is unavailable in the sandbox (exit {check.exit_code}). "
+                f"Mount the {self.config.kind!r} runtime tree at {self.config.runtime_mount!r} and ensure "
+                f"<runtime-root>/{self.config.kind}/bin/{self.config.executable} exists on the worker. "
+                f"stdout={check.stdout[-self.config.output_tail_chars :]!r}, "
+                f"stderr={check.stderr[-self.config.output_tail_chars :]!r}."
+            )
         await self._prepare(runtime)
-
-    async def _install_cli(self, check_command: str) -> ExecResult:
-        """Install the configured CLI, optionally using npm tarballs."""
-        install = self.config.install
-        if install.strategy == "command":
-            if not install.command:
-                raise RuntimeError(
-                    f"Harness executable {self.config.executable!r} is unavailable and no install command "
-                    "is configured."
-                )
-            return await self.sandbox.exec(install.command, timeout_s=install.timeout_s)
-
-        if not install.node_tarball_env or not install.cli_tarball_env:
-            raise RuntimeError("npm_tarball harness installation requires node_tarball_env and cli_tarball_env.")
-        if not os.environ.get(install.node_tarball_env):
-            raise RuntimeError(
-                f"Host environment variable {install.node_tarball_env!r} is not set for npm installation."
-            )
-        if not os.environ.get(install.cli_tarball_env):
-            raise RuntimeError(
-                f"Host environment variable {install.cli_tarball_env!r} is not set for npm installation."
-            )
-
-        node_dir = shlex.quote(install.node_install_dir)
-        node_tarball = shlex.quote(install.node_tarball_path)
-        cli_tarball = shlex.quote(install.cli_tarball_path)
-        npm_prefix = shlex.quote(install.npm_prefix)
-        # Prefer the Tencent npm mirror (direct via no_proxy) so the platform
-        # package fetch never depends on reaching npmjs.org through the proxy;
-        # override with NPM_REGISTRY for other environments.
-        npm_registry = shlex.quote(os.environ.get("NPM_REGISTRY", "https://mirrors.tencent.com/npm/"))
-        # slime-style tarball install:
-        #   1) Ensure the base runtime (Node + npm) is present — prefer a base
-        #      image that ships Node >= 18 ("npm baked into the image"); fall
-        #      back to extracting the mounted Node 22 tarball when the image
-        #      lacks a usable npm.
-        #   2) Install the harness CLI from its npm tarball. `--prefer-offline`
-        #      uses a pre-seeded npm cache when one is baked into the image, so
-        #      only cache misses touch the registry.
-        # npm is a harness-agnostic path: adding a new CLI-style harness only
-        # needs a tarball + check_command, no host-side binary mounts.
-        command = (
-            "set -euo pipefail; "
-            # Step 1: base runtime.
-            "if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 "
-            "|| ! node -e \"process.exit(+process.versions.node.split('.')[0] >= 18 ? 0 : 1)\" >/dev/null 2>&1; then "
-            f"mkdir -p {node_dir}; "
-            # `--no-same-owner`: the official Node tarball ships files owned by
-            # uid 1000 (iojs). Without it GNU tar (running as root) tries to
-            # chown every extracted file to uid 1000, which sandboxes that deny
-            # chown reject with EPERM → tar exits 2 and the install aborts.
-            f"if tar -tf {node_tarball} >/dev/null 2>&1; then "
-            f"tar --no-same-owner -xf {node_tarball} -C {node_dir} --strip-components=1; "
-            f"elif command -v xz >/dev/null 2>&1; then "
-            f"xz -dc {node_tarball} | tar --no-same-owner -xf - -C {node_dir} --strip-components=1; "
-            "else echo 'Node tarball is compressed but xz is unavailable.' >&2; exit 127; fi; "
-            f"ln -sf {node_dir}/bin/node /usr/local/bin/node; "
-            f"ln -sf {node_dir}/bin/npm /usr/local/bin/npm; "
-            f"ln -sf {node_dir}/bin/npx /usr/local/bin/npx; "
-            "hash -r; "
-            "fi; "
-            # Step 2: harness CLI via npm tarball.
-            f"npm install -g --prefix={npm_prefix} --no-audit --no-fund --prefer-offline "
-            f"--registry={npm_registry} {cli_tarball}; "
-            f"{check_command}"
-        )
-        last_result = ExecResult(1, "", "")
-        for attempt in range(install.retries):
-            last_result = await self.sandbox.exec(command, timeout_s=install.timeout_s)
-            if last_result.exit_code == 0:
-                return last_result
-            if attempt + 1 < install.retries and install.retry_backoff_s:
-                await asyncio.sleep(install.retry_backoff_s * (attempt + 1))
-        return last_result
 
     @staticmethod
     def inherited_proxy_env() -> dict[str, str]:

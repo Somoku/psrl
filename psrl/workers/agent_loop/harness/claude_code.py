@@ -1,28 +1,30 @@
 """Claude Code harness adapter."""
 
 import json
-import shlex
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from psrl.workers.agent_loop.harness.base import Harness, HarnessRuntime
+from psrl.workers.agent_loop.harness.runtime import executable_path
 
 
 class ClaudeCodeHarness(Harness):
     """Run Claude Code against a TITO session-scoped Messages endpoint."""
 
+    def config_dir(self) -> str:
+        return str(PurePosixPath(self.config.home_dir) / ".claude")
+
     async def _prepare(self, runtime: HarnessRuntime) -> None:
-        claude_dir = PurePosixPath(self.config.home_dir) / ".claude"
-        permission_mode = self.config.permission_mode or "default"
-        result = await self.sandbox.exec(f"mkdir -p {shlex.quote(str(claude_dir))}", timeout_s=30)
-        if result.exit_code != 0:
-            raise RuntimeError(f"Could not create Claude Code config directory: {result.stderr.strip()}")
+        claude_dir = PurePosixPath(self.config_dir())
         await self.sandbox.write_bytes(
             str(PurePosixPath(self.config.home_dir) / ".claude.json"),
             json.dumps({"hasCompletedOnboarding": True}).encode(),
         )
         deny = [] if self.config.subagents_enabled else ["Agent"]
-        settings_env = {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}
+        settings_env = {
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "CLAUDE_CODE_TOTAL_TOKENS_REMINDER": "off",
+        }
         if self.config.disable_prompt_caching:
             settings_env["DISABLE_PROMPT_CACHING"] = "1"
         if not self.config.thinking_enabled:
@@ -42,7 +44,7 @@ class ClaudeCodeHarness(Harness):
                 {
                     "autoCompactEnabled": self.config.compaction.enabled,
                     "permissions": {
-                        "defaultMode": permission_mode,
+                        "allow": list(self.config.allowed_permissions),
                         "deny": deny,
                     },
                     "env": settings_env,
@@ -52,7 +54,7 @@ class ClaudeCodeHarness(Harness):
 
     def build_command(self, prompt: str, runtime: HarnessRuntime) -> Sequence[str]:
         command = [
-            self.config.executable,
+            executable_path(self.config.runtime_mount, self.config.executable),
             "-p",
             prompt,
             "--permission-mode",
@@ -65,8 +67,6 @@ class ClaudeCodeHarness(Harness):
             "--model",
             self.config.model or runtime.model,
         ]
-        if self.config.allowed_tools:
-            command.extend(("--allowedTools", *self.config.allowed_tools))
         if self.config.system_prompt is not None and self.config.system_prompt_mode != "none":
             prompt_flag = "--append-system-prompt" if self.config.system_prompt_mode == "append" else "--system-prompt"
             command.extend((prompt_flag, self.config.system_prompt))
@@ -90,6 +90,7 @@ class ClaudeCodeHarness(Harness):
             **self.config.env,
             "HOME": self.config.home_dir,
             "IS_SANDBOX": "1",
+            "DISABLE_AUTOUPDATER": "1",
             "ANTHROPIC_BASE_URL": runtime.session_root_url,
             "ANTHROPIC_AUTH_TOKEN": runtime.session_id,
             "ANTHROPIC_MODEL": self.config.model or runtime.model,
@@ -128,13 +129,10 @@ class ClaudeCodeHarness(Harness):
         if not self.config.subagents_enabled:
             env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
         if runtime.context_window_tokens and runtime.compaction_token_limit:
-            # Claude Code accepts the compaction window in tokens and the
-            # trigger as a percentage of that window.  Keep explicit adapter
-            # env overrides authoritative for experiments and compatibility.
-            trigger_percent = max(
-                1,
-                min(100, (runtime.compaction_token_limit * 100) // runtime.context_window_tokens),
-            )
+            # Claude Code accepts the compaction window in tokens and the trigger
+            # as a percentage of that window.
+            # The window is the rollout `max_model_len`;
+            # the percentage is the configured `compact_percent`.
             env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(runtime.context_window_tokens))
-            env.setdefault("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", str(trigger_percent))
+            env.setdefault("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", str(self.config.compaction.compact_percent))
         return self.callback_no_proxy(runtime, env)

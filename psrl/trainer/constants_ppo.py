@@ -27,9 +27,7 @@ _HOST_RUNTIME_ENV_KEYS = (
     "ALL_PROXY",
     "no_proxy",
     "NO_PROXY",
-    "AGENT_NODE_TARBALL",
-    "AGENT_CC_TARBALL",
-    "AGENT_CODEX_TARBALL",
+    "PSRL_HARNESS_RUNTIME_ROOT",
 )
 
 

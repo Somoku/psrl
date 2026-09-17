@@ -2,21 +2,21 @@
 
 import json
 import math
-import shlex
 from collections.abc import Mapping, Sequence
 from pathlib import PurePosixPath
 
 from psrl.workers.agent_loop.harness.base import Harness, HarnessRuntime
+from psrl.workers.agent_loop.harness.runtime import executable_path
 
 
 class CodexHarness(Harness):
     """Run Codex against a TITO session-scoped Responses endpoint."""
 
+    def config_dir(self) -> str:
+        return str(PurePosixPath(self.config.home_dir) / ".codex")
+
     async def _prepare(self, runtime: HarnessRuntime) -> None:
-        codex_dir = PurePosixPath(self.config.home_dir) / ".codex"
-        result = await self.sandbox.exec(f"mkdir -p {shlex.quote(str(codex_dir))}", timeout_s=30)
-        if result.exit_code != 0:
-            raise RuntimeError(f"Could not create Codex config directory: {result.stderr.strip()}")
+        codex_dir = PurePosixPath(self.config_dir())
         model = self.config.model or runtime.model
         config_lines = [
             f"model = {json.dumps(model)}",
@@ -58,9 +58,10 @@ class CodexHarness(Harness):
 
     def build_command(self, prompt: str, runtime: HarnessRuntime) -> Sequence[str]:
         return (
-            self.config.executable,
+            executable_path(self.config.runtime_mount, self.config.executable),
             "exec",
             "--skip-git-repo-check",
+            "--json",
             *self.config.args,
             prompt,
         )
@@ -73,6 +74,6 @@ class CodexHarness(Harness):
                 **self.config.env,
                 "HOME": self.config.home_dir,
                 "OPENAI_API_KEY": runtime.session_id,
-                "CODEX_HOME": str(PurePosixPath(self.config.home_dir) / ".codex"),
+                "CODEX_HOME": self.config_dir(),
             },
         )

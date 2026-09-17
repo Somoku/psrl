@@ -27,17 +27,21 @@ Three independent data paths are supported:
 | `simple_cases_val.json` | 12 synthetic validation bug-fix tasks |
 | `prepare_swebench.py` | HF → parquet converter for SWE-smith-py and SWE-bench Verified/Lite/Full |
 | `prepare_swe_gym.py` | HF → parquet converter for SWE-Gym and SWE-Gym-Subset |
+| `prepare_swe_gym_293.py` | HF → parquet converter for the SWE-Gym-293 (SkyRL-v0-293) dataset |
 | `swebench_subsets.py` | Repo-balanced sampling helpers used by `prepare_swebench.py` and `prepare_swe_gym.py` |
 | `docker_scripts/bake_simple_repos.sh` | Bakes toy repositories into a Docker image for Path A |
+| `docker_scripts/build_harness_runtimes.sh` | Fetches the native Claude Code / Codex runtime trees (no Node) for harness mode |
+| `docker_scripts/bake_harness_image.sh` | Per-image git-purged derivative (harness mode, optional) |
 | `docker_scripts/prefetch_images.sh` | Pull per-SWE-problem images (skopeo-first, multi-mirror fallback, tar cache, `docker load`) |
 | `docker_scripts/prefetch_example.sh` | Reference invocation that chains `prefetch_images.sh` + `load_all_nodes.sh` |
 | `docker_scripts/swe_gym.sh` | Convenience wrapper: prefetch full SWE-Gym images (2438 problems) |
+| `docker_scripts/swe_gym_293.sh` | Convenience wrapper: prefetch SWE-Gym-293 train + val images, then fan out |
 | `docker_scripts/swe_gym_subset.sh` | Convenience wrapper: prefetch SWE-Gym-Subset images (100 problems) |
 | `docker_scripts/swe_eval_subset.sh` | Convenience wrapper: prefetch SWE-bench eval subset images |
 | `docker_scripts/swe_smith.sh` | Convenience wrapper: prefetch SWE-smith images |
 | `docker_scripts/probe_mirrors.sh` | Quickly check which public Docker Hub mirrors can serve a given image (uses `skopeo inspect`, no download) |
 | `docker_scripts/load_all_nodes.sh` | `pssh` fan-out: on every host listed in a file, `docker load` every `*.tar` in a shared-FS image dir, with per-node parallelism and skip-if-already-loaded |
-| `_prefetch_logs/` | One log file per image (kept by `prefetch_images.sh`) — header `已经拥有了` when cached, or a full per-mirror/per-attempt log when pulled |
+| `_prefetch_logs/` | One log file per image (kept by `prefetch_images.sh`) — header `Already have` when cached, or a full per-mirror/per-attempt log when pulled |
 | `_load_logs/<timestamp>/` | `pssh` per-host stdout / stderr from `load_all_nodes.sh` |
 
 ---
@@ -76,11 +80,40 @@ Each row contains a synthetic problem statement, a reference patch, and
 
 ### Prerequisites
 
-Extra Python packages are required for grading (not needed for Path A):
+Extra Python packages are required **at preparation time only**:
 
 ```bash
 python -m pip install swebench==4.1.0 swesmith
 ```
+
+Grading is host-independent: the eval script travels with the prepared row and
+is parsed inside the grading sandbox by a vendored, stdlib-only driver. The
+`prepare_*` scripts use `swebench`/`swesmith` to *freeze* that grading metadata,
+but nothing on the training host imports them at rollout time. So these packages
+are needed to prepare data, not to train on it.
+
+If you bump the pinned `swebench`/`swesmith` versions, regenerate the vendored
+parser registry so the frozen parser names stay resolvable:
+
+```bash
+python -m examples.mini_swe.grading.vendor_parsers
+```
+
+### Grading metadata
+
+`prepare_swebench.py` records everything the grader needs under
+`extra_info.swe_problem`:
+
+| Dataset | `eval_script` | `log_parser` | What prepare does |
+|---|---|---|---|
+| `verified` / `lite` / `full` | shipped by the HF dataset | shipped by the HF dataset | copies them through unchanged |
+| `smith` | **frozen here** | **frozen here** | builds the official-shaped eval script (`set -uxo pipefail` + `>>>>> Start/End Test Output`) from the repo profile and records the flattened parser name |
+
+SWE-smith rows have neither field upstream, so the preparation step generates
+them. Splits prepared before this change must be regenerated (or the eval script
+backfilled) — otherwise `MiniSWEEnvironment.reset` fails fast with an explicit
+"requires swe_problem.eval_script" error rather than silently grading on the
+training host.
 
 ### Step 1: Generate SWE-smith-py training data
 
@@ -236,7 +269,7 @@ What each flag does:
   `rm -f`'d before every retry, after every failed mirror, on SIGINT/SIGTERM
   (via `trap`), and again in the "all mirrors failed" branch.
 - Every image gets a log file in `_prefetch_logs/`:
-  - **Cached**: header `已经拥有了 <image>` + verification timestamp.
+  - **Cached**: header `Already have <image>` + verification timestamp.
   - **Pulled**: per-mirror, per-attempt output (`----- attempt N/M -----`).
   - **Failed**: final attempt's fatal error + note pointing at `.log` /
     `.log.load`.
@@ -431,15 +464,20 @@ removes F2P test files on HEAD), SWE-Gym images have a standard repository
 layout — no `git checkout HEAD~1` is needed. Grading uses a pre-computed
 `eval_script` embedded directly in the parquet.
 
+Three variants are supported: the full 2438-instance set, the 100-instance
+subset (fast iteration), and [SWE-Gym-293](#swe-gym-293-skyrl-v0-293) — a
+curated SWE-bench Verified subset with a train/val split.
+
 ### Prerequisites
 
 ```bash
 # Same grading deps as Path B
 python -m pip install swebench==4.1.0
 
-# ONLY needed if you prepare the full SWE-Gym dataset (2438 instances).
-# The SWE-Gym-Subset (100 instances) ships with pre-computed eval_scripts
-# and does NOT require the fork.
+# Needed for the full SWE-Gym dataset (2438) and for SWE-Gym-293.
+# The 100-instance subset ships with pre-computed eval_scripts and does NOT
+# require the fork. For SWE-Gym-293 the fork is installed into an isolated venv
+# by --ensure-fork, so this global install is not required there.
 pip install git+https://github.com/SWE-Gym/SWE-Bench-Fork.git
 
 # After generating parquets, restore swebench 4.1.0:
@@ -452,6 +490,7 @@ python -m pip install swebench==4.1.0
 |-----|-----------------|-----------|---------------------|-------|
 | `gym` | `SWE-Gym/SWE-Gym` | 2438 | Generated via `make_test_spec` (needs SWE-Bench-Fork 2.0.13) | Full training set |
 | `gym-subset` | `SumanthRH/SWE-Gym-Subset` | 100 | Pre-computed in HF dataset column | Quick iteration, no Fork needed |
+| `skyrl293` | `NovaSky-AI/SkyRL-v0-293-data` | 293 train + 23 val | Generated via SWE-Bench-Fork | SkyRL's curated SWE-bench Verified subset — see [SWE-Gym-293](#swe-gym-293-skyrl-v0-293) |
 
 ### Step 1: Generate SWE-Gym training data
 
@@ -477,6 +516,24 @@ python -m examples.mini_swe.prepare.prepare_swe_gym \
 The script automatically skips instances for which `eval_script` cannot be
 resolved (prints a count of skipped instances at the end). If many instances
 are skipped, verify that SWE-Bench-Fork 2.0.13 is correctly installed.
+
+#### SWE-Gym-293 (SkyRL-v0-293)
+
+A **curated SWE-bench Verified subset** that a Qwen3.5-4B model already solves
+part of — which is what produces a non-zero reward signal under GRPO, unlike the
+unfiltered `swe_smith_py_1k` slice. `prepare_swe_gym_293.py` downloads the
+parquet directly from HuggingFace and generates each instance's `eval_script`
+with the SWE-Bench-Fork inside an isolated venv (`--fork-venv`), so the main
+environment's swebench 4.1.0 is never disturbed. Re-run with `--force-fork` to
+rebuild the venv from scratch.
+
+```bash
+python -m examples.mini_swe.prepare.prepare_swe_gym_293 \
+    --output-dir examples/mini_swe/data/swe_gym_293 \
+    --ensure-fork --fork-venv /tmp/swegym-fork-venv
+```
+
+Output: `data/swe_gym_293/train.parquet` (293 rows) and `val.parquet` (23 rows).
 
 ### Step 2: Pre-fetch Docker images
 
@@ -512,6 +569,66 @@ bash examples/mini_swe/prepare/docker_scripts/load_all_nodes.sh \
     --image-dir ${PSRL_WORKSPACE}/docker_images/swe_gym
 ```
 
+#### Pre-fetching SWE-Gym-293
+
+One wrapper handles both splits and the fan-out:
+
+```bash
+bash examples/mini_swe/prepare/docker_scripts/swe_gym_293.sh
+```
+
+It prefetches `train.parquet` (293 × `xingyaoww/sweb.eval.x86_64.*`) **and**
+`val.parquet` (23 × legacy `swebench/sweb.eval.x86_64.*` images), then runs
+`docker load` on the nodes listed in `${PSRL_WORKSPACE}/hosts/16GPUs` when that
+file exists (otherwise it stops after the tar cache and tells you to run
+`load_all_nodes.sh` manually).
+
+> **Note**: the validation split (23 instances: sqlfluff/marshmallow/pvlib/
+> astroid/pyvista/pydicom) uses a *disjoint* set of `swebench/`-namespace images
+> that never appear in `train.parquet`. Prefetching the training split alone
+> makes validation fail at sandbox creation with
+> `Docker Engine returned HTTP 404: No such image`.
+
+Env overrides: `SWE_GYM_293_TRAIN` / `SWE_GYM_293_VAL` (defaults under
+`data/swe_gym_293/`), `SWE_GYM_293_IMAGE_DIR` (shared tar cache) and
+`SWE_PREFETCH_WORKERS` (skopeo parallelism, default 64).
+
+### Step 3: Harness runtime trees + git-purged derivatives (harness mode only)
+
+The native mini-SWE-agent loop runs on the host and needs no image changes. The
+**harness** loops (Claude Code / Codex) run a self-contained native CLI inside
+the sandbox, so prepare two things:
+
+1. **Runtime trees (required, once on the shared filesystem).** Each sandbox
+   mounts one tree read-only; there is no Node, no npm and no in-sandbox install.
+
+   ```bash
+   export PSRL_HARNESS_RUNTIME_ROOT=/shared/psrl/harness-runtimes
+   bash examples/mini_swe/prepare/docker_scripts/build_harness_runtimes.sh
+   ```
+
+2. **Git-purged derivative (optional, per worker host).** Once the base images
+   are present on a node, bake one derivative per unique image:
+
+   ```bash
+   bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
+       --parquet examples/mini_swe/data/swe_gym_293/train.parquet
+   ```
+
+The derivative only **purges leaked git metadata** (remotes, refs, reflog,
+unreachable objects) so an agent cannot read a future fix commit from the image;
+the harness executable is never baked. Run it on every worker host that creates
+sandboxes (Docker images are node-local), or distribute the derivative with
+`docker save`/`docker load`. Without a bake, training still works — a runtime git
+probe purges only images that actually leak — but you pay that cost on every
+rollout.
+
+See the main README's
+[Harness training: preprocessing & bake](../README.md#harness-training-preprocessing--bake)
+for the full checklist, tag-revision and runtime-fallback details, or the
+condensed docs page
+[docs → SWE Data Preparation](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/swe/prepare.html).
+
 > **Disk budget**: The full 2438-instance dataset uses ~200 unique images,
 > totalling ~500–800 GB of `docker-archive` tars. The 100-instance subset
 > uses ~80 unique images (~200 GB). Plan shared-FS and `/var/lib/docker`
@@ -529,12 +646,12 @@ Each output row produced by `prepare_swebench.py` or `prepare_swe_gym.py` contai
 | `data_source` | `str` | `"swe_smith_py"`, `"swebench_verified"`, or `"swe_gym"`. Determines which reward branch fires in `reward.py`. |
 | `ability` | `str` | Always `"software_engineering"`. |
 | `reward_model.style` | `str` | `"swebench_test_exec"`. Signals test-execution reward path. |
-| `reward_model.ground_truth.instance_id` | `str` | HuggingFace `instance_id` (e.g. `django__django-11039`). The dict key is kept as `instance_id` because it is consumed by the upstream swebench / swesmith harnesses. |
+| `reward_model.ground_truth.instance_id` | `str` | HuggingFace `instance_id` (e.g. `django__django-11039`). Consumed by PSRL's reward computation and the standalone evaluation CLI. |
 | `reward_model.ground_truth.FAIL_TO_PASS` | `list[str]` | Tests that must go from failing to passing. |
 | `reward_model.ground_truth.PASS_TO_PASS` | `list[str]` | Tests that must continue passing. |
 | `reward_model.ground_truth.gold_patch` | `str` | Reference patch (for offline analysis only; not used in RL reward). |
 | `extra_info.swe_problem_id` | `str` | The SWE problem's HuggingFace `instance_id`, used for logging and grader correlation. |
-| `extra_info.swe_problem` | `dict` | Full HuggingFace dataset row for this SWE problem. Passed to `grade_fresh_container` for `make_test_spec` / `get_test_cmd`. |
+| `extra_info.swe_problem` | `dict` | Full HuggingFace dataset row for this SWE problem, including the frozen grading fields: `eval_script` (executed in the grader sandbox) and `log_parser` (a key into the vendored parser registry). Verified/Gym rows inherit both from the HF dataset; SWE-smith rows get them frozen at prepare time. |
 | `extra_info.swe_problem_image` | `str` | Docker image name for this SWE problem. |
 | `extra_info.swe_restore_tests` | `bool` | `True` for SWE-smith-py (must run `git checkout HEAD~1` to restore F2P test files). `False` for Verified and SWE-Gym. |
 | `extra_info.swe_grader` | `str` | `"swebench_fresh_container"`. Activates post-rollout fresh-container grading in the agent loop. |

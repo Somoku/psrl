@@ -74,7 +74,17 @@ examples/mini_swe/
 ├── config.py                             # Runtime config dataclasses
 ├── runner.py                             # Black-box mini-swe/Docker/grader runner
 ├── reward.py                             # Reward function (patch-overlap + test-execution)
-├── swebench_grader.py                    # Fresh-container grader for SWE-smith / SWE-Gym / Verified (shared by training + eval)
+├── swebench_grader.py                    # Fresh-container grader orchestration for SWE-smith / SWE-Gym / Verified (shared by training + eval)
+├── grading/                              # Host-independent grading payload (frozen eval script + vendored parser registry + in-sandbox driver)
+│   ├── schema.py                         # GradingPlan built from swe_problem.eval_script / log_parser
+│   ├── driver.py                         # Stdlib-only driver executed inside the grading sandbox
+│   ├── payload.py                        # Packages driver + _vendor into grader.zip
+│   ├── runtime.py                        # Host orchestration: write payload, run, read scorecard
+│   ├── freeze.py                         # Prepare-time SWE-smith eval_script / parser freezing
+│   └── _vendor/                          # Vendored swebench parsers + grading logic (see PROVENANCE.md)
+├── harness_task.py                       # Harness prompt + patch collection helpers
+├── integrity.py                          # Post-rollout integrity scan (format-dispatched: Claude stream-json / Codex JSONL)
+├── git_sanitize.py                       # Runtime git-leak probe + fallback purge for harness sandboxes
 ├── fsdp_qwen_7b_dapo.sh                  # Launch script — toy dataset (FSDP, 7B)
 ├── fsdp_qwen_14b_dapo.sh                 # Launch script — toy / DAPO path (FSDP, 14B)
 ├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (FSDP, 7B)
@@ -88,7 +98,8 @@ examples/mini_swe/
 ├── config/
 │   ├── simple_agent_config.yaml          # Agent config for toy path
 │   ├── swebench_agent_config.yaml        # Agent config for SWE-smith / SWE-Gym / Verified
-│   └── swebench_agent_config_xml_fc.yaml # XML function-calling variant (newer models)
+│   ├── swebench_agent_config_xml_fc.yaml # XML function-calling variant (newer models)
+│   └── swebench_harness_config.yaml      # Claude Code / Codex harness agent-loop config
 ├── eval/                                 # Standalone evaluation + vLLM serving (see eval/README.md)
 │   ├── README.md                         # Guide for gold-patch sanity, multi-node eval, serving your own checkpoint
 │   ├── eval_swebench.py                  # Single-node eval entry point
@@ -102,21 +113,28 @@ examples/mini_swe/
     ├── simple_cases_val.json             # Synthetic validation bug-fix tasks
     ├── prepare_swebench.py               # HF → parquet converter (smith / verified / lite)
     ├── prepare_swe_gym.py                # HF → parquet converter (SWE-Gym / SWE-Gym-Subset)
+    ├── prepare_swe_gym_293.py            # HF → parquet converter SkyRL-v0-293
     ├── swebench_subsets.py               # Repo-balanced sampling helpers
     └── docker_scripts/                   # Docker image pre-fetch / fan-out helpers
         ├── bake_simple_repos.sh          # Bakes toy repos into a Docker image (Path A)
+        ├── bake_harness_image.sh         # Per-image git-purged derivative (harness mode)
+        ├── build_harness_runtimes.sh     # Fetch native Claude Code / Codex runtime trees (no Node)
         ├── prefetch_images.sh            # Pull per-SWE-problem images (skopeo + multi-mirror + tar cache)
         ├── prefetch_example.sh           # Reference invocation chaining prefetch + load_all_nodes
         ├── swe_smith.sh                  # Convenience wrapper for SWE-smith images
         ├── swe_gym.sh                    # Convenience wrapper for SWE-Gym images
         ├── swe_gym_subset.sh             # Convenience wrapper for SWE-Gym-Subset images
+        ├── swe_gym_293.sh                # Convenience wrapper: SWE-Gym-293 train + val images
         ├── swe_eval_subset.sh            # Convenience wrapper for SWE-bench eval subset images
         ├── probe_mirrors.sh              # Check which public Docker Hub mirrors serve a given image
         └── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
 
 # Core integration modules inside psrl/
 psrl/workers/agent_loop/loops/session_agent_loop.py       # Shared SessionRouter/TITO lifecycle
-psrl/workers/agent_loop/loops/mini_swe_agent_loop_v1.py   # Session-router/TITO black-box loop
+psrl/workers/agent_loop/loops/mini_swe_agent_loop_v1.py   # Session-router/TITO black-box loop (native mini-SWE)
+psrl/workers/agent_loop/loops/harness_agent_loop.py       # Generic sandboxed-harness lifecycle
+psrl/workers/agent_loop/loops/mini_swe_harness_agent_loop.py # Mini-SWE task hooks for harness mode
+psrl/workers/agent_loop/harness/                          # Harness adapters (claude_code / codex) + config
 psrl/workers/agent_loop/agent_data/mini_swe_agent_data.py # MiniSWEAgentData
 psrl/environments/mini_swe_env.py                         # Task metadata → observation adapter
 psrl/sandbox/                                             # Backend-neutral runtime abstraction
@@ -143,13 +161,16 @@ examples/mini_swe/runner.py                               # Episode orchestratio
 # 2. mini-SWE-agent (used as a library)
 python -m pip install mini-swe-agent
 
-# 3. Extra deps for SWE-smith-py / SWE-bench grading (skip for toy path)
+# 3. Grading deps — needed to PREPARE data only (swebench/swesmith are used to
+#    freeze eval scripts + parser names; the training host never imports them).
 python -m pip install swebench==4.1.0 swesmith
+python -m examples.mini_swe.grading.vendor_parsers   # regenerate vendored parser registry after version bumps
 
-# 4. Verify
+# 4. Verify (preparation deps + the host-independent grading payload)
 python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent OK')"
-python -c "import swebench; print('swebench', swebench.__version__)"
-python -c "from swesmith.profiles import registry; print('swesmith profiles:', len(registry.data))"
+python -c "import swebench; print('swebench', swebench.__version__)"   # prepare-time only
+python -c "from swesmith.profiles import registry; print('swesmith profiles:', len(registry.data))"   # prepare-time only
+python -c "from examples.mini_swe.grading.payload import grader_zip_bytes; print('grading payload', len(grader_zip_bytes()), 'bytes: OK')"
 docker run --rm python:3.11-slim bash -c "echo Docker OK"
 ```
 
@@ -164,11 +185,18 @@ All dataset preparation (toy, SWE-smith-py, and SWE-Gym) is documented in
 - **Path B** — converting SWE-smith-py and SWE-bench Verified from HuggingFace,
   generating balanced subsets, and pre-fetching per-SWE-problem Docker images on
   every cluster node
-- **Path C** — converting SWE-Gym (2438 problems) or SWE-Gym-Subset (100
-  problems) from HuggingFace, with pre-computed eval scripts and `xingyaoww`
+- **Path C** — converting SWE-Gym (2438 problems), SWE-Gym-Subset (100
+  problems), or SWE-Gym-293 / SkyRL-v0-293 (293 train + 23 val) from
+  HuggingFace, with pre-computed eval scripts and `xingyaoww` / `swebench`
   Docker images
 
 Read that file before running training for the first time.
+
+**Harness mode (Claude Code / Codex) needs two extra host-side preparations**
+on top of the data and image steps: building the native harness runtime trees
+(bind-mounted read-only, no Node) and optionally baking a per-image derivative
+that purges leaked git metadata.
+See [Harness training: preprocessing & bake](#harness-training-preprocessing--bake).
 
 ---
 
@@ -214,10 +242,14 @@ Path A).
 
 ### SWE-smith-py (real RL)
 
-#### Step 1: Install grading dependencies
+#### Step 1: Install preparation dependencies
+
+`swebench`/`swesmith` are used only while *preparing* data (freezing the SWE-smith
+eval script + parser name); the training host imports neither:
 
 ```bash
 python -m pip install swebench==4.1.0 swesmith
+python -m examples.mini_swe.grading.vendor_parsers
 ```
 
 #### Step 2: Prepare data and pre-fetch images
@@ -234,9 +266,8 @@ examples/mini_swe/data/
 
 ```bash
 python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent OK')"
-python -c "import swebench; print('swebench', swebench.__version__)"
-python -c "from swesmith.profiles import registry; print('swesmith profiles:', len(registry.data))"
 python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; print('grader OK')"
+python -c "from examples.mini_swe.grading.payload import grader_zip_bytes; print('grading payload', len(grader_zip_bytes()), 'bytes: OK')"
 ray status | head -5
 ```
 
@@ -257,7 +288,7 @@ bash examples/mini_swe/fsdp_qwen_7b_swe_smith.sh 3
 
 | Metric | Meaning |
 |--------|---------|
-| `train/score` | Outcome reward: Claude Code `binary_01` uses `1.0/0.0`; legacy signed `binary` uses `+1.0/-1.0` |
+| `train/score` | Shaped outcome reward: `+1.0` resolved, `-1.0` failed, `0.0` policy violation |
 | `train/acc` | Binary resolve rate (0 or 1 per sample) — the primary progress indicator |
 
 ---
@@ -268,10 +299,14 @@ SWE-Gym provides 2438 real-world bugs with pre-computed eval scripts and Docker
 images from the `xingyaoww/sweb.eval.x86_64.*` registry. It shares the same
 agent config (`swebench_agent_config.yaml`) and grading infrastructure as
 SWE-smith, with two key differences: no `git checkout HEAD~1` is needed (standard
-repo layout), and eval scripts are pre-computed in the parquet rather than
-generated at grading time.
+repo layout), and eval scripts are already frozen in the parquet (`swe_problem.eval_script`),
+so grading is host-independent without any extra preparation step.
 
-#### Step 1: Install grading dependencies
+#### Step 1: Install preparation dependencies
+
+The full SWE-Gym dataset ships without `eval_script`, so `prepare_swe_gym.py`
+needs the SWE-Bench-Fork to generate it. This is preparation-only — grading
+itself imports nothing upstream:
 
 ```bash
 python -m pip install swebench==4.1.0
@@ -294,8 +329,8 @@ examples/mini_swe/data/
 
 ```bash
 python -c "from minisweagent.agents.default import DefaultAgent; print('mini-swe-agent OK')"
-python -c "import swebench; print('swebench', swebench.__version__)"
 python -c "from examples.mini_swe.swebench_grader import grade_fresh_container; print('grader OK')"
+python -c "from examples.mini_swe.grading.payload import grader_zip_bytes; print('grading payload', len(grader_zip_bytes()), 'bytes: OK')"
 docker run --rm xingyaoww/sweb.eval.x86_64.getmoto_s_moto-7365:latest true && echo "SWE-Gym image OK"
 ray status | head -5
 ```
@@ -334,19 +369,23 @@ TEST_FILE="$(pwd)/examples/mini_swe/data/swe_gym_claude/train.parquet" \
 bash examples/mini_swe/fsdp_qwen_7b_swe_gym.sh
 ```
 
-The task image should ideally contain the selected CLI. If it does not, the
-example config runs each project's official installation command inside the
-disposable agent sandbox. Prebuilt images avoid repeated package installation
-and are recommended for throughput. `callback_base_url` is only needed when a remote
-backend cannot reach the worker's configured SessionRouter origin; local Docker
-rewrites loopback through `host.docker.internal` automatically.
+Before launching, complete the harness preprocessing in
+[Harness training: preprocessing & bake](#harness-training-preprocessing--bake):
+build the native runtime trees and export `PSRL_HARNESS_RUNTIME_ROOT` (required),
+and optionally bake the per-image derivative **on every worker host that creates
+sandboxes**. Without the bake the runtime git probe has to purge any leaked image
+metadata — a missing bake never blocks training, it only costs throughput.
+`callback_base_url` is only needed when a remote backend cannot reach the
+worker's configured SessionRouter origin; local Docker rewrites loopback
+through `host.docker.internal` automatically.
 
 Lifecycle ordering is: create `session_id`, acquire the task sandbox, optionally
-snapshot the clean filesystem, prepare and run the harness, fetch all TITO
-trajectories, destroy the agent sandbox and session, then grade the captured
-patch in a separate clean sandbox. Cancelling the loop cancels the active CLI
-exec and releases the sandbox lease; SessionRouter deletion drains any in-flight
-inference request before removing session state.
+snapshot the clean filesystem, run the sandbox-init hook (git sanitization),
+prepare and run the harness, fetch all TITO trajectories, destroy the agent
+sandbox and session, then grade the captured patch in a separate clean sandbox.
+Cancelling the loop cancels the active CLI exec and releases the sandbox lease;
+SessionRouter deletion drains any in-flight inference request before removing
+session state.
 
 #### Extending harness training to another task
 
@@ -356,14 +395,16 @@ subclasses it and supplies only the following hooks:
 | Hook | Task responsibility |
 |------|---------------------|
 | `prepare_harness_task` | Return prompt, rollout `SandboxSpec`, backend, and opaque task state |
+| `prepare_harness_sandbox` | Optionally initialize the acquired sandbox (e.g. git sanitization) and add timing entries |
 | `collect_harness_artifact` | Optionally collect a patch, answer file, or other result before sandbox deletion |
 | `finalize_harness_task` | Optionally grade the artifact in a clean environment and return reward fields |
 | `close_harness_task` | Release task-only resources such as environments or concurrency slots |
 
 Only `prepare_harness_task` is abstract. Tasks without artifacts or an external
 grader can use the other default implementations. The generic layer owns session
-creation/deletion, sandbox leases, harness abort, TITO collection, trajectory
-validation, response capping, reward dispatch, and snapshot cleanup.
+creation/deletion, sandbox leases, sandbox init timing, harness abort, TITO
+collection, trajectory validation, response capping, reward dispatch, and
+snapshot cleanup.
 
 ```python
 class MyHarnessAgentLoop(HarnessAgentLoop):
@@ -468,115 +509,171 @@ being discarded. Lower values are more on-policy; higher values increase through
 
 ---
 
-## Claude Code harness: sandbox preparation
+## Harness training: preprocessing & bake
 
-This section documents how the **`claude_code` harness** (`mini_swe_claude_code`
-in `config/swebench_harness_config.yaml`) prepares its per-task sandboxes:
-the host tarball artifacts, the optional baked template image, and where the
-flow differs from the **mini-SWE-agent** training prepare path. The `codex`
-harness follows the same tarball/bake flow.
+Canonical reference for running a **harness** (Claude Code or Codex) instead of
+mini-SWE-agent's native loop. The `claude_code` harness is `mini_swe_claude_code`
+and the Codex harness is `mini_swe_codex`, both defined in
+`config/swebench_harness_config.yaml` and selected by the data's `agent_name`.
 
-### 1. Tarball artifacts (host-side, one-time download)
+Harness mode needs everything the native path needs (task parquet + prefetched
+per-problem images) plus two host-side preparations: the read-only harness
+runtime trees (§1) and, optionally, the git-purged per-image derivative (§2).
+Do them **once per host that creates sandboxes**; the runtime trees live on the
+shared filesystem, the baked images are node-local.
 
-The Claude Code CLI is an npm package. Two host artifacts are mounted into every
-rollout sandbox (read-only) via `examples/mini_swe/runner.py`:
+| # | Step | Reference |
+|---|------|-----------|
+| 1 | Build the task parquet; set `--agent-name mini_swe_claude_code` / `mini_swe_codex` (the prepared launch scripts also pin `default_agent_loop`) | [`prepare/README.md`](prepare/README.md) Path C |
+| 2 | Prefetch and fan out the per-problem base images to every worker node | [`prepare/README.md`](prepare/README.md) Path C Step 2 |
+| 3 | Build the native harness runtime trees and export `PSRL_HARNESS_RUNTIME_ROOT` | §1 |
+| 4 | Bake the per-image derivative (**git-leak purge** only; optional) | §2 |
+| 5 | Launch with `TRAJECTORY_ID_STRATEGY=auto` and the harness agent-loop config | §4 |
 
-| Host env var | Mount target | Contents |
-|--------------|--------------|----------|
-| `AGENT_NODE_TARBALL` | `/tmp/node22.tarball` | Node 22 runtime tarball (`.xz` or plain `.tar`) |
-| `AGENT_CC_TARBALL` | `/tmp/claude-code.tgz` | `@anthropic-ai/claude-code` **wrapper** npm tarball (~24 KB; the ~90 MB platform binary is an `optionalDependencies` entry fetched by npm) |
-| `AGENT_CODEX_TARBALL` | `/tmp/codex.tgz` | codex wrapper tarball (codex harness only) |
+Step 4 is optional but recommended. A missing bake never blocks training: the
+sandbox falls back to the runtime git probe, which purges only images that
+actually leak (see §2).
 
-Set them in the launch environment (e.g. `megatron_qwen_4b_swe_smith.sh`):
+### 1. Harness runtime trees (host-side, read-only mount)
+
+The harness executables are **self-contained native binaries** — Claude Code
+2.1.233 (linux-x64) and Codex 0.154.0 (linux-x64). There is no Node, no npm and
+no in-sandbox installation. Each sandbox binds one runtime tree read-only; the
+mount path is the harness config's `runtime_mount` (default `/opt/harness`) and
+the executable resolves to `<runtime_mount>/bin/<executable>`.
+
+| Host env var | Layout | In-sandbox mount |
+|--------------|--------|------------------|
+| `PSRL_HARNESS_RUNTIME_ROOT` | `<root>/<kind>/bin/<executable>` | `<harness.runtime_mount>` (default `/opt/harness`) |
+
+Build it once on the shared filesystem (idempotent; verifies the pinned Claude
+Code sha256 and runs `<bin> --version`):
 
 ```bash
-export AGENT_NODE_TARBALL="/shared/artifacts/node-v22-linux-x64.tar.xz"
-export AGENT_CC_TARBALL="/shared/artifacts/anthropic-ai-claude-code-2.1.233.tgz"
+export PSRL_HARNESS_RUNTIME_ROOT=/shared/psrl/harness-runtimes
+bash examples/mini_swe/prepare/docker_scripts/build_harness_runtimes.sh
+# -> $PSRL_HARNESS_RUNTIME_ROOT/claude_code/bin/claude
+#    $PSRL_HARNESS_RUNTIME_ROOT/codex/bin/codex
 ```
 
-They are propagated to Ray workers via `_HOST_RUNTIME_ENV_KEYS`
-(`psrl/trainer/constants_ppo.py`). Keep the CLI tarball version in sync with
-the platform package (the bake tag and the `check_command` both derive from it).
+`NPM_REGISTRY` defaults to `registry.npmjs.org`; point it at a mirror (e.g.
+`https://mirrors.tencent.com/npm`) when the host cannot reach npmjs.org
+directly. The root is propagated to Ray workers via `_HOST_RUNTIME_ENV_KEYS`
+(`psrl/trainer/constants_ppo.py`).
 
-### 2. Per-sandbox install (fallback path)
+Per trajectory the harness setup is a **single round trip** — create the state
+directory and run `<runtime_mount>/bin/<executable> --version`. No install, no
+network fetch, and no write to `/usr/local`: the task image's Node (if any) is
+never touched.
 
-When the sandbox image does **not** already contain the CLI, `Harness.prepare`
-runs `_install_cli` (`psrl/workers/agent_loop/harness/base.py`):
+Backend note: bind mounts require host-mount support. Docker has it; a microVM
+backend (E2B / Cube / AgentEnv) does not, and the sandbox manager rejects the
+spec — those backends must provision the runtime into their template instead.
 
-1. Ensure a usable runtime: prefer a base image that ships Node ≥ 18 + npm;
-   otherwise extract the mounted Node 22 tarball into `/opt/node22` with
-   `tar --no-same-owner` (the official tarball is owned by `uid 1000`/`iojs`,
-   and sandboxes that deny chown would otherwise fail) and symlink
-   `node`/`npm`/`npx` into `/usr/local/bin`.
-2. `npm install -g --prefix=/usr/local --no-audit --no-fund --prefer-offline <cli.tgz>`
-   — `--prefer-offline` consumes a pre-seeded npm cache when present so only
-   cache misses touch the registry.
-3. Run the harness `check_command` (`/usr/local/bin/claude --version`).
-
-The registry fetch relies on the proxy env (`http_proxy`/`https_proxy`/
-`no_proxy`) forwarded from the launch host into every sandbox — both rollout and
-grader containers get it via `forward_env` in `runner.py`. `mirrors.tencent.com`
-is in `no_proxy`, so the npm mirror is reached directly.
-
-### 3. Baked per-image harness derivatives (recommended, removes the install)
+### 2. Per-image bake (git purge only, optional)
 
 Each SWE task uses its **own** per-problem base image (the parquet's
 `sandbox_overrides.environment.image` — e.g. `swebench/swesmith.x86_64.*`), so
 there is no single "harness image". `bake_harness_image.sh` derives one image
-per base — `psrl/swebench-harness:<sha12(base)>` — that adds Node + npm, the
-Claude Code CLI, and a seeded npm cache:
+per base — `psrl/swebench-harness:<sha12(revision:base)>` — that **purges leaked
+git metadata** (remotes, refs, reflog, unreachable objects) so an agent can
+never read a future fix commit from the image. The harness executable is **not**
+baked: it is mounted read-only (§1).
+
+Bake every unique image referenced by the train/validation parquets, **on each
+worker host that creates sandboxes** (Docker images are node-local):
 
 ```bash
-# one-time, per worker host that creates sandboxes:
+# every unique image in a parquet:
 bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
-  swebench/swesmith.x86_64.foo:latest          # bake one image
-# or bake every unique image referenced by a parquet:
+  --parquet examples/mini_swe/data/swe_gym_293/train.parquet
+# a single image:
 bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
-  --parquet examples/mini_swe/data/swe_smith_py_1k/train.parquet
+  swebench/swesmith.x86_64.foo:latest
 ```
 
-What it does per image: decompress the Node tarball on the host once (cached),
-create a container from the base image with the two tarballs mounted **plus the
-host proxy env and `NPM_REGISTRY` forwarded** (default `mirrors.tencent.com/npm`,
-reached directly via `no_proxy`), run the same install command as §2 (seeding a
-shared host npm cache at `NPM_CACHE_DIR` so the ~90 MB platform package is
-downloaded once, not per image), then `docker commit`.
+What it does per image: start a container from the base image, run the git
+purge, then `docker commit`. A per-image host lock serializes concurrent bakes
+of the same image.
+
+Verify a baked image is git-clean:
+
+```bash
+tag=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^psrl/swebench-harness:' | head -1)
+docker run --rm "$tag" bash -lc \
+  'cd /testbed && echo "remotes=[$(git remote)]" && echo "leaked=$(git rev-list --count --all --reflog --not HEAD)"'
+# expected: remotes=[] and leaked=0
+```
 
 * `runner.py` selects the derivative automatically: for each task it computes
   `psrl/swebench-harness:<sha12(task-image)>` and uses it when present, else
-  falls back to the task image + the §2 tarball install — **a missing bake never
+  falls back to the task image + the runtime git probe — **a missing bake never
   blocks training**.
-* Idempotent: re-bake only when a base image or the CLI/node version changes.
+* **Tag revision**: the digest includes `BAKE_REVISION` (currently
+  `v3-gitclean`). Bump it in `bake_harness_image.sh` *and*
+  `runner.py:_IMAGE_BAKE_REVISION` together to invalidate old derivatives after
+  changing the bake steps; a test asserts the two stay in sync.
+* **Runtime fallback**: on a host without the derivative, the harness loop runs
+  a cheap git probe (`examples/mini_swe/git_sanitize.py`) before the agent
+  starts and purges only when it detects a leak. Probe/purge timings show up in
+  the trajectory `[Time Breakdown]` as `sandbox_init` / `git_probe` / `git_purge`
+  (raw metrics `git_leak_detected` / `git_sanitize_error` are on the reward
+  info). A purge failure is logged and degraded, never fatal.
+* **Knobs**: `PSRL_BAKE_WORKDIR` (default `/testbed`),
+  `PSRL_BAKE_SKIP_GIT_CLEAN=1`, `PSRL_HARNESS_IMAGE_TAG` (single-image mode).
 * Local-only images: on multi-host clusters run the bake on every host, or
   distribute with `docker save`/`docker load`, or `docker push` to a registry.
 
-### 4. Differences vs. the mini-SWE-agent training prepare flow
+### 3. Differences vs. the mini-SWE-agent training prepare flow
 
 | Aspect | mini-SWE-agent | `claude_code` harness |
 |--------|----------------|------------------------|
-| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: npm-installed inside each sandbox, or baked into the template image |
-| Per-sandbox install | None (pure Python on the host) | Node 22 extraction + `npm install -g <tarball>` (eliminated by the bake) |
-| Network dependency | None at rollout time | npm registry fetch (proxy forwarded; offline via baked cache) |
-| System prompt / tools | Native mini-SWE-agent template | Claude Code stock system prompt is retained; task and integrity constraints are in the user prompt, while `tools` limits execution to `Bash`, `Read`, `Edit`, `Write`, `Glob`, and `Grep` |
-| Permission mode | n/a | `permission_mode: default` — Claude rejects `bypassPermissions` as root; tools are pre-allowed instead |
-| Compaction | n/a | `compaction: context_window_tokens=65536, safety_tokens=8192` drives the prompt-too-long limit and Claude's reactive compaction |
-| Sandbox image | Per-task image as-is | Per-image baked derivative `psrl/swebench-harness:<sha12>` when present, else the per-task image + install |
+| CLI / agent location | Host-side Python library (`pip install mini-swe-agent`), imported by the runner | **Sandbox-resident CLI**: a self-contained native binary (Claude Code 2.1.233 / Codex 0.154.0), bind-mounted read-only from the host runtime tree — no Node, no npm |
+| Per-sandbox install | None (pure Python on the host) | **None** — a single `<runtime_mount>/bin/<executable> --version` probe; the executable is mounted read-only |
+| Network dependency | None at rollout time | None at rollout time: the runtime tree is built ahead of time (`build_harness_runtimes.sh`) |
+| System prompt / tools | Native mini-SWE-agent template | Keeps Claude Code's stock system prompt (`system_prompt_mode: none`) and full default tool catalog (`tools: null`); task + integrity rules ride in the user message, and safety is enforced post-hoc by the integrity scan |
+| Permission mode | n/a | `permission_mode: acceptEdits` (Claude rejects `bypassPermissions` as root); headless-required tools are pre-approved via `permissions.allow` in `settings.json`, and `subagents_enabled: false` adds an `Agent` deny rule |
+| Compaction | n/a | `compaction.compact_percent` (Claude `87.5`, Codex `75`) triggers auto-compact at that share of the rollout `max_model_len`; the same threshold drives the `x-smg-prompt-too-long-limit` header |
+| Sandbox image | Per-task image as-is | Per-image baked derivative `psrl/swebench-harness:<sha12>` (git purge only) when present, else the per-task image + runtime git probe |
+| Git hygiene | Image git state left as-is | The baked derivative purges remotes/refs/reflog/unreachable objects; an unbaked image gets a runtime probe + conditional purge before the harness starts |
+| Integrity / anti-cheat | n/a | Trajectory scan dispatched on `trajectory_format` (Claude stream-json / Codex JSONL) **plus** an independent final-patch re-check, so a trajectory violation cannot hide a protected-path edit |
 | Grading | Fresh container from the SWE problem image | Same fresh-container grader; additionally supports **clean-snapshot reuse** — the clean rollout sandbox is `docker commit`ted (`FILESYSTEM_SNAPSHOT` + `RESTORE` on the docker backend) and the grader restores from it, avoiding a fresh cold start |
-| Prep instrumentation | n/a | Trajectory dump emits a fine-grained `prep` breakdown: `task` / `sandbox` / `snapshot` / `install` |
+| Prep instrumentation | n/a | Trajectory dump emits a fine-grained `prep` breakdown: `task` / `sandbox` / `snapshot` / `sandbox_init` / `git_probe` / `git_purge` / `harness_prepare` |
+
+### 4. Launching harness training
+
+Point the trainer at the harness agent-loop config and a parquet whose
+`agent_name` selects the harness. Harness mode requires TITO auto trajectory IDs
+so sub-agent / compaction branches stay in one session:
+
+```bash
+AGENT_LOOP_CONFIG_PATH="$(pwd)/examples/mini_swe/config/swebench_harness_config.yaml" \
+TRAJECTORY_ID_STRATEGY=auto \
+TRAIN_FILE="$(pwd)/examples/mini_swe/data/swe_gym_293/train.parquet" \
+TEST_FILE="$(pwd)/examples/mini_swe/data/swe_gym_293/val.parquet" \
+bash examples/mini_swe/fsdp_qwen_7b_swe_gym.sh
+```
+
+`megatron_qwen_4b_swe_smith.sh` already defaults to the `mini_swe_claude_code` harness and `swebench_harness_config.yaml`.
 
 ### 5. Gotchas
 
-* **Node tarball ownership**: the official Node tarball is owned by
-  `iojs/iojs` (uid 1000). Extraction **must** use `--no-same-owner`, or
-  sandboxes that deny chown fail with `tar: Cannot change ownership … Operation
-  not permitted`.
-* **Wrapper vs. binary**: `claude-code.tgz` is only the wrapper package; the
-  actual binary arrives via npm's `optionalDependencies`. Never mount a "binary"
-  directly — keep the tarball/bake flow uniform.
+* **Native binary, not npm**: the `@anthropic-ai/claude-code` npm package is only
+  a wrapper that downloads a platform binary as an `optionalDependencies` entry;
+  PSRL fetches that platform binary directly (sha256-pinned) and mounts it, so no
+  Node/npm ever runs in a sandbox.
+* **Runtime tree must exist on every worker**: the mount source is resolved
+  node-locally, so `PSRL_HARNESS_RUNTIME_ROOT` must point at a shared path every
+  worker can read (same as the task images).
 * **Snapshot reuse safety**: `clean_snapshot_compatible` only allows reuse when
   the rollout sandbox has no content-bearing bind mounts the grader relies on
-  (harness tarball mounts are excluded), so repo-bind-mount configurations fall
-  back to a fresh grader.
+  (the read-only harness runtime mount is excluded), so repo-bind-mount
+  configurations fall back to a fresh grader.
+* **Bake is per host**: derivatives live in the node-local Docker daemon. A node
+  that was not baked still trains, but pays the runtime git probe every rollout.
+* **Host-mounted repos are skipped by the runtime purge**: if a task bind-mounts
+  a host checkout into the workdir, git sanitization is skipped to avoid mutating
+  the host; rely on the baked image or the image contract instead.
 
 ---
 
@@ -632,7 +729,7 @@ which is written by `prepare_swebench.py`.
 | Field | Category | Description |
 |-------|----------|-------------|
 | `rollout.multi_turn.enable` | Required | Must be `True` for mini-SWE-agent |
-| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode |
+| `rollout.multi_turn.max_turns` | Required | Max LLM generation turns per episode; training reads `gen_actor_rollout_ref`, validation reads `train_actor_rollout_ref` |
 | `sandbox_config.environment.image` | Data-affine | Docker image (overridden per-SWE-problem for SWE-smith path) |
 | `sandbox_config.environment.template` | Data-affine | Provider template/snapshot ID for AgentEnv or CubeSandbox |
 | `sandbox_config.environment.cwd` | Data-affine | Working directory inside container (`/testbed` for SWE-bench images) |
@@ -645,23 +742,30 @@ which is written by `prepare_swebench.py`.
 | `sandbox_config.policy_profile` | Infrastructure | Docker policy profile; set `null` for microVM providers |
 | `sandbox_config.snapshot_verifier` | Infrastructure | Use a capability-gated clean verifier snapshot when its spec matches exactly |
 | `sandbox_config.collect_resource_metrics` | Infrastructure | Sample per-trajectory memory/CPU once; disabled by default |
-| `sandbox_config.max_parallel_tasks_per_worker` | Infrastructure | Concurrency limit per node (`0` = unlimited) |
-| `agent.system_template` | Native required | Native mini-SWE-agent system prompt; Claude Code harness training preserves the CLI stock prompt |
+| `sandbox_config.sandbox_cpu_count` | Infrastructure | Per-container CPU request charged with the effective memory request against the node envelope |
+| `agent.system_template` | Native required | Native mini-SWE-agent system prompt; harnesses use their adapter-specific system prompt |
 | `agent.problem_template` | Native required | Native `instance_template`; harnesses preserve the same `<pr_description>` task boundary |
 | `agent.cost_limit` | Optional | LiteLLM cost limit per episode (`0.0` = unlimited) |
 
-Harness-specific Claude settings live under `harness`. The example leaves
-`system_prompt` unset so Claude Code keeps its stock prompt; task and integrity
-rules are rendered by `build_harness_prompt` as the user message. `tools` limits
-the tool catalog, and `compaction.context_window_tokens` is the CLI capacity.
-`max_output_tokens` is optional and defaults to the Claude Code behavior because
-neither the Dressage nor ProRL reference recipe sets
-`CLAUDE_CODE_MAX_OUTPUT_TOKENS`. Thinking, interleaved thinking, the optional
-thinking budget, ProRL-style `reasoning_effort` (`--effort`), and advertised
-model capabilities are independently configurable. The example follows
-Dressage by enabling thinking/interleaving, leaving both the fixed budget and
-effort unset, and advertising `thinking`, `adaptive_thinking`, and
-`interleaved_thinking`.
+Harness settings live under `harness` in `swebench_harness_config.yaml`:
+
+| Field | Effect |
+|-------|--------|
+| `kind` | Harness adapter to run (`claude_code`, `codex`). |
+| `tools` | `null` keeps the CLI's full default tool catalog; a string pins `--tools` and restricts it. |
+| `allowed_permissions` | Headless pre-approval rules written to `settings.json` `permissions.allow`; does not restrict the catalog. |
+| `permission_mode` | CLI permission mode (`acceptEdits`; Claude rejects `bypassPermissions` as root). |
+| `system_prompt` / `system_prompt_mode` | `none` keeps the CLI's stock system prompt; `append` / `replace` inject or replace it. |
+| `subagents_enabled` | `false` denies the Claude `Agent` tool and background tasks. |
+| `compaction.compact_percent` | Share of the rollout `max_model_len` at which the CLI auto-compacts (same threshold drives the `x-smg-prompt-too-long-limit` header). |
+| `trajectory_format` | Integrity-scan dispatch key: `claude_code_stream_json`, `codex_jsonl`, `auto`, or `plain_text`. |
+| `runtime_mount` | In-sandbox path of the read-only runtime tree; executable resolves to `<runtime_mount>/bin/<executable>` (default `/opt/harness`). |
+
+The context window is the effective rollout `max_model_len` — there is no
+separate harness window knob. Training episodes read
+`gen_actor_rollout_ref.rollout`, validation episodes read
+`train_actor_rollout_ref.rollout`, so `max_model_len` and `multi_turn.max_turns`
+can differ between the two.
 
 ---
 
@@ -723,17 +827,14 @@ FAIL_TO_PASS tests pass and all PASS_TO_PASS tests still pass):
 
 | Condition | `score` (→ loss) | `acc` (→ wandb) |
 |-----------|-----------------|-----------------|
-| All F2P pass, no P2P regressions | `1.0` | `1.0` |
-| Patch or trajectory integrity violation | `0.0` | `0.0` |
-| Not resolved (patch failed, tests failed) | `0.0` with `binary_01`; `-1.0` with legacy `binary` | `0.0` |
+| All F2P pass, no P2P regressions | `+1.0` | `1.0` |
+| Patch modified test or config files | `0.0` (policy violation — not penalised) | `0.0` |
+| Not resolved (patch failed, tests failed) | `-1.0` | `0.0` |
 | No patch submitted / 0 turns (aborted) | `0.0` | `0.0` |
 
-The Claude Code recipe uses `binary_01` to match Dressage and ProRL. Existing
-Mini-SWE recipes keep the legacy signed `binary` mode, so GAE, REINFORCE, and
-non-normalized GRPO runs do not silently change scale. For normalized GRPO,
-`{0, 1}` and `{-1, +1}` are positive affine transforms and produce the same
-group-normalized advantages. The `score` field drives the policy-gradient loss;
-`acc` separately tracks resolve rate.
+The `{-1, 0, +1}` convention. The `score` field drives the
+policy gradient loss; the `acc` field is a separate metric for tracking resolve
+rate. Both are visible in wandb as `train/score` and `train/acc`.
 
 **Patch policy rules** (configurable via environment variables):
 
@@ -741,15 +842,7 @@ group-normalized advantages. The `score` field drives the policy-gradient loss;
 |---------|---------|--------|
 | `SWE_STRICT_NO_TEST_PATCH` | `1` | Reject patches that modify FAIL_TO_PASS / PASS_TO_PASS test files |
 | `SWE_STRICT_NO_CONFIG_PATCH` | `1` | Reject patches that modify `pyproject.toml`, `setup.py`, etc. |
-| `SWE_TEST_PATCH_POLICY_SCOPE` | `eval_tests_only` | `all_tests` to also reject changes to non-eval test files; the Claude Code launcher exports `all_tests` |
-
-The Claude Code path also scans its JSONL tool trace after rollout. Accessing
-the task repository or mirrors through network tools, or writing test/evaluator
-paths and later reverting them, marks the rollout as an integrity violation.
-An unavailable trace fails closed with zero reward instead of bypassing the
-check.
-Patch extraction stages all files and diffs against the task's declared
-`base_commit`, so untracked files and agent-created commits are both preserved.
+| `SWE_TEST_PATCH_POLICY_SCOPE` | `eval_tests_only` | `all_tests` to also reject changes to non-eval test files |
 
 ---
 
@@ -764,7 +857,7 @@ Patch extraction stages all files and diffs against the task's declared
 | `eval_script missing` error in grader | SWE-Gym parquet missing eval_script | Re-run `prepare_swe_gym.py` (full dataset requires SWE-Bench-Fork 2.0.13) |
 | Grader always returns `resolved=False` | Image pull failing silently | Check `grading.json` in the eval output dir for error messages |
 | No patch found | Agent hit turn limit without submitting | Increase `max_turns` |
-| OOM during rollout | Too many concurrent containers | Reduce `max_parallel_tasks_per_worker` or lower `train_prompt_bsz` |
+| OOM during rollout | The sandbox node envelope overlaps too much with co-located services | Set `gen_actor_rollout_ref.rollout.agent.sandbox.capacity.memory_mb` explicitly or lower its single `utilization` value; verify each rollout/grader memory request |
 | `alignment_failed` every episode | Context truncation | Reduce `max_prompt_length` or increase `max_model_len` |
 
 ### Emergency cleanup

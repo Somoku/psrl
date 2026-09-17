@@ -419,7 +419,7 @@ pull_image() {
             echo "  [cached-tar] $img  ($tar_path)"
             init_log "$log_path" \
                 "========================================================" \
-                "  已经拥有了 $img" \
+                "  Already have $img" \
                 "  tar      : $tar_path ($(du -h "$tar_path" | cut -f1))" \
                 "  verified : tar -tf passed, manifest.json present" \
                 "  checked  : $(date -Iseconds)" \
@@ -604,7 +604,7 @@ is_cached() {
 
 # Pre-scan purely for the human-readable summary banner. Every image — cached
 # OR to-pull — is then dispatched through pull_image so each one gets a log
-# file (the cache short-circuit in pull_image writes a "已经拥有了" log and
+# file (the cache short-circuit in pull_image writes a "Already have" log and
 # exits quickly; no re-pull is done).
 TO_PULL=()
 CACHED_IMAGES=()

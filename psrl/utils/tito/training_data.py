@@ -157,7 +157,7 @@ def build_training_data(
             # Non-last turn: at most max_trim_tokens (typically 0 or 1).
             allowed = max_trim_tokens  # is_last already guarded above
             if trim_count > allowed:
-                # miles-style: a boundary divergence beyond the model's ceiling
+                # A boundary divergence beyond the model's ceiling
                 # (e.g. a truncated turn, or a response that embeds a special
                 # token mid-stream) is a diagnostic condition, not a reason to
                 # discard the whole trajectory. Clamp the trim to the allowed

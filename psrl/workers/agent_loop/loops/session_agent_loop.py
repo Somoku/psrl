@@ -320,7 +320,7 @@ class SessionAgentLoop(AgentLoopBase):
     def _validate_records(records: list[dict]) -> None:
         for turn, record in enumerate(records):
             for mismatch in record.get("mismatch_report", []):
-                # miles-style: the TITO re-tokenization comparator is a DEBUG
+                # The TITO re-tokenization comparator is a DEBUG
                 # diagnostic, not a correctness gate. Its mismatches legitimately
                 # fire on truncated generations (finish_reason=length) and on
                 # responses that embed a special token mid-stream — both produce

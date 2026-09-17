@@ -13,7 +13,7 @@
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop_v1.MiniSWEAgentLoopV1
   sandbox_config:
     # Cross-process file-lock slots cap all AgentLoopWorkers on one node.
-    max_parallel_tasks_per_worker: 8
+    sandbox_cpu_count: 2
     collect_resource_metrics: ${oc.decode:${oc.env:PSRL_SANDBOX_COLLECT_RESOURCE_METRICS,false}}
     rollout_turn_timeout: 1800
     environment:

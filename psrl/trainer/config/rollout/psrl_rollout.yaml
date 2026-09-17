@@ -175,10 +175,23 @@ agent:
 
     default_backend: docker
 
+    # One node envelope shared by every Docker sandbox on that node. Null uses
+    # the node's cgroup/machine limit; utilization is the sole safety margin.
+    capacity:
+      memory_mb: null
+      cpu_cores: null
+      utilization: 0.5
+
     backends:
 
       docker:
         _target_: psrl.sandbox.backends.DockerBackend
+
+        # One owner lease per worker drives node-level garbage collection. The
+        # lease directory must be visible to every worker using the same daemon;
+        # mount it from the host when workers run in containers.
+        lifecycle:
+          heartbeat_dir: /tmp/psrl-sandbox-heartbeats
 
         # Rootless is opt-in because existing clusters may still use a rootful
         # node-local daemon. Set require_rootless=true after daemon migration.

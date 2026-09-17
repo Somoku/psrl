@@ -300,6 +300,11 @@ class SandboxBackend(ABC):
     def capabilities(self) -> SandboxCapabilities:
         """Return capabilities available to newly created sessions."""
 
+    @property
+    def uses_node_capacity(self) -> bool:
+        """Return whether sessions consume resources on the worker's node."""
+        return False
+
     @abstractmethod
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         """Create a session from a portable specification."""
@@ -307,6 +312,14 @@ class SandboxBackend(ABC):
     @abstractmethod
     async def connect(self, sandbox_id: str) -> SandboxSession:
         """Connect to and, when necessary, resume a session."""
+
+    async def prepare(self, spec: SandboxSpec) -> None:
+        """
+        Warm reusable artifacts without allocating a sandbox or capacity lease.
+
+        Backends without artifact preparation may leave this as a no-op.
+        """
+        return None
 
     async def restore(self, snapshot: SnapshotRef, spec: SandboxSpec | None = None) -> SandboxSession:
         """Create a session from a snapshot when supported."""

@@ -5,7 +5,7 @@ import math
 import os
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -64,6 +64,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
+from psrl.sandbox.capacity import SandboxCapacityCoordinator
 from psrl.trainer.ppo.batch_schedule import (
     TRAJECTORY_AGG_MODE,
     BatchScheduleStep,
@@ -1858,13 +1859,30 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         # Distribute agent loop workers across cluster nodes round-robin so that
         # Docker containers are spread across machines instead of piling up on one.
         alive_node_ids = [n["NodeID"] for n in ray.nodes() if n["Alive"]]
-        for i in range(num_agent_workers):
-            node_id = alive_node_ids[i % len(alive_node_ids)]
+        worker_node_ids = [alive_node_ids[i % len(alive_node_ids)] for i in range(num_agent_workers)]
+        workers_per_node = Counter(worker_node_ids)
+        sandbox_config = self.config.gen_actor_rollout_ref.rollout.agent.sandbox
+        use_node_capacity = any(
+            str(backend.get("_target_", "")).endswith("DockerBackend") for backend in sandbox_config.backends.values()
+        )
+        capacity_config = (
+            OmegaConf.to_container(sandbox_config.get("capacity", {}), resolve=True) if use_node_capacity else None
+        )
+        capacity_coordinators = {}
+        for i, node_id in enumerate(worker_node_ids):
+            if use_node_capacity and node_id not in capacity_coordinators:
+                coordinator_concurrency = workers_per_node[node_id] * (max_concurrency_per_worker + 1) + 1
+                capacity_coordinators[node_id] = ray.remote(SandboxCapacityCoordinator).options(
+                    num_cpus=0,
+                    max_concurrency=coordinator_concurrency,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+                ).remote(capacity_config)
+            capacity_coordinator = capacity_coordinators.get(node_id)
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(
                     name=f"agent_loop_worker_{i}",
                     max_concurrency=max_concurrency_per_worker,
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=True),
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=not use_node_capacity),
                 ).remote(
                     self.config,
                     self.ps_manager_handle,
@@ -1872,9 +1890,17 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
                     self.session_router_url,
                     worker_id=i,
                     worker_num=num_agent_workers,
+                    capacity_coordinator=capacity_coordinator,
                 )
             )
-            psrl_logger.info(f"Agent loop worker {i} scheduled on node {node_id} (soft=True).")
+            psrl_logger.info(
+                f"Agent loop worker {i} scheduled on node {node_id!r} (node_capacity={use_node_capacity!r})."
+            )
+        self.sandbox_capacity_coordinators = capacity_coordinators
+        if capacity_coordinators:
+            snapshots = ray.get([coordinator.snapshot.remote() for coordinator in capacity_coordinators.values()])
+            for node_id, snapshot in zip(capacity_coordinators, snapshots, strict=True):
+                psrl_logger.info(f"Sandbox capacity on node {node_id!r}: {snapshot!r}.")
 
         # start rollout coordinator
         self.init_rollout_coordinator()

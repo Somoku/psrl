@@ -205,8 +205,7 @@ psrl/
 │   │   ├── cluster_topology.py   # ClusterTopology / GPUSlot / InstanceStatus
 │   │   └── diagnostics.py        # Backlog diagnostics logging
 │   │
-│   ├── concurrency/              # ★ NEW: cross-process limiters
-│   │   ├── slot.py               # fcntl file-lock slot limiter
+│   ├── concurrency/              # Process-local concurrency utilities
 │   │   └── token_bucket.py       # rate limiting
 │   │
 │   ├── checkpoint/               # ★ NEW: checkpoint helpers
@@ -293,7 +292,7 @@ deprecated/          # ★ Top-level graveyard: pre-SMG code, not imported by an
 examples/
 ├── mini_swe/        # ★ SWE-bench RL recipe: fsdp_/megatron_ launch scripts (7B–32B, swe_gym +
 │                    #   swe_smith), config.py, reward.py, swebench_grader.py, runner.py,
-│                    #   config/, data/, eval/, prepare/, plus checked-in run logs
+│                    #   config/, data/, eval/, prepare/, utils/, plus checked-in run logs
 ├── dapo_trainer/    # DAPO recipes (fsdp + megatron, 3B–70B)
 ├── tx/              # Qwen3 / Qwen3.5 launch scripts (8B/32B, 4B/35B-A3B)
 ├── anaylsis/        # [sic] Rollout analysis plots: plot_request_route_timeline.py,
@@ -400,7 +399,9 @@ Templates: `ppo_trainer.yaml` (FSDP) / `ppo_megatron_trainer.yaml` (Megatron).
 |-------|------|------|
 | `SandboxManager` / `SandboxLease` | `sandbox/manager.py` | Worker registry, idempotent create, capability/state-policy gates and lifecycle ownership |
 | `SyncSandboxManager` / `SyncSandboxSession` | `sandbox/sync.py` | Thread facade over the owning worker event loop; no extra backend client/loop |
-| `DockerBackend` | `sandbox/backends/docker.py` | Persistent Engine API data/lifecycle plane, security policy, metrics and crash-reaper ownership |
+| `DockerBackend` | `sandbox/backends/docker.py` | Persistent Engine API data plane, typed security/disk policy, container limits and metrics |
+| `DockerLifecycle` | `sandbox/backends/docker_lifecycle.py` | Worker owner lease, graceful cleanup and restartable node-level crash collector |
+| `SandboxCapacityCoordinator` | `sandbox/capacity.py` | One Ray actor per node; weighted CPU+memory admission using actual sandbox requests |
 | `AgentEnvBackend` | `sandbox/backends/e2b.py` | AgentEnv image/template factory plus native full-state fork/snapshot driver |
 | `CubeSandboxBackend` | `sandbox/backends/e2b.py` | Cube template factory plus snapshot/restore branch driver |
 

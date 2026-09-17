@@ -21,9 +21,6 @@ from omegaconf import DictConfig, OmegaConf
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-MINI_SWE_SLOT_PREFIX = "psrl_mini_swe_agent_slots"
-
-
 # ---------------------------------------------------------------------------
 # Nested structured dataclasses
 # ---------------------------------------------------------------------------
@@ -48,7 +45,6 @@ class MiniEnvironmentConfig:
         }
     )
     forward_env: list[str] = field(default_factory=list)
-    mount_harness_tarballs: bool = False
     memory: str | int | None = "8g"
     container_timeout: str = "2h"
     # Default shell-command timeout; case-specific mappings may override it.
@@ -61,7 +57,9 @@ class MiniSandboxConfig:
     PSRL-side orchestration settings (not passed to mini-swe-agent directly).
     """
 
-    max_parallel_tasks_per_worker: int = 0
+    # Per-sandbox CPU request. Node-wide admission uses this value together
+    # with the effective rollout or grader memory request.
+    sandbox_cpu_count: int = 2
     backend: str | None = None
     policy_profile: str | None = "mini_swe"
     snapshot_verifier: bool = True

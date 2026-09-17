@@ -3,15 +3,14 @@
 import functools
 import hashlib
 import logging
-import math
 import os
 import re
 import subprocess
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
+from examples.mini_swe.grading.schema import GradingPlan
 from examples.mini_swe.harness_adapter import MiniSWEAgentAdapter, MiniSWEAgentConfig, RunnerCancelled
 from psrl.sandbox import (
     MountSpec,
@@ -20,9 +19,11 @@ from psrl.sandbox import (
     SandboxSource,
     SandboxSpec,
     SandboxStatePolicy,
+    SnapshotKind,
     SnapshotRef,
     SyncSandboxManager,
 )
+from psrl.sandbox.capacity import parse_memory_mb
 
 os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 
@@ -58,48 +59,6 @@ _PROXY_ENV_KEYS = [
     "NO_PROXY",
 ]
 
-_HARNESS_TARBALL_MOUNTS = (
-    ("AGENT_NODE_TARBALL", "/tmp/node22.tarball"),
-    ("AGENT_CC_TARBALL", "/tmp/claude-code.tgz"),
-    ("AGENT_CODEX_TARBALL", "/tmp/codex.tgz"),
-)
-
-
-def _harness_tarball_mounts(enabled: bool) -> tuple[MountSpec, ...]:
-    """Resolve optional host tarballs into read-only Docker mounts."""
-    if not enabled:
-        return ()
-
-    mounts: list[MountSpec] = []
-    for env_name, target in _HARNESS_TARBALL_MOUNTS:
-        source_value = os.environ.get(env_name)
-        if not source_value:
-            continue
-        source = Path(source_value).expanduser()
-        if not source.is_file():
-            raise RuntimeError(f"Harness tarball from {env_name} does not exist on the worker host: {source!s}.")
-        mounts.append(MountSpec(str(source), target, read_only=True))
-    return tuple(mounts)
-
-
-def _parse_memory_mb(value: str | int | None) -> int | None:
-    """Parse a Docker-style memory value into portable MiB."""
-    if value is None or value == "":
-        return None
-    if isinstance(value, int):
-        return max(1, math.ceil(value / (1024 * 1024)))
-    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", str(value).strip().lower())
-    if match is None:
-        raise ValueError(f"Invalid sandbox memory limit: {value!r}.")
-    amount = float(match.group(1))
-    multiplier = {
-        "": 1 / (1024 * 1024),
-        "k": 1 / 1024,
-        "m": 1,
-        "g": 1024,
-        "t": 1024 * 1024,
-    }[match.group(2)]
-    return max(1, math.ceil(amount * multiplier))
 
 
 def parse_duration_seconds(value: str | int | float | None) -> float | None:
@@ -115,15 +74,23 @@ def parse_duration_seconds(value: str | int | float | None) -> float | None:
 
 
 def _resolve_harness_sandbox_image(configured_image: str) -> str:
-    """Prefer the pre-baked per-image harness derivative when present.
+    """Prefer the pre-baked per-image derivative when present.
 
     Each SWE task uses its own per-problem base image (from the parquet's
     ``sandbox_overrides.environment.image``), so a single global baked image is
     meaningless here. ``bake_harness_image.sh`` derives one image per base:
-    ``psrl/swebench-harness:<sha12(base)>``. When that derivative exists on this
-    host, sandboxes start from it (no per-sandbox install); otherwise we fall
-    back to the original image + the tarball install — correct, just slower. A
-    missing bake must never block the run.
+    ``psrl/swebench-harness:<sha12(base)>``. The derivative purges leaked git
+    metadata, so a sandbox that starts from it already passes the runtime
+    git-leak probe. When the derivative is absent we fall back to the original
+    image + the runtime git sanitization — correct, just slower. A missing bake
+    must never block the run.
+
+    The tag keys on the base image alone, so changing the bake steps does not
+    invalidate an existing derivative. Re-run ``rebake_harness_image.sh`` after
+    such a change to replace the stale image.
+
+    The harness executable itself is never baked into the image: it comes from
+    the read-only runtime tree mounted by the harness loop.
     """
     baked = f"psrl/swebench-harness:{_image_digest(configured_image)}"
     if _docker_image_exists(baked):
@@ -183,8 +150,6 @@ def build_sandbox_spec(
     if not grading and not observation.get("use_preexisting_repo", True) and observation.get("repo_path"):
         mounts.append(MountSpec(str(observation["repo_path"]), "/testbed"))
         cwd = "/testbed"
-    if not grading:
-        mounts.extend(_harness_tarball_mounts(bool(container_config.get("mount_harness_tarballs", False))))
 
     task_id = str(observation.get("swe_task_id", ""))
     metadata = {"psrl.swe_task_id": task_id}
@@ -196,18 +161,22 @@ def build_sandbox_spec(
 
     sandbox_config = payload["runtime_config"]["sandbox_config"]
     selected_template = template or (container_config.get("template") if image is None else None)
-    # Prefer the per-image baked harness derivative (Node + CLI + npm cache,
-    # see prepare/docker_scripts/bake_harness_image.sh) so per-task installs are
-    # eliminated; falls back to the configured image when not baked. The grader
-    # keeps its explicit problem image (``image`` is non-None there).
+    # Prefer the per-image baked derivative (git-purged, see
+    # prepare/docker_scripts/bake_harness_image.sh); falls back to the configured
+    # image when not baked. The grader keeps its explicit problem image
+    # (``image`` is non-None there).
     resolved_image = image or _resolve_harness_sandbox_image(str(container_config["image"]))
     source = (
         SandboxSource.template(str(selected_template)) if selected_template else SandboxSource.image(resolved_image)
     )
     sandbox_prefix = str(payload.get("sandbox_prefix", task_id))
+    sandbox_cpu = sandbox_config.get("sandbox_cpu_count") or 0
     return SandboxSpec(
         source=source,
-        resources=ResourceSpec(memory_mb=_parse_memory_mb(container_config.get("memory"))),
+        resources=ResourceSpec(
+            cpu_count=float(sandbox_cpu) if sandbox_cpu else None,
+            memory_mb=parse_memory_mb(container_config.get("memory")),
+        ),
         workdir=cwd,
         metadata=metadata,
         env=sandbox_env,
@@ -290,7 +259,16 @@ def _grader_failure(swe_problem: dict[str, Any], error: str) -> dict[str, Any]:
 
 
 def _snapshot_matches_spec(snapshot: SnapshotRef, spec: SandboxSpec) -> bool:
-    """Return whether restoring a snapshot preserves verifier resources and image."""
+    """Return whether ``snapshot`` can seed the grading sandbox ``spec``.
+
+    A ``FILESYSTEM`` snapshot (docker commit) is self-contained: ``restore``
+    recreates the container from the committed image using the grader's own
+    source reference and resource flags, so neither has to match. A
+    ``FULL_STATE`` snapshot must be rebuilt with the exact same source and
+    resources, so those are compared.
+    """
+    if snapshot.kind == SnapshotKind.FILESYSTEM:
+        return True
     metadata = snapshot.metadata
     return (
         metadata.get("psrl.source_kind") == spec.source.kind.value
@@ -359,13 +337,10 @@ def grade_patch(
     try:
         from examples.mini_swe.swebench_grader import grade_fresh_container
 
-        grader_kind = (
-            "smith"
-            if observation.get("swe_restore_tests", False)
-            else "gym"
-            if swe_problem.get("eval_script")
-            else "verified"
-        )
+        # ``grader_kind`` only selects the SWE-smith pre/post steps (HEAD~1
+        # restore and test-file revert); grading itself is driven entirely by the
+        # frozen eval script + vendored parser.
+        grader_kind = "smith" if observation.get("swe_restore_tests", False) else "verified"
         grader_config = resolve_container_config(payload, grading=True)
         grader_spec = grader_spec or build_grader_spec(payload)
         if grader_spec is None:
@@ -386,6 +361,7 @@ def grade_patch(
             sandbox=sandbox,
             sandbox_spec=grader_spec,
             sandbox_snapshot=verifier_snapshot,
+            grading_plan=GradingPlan.from_swe_problem(swe_problem),
         )
     except Exception as exc:
         return _grader_failure(swe_problem, str(exc))

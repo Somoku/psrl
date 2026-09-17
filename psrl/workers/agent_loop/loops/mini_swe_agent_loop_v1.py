@@ -5,12 +5,11 @@ import os
 import threading
 from dataclasses import asdict
 
-from examples.mini_swe.config import MINI_SWE_SLOT_PREFIX, MiniSWEAgentRuntimeConfig, build_runtime_config
-from examples.mini_swe.runner import parse_duration_seconds, run_agent
+from examples.mini_swe.config import MiniSWEAgentRuntimeConfig, build_runtime_config
+from examples.mini_swe.runner import build_grader_spec, parse_duration_seconds, run_agent
 
 from psrl.environments import Environment
 from psrl.sandbox import SyncSandboxManager
-from psrl.utils.concurrency import SlotManager
 from psrl.workers.agent_loop.agent_data import AgentData, MiniSWEAgentData
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.loops.session_agent_loop import SessionAgentLoop
@@ -68,6 +67,14 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
         if episode_timeout is None:
             raise ValueError("MiniSWE container_timeout must be configured.")
         timeout = episode_timeout + 1200.0
+        grader_spec = build_grader_spec(payload)
+        prepare_task = (
+            asyncio.create_task(
+                self.sandbox_manager.prepare(grader_spec, backend=runtime_config.sandbox_config.backend)
+            )
+            if grader_spec is not None
+            else None
+        )
         cancel_event = threading.Event()
         runner = asyncio.get_running_loop().run_in_executor(
             _RUNNER_THREAD_POOL,
@@ -85,6 +92,12 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
             except Exception:
                 pass
             raise
+        finally:
+            if prepare_task is not None:
+                prepare_task.cancel()
+                results = await asyncio.gather(prepare_task, return_exceptions=True)
+                if isinstance(results[0], Exception):
+                    psrl_logger.warning(f"Grader image preparation failed: {results[0]!r}.")
 
     async def run(
         self,
@@ -109,24 +122,10 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
         agent_data.init_trajectory(request)
 
         session_id: str | None = None
-        run_slot: tuple[int, int] | None = None
         sync_sandbox = None
         try:
             runtime_config = observation["runtime_config"]
-            parallelism = runtime_config.sandbox_config.max_parallel_tasks_per_worker
-            if parallelism > 0:
-                namespace = os.path.join(
-                    str(self.config.trainer.project_name),
-                    str(self.config.trainer.experiment_name),
-                )
-                run_slot = await SlotManager.acquire(parallelism, namespace, prefix=MINI_SWE_SLOT_PREFIX)
-
             session_id = await self.create_session(request)
-            if self.sandbox_manager is None:
-                raise RuntimeError(
-                    "mini-SWE-agent requires rollout.agent.sandbox.default_backend; "
-                    "the training path no longer bypasses SandboxManager."
-                )
             sync_sandbox = self.sandbox_manager.sync(
                 backend=runtime_config.sandbox_config.backend,
             )
@@ -169,6 +168,5 @@ class MiniSWEAgentLoopV1(SessionAgentLoop):
                 try:
                     await env.close()
                 finally:
-                    SlotManager.release(run_slot)
                     if session_id is not None:
                         await self.delete_session(session_id)

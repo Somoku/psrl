@@ -50,6 +50,7 @@ class PSRL_AgentLoopWorker:
         session_router_url: str,
         worker_id: int = 0,
         worker_num: int = 1,
+        capacity_coordinator: ray.actor.ActorHandle | None = None,
     ):
         """Initialize agent loop worker.
 
@@ -60,6 +61,7 @@ class PSRL_AgentLoopWorker:
             session_router_url (str): URL of the session router.
             worker_id (int): Unique identifier for this worker instance.
             worker_num (int): Total number of worker instances.
+            capacity_coordinator: Node-local sandbox capacity coordinator.
         """
 
         # Per-actor identity used to label every Docker container this worker
@@ -93,8 +95,12 @@ class PSRL_AgentLoopWorker:
         self.ps_manager_handle = ps_manager_handle
         self.agent_loop_manager = None
         self.reward_manager = None
-        sandbox_config = OmegaConf.select(config, "gen_actor_rollout_ref.rollout.agent.sandbox")
-        self.sandbox_manager = build_sandbox_manager(sandbox_config)
+        sandbox_config = config.gen_actor_rollout_ref.rollout.agent.sandbox
+        self.sandbox_manager = build_sandbox_manager(
+            sandbox_config,
+            capacity_coordinator=capacity_coordinator,
+            owner_id=self._actor_id,
+        )
 
         n_rollout_instances = self.config.psrl.deployment.n_rollout_instances
         n_validate_instances = (
@@ -224,10 +230,9 @@ class PSRL_AgentLoopWorker:
                 self.busy_loop_task.cancel()
         if self.agent_programs:
             await asyncio.gather(*self.agent_programs, return_exceptions=True)
-        if self.sandbox_manager is not None:
-            metrics = {name: snapshot.as_dict() for name, snapshot in self.sandbox_manager.metrics_snapshot().items()}
-            psrl_logger.info("Final sandbox lifecycle metrics: %s.", metrics)
-            await self.sandbox_manager.shutdown()
+        metrics = {name: snapshot.as_dict() for name, snapshot in self.sandbox_manager.metrics_snapshot().items()}
+        psrl_logger.info("Final sandbox lifecycle metrics: %s.", metrics)
+        await self.sandbox_manager.shutdown()
 
     async def _launch_agent_loop(self):
         """Main loop that processes agent programs from the pending queue."""

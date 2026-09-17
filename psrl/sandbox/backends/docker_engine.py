@@ -21,6 +21,19 @@ class DockerEngineError(RuntimeError):
         self.message = message
 
 
+class DockerExecOutputLimitError(RuntimeError):
+    """A Docker exec stream exceeded the configured output budget.
+
+    This is a transport guard rather than an Engine API failure: the response
+    is HTTP 200, but the client stopped reading it. It is deliberately not a
+    `DockerEngineError`, which carries an HTTP status that callers branch on.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(f"Docker command output limit exceeded: {message}.")
+        self.message = message
+
+
 class DockerEngine(Protocol):
     """Operations consumed by `DockerBackend`."""
 
@@ -28,13 +41,19 @@ class DockerEngine(Protocol):
 
     async def pull_image(self, reference: str, auth: Mapping[str, str] | None = None) -> None: ...
 
+    async def image_exists(self, reference: str) -> bool: ...
+
     async def create_container(self, name: str, config: Mapping[str, Any]) -> str: ...
 
     async def start_container(self, container_id: str) -> None: ...
 
+    async def commit_container(self, container_id: str, repository: str, tag: str) -> str: ...
+
     async def inspect_container(self, container_id: str) -> Mapping[str, Any] | None: ...
 
     async def remove_container(self, container_id: str) -> None: ...
+
+    async def remove_image(self, reference: str) -> None: ...
 
     async def pause_container(self, container_id: str) -> None: ...
 
@@ -68,12 +87,17 @@ class DockerEngineClient:
         *,
         request_timeout_s: float = 180.0,
         connection_limit: int = 128,
+        max_exec_output_bytes: int = 16 * 1024 * 1024,
     ) -> None:
         self.docker_host = docker_host or os.getenv("DOCKER_HOST", "unix:///var/run/docker.sock")
         self.request_timeout_s = request_timeout_s
         self.connection_limit = connection_limit
+        if connection_limit < 1 or request_timeout_s <= 0 or max_exec_output_bytes < 1:
+            raise ValueError("Docker connection, timeout, and output limits must be positive.")
+        self.max_exec_output_bytes = max_exec_output_bytes
         self._session: aiohttp.ClientSession | None = None
         self._base_url = "http://docker"
+        self._closed = False
 
     def _connector(self) -> aiohttp.BaseConnector:
         if self.docker_host.startswith("unix://"):
@@ -87,6 +111,8 @@ class DockerEngineClient:
         raise ValueError(f"Unsupported Docker host {self.docker_host!r}.")
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        if self._closed:
+            raise RuntimeError("Docker Engine client is closed.")
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=self.request_timeout_s)
             self._session = aiohttp.ClientSession(connector=self._connector(), timeout=timeout)
@@ -99,13 +125,22 @@ class DockerEngineClient:
         *,
         expected: tuple[int, ...],
         timeout_s: float | None = None,
+        max_response_bytes: int | None = None,
         **kwargs: Any,
     ) -> tuple[aiohttp.typedefs.LooseHeaders, bytes, int]:
         session = await self._get_session()
         if timeout_s is not None:
             kwargs["timeout"] = aiohttp.ClientTimeout(total=timeout_s)
         async with session.request(method, f"{self._base_url}{path}", **kwargs) as response:
-            body = await response.read()
+            if max_response_bytes is None:
+                body = await response.read()
+            else:
+                buffer = bytearray()
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    if len(buffer) + len(chunk) > max_response_bytes:
+                        raise DockerExecOutputLimitError(f"{max_response_bytes} bytes")
+                    buffer.extend(chunk)
+                body = bytes(buffer)
             if response.status not in expected:
                 message = body.decode(errors="replace")
                 try:
@@ -126,12 +161,26 @@ class DockerEngineClient:
             headers = {
                 "X-Registry-Auth": urlsafe_b64encode(json.dumps(dict(auth), separators=(",", ":")).encode()).decode()
             }
-        await self._request(
-            "POST",
-            f"/images/create?fromImage={image}",
-            expected=(200,),
-            headers=headers,
-        )
+        session = await self._get_session()
+        async with session.post(f"{self._base_url}/images/create?fromImage={image}", headers=headers) as response:
+            if response.status != 200:
+                raise DockerEngineError(response.status, (await response.text()).strip())
+            # Docker can report pull failures inside an HTTP 200 JSON stream.
+            # Consume progress incrementally instead of retaining every layer update.
+            async for line in response.content:
+                if not line.strip():
+                    continue
+                progress = json.loads(line)
+                error = progress.get("error") or (progress.get("errorDetail") or {}).get("message")
+                if error:
+                    raise DockerEngineError(response.status, str(error))
+
+    async def image_exists(self, reference: str) -> bool:
+        """
+        Check the daemon cache without downloading or refreshing a mutable tag.
+        """
+        _, _, status = await self._request("GET", f"/images/{quote(reference, safe='')}/json", expected=(200, 404))
+        return status == 200
 
     async def create_container(self, name: str, config: Mapping[str, Any]) -> str:
         path = f"/containers/create?name={quote(name, safe='')}"
@@ -144,15 +193,13 @@ class DockerEngineClient:
     async def commit_container(self, container_id: str, repository: str, tag: str) -> str:
         """Commit a running container's writable layer into a new image.
 
-        Used by the harness-image baker to turn a one-time provisioned sandbox
-        (base image + Node + CLI + seeded npm cache) into a reusable template
-        image, so every task starts from the provisioned state instead of
-        re-installing per sandbox. Returns the committed image ID.
+        Used by the per-image bake (git-purge derivative) and by the clean
+        verifier snapshot, so a later sandbox starts from the committed state
+        instead of repeating the one-time work. Returns the committed image ID.
         """
         path = (
-            f"/commit?container={quote(container_id, safe='')}&"
-            f"repo={quote(repository, safe='')}&"
-            f"tag={quote(tag, safe='')}"
+            f"/commit?container={quote(container_id, safe='')}"
+            f"&repo={quote(repository, safe='')}&tag={quote(tag, safe='')}"
         )
         # The Engine API rejects /commit unless Content-Type is application/json.
         _, body, _ = await self._request("POST", path, expected=(201,), json={})
@@ -237,10 +284,14 @@ class DockerEngineClient:
             f"/exec/{exec_id}/start",
             expected=(200,),
             timeout_s=timeout_s,
+            max_response_bytes=self.max_exec_output_bytes,
             json={"Detach": False, "Tty": False},
         )
         _, inspect_body, _ = await self._request("GET", f"/exec/{exec_id}/json", expected=(200,))
-        exit_code = int(json.loads(inspect_body).get("ExitCode", 0))
+        inspection = json.loads(inspect_body)
+        if inspection.get("Running") or inspection.get("ExitCode") is None:
+            raise DockerEngineError(200, "Docker exec stream ended before a final exit status was available")
+        exit_code = int(inspection["ExitCode"])
         stdout, stderr = self._demultiplex_exec(output)
         return exit_code, stdout, stderr
 
@@ -289,6 +340,7 @@ class DockerEngineClient:
         return json.loads(body)
 
     async def close(self) -> None:
+        self._closed = True
         if self._session is not None:
             await self._session.close()
             self._session = None

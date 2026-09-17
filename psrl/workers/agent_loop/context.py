@@ -21,4 +21,4 @@ class AgentLoopContext:
     processor: AutoProcessor | None
     dataset_cls: type[RLHFDataset]
     data_config: DictConfig
-    sandbox_manager: SandboxManager | None = None
+    sandbox_manager: SandboxManager

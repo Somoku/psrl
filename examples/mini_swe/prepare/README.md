@@ -32,6 +32,7 @@ Three independent data paths are supported:
 | `docker_scripts/bake_simple_repos.sh` | Bakes toy repositories into a Docker image for Path A |
 | `docker_scripts/build_harness_runtimes.sh` | Fetches the native Claude Code / Codex runtime trees (no Node) for harness mode |
 | `docker_scripts/bake_harness_image.sh` | Per-image git-purged derivative (harness mode, optional) |
+| `docker_scripts/rebake_harness_image.sh` | Force re-bake of existing derivatives after a bake-step change |
 | `docker_scripts/prefetch_images.sh` | Pull per-SWE-problem images (skopeo-first, multi-mirror fallback, tar cache, `docker load`) |
 | `docker_scripts/prefetch_example.sh` | Reference invocation that chains `prefetch_images.sh` + `load_all_nodes.sh` |
 | `docker_scripts/swe_gym.sh` | Convenience wrapper: prefetch full SWE-Gym images (2438 problems) |
@@ -623,9 +624,18 @@ sandboxes (Docker images are node-local), or distribute the derivative with
 probe purges only images that actually leak — but you pay that cost on every
 rollout.
 
+The tag is keyed on the base image alone, so an existing derivative is skipped.
+After changing the bake steps, re-bake with `rebake_harness_image.sh` (same
+arguments) to delete and re-create it:
+
+```bash
+bash examples/mini_swe/prepare/docker_scripts/rebake_harness_image.sh \
+    --parquet examples/mini_swe/data/swe_gym_293/train.parquet
+```
+
 See the main README's
 [Harness training: preprocessing & bake](../README.md#harness-training-preprocessing--bake)
-for the full checklist, tag-revision and runtime-fallback details, or the
+for the full checklist, re-bake and runtime-fallback details, or the
 condensed docs page
 [docs → SWE Data Preparation](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/swe/prepare.html).
 

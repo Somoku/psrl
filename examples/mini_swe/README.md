@@ -119,6 +119,7 @@ examples/mini_swe/
     └── docker_scripts/                   # Docker image pre-fetch / fan-out helpers
         ├── bake_simple_repos.sh          # Bakes toy repos into a Docker image (Path A)
         ├── bake_harness_image.sh         # Per-image git-purged derivative (harness mode)
+        ├── rebake_harness_image.sh       # Force re-bake after a bake-step change
         ├── build_harness_runtimes.sh     # Fetch native Claude Code / Codex runtime trees (no Node)
         ├── prefetch_images.sh            # Pull per-SWE-problem images (skopeo + multi-mirror + tar cache)
         ├── prefetch_example.sh           # Reference invocation chaining prefetch + load_all_nodes
@@ -576,7 +577,7 @@ spec — those backends must provision the runtime into their template instead.
 Each SWE task uses its **own** per-problem base image (the parquet's
 `sandbox_overrides.environment.image` — e.g. `swebench/swesmith.x86_64.*`), so
 there is no single "harness image". `bake_harness_image.sh` derives one image
-per base — `psrl/swebench-harness:<sha12(revision:base)>` — that **purges leaked
+per base — `psrl/swebench-harness:<sha12(base)>` — that **purges leaked
 git metadata** (remotes, refs, reflog, unreachable objects) so an agent can
 never read a future fix commit from the image. The harness executable is **not**
 baked: it is mounted read-only (§1).
@@ -610,10 +611,17 @@ docker run --rm "$tag" bash -lc \
   `psrl/swebench-harness:<sha12(task-image)>` and uses it when present, else
   falls back to the task image + the runtime git probe — **a missing bake never
   blocks training**.
-* **Tag revision**: the digest includes `BAKE_REVISION` (currently
-  `v3-gitclean`). Bump it in `bake_harness_image.sh` *and*
-  `runner.py:_IMAGE_BAKE_REVISION` together to invalidate old derivatives after
-  changing the bake steps; a test asserts the two stay in sync.
+* **Re-baking after a bake change**: the tag keys on the base image alone, so a
+  derivative that already exists is skipped. After editing the bake steps, run
+  `rebake_harness_image.sh` (same arguments) to delete the existing derivative(s)
+  and re-bake — the supported replacement for the old `BAKE_REVISION` bump:
+  ```bash
+  bash examples/mini_swe/prepare/docker_scripts/rebake_harness_image.sh \
+    --parquet examples/mini_swe/data/swe_gym_293/train.parquet
+  ```
+  It also removes tags left by an older digest formula. `PSRL_REBAKE_VERIFY=1`
+  probes each new image for git leaks, `PSRL_REBAKE_DRY_RUN=1` only prints the
+  plan, and `PSRL_BAKE_IMAGE_GLOB` overrides which tags are deleted.
 * **Runtime fallback**: on a host without the derivative, the harness loop runs
   a cheap git probe (`examples/mini_swe/utils/git_sanitize.py`) before the agent
   starts and purges only when it detects a leak. Probe/purge timings show up in
@@ -621,7 +629,9 @@ docker run --rm "$tag" bash -lc \
   (raw metrics `git_leak_detected` / `git_sanitize_error` are on the reward
   info). A purge failure is logged and degraded, never fatal.
 * **Knobs**: `PSRL_BAKE_WORKDIR` (default `/testbed`),
-  `PSRL_BAKE_SKIP_GIT_CLEAN=1`, `PSRL_HARNESS_IMAGE_TAG` (single-image mode).
+  `PSRL_BAKE_SKIP_GIT_CLEAN=1`, `PSRL_HARNESS_IMAGE_TAG` (single-image mode);
+  `rebake_harness_image.sh` adds `PSRL_BAKE_IMAGE_GLOB`, `PSRL_REBAKE_VERIFY=1`
+  and `PSRL_REBAKE_DRY_RUN=1`.
 * Local-only images: on multi-host clusters run the bake on every host, or
   distribute with `docker save`/`docker load`, or `docker push` to a registry.
 

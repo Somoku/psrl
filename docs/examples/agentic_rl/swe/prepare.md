@@ -142,13 +142,15 @@ Build once on the shared filesystem. The script is idempotent, verifies the pinn
 
 ### 2. Bake the git-purged derivative (optional)
 
-Each task has its own base image, so `bake_harness_image.sh` derives one per-image derivative — `psrl/swebench-harness:<sha12(revision:base)>` — that purges leaked git metadata (remotes, refs, reflog, unreachable objects) so an agent can never read a future fix commit. The harness executable is **not** baked; it is mounted read-only in step 1.
+Each task has its own base image, so `bake_harness_image.sh` derives one per-image derivative — `psrl/swebench-harness:<sha12(base)>` — that purges leaked git metadata (remotes, refs, reflog, unreachable objects) so an agent can never read a future fix commit. The harness executable is **not** baked; it is mounted read-only in step 1.
 
 ```bash
 # every unique image in a parquet, on each worker host that creates sandboxes
 bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
     --parquet examples/mini_swe/data/swe_gym_293/train.parquet
 ```
+
+The tag keys on the base image alone, so an existing derivative is skipped. After changing the bake steps, use `rebake_harness_image.sh` (same arguments) to delete the stale derivative and re-bake it.
 
 A missing bake never blocks training: the runner falls back to the base image plus a runtime git probe that purges only images that actually leak — you just pay that cost on every rollout.
 
@@ -166,7 +168,7 @@ Both steps are idempotent — already-cached tars and already-loaded images are 
 ---
 
 ```{seealso}
-Full instructions including mirror configuration, retry strategies, disk planning, and the harness tag-revision / runtime-fallback details:
+Full instructions including mirror configuration, retry strategies, disk planning, and the harness re-bake / runtime-fallback details:
 [`examples/mini_swe/prepare/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/mini_swe/prepare/README.md)
 and
 [`examples/mini_swe/README.md`](https://github.com/psrl-project/psrl/blob/main/examples/mini_swe/README.md#harness-training-preprocessing--bake).

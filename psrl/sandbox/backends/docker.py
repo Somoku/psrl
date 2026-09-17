@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import atexit
 import hashlib
 import json
+import logging
 import os
+import shutil
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -14,7 +15,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from psrl.sandbox.backends.docker_engine import DockerEngine, DockerEngineClient, DockerEngineError
+import aiohttp
+
+from psrl.sandbox.backends.docker_engine import (
+    DockerEngine,
+    DockerEngineClient,
+    DockerEngineError,
+    DockerExecOutputLimitError,
+)
+from psrl.sandbox.backends.docker_lifecycle import DockerLifecycle, DockerLifecycleConfig
 from psrl.sandbox.core import (
     ExecResult,
     PauseMode,
@@ -32,7 +41,9 @@ from psrl.sandbox.core import (
     SnapshotRef,
 )
 from psrl.sandbox.metrics import SandboxMetrics, SandboxMetricsSnapshot
-from psrl.sandbox.utils.docker_utils import force_remove_containers_by_label, spawn_actor_reaper
+from psrl.sandbox.utils.docker_utils import lease_store_id
+
+psrl_logger = logging.getLogger(__file__)
 
 # FILESYSTEM_SNAPSHOT + RESTORE: a docker commit turns a container's writable
 # layer into a reusable image, and restore creates a container from it — the
@@ -136,6 +147,35 @@ class DockerPolicyProfile:
         return cls(**normalized)
 
 
+@dataclass(frozen=True)
+class DockerDiskAdmissionConfig:
+    """Host disk headroom required before a sandbox can be created."""
+
+    path: str | None = None
+    min_free_mb: int = 0
+    wait_timeout_s: float = 300.0
+    poll_interval_s: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.min_free_mb < 0 or self.wait_timeout_s < 0 or self.poll_interval_s <= 0:
+            raise ValueError(
+                "Docker disk min_free_mb and wait_timeout_s must not be negative, "
+                "and poll_interval_s must be positive."
+            )
+        if self.min_free_mb > 0 and not self.path:
+            raise ValueError("Docker disk path is required when min_free_mb is positive.")
+
+    @classmethod
+    def from_value(
+        cls,
+        value: DockerDiskAdmissionConfig | Mapping[str, Any] | None,
+    ) -> DockerDiskAdmissionConfig:
+        """Normalize a Hydra mapping into immutable disk admission policy."""
+        if isinstance(value, cls):
+            return value
+        return cls(**dict(value or {}))
+
+
 class DockerBackend(SandboxBackend):
     """Local Docker backend using one persistent Engine API connection pool."""
 
@@ -149,10 +189,14 @@ class DockerBackend(SandboxBackend):
         command_interpreter: Sequence[str] = ("bash", "-lc"),
         request_timeout_s: float = 180.0,
         connection_limit: int = 128,
+        image_pull_concurrency: int = 2,
+        max_exec_output_bytes: int = 16 * 1024 * 1024,
         auto_pull: bool = True,
         registry_auth: Mapping[str, str] | None = None,
         owner_id_env: str = "PSRL_ACTOR_ID",
-        reaper_binary: str = "docker",
+        lifecycle: DockerLifecycleConfig | Mapping[str, Any] | None = None,
+        disk_admission: DockerDiskAdmissionConfig | Mapping[str, Any] | None = None,
+        cgroup_parent: str | None = None,
         engine: DockerEngine | None = None,
     ) -> None:
         self._name = name
@@ -168,19 +212,65 @@ class DockerBackend(SandboxBackend):
         if not self.keepalive_command or not self.command_interpreter:
             raise ValueError("Docker keepalive_command and command_interpreter cannot be empty.")
         self.owner_id = os.getenv(owner_id_env, "")
-        self.reaper_binary = reaper_binary
+        self.lifecycle = DockerLifecycle(
+            self.owner_id,
+            DockerLifecycleConfig.from_value(lifecycle, docker_host=docker_host),
+        )
+        self.disk_admission = DockerDiskAdmissionConfig.from_value(disk_admission)
+        self.cgroup_parent = cgroup_parent
         self.auto_pull = auto_pull
         self.registry_auth = dict(registry_auth or {})
         self.engine = engine or DockerEngineClient(
             docker_host,
             request_timeout_s=request_timeout_s,
             connection_limit=connection_limit,
+            max_exec_output_bytes=max_exec_output_bytes,
         )
         self.metrics = SandboxMetrics()
         self._rootless_checked = False
         self._rootless_lock = asyncio.Lock()
-        self._reaper_proc = None
-        self._atexit_registered = False
+        if image_pull_concurrency < 1:
+            raise ValueError("Docker image_pull_concurrency must be positive.")
+        self._image_pull_slots = asyncio.Semaphore(image_pull_concurrency)
+        self._image_tasks: dict[str, asyncio.Task[None]] = {}
+        self._closed = False
+
+    async def prepare(self, spec: SandboxSpec) -> None:
+        """
+        Warm an image with bounded, shared downloads on this backend instance.
+        """
+        if self._closed:
+            raise RuntimeError("Docker backend is closed.")
+        if spec.source.kind != SandboxSourceKind.IMAGE:
+            raise RuntimeError("DockerBackend requires an image source.")
+        reference = spec.source.reference
+        task = self._image_tasks.get(reference)
+        if task is None:
+            task = asyncio.create_task(self._prepare_image(reference))
+            self._image_tasks[reference] = task
+            task.add_done_callback(lambda done: self._finish_image_prepare(reference, done))
+        await asyncio.shield(task)
+
+    def _finish_image_prepare(self, reference: str, task: asyncio.Task[None]) -> None:
+        """
+        Forget completed downloads and observe failures after waiter cancellation.
+        """
+        self._image_tasks.pop(reference, None)
+        if not task.cancelled():
+            task.exception()
+
+    async def _prepare_image(self, reference: str) -> None:
+        """
+        Recheck the daemon cache after admission before downloading an image.
+        """
+        async with self._image_pull_slots:
+            if await self.engine.image_exists(reference):
+                return
+            if not self.auto_pull:
+                raise RuntimeError(f"Docker image {reference!r} is unavailable and auto_pull is disabled.")
+            await self._await_disk_headroom()
+            with self.metrics.measure("pull_image"):
+                await self.engine.pull_image(reference, self.registry_auth or None)
 
     @property
     def name(self) -> str:
@@ -190,25 +280,39 @@ class DockerBackend(SandboxBackend):
     def capabilities(self) -> SandboxCapabilities:
         return _DOCKER_CAPABILITIES
 
+    @property
+    def uses_node_capacity(self) -> bool:
+        """Return that Docker sessions share the worker node's resources."""
+        return True
+
     def metrics_snapshot(self) -> SandboxMetricsSnapshot:
         """Return Docker lifecycle, latency, and memory metrics."""
         return self.metrics.snapshot()
 
-    def _ensure_reaper(self) -> None:
-        """Start crash recovery before the first owned container is created."""
-        if not self.owner_id or self._reaper_proc is not None:
+    async def _await_disk_headroom(self) -> None:
+        """Block until the Docker data path has enough free space, then give up."""
+        policy = self.disk_admission
+        if not policy.path or policy.min_free_mb <= 0:
             return
-        self._reaper_proc = spawn_actor_reaper(self.owner_id, binary=self.reaper_binary)
-        if not self._atexit_registered:
-            atexit.register(self._shutdown_sync)
-            self._atexit_registered = True
-
-    def _shutdown_sync(self) -> None:
-        """Best-effort cleanup for interpreter and Ray actor shutdown."""
-        if self.owner_id and self._reaper_proc is not None:
-            force_remove_containers_by_label("psrl.actor_id", self.owner_id, binary=self.reaper_binary)
-        if self._reaper_proc is not None and self._reaper_proc.poll() is None:
-            self._reaper_proc.terminate()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + policy.wait_timeout_s
+        while True:
+            try:
+                usage = await asyncio.to_thread(shutil.disk_usage, policy.path)
+                free_mb = usage.free // (1024 * 1024)
+            except OSError as exc:
+                raise RuntimeError(f"Could not inspect Docker data path {policy.path!r}.") from exc
+            if free_mb >= policy.min_free_mb:
+                return
+            if loop.time() >= deadline:
+                with self.metrics.measure("disk_admission_failure"):
+                    raise RuntimeError(
+                        f"Docker data path {policy.path!r} has {free_mb} MiB free, below the "
+                        f"{policy.min_free_mb} MiB admission threshold, after waiting "
+                        f"{policy.wait_timeout_s:.0f}s."
+                    )
+            with self.metrics.measure("disk_admission_wait"):
+                await asyncio.sleep(min(policy.poll_interval_s, max(0.0, deadline - loop.time())))
 
     async def _check_rootless(self) -> None:
         if not self.security.require_rootless or self._rootless_checked:
@@ -240,6 +344,7 @@ class DockerBackend(SandboxBackend):
 
     def _build_container_config(self, spec: SandboxSpec, policy: DockerPolicyProfile) -> dict[str, Any]:
         labels = {**dict(spec.metadata), "psrl.sandbox": "true"}
+        labels["psrl.lease_store"] = lease_store_id(self.lifecycle.config.heartbeat_dir)
         if self.owner_id:
             labels["psrl.actor_id"] = self.owner_id
         if spec.idempotency_key:
@@ -294,6 +399,8 @@ class DockerBackend(SandboxBackend):
             host_config["ExtraHosts"] = extra_hosts
         if tmpfs:
             host_config["Tmpfs"] = tmpfs
+        if self.cgroup_parent:
+            host_config["CgroupParent"] = self.cgroup_parent
         if spec.resources.cpu_count is not None:
             host_config["NanoCpus"] = int(spec.resources.cpu_count * 1_000_000_000)
         if spec.resources.memory_mb is not None:
@@ -334,29 +441,50 @@ class DockerBackend(SandboxBackend):
         return config
 
     async def create(self, spec: SandboxSpec) -> SandboxSession:
+        if self._closed:
+            raise RuntimeError("Docker backend is closed.")
         if spec.source.kind != SandboxSourceKind.IMAGE:
             raise RuntimeError("DockerBackend requires an image source.")
         if spec.resources.disk_mb is not None:
             raise RuntimeError("DockerBackend does not implement a portable disk size limit.")
+        await self._await_disk_headroom()
         await self._check_rootless()
-        self._ensure_reaper()
+        await asyncio.to_thread(self.lifecycle.start)
         policy = self._resolve_policy(spec)
         name = self._container_name(spec)
         config = self._build_container_config(spec, policy)
         with self.metrics.measure("create"):
-            try:
-                container_id = await self._create_and_start(name, config)
-            except DockerEngineError as exc:
-                if exc.status == 404 and self.auto_pull:
-                    with self.metrics.measure("pull_image"):
-                        await self.engine.pull_image(spec.source.reference, self.registry_auth or None)
-                    container_id = await self._create_and_start(name, config)
-                elif exc.status != 409 or not spec.idempotency_key:
-                    raise
-                else:
-                    container_id = await self._recover_idempotent_conflict(name, config, spec, exc)
+            container_id = await self._create_or_recover(name, config, spec)
         self.metrics.session_started()
-        return DockerSession(self, container_id, spec=spec, lifetime_timeout_s=spec.idle_timeout_s)
+        return DockerSession(
+            self,
+            container_id,
+            spec=spec,
+            lifetime_timeout_s=spec.idle_timeout_s,
+        )
+
+    async def _create_or_recover(
+        self,
+        name: str,
+        config: Mapping[str, Any],
+        spec: SandboxSpec,
+    ) -> str:
+        """
+        Create once, pull a missing image once, or join an exact retry.
+        """
+        try:
+            return await self._create_and_start(name, config)
+        except DockerEngineError as exc:
+            create_error = exc
+        if create_error.status == 404 and self.auto_pull:
+            await self.prepare(spec)
+            try:
+                return await self._create_and_start(name, config)
+            except DockerEngineError as exc:
+                create_error = exc
+        if create_error.status == 409 and spec.idempotency_key:
+            return await self._recover_idempotent_conflict(name, config, spec, create_error)
+        raise create_error
 
     async def _create_and_start(self, name: str, config: Mapping[str, Any]) -> str:
         """Create and start a container without leaking a failed start."""
@@ -364,7 +492,10 @@ class DockerBackend(SandboxBackend):
         try:
             await self.engine.start_container(container_id)
         except BaseException:
-            await self.engine.remove_container(container_id)
+            try:
+                await self.engine.remove_container(container_id)
+            except BaseException as cleanup_error:
+                psrl_logger.warning(f"Failed to remove Docker container {container_id!r}: {cleanup_error!r}.")
             raise
         return container_id
 
@@ -428,18 +559,21 @@ class DockerBackend(SandboxBackend):
         """Remove the committed image backing a filesystem snapshot."""
         if snapshot.kind != SnapshotKind.FILESYSTEM:
             return
-        image = snapshot.metadata.get("psrl.docker.image")
+        image = snapshot.metadata.get("psrl.docker.image") or snapshot.snapshot_id
         if image:
-            try:
-                await self.engine.remove_image(str(image))
-            except DockerEngineError as exc:
-                if exc.status != 404:
-                    raise
+            await self.engine.remove_image(str(image))
 
     async def shutdown(self) -> None:
         """Stop crash recovery and close the persistent Engine connection pool."""
-        await asyncio.to_thread(self._shutdown_sync)
-        await self.engine.close()
+        self._closed = True
+        tasks = list(self._image_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.to_thread(self.lifecycle.close)
+        finally:
+            await self.engine.close()
 
 
 class DockerSession(SandboxSession):
@@ -487,8 +621,9 @@ class DockerSession(SandboxSession):
         if kind != SnapshotKind.FILESYSTEM:
             raise NotImplementedError(f"DockerSession only supports FILESYSTEM snapshots, got {kind.value}.")
         repo = f"psrl/snapshot/{self.sandbox_id}"
-        image_id = await self.backend.engine.commit_container(self.sandbox_id, repo, "latest")
-        image_tag = f"{repo}:latest"
+        tag = uuid.uuid4().hex
+        image_id = await self.backend.engine.commit_container(self.sandbox_id, repo, tag)
+        image_tag = f"{repo}:{tag}"
         return SnapshotRef(
             backend=self.backend.name,
             snapshot_id=image_tag,
@@ -524,28 +659,32 @@ class DockerSession(SandboxSession):
         self._command_count += 1
         try:
             with self.backend.metrics.measure("exec"):
-                exit_code, stdout, stderr = await self.backend.engine.exec(
-                    self.sandbox_id,
-                    [*self.backend.command_interpreter, command],
-                    cwd=cwd,
-                    env=env,
-                    timeout_s=timeout_s,
+                exit_code, stdout, stderr = await asyncio.wait_for(
+                    self.backend.engine.exec(
+                        self.sandbox_id,
+                        [*self.backend.command_interpreter, command],
+                        cwd=cwd,
+                        env=env,
+                        timeout_s=timeout_s,
+                    ),
+                    timeout=timeout_s,
                 )
-        except asyncio.CancelledError:
+        except (
+            asyncio.CancelledError,
+            TimeoutError,
+            asyncio.TimeoutError,
+            aiohttp.ClientError,
+            DockerEngineError,
+            DockerExecOutputLimitError,
+        ) as exc:
+            # Losing the exec stream does not stop the process in Docker.
             try:
                 await self.terminate()
             except Exception:
-                pass
+                psrl_logger.warning("Failed to terminate a Docker sandbox after command failure.", exc_info=True)
+            if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                raise TimeoutError(f"Docker command timed out (requested timeout={timeout_s!r}).") from exc
             raise
-        except (TimeoutError, asyncio.TimeoutError):
-            # The Engine API cannot cancel an exec after its start request has
-            # timed out. Destroy the disposable session so no runaway process
-            # survives or races subsequent commands.
-            try:
-                await self.terminate()
-            except Exception:
-                pass
-            raise TimeoutError(f"Docker command exceeded {timeout_s} seconds.") from None
         return ExecResult(
             exit_code=exit_code,
             stdout=stdout.decode(errors="replace"),

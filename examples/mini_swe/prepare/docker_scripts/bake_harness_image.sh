@@ -5,7 +5,7 @@
 # `sandbox_overrides.environment.image`), so a single global baked image is
 # meaningless. This script derives, from one base image or from every unique
 # image in a parquet, a derivative image
-#     psrl/swebench-harness:<sha12(revision:base-image)>
+#     psrl/swebench-harness:<sha12(base-image)>
 # that purges leaked git metadata (remotes / refs / reflog / unreachable objects)
 # so a sandbox that starts from it can never read a future fix commit. Runner
 # (`examples/mini_swe/runner.py`) selects the derivative when it exists locally
@@ -26,17 +26,15 @@
 #   PSRL_BAKE_SKIP_GIT_CLEAN=1  skip the git purge (no-op derivative)
 #   PSRL_HARNESS_IMAGE_TAG  explicit output tag (single-image mode only)
 #
-# Bumping BAKE_REVISION invalidates every existing derivative so a changed bake
-# is re-run; it must stay in sync with _IMAGE_BAKE_REVISION in
-# examples/mini_swe/runner.py.
+# The tag keys on the base image alone, so this script SKIPS an image that is
+# already baked. After changing the bake steps, run rebake_harness_image.sh
+# instead to replace the stale derivative.
 set -euo pipefail
 
-# Bump to invalidate existing derivatives; keep in sync with runner.py.
-BAKE_REVISION="${PSRL_BAKE_REVISION:-v3-gitclean}"
 BAKE_WORKDIR="${PSRL_BAKE_WORKDIR:-/testbed}"
 SKIP_GIT_CLEAN="${PSRL_BAKE_SKIP_GIT_CLEAN:-0}"
 
-digest() { printf '%s' "$BAKE_REVISION:$1" | sha256sum | cut -c1-12; }
+digest() { printf '%s' "$1" | sha256sum | cut -c1-12; }
 
 # Purge leaked git metadata so the derivative can never expose a future fix
 # commit. Must stay in sync with examples/mini_swe/utils/git_sanitize.py. The workdir

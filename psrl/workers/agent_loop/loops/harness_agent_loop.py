@@ -1,17 +1,18 @@
 """Generic task lifecycle for sandboxed coding harness training."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
 from abc import abstractmethod
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
 from omegaconf import DictConfig
 
-from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef
+from psrl.sandbox import SandboxFeature, SandboxLease, SandboxSession, SnapshotKind, SnapshotRef, SyncSandboxManager
 from psrl.workers.agent_loop.context import AgentLoopContext
 from psrl.workers.agent_loop.harness import (
     Harness,
@@ -58,8 +59,6 @@ class HarnessAgentLoop(SessionAgentLoop):
                 "Harness training requires psrl.rollout_gateway.trajectory_id_strategy=auto so TITO can assign "
                 "multi-agent and compaction branches from its prefix tree."
             )
-        if self.sandbox_manager is None:
-            raise ValueError("Harness training requires rollout.agent.sandbox.default_backend.")
         if context.config.gen_actor_rollout_ref.rollout.agent.traj_reward_mode != "traj":
             raise ValueError("Harness training supports only agent.traj_reward_mode=traj.")
 
@@ -102,6 +101,26 @@ class HarnessAgentLoop(SessionAgentLoop):
         Release task-specific state after generic resources are cleaned up.
         """
         return None
+
+    async def _run_sync_sandbox_operation(
+        self,
+        backend: str | None,
+        operation: Callable[[SyncSandboxManager], Any],
+    ) -> Any:
+        """
+        Run blocking harness code with cancellation-safe sandbox ownership.
+        """
+        sync_sandbox = self.sandbox_manager.sync(backend=backend)
+        operation_task = asyncio.create_task(asyncio.to_thread(operation, sync_sandbox))
+        try:
+            return await asyncio.shield(operation_task)
+        except asyncio.CancelledError:
+            await sync_sandbox.aclose()
+            with contextlib.suppress(Exception):
+                await asyncio.shield(operation_task)
+            raise
+        finally:
+            await sync_sandbox.aclose()
 
     async def prepare_harness_sandbox(
         self,
@@ -165,6 +184,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         lease: SandboxLease | None = None
         harness: Harness | None = None
         clean_snapshot: SnapshotRef | None = None
+        prepare_tasks: list[asyncio.Task[None]] = []
         run_start = time.perf_counter()
         timing = {
             "prep_s": 0.0,
@@ -181,7 +201,15 @@ class HarnessAgentLoop(SessionAgentLoop):
             task = await self.prepare_harness_task(request)
             task = self.attach_runtime_mount(task)
             timing["task_prepare_s"] = time.perf_counter() - run_start
+            prepare_tasks.append(
+                asyncio.create_task(self.sandbox_manager.prepare(task.sandbox_spec, backend=task.backend))
+            )
+            if task.clean_sandbox_spec is not None:
+                prepare_tasks.append(
+                    asyncio.create_task(self.sandbox_manager.prepare(task.clean_sandbox_spec, backend=task.backend))
+                )
             session_id = await self.create_session(request)
+            await prepare_tasks[0]
             sandbox_started = time.perf_counter()
             # Retain lease ownership if cancellation races sandbox creation.
             acquire_task = asyncio.create_task(
@@ -252,6 +280,12 @@ class HarnessAgentLoop(SessionAgentLoop):
                     f"Harness process diagnostics:\n{harness_result.diagnostic_text()}"
                 )
 
+            # Preparation is speculative: a clean snapshot may already provide
+            # the grader image, and finalization can retry a failed image pull.
+            prepare_results = await asyncio.gather(*prepare_tasks, return_exceptions=True)
+            for result in prepare_results:
+                if isinstance(result, Exception):
+                    psrl_logger.warning(f"Sandbox artifact preparation failed: {result!r}.")
             task_reward_info = await self.finalize_harness_task(
                 task,
                 artifact,
@@ -289,6 +323,9 @@ class HarnessAgentLoop(SessionAgentLoop):
                 return None, TerminateReason.ABORTED
             return scored_output, self.get_harness_terminate_reason(training_data)
         finally:
+            for prepare_task in prepare_tasks:
+                prepare_task.cancel()
+            await asyncio.gather(*prepare_tasks, return_exceptions=True)
             await self._cleanup_harness_run(task, session_id, lease, harness, clean_snapshot)
 
     async def _try_snapshot_clean_sandbox(
@@ -297,12 +334,11 @@ class HarnessAgentLoop(SessionAgentLoop):
         lease: SandboxLease,
     ) -> SnapshotRef | None:
         caps = lease.session.capabilities
-        if caps.supports(SandboxFeature.FILESYSTEM_SNAPSHOT):
-            kind = SnapshotKind.FILESYSTEM
-        elif caps.supports(SandboxFeature.FULL_STATE_SNAPSHOT):
-            kind = SnapshotKind.FULL_STATE
-        else:
+        # The sandbox has not been prepared yet. Docker already shares the
+        # original image layers; committing here adds I/O without caching setup.
+        if not caps.supports(SandboxFeature.FULL_STATE_SNAPSHOT):
             return None
+        kind = SnapshotKind.FULL_STATE
         if not caps.supports(SandboxFeature.RESTORE):
             return None
         if not clean_snapshot_compatible(task, kind):

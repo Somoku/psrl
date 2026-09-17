@@ -1,5 +1,13 @@
 # SciAccel-RL: agentic RL on scientific-computing repair tasks
 
+> [!IMPORTANT]
+> **This example has moved to its own repository:
+> [ScienceInfra](https://github.com/Gen-Verse/ScienceInfra).**
+>
+> Development continues there, as an installable `scienceinfra` package with a
+> bundled demo task bank. This copy still runs, but it is the older version and
+> is no longer the one being updated. Use ScienceInfra for new work.
+
 Trains a model to fix injected defects in real scientific simulation codebases
 (LAPS, MITgcm, Athena++). Each task is a containerized [Harbor](https://github.com/laude-institute/harbor)
 episode: the agent gets a repository and an instruction, edits source, and a
@@ -11,18 +19,33 @@ grade: budget 8 to 15 minutes per episode for the image build alone.
 
 ## Results
 
-Qwen3.5-4B on the `laps` repair bank at hint level L1, GRPO, 3 nodes:
+Qwen3.5-4B, GRPO at hint level L1 on 3 nodes, trained separately on two
+environments. Both are the `repair` category at the `easy` tier.
+
+### `laps`: LAPS, MHD in Fortran
 
 <p align="center">
-  <img src="../../assets/sciaccel_rl_laps_L1_curves.png" alt="Reward, response length, entropy, and train-inference KL over 31 GRPO steps" width="100%">
+  <img src="../../assets/sciaccel_rl_laps_L1_curves.png" alt="laps: reward, response length, entropy, and train-inference KL over 31 GRPO steps" width="100%">
 </p>
 
 Reward climbs from 0.49 to 0.77, peaking at 0.91. Response length falls from
 ~40k tokens to ~28k over the same window, so the gain is not bought by rambling:
-the policy is finding the defect in fewer tokens. Entropy decays smoothly
-(0.59 to 0.38) rather than collapsing, and train-inference KL stays flat around
-0.03, which is the check that the rollout and trainer policies have not drifted
-apart. Reproduce the figure with [`plot/plot.py`](plot/plot.py) against a run log.
+the policy is finding the defect in fewer tokens.
+
+### `mitgcm-biogeo`: MITgcm biogeochemistry
+
+<p align="center">
+  <img src="../../assets/sciaccel_rl_mitgcm_biogeo_L1_curves.png" alt="mitgcm-biogeo: reward, response length, entropy, and train-inference KL over 30 GRPO steps" width="100%">
+</p>
+
+Reward climbs from ~0.42 to ~0.53, peaking at 0.71, on a noisier curve than
+laps. Response length moves the other way here, ~24k tokens to ~31k, so on this
+bank the policy buys accuracy with more exploration rather than less.
+
+In both runs entropy decays smoothly rather than collapsing, and
+train-inference KL stays low and trends down, which is the check that the
+rollout and trainer policies have not drifted apart. Reproduce either figure
+with [`plot/plot.py`](plot/plot.py) against that run's log.
 
 ## Quickstart
 

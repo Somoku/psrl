@@ -104,7 +104,7 @@ def main() -> None:
     if not args.log_file.is_file():
         raise SystemExit(f"Log file not found: {args.log_file}")
 
-    output = args.output or args.log_file.with_name(f"{args.log_file.stem}_training_curves.svg")
+    output = args.output or args.log_file.with_name(f"{args.log_file.stem}_training_curves.png")
     data = parse_log(args.log_file)
     missing = [name for name, _ in METRICS if not data[name]]
     if missing:

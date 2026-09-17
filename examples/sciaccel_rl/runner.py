@@ -142,6 +142,7 @@ async def run_harbor_episode(
     actor_id: str = "",
     thinking_template: str = MULTI_TRAJ,
     hint: str = "",
+    guidance: str = "",
 ) -> HarborEpisodeResult:
     """
     Run one Harbor episode and return the verifier reward.
@@ -176,6 +177,9 @@ async def run_harbor_episode(
             only path that puts extra text in front of the agent. An empty hint
             leaves the job config untouched, which keeps the unhinted level a
             true control.
+        guidance: Terminal and build discipline, delivered at every hint level so
+            it stays orthogonal to localization. It describes how to spend turns,
+            never where the defect is, so it does not weaken the unhinted control.
 
     Returns:
         HarborEpisodeResult with the verifier's shaped reward.
@@ -254,8 +258,9 @@ async def run_harbor_episode(
         ],
         n_attempts=1,
         n_concurrent_trials=1,
-        # Harbor appends this to the on-disk instruction before the agent sees it.
-        **({"extra_instructions": [hint]} if hint else {}),
+        # Harbor appends these to the on-disk instruction before the agent sees it.
+        # Guidance leads, so the localization hint stays closest to the task.
+        **({"extra_instructions": [t for t in (guidance, hint) if t]} if (guidance or hint) else {}),
         **({"environment": env_kwargs} if env_kwargs else {}),
     )
 

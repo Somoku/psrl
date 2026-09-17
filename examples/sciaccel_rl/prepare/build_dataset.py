@@ -8,6 +8,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -50,9 +51,13 @@ HINT_LEVELS = ("L1", "L2", "L3")
 # Excised routines are not: their instruction already names the file and subroutine.
 _HINTED_SOURCES = frozenset({"inject", "semantic", "semantic-gr-sol"})
 
-# Tokens the hint may add. The builder refuses a hint wider than this so a prompt
-# cannot silently cross `data.max_prompt_length` under `data.truncation=error`.
-_HINT_CHAR_BUDGET = 400
+# Characters the hint may add. The builder refuses a wider one so a prompt cannot
+# silently cross `data.max_prompt_length` under `data.truncation=error`.
+_HINT_CHAR_BUDGET = 600
+
+# The stage that copies the pinned source into the image. Its destination is the root
+# the canonical row's defect paths are relative to.
+_PREP_SOURCE_ROOT = re.compile(r"^\s*COPY\s+--from=prep\s+(/\S+)", re.MULTILINE)
 
 
 def _resolve_tasks_root(repo: Path, env: str) -> Path:
@@ -181,11 +186,76 @@ def _discover_task_dirs(
     return found
 
 
+def _container_source_root(task_dir: Path) -> str:
+    """
+    Return the container path holding the pinned source, or an empty string.
+
+    A canonical row records defect files relative to the source root, while the
+    container holds them under a per-env prefix such as `/app/athena`. Naming the
+    bare relative path makes the agent rediscover the layout before it can open the
+    file it was just handed.
+
+    Args:
+        task_dir (Path): Compiled task directory containing `task.toml`.
+
+    Returns:
+        str: An absolute container path such as `/app/athena`, or an empty string
+            when the task builds no pinned source stage.
+    """
+    dockerfile = task_dir / "environment" / "Dockerfile"
+    if not dockerfile.is_file():
+        return ""
+    match = _PREP_SOURCE_ROOT.search(dockerfile.read_text(encoding="utf-8", errors="replace"))
+    return match.group(1).rstrip("/") if match else ""
+
+
+def _build_guidance(environment: dict[str, Any]) -> str:
+    """
+    Write the terminal and build discipline delivered at every hint level.
+
+    This is about how to spend turns, never about where the defect is, so it stays
+    orthogonal to `hint_level` and leaves the unhinted control a true control. It
+    exists because turns, not reasoning, are the budget that runs out first: a bank
+    whose tasks need one compiled binary per graded check spends most of its turns
+    driving builds rather than editing source.
+
+    Nothing here changes what gets compiled. The build variants and the pinned
+    compiler flags are fixed by the task's own contract, and the delivered frames
+    are graded on exact bytes, so only the scheduling is open to advice.
+
+    Args:
+        environment (dict[str, Any]): The manifest's `environment` table, read for
+            the container's CPU and memory limits.
+
+    Returns:
+        str: A markdown section to append to the instruction.
+    """
+    cpus = int(environment.get("cpus", 0)) or 4
+    memory_mb = int(environment.get("memory_mb", 0)) or 8192
+    return (
+        "## Working inside the turn budget\n\n"
+        "Each terminal round trip costs one turn, and the episode ends when the turns\n"
+        "run out even if the repair was correct.\n\n"
+        "- Give a long command a duration that covers it. A duration shorter than the\n"
+        "  command returns a blank screen, and reading that screen costs another turn.\n"
+        f"- This container has {cpus} CPUs and {memory_mb} MB. Independent builds are CPU\n"
+        "  bound, so running them one after another costs turns without saving wall\n"
+        "  time. Launch them together in the background and wait once, keeping the\n"
+        f"  total number of parallel compile jobs near {cpus} so memory holds.\n"
+        "- Re-run the configure step only when it failed. A failing compile usually\n"
+        "  means the source is still wrong rather than the configuration.\n"
+        "- Apply the fix in every affected file before building, rather than\n"
+        "  rebuilding after each edit."
+    )
+
+
 def _build_hint(
     canonical: dict[str, Any],
     level: str,
     task_name: str = "",
     resolved_lines: dict[str, int] | None = None,
+    resolved_files: dict[str, dict[str, int]] | None = None,
+    source_root: str = "",
 ) -> str:
     """
     Write the localization hint for one task, or an empty string for no hint.
@@ -197,10 +267,14 @@ def _build_hint(
     class, and a line number.
 
     The line number has two sources. Envs that record `candidate.meta.line` are used
-    directly. For the rest, `resolved_lines` supplies a value located by matching the
-    provenance `old` text against the pinned upstream source, which
-    `resolve_defect_lines.py` produces and cross-validates. Where neither is
+    directly. For the rest, `resolve_defect_lines.py` locates it by matching the
+    provenance `old` text against the pinned upstream source. Where neither is
     available, `L1` degrades to `L2` rather than inventing a line.
+
+    A multi-file defect carries one edit per file, so `resolved_files` gives a line
+    for each and `L1` names all of them. Naming only the files would make the widest
+    tasks the weakest hints, which is backwards: a six-file edit is the one a reader
+    most needs pointed at.
 
     Both injected and semantic defects are hinted. A semantic defect substitutes one
     calibrated constant for another, so its file is as real a localization target as
@@ -214,6 +288,10 @@ def _build_hint(
         task_name (str): Task directory name, used to look up `resolved_lines`.
         resolved_lines (dict[str, int] | None): Task name to line number, from the
             env's `factory/DEFECT_LINES.json`.
+        resolved_files (dict[str, dict[str, int]] | None): Task name to per-file line
+            numbers, for defects that span more than one file.
+        source_root (str): Container path the defect files sit under, from
+            `_container_source_root`. Empty leaves the paths relative.
 
     Returns:
         str: A markdown section to append to the instruction, or an empty string.
@@ -239,23 +317,26 @@ def _build_hint(
     line = meta.get("line")
     if line is None and resolved_lines is not None:
         line = resolved_lines.get(task_name)
-    # A line locates a point, so it is only meaningful for a single-file defect.
-    if level == "L1" and line is not None and len(defect_files) == 1:
-        location = f"{defect_files[0]}, line {line}"
+    per_file = (resolved_files or {}).get(task_name) or {}
+
+    # Prefix at render time only, because `per_file` is keyed by the relative path.
+    def shown(name: str) -> str:
+        return f"{source_root}/{name}" if source_root else name
+
+    if level == "L1" and len(defect_files) == 1 and line is not None:
+        location = f"{shown(defect_files[0])}, line {line}"
         confined = "The defect is a single edit confined to:"
     elif len(defect_files) == 1:
-        location = defect_files[0]
+        location = shown(defect_files[0])
         confined = "The defect is a single edit confined to:"
+    elif level == "L1" and all(f in per_file for f in defect_files):
+        # Every file has its own line, so name them all rather than dropping to a
+        # file-only hint. The edit is the same change repeated, not several defects.
+        location = "\n    ".join(f"{shown(f)}, line {per_file[f]}" for f in defect_files)
+        confined = "The same change was made at each of these locations:"
     else:
-        location = "\n    ".join(defect_files)
+        location = "\n    ".join(shown(f) for f in defect_files)
         confined = "The same change was made in each of these files:"
-        # Naming the shared directory stays inside the budget and localizes just as
-        # well, because every file under it received the same edit.
-        if len(location) > _HINT_CHAR_BUDGET // 2:
-            common = os.path.commonpath(defect_files)
-            if common and common not in (".", "/"):
-                location = f"{common}/ (all {len(defect_files)} files below it)"
-                confined = "The same change was made in every solver file under:"
 
     # The closing clause must not claim single-file scope for a multi-file defect, or
     # the hint actively misleads the model into stopping after the first fix.
@@ -277,6 +358,7 @@ def _build_row(
     canonical_rows: dict[str, dict[str, Any]],
     hint_level: str,
     resolved_lines: dict[str, int] | None = None,
+    resolved_files: dict[str, dict[str, int]] | None = None,
 ) -> dict[str, Any]:
     """
     Build one dataset row from a compiled task directory.
@@ -289,6 +371,8 @@ def _build_row(
         hint_level (str): One of `HINT_LEVELS`, selecting the hint strength.
         resolved_lines (dict[str, int] | None): Task name to line number, from
             `_load_resolved_lines`.
+        resolved_files (dict[str, dict[str, int]] | None): Task name to per-file line
+            numbers, for defects spanning more than one file.
 
     Returns:
         dict[str, Any]: One row for the output Parquet.
@@ -300,7 +384,15 @@ def _build_row(
     environment = manifest.get("environment", {})
     task_name = manifest["task"]["name"]
     canonical = canonical_rows.get(task_dir.name, {})
-    hint = _build_hint(canonical, hint_level, task_name=task_dir.name, resolved_lines=resolved_lines)
+    hint = _build_hint(
+        canonical,
+        hint_level,
+        task_name=task_dir.name,
+        resolved_lines=resolved_lines,
+        resolved_files=resolved_files,
+        source_root=_container_source_root(task_dir),
+    )
+    guidance = _build_guidance(environment)
 
     # Manifest and directory categories must agree.
     manifest_category = taxonomy.get("category")
@@ -340,6 +432,8 @@ def _build_row(
         # This field, not `prompt`, is what actually reaches the model.
         "hint": hint,
         "hint_level": hint_level,
+        # Delivered at every level, so it never confounds a hint-level comparison.
+        "guidance": guidance,
         "timeout_sec": float(manifest.get("agent", {}).get("timeout_sec", 3600.0)),
         "gpus": int(environment.get("gpus", 0)),
         "category": category,
@@ -351,9 +445,9 @@ def _build_row(
         "network_mode": environment.get("network_mode", ""),
     }
 
-    # Harbor re-reads `instruction.md` and appends the hint itself, so this column is a
+    # Harbor re-reads `instruction.md` and appends these itself, so this column is a
     # record of the delivered prompt rather than the delivery path.
-    prompt_content = f"{instruction}\n\n{hint}" if hint else instruction
+    prompt_content = "\n\n".join(part for part in (instruction, guidance, hint) if part)
 
     return {
         "prompt": [{"role": "user", "content": prompt_content}],
@@ -462,7 +556,7 @@ def _build_stats(df: pd.DataFrame) -> dict[str, Any]:
     }
 
 
-def _load_resolved_lines(repo: Path, env: str) -> dict[str, int]:
+def _load_resolved_lines(repo: Path, env: str) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
     """
     Load `factory/DEFECT_LINES.json`, or return empty when the env has none.
 
@@ -475,16 +569,23 @@ def _load_resolved_lines(repo: Path, env: str) -> dict[str, int]:
         env (str): Environment directory name under `envs/`.
 
     Returns:
-        dict[str, int]: Task directory name to 1-based line number.
+        tuple[dict[str, int], dict[str, dict[str, int]]]: Task name to line for
+            single-file defects, and task name to per-file lines for multi-file ones.
     """
     path = repo / "envs" / env / "factory" / "DEFECT_LINES.json"
     if not path.exists():
         psrl_logger.info(f"No resolved line cache at {path!s}. L1 falls back to file-only where needed.")
-        return {}
+        return {}, {}
     cache = json.loads(path.read_text(encoding="utf-8"))
     resolved = {str(k): int(v) for k, v in (cache.get("resolved") or {}).items()}
-    psrl_logger.info(f"Loaded {len(resolved)} resolved defect lines from {path!s}.")
-    return resolved
+    per_file = {
+        str(task): {str(f): int(line) for f, line in (files or {}).items()}
+        for task, files in (cache.get("resolved_files") or {}).items()
+    }
+    psrl_logger.info(
+        f"Loaded {len(resolved)} resolved defect lines and {len(per_file)} per-file line maps from {path!s}."
+    )
+    return resolved, per_file
 
 
 def build_datasets(
@@ -532,7 +633,7 @@ def build_datasets(
 
     repo = Path(repo_path).resolve()
     canonical_rows = _load_canonical_rows(repo, env)
-    resolved_lines = _load_resolved_lines(repo, env)
+    resolved_lines, resolved_files = _load_resolved_lines(repo, env)
     task_dirs = _discover_task_dirs(repo, env, categories, difficulty)
     psrl_logger.info(f"Discovered compiled tasks under {repo / 'envs' / env / 'tasks'!s}. Count: {len(task_dirs)}.")
 
@@ -540,8 +641,8 @@ def build_datasets(
     rows: list[dict[str, Any]] = []
     plain_rows: list[dict[str, Any]] = []
     for category, task_dir in task_dirs:
-        rows.append(_build_row(category, task_dir, canonical_rows, hint_level, resolved_lines))
-        plain_rows.append(_build_row(category, task_dir, canonical_rows, "L3", resolved_lines))
+        rows.append(_build_row(category, task_dir, canonical_rows, hint_level, resolved_lines, resolved_files))
+        plain_rows.append(_build_row(category, task_dir, canonical_rows, "L3", resolved_lines, resolved_files))
         counts[category] += 1
 
     df = pd.DataFrame(rows)

@@ -38,6 +38,12 @@ CACHE_NAME = "DEFECT_LINES.json"
 # Where each env's pinned source comes from, preferring a bundled archive that needs
 # no network. A sha256 mismatch means the env moved and this table is stale.
 _SOURCES: dict[str, dict[str, Any]] = {
+    # Bundled rather than fetched: the upstream academic server is unreachable from
+    # the training cluster, so the image build copies this same archive.
+    "pluto-cooling-chemistry": {
+        "bundled": "env/source/pluto-4.4-patch4.tar.gz",
+        "sha256": "1ba5527b76d49fdd78ae24dbfbdad085ec83393748f1e618516a9d63bd945787",
+    },
     "mitgcm-biogeo": {
         "bundled": "env/source/mitgcm-853761d8f46926cd8042d6e0ad252050561fd6fa.tar.gz",
         "sha256": "7fc8abfc7bd58bc4c5a40c20213f8e3f2fb377c889a7ed0e3ddbfe1fe4358586",
@@ -191,6 +197,7 @@ def resolve_env(repo: Path, env: str, allow_network: bool = True) -> dict[str, A
         source_root = _extract_root(archive, workdir / "src")
 
         lines: dict[str, int] = {}
+        per_file: dict[str, dict[str, int]] = {}
         statuses: dict[str, str] = {}
         agreements = disagreements = 0
         for task_name, row in _iter_provenance(env_dir):
@@ -199,6 +206,20 @@ def resolve_env(repo: Path, env: str, allow_network: bool = True) -> dict[str, A
             if not edits:
                 statuses[task_name] = "no_edits"
                 continue
+            # A multi-file defect carries one edit per file, so resolve them all. The
+            # hint can then name a line for each file instead of degrading to L2.
+            resolved_edits: dict[str, int] = {}
+            for edit in edits:
+                edit_file = edit.get("file")
+                edit_old = edit.get("old")
+                if not edit_file or edit_old is None or edit_file in resolved_edits:
+                    continue
+                edit_line, _ = _resolve_one(source_root, edit_file, edit_old)
+                if edit_line is not None:
+                    resolved_edits[edit_file] = edit_line
+            if len(resolved_edits) > 1:
+                per_file[task_name] = resolved_edits
+
             edit = edits[0]
             defect_file = edit.get("file")
             old_text = edit.get("old")
@@ -235,6 +256,8 @@ def resolve_env(repo: Path, env: str, allow_network: bool = True) -> dict[str, A
             # Only tasks whose provenance records no line. A task with a recorded line
             # is deliberately absent, so the cache can never contradict it.
             "resolved": lines,
+            # Per-file lines for multi-file defects, keyed task -> file -> line.
+            "resolved_files": per_file,
             "statuses": statuses,
             "cross_check": {"agree": agreements, "offset": disagreements},
         }

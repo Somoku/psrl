@@ -14,7 +14,8 @@
       "Bash(python3:*)",
       "WebSearch",
       "WebFetch",
-      "Bash(cd *)"
+      "Bash(cd *)",
+      "Workflow(deep-research)"
     ],
     "deny": [
       "Bash(git reset --hard:*)"

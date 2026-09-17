@@ -14,7 +14,7 @@ Reward structure for mini_swe_agent data sources (toy / simple-test):
 
 Reward structure for swebench_verified / swe_smith_py / swe_gym data sources:
 
-  binary_01: 1.0 resolved, 0.0 otherwise (Dressage / ProRL-compatible)
+  binary_01: 1.0 resolved, 0.0 otherwise
   binary:   +1.0 resolved, -1.0 otherwise (legacy signed behavior)
   aborted:   0.0 and removed from training when the agent loop produced no sample
 
@@ -170,7 +170,7 @@ def _compute_swe_reward(
     """Compute SWE-bench reward with configurable granularity.
 
     Reward modes:
-        binary_01:      {1, 0} — Dressage / ProRL-compatible outcome reward.
+        binary_01:      {1, 0} — unsigned behavior.
         binary:         {+1, 0, -1} — legacy signed behavior.
         test_ratio:     Continuous based on f2p_pass / f2p_total.
         partial_credit: Multi-level: no_patch < apply_fail < no_progress < partial_fix < resolved.
@@ -312,7 +312,7 @@ def compute_score(
 
     Args:
         reward_mode: Reward granularity for SWE-bench data sources.
-            - "binary_01": {1, 0} outcome reward compatible with Dressage / ProRL
+            - "binary_01": {1, 0} outcome reward
             - "binary": {+1, 0, -1} legacy signed behavior
             - "partial_credit": Multi-level rewards based on patch/test progress
             - "test_ratio": Continuous score based on f2p/p2p ratios

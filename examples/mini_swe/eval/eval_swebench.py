@@ -262,6 +262,7 @@ def _evaluate_swe_problem(
     Returns:
         dict[str, Any]: Per-SWE-problem result row.
     """
+    from examples.mini_swe.grading.schema import GradingPlan
     from examples.mini_swe.prepare.swebench_subsets import get_swebench_image_name
     from examples.mini_swe.swebench_grader import grade_fresh_container
 
@@ -316,14 +317,23 @@ def _evaluate_swe_problem(
     needs_h1 = "swesmith" in image_name.lower()
     grader_kind = "smith" if needs_h1 else "verified"
 
+    # Grading is host-independent: Verified rows already carry ``eval_script``,
+    # while SWE-smith rows need it frozen from the profile first.
+    eval_problem = dict(swe_problem)
+    if needs_h1:
+        from examples.mini_swe.grading.freeze import freeze_smith_grading
+
+        eval_problem.update(freeze_smith_grading(eval_problem))
+
     grade = grade_fresh_container(
-        swe_problem,
+        eval_problem,
         patch,
         grader_kind=grader_kind,
         image_name=image_name,
         timeout=grader_timeout,
         swe_task_id=f"{swe_problem_id}__eval",
         memory=grader_memory,
+        grading_plan=GradingPlan.from_swe_problem(eval_problem),
     )
     (problem_dir / "grading.json").write_text(json.dumps(grade, indent=2, default=str))
 

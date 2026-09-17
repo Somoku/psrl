@@ -154,6 +154,13 @@ class MiniSWEEnvironment(Environment[dict, None]):
                 "Fresh-container grading requires swe_problem with instance_id and swe_problem_image; "
                 f"available extra_info keys: {sorted(extra_info.keys())}."
             )
+        # Grading is host-independent: the eval script must travel with the row.
+        # Re-run the dataset preparation step if a split predates that change.
+        if swe_grader == "swebench_fresh_container" and not str(swe_problem.get("eval_script") or "").strip():
+            raise ValueError(
+                "Fresh-container grading requires swe_problem.eval_script. Re-run the preparation "
+                "step for this split (see examples/mini_swe/prepare/README.md)."
+            )
 
         observation = {
             "problem_statement": problem_statement,

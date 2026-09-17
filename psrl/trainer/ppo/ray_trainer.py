@@ -1872,11 +1872,15 @@ class PSRL_RayPPOTrainer(RayPPOTrainer):
         for i, node_id in enumerate(worker_node_ids):
             if use_node_capacity and node_id not in capacity_coordinators:
                 coordinator_concurrency = workers_per_node[node_id] * (max_concurrency_per_worker + 1) + 1
-                capacity_coordinators[node_id] = ray.remote(SandboxCapacityCoordinator).options(
-                    num_cpus=0,
-                    max_concurrency=coordinator_concurrency,
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
-                ).remote(capacity_config)
+                capacity_coordinators[node_id] = (
+                    ray.remote(SandboxCapacityCoordinator)
+                    .options(
+                        num_cpus=0,
+                        max_concurrency=coordinator_concurrency,
+                        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+                    )
+                    .remote(capacity_config)
+                )
             capacity_coordinator = capacity_coordinators.get(node_id)
             self.agent_loop_workers.append(
                 PSRL_AgentLoopWorker.options(

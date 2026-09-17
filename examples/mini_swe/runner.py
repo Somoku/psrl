@@ -60,7 +60,6 @@ _PROXY_ENV_KEYS = [
 ]
 
 
-
 def parse_duration_seconds(value: str | int | float | None) -> float | None:
     """Parse a compact MiniSWE duration into seconds."""
     if value is None or (isinstance(value, str) and not value.strip()):

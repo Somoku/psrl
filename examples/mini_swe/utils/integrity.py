@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -34,15 +34,31 @@ _PROTECTED_BASENAMES = {
     "pyproject.toml",
 }
 
+# Trajectory output formats the scanner can dispatch on. These mirror the
+# `HarnessConfig.trajectory_format` values; `plain_text` intentionally has no
+# parser and is reported as unscannable.
+TRAJECTORY_FORMAT_CLAUDE_CODE = "claude_code_stream_json"
+TRAJECTORY_FORMAT_CODEX = "codex_jsonl"
+TRAJECTORY_FORMAT_PLAIN_TEXT = "plain_text"
 
-def scan_claude_code_integrity(log_bytes: bytes, repo: str) -> dict[str, Any]:
-    """Scan Claude Code JSONL output for repository downloads and protected writes."""
-    violations: list[dict[str, str]] = []
-    malformed_lines = 0
+TrajectoryParser = Callable[[Any], Iterator[tuple[str, dict[str, Any]]]]
+
+
+def scan_trajectory_integrity(log_bytes: bytes, trajectory_format: str, repo: str) -> dict[str, Any]:
+    """Scan a harness trajectory for repository downloads and protected writes.
+
+    Dispatches on the trajectory output format rather than the harness kind so a
+    new harness only needs a parser registered for its format. An unparsable
+    trajectory (unknown format, or no valid JSON lines) is reported as
+    unscannable but is NOT treated as a violation.
+    """
+    parser = _TRAJECTORY_PARSERS.get(trajectory_format)
+    if parser is None:
+        return _unscannable_result(f"No integrity parser for trajectory format {trajectory_format!r}.")
+
+    tool_calls: list[tuple[str, dict[str, Any]]] = []
     parsed_lines = 0
-    seen_calls: set[tuple[str, str]] = set()
-    repo_slug = _normalize_repo_slug(repo)
-
+    malformed_lines = 0
     for raw_line in log_bytes.splitlines():
         try:
             payload = json.loads(raw_line)
@@ -50,38 +66,88 @@ def scan_claude_code_integrity(log_bytes: bytes, repo: str) -> dict[str, Any]:
             malformed_lines += 1
             continue
         parsed_lines += 1
-        for name, arguments in _iter_tool_calls(payload):
-            serialized = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
-            call_key = (name.lower(), serialized)
-            if call_key in seen_calls:
-                continue
-            seen_calls.add(call_key)
+        tool_calls.extend(parser(payload))
 
-            if repo_slug and _accesses_task_repository(name, arguments, repo_slug):
-                violations.append(
-                    {
-                        "kind": "invalid_tool_call",
-                        "reason": "blocked_repo_web_access",
-                        "tool": name,
-                        "repo": repo_slug,
-                        "snippet": _snippet(serialized),
-                    }
-                )
-            protected_path = _protected_write_path(name, arguments)
-            if protected_path:
-                violations.append(
-                    {
-                        "kind": "invalid_protected_write",
-                        "reason": "write_to_test_or_harness_path",
-                        "tool": name,
-                        "path": protected_path,
-                        "snippet": _snippet(serialized),
-                    }
-                )
+    if parsed_lines == 0:
+        return _unscannable_result(
+            "Trajectory log contained no parseable JSON lines.",
+            parsed_lines=parsed_lines,
+            malformed_lines=malformed_lines,
+        )
+    return _evaluate_tool_calls(
+        tool_calls,
+        _normalize_repo_slug(repo),
+        parsed_lines=parsed_lines,
+        malformed_lines=malformed_lines,
+    )
+
+
+def scan_claude_code_integrity(log_bytes: bytes, repo: str) -> dict[str, Any]:
+    """Backwards-compatible wrapper for the Claude Code stream-json scanner."""
+    return scan_trajectory_integrity(log_bytes, TRAJECTORY_FORMAT_CLAUDE_CODE, repo)
+
+
+def _unscannable_result(
+    note: str,
+    parsed_lines: int = 0,
+    malformed_lines: int = 0,
+) -> dict[str, Any]:
+    """Return an all-clear, non-violating result for an unscannable trajectory."""
+    return {
+        "violated": False,
+        "scannable": False,
+        "reasons": [],
+        "violations": [],
+        "parsed_lines": parsed_lines,
+        "malformed_lines": malformed_lines,
+        "tool_calls": 0,
+        "scan_note": note,
+    }
+
+
+def _evaluate_tool_calls(
+    tool_calls: list[tuple[str, dict[str, Any]]],
+    repo_slug: str,
+    parsed_lines: int,
+    malformed_lines: int,
+) -> dict[str, Any]:
+    """Apply the repository-access and protected-write checks to normalized calls."""
+    violations: list[dict[str, str]] = []
+    seen_calls: set[tuple[str, str]] = set()
+
+    for name, arguments in tool_calls:
+        serialized = json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)
+        call_key = (name.lower(), serialized)
+        if call_key in seen_calls:
+            continue
+        seen_calls.add(call_key)
+
+        if repo_slug and _accesses_task_repository(name, arguments, repo_slug):
+            violations.append(
+                {
+                    "kind": "invalid_tool_call",
+                    "reason": "blocked_repo_web_access",
+                    "tool": name,
+                    "repo": repo_slug,
+                    "snippet": _snippet(serialized),
+                }
+            )
+        protected_path = _protected_write_path(name, arguments)
+        if protected_path:
+            violations.append(
+                {
+                    "kind": "invalid_protected_write",
+                    "reason": "write_to_test_or_harness_path",
+                    "tool": name,
+                    "path": protected_path,
+                    "snippet": _snippet(serialized),
+                }
+            )
 
     reasons = sorted({violation["reason"] for violation in violations})
     return {
         "violated": bool(violations),
+        "scannable": True,
         "reasons": reasons,
         "violations": violations,
         "parsed_lines": parsed_lines,
@@ -90,7 +156,7 @@ def scan_claude_code_integrity(log_bytes: bytes, repo: str) -> dict[str, Any]:
     }
 
 
-def _iter_tool_calls(value: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+def _iter_claude_code_tool_calls(value: Any) -> Iterator[tuple[str, dict[str, Any]]]:
     """Yield Anthropic or OpenAI-style tool calls from a nested JSON event."""
     if isinstance(value, dict):
         if value.get("type") == "tool_use" and value.get("name"):
@@ -108,10 +174,45 @@ def _iter_tool_calls(value: Any) -> Iterator[tuple[str, dict[str, Any]]]:
             yield str(function["name"]), arguments if isinstance(arguments, dict) else {}
 
         for nested in value.values():
-            yield from _iter_tool_calls(nested)
+            yield from _iter_claude_code_tool_calls(nested)
     elif isinstance(value, list):
         for nested in value:
-            yield from _iter_tool_calls(nested)
+            yield from _iter_claude_code_tool_calls(nested)
+
+
+def _iter_codex_tool_calls(value: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield normalized tool calls from a Codex `exec --json` JSONL event.
+
+    Codex emits `item.*` events whose `item.type` identifies the action. The
+    parser maps those onto the same `(tool_name, arguments)` shape the shared
+    checks consume, so it does not depend on Anthropic/OpenAI tool schemas.
+    """
+    if isinstance(value, dict):
+        event_type = value.get("type")
+        if event_type == "command_execution":
+            command = value.get("command")
+            if command:
+                yield "bash", {"command": command}
+        elif event_type == "file_change":
+            for change in value.get("changes") or []:
+                if isinstance(change, dict) and change.get("path"):
+                    yield "edit", {"path": change["path"]}
+        elif event_type == "web_search":
+            yield "web_search", {"query": value.get("query")}
+        elif event_type == "mcp_tool_call":
+            yield str(value.get("tool") or "mcp_tool_call"), value.get("arguments") or {}
+
+        for nested in value.values():
+            yield from _iter_codex_tool_calls(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_codex_tool_calls(nested)
+
+
+_TRAJECTORY_PARSERS: dict[str, TrajectoryParser] = {
+    TRAJECTORY_FORMAT_CLAUDE_CODE: _iter_claude_code_tool_calls,
+    TRAJECTORY_FORMAT_CODEX: _iter_codex_tool_calls,
+}
 
 
 def _accesses_task_repository(name: str, arguments: dict[str, Any], repo_slug: str) -> bool:

@@ -39,7 +39,7 @@ SKIP_GIT_CLEAN="${PSRL_BAKE_SKIP_GIT_CLEAN:-0}"
 digest() { printf '%s' "$BAKE_REVISION:$1" | sha256sum | cut -c1-12; }
 
 # Purge leaked git metadata so the derivative can never expose a future fix
-# commit. Must stay in sync with examples/mini_swe/git_sanitize.py. The workdir
+# commit. Must stay in sync with examples/mini_swe/utils/git_sanitize.py. The workdir
 # placeholder is substituted on the host; a missing repo or a non-worktree is a
 # no-op, so this is safe for images that do not bake a repo at BAKE_WORKDIR.
 git_clean_script='set -u

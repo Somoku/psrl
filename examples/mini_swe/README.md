@@ -13,6 +13,11 @@ Three training paths are supported:
 | **SWE-smith-py** | Real GitHub bugs (50k SWE problems, per-repo images) | F2P / P2P test execution | Full RL training |
 | **SWE-Gym** | Real GitHub bugs (2438 SWE problems, `xingyaoww` images) | F2P / P2P test execution (pre-computed eval_script) | Full RL training |
 
+The **harness mode** (Claude Code / Codex) can replace mini-SWE-agent's native
+loop on either real path. `megatron_qwen_4b_swe_cc.sh` is the ready-to-run
+Claude Code recipe (Megatron, Qwen3.5-4B, SWE-Gym-293); see
+[Harness training](#harness-training-preprocessing--bake).
+
 ---
 
 ## Overview
@@ -90,7 +95,8 @@ examples/mini_swe/
 ├── fsdp_qwen_14b_dapo.sh                 # Launch script — toy / DAPO path (FSDP, 14B)
 ├── fsdp_qwen_7b_swe_smith.sh             # Launch script — SWE-smith-py (FSDP, 7B)
 ├── fsdp_qwen_7b_swe_gym.sh               # Launch script — SWE-Gym (FSDP, 7B)
-├── megatron_qwen_4b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 4B)
+├── megatron_qwen_4b_swe_cc.sh            # Launch script — Claude Code harness (Megatron, Qwen3.5-4B, SWE-Gym-293)
+├── megatron_qwen_4b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 4B, native loop)
 ├── megatron_qwen_7b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 7B)
 ├── megatron_qwen_8b_swe_smith.sh         # Launch script — SWE-smith (Megatron, 8B)
 ├── megatron_qwen_8b_swe_gym.sh           # Launch script — SWE-Gym (Megatron, 8B)
@@ -100,7 +106,10 @@ examples/mini_swe/
 │   ├── simple_agent_config.yaml          # Agent config for toy path
 │   ├── swebench_agent_config.yaml        # Agent config for SWE-smith / SWE-Gym / Verified
 │   ├── swebench_agent_config_xml_fc.yaml # XML function-calling variant (newer models)
-│   └── swebench_harness_config.yaml      # Claude Code / Codex harness agent-loop config
+│   ├── swebench_agent_config_full_sweagent.yaml # Full SWE-agent format (SWE-agent-LM-7B)
+│   ├── swebench_harness_config.yaml      # Claude Code / Codex harness agent-loop config
+│   ├── qwen_no_think_strip.jinja         # Qwen3 chat template (strips thinking)
+│   └── qwen35_no_think_strip.jinja       # Qwen3.5 chat template (used by the cc harness script)
 ├── eval/                                 # Standalone evaluation + vLLM serving (see eval/README.md)
 │   ├── README.md                         # Guide for gold-patch sanity, multi-node eval, serving your own checkpoint
 │   ├── eval_swebench.py                  # Single-node eval entry point
@@ -129,7 +138,8 @@ examples/mini_swe/
         ├── swe_gym_293.sh                # Convenience wrapper: SWE-Gym-293 train + val images
         ├── swe_eval_subset.sh            # Convenience wrapper for SWE-bench eval subset images
         ├── probe_mirrors.sh              # Check which public Docker Hub mirrors serve a given image
-        └── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
+        ├── load_all_nodes.sh             # pssh fan-out of `docker load` across the cluster
+        └── migrate_docker_overlay2.sh    # Move the Docker data-root/overlay2 onto a larger disk
 
 # Core integration modules inside psrl/
 psrl/workers/agent_loop/loops/session_agent_loop.py       # Shared SessionRouter/TITO lifecycle
@@ -359,6 +369,10 @@ python -m examples.mini_swe.prepare.prepare_swe_gym \
   --output-dir examples/mini_swe/data/swe_gym_codex
 ```
 
+For a ready-to-run Megatron recipe, `examples/mini_swe/megatron_qwen_4b_swe_cc.sh`
+already pins the `mini_swe_claude_code` loop and TITO auto IDs on the SWE-Gym-293
+parquets — see [§4 Launching harness training](#4-launching-harness-training).
+
 Launch either dataset through the same trainer. Harness mode must use TITO's
 automatic prefix-tree trajectory IDs so sub-agents and context-compression
 branches remain in one session without sharing a trajectory ID:
@@ -526,11 +540,11 @@ shared filesystem, the baked images are node-local.
 
 | # | Step | Reference |
 |---|------|-----------|
-| 1 | Build the task parquet; set `--agent-name mini_swe_claude_code` / `mini_swe_codex` (the prepared launch scripts also pin `default_agent_loop`) | [`prepare/README.md`](prepare/README.md) Path C |
+| 1 | Build the task parquet; set `--agent-name mini_swe_claude_code` / `mini_swe_codex` (`megatron_qwen_4b_swe_cc.sh` instead pins `default_agent_loop` at launch) | [`prepare/README.md`](prepare/README.md) Path C |
 | 2 | Prefetch and fan out the per-problem base images to every worker node | [`prepare/README.md`](prepare/README.md) Path C Step 2 |
 | 3 | Build the native harness runtime trees and export `PSRL_HARNESS_RUNTIME_ROOT` | §1 |
 | 4 | Bake the per-image derivative (**git-leak purge** only; optional) | §2 |
-| 5 | Launch with `TRAJECTORY_ID_STRATEGY=auto` and the harness agent-loop config | §4 |
+| 5 | Launch with the harness agent-loop config and TITO auto trajectory IDs (`megatron_qwen_4b_swe_cc.sh` sets both) | §4 |
 
 Step 4 is optional but recommended. A missing bake never blocks training: the
 sandbox falls back to the runtime git probe, which purges only images that
@@ -653,19 +667,39 @@ docker run --rm "$tag" bash -lc \
 
 ### 4. Launching harness training
 
-Point the trainer at the harness agent-loop config and a parquet whose
-`agent_name` selects the harness. Harness mode requires TITO auto trajectory IDs
-so sub-agent / compaction branches stay in one session:
+**Ready-to-run (Megatron, Claude Code).** `megatron_qwen_4b_swe_cc.sh` is the
+canonical harness recipe: Qwen3.5-4B on the SWE-Gym-293 parquets, trained with
+Megatron (TP=4 / CP=2, 2 nodes × 8 GPUs). It pins everything harness mode needs:
+
+- `agent_loop_config_path=config/swebench_harness_config.yaml`
+- `default_agent_loop=mini_swe_claude_code` (so the parquet's `agent_name` is not required to select the harness)
+- `psrl.rollout_gateway.trajectory_id_strategy=auto` (TITO prefix-tree IDs)
+- `PSRL_HARNESS_RUNTIME_ROOT` (the read-only runtime trees from §1)
+
+```bash
+bash examples/mini_swe/megatron_qwen_4b_swe_cc.sh        # staleness defaults to 1
+bash examples/mini_swe/megatron_qwen_4b_swe_cc.sh 2      # optional staleness arg
+```
+
+It expects `data/swe_gym_293/{train,val}.parquet` and their prefetched images
+from [`prepare/README.md`](prepare/README.md) Path C, and it exports
+`SWE_STRICT_NO_TEST_PATCH=1` / `SWE_TEST_PATCH_POLICY_SCOPE=all_tests`.
+
+**Generic (any model/dataset, FSDP).** Point the trainer at the harness config
+and a parquet whose `agent_name` selects the harness. Harness mode requires TITO
+auto trajectory IDs so sub-agent / compaction branches stay in one session:
 
 ```bash
 AGENT_LOOP_CONFIG_PATH="$(pwd)/examples/mini_swe/config/swebench_harness_config.yaml" \
 TRAJECTORY_ID_STRATEGY=auto \
-TRAIN_FILE="$(pwd)/examples/mini_swe/data/swe_gym_293/train.parquet" \
-TEST_FILE="$(pwd)/examples/mini_swe/data/swe_gym_293/val.parquet" \
+TRAIN_FILE="$(pwd)/examples/mini_swe/data/swe_gym_claude/train.parquet" \
+TEST_FILE="$(pwd)/examples/mini_swe/data/swe_gym_claude/train.parquet" \
 bash examples/mini_swe/fsdp_qwen_7b_swe_gym.sh
 ```
 
-`megatron_qwen_4b_swe_smith.sh` already defaults to the `mini_swe_claude_code` harness and `swebench_harness_config.yaml`.
+`TRAJECTORY_ID_STRATEGY` is read by `fsdp_qwen_7b_swe_gym.sh`; the Megatron
+scripts pass the equivalent `psrl.rollout_gateway.trajectory_id_strategy`
+config key directly. Both resolve to the same TITO strategy.
 
 ### 5. Gotchas
 
@@ -728,6 +762,7 @@ and rewrites forwarded proxy URLs whose host is `localhost`, `127.0.0.1`, or
 | `config/simple_agent_config.yaml` | Toy path — single `python:3.11-slim` image, preexisting repos |
 | `config/swebench_agent_config.yaml` | SWE-smith-py / SWE-Gym / Verified — per-SWE-problem images, `cwd=/testbed` |
 | `config/swebench_agent_config_xml_fc.yaml` | Same as above but with XML function-calling format (for newer models) |
+| `config/swebench_agent_config_full_sweagent.yaml` | Full SWE-agent prompt format (SWE-agent-LM-7B) |
 | `config/swebench_harness_config.yaml` | Claude Code or Codex harness over the same SWE task and grader contracts |
 
 The `environment.image` field in `swebench_agent_config.yaml` is intentionally set

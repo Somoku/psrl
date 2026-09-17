@@ -72,7 +72,7 @@ Real-world bugs with pre-computed eval scripts. No `git checkout HEAD~1` is need
 |---------|---------------------|-----------|---------------|
 | `gym-subset` | `SumanthRH/SWE-Gym-Subset` | 100 | Shipped in the dataset |
 | `gym` | `SWE-Gym/SWE-Gym` | 2438 | Generated with SWE-Bench-Fork 2.0.13 |
-| `skyrl293` | `NovaSky-AI/SkyRL-v0-293-data` | 293 + 23 | Generated with SWE-Bench-Fork |
+| SWE-Gym-293 | `NovaSky-AI/SkyRL-v0-293-data` | 293 + 23 | Generated with SWE-Bench-Fork (own script, not a `--dataset` key) |
 
 ### Step 1: Generate parquets
 
@@ -126,7 +126,7 @@ Env overrides: `SWE_GYM_293_TRAIN` / `SWE_GYM_293_VAL` (defaults under `data/swe
 
 ## Harness Mode Preparation
 
-Only needed when `agent_name` selects a harness (`mini_swe_claude_code` or `mini_swe_codex`) instead of the native loop. Both steps are host-side; Docker images stay node-local.
+Only needed when a harness loop is selected — either the parquet's `agent_name` is `mini_swe_claude_code` / `mini_swe_codex`, or the launch script pins `default_agent_loop` (as `megatron_qwen_4b_swe_cc.sh` does). Both steps are host-side; Docker images stay node-local.
 
 ### 1. Build the harness runtime trees
 
@@ -153,6 +153,10 @@ bash examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh \
 The tag keys on the base image alone, so an existing derivative is skipped. After changing the bake steps, use `rebake_harness_image.sh` (same arguments) to delete the stale derivative and re-bake it.
 
 A missing bake never blocks training: the runner falls back to the base image plus a runtime git probe that purges only images that actually leak — you just pay that cost on every rollout.
+
+### 3. Launch the harness recipe
+
+With the parquets and images ready, `examples/mini_swe/megatron_qwen_4b_swe_cc.sh` is the ready-to-run Claude Code recipe (Megatron, Qwen3.5-4B, SWE-Gym-293). It exports `PSRL_HARNESS_RUNTIME_ROOT` and sets `psrl.rollout_gateway.trajectory_id_strategy=auto` itself, so only steps 1–2 above are host-side prerequisites.
 
 ---
 

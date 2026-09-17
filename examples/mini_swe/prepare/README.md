@@ -16,6 +16,13 @@ Three independent data paths are supported:
   (`xingyaoww/sweb.eval.x86_64.*`). Supports a 100-problem subset for fast
   iteration and the full 2438-problem set for production training.
 
+Harness mode (Claude Code / Codex) reuses any of these paths and adds two
+host-side steps — the read-only runtime trees and an optional git-purged
+per-image derivative. See
+[Step 3: Harness runtime trees](#step-3-harness-runtime-trees--git-purged-derivatives-harness-mode-only);
+the ready-to-run Claude Code launch script is
+[`megatron_qwen_4b_swe_cc.sh`](../megatron_qwen_4b_swe_cc.sh) (SWE-Gym-293 data).
+
 ---
 
 ## Files
@@ -42,6 +49,7 @@ Three independent data paths are supported:
 | `docker_scripts/swe_smith.sh` | Convenience wrapper: prefetch SWE-smith images |
 | `docker_scripts/probe_mirrors.sh` | Quickly check which public Docker Hub mirrors can serve a given image (uses `skopeo inspect`, no download) |
 | `docker_scripts/load_all_nodes.sh` | `pssh` fan-out: on every host listed in a file, `docker load` every `*.tar` in a shared-FS image dir, with per-node parallelism and skip-if-already-loaded |
+| `docker_scripts/migrate_docker_overlay2.sh` | Move the Docker data-root / `overlay2` store onto a larger disk before loading a big image set |
 | `_prefetch_logs/` | One log file per image (kept by `prefetch_images.sh`) — header `Already have` when cached, or a full per-mirror/per-attempt log when pulled |
 | `_load_logs/<timestamp>/` | `pssh` per-host stdout / stderr from `load_all_nodes.sh` |
 
@@ -485,13 +493,15 @@ pip install git+https://github.com/SWE-Gym/SWE-Bench-Fork.git
 python -m pip install swebench==4.1.0
 ```
 
-### Dataset variants
+### Dataset variants (`prepare_swe_gym.py --dataset`)
 
 | Key | HuggingFace path | Instances | `eval_script` source | Notes |
 |-----|-----------------|-----------|---------------------|-------|
 | `gym` | `SWE-Gym/SWE-Gym` | 2438 | Generated via `make_test_spec` (needs SWE-Bench-Fork 2.0.13) | Full training set |
 | `gym-subset` | `SumanthRH/SWE-Gym-Subset` | 100 | Pre-computed in HF dataset column | Quick iteration, no Fork needed |
-| `skyrl293` | `NovaSky-AI/SkyRL-v0-293-data` | 293 train + 23 val | Generated via SWE-Bench-Fork | SkyRL's curated SWE-bench Verified subset — see [SWE-Gym-293](#swe-gym-293-skyrl-v0-293) |
+
+SWE-Gym-293 / SkyRL-v0-293 is **not** a `--dataset` key here; it has its own
+converter, [`prepare_swe_gym_293.py`](#swe-gym-293-skyrl-v0-293).
 
 ### Step 1: Generate SWE-Gym training data
 
@@ -535,6 +545,13 @@ python -m examples.mini_swe.prepare.prepare_swe_gym_293 \
 ```
 
 Output: `data/swe_gym_293/train.parquet` (293 rows) and `val.parquet` (23 rows).
+
+These are the parquets used by the ready-to-run Claude Code harness script
+[`megatron_qwen_4b_swe_cc.sh`](../megatron_qwen_4b_swe_cc.sh). It pins
+`default_agent_loop=mini_swe_claude_code` at launch, so the default
+`agent_name` tag is fine; for other harness recipes add
+`--agent-name mini_swe_claude_code` (or `mini_swe_codex`) so the rows select the
+harness themselves.
 
 ### Step 2: Pre-fetch Docker images
 
@@ -596,9 +613,10 @@ Env overrides: `SWE_GYM_293_TRAIN` / `SWE_GYM_293_VAL` (defaults under
 
 ### Step 3: Harness runtime trees + git-purged derivatives (harness mode only)
 
-The native mini-SWE-agent loop runs on the host and needs no image changes. The
-**harness** loops (Claude Code / Codex) run a self-contained native CLI inside
-the sandbox, so prepare two things:
+This step applies to **any** data path (A/B/C), not just SWE-Gym — skip it unless
+you plan to run a harness. The native mini-SWE-agent loop runs on the host and
+needs no image changes. The **harness** loops (Claude Code / Codex) run a
+self-contained native CLI inside the sandbox, so prepare two things:
 
 1. **Runtime trees (required, once on the shared filesystem).** Each sandbox
    mounts one tree read-only; there is no Node, no npm and no in-sandbox install.
@@ -631,6 +649,18 @@ arguments) to delete and re-create it:
 ```bash
 bash examples/mini_swe/prepare/docker_scripts/rebake_harness_image.sh \
     --parquet examples/mini_swe/data/swe_gym_293/train.parquet
+```
+
+#### Launching the harness recipe
+
+Once the parquets and images are ready, `examples/mini_swe/megatron_qwen_4b_swe_cc.sh`
+is the ready-to-run Claude Code script (Megatron, Qwen3.5-4B, SWE-Gym-293). It
+exports `PSRL_HARNESS_RUNTIME_ROOT` and sets
+`psrl.rollout_gateway.trajectory_id_strategy=auto`, so the two host-side steps
+above are all that remain:
+
+```bash
+bash examples/mini_swe/megatron_qwen_4b_swe_cc.sh
 ```
 
 See the main README's

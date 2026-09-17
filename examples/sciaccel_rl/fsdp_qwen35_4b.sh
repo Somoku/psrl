@@ -26,7 +26,7 @@ HF_MODEL_PATH=${HF_MODEL_PATH:-${PSRL_WORKSPACE:-}/models/Qwen3.5-4B}
 # `L1` adds file, line, and defect note, `L2` drops the line, `L3` is the unhinted control.
 HINT_LEVEL=${HINT_LEVEL:-L1}
 # Built by `prepare/prepare_all.sh`, one directory per (env, category, tier).
-DATA_DIR=${DATA_DIR:-${PSRL_PATH}/examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy}
+DATA_DIR=${DATA_DIR:-${PSRL_PATH}/examples/sciaccel_rl/data/pluto-cooling-chemistry/repair_easy}
 train_files=${DATA_DIR}/train/${HINT_LEVEL}.parquet
 # Hinted eval matches the training distribution. `L3` is the unhinted control, so its
 # in-distribution eval set IS the unhinted one. Override with VAL_FILES.
@@ -49,10 +49,11 @@ for f in "${train_files}" "${val_files}"; do
 done
 
 # --- Experiment ---
-project_name=sciaccel_rl_mit
-# The dataset directory is part of the identity, because a repair only run and a
-# mixed run at the same hint level are different experiments.
-experiment_name=GRPO-sciaccel-Qwen35-4B-$(basename "${DATA_DIR}")-${HINT_LEVEL}
+project_name=${PROJECT_NAME:-sciaccel_rl_pluto}
+# `<env>_<category>_<tier>` from the last two path segments, because every env's
+# dataset dir ends in the same `repair_easy` and the basename alone would collide.
+dataset_tag=$(basename "$(dirname "${DATA_DIR}")")_$(basename "${DATA_DIR}")
+experiment_name=GRPO-sciaccel-Qwen35-4B-${dataset_tag}-${HINT_LEVEL}
 OUTPUT_DIR=${OUTPUT_DIR:-${PSRL_PATH}/examples/sciaccel_rl}
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/${project_name}/${experiment_name}
 PSRL_LOG_DIR=${OUTPUT_DIR}/psrl_logs/${experiment_name}
@@ -89,7 +90,7 @@ max_turns=${MAX_TURNS:-50}
 
 # Nodes allowed to host agent loop workers, and therefore Docker containers. A node
 # with a degraded daemon accepts actors and then hangs. Empty means every alive node.
-AGENT_NODE_IPS=${AGENT_NODE_IPS:-}
+AGENT_NODE_IPS=${AGENT_NODE_IPS:-28.49.55.85,28.49.196.175}
 
 # One worker per allowed node. Placement is round-robin, so more workers than nodes
 # stacks them and multiplies the container count `max_concurrent_episodes` bounds.

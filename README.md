@@ -27,8 +27,9 @@ An Efficient Asynchronous RL Framework for LLM Post-Training
 
 ## 📰 News
 
-- **[2026/07/28]** 🎉 We open-source **PSRL**!
-- **[2026/06/13]** 🏆 **StaleFlow**, the paper introducing the PSRL system, is accepted to **SIGMOD 2027**! Check out the [paper](https://arxiv.org/abs/2601.12784).
+- **[2026/09/17]** 🔬 PSRL now powers the RL post-training of **[ScienceIDE](https://github.com/aitofound/ScienceIDE)** <a href="https://github.com/aitofound/ScienceIDE"><img src="https://img.shields.io/github/stars/aitofound/ScienceIDE?style=social" alt="ScienceIDE stars" valign="middle"></a>, a collection of **scientific codebase environments**. Check out the [technical report](https://arxiv.org/abs/2609.19134).
+- **[2026/07/28]** 🎉 We **open-source** PSRL.
+- **[2026/06/13]** 🏆 **StaleFlow**, the paper introducing the PSRL system, is accepted to **SIGMOD 2027**. Check out the [paper](https://arxiv.org/abs/2601.12784).
 - **[2026/06/10]** 🔬 We release **ForeMoE**, which uses foreseeable rollout expert-routing information to optimize MoE RL load balancing. Check out the [paper](https://arxiv.org/abs/2606.11867).
 
 ## ✨ Overview
@@ -175,7 +176,7 @@ If you use PSRL in your research, please cite our paper:
 
 ```bibtex
 @article{li2026staleflow,
-  title={Unleashing Efficient Asynchronous RL Post-Training via Staleness-Constrained Rollout Coordination},
+  title={StaleFlow: Staleness-Aware Data Management for Mitigating Data Skewness in Fully Disaggregated RL Post-Training},
   author={Li, Haoyang and Lin, Sheng and Fu, Fangcheng and Zhou, Yuming and Ji, Xiaodong and Zhao, Yanfeng and Wang, Lefeng and Jiang, Jie and Cui, Bin},
   journal={arXiv preprint arXiv:2601.12784},
   year={2026}

@@ -47,6 +47,9 @@ tensorflow/my_graph/*
 **/_build/
 **/outputs
 **/outputs/
+
+# Talk material. Cites cluster-side measurements that stay out of published docs.
+examples/sciaccel_rl/slides/
 **/output/
 **/playground
 **/wandb

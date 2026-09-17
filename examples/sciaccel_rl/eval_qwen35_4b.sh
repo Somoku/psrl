@@ -31,10 +31,10 @@ HINT_LEVEL=${HINT_LEVEL:-L1}
 DATA_DIR=${DATA_DIR:-${PSRL_PATH}/examples/sciaccel_rl/data/mitgcm-biogeo/repair_easy}
 # Score the untrained `HF_MODEL_PATH` weights instead of a checkpoint, which is the
 # step-0 baseline for that model on this split.
-EVAL_BASE=${EVAL_BASE:-True}
+EVAL_BASE=${EVAL_BASE:-False}
 # Must be a `global_step_N` directory holding `actor/`, because `resume_path` asserts on
 # that prefix to recover the step number. Unused when EVAL_BASE=True.
-CKPT_PATH=${CKPT_PATH:-${PSRL_PATH}/examples/sciaccel_rl/ckpts/sciaccel_rl/<experiment>/global_step_30}
+CKPT_PATH=${CKPT_PATH:-/apdcephfs_zwfy10_303541817/share_303541817/lhy/psrl/examples/sciaccel_rl/results/mitgcm-biogeo_repair/GRPO-sciaccel-Qwen35-4B-mitgcm-biogeo_repair_easy-L1/global_step_30}
 # Required by the config schema even though no training runs, and only read for it.
 train_files=${DATA_DIR}/train/${HINT_LEVEL}.parquet
 # Hinted eval, matching the training distribution. `L3` is the unhinted control, so

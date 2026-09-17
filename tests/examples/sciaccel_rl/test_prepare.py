@@ -1,10 +1,13 @@
 """Tests for the SciAccel-RL dataset preparation script."""
 
 import os
+import re
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from examples.sciaccel_rl.prepare.build_dataset import _container_source_root
 
 # The task bank lives outside this repo, so these tests are opt-in. Set
 # SCIACCEL_RL_REPO to a checkout with compiled envs, or they skip.
@@ -154,6 +157,35 @@ class TestHintLevels:
                 assert f"line {line}" in hint
         assert all("line " not in row["hint"] for row in hint_datasets["L2"]["extra_info"])
 
+    def test_l1_names_a_line_for_every_file_of_a_multi_file_defect(self, hint_datasets, canonical_rows):
+        # A multi-file defect carries one edit per file, so naming only the files would
+        # make the widest tasks the weakest hints. Each named file gets its own line.
+        checked = 0
+        for _, row in hint_datasets["L1"].iterrows():
+            hint = row["extra_info"]["hint"]
+            if not hint or "line " not in hint:
+                continue
+            canonical = canonical_rows[Path(row["extra_info"]["task_path"]).name]
+            meta = canonical["candidate"].get("meta") or {}
+            files = [str(f) for f in (meta.get("files") or []) if f]
+            if len(files) < 2:
+                continue
+            checked += 1
+            for name in files:
+                assert f"{name}, line " in hint, f"{name} named without a line in: {hint}"
+            assert hint.count(", line ") == len(files), f"expected {len(files)} lines in: {hint}"
+        if checked == 0:
+            pytest.skip(f"env {ENV!r} has no multi-file defect at this tier")
+
+    def test_every_hint_stays_inside_the_char_budget(self, hint_datasets):
+        # The budget guards `data.max_prompt_length` under `data.truncation=error`, so a
+        # six-file defect naming a line each must still fit.
+        from examples.sciaccel_rl.prepare.build_dataset import _HINT_CHAR_BUDGET
+
+        for level in ("L1", "L2"):
+            for row in hint_datasets[level]["extra_info"]:
+                assert len(row["hint"] or "") <= _HINT_CHAR_BUDGET
+
     def test_prompt_column_mirrors_the_hint(self, hint_datasets):
         # The column is documentation, because Harbor delivers the hint itself.
         for _, row in hint_datasets["L1"].iterrows():
@@ -173,6 +205,19 @@ class TestHintLevels:
     def test_hint_level_is_recorded_on_every_row(self, hint_datasets):
         for level in ("L1", "L2", "L3"):
             assert all(row["hint_level"] == level for row in hint_datasets[level]["extra_info"])
+
+    def test_hint_names_the_container_path_not_a_relative_one(self, hint_datasets):
+        # A canonical row records defect files relative to the source root, while the
+        # container holds them under a prefix that the agent otherwise rediscovers.
+        for level in ("L1", "L2"):
+            for _, row in hint_datasets[level].iterrows():
+                hint = row["extra_info"]["hint"]
+                if not hint:
+                    continue
+                root = _container_source_root(Path(row["extra_info"]["task_path"]))
+                assert root, f"no source root resolved for {row['task_name']}"
+                for named in re.findall(r"^\s{4}(\S+?)(?:, line \d+)?$", hint, re.MULTILINE):
+                    assert named.startswith(f"{root}/"), f"{named} is not under {root}"
 
     def test_unknown_level_is_rejected(self):
         from examples.sciaccel_rl.prepare.build_dataset import build_datasets
@@ -215,6 +260,33 @@ class TestHintLevels:
         assert all(row["hint"] for row in train["extra_info"])
         # Validation stays unhinted so it measures the task as it really ships.
         assert all(not row["hint"] for row in val["extra_info"])
+
+
+@pytest.mark.skipif(not _HAS_COMPILED_ENV, reason=_SKIP_REASON)
+class TestGuidance:
+    """Test the turn-budget guidance delivered alongside the hint."""
+
+    def test_guidance_reaches_every_level_including_the_control(self, hint_datasets):
+        # It describes how to spend turns, never where the defect is, so withholding
+        # it from L3 would make the unhinted control differ by two variables.
+        for level in ("L1", "L2", "L3"):
+            assert all(row["guidance"] for row in hint_datasets[level]["extra_info"])
+
+    def test_guidance_is_identical_across_levels(self, hint_datasets):
+        # Guidance is parameterized from the task's own container limits, which differ
+        # between tasks, so the invariant is per task rather than bank-wide.
+        by_task = defaultdict(set)
+        for level in ("L1", "L2", "L3"):
+            for _, row in hint_datasets[level].iterrows():
+                by_task[row["task_name"]].add(row["extra_info"]["guidance"])
+        assert by_task
+        assert all(len(texts) == 1 for texts in by_task.values())
+
+    def test_guidance_names_no_location(self, hint_datasets):
+        # Leaking a filename here would hand the control group a hint.
+        guidance = hint_datasets["L3"]["extra_info"].iloc[0]["guidance"]
+        assert not re.search(r"\.(?:cpp|hpp|F|f90)\b", guidance)
+        assert "line " not in guidance
 
 
 @pytest.mark.skipif(not _HAS_COMPILED_ENV, reason=_SKIP_REASON)

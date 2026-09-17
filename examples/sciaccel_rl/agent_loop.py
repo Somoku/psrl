@@ -127,6 +127,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
         task_path = extra_info.get("task_path", "")
         reward_key = extra_info.get("reward_key", "reward")
         hint = extra_info.get("hint", "")
+        guidance = extra_info.get("guidance", "")
         needs_gpu = int(extra_info.get("gpus", 0)) > 0
         uid = request.get("uid", "?")
 
@@ -154,6 +155,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
                 needs_gpu=needs_gpu,
                 session_id=session_id,
                 hint=hint,
+                guidance=guidance,
             )
 
             if harbor_result.exception:
@@ -328,6 +330,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
         needs_gpu: bool = False,
         session_id: str = "",
         hint: str = "",
+        guidance: str = "",
     ) -> HarborEpisodeResult:
         """
         Run the Harbor Job on the dedicated Harbor event loop thread.
@@ -353,6 +356,7 @@ class SciAccelAgentLoop(SessionAgentLoop):
                     actor_id=os.getenv("PSRL_ACTOR_ID", ""),
                     thinking_template=self.thinking_template,
                     hint=hint,
+                    guidance=guidance,
                 )
             finally:
                 gate.release()

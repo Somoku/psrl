@@ -77,7 +77,7 @@ class TestRunHarborEpisode:
         assert result.exception is None
         assert job_config.agents[0].kwargs["record_terminal_session"] is False
 
-    def _run_with_hint(self, hint):
+    def _run_with_hint(self, hint, guidance=""):
         """
         Run one mocked episode and return the JobConfig Harbor was handed.
         """
@@ -110,9 +110,20 @@ class TestRunHarborEpisode:
                     model_name="Qwen/Qwen3.5-4B",
                     config=SciAccelRuntimeConfig(),
                     hint=hint,
+                    guidance=guidance,
                 )
             )
             return mock_job_cls.create.await_args.args[0]
+
+    def test_guidance_leads_the_hint_when_both_are_present(self):
+        # Guidance first keeps the localization hint closest to the task text.
+        job_config = self._run_with_hint("## Where to look", guidance="## Turn budget")
+        assert job_config.extra_instructions == ["## Turn budget", "## Where to look"]
+
+    def test_guidance_is_delivered_without_a_hint(self):
+        # It rides every hint level, including the unhinted control.
+        job_config = self._run_with_hint("", guidance="## Turn budget")
+        assert job_config.extra_instructions == ["## Turn budget"]
 
     def test_hint_reaches_harbor_as_extra_instructions(self):
         # Harbor re-reads `instruction.md` from disk, so this is the only delivery path.

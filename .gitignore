@@ -48,6 +48,7 @@ tensorflow/my_graph/*
 **/logs/
 **/log/
 **/*log*/
+!examples/mini_swe/grading/_vendor/log_parsers/
 **/models/
 **/data/
 

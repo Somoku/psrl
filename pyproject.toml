@@ -63,8 +63,13 @@ psrl = "psrl.trainer.config.hydra_plugins.psrl_searchpath:PSRLSearchPathPlugin"
 [tool.ruff]
 line-length = 119
 src = ["psrl"]
-# Archived pre-SMG code kept for reference only; never imported by live code.
-extend-exclude = ["deprecated"]
+extend-exclude = [
+    # Archived pre-SMG code kept for reference only; never imported by live code.
+    "deprecated",
+    # Vendored upstream parsers: copied verbatim and hashed in _vendor/PROVENANCE.md.
+    # Reformatting them would trip the payload integrity check in payload.py.
+    "examples/mini_swe/grading/_vendor",
+]
 
 [tool.ruff.lint]
 select = [

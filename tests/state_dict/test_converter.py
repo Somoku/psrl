@@ -800,16 +800,6 @@ class TestLoadStateDictNdimMismatchSlicing(unittest.TestCase):
             expected = src_2d[i * 128 : (i + 1) * 128].reshape(1, 128, 2048)
             self.assertTrue(torch.equal(shard, expected), f"Shard {i} values mismatch.")
 
-    def test_no_op_when_ndim_matches(self):
-        """
-        When src_tensor.ndim == dst_tensor_sample.ndim the mismatch branch is NOT taken;
-        get_local_sharded_tensors handles it instead.  Verify the condition is correct.
-        """
-        src_3d = torch.randn(1, 128, 2048)
-        dst_sample = torch.empty(1, 128, 2048)
-        # ndim matches → the branch condition is False
-        self.assertEqual(src_3d.ndim, dst_sample.ndim)
-
 
 if __name__ == "__main__":
     unittest.main()

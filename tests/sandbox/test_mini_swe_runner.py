@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from typing import Any
 
@@ -116,6 +117,38 @@ def test_verifier_snapshot_requires_matching_runtime_resources() -> None:
     assert _snapshot_compatible(rollout, grader)
 
 
+def test_filesystem_snapshot_seeds_grader_across_resources() -> None:
+    """A docker-commit snapshot is reusable even when resources differ."""
+    from examples.mini_swe.runner import _snapshot_matches_spec
+    from psrl.sandbox import SnapshotKind, SnapshotRef
+
+    payload = _payload()
+    grader = build_sandbox_spec(payload, grading=True)
+    snapshot = SnapshotRef(
+        backend="docker",
+        snapshot_id="psrl/snapshot/x:latest",
+        kind=SnapshotKind.FILESYSTEM,
+        metadata={"psrl.docker.image": "psrl/snapshot/x:latest"},
+    )
+
+    assert _snapshot_matches_spec(snapshot, grader)
+
+    # A full-state snapshot still has to match the target spec exactly.
+    full_state = SnapshotRef(
+        backend="e2b",
+        snapshot_id="snap",
+        kind=SnapshotKind.FULL_STATE,
+        metadata={
+            "psrl.source_kind": "image",
+            "psrl.source_reference": "other-image",
+            "psrl.cpu_count": None,
+            "psrl.memory_mb": 8 * 1024,
+            "psrl.disk_mb": None,
+        },
+    )
+    assert not _snapshot_matches_spec(full_state, grader)
+
+
 def test_ungraded_minisweagent_task_does_not_require_swebench_metadata() -> None:
     payload = _payload()
 
@@ -150,25 +183,42 @@ def test_cancelled_harness_stops_before_starting_another_command() -> None:
         adapter.execute({"command": "echo should-not-run"})
 
 
-def test_fresh_grader_uses_generic_sandbox_data_plane(monkeypatch) -> None:
+def test_fresh_grader_runs_vendored_driver_inside_sandbox() -> None:
     from examples.mini_swe import swebench_grader
+    from examples.mini_swe.grading import payload as grading_payload
 
     class FakeSession:
         def __init__(self) -> None:
             self.ref = SandboxRef("fake", "grader-session")
             self.writes: dict[str, bytes] = {}
             self.commands: list[str] = []
-            self.released = False
+            self.closed = False
 
         def exec(self, command: str, **kwargs: Any) -> ExecResult:
             self.commands.append(command)
-            return ExecResult(0, "tests passed", "")
+            return ExecResult(0, "", "")
 
         def write_bytes(self, path: str, data: bytes) -> None:
             self.writes[path] = data
 
+        def read_bytes(self, path: str) -> bytes:
+            if path != grading_payload.SCORECARD_PATH:
+                raise FileNotFoundError(path)
+            return json.dumps(
+                {
+                    "resolved": True,
+                    "f2p_pass": 1,
+                    "f2p_total": 1,
+                    "p2p_pass": 0,
+                    "p2p_total": 0,
+                    "parser_error": None,
+                    "failure_reason": None,
+                    "output_tail": "",
+                }
+            ).encode()
+
         def close(self) -> None:
-            self.released = True
+            self.closed = True
 
     class FakeSyncSandbox:
         def __init__(self) -> None:
@@ -181,38 +231,46 @@ def test_fresh_grader_uses_generic_sandbox_data_plane(monkeypatch) -> None:
 
     sandbox = FakeSyncSandbox()
     spec = SandboxSpec(source=SandboxSource.image("image"), workdir="/testbed")
-    monkeypatch.setattr(swebench_grader, "_get_gym_eval_script", lambda problem: "pytest -q")
-    monkeypatch.setattr(
-        swebench_grader,
-        "_grade_gym",
-        lambda *args: {
-            "resolved": True,
-            "f2p_pass": 1,
-            "f2p_total": 1,
-            "p2p_pass": 0,
-            "p2p_total": 0,
-            "resolved_by": "test",
-        },
-    )
+    eval_script = "#!/bin/bash\necho hi\n"
+    swe_problem = {
+        "instance_id": "task",
+        "repo": "django/django",
+        "FAIL_TO_PASS": ["t.py::a"],
+        "PASS_TO_PASS": [],
+        "eval_script": eval_script,
+    }
 
     result = swebench_grader.grade_fresh_container(
-        {
-            "instance_id": "task",
-            "base_commit": "abc123",
-            "FAIL_TO_PASS": ["test_a.py::test_a"],
-            "eval_script": "pytest -q",
-        },
+        swe_problem,
         "diff --git a/a.py b/a.py\n",
-        "gym",
+        "verified",
         "image",
         sandbox=sandbox,
         sandbox_spec=spec,
     )
 
-    assert result["resolved"]
+    assert result["resolved"] is True
+    assert result["resolved_by"] == "harness"
     assert sandbox.specs == [spec]
+    assert sandbox.session.writes[grading_payload.DRIVER_ZIP_PATH]
+    assert sandbox.session.writes[grading_payload.EVAL_SCRIPT_PATH] == eval_script.encode()
     assert sandbox.session.writes["/tmp/psrl-model.patch"].startswith(b"diff --git")
-    assert sandbox.session.writes["/tmp/psrl-eval.sh"] == b"pytest -q"
-    assert "git reset --hard abc123 && git clean -fd" in sandbox.session.commands
-    assert "git apply --binary /tmp/psrl-model.patch" in sandbox.session.commands
-    assert sandbox.session.released
+    assert json.loads(sandbox.session.writes[grading_payload.INPUT_PATH])["repo"] == "django/django"
+    assert sandbox.session.closed
+
+
+def test_fresh_grader_fails_closed_without_eval_script() -> None:
+    from examples.mini_swe import swebench_grader
+
+    result = swebench_grader.grade_fresh_container(
+        {"instance_id": "task", "FAIL_TO_PASS": ["t.py::a"], "PASS_TO_PASS": []},
+        "diff --git a/a.py b/a.py\n",
+        "verified",
+        "image",
+        sandbox=object(),
+        sandbox_spec=SandboxSpec(source=SandboxSource.image("image"), workdir="/testbed"),
+    )
+
+    assert result["resolved"] is False
+    assert result["failure_reason"] == "missing_eval_script"
+    assert result["resolved_by"] == "missing_eval_script"

@@ -153,3 +153,42 @@ def test_routed_experts_cross_turn_assembly():
     assert re.dtype == np.uint8
     np.testing.assert_array_equal(re[0:5], t1)
     np.testing.assert_array_equal(re[5:8], t2)
+
+
+def test_trailing_trim_overflow_is_clamped():
+    """trim_count=1 with max_trim_tokens=0 clamps the trim (keeps the divergent token) instead of raising."""
+    accumulated = [1, 2, 10, 11, 20, 30, 31]
+    records = [
+        {
+            "prompt_token_count": 2,
+            "output_logprobs": [[-0.5, 10], [-0.3, 11], [-0.9, 99]],
+            "finish_reason": "tool_calls",
+        },
+        {
+            "prompt_token_count": 5,
+            "output_logprobs": [[-0.2, 30], [-0.1, 31]],
+            "finish_reason": "stop",
+        },
+    ]
+    result = build_training_data(accumulated, records, max_trim_tokens=0)
+    # The non-matching token 99 is retained because the trim is clamped to 0.
+    assert result["response_ids"] == [10, 11, 99, 30, 31]
+    assert result["response_mask"] == [1, 1, 1, 1, 1]
+    assert result["logprobs"] == [-0.5, -0.3, -0.9, -0.2, -0.1]
+
+
+def test_last_turn_trim_never_occurs():
+    """Last turn output is never trimmed even if it doesn't match accumulated tail."""
+    # accumulated ends before the last turn's output — trim logic is skipped for is_last
+    accumulated = [1, 2, 10, 11]
+    records = [
+        {
+            "prompt_token_count": 2,
+            "output_logprobs": [[-0.5, 10], [-0.3, 11]],
+            "finish_reason": "stop",
+        }
+    ]
+    # Single-turn (is_last=True from the start): no trim attempted, no ValueError
+    result = build_training_data(accumulated, records, max_trim_tokens=0)
+    assert result["response_ids"] == [10, 11]
+    assert result["response_mask"] == [1, 1]

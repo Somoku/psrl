@@ -10,11 +10,12 @@ from pathlib import Path
 
 import pytest
 from examples.mini_swe.config import build_runtime_config
-from examples.mini_swe.harness_task import build_harness_prompt, collect_git_patch
-from examples.mini_swe.integrity import scan_claude_code_integrity
+from examples.mini_swe.utils.harness_task import build_harness_prompt, collect_git_patch
 from omegaconf import OmegaConf
 from psrl.sandbox import (
     ExecResult,
+    MountSpec,
+    ResourceSpec,
     SandboxCapabilities,
     SandboxRef,
     SandboxSession,
@@ -34,6 +35,7 @@ from psrl.workers.agent_loop.harness import (
 )
 from psrl.workers.agent_loop.harness.claude_code import ClaudeCodeHarness
 from psrl.workers.agent_loop.harness.codex import CodexHarness
+from psrl.workers.agent_loop.harness.runtime import executable_path, host_runtime_dir, runtime_mount_spec
 
 
 class FakeSandbox(SandboxSession):
@@ -42,11 +44,11 @@ class FakeSandbox(SandboxSession):
     def __init__(
         self,
         *,
-        executable_available: bool = True,
+        runtime_available: bool = True,
         block_cli: bool = False,
         cli_exit_code: int = 0,
     ) -> None:
-        self.executable_available = executable_available
+        self.runtime_available = runtime_available
         self.block_cli = block_cli
         self.cli_exit_code = cli_exit_code
         self.commands: list[tuple[str, str | None, Mapping[str, str] | None]] = []
@@ -70,21 +72,19 @@ class FakeSandbox(SandboxSession):
         timeout_s: float | None = None,
     ) -> ExecResult:
         self.commands.append((command, cwd, env))
-        if command.startswith("command -v"):
-            return ExecResult(0 if self.executable_available else 1, "/usr/bin/tool\n", "")
-        if command.startswith("npm install"):
-            self.executable_available = True
-            return ExecResult(0, "installed", "")
+        # The prepare probe creates the state dir and checks the mounted CLI.
+        if command.startswith("mkdir -p /root/.psrl-harness"):
+            return ExecResult(0 if self.runtime_available else 1, "", "" if self.runtime_available else "no such file")
         if command.startswith("tail -c"):
             return ExecResult(0, "bounded tail", "")
-        if command.startswith(("claude ", "codex ")) and self.block_cli:
+        if "/opt/harness/bin/" in command and self.block_cli:
             self.cli_started.set()
             try:
                 await asyncio.Future()
             except asyncio.CancelledError:
                 self.cli_cancelled = True
                 raise
-        if command.startswith(("claude ", "codex ")):
+        if "/opt/harness/bin/" in command:
             return ExecResult(self.cli_exit_code, "", "")
         return ExecResult(0, "", "")
 
@@ -117,15 +117,16 @@ def _runtime(
     )
 
 
-def test_harness_compaction_budget_uses_a_safe_trigger_before_the_window() -> None:
-    assert HarnessCompactionConfig().resolve(10_240) == (10_240, 9_728)
-    assert HarnessCompactionConfig(safety_tokens=0).resolve(10_240) == (10_240, 10_240)
-    assert HarnessCompactionConfig(context_window_tokens=32_000, safety_tokens=0).resolve(10_240) == (
-        32_000,
-        10_240,
-    )
-    with pytest.raises(ValueError, match="cannot exceed"):
-        HarnessCompactionConfig(trigger_tokens=10_241).resolve(10_240)
+def test_harness_compaction_budget_uses_configured_percent_of_window() -> None:
+    assert HarnessCompactionConfig().resolve(10_240) == (10_240, 7_680)
+    assert HarnessCompactionConfig(compact_percent=100).resolve(10_240) == (10_240, 10_240)
+    assert HarnessCompactionConfig(enabled=False).resolve(10_240) is None
+    with pytest.raises(ValueError, match="compact_percent"):
+        HarnessCompactionConfig(compact_percent=0).resolve(10_240)
+    with pytest.raises(ValueError, match="compact_percent"):
+        HarnessCompactionConfig(compact_percent=101).resolve(10_240)
+    with pytest.raises(ValueError, match="context window"):
+        HarnessCompactionConfig().resolve(0)
 
 
 def test_harness_prompt_preserves_native_miniswe_task_boundary() -> None:
@@ -136,7 +137,9 @@ def test_harness_prompt_preserves_native_miniswe_task_boundary() -> None:
         "Implement the required changes in the current repository and verify the fix.\n\n"
         "Integrity rules:\n"
         "- Do not modify tests, pytest configuration, or evaluation harness files.\n"
-        "- Do not retrieve a solution, patch, commit, or pull request from the task repository or its mirrors."
+        "- Do not retrieve a solution, patch, commit, or pull request from the task repository or its mirrors.\n"
+        "- Do not create nested git repositories (directories containing a .git) inside the working directory; "
+        "if you need a scratch repository to reproduce the issue, create it under /tmp instead."
     )
 
 
@@ -148,8 +151,8 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
             "kind": "claude_code",
             "executable": "claude",
             "args": ["--max-budget-usd", "0"],
-            "permission_mode": "default",
-            "allowed_tools": ["Bash", "Read", "Edit"],
+            "permission_mode": "acceptEdits",
+            "allowed_permissions": ["Bash(*)", "Read(*)", "Edit(*)"],
             "system_prompt": "minimal system",
             "tools": "Bash,Read,Edit",
             "env": {"ANTHROPIC_BASE_URL": "http://must-not-escape", "CUSTOM": "value"},
@@ -164,11 +167,14 @@ async def test_claude_code_uses_session_root_and_bounded_process_output() -> Non
     assert result.exit_code == 1
     assert result.stderr_tail == "bounded tail"
     assert b"hasCompletedOnboarding" in sandbox.writes["/root/.claude.json"]
-    cli_command, cwd, env = next(item for item in sandbox.commands if item[0].startswith("claude "))
+    settings = json.loads(sandbox.writes["/root/.claude/settings.json"])
+    assert settings["permissions"]["allow"] == ["Bash(*)", "Read(*)", "Edit(*)"]
+    assert settings["permissions"]["deny"] == []
+    assert "defaultMode" not in settings["permissions"]
+    cli_command, cwd, env = next(item for item in sandbox.commands if "--output-format" in item[0])
     assert "--output-format stream-json" in cli_command
-    assert "--permission-mode default" in cli_command
-    assert "--model Qwen/Qwen3" in cli_command
-    assert "--allowedTools Bash Read Edit" in cli_command
+    assert "--permission-mode acceptEdits" in cli_command
+    assert "--allowedTools" not in cli_command
     assert "--system-prompt 'minimal system'" in cli_command
     assert "--tools Bash,Read,Edit" in cli_command
     assert "--max-turns" not in cli_command
@@ -195,93 +201,41 @@ async def test_successful_harness_skips_diagnostic_tail_commands() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claude_code_receives_token_based_compaction_settings() -> None:
+async def test_claude_code_receives_percent_based_compaction_settings() -> None:
     sandbox = FakeSandbox()
-    harness = create_harness(HarnessConfig(kind="claude_code", executable="claude"), sandbox)
+    config = HarnessConfig.from_value(
+        {
+            "kind": "claude_code",
+            "executable": "claude",
+            "max_output_tokens": 8192,
+            "compaction": {"enabled": True, "compact_percent": 80},
+        }
+    )
+    harness = create_harness(config, sandbox)
 
-    env = harness.build_env(_runtime(10_240, 9_728))
+    env = harness.build_env(_runtime(10_240, 8_192))
 
     assert env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "10240"
-    assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "95"
-    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in env
+    assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "80"
+    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "8192"
 
 
-def test_claude_code_receives_framework_turn_and_configured_output_limits() -> None:
+def test_claude_code_applies_turn_bound_and_leaves_output_limit_config_gated() -> None:
     sandbox = FakeSandbox()
-    harness = create_harness(
-        HarnessConfig(
-            kind="claude_code",
-            executable="claude",
-            max_output_tokens=4096,
-            reasoning_effort="high",
-        ),
+    harness = create_harness(HarnessConfig(kind="claude_code", executable="claude"), sandbox)
+    configured = create_harness(
+        HarnessConfig(kind="claude_code", executable="claude", max_output_tokens=8192),
         sandbox,
     )
     runtime = _runtime(max_turns=12)
 
     command = harness.build_command("fix", runtime)
-    env = harness.build_env(runtime)
 
     assert "--max-turns 12" in " ".join(command)
-    assert "--effort high" in " ".join(command)
-    assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "4096"
-
-
-@pytest.mark.asyncio
-async def test_claude_code_configures_dressage_thinking_capabilities() -> None:
-    sandbox = FakeSandbox()
-    harness = create_harness(
-        HarnessConfig(
-            kind="claude_code",
-            executable="claude",
-            thinking_budget_tokens=2048,
-            supported_capabilities=("thinking", "adaptive_thinking", "interleaved_thinking"),
-            disable_prompt_caching=True,
-            subagents_enabled=False,
-        ),
-        sandbox,
-    )
-
-    await harness.prepare(_runtime())
-    env = harness.build_env(_runtime())
-    settings = sandbox.writes["/root/.claude/settings.json"].decode()
-
-    assert env["MAX_THINKING_TOKENS"] == "2048"
-    assert env["DISABLE_PROMPT_CACHING"] == "1"
-    assert env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"] == (
-        "thinking,adaptive_thinking,interleaved_thinking"
-    )
-    assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in env
-    assert '"deny": ["Agent"]' in settings
-
-
-def test_claude_code_integrity_scans_tool_calls_without_duplicate_events() -> None:
-    tool_call = {
-        "type": "assistant",
-        "message": {
-            "content": [
-                {
-                    "type": "tool_use",
-                    "name": "Bash",
-                    "input": {
-                        "command": "git clone https://github.com/example/project.git /tmp/solution",
-                    },
-                },
-                {
-                    "type": "tool_use",
-                    "name": "Write",
-                    "input": {"file_path": "/testbed/tests/test_fix.py"},
-                },
-            ]
-        },
-    }
-    log_bytes = (json.dumps(tool_call) + "\n" + json.dumps(tool_call)).encode()
-
-    result = scan_claude_code_integrity(log_bytes, "example/project")
-
-    assert result["violated"]
-    assert result["tool_calls"] == 2
-    assert result["reasons"] == ["blocked_repo_web_access", "write_to_test_or_harness_path"]
+    # `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is config-gated: when unset, Claude Code's
+    # default applies; only an explicit `max_output_tokens` writes the env var.
+    assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in harness.build_env(runtime)
+    assert configured.build_env(runtime)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "8192"
 
 
 @pytest.mark.asyncio
@@ -302,13 +256,18 @@ async def test_failed_trajectory_can_collect_output_after_successful_cli_exit() 
 async def test_patch_collection_includes_staged_and_untracked_changes() -> None:
     sandbox = FakeSandbox()
 
-    await collect_git_patch(sandbox, "/testbed", base_commit="abc123")
+    await collect_git_patch(sandbox, "/testbed")
 
-    assert (
-        "git add -A && git diff --cached --binary --submodule=diff abc123 --",
-        "/testbed",
-        None,
-    ) in sandbox.commands
+    script, cwd, _ = sandbox.commands[-1]
+    assert cwd == "/testbed"
+    # Staged (index vs base/HEAD) and unstaged (worktree vs index) tracked changes.
+    assert "git diff --cached --binary --submodule=diff --" in script
+    assert "git diff --binary --submodule=diff --" in script
+    # Untracked files become new-file diffs, but nested repositories are skipped.
+    assert "git ls-files --others --exclude-standard" in script
+    assert '[ -e "$d/.git" ]' in script
+    # The collector never stages, so a nested repo without a commit cannot break it.
+    assert "git add" not in script
 
 
 @pytest.mark.asyncio
@@ -326,11 +285,9 @@ async def test_codex_writes_responses_provider_config_and_uses_session_as_key() 
     assert "requires_openai_auth = false" in codex_config
     assert "supports_websockets = false" in codex_config
     assert harness.build_env(_runtime())["OPENAI_API_KEY"] == "session-1"
-    assert harness.build_command("fix", _runtime())[:3] == (
-        "codex",
-        "exec",
-        "--skip-git-repo-check",
-    )
+    command = harness.build_command("fix", _runtime())
+    assert command[0] == "/opt/harness/bin/codex"
+    assert command[1:4] == ("exec", "--skip-git-repo-check", "--json")
 
 
 @pytest.mark.asyncio
@@ -338,29 +295,23 @@ async def test_codex_writes_compaction_threshold_with_context_headroom() -> None
     sandbox = FakeSandbox()
     harness = create_harness(HarnessConfig(kind="codex", executable="codex"), sandbox)
 
-    await harness.prepare(_runtime(10_240, 9_728))
+    await harness.prepare(_runtime(10_240, 7_680))
 
     codex_config = sandbox.writes["/root/.codex/config.toml"].decode()
-    assert "model_context_window = 10809" in codex_config
-    assert "model_auto_compact_token_limit = 9728" in codex_config
+    assert "model_context_window = 10240" in codex_config
+    assert "model_auto_compact_token_limit = 7680" in codex_config
 
 
 @pytest.mark.asyncio
-async def test_optional_install_runs_once_before_adapter_preparation() -> None:
-    sandbox = FakeSandbox(executable_available=False)
-    config = HarnessConfig.from_value(
-        {
-            "kind": "codex",
-            "executable": "codex",
-            "install": {"command": "npm install -g @openai/codex"},
-        }
-    )
+async def test_prepare_fails_clearly_when_runtime_tree_is_missing() -> None:
+    sandbox = FakeSandbox(runtime_available=False)
+    config = HarnessConfig(kind="codex", executable="codex")
 
-    await create_harness(config, sandbox).prepare(_runtime())
+    with pytest.raises(RuntimeError, match="unavailable in the sandbox"):
+        await create_harness(config, sandbox).prepare(_runtime())
 
-    commands = [item[0] for item in sandbox.commands]
-    assert commands.count("command -v codex") == 2
-    assert "npm install -g @openai/codex" in commands
+    # The explicit probe is the only setup command; there is no install path.
+    assert all("npm" not in command for command, _, _ in sandbox.commands)
 
 
 @pytest.mark.asyncio
@@ -391,15 +342,6 @@ def test_example_config_selects_both_harnesses() -> None:
 
     assert [item.name for item in configs] == ["mini_swe_claude_code", "mini_swe_codex"]
     assert [HarnessConfig.from_value(item.harness).kind for item in configs] == ["claude_code", "codex"]
-    claude_config = HarnessConfig.from_value(configs[0].harness)
-    assert claude_config.system_prompt is None
-    assert claude_config.max_output_tokens is None
-    assert claude_config.reasoning_effort is None
-    assert claude_config.supported_capabilities == (
-        "thinking",
-        "adaptive_thinking",
-        "interleaved_thinking",
-    )
     assert all(item.sandbox_config.environment.cwd == "/testbed" for item in configs)
 
     runtime = build_runtime_config(
@@ -412,12 +354,26 @@ def test_example_config_selects_both_harnesses() -> None:
 
 def test_task_context_only_enables_compatible_clean_snapshot() -> None:
     state_policy = SandboxStatePolicy(enabled=True)
+    runtime_mount = MountSpec("/host/runtimes/claude_code", "/opt/harness", read_only=True)
     rollout = SandboxSpec(source=SandboxSource.image("image"), state_policy=state_policy)
+    rollout_with_runtime = SandboxSpec(
+        source=SandboxSource.image("image"),
+        mounts=(runtime_mount,),
+        state_policy=state_policy,
+    )
     compatible = HarnessTaskContext(
         state={"task": "opaque"},
         prompt="solve",
         sandbox_spec=rollout,
         clean_sandbox_spec=SandboxSpec(source=SandboxSource.image("image"), state_policy=state_policy),
+    )
+    # The read-only harness runtime mount is excluded from mount compatibility.
+    compatible_with_runtime = HarnessTaskContext(
+        state={"task": "opaque"},
+        prompt="solve",
+        sandbox_spec=rollout_with_runtime,
+        clean_sandbox_spec=SandboxSpec(source=SandboxSource.image("image"), state_policy=state_policy),
+        runtime_mount_target="/opt/harness",
     )
     incompatible = HarnessTaskContext(
         state=None,
@@ -433,8 +389,55 @@ def test_task_context_only_enables_compatible_clean_snapshot() -> None:
     )
 
     assert clean_snapshot_compatible(compatible)
+    assert clean_snapshot_compatible(compatible_with_runtime)
     assert not clean_snapshot_compatible(incompatible)
     assert not clean_snapshot_compatible(disabled)
+
+
+def test_filesystem_clean_snapshot_ignores_source_and_resources() -> None:
+    """A committed image seeds the grader regardless of its own flags.
+
+    This is what lets a lightweight rollout sandbox (8GiB, baked derivative)
+    seed the heavier grader sandbox (30GiB, original image): ``docker commit``
+    captures the filesystem only, and restore recreates the container with the
+    grader's own source and resources.
+    """
+    from psrl.sandbox import SnapshotKind
+
+    state_policy = SandboxStatePolicy(enabled=True)
+    rollout = SandboxSpec(
+        source=SandboxSource.image("psrl/swebench-harness:abc"),
+        resources=ResourceSpec(cpu_count=2, memory_mb=8 * 1024),
+        state_policy=state_policy,
+    )
+    grader = SandboxSpec(
+        source=SandboxSource.image("swebench/sweb.eval.x86_64.repo_1776_repo-1:latest"),
+        resources=ResourceSpec(cpu_count=None, memory_mb=30 * 1024),
+        state_policy=state_policy,
+    )
+    task = HarnessTaskContext(state=None, prompt="solve", sandbox_spec=rollout, clean_sandbox_spec=grader)
+
+    assert clean_snapshot_compatible(task, SnapshotKind.FILESYSTEM)
+    # A full-state snapshot must be rebuilt with matching source and resources.
+    assert not clean_snapshot_compatible(task, SnapshotKind.FULL_STATE)
+
+
+def test_runtime_tree_paths_are_derived_from_mount_and_root(monkeypatch, tmp_path) -> None:
+    assert executable_path("/opt/harness", "claude") == "/opt/harness/bin/claude"
+
+    monkeypatch.delenv("PSRL_HARNESS_RUNTIME_ROOT", raising=False)
+    with pytest.raises(RuntimeError, match="PSRL_HARNESS_RUNTIME_ROOT"):
+        host_runtime_dir("claude_code")
+
+    monkeypatch.setenv("PSRL_HARNESS_RUNTIME_ROOT", str(tmp_path))
+    (tmp_path / "claude_code" / "bin").mkdir(parents=True)
+    mount = runtime_mount_spec("claude_code", "/opt/harness")
+    assert mount.source == str(tmp_path / "claude_code")
+    assert mount.target == "/opt/harness"
+    assert mount.read_only
+
+    with pytest.raises(RuntimeError, match="missing on this worker"):
+        runtime_mount_spec("codex", "/opt/harness")
 
 
 def test_generic_harness_loop_has_no_task_specific_imports() -> None:

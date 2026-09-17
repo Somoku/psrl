@@ -7,6 +7,7 @@ import pytest
 from psrl.sandbox import (
     ExecResult,
     PauseMode,
+    ResourceSpec,
     SandboxBackend,
     SandboxCapabilities,
     SandboxFeature,
@@ -20,6 +21,7 @@ from psrl.sandbox import (
     SnapshotKind,
     SnapshotRef,
 )
+from psrl.sandbox.capacity import SandboxCapacityConfig
 
 
 class FakeSession(SandboxSession):
@@ -78,8 +80,9 @@ class FakeSession(SandboxSession):
 
 
 class FakeBackend(SandboxBackend):
-    def __init__(self, features: set[SandboxFeature]) -> None:
+    def __init__(self, features: set[SandboxFeature], uses_node_capacity: bool = False) -> None:
         self._capabilities = SandboxCapabilities(frozenset(features))
+        self._uses_node_capacity = uses_node_capacity
         self.created: list[FakeSession] = []
         self.deleted_snapshots: list[SnapshotRef] = []
 
@@ -90,6 +93,10 @@ class FakeBackend(SandboxBackend):
     @property
     def capabilities(self) -> SandboxCapabilities:
         return self._capabilities
+
+    @property
+    def uses_node_capacity(self) -> bool:
+        return self._uses_node_capacity
 
     async def create(self, spec: SandboxSpec) -> SandboxSession:
         session = FakeSession(self, f"session-{len(self.created)}", spec)
@@ -343,3 +350,125 @@ async def test_shutdown_also_tracks_non_idempotent_create() -> None:
 
     assert isinstance(lease.session, FakeSession)
     assert lease.session.terminated
+
+
+class FakeRemoteMethod:
+    def __init__(self, method) -> None:
+        self.method = method
+
+    def remote(self, *args):
+        return self.method(*args)
+
+
+class FakeCapacityCoordinator:
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, int, float]] = []
+        self.released: list[str] = []
+        self.released_owners: list[str] = []
+        self.acquire = FakeRemoteMethod(self._acquire)
+        self.release = FakeRemoteMethod(self._release)
+        self.cancel = FakeRemoteMethod(self._release)
+        self.renew_owner = FakeRemoteMethod(self._renew_owner)
+        self.release_owner = FakeRemoteMethod(self._release_owner)
+
+    async def _acquire(self, lease_id: str, owner_id: str, memory_mb: int, cpu_count: float) -> None:
+        self.requests.append((lease_id, owner_id, memory_mb, cpu_count))
+
+    async def _release(self, lease_id: str) -> None:
+        self.released.append(lease_id)
+
+    async def _renew_owner(self, owner_id: str) -> None:
+        return None
+
+    async def _release_owner(self, owner_id: str) -> None:
+        self.released_owners.append(owner_id)
+
+
+def _capacity_manager(backend: FakeBackend, coordinator: FakeCapacityCoordinator) -> SandboxManager:
+    return SandboxManager(
+        {"fake": backend},
+        "fake",
+        capacity_coordinator=coordinator,
+        capacity_owner_id="worker-1",
+        capacity_heartbeat_interval_s=SandboxCapacityConfig().heartbeat_interval_s,
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_backend_charges_actual_spec_until_sandbox_release() -> None:
+    backend = FakeBackend(set(), uses_node_capacity=True)
+    capacity = FakeCapacityCoordinator()
+    manager = _capacity_manager(backend, capacity)
+    resources = ResourceSpec(cpu_count=1.5, memory_mb=4096)
+
+    lease = await manager.acquire(SandboxSpec(SandboxSource.image("image"), resources=resources))
+
+    assert len(capacity.requests) == 1
+    lease_id, owner_id, memory_mb, cpu_count = capacity.requests[0]
+    assert (owner_id, memory_mb, cpu_count) == ("worker-1", 4096, 1.5)
+    assert capacity.released == []
+    await lease.release()
+    assert capacity.released == [lease_id]
+    await manager.shutdown()
+    assert capacity.released_owners == ["worker-1"]
+
+
+@pytest.mark.asyncio
+async def test_failed_local_create_returns_capacity() -> None:
+    class FailingBackend(FakeBackend):
+        async def create(self, spec: SandboxSpec) -> SandboxSession:
+            raise RuntimeError("create failed")
+
+    backend = FailingBackend(set(), uses_node_capacity=True)
+    capacity = FakeCapacityCoordinator()
+    manager = _capacity_manager(backend, capacity)
+    spec = SandboxSpec(
+        SandboxSource.image("image"),
+        resources=ResourceSpec(cpu_count=1, memory_mb=1024),
+    )
+
+    with pytest.raises(RuntimeError, match="create failed"):
+        await manager.acquire(spec)
+
+    assert capacity.released == [capacity.requests[0][0]]
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_frees_capacity_before_joining_waiting_creates() -> None:
+    class BlockingCapacityCoordinator(FakeCapacityCoordinator):
+        def __init__(self) -> None:
+            self.active_lease: str | None = None
+            self.waiting = asyncio.Event()
+            self.available = asyncio.Event()
+            super().__init__()
+
+        async def _acquire(self, lease_id: str, owner_id: str, memory_mb: int, cpu_count: float) -> None:
+            await super()._acquire(lease_id, owner_id, memory_mb, cpu_count)
+            if self.active_lease is not None:
+                self.waiting.set()
+                await self.available.wait()
+            self.active_lease = lease_id
+
+        async def _release(self, lease_id: str) -> None:
+            await super()._release(lease_id)
+            if self.active_lease == lease_id:
+                self.active_lease = None
+                self.available.set()
+
+    backend = FakeBackend(set(), uses_node_capacity=True)
+    capacity = BlockingCapacityCoordinator()
+    manager = _capacity_manager(backend, capacity)
+    spec = SandboxSpec(
+        SandboxSource.image("image"),
+        resources=ResourceSpec(cpu_count=1, memory_mb=1024),
+    )
+    first = await manager.acquire(spec)
+    second_task = asyncio.create_task(manager.acquire(spec))
+    await capacity.waiting.wait()
+
+    await asyncio.wait_for(manager.shutdown(), timeout=1)
+    second = await second_task
+
+    assert first.session.terminated
+    assert second.session.terminated

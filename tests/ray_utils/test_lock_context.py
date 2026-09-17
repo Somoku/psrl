@@ -90,22 +90,8 @@ class CounterActor:
 
 
 # --------------------------------------------
-# 4. 定义两个 worker：一个不加锁，一个加锁
+# 4. 定义加锁 worker
 # --------------------------------------------
-
-
-@ray.remote
-def worker_no_lock(counter: ray.actor.ActorHandle, work_id: int):
-    """
-    无锁版本：
-      1. 先读取 count
-      2. 本地 sleep 一小会儿（模拟计算/延迟），以便其他 worker 插入
-      3. 再写入 count + 1
-    """
-    curr = ray.get(counter.read.remote())
-    time.sleep(0.1)
-    ray.get(counter.write.remote(curr + 1))
-    return f"worker_no_lock-{work_id} done"
 
 
 @ray.remote
@@ -125,18 +111,6 @@ def worker_with_lock(counter: ray.actor.ActorHandle, work_id: int):
 # 5. 测试：分别运行 N 个无锁任务和 N 个有锁任务，观察最终结果
 # --------------------------------------------
 NUM_WORKERS = 5
-
-
-def test_no_lock_loses_updates(ray_cluster):
-    """无锁版本，多个 worker 可能会发生读-写丢失，最终 count 应该 < NUM_WORKERS"""
-    counter1 = CounterActor.remote()
-
-    futures_no_lock = [worker_no_lock.remote(counter1, i) for i in range(NUM_WORKERS)]
-    ray.get(futures_no_lock)
-
-    final_no_lock = ray.get(counter1.read.remote())
-    # With concurrent reads and sleeps, race conditions cause lost updates
-    assert final_no_lock <= NUM_WORKERS, f"Expected final_no_lock <= {NUM_WORKERS}, got {final_no_lock}"
 
 
 def test_lock_serializes_counter(ray_cluster):

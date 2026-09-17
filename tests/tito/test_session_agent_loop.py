@@ -16,7 +16,8 @@ def _bare_loop(trajectory_id_strategy: str = "manual") -> SessionAgentLoop:
     loop.trajectory_id_strategy = trajectory_id_strategy
     loop.config = SimpleNamespace(
         psrl=SimpleNamespace(
-            rollout_coordination=SimpleNamespace(routing_strategy=SimpleNamespace(enable_trajectory_sticky=True))
+            rollout_coordination=SimpleNamespace(routing_strategy=SimpleNamespace(enable_trajectory_sticky=True)),
+            rollout_gateway=SimpleNamespace(tito_debug=False),
         )
     )
     loop.timer = SimpleNamespace(generation=nullcontext)

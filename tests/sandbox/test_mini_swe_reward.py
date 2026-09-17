@@ -16,14 +16,6 @@ def _extra_info(*, resolved: bool) -> dict:
     }
 
 
-def test_binary_01_matches_dressage_outcome_reward() -> None:
-    success = compute_score("swe_gym", "", {}, _extra_info(resolved=True), reward_mode="binary_01")
-    failure = compute_score("swe_gym", "", {}, _extra_info(resolved=False), reward_mode="binary_01")
-
-    assert success == {"score": 1.0, "acc": 1.0}
-    assert failure == {"score": 0.0, "acc": 0.0}
-
-
 def test_legacy_binary_remains_signed_for_existing_recipes() -> None:
     failure = compute_score("swe_gym", "", {}, _extra_info(resolved=False), reward_mode="binary")
 

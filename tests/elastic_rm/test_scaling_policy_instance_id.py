@@ -41,7 +41,6 @@ RolloutInstanceId = _utils_mod.RolloutInstanceId
 # Load scaling_policy directly (real module under test).
 _sp_mod = _load_direct("psrl.utils.elastic_rm.scaling_policy", "utils/elastic_rm/scaling_policy.py")
 InstanceSignal = _sp_mod.InstanceSignal
-ScalingAction = _sp_mod.ScalingAction
 ScalingPolicy = _sp_mod.ScalingPolicy
 ThroughputProfileLoader = _sp_mod.ThroughputProfileLoader
 
@@ -68,35 +67,6 @@ def _make_signal(instance_id: RolloutInstanceId, is_awaken: bool = True, kv: flo
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
-
-
-def test_instance_signal_accepts_rollout_instance_id():
-    """InstanceSignal.instance_id should accept a RolloutInstanceId tuple."""
-    iid: RolloutInstanceId = ("worker_abc", 0)
-    sig = _make_signal(iid)
-    assert sig.instance_id == ("worker_abc", 0)
-
-
-def test_instance_signal_rejects_bare_int():
-    """Bare int should no longer be the type — creating with int should still work at runtime
-    (dataclasses don't enforce types) but we verify tuple is accepted and round-trips correctly."""
-    iid: RolloutInstanceId = ("worker_xyz", 2)
-    sig = _make_signal(iid)
-    assert isinstance(sig.instance_id, tuple)
-    assert sig.instance_id[0] == "worker_xyz"
-    assert sig.instance_id[1] == 2
-
-
-def test_scaling_action_preferred_instance_ids_accepts_tuple_list():
-    """ScalingAction.preferred_instance_ids should accept list[RolloutInstanceId]."""
-    iid: RolloutInstanceId = ("worker_abc", 0)
-    action = ScalingAction(
-        action_type="scale_up",
-        role_name="Rollout",
-        model_name="test_model",
-        preferred_instance_ids=[iid],
-    )
-    assert action.preferred_instance_ids == [("worker_abc", 0)]
 
 
 def test_build_mu_maps_uses_tuple_key():

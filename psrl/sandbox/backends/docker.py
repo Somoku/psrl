@@ -727,7 +727,14 @@ class DockerSession(SandboxSession):
             if self._terminated:
                 return
             with self.backend.metrics.measure("terminate"):
-                await self.backend.engine.remove_container(self.sandbox_id)
+                try:
+                    await self.backend.engine.remove_container(self.sandbox_id)
+                except Exception as exc:
+                    psrl_logger.warning(
+                        f"Could not remove Docker sandbox {self.sandbox_id!r}: {exc!r}. "
+                        "Leaving the container to backend shutdown and the node sandbox GC."
+                    )
+                    pass
             self._terminated = True
             current_task = asyncio.current_task()
             if self._timeout_task is not None and self._timeout_task is not current_task:

@@ -129,6 +129,31 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     python -m pip install --upgrade pip setuptools wheel && \
     python -m pip install "uv==${UV_VERSION}"
 
+ARG DOCKER_APT_MIRROR=https://mirrors.tencentyun.com/docker-ce
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    codename="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME}")" && \
+    test -n "${codename}" && \
+    install -m 0755 -d /usr/share/keyrings && \
+    curl -fsSL "${DOCKER_APT_MIRROR}/linux/ubuntu/gpg" -o /tmp/docker.asc && \
+    gpg --dearmor --yes -o /usr/share/keyrings/docker-archive-keyring.gpg /tmp/docker.asc && \
+    chmod a+r /usr/share/keyrings/docker-archive-keyring.gpg && \
+    rm -f /tmp/docker.asc && \
+    printf 'deb [arch=%s signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] %s/linux/ubuntu %s stable\n' \
+        "$(dpkg --print-architecture)" "${DOCKER_APT_MIRROR}" "${codename}" \
+        > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-ce \
+        docker-ce-cli \
+        docker-ce-rootless-extras \
+        docker-compose-plugin && \
+    docker --version && \
+    dockerd --version && \
+    containerd --version
+
 # Install the shared PyTorch/CUDA ABI first. Every native extension below is
 # compiled against this exact environment.
 RUN --mount=type=cache,target=/root/.cache/uv \

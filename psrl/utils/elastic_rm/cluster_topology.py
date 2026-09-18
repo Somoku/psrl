@@ -52,7 +52,7 @@ class ClusterTopology:
     """Centralized GPU-to-instance mapping with conflict detection.
 
     Maintains a forward index (instance -> gpu_slots) and a reverse index
-    (gpu_slot -> instances) that are always kept in sync.  Provides high-level
+    (gpu_slot -> instances) that are always kept in sync. Provides high-level
     queries for conflict detection and non-conflicting instance selection,
     eliminating the need for callers to manage their own reverse indices.
     """
@@ -73,7 +73,7 @@ class ClusterTopology:
         gpu_slots: frozenset[GPUSlot] | None = None,
         status: InstanceStatus = InstanceStatus.ASLEEP,
     ) -> InstanceIdentifier:
-        """Register an instance.  If already registered, updates gpu_slots and status."""
+        """Register an instance. If already registered, update its GPU slots and status."""
         key = InstanceIdentifier(role=role, model_name=model_name, instance_id=instance_id)
         gpu_slots = gpu_slots or frozenset()
 
@@ -183,7 +183,7 @@ class ClusterTopology:
         """Select up to *target_awake_num* instances whose GPUs don't overlap with already-AWAKEN instances.
 
         The occupied GPU set is derived from all instances currently marked AWAKEN
-        in the topology, so no external state tracking is needed.  Successive calls
+        in the topology, so no external state tracking is needed. Successive calls
         are safe as long as the caller marks the returned instances as AWAKEN (via
         ``set_status``) before the next call.
 
@@ -252,7 +252,7 @@ class ClusterTopology:
         """Collect GPU placement from a Ray worker group.
 
         Each worker in the group is assumed to use exactly one GPU (the first
-        accelerator id reported by ``get_runtime_gpu_ids``).  Workers may reside
+        accelerator id reported by ``get_runtime_gpu_ids``). Workers may reside
         on different nodes, so each ``GPUSlot`` carries its own ``node_id``.
 
         Args:
@@ -260,7 +260,7 @@ class ClusterTopology:
                 ``get_node_id`` methods callable via ``execute_all_sync``.
 
         Returns:
-            frozenset of GPUSlot — one per worker in the group.
+            frozenset of GPUSlot, with one per worker in the group.
         """
         gpu_ids_per_worker: list[list[int]] = worker_group.execute_all_sync("get_runtime_gpu_ids")
         node_ids: list[str] = worker_group.execute_all_sync("get_node_id")

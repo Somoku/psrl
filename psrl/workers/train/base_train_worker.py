@@ -23,10 +23,9 @@ class TrainInterface:
     ps_manager_handle: ray.actor.ActorHandle
 
 
-# NOTE(lhy): This class is used to abstract the base train worker for PSRL.
-# It is used to handle the NIXL push and pull operations.
-# Cannot directly call this class, please use the derived classes instead.
 class PSRL_BaseTrainWorker:
+    """Provide shared parameter synchronization operations for train workers."""
+
     def __init__(
         self,
         worker_rank: int,
@@ -34,12 +33,10 @@ class PSRL_BaseTrainWorker:
         psrl_config: DictConfig,
         train_interface: TrainInterface,
     ):
-        # Basic debug
         self.worker_rank = worker_rank
         self.worker_world_size = worker_world_size
         self.psrl_config = psrl_config
         self.train_interface = train_interface
-        # NIXL
         self.node_id = None
         self.nixl_storage_client = None
         self.unified_state_dict = None
@@ -50,18 +47,13 @@ class PSRL_BaseTrainWorker:
         self._cached_ps_worker_handles: dict[str, ray.actor.ActorHandle] = {}
         # Cache for non-persistent named buffers fetched from PS (populated lazily).
         self._cached_non_persistent_buffers: dict[str, torch.Tensor] | None = None
-        # NIXL wait threads
         self.nixl_wait_thread = None  # Single thread for all wait operations
         self.nixl_wait_thread_lock = threading.Lock()
         self.nixl_wait_completed = threading.Event()
 
-        # Build logger
         self.log_prefix = f"BaseTrainWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
         psrl_logger.info(f"Initialized on {ray.get_runtime_context().get_node_id()}.")
-
-        # Env debug
-        # log_env_info(psrl_logger, level=logging.DEBUG)
 
     def get_node_id(self) -> str:
         """
@@ -138,11 +130,10 @@ class PSRL_BaseTrainWorker:
                 ps_manager_handle.get_ps_nixl_train_storage_client_names.remote()
             )
         psrl_logger.debug(
-            f"Pushing the model with version {next_ps_model_version} to the PS "
-            f"via NIXL on {len(self._cached_ps_nixl_train_storage_client_names)} clients."
+            f"Pushing model to the PS via NIXL. Version={next_ps_model_version}, "
+            f"clients={len(self._cached_ps_nixl_train_storage_client_names)}."
         )
 
-        # Clear previous wait thread
         with self.nixl_wait_thread_lock:
             if self.nixl_wait_thread is not None and self.nixl_wait_thread.is_alive():
                 raise RuntimeError(
@@ -152,13 +143,10 @@ class PSRL_BaseTrainWorker:
             self.nixl_wait_thread = None
             self.nixl_wait_completed.clear()
 
-        # Start a single background thread to wait for all operations
         def wait_all_operations():
             try:
-                # NOTE(lhy): Now we use a dict to store the PS handle and the key and shards
-                # to transfer and merge them on the PS side.
-                # This is more efficient than calling transfer_train_to_gen for each key and shard, which will cause
-                # a lot of remote calls and may cause the ray actor collapse.
+                # NOTE(lhy): Merge key and shard transfers on the PS side to avoid
+                # flooding the Ray actor with one remote call per shard.
                 ps_handle_to_precision_transfer_key_and_shards_list: dict[
                     str, list[tuple[str, list[tuple[int, ...]]]]
                 ] = {}
@@ -174,7 +162,8 @@ class PSRL_BaseTrainWorker:
                                 ps_manager_handle.get_ps_worker_handle.remote(target_client_name)
                             )
                         psrl_logger.debug(
-                            f"Pushing key {key} to {target_client_name} for version {next_ps_model_version}"
+                            f"Pushing key={key!r} to client={target_client_name!r} "
+                            f"for version={next_ps_model_version}."
                         )
                         try:
                             shards_to_transfer = self.nixl_storage_client.client_write(
@@ -183,20 +172,16 @@ class PSRL_BaseTrainWorker:
                                 key,
                                 f"train_push_{next_ps_model_version}",
                             )
-                            # shards_to_transfer = self.nixl_storage_client.client_write(
-                            #     target_agent_name, target_client_name, key, "train_push"
-                            # )
                         except Exception as e:
                             psrl_logger.error(
-                                f"Error pushing key {key} to {target_client_name} "
-                                f"for version {next_ps_model_version}: {e}"
+                                f"Error pushing key={key!r} to client={target_client_name!r} "
+                                f"for version={next_ps_model_version}: {e!r}."
                             )
                             raise e
                         if len(shards_to_transfer) > 0:
                             wait_operations.append((key, target_client_name, shards_to_transfer))
                     psrl_logger.debug(
-                        f"Starting to wait for {len(wait_operations)} NIXL operations "
-                        f"for version {next_ps_model_version}..."
+                        f"Waiting for NIXL operations. Count={len(wait_operations)}, version={next_ps_model_version}."
                     )
                     for wait_key, wait_target_client_name, wait_shards_to_transfer in wait_operations:
                         try:
@@ -208,11 +193,13 @@ class PSRL_BaseTrainWorker:
                             )
                         except Exception as e:
                             psrl_logger.error(
-                                f"Error waiting for key {wait_key} to target {wait_target_client_name} "
-                                f"for version {next_ps_model_version}: {e}"
+                                f"Error waiting for key={wait_key!r} on client={wait_target_client_name!r} "
+                                f"for version={next_ps_model_version}: {e!r}."
                             )
                             raise e
-                        psrl_logger.debug(f"Wait completed for key {wait_key} to target {wait_target_client_name}")
+                        psrl_logger.debug(
+                            f"NIXL wait completed for key={wait_key!r} on client={wait_target_client_name!r}."
+                        )
                         if wait_target_client_name not in ps_handle_to_precision_transfer_key_and_shards_list:
                             ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name] = []
                         ps_handle_to_precision_transfer_key_and_shards_list[wait_target_client_name].append(
@@ -230,25 +217,21 @@ class PSRL_BaseTrainWorker:
                     )
                 ray.get(precision_transfer_futures)
                 psrl_logger.debug("Starting to push model tag to the PS...")
-                # Ensure all workers have completed the NIXL push operations and precision transfers
                 assert dist.is_initialized(), "Pytorch distributed is not initialized."
                 dist.barrier()
                 psrl_logger.debug("Barrier done, now pushing model tag to the PS on the representative rank...")
                 if self.worker_rank == 0:
-                    # Only the representative rank pushes the model tag to the PS
                     ray.get(ps_manager_handle.push_model_state_dict_nixl.remote(next_ps_model_version))
                 self.nixl_storage_client.clear_intermediate_cached_data()
                 self.nixl_wait_completed.set()
                 psrl_logger.debug(
-                    f"All NIXL push operations completed, "
-                    f"model with version {next_ps_model_version} is successfully pushed to the PS."
+                    f"All NIXL push operations completed. Model version={next_ps_model_version} was pushed to the PS."
                 )
             except Exception as e:
                 raise RuntimeError(f"Error in NIXL wait thread: {e}") from e
 
         wait_thread = threading.Thread(target=wait_all_operations, daemon=True)
         wait_thread.start()
-        # Store the thread reference
         with self.nixl_wait_thread_lock:
             self.nixl_wait_thread = wait_thread
 
@@ -269,9 +252,7 @@ class PSRL_BaseTrainWorker:
 
             psrl_logger.debug("Waiting for NIXL wait thread to complete...")
             if timeout is not None:
-                # Use the event to wait with timeout
                 if self.nixl_wait_completed.wait(timeout=timeout):
-                    # Event was set, check if thread actually completed successfully
                     self.nixl_wait_thread.join(timeout=1.0)  # Brief join to catch any exceptions
                     if self.nixl_wait_thread.is_alive():
                         psrl_logger.warning("NIXL wait thread is still alive after event was set.")
@@ -282,7 +263,6 @@ class PSRL_BaseTrainWorker:
                     psrl_logger.warning("Timeout waiting for NIXL wait thread to complete.")
                     return False
             else:
-                # Wait indefinitely
                 self.nixl_wait_thread.join()
                 if self.nixl_wait_thread.is_alive():
                     psrl_logger.warning("NIXL wait thread is still alive after join.")
@@ -310,16 +290,10 @@ class PSRL_BaseTrainWorker:
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             self.ray_push_model()
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            # ---- DEBUG: log train info BEFORE push ----
-            # self._debug_log_train_info(label=f"TRAIN_BEFORE_PUSH_R{self.worker_rank}")
             self.param_sync_plan.before_push(self.unified_state_dict)
             self.nixl_push_model()
-            # TODO(lhy): wait for the push to complete before the next iteration optimizer update
-            # This will enable the NIXL push to be overlapped with the next iteration training
             self.wait_for_nixl_push_completion()
             self.param_sync_plan.after_push(self.unified_state_dict)
-            # ---- DEBUG: log PS info AFTER push completes ----
-            # self._debug_log_ps_info(label=f"PS_AFTER_PUSH_R{self.worker_rank}")
         else:
             raise NotImplementedError(f"PSRL TrainWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
 
@@ -348,7 +322,6 @@ class PSRL_BaseTrainWorker:
             "pull_model_state_dict_nixl should only be used in 'nixl_cpu' or 'nixl_gpu' mode."
         )
         ps_manager_handle = self.train_interface.ps_manager_handle
-        # Cache the agent and client names to avoid redundant ray calls
         if self._cached_ps_nixl_agent_names is None:
             self._cached_ps_nixl_agent_names = ray.get(ps_manager_handle.get_ps_nixl_agent_names.remote())
         if self._cached_ps_nixl_train_storage_client_names is None:
@@ -376,17 +349,13 @@ class PSRL_BaseTrainWorker:
                 shards_to_transfer = self.nixl_storage_client.client_read(
                     target_agent_name, target_client_name, key, f"train_pull_{self.pull_times}"
                 )
-                # shards_to_transfer = self.nixl_storage_client.client_read(
-                #     target_agent_name, target_client_name, key, "train_pull", merge_and_cache_xfer=False
-                # )
                 if len(shards_to_transfer) > 0:
                     wait_operations.append((key, target_client_name, shards_to_transfer))
-        # Generation cannot be overlapped with the NIXL pull, so we need to wait for all operations to complete
+        # Generation must wait for every NIXL pull operation.
         for key, target_client_name, shards_to_transfer in wait_operations:
             self.nixl_storage_client.wait(
                 key, f"train_pull_{self.pull_times}", "READ", target_client=target_client_name
             )
-            # self.nixl_storage_client.wait(key, "train_pull", "READ", target_client=target_client_name)
         self.nixl_storage_client.merge_and_finish_cached_xfer()
         torch.cuda.synchronize()
         self.nixl_storage_client.clear_intermediate_cached_data()
@@ -403,27 +372,17 @@ class PSRL_BaseTrainWorker:
         if self.psrl_config.ps_mode == "cpu" or self.psrl_config.ps_mode == "cpu_ref":
             raise RuntimeError("ray_pull_model is not supported for TrainWorker in 'cpu' or 'cpu_ref' mode.")
         elif self.psrl_config.ps_mode == "nixl_cpu" or self.psrl_config.ps_mode == "nixl_gpu":
-            # ---- DEBUG: log PS info BEFORE pull ----
-            # self._debug_log_ps_info(label=f"PS_BEFORE_PULL_R{self.worker_rank}")
             self.nixl_pull_model()
-            # ---- DEBUG: log train info AFTER pull ----
-            # self._debug_log_train_info(label=f"TRAIN_AFTER_PULL_R{self.worker_rank}")
-            # Reload the optimizer's fp32/bf16 copy from the model's current bf16 params
-            # NOTE(linsh): Only reload after the first pull because
-            # the model is init with empty state dict and pull from CPU PS
-            # for efficiency, but the optimizer state is not maintained by PS.
+            # NOTE(linsh): Reload after the first pull because empty initialization leaves
+            # optimizer master parameters stale, while later optimizer state remains local.
             if self.pull_times == 1:
                 self.reload_optimizer_after_pull()
         else:
             raise NotImplementedError(f"PSRL GenWorker does not support PS mode '{self.psrl_config.ps_mode}' yet.")
-        # Restore non-persistent buffers (e.g. inv_freq) that are not transferred by NIXL pull.
         self._restore_non_persistent_buffers_from_ps()
 
     def _restore_non_persistent_buffers_from_ps(self) -> None:
-        """
-        Restore non-persistent buffers from PS after pull.
-        Subclasses must override this method.
-        """
+        """Restore non-persistent buffers from the parameter server after pull."""
         raise NotImplementedError
 
     def _get_any_ps_worker_handle(self) -> ray.actor.ActorHandle:
@@ -441,15 +400,14 @@ class PSRL_BaseTrainWorker:
         # Prefer PS worker on the same node to avoid cross-node data transfer.
         client_name = ray.get(ps_manager_handle.get_ps_nixl_train_storage_client_name_for_node.remote(my_node_id))
         if client_name is None:
-            # Fallback: pick the first available PS client.
             if self._cached_ps_nixl_train_storage_client_names is None:
                 self._cached_ps_nixl_train_storage_client_names = ray.get(
                     ps_manager_handle.get_ps_nixl_train_storage_client_names.remote()
                 )
             client_name = self._cached_ps_nixl_train_storage_client_names[0]
             psrl_logger.warning(
-                f"[_get_any_ps_worker_handle] No PS worker found on node {my_node_id}; "
-                f"falling back to client {client_name}."
+                f"[_get_any_ps_worker_handle] No PS worker found on node={my_node_id!r}. "
+                f"Falling back to client={client_name!r}."
             )
         if client_name not in self._cached_ps_worker_handles:
             self._cached_ps_worker_handles[client_name] = ray.get(
@@ -470,8 +428,8 @@ class PSRL_BaseTrainWorker:
         ps_handle = self._get_any_ps_worker_handle()
         self._cached_non_persistent_buffers = ray.get(ps_handle.get_non_persistent_named_buffers.remote())
         psrl_logger.debug(
-            f"[_get_non_persistent_buffers_from_ps] Fetched "
-            f"{len(self._cached_non_persistent_buffers)} non-persistent buffer(s) from PS."
+            "[_get_non_persistent_buffers_from_ps] Fetched non-persistent buffers from PS. "
+            f"Count={len(self._cached_non_persistent_buffers)}."
         )
         return self._cached_non_persistent_buffers
 
@@ -479,15 +437,9 @@ class PSRL_BaseTrainWorker:
         """Debug log the train info."""
         if self.nixl_storage_client is not None:
             self.nixl_storage_client.log_shard_info(label=label)
-        # self._debug_log_train_model_info(label=label)
 
     def reload_optimizer_after_pull(self):
-        """Reload optimizer's fp32/bf16 master params from the model's current bf16 params.
-
-        Must be called after NIXL pull updates the model weights, so that the optimizer's
-        internal fp32/bf16 copy reflects the pulled weights rather than the stale initialization values.
-        Subclasses should override if the optimizer provides a reload API.
-        """
+        """Reload optimizer master parameters from the current model weights."""
         pass
 
     def _debug_log_train_model_info(self, label: str):

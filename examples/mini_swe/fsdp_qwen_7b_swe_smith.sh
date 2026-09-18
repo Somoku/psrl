@@ -22,8 +22,7 @@ echo "=== Pre-flight done ==="
 MODEL_PATH=${PSRL_WORKSPACE}/models/SWE-agent-LM-7B
 
 # --- Data ---
-# Train: SWE-smith-py 1 000-problem repo-balanced subset.
-# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_smith_py_1k/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
@@ -73,10 +72,8 @@ VAL_INSTANCES=$(( (TRAIN_NNODES * TRAIN_NGPUS_PER_NODE) / (VAL_TP * VAL_PP) ))
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( VAL_TP * VAL_PP ))
 
 # --- Algorithm (GRPO / DAPO) ---
-# Dynamic sampling filter: mirrors OpenClaw's check_reward_nonzero_std.
-# Drops rollout groups where all n=8 samples share the same reward (std=0),
-# preventing zero-gradient updates on batches where every rollout failed.
-# Uses psrl.group_post_process with algorithm.filter_groups.metric=score.
+
+# Drop groups with zero reward variance to avoid zero-gradient updates.
 enable_dynamic_sampling_filter=False
 adv_estimator=grpo
 use_kl_in_reward=False
@@ -87,11 +84,8 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths ---
-# SWE-bench episodes are multi-turn; swebench images typically use up to 250 turns
-# in upstream mini-SWE-agent.  We cap at 30 to match the eval script budget and
-# prevent degenerate loops from wasting compute.
-# NOTE: GEN_INSTANCES / VAL_INSTANCES below refer to parallel rollout-engine
-# instances, not SWE problems.
+
+# Match evaluation's 50-turn ceiling to bound agent loops.
 max_turns=50
 max_prompt_length=2048
 max_response_length=30000
@@ -108,17 +102,14 @@ n_resp_per_prompt_val=8
 train_prompt_mini_bsz=32
 
 # --- Sampling ---
-# Use temperature=0.7, top_p=0.95 to match the model's fine-tuning distribution
-# (generation_config.json: T=0.7, top_p=0.8, top_k=20) while giving slightly
-# more diversity for GRPO exploration.
+
+# Preserve the model's sampling distribution while allowing GRPO exploration.
 temperature=0.7
 top_p=0.95
 top_k=-1
 val_top_p=0.7
 
 # --- Reward ---
-# Reward mode: binary | partial_credit | test_ratio | shaped
-# partial_credit gives intermediate rewards for patch submission, partial test fixes.
 reward_mode=binary
 
 # --- TIS ---

@@ -6,6 +6,14 @@ from psrl.trainer.ppo.batch_schedule import (
     SUPPORTED_BATCH_AGG_MODES,
     TRAJECTORY_AGG_MODE,
 )
+from psrl.utils.agent.thinking import (
+    MULTI_TRAJ,
+    requires_accumulating_template,
+    template_prefills_assistant_think,
+    validate_thinking_template,
+    wants_thinking_disabled,
+)
+from psrl.utils.common.chat_template import resolve_chat_template_value
 
 
 def resolve_fine_grain_chunk_size(config, dp_size: int) -> tuple[str, int]:
@@ -110,9 +118,6 @@ def validate_config(
         use_critic (bool): is critic needed
     """
 
-    # AGENT(VERL): PSRL distinguish train and rollout gpu resources
-
-    # number of GPUs used in training
     train_n_gpus = config.psrl.deployment.train_ngpus_per_node * config.psrl.deployment.train_nnodes
     if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:
         if config.train_actor_rollout_ref.actor.strategy == "megatron":
@@ -142,8 +147,6 @@ def validate_config(
             f"({minimal_bsz})"
         )
 
-    # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
-    # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
     def check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
         """Validate mutually exclusive micro batch size configuration options.
 
@@ -176,20 +179,17 @@ def validate_config(
                     f"'{name}.{param}' because only '*_{param_per_gpu}' is supported (the former is deprecated)."
                 )
 
-    # Actor validation done in ActorConfig.__post_init__ and validate()
     actor_config = omega_conf_to_dataclass(config.train_actor_rollout_ref.actor)
     actor_config.validate(train_n_gpus, config.data.train_batch_size, config.train_actor_rollout_ref.model)
 
     if not config.train_actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:
-            # reference: log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
             check_mutually_exclusive(
                 config.train_actor_rollout_ref.ref.log_prob_micro_batch_size,
                 config.train_actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu,
                 "train_actor_rollout_ref.ref",
             )
 
-        #  The rollout section also has log_prob_micro_batch_size vs. log_prob_micro_batch_size_per_gpu
         check_mutually_exclusive(
             config.train_actor_rollout_ref.rollout.log_prob_micro_batch_size,
             config.train_actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu,
@@ -229,7 +229,34 @@ def validate_config(
 
         get_vllm_max_lora_rank(lora_rank)
 
-    # ---- PSRL specific validation ----
+    # --- PSRL Validation ---
+
+    thinking_template = config.psrl.agentic_rl.get("thinking_template", MULTI_TRAJ)
+    validate_thinking_template(thinking_template)
+    chat_template = config.gen_actor_rollout_ref.rollout.get("chat_template", None)
+    if requires_accumulating_template(thinking_template) and not chat_template:
+        raise ValueError(
+            "psrl.agentic_rl.thinking_template='multi_thinking' requires "
+            "gen_actor_rollout_ref.rollout.chat_template to point at an accumulating "
+            "template that replays prior-turn <think> blocks (for example "
+            "examples/sciaccel_rl/config/qwen35_acc_thinking.jinja2 for Qwen3.5). "
+            "The stock Qwen3/Qwen3.5 templates strip them and would fork the session "
+            "into one trajectory per turn."
+        )
+    if wants_thinking_disabled(thinking_template) and chat_template:
+        # Reject only templates that prefill an unclosed `<think>` on history, since a balanced
+        # accumulating template stays valid with thinking off.
+        template_source = resolve_chat_template_value(chat_template)
+        if template_source and template_prefills_assistant_think(template_source):
+            raise ValueError(
+                f"psrl.agentic_rl.thinking_template={thinking_template!r} turns thinking off, but "
+                f"gen_actor_rollout_ref.rollout.chat_template={chat_template!r} opens a <think> on "
+                "historical assistant turns and relies on the generated text to close it. With "
+                "thinking off there is no closing tag, so every historical turn renders an "
+                "unterminated <think>. Use a template whose assistant branch emits a bare content "
+                "(examples/sciaccel_rl/config/qwen3_acc_thinking.jinja2), or unset the override to "
+                "use the model's own template, which emits a balanced empty <think> block."
+            )
 
     batch_agg_mode = config.psrl.agentic_rl.get("batch_agg_mode", TRAJECTORY_AGG_MODE)
     assert batch_agg_mode in SUPPORTED_BATCH_AGG_MODES, (
@@ -240,18 +267,18 @@ def validate_config(
         requests_per_buffer = config.psrl.staleness_buffer_entries * rollout_n
         actor_entries_per_update = config.train_actor_rollout_ref.actor.ppo_mini_batch_size * rollout_n
         assert requests_per_buffer % actor_entries_per_update == 0, (
-            "With psrl.agentic_rl.batch_agg_mode='request', requests_per_buffer "
-            "must be divisible by the actor entries_per_update: "
-            f"{requests_per_buffer} % {actor_entries_per_update} != 0. "
+            "With psrl.agentic_rl.batch_agg_mode='request', "
+            f"requests_per_buffer={requests_per_buffer} must be divisible by "
+            f"actor_entries_per_update={actor_entries_per_update}. "
             "Adjust psrl.staleness_buffer_entries or "
             "train_actor_rollout_ref.actor.ppo_mini_batch_size."
         )
         if use_critic:
             critic_entries_per_update = config.critic.ppo_mini_batch_size * rollout_n
             assert requests_per_buffer % critic_entries_per_update == 0, (
-                "With psrl.agentic_rl.batch_agg_mode='request', requests_per_buffer "
-                "must be divisible by the critic entries_per_update: "
-                f"{requests_per_buffer} % {critic_entries_per_update} != 0. "
+                "With psrl.agentic_rl.batch_agg_mode='request', "
+                f"requests_per_buffer={requests_per_buffer} must be divisible by "
+                f"critic_entries_per_update={critic_entries_per_update}. "
                 "Adjust psrl.staleness_buffer_entries or critic.ppo_mini_batch_size."
             )
 
@@ -321,7 +348,7 @@ def validate_config(
         )
         assert not lmcache_cfg.get("clear_on_weight_update", True), (
             "psrl.lmcache.clear_on_weight_update must be False when psrl.lmcache.enable_p2p is True "
-            "(LMCache P2PBackend does not support clear; stale entries cannot be flushed on weight update)."
+            "(LMCache P2PBackend does not support clear. Stale entries cannot be flushed on weight update)."
         )
         assert lmcache_cfg.get("multi_version_kv", False), (
             "psrl.lmcache.multi_version_kv must be True when psrl.lmcache.enable_p2p is True "
@@ -342,14 +369,12 @@ def validate_config(
             f"psrl.rollout_coordination.session_strategy.thunder_agent.continue_scope must be "
             f"'bucketed' or 'global', got {continue_scope!r}."
         )
-        # Under trajectory sticky, a session always re-routes to the instance it
-        # already occupies, so global (relocating) continue would disagree with
-        # actual routing. Require bucketed in that case.
+        # Trajectory-sticky routing pins sessions to their current instance.
         sticky_enabled = bool(config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky)
         assert not (sticky_enabled and continue_scope == "global"), (
             "psrl.rollout_coordination.session_strategy.thunder_agent.continue_scope must be "
             "'bucketed' when psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky "
-            "is True (sticky sessions re-route to their current instance; global continue would "
+            "is True (sticky sessions re-route to their current instance. Global continue would "
             "mismatch)."
         )
 
@@ -387,14 +412,16 @@ def validate_config(
                 config.train_actor_rollout_ref.actor.ppo_mini_batch_size * selected_requests_per_group
             )
             assert requests_per_window % actor_requests_per_update == 0, (
-                "Request-aggregated pre_step windows must contain a whole number of actor updates: "
-                f"{requests_per_window} % {actor_requests_per_update} != 0."
+                "Request-aggregated pre_step windows must contain a whole number of actor updates. "
+                f"requests_per_window={requests_per_window}, "
+                f"actor_requests_per_update={actor_requests_per_update}."
             )
             if use_critic:
                 critic_requests_per_update = config.critic.ppo_mini_batch_size * selected_requests_per_group
                 assert requests_per_window % critic_requests_per_update == 0, (
-                    "Request-aggregated pre_step windows must contain a whole number of critic updates: "
-                    f"{requests_per_window} % {critic_requests_per_update} != 0."
+                    "Request-aggregated pre_step windows must contain a whole number of critic updates. "
+                    f"requests_per_window={requests_per_window}, "
+                    f"critic_requests_per_update={critic_requests_per_update}."
                 )
 
         ppo_epochs = config.train_actor_rollout_ref.actor.get("ppo_epochs", 1)
@@ -439,6 +466,28 @@ def validate_config(
                 "WARNING: psrl.fine_grain_overlap with reward_normalization='batch': "
                 "per-chunk reward normalization uses chunk-level statistics, not full-batch statistics. "
                 "Use reward_normalization='group' for exact equivalence with the full-batch path."
+            )
+
+    # env worker checks
+    env_worker_config = config.psrl.env_worker
+    if env_worker_config.enable:
+        if env_worker_config.placement not in ("colocated", "dedicated"):
+            raise ValueError(
+                f"psrl.env_worker.placement must be colocated or dedicated, got {env_worker_config.placement!r}."
+            )
+        if env_worker_config.placement == "dedicated" and not env_worker_config.dedicated_node_ips:
+            raise ValueError(
+                "psrl.env_worker.placement=dedicated requires a non-empty psrl.env_worker.dedicated_node_ips list."
+            )
+        if env_worker_config.routing.method not in ("least_loaded", "round_robin", "random"):
+            raise ValueError(
+                f"psrl.env_worker.routing.method must be least_loaded, round_robin, or random, "
+                f"got {env_worker_config.routing.method!r}."
+            )
+        if int(env_worker_config.cpu_slots_per_worker) <= 0:
+            raise ValueError(
+                f"psrl.env_worker.cpu_slots_per_worker must be positive, "
+                f"got {env_worker_config.cpu_slots_per_worker!r}."
             )
 
     print("[validate_config] All configuration checks passed successfully!")

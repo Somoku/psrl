@@ -1,18 +1,34 @@
-"""Docker CLI helpers used only by out-of-process crash recovery."""
+"""Docker CLI helpers for sandbox crash recovery and episode cleanup."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import fcntl
 import hashlib
 import logging
 import os
+import re
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from typing import BinaryIO
 
 psrl_logger = logging.getLogger(__file__)
+
+# Serialize and throttle dangling-image pruning across concurrent episodes.
+_PRUNE_LOCK = threading.Lock()
+_LAST_PRUNE_MONOTONIC = 0.0
+# Images removed per `docker rmi` call, to bound the argument list.
+_PRUNE_BATCH_SIZE = 200
+
+# Cleanup runs here rather than on asyncio's default executor, whose small shared
+# pool stalls episode I/O when many `docker rm` calls block on a loaded daemon.
+CLEANUP_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="psrl-docker-cleanup",
+)
 
 
 def _command(docker_command: Sequence[str], *args: str) -> list[str]:
@@ -60,6 +76,148 @@ def force_remove_containers_by_label(
     except (OSError, subprocess.TimeoutExpired) as exc:
         psrl_logger.warning(f"Failed to remove Docker containers with label {label!r}: {exc}.")
         return []
+
+
+def sanitize_compose_project_name(name: str) -> str:
+    """
+    Render a name the way Docker Compose derives a project name.
+
+    Mirrors Harbor's private sanitizer, so callers can find an episode's
+    containers by the `com.docker.compose.project` label.
+
+    Args:
+        name (str): Raw name, normally a Harbor session id.
+
+    Returns:
+        str: The sanitized project name.
+    """
+    name = name.lower()
+    if not re.match(r"^[a-z0-9]", name):
+        name = "0" + name
+    return re.sub(r"[^a-z0-9_-]", "-", name)
+
+
+def force_remove_compose_project(session_id: str) -> list[str]:
+    """
+    Force-remove every container Compose created for one episode.
+
+    Cancelling the coroutine that awaits a job does not stop its containers, so
+    an abandoned verifier keeps holding CPU and memory until this runs.
+
+    Args:
+        session_id (str): Harbor session id used as the Compose project name.
+
+    Returns:
+        list[str]: Container IDs that were force-removed.
+    """
+    if not session_id:
+        return []
+    return force_remove_containers_by_label(
+        "com.docker.compose.project",
+        sanitize_compose_project_name(session_id),
+    )
+
+
+def force_remove_compose_images(session_id: str) -> int:
+    """
+    Remove the tagged images Compose built for one episode.
+
+    Compose names images `<project>-<service>` from a fresh session id, so an
+    abandoned episode leaves tagged images that a dangling sweep never sees.
+
+    Args:
+        session_id (str): Harbor session id used as the Compose project name.
+
+    Returns:
+        int: Number of images removed.
+    """
+    if not session_id:
+        return 0
+
+    project = sanitize_compose_project_name(session_id)
+    try:
+        # The project prefix selects exactly this episode's images.
+        listed = subprocess.run(
+            ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}", "--filter", f"reference={project}-*"],
+            capture_output=True,
+            timeout=120,
+        )
+        names = [name for name in listed.stdout.decode(errors="replace").split() if name]
+        if not names:
+            return 0
+        subprocess.run(
+            ["docker", "rmi", "-f", *names],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=300,
+        )
+        psrl_logger.info(f"Removed {len(names)} image(s) for episode {project}.")
+        return len(names)
+    except subprocess.TimeoutExpired:
+        psrl_logger.warning(f"Timeout removing images for episode {project}.")
+        return 0
+    except Exception as exc:
+        psrl_logger.warning(f"Failed to remove images for episode {project}: {exc}.")
+        return 0
+
+
+def prune_dangling_images(min_interval_secs: float = 900.0, timeout_secs: float = 600.0) -> bool:
+    """
+    Remove dangling Docker images, at most once per `min_interval_secs`.
+
+    Batched `docker rmi -f` by explicit ID replaces `docker image prune -f`,
+    which can hang on a degraded daemon. Only untagged images are touched, so
+    task images stay warm for the next episode.
+
+    Args:
+        min_interval_secs (float): Minimum wall-clock gap between prunes.
+        timeout_secs (float): Upper bound on the whole removal loop.
+
+    Returns:
+        bool: Whether a prune actually ran on this call.
+    """
+    global _LAST_PRUNE_MONOTONIC
+
+    if not _PRUNE_LOCK.acquire(blocking=False):
+        return False
+    try:
+        now = time.monotonic()
+        if _LAST_PRUNE_MONOTONIC and now - _LAST_PRUNE_MONOTONIC < min_interval_secs:
+            return False
+        _LAST_PRUNE_MONOTONIC = now
+
+        deadline = now + timeout_secs
+        removed = 0
+        # A dangling ID held by a live container keeps reappearing, so track attempts.
+        attempted: set[str] = set()
+        while time.monotonic() < deadline:
+            listed = subprocess.run(
+                ["docker", "images", "-f", "dangling=true", "-q"],
+                capture_output=True,
+                timeout=120,
+            )
+            ids = [item for item in listed.stdout.decode(errors="replace").split() if item and item not in attempted]
+            if not ids:
+                break
+            batch = ids[:_PRUNE_BATCH_SIZE]
+            attempted.update(batch)
+            subprocess.run(
+                ["docker", "rmi", "-f", *batch],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=300,
+            )
+            removed += len(batch)
+        psrl_logger.info(f"Removed {removed} untagged Docker image(s).")
+        return True
+    except subprocess.TimeoutExpired:
+        psrl_logger.warning(f"Timeout removing untagged images after {timeout_secs}s.")
+        return False
+    except Exception as exc:
+        psrl_logger.warning(f"Failed to prune dangling images: {exc}.")
+        return False
+    finally:
+        _PRUNE_LOCK.release()
 
 
 def lease_store_id(heartbeat_dir: str) -> str:
@@ -274,7 +432,7 @@ def run_gc_loop(
                     docker_command=docker_command,
                 )
             except Exception:
-                psrl_logger.warning("Node sandbox GC sweep failed; retrying next interval.", exc_info=True)
+                psrl_logger.warning("Node sandbox GC sweep failed. Retrying next interval.", exc_info=True)
                 remaining = None
             if remaining is None or remaining > 0:
                 idle_cycles = 0

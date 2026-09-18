@@ -37,10 +37,8 @@ class NIXLMetaServer:
         self._is_all_client_infos_recved = False
         self._is_all_temp_mappings_recved = False
 
-        # NOTE(claude): When broadcast_init is enabled, PS workers act as both senders and
-        # receivers during initialization and need each other's GPU descriptors to perform
-        # direct NIXL writes. This flag causes _get_relevant_client_names_for_agent to include
-        # all PS clients in the Phase 2b info broadcast for PS agents.
+        # NOTE(claude): Broadcast initialization makes PS workers direct peers, so
+        # each receives every PS GPU descriptor.
         self._broadcast_init_enabled = broadcast_init_enabled
 
     def _add_client(self, agent_name: str, client_name: str):
@@ -55,7 +53,7 @@ class NIXLMetaServer:
         """
         psrl_logger.info(f"Waiting for {expected_agents} agents to connect and send sharding...")
         if self._is_all_client_shardings_recved:
-            # TODO(lhy): support elastic adding new clients after all clients are connected
+            # TODO(lhy): Support elastic clients after initial registration.
             return True
         start = time.time()
         already_recved_agents = set()
@@ -89,7 +87,7 @@ class NIXLMetaServer:
         """
         psrl_logger.info(f"Waiting for {expected_agents} agents to send client infos...")
         if self._is_all_client_infos_recved:
-            # TODO(lhy): support elastic adding new clients after all clients are connected
+            # TODO(lhy): Support elastic clients after initial registration.
             return True
         start = time.time()
         already_recved_agents = set()
@@ -160,24 +158,20 @@ class NIXLMetaServer:
         for client_name, sharding_dict in self.client_sharding_dicts.items():
             all_keys.update(sharding_dict.keys())
         _t_keys = time.time()
-        # Then we can make the unified sharding for each client
-        # That is, for each key, we need to find the new representation
-        # of (shard_dim, shard_mesh, shard_indices) for the mutual slice of all clients
+        # Build each key's finest common sharding representation.
         for key in all_keys:
             shard_mesh_list = []
             for client_name, sharding_dict in self.client_sharding_dicts.items():
                 if key not in sharding_dict:
-                    # raise RuntimeError(f"Key {key} not found in sharding of client {client_name}.")
-                    # This handle the case that some clients do not have the key (pipeline parallelism),
-                    # but we can still make the unified sharding
+                    # Pipeline stages may omit keys but still need an empty shard descriptor.
                     sharding_dict[key] = NIXLSharding.empty()
                 shard_mesh_list.append(sharding_dict[key].shard_mesh)
             finest_shard_mesh = NIXLSharding.find_finest_shard_mesh(shard_mesh_list)
             for client_name, sharding_dict in self.client_sharding_dicts.items():
                 if client_name not in self.client_unified_sharding_dicts:
                     self.client_unified_sharding_dicts[client_name] = {}
-                # NOTE(claude): mutate in-place — client_sharding_dicts is never read after
-                # make_unified_sharding, so deepcopy is unnecessary.
+                # NOTE(claude): Mutation is safe because `client_sharding_dicts` is
+                # unused after unified sharding is built.
                 sharding_dict[key].refactor_based_on_finer_shard_mesh(finest_shard_mesh)
                 self.client_unified_sharding_dicts[client_name][key] = sharding_dict[key]
         psrl_logger.info(
@@ -229,7 +223,7 @@ class NIXLMetaServer:
           - PUSH_SIDE needs: all PS_FOR_PUSH (train pushes to PS)
           - PULL_SIDE needs: all PS_FOR_PULL (gen pulls from PS)
           - PS clients do not initiate transfers and need no remote infos beyond their own,
-            unless broadcast_init is enabled — in that case PS workers write to each other
+            unless broadcast_init is enabled. In that case PS workers write to each other
             and therefore need every other PS worker's descriptors.
         """
         my_clients: set[str] = set(self.connected_clients[agent_name])
@@ -249,10 +243,8 @@ class NIXLMetaServer:
             if client_info.type in needed_types:
                 relevant.add(client_name)
 
-        # When broadcast_init is enabled, each PS worker writes directly to every other PS
-        # worker's train buffer via NIXL. Include all PS clients so every PS agent receives
-        # the GPU descriptors it needs for the broadcast. This piggybacks on the existing
-        # Phase 2b info exchange — no extra coordination round is required.
+        # Broadcast initialization uses direct PS writes, so include every PS
+        # descriptor in the existing info exchange.
         if self._broadcast_init_enabled:
             ps_types = {NIXLClientType.PS_FOR_PUSH, NIXLClientType.PS_FOR_PULL}
             if my_types & ps_types:

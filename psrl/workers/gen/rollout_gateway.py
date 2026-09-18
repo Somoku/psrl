@@ -8,6 +8,7 @@ from omegaconf import DictConfig
 
 from psrl.utils.common.http_utils import find_available_port
 from psrl.utils.logger import DualOutputHandler
+from psrl.utils.rollout.turn_output_writer import TurnOutputWriter
 from psrl.workers.gen.smg_adapter import build_rollout_router_args, get_trajectory_id_strategy
 
 psrl_logger = logging.getLogger(__file__)
@@ -15,11 +16,10 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
 def _run_smg(args):
-    """Entry point for the smg router subprocess.
+    """
+    Run the SMG router subprocess.
 
-    This function is the target of ``multiprocessing.Process`` and runs
-    ``launch_router()`` from the ``smg`` Python binding.  It must
-    be a module-level function so that it can be pickled by multiprocessing.
+    This target must remain at module scope for multiprocessing pickling.
     """
     try:
         from smg.launch_router import launch_router
@@ -116,9 +116,7 @@ class RolloutGateway:
 
         router_args = self._init_router_args()
 
-        # Set per-module Rust log filter for the SMG gateway subprocess.
-        # EnvFilter::try_from_default_env() in SMG's init_logging reads RUST_LOG
-        # before falling back to the configured log_level, so this takes precedence.
+        # `RUST_LOG` overrides the configured SMG log level.
         rust_log_filter = str(self._cfg_get("psrl.rollout_gateway.rust_log_filter", ""))
         if rust_log_filter:
             os.environ["RUST_LOG"] = rust_log_filter
@@ -129,9 +127,8 @@ class RolloutGateway:
             daemon=True,
         )
         self.router_process.start()
-        # Wait 3 seconds
         time.sleep(3)
-        assert self.router_process.is_alive()
+        assert self.router_process.is_alive(), "SMG router process exited during startup."
         psrl_logger.info("Router launched at %s:%s", self.smg_ip, self.smg_port)
         self.smg_url = f"http://{self.smg_ip}:{self.smg_port}"
         return self.smg_url
@@ -158,6 +155,7 @@ class RolloutGateway:
             client_concurrency,
             trajectory_id_strategy,
             logging_path,
+            turn_output_kwargs,
         ):
             import uvicorn
 
@@ -171,13 +169,21 @@ class RolloutGateway:
             if logging_path:
                 session_logger.addHandler(DualOutputHandler(logging_path, "SessionRouter"))
 
+            # Built here rather than in the parent: the writer owns a
+            # threading.Lock, which cannot cross a process boundary.
+            turn_output_writer = TurnOutputWriter(**turn_output_kwargs) if turn_output_kwargs["enable"] else None
+            if turn_output_writer is not None:
+                session_logger.info("Session turn output enabled at %s", turn_output_writer.output_dir)
+
             router = SessionRouter(
                 smg_url=smg_url,
                 client_concurrency=client_concurrency,
                 trajectory_id_strategy=trajectory_id_strategy,
+                turn_output_writer=turn_output_writer,
             )
             uvicorn.run(router.app, host=host, port=port, log_level="warning")
 
+        turn_output_writer_template = TurnOutputWriter.from_config(self.config)
         self.session_router_process = multiprocessing.Process(
             target=_run_session_router,
             args=(
@@ -187,6 +193,11 @@ class RolloutGateway:
                 session_client_concurrency,
                 get_trajectory_id_strategy(self.config),
                 self.config.psrl.logging_path,
+                {
+                    "enable": turn_output_writer_template.enable,
+                    "output_dir": turn_output_writer_template.output_dir,
+                    "include_response": turn_output_writer_template.include_response,
+                },
             ),
         )
         self.session_router_process.daemon = True

@@ -1,12 +1,5 @@
 """
-Weight Layout Plan Execution for PSRL
-
-This module executes WeightLayoutPlan from vLLM models, converting vLLM runtime
-parameters to HuggingFace checkpoint format.
-
-Key classes:
-- PlanExecutor: Executes a flattened WeightLayoutPlan on a model's parameters
-- ConvertedWeight: Output fragment with HF name, tensor, and sharding metadata
+Execute vLLM weight layout plans for PSRL.
 """
 
 from __future__ import annotations
@@ -89,8 +82,7 @@ class PlanExecutor:
         matching_rules = self.plan.matches_rules(param_name, module)
 
         if not matching_rules:
-            # No matching rule - parameter is passthrough (HF format already)
-            # Apply reverse name map if present
+            # Unmatched parameters retain their names unless the plan supplies a reverse map.
             hf_name = param_name
             if self.plan.name_map is not None:
                 hf_name = self.plan.name_map.to_hf_or_identity(hf_name)
@@ -116,7 +108,7 @@ class PlanExecutor:
         """Apply a single flattened rule to a parameter.
 
         For SUFFIX match rules the transform produces *relative* fragment names
-        (e.g. ``"q_proj.weight"``).  We need to reconstruct the full HF path by
+        (e.g. ``"q_proj.weight"``). We need to reconstruct the full HF path by
         prepending the base that was stripped when matching.
 
         Args:
@@ -135,21 +127,7 @@ class PlanExecutor:
 
         rule = flattened_rule.rule
 
-        # ------------------------------------------------------------------
-        # Compute the name_base used to reconstruct the full HF path.
-        #
-        # For SUFFIX matches the transform emits names relative to the
-        # suffix pattern (e.g. "q_proj.weight"), so we need:
-        #   name_base = full_name[: -len(pattern)]
-        #
-        # When the rule lives inside a mounted sub-plan the FlattenedRule
-        # carries a prefix (e.g. "language_model").  The param_name passed
-        # here is always the *full* name, so we just strip the pattern from
-        # the end regardless of prefix.
-        #
-        # For EXACT / PREFIX / REGEX matches the transform is expected to
-        # emit fully-qualified names already, so name_base stays None.
-        # ------------------------------------------------------------------
+        # Suffix transforms emit relative names, so retain their stripped prefix.
         name_base: str | None = None
         if rule.match == MatchMode.SUFFIX:
             pattern = rule.vllm_pattern
@@ -174,15 +152,12 @@ class PlanExecutor:
         for fragment in fragments:
             hf_name = fragment.name
 
-            # Handle identity transform sentinel:
-            # name=None means "keep original vLLM name" (no rename was specified)
+            # A `None` identity name preserves the original vLLM name.
             if hf_name is None:
                 hf_name = full_name
             elif name_base is not None:
-                # SUFFIX match: prepend base to reconstruct full path
-                # e.g. "model.layers.0.self_attn." + "q_proj.weight"
+                # Prepend the suffix base to reconstruct the full path.
                 hf_name = name_base + hf_name
-            # else: EXACT/PREFIX/REGEX — fragment.name is already the full path
 
             # Apply global name map if present
             if self.plan.name_map is not None:

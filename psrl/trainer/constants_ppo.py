@@ -9,8 +9,7 @@ PPO_RAY_RUNTIME_ENV = {
         "NCCL_DEBUG": "VERSION",
         "VLLM_LOGGING_LEVEL": "WARN",
         "VLLM_ALLOW_RUNTIME_LORA_UPDATING": "true",
-        # "VLLM_DISABLE_COMPILE_CACHE": "1",  # NOTE: workaround for vllm compile cache issue, see https://github.com/vllm-project/vllm/issues/18851
-        "VLLM_SKIP_P2P_CHECK": "1",  # Skip P2P check for init speedup in vLLM
+        "VLLM_SKIP_P2P_CHECK": "1",  # Avoid the startup cost of the vLLM P2P probe.
         "VERL_DATAPROTO_SERIALIZATION_METHOD": "numpy",
         "PSRL_LOGGING_LEVEL": "INFO",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",

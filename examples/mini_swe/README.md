@@ -110,12 +110,10 @@ examples/mini_swe/
 │   ├── swebench_harness_config.yaml      # Claude Code / Codex harness agent-loop config
 │   ├── qwen_no_think_strip.jinja         # Qwen3 chat template (strips thinking)
 │   └── qwen35_no_think_strip.jinja       # Qwen3.5 chat template (used by the cc harness script)
-├── eval/                                 # Standalone evaluation + vLLM serving (see eval/README.md)
+├── eval/                                 # Standalone evaluation (serving is in psrl/eval/)
 │   ├── README.md                         # Guide for gold-patch sanity, multi-node eval, serving your own checkpoint
 │   ├── eval_swebench.py                  # Single-node eval entry point
-│   ├── eval_swebench_multinode.py        # Hash-sharded cross-host eval launcher
-│   ├── serve_vllm.sh                     # Single-node vLLM OpenAI-compatible server (TP/PP/DP)
-│   └── serve_vllm_multinode.sh           # Cross-host DP fan-out + litellm proxy config generator
+│   └── eval_swebench_multinode.py        # Hash-sharded cross-host eval launcher
 └── prepare/
     ├── README.md                         # Data preparation guide (Path A, B, and C)
     ├── prepare_simple_data.py            # Toy dataset generator

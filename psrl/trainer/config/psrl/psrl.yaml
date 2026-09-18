@@ -20,6 +20,7 @@ defaults:
   - buffer_post_process@buffer_post_process
   - tms@tms
   - lmcache@lmcache
+  - env_worker@env_worker
   - rollout_gateway@rollout_gateway
   - _self_
 

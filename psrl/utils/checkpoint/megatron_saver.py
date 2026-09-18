@@ -1,37 +1,7 @@
-"""Per-rank Megatron checkpoint save/load (bypasses DCP to avoid UCX heap corruption).
+"""Save and load per-rank Megatron checkpoints with plain tensors.
 
-Each rank saves its own ``rank_<N>.pt`` via ``torch.save`` applied to the output
-of ``_extract_plain_state_dict``.  This avoids DCP's ``all_gather_object`` of
-shard metadata, which corrupts NIXL's UCX endpoint addresses under high memory
-pressure (``address.c:1139 Assertion `addr_version == UCP_OBJECT_VERSION_V2'``).
-
-## Tensor extraction on save
-
-``_extract_plain_state_dict`` replaces every Megatron wrapper with its payload
-**without** calling ``apply_factories()``:
-
-  ``ShardedTensorFactory`` → ``.data``  (original un-split local tensor)
-  ``ShardedTensor``        → ``.data``  (local shard tensor)
-  ``ShardedObject``        → ``.data``
-  ``LocalNonpersistentObject`` → ``.obj``
-
-``ShardedTensorFactory`` is the key case: its ``.data`` is the original fused
-tensor (e.g. SwiGLU ``linear_fc1.weight`` as ``[hidden, 2*ffn_hidden]``), so
-the split/merge round-trip that DCP normally performs is avoided entirely.
-
-## Backward compatibility
-
-``_unwrap_sharded_state_dict`` also handles checkpoints saved in the legacy
-``per_rank_torch_save`` format, where ``apply_factories()`` was called before
-``torch.save()``.  That leaves ``list[ShardedTensor]`` entries for
-``ShardedTensorFactory`` outputs (e.g. SwiGLU ``linear_fc1.weight`` split into
-``[gate_half, up_half]``); these are reconstructed via
-``torch.cat([x.data for x in lst])``.
-
-## Parallel config constraint
-
-The parallel config (TP / PP / DP / world_size) must be identical between save
-and load runs.  The saved ``parallel_config.json`` is validated on load.
+Sharded wrappers are replaced with payloads before `torch.save` to avoid DCP
+metadata gathering. Save and load must use identical parallel configurations.
 """
 
 import json
@@ -60,7 +30,7 @@ def _assert_no_sharded_objects(obj, _path="root"):
     """
     if isinstance(obj, (ShardedBase, LocalNonpersistentObject)):
         raise AssertionError(
-            f"Unexpected sharded wrapper at {_path!r}: {type(obj).__name__}.  "
+            f"Unexpected sharded wrapper at {_path!r}: {type(obj).__name__}. "
             f"All wrappers should have been extracted before this point."
         )
     if isinstance(obj, dict):
@@ -72,20 +42,14 @@ def _assert_no_sharded_objects(obj, _path="root"):
 
 
 def _extract_plain_state_dict(obj):
-    """Replace all Megatron checkpoint wrappers with their payload (save path).
-
-    Walk *obj* recursively and substitute every wrapper type with its
-    underlying data.  No ``apply_factories()`` call is required — factory
-    ``.data`` already holds the original local tensor before any split.
-    """
+    """Replace Megatron checkpoint wrappers with their payloads before saving."""
     if isinstance(obj, dict):
         return {k: _extract_plain_state_dict(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [_extract_plain_state_dict(v) for v in obj]
     if isinstance(obj, tuple):
         return tuple(_extract_plain_state_dict(v) for v in obj)
-    # ShardedTensorFactory is a subclass of ShardedBase, so this branch
-    # handles factories, ShardedTensor, and ShardedObject uniformly.
+    # `ShardedTensorFactory` subclasses `ShardedBase`, so this branch handles both.
     if isinstance(obj, ShardedBase):
         return obj.data
     if isinstance(obj, LocalNonpersistentObject):
@@ -94,19 +58,11 @@ def _extract_plain_state_dict(obj):
 
 
 def _unwrap_sharded_state_dict(obj):
-    """Unwrap Megatron checkpoint wrappers from a loaded state dict (load path).
-
-    Handles both the current format (plain tensors — effectively a no-op) and
-    the legacy ``per_rank_torch_save`` format where ``apply_factories()`` was
-    called before ``torch.save()``, leaving ``list[ShardedTensor]`` entries for
-    ``ShardedTensorFactory`` outputs.
-    """
+    """Unwrap checkpoint wrappers, including shard lists emitted by `apply_factories`."""
     if isinstance(obj, dict):
         return {k: _unwrap_sharded_state_dict(v) for k, v in obj.items()}
     if isinstance(obj, list):
-        # Legacy format: apply_factories() produced list[ShardedTensor] for
-        # ShardedTensorFactory outputs (e.g. SwiGLU linear_fc1.weight →
-        # [gate_half, up_half]).  merge_fn is always torch.cat for dense models.
+        # Dense factory outputs use shard lists that merge with `torch.cat`.
         if obj and all(isinstance(x, ShardedBase) for x in obj):
             return torch.cat([x.data for x in obj])
         return [_unwrap_sharded_state_dict(v) for v in obj]
@@ -127,7 +83,7 @@ def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
             ``ShardedTensorFactory``, ``ShardedTensor``, ``ShardedObject``,
             ``LocalNonpersistentObject``).
         ckpt_path (str): Directory to save checkpoint files into.
-        async_save (bool): Unused; kept for API compatibility.
+        async_save (bool): Unused and retained for API compatibility.
     """
     assert not async_save, "async_save is not supported by save_megatron_checkpoint"
 
@@ -140,7 +96,7 @@ def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
 
     save_path = os.path.join(ckpt_path, f"rank_{rank}.pt")
     torch.save(plain_state_dict, save_path)
-    assert os.path.exists(save_path), f"torch.save appeared to succeed but {save_path!r} not found on disk"
+    assert os.path.exists(save_path), f"torch.save appeared to succeed, but path={save_path!r} was not found on disk."
 
     if rank == 0:
         metadata = {
@@ -158,14 +114,14 @@ def save_megatron_checkpoint(sharded_state_dict, ckpt_path, async_save=False):
     return None
 
 
-def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001  (sharded_state_dict unused; kept for API compatibility)
+def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001
     """Load a per-rank Megatron checkpoint from *ckpt_dir*.
 
     Validates the parallel config stored in ``parallel_config.json`` and
     asserts that the loaded state dict contains no residual Megatron wrappers.
 
     Args:
-        sharded_state_dict: Unused; kept for API compatibility with
+        sharded_state_dict: Unused and retained for API compatibility with
             ``load_dist_checkpointing``.
         ckpt_dir (str): Directory containing ``rank_<N>.pt`` files and
             ``parallel_config.json``.
@@ -177,25 +133,25 @@ def load_megatron_checkpoint(sharded_state_dict, ckpt_dir):  # noqa: ARG001  (sh
     rank_path = os.path.join(ckpt_dir, f"rank_{rank}.pt")
 
     assert os.path.exists(rank_path), (
-        f"Per-rank checkpoint not found: {rank_path!r}.  "
+        f"Per-rank checkpoint not found at {rank_path!r}. "
         f"Only the per-rank format saved by save_megatron_checkpoint is supported."
     )
 
     metadata_path = os.path.join(ckpt_dir, _METADATA_FILE)
     assert os.path.exists(metadata_path), (
-        f"Metadata file not found: {metadata_path!r}.  Checkpoint directory may be corrupt or incomplete."
+        f"Metadata file not found at {metadata_path!r}. Checkpoint directory may be corrupt or incomplete."
     )
 
     with open(metadata_path) as f:
         metadata = json.load(f)
 
     fmt = metadata.get("format")
-    assert fmt in _KNOWN_FORMATS, f"Unknown checkpoint format {fmt!r}; expected one of {sorted(_KNOWN_FORMATS)}"
+    assert fmt in _KNOWN_FORMATS, f"Unknown checkpoint format {fmt!r}. Expected one of {sorted(_KNOWN_FORMATS)}."
 
     saved_ws = metadata.get("world_size")
     current_ws = torch.distributed.get_world_size()
     assert saved_ws == current_ws, (
-        f"Checkpoint world_size={saved_ws} != current world_size={current_ws}.  "
+        f"Checkpoint world_size={saved_ws} does not match current world_size={current_ws}. "
         f"Cannot load per-rank checkpoint with a different parallel config."
     )
 

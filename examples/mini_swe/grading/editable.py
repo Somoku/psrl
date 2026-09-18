@@ -10,9 +10,8 @@ import shlex
 # Characters that make a shell line more than one command. A line carrying any
 # of them is never rewritten: splitting it correctly is not worth the risk.
 _SHELL_METACHARACTERS = ";&|<>()`$\\\n"
-# Flags that are safe to keep when the line is otherwise a single editable
-# install of the project root. Anything else means the line may also install
-# dependencies, which must keep running verbatim.
+# Flags safe to keep when the line is otherwise a single editable install of the
+# project root. Anything else may also install dependencies, which must keep running verbatim.
 _EDITABLE_INSTALL_BENIGN_FLAGS = frozenset(
     {
         "-v",
@@ -104,9 +103,8 @@ def render_eval_script(
     """
     if not skip_editable_install:
         return eval_script
-    # The probe defaults to its own cwd, which is the directory the pip
-    # command would install from, so a script that changes directory is
-    # handled without guessing.
+    # The probe defaults to its own cwd, which is the directory the pip command
+    # would install from, so a script that changes directory is handled without guessing.
     probe = shlex.quote(probe_path)
     rendered: list[str] = []
     for line in eval_script.split("\n"):

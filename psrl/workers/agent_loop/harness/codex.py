@@ -25,10 +25,8 @@ class CodexHarness(Harness):
             'sandbox_mode = "danger-full-access"',
         ]
         if runtime.context_window_tokens and runtime.compaction_token_limit:
-            # Current Codex releases clamp the configured auto-compact limit
-            # to 90% of model_context_window.  Choose a synthetic window that
-            # makes the requested token threshold the effective limit while
-            # still leaving room for Codex's compaction turn.
+            # Current Codex releases clamp the configured auto-compact limit to 90% of model_context_window.
+            # Choose a synthetic window making the requested token threshold effective and leaving room to compact.
             codex_context_window = max(
                 runtime.context_window_tokens,
                 math.ceil(runtime.compaction_token_limit / 0.9),

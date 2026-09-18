@@ -5,8 +5,8 @@ Two guarantees are covered:
 1. The packaged driver (``grader.zip``) parses marker-delimited and raw logs the
    way the official harness does, and reports infrastructure failures without
    ever consulting a process exit code.
-2. No runtime module imports the upstream ``swebench``/``swesmith`` packages;
-   those are confined to prepare-time tooling.
+2. No runtime module imports the upstream ``swebench``/``swesmith`` packages.
+   Those are confined to prepare-time tooling.
 """
 
 from __future__ import annotations
@@ -128,8 +128,8 @@ def test_plan_defaults_to_pytest_for_gym_rows() -> None:
         }
     )
     assert plan is not None
-    # SWE-Gym rows carry no log_parser; falling back to the repo-keyed map would
-    # wrongly pick parse_log_django, so the plan pins the pytest parser.
+    # SWE-Gym rows carry no log_parser. Falling back to the repo-keyed map
+    # would wrongly pick parse_log_django, so the plan pins the pytest parser.
     assert plan.parser_name == "parse_log_pytest"
     assert plan.markers is False
     assert GradingPlan.from_swe_problem({"instance_id": "x"}) is None
@@ -149,8 +149,8 @@ def test_runtime_modules_do_not_import_upstream_graders(relative: str) -> None:
 
 
 def test_swesmith_parsers_accept_the_two_argument_call_convention() -> None:
-    # Flattened SWE-smith parsers are single-argument; the registry adapts them to
-    # (log, test_spec) so the driver can call every parser uniformly.
+    # Flattened SWE-smith parsers are single-argument. The registry adapts them
+    # to (log, test_spec) so the driver can call every parser uniformly.
     from examples.mini_swe.grading.parsers import parser_registry
 
     PARSER_BY_NAME = parser_registry()
@@ -180,9 +180,8 @@ def test_vendored_package_has_no_upstream_imports() -> None:
 
 
 def test_container_command_selects_version_checked_interpreter() -> None:
-    # The sandbox login shell auto-activates the task image's conda ``testbed``
-    # env, whose interpreter may be too old for the vendored payload; the driver
-    # must be run with a version-checked interpreter rather than bare ``python3``.
+    # The sandbox login shell auto-activates the task image's ``testbed`` env.
+    # Its interpreter may be too old, so run a version-checked one, not ``python3``.
     from examples.mini_swe.grading.payload import build_container_command
 
     command = build_container_command()

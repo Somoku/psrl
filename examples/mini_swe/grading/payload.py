@@ -50,7 +50,7 @@ def _assert_vendor_bundle_intact() -> None:
 
     The bundle ships verbatim into every grading sandbox, so a missing file or a
     hand-edited parser would silently change rewards. ``PROVENANCE.md`` records
-    the expected sha256 of each file; compare against it before the payload is
+    the expected sha256 of each file. Compare against it before the payload is
     built, so a bad checkout stops training instead of skewing it.
     """
     provenance = _HERE / "_vendor" / "PROVENANCE.md"
@@ -120,7 +120,7 @@ def build_container_command(
     Select the driver interpreter, execute tests, then parse their log.
 
     The test interpreter comes from the original eval script. Nonzero test
-    status alone does not determine the reward; the parsed test report does.
+    status alone does not determine the reward. The parsed test report does.
     """
     if not python_candidates or any(not p for p in python_candidates):
         raise ValueError("At least one nonempty driver Python candidate is required.")

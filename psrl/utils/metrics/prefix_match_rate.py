@@ -2,7 +2,7 @@
 Compute prefix sharing metrics without materializing a token trie.
 
 Global compression is total sequence length divided by the number of distinct
-nonempty prefixes; sharing is the fraction of tokens saved. Within compression
+nonempty prefixes. Sharing is the fraction of tokens saved. Within compression
 builds an independent tree per prompt group. Cross compression deduplicates only
 prefixes also present outside that group, keeping private tokens per occurrence.
 Both group scopes report unweighted mean, population variance, maximum and minimum.
@@ -130,7 +130,7 @@ def sequences_from_batch(data) -> tuple[list[np.ndarray], list[int] | None]:
 
     ``data`` is the ``TensorDict`` returned by ``transfer_queue.kv_batch_get``
     for a training batch. ``input_ids`` is a jagged nested tensor (one 1-D
-    tensor per sample); ``parent_id`` groups samples sharing a prompt.
+    tensor per sample). ``parent_id`` groups samples sharing a prompt.
     """
     import torch
 

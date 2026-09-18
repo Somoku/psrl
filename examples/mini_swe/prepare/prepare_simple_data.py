@@ -1,20 +1,5 @@
 """
-mini-SWE-agent Dataset Generator.
-
-Supports simple test cases (for quick validation), loaded from JSON files.
-
-Data format:
-- prompt: Minimal chat messages (satisfies framework's ``raw_prompt`` requirement).
-          The real system/instance templates are applied at runtime by
-          mini-SWE-agent via ``simple_agent_config.yaml``.
-- reward_model: Evaluation configuration.
-- extra_info: Contains problem_statement, expected_patch,
-              and data-affine overrides (sandbox_overrides / agent_overrides).
-- agent_name: "mini_swe_agent"
-
-Simple test cases are stored in separate JSON files for easy editing:
-  - simple_cases_train.json  (training cases)
-  - simple_cases_val.json    (validation cases)
+Generate simple mini-SWE-agent train and validation parquet files.
 """
 
 import argparse
@@ -135,8 +120,8 @@ def main() -> None:
     test_df.to_parquet(test_path)
 
     psrl_logger.info("Dataset generation completed!")
-    psrl_logger.info(f"Train: {len(train_df)} samples -> {train_path}.")
-    psrl_logger.info(f"Test:  {len(test_df)} samples -> {test_path}.")
+    psrl_logger.info(f"Train sample count: {len(train_df)}. Path: {train_path!r}.")
+    psrl_logger.info(f"Test sample count: {len(test_df)}. Path: {test_path!r}.")
 
 
 if __name__ == "__main__":

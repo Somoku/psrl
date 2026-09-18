@@ -2,7 +2,7 @@
 SWE-bench / SWE-smith-py subset sampling utilities.
 
 Provides repo-balanced subsampling so that no single repository dominates the
-training distribution.  All sampling is deterministic given a fixed seed.
+training distribution. All sampling is deterministic given a fixed seed.
 """
 
 from __future__ import annotations
@@ -18,9 +18,7 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-# ---------------------------------------------------------------------------
-# Image-name helpers  (mirrors minisweagent swebench.py logic exactly)
-# ---------------------------------------------------------------------------
+# --- Image name helpers ---
 
 
 def get_swebench_image_name(swe_problem: dict[str, Any]) -> str:
@@ -69,9 +67,7 @@ def get_repo_key(swe_problem: dict[str, Any]) -> str:
     return repo
 
 
-# ---------------------------------------------------------------------------
-# Subset sampling
-# ---------------------------------------------------------------------------
+# --- Subset sampling ---
 
 
 def repo_balanced_sample(
@@ -136,12 +132,7 @@ def filter_by_spec(
     spec: str,
 ) -> list[dict[str, Any]]:
     """
-    Filter SWE problems by a slice-or-regex spec string.
-
-    Supported formats:
-      - ``"0:100"`` — Python slice (start:stop, step optional).
-      - ``"^django"`` — Regex matched against each row's `instance_id` field.
-      - ``""`` — No filter, return all.
+    Filter SWE problems by Python slice syntax or an `instance_id` regex.
 
     Args:
         swe_problems (list[dict[str, Any]]): Full pool of dataset rows.
@@ -161,5 +152,5 @@ def filter_by_spec(
     # Regex spec: match against instance_id (the HF dataset field name).
     pattern = re.compile(spec)
     filtered = [prob for prob in swe_problems if pattern.search(prob["instance_id"])]
-    psrl_logger.info(f"filter_by_spec regex={spec!r}: {len(swe_problems)} → {len(filtered)} SWE problems.")
+    psrl_logger.info(f"Filtered by regex={spec!r}. Input count: {len(swe_problems)}. Output count: {len(filtered)}.")
     return filtered

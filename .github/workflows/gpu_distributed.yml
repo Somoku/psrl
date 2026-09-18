@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install psrl with GPU dependencies
-        # Each run: block is a fresh shell — source psrl.sh in every step that needs it
+        # Each `run` block uses a fresh shell, so source `psrl.sh` when needed.
         run: |
           pip install -e ".[grpc,test]"
 

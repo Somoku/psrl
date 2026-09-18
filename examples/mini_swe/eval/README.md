@@ -8,8 +8,10 @@ OpenAI-compatible endpoint for mini-swe-agent to drive.
 |------|---------|
 | [`eval_swebench.py`](eval_swebench.py) | Single-host evaluation entry point (rollout + grading). Supports an HF dataset key *or* a prepared parquet file via `--dataset`. |
 | [`eval_swebench_multinode.py`](eval_swebench_multinode.py) | Hash-shards a prepared parquet across hosts, fans `eval_swebench` out over ssh, merges per-shard artefacts into one output directory. Forwards `OPENAI_API_BASE` / `OPENAI_API_KEY` to every host. |
-| [`serve_vllm.sh`](serve_vllm.sh) | Single-node vLLM OpenAI-compatible server wrapper with TP / PP / DP flags, tool-call-parser selection, health probe, and background launch. |
-| [`serve_vllm_multinode.sh`](serve_vllm_multinode.sh) | Fans `serve_vllm.sh` to every host in a hosts file (data-parallel across hosts), writes `endpoints.txt` + a drop-in litellm proxy config that routes across every replica. |
+
+Model serving is **not** in this directory: it lives in
+[`psrl/eval/`](../../../psrl/eval/) because `examples/sciaccel_rl/eval/` needs the
+same thing. Use `python -m psrl.eval.serve` with `topology=single|fleet|multinode`.
 
 The grader itself — [`../swebench_grader.py`](../swebench_grader.py) — stays at
 the top level of `examples/mini_swe/` because it is shared between standalone
@@ -91,25 +93,31 @@ at. So to evaluate your own checkpoint, serve it with **any OpenAI-compatible
 server** (vLLM / sglang / TGI / llama.cpp server / litellm proxy) and point
 the eval at it.
 
-The two `serve_vllm*.sh` helpers in this directory wrap vLLM for this:
+Serving lives in [`psrl/eval/`](../../../psrl/eval/), shared with
+`examples/sciaccel_rl/eval/`:
 
-#### Single-node (TP / PP / DP on one box)
+#### Single-node
 
 PSRL trains with the `mswea_bash_command` text-block format (not OpenAI
 tool-calls), so vLLM should be started as a **plain text-completion server**
 — no `--tool-call-parser`, no `--enable-auto-tool-choice`:
 
 ```bash
-bash examples/mini_swe/eval/serve_vllm.sh \
-    --checkpoint ${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
-    --served-model-name my-model \
-    --port 8000 \
-    --tp 4 \            # tensor parallel across 4 GPUs on this host
-    --pp 1 \
-    --dp 1              # vLLM in-server data-parallel replicas (>=0.6)
-# No --tool-call-parser here.  The model was trained to output
-# ```mswea_bash_command blocks, not OpenAI tool-call JSON.
+python -m psrl.eval.serve \
+    topology=single \
+    topology.tp=4 \
+    server.checkpoint=${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
+    server.served_model_name=my-model \
+    output_dir=output/serve/my-step-1000
+# server.tool_call_parser is empty in every preset. The model was trained to
+# emit ```mswea_bash_command blocks, not OpenAI tool-call JSON.
 ```
+
+For several independent replicas on one host use `topology=fleet`
+(`topology.replicas=4 topology.tp=2` fills 8 GPUs, one endpoint each). Prefer that
+over `topology.dp` — vLLM's in-server data parallelism — which is broken in this
+repo's patched build. Both write `<output_dir>/endpoints.json`, containing only
+replicas that passed a health check.
 
 `--tool-call-parser` is only needed when serving **external models** (GPT-4,
 Claude, Llama3-Instruct, etc.) that natively output OpenAI tool-call JSON and
@@ -137,25 +145,31 @@ python -m examples.mini_swe.eval.eval_swebench \
 # unless you want to override to 'litellm' for an external model.
 ```
 
-#### Cross-node (DP across hosts)
+#### Cross-node (one fleet per host)
 
-For bigger throughput, run one full vLLM replica per host (data-parallel
-across hosts):
+For bigger throughput, run a fleet on every host in a hosts file:
 
 ```bash
-bash examples/mini_swe/eval/serve_vllm_multinode.sh \
-    --hosts ${PSRL_WORKSPACE}/hosts/32GPUs \
-    --checkpoint ${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
-    --served-model-name my-model \
-    --port 8000 \
-    --tp 4 \
-    --outdir examples/mini_swe/output/serve/my_step1000
-# No --tool-call-parser for PSRL-trained models.
+python -m psrl.eval.serve \
+    topology=multinode \
+    topology.hosts_file=${PSRL_WORKSPACE}/hosts/32GPUs \
+    topology.replicas=1 \
+    topology.tp=4 \
+    server.checkpoint=${PSRL_WORKSPACE}/checkpoints/my-step-1000 \
+    server.served_model_name=my-model \
+    output_dir=examples/mini_swe/output/serve/my_step1000
+# server.tool_call_parser stays empty for PSRL-trained models.
 ```
 
-`serve_vllm_multinode.sh` writes `<outdir>/endpoints.txt` (one
-`http://<host>:<port>` per healthy host) and `<outdir>/litellm_proxy.yaml`
-(a litellm router config).
+Total endpoints are `hosts x topology.replicas`. Keep `replicas=1` when using the
+direct-to-localhost pattern below, since each eval shard is given exactly one
+`OPENAI_API_BASE`; put extra parallelism in `topology.dp` instead so all replicas
+share one port. Scaling out is a different `hosts_file` and nothing else.
+
+The launcher writes `<output_dir>/endpoints.json` listing every healthy endpoint
+with its host, GPUs, and PID. Hosts that came up with nothing are logged and
+excluded. It exits non-zero only when healthy endpoints fall below
+`topology.min_healthy_frac` (default 0.5), so a partial cluster still runs.
 
 **Recommended: direct-to-localhost (no central proxy)**
 
@@ -185,11 +199,27 @@ to override.
 
 **Alternative: litellm proxy (open-network environments)**
 
-If there is no corporate proxy, a central litellm router can load-balance
-across all replicas:
+If there is no corporate proxy, a central litellm router can load-balance across
+all replicas. The launcher no longer generates a router config — build one from
+`endpoints.json`, which is the authoritative list of healthy replicas:
 
 ```bash
-litellm --config <outdir>/litellm_proxy.yaml --port 4000 &
+python -c "
+import json, sys
+payload = json.load(open(sys.argv[1]))
+name = payload['served_model_name']
+print('model_list:')
+for e in payload['endpoints']:
+    print(f'  - model_name: {name}')
+    print('    litellm_params:')
+    print(f'      model: openai/{name}')
+    print(f\"      api_base: {e['url']}\")
+    print('      api_key: dummy')
+print('router_settings:')
+print('  routing_strategy: least-busy')
+" <output_dir>/endpoints.json > litellm_proxy.yaml
+
+litellm --config litellm_proxy.yaml --port 4000 &
 export OPENAI_API_BASE=http://<launcher_ip>:4000/v1
 export OPENAI_API_KEY=dummy
 # then run eval_swebench_multinode as above
@@ -201,12 +231,15 @@ For models that natively support OpenAI tool-calling (GPT-4o, Claude,
 Llama3-Instruct, etc.) you need the tool-call parser on the vLLM side:
 
 ```bash
-bash examples/mini_swe/eval/serve_vllm.sh \
-    --checkpoint ${PSRL_WORKSPACE}/checkpoints/external-model \
-    --served-model-name ext-model \
-    --port 8001 \
-    --tp 4 \
-    --tool-call-parser hermes      # llama3_json / mistral / deepseek_v3 as needed
+python -m psrl.eval.serve \
+    topology=single \
+    topology.port=8001 \
+    topology.tp=4 \
+    server.checkpoint=${PSRL_WORKSPACE}/checkpoints/external-model \
+    server.served_model_name=ext-model \
+    server.tool_call_parser=hermes \
+    output_dir=output/serve/ext-model
+# llama3_json / mistral / deepseek_v3 as needed
 ```
 
 Then eval with `--model-class litellm`:
@@ -223,22 +256,38 @@ python -m examples.mini_swe.eval.eval_swebench \
 
 #### Cross-node tensor parallelism
 
-`serve_vllm_multinode.sh` does **not** do cross-node TP — it assumes each
-host fits one full replica. If your model is so large that one host's GPUs
-aren't enough, start a Ray cluster yourself (`ray start --head` on the head
-node, `ray start --address=<head>:6379` on the workers), then use
-`serve_vllm.sh` on the head node with
-`--distributed-executor-backend ray --tp <total_gpus>`.
-
-#### Stopping vLLM replicas
+`topology=multinode` does **not** do cross-node TP — every replica stays inside one
+host, so a wedged host costs only its own capacity instead of hanging a replica.
+If your model is too large for one host's GPUs, start a Ray cluster yourself
+(`ray start --head` on the head node, `ray start --address=<head>:6379` on the
+workers), then run a single server on the head node and pass the Ray backend
+through:
 
 ```bash
-# Single host
-kill "$(cat /tmp/vllm_8000.pid)"
+python -m psrl.eval.serve \
+    topology=single \
+    topology.tp=<total_gpus> \
+    server.checkpoint=<ckpt> \
+    server.served_model_name=big-model \
+    'server.extra=[--distributed-executor-backend,ray]' \
+    output_dir=output/serve/big-model
+```
+
+#### Stopping servers
+
+`endpoints.json` records each replica's PID, so teardown does not need a pid file:
+
+```bash
+# Every replica this launcher started on one host
+python -c "
+import json, os, signal, sys
+for e in json.load(open(sys.argv[1]))['endpoints']:
+    os.kill(e['pid'], signal.SIGTERM)
+" <output_dir>/endpoints.json
 
 # Every host in a hosts file
 pssh -h ${PSRL_WORKSPACE}/hosts/32GPUs -i \
-    "pkill -f 'vllm.entrypoints.openai.api_server.*--port 8000'"
+    "pkill -f 'vllm.entrypoints.openai.api_server'"
 ```
 
 ### Checkpoint evaluation (HF dataset mode)

@@ -18,15 +18,11 @@ reward_loop_worker:
   heartbeat_interval_s: 30
   shutdown_timeout_s: 10
 
-# Ordered list of manager names to activate.
-# Only managers listed here will be used at runtime.
-# Example: active_managers: [dapo, gen_qwen3_8b]
+# Only listed managers are active at runtime.
 active_managers:
   - naive
 
-# Named reward manager definitions (keyed by name).
-# Each entry defines a complete reward manager configuration.
-# Scripts override individual fields via: reward.managers.<name>.<field>=<value>
+# Scripts may override `reward.managers.<name>.<field>` in these named configurations.
 managers:
   dapo:
     reward_manager:
@@ -86,7 +82,7 @@ managers:
     rollout_nnodes_per_instance: 1
   
     model:
-      path: ${oc.env:PSRL_WORKSPACE,.}/models/Qwen3-8B
+      path: ${oc.env:PSRL_WORKSPACE,/tmp}/models/Qwen3-8B
       external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
       trust_remote_code: False
   
@@ -142,7 +138,7 @@ managers:
     rollout_nnodes_per_instance: 1
   
     model:
-      path: ${oc.env:PSRL_WORKSPACE,.}/models/Skywork-Reward-V2-Qwen3-8B
+      path: ${oc.env:PSRL_WORKSPACE,/tmp}/models/Skywork-Reward-V2-Qwen3-8B
       external_lib: ${oc.select:train_actor_rollout_ref.model.external_lib,null}
       trust_remote_code: False
   

@@ -106,7 +106,7 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         Drop leaked git metadata before the harness starts.
 
         Baked task images are already clean, so the probe normally returns
-        immediately; only unbaked images pay for the fallback purge. A host
+        immediately. Only unbaked images pay for the fallback purge. A host
         bind-mounted repository is skipped because purging would mutate the
         host checkout.
         """
@@ -198,10 +198,10 @@ class MiniSWEHarnessAgentLoop(HarnessAgentLoop):
         grading_started = time.perf_counter()
         observation = task.state.payload["observation"]
         swe_problem = observation.get("swe_problem", {}) or {}
-        # The final-patch re-check runs independently of the trajectory scan so a
-        # trajectory violation never hides a protected-path edit in the patch.
-        # Only fresh-container tasks enforce the patch policy; toy tasks must not
-        # gain a new test/config-file penalty.
+        # The final-patch re-check runs independently of the trajectory scan, so a trajectory violation
+        # never hides a protected-path edit in the patch.
+        #
+        # Only fresh-container tasks enforce the patch policy, toy tasks gain no new test/config-file penalty.
         patch_policy: dict = {}
         if artifact.patch and observation.get("swe_grader") == "swebench_fresh_container":
             patch_policy = analyze_patch_policy(artifact.patch, swe_problem)

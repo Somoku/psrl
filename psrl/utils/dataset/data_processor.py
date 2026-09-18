@@ -33,8 +33,8 @@ class DatasetType:
     test: str = "test"
 
 
-# NOTE(lhy): ray.remote must be declared here
-# otherwise their will be weird bugs (NCCL broadcast/all-gather hangs, randomly crashed) during vllm generation
+# NOTE(lhy): Keep `ray.remote` here to avoid NCCL hangs and intermittent crashes
+# during vLLM generation.
 @ray.remote
 class DataProcessor:
     def __init__(
@@ -66,8 +66,6 @@ class DataProcessor:
         self.processor = processor
         self.train_dataloader_iters = None
         self.val_dataloader_iters = None
-        # train_datasets_ratios is set here for multi-dataset mode;
-        # in legacy mode it will be overridden to [1.0] in build_train_and_val_dataset().
         if self.config.data.get("use_multi_dataset", True):
             self.train_datasets_ratios = self.config.data.train_datasets_ratios
         else:
@@ -90,13 +88,11 @@ class DataProcessor:
             self.rollout_n = self.config.gen_actor_rollout_ref.rollout.n
             self.alg_rollout_n = self.rollout_n
         assert self.rollout_n >= self.alg_rollout_n, (
-            f"Rollout n {self.rollout_n} must be greater than or equal to alg_rollout_n {self.alg_rollout_n}."
+            f"Rollout n={self.rollout_n} must be greater than or equal to alg_rollout_n={self.alg_rollout_n}."
         )
         self.val_rollout_n = self.config.train_actor_rollout_ref.rollout.val_kwargs.n
 
-        # Use conservative bounds: divide available space by 2 for train and eval each
-        # This ensures: MAX_TRAIN_ID * rollout_n < sys.maxsize // 2
-        # MAX_VAL_ID * val_rollout_n < sys.maxsize // 2
+        # Reserve disjoint train and validation ID ranges without overflowing `sys.maxsize`.
         self.MAX_TRAIN_ID = sys.maxsize // (2 * self.rollout_n)
         self.MAX_VAL_ID = sys.maxsize // (2 * self.val_rollout_n)
 
@@ -105,10 +101,7 @@ class DataProcessor:
         self.stop_data_process = False
         self.dataloader_lock = threading.Lock()
 
-        # Partial dataloader batch left over from a previous
-        # `sample_train_prompts` call. Successive small retries amortise into
-        # one underlying dataloader fetch by draining `retry_buffer` first
-        # before pulling a fresh batch via `get_train_next`.
+        # Preserve partial batches so retries do not consume extra dataloader entries.
         self.retry_buffer: dict | None = None
 
         # Build logger
@@ -138,7 +131,7 @@ class DataProcessor:
                 raise ValueError("use_multi_dataset=False requires 'train_files' to be set in data config.")
             if self.config.data.get("train_datas"):
                 psrl_logger.warning(
-                    "use_multi_dataset=False but 'train_datas' is set in data config — it will be ignored."
+                    "use_multi_dataset=False but 'train_datas' is set in data config. It will be ignored."
                 )
 
     def set_reward_manager(self, reward_manager_handle: ray.actor.ActorHandle):
@@ -162,19 +155,18 @@ class DataProcessor:
 
         Behavior depends on ``config.data.use_multi_dataset``:
 
-        * ``True`` (default): uses PSRL multi-dataset path.  Each entry in
+        * ``True`` (default): uses the PSRL multi-dataset path. Each entry in
           ``config.data.train_datas`` / ``config.data.val_datas`` is turned into
-          a separate ``RLHFDataset``; oversampling is applied so that all datasets
+          a separate ``RLHFDataset``. Oversampling ensures that all datasets
           contribute the same number of batches per epoch.
 
         * ``False``: falls back to the veRL-native single-dataset path.
-          ``config.data.train_files`` / ``config.data.val_files`` are used; no
+          ``config.data.train_files`` / ``config.data.val_files`` are used. No
           oversampling is performed, and ``train_datasets_ratios`` is forced to
           ``[1.0]`` so that the rest of the dataloader pipeline sees a
           single-element list transparently.
         """
         if self.config.data.get("use_multi_dataset", True):
-            # ── Multi-dataset path (PSRL) ──────────────────────────────────────
             self.train_datasets = create_multi_rl_datasets(
                 [self.with_rollout_tool_paths(data_config) for data_config in self.config.data.train_datas],
                 self.tokenizer,
@@ -203,10 +195,7 @@ class DataProcessor:
                 self.processor,
             )
         else:
-            # ── Legacy path (veRL-compatible) ──────────────────────────────────
-            # Single dataset wrapped in a list so the rest of the pipeline
-            # (build_train_dataloader, _concat_and_shuffle_batch_dicts, etc.)
-            # works transparently without any further changes.
+            # Keep downstream dataloader operations list-based.
             self.train_datasets = [
                 create_rl_dataset(
                     data_paths=self.config.data.train_files,
@@ -225,7 +214,6 @@ class DataProcessor:
                     max_samples=self.config.data.get("val_max_samples", -1),
                 )
             ]
-            # Force single-element ratio so build_train_dataloader works unchanged.
             self.train_datasets_ratios = [1.0]
 
     def build_train_sampler(self) -> None:
@@ -471,7 +459,7 @@ class DataProcessor:
                 data = next(dataloader_iter)
                 return data
             except StopIteration:
-                psrl_logger.info(f"Validation dataloader {i} iterator exhausted.")
+                psrl_logger.info(f"Validation dataloader index={i} exhausted.")
                 # Reset the exhausted iterator and move to next dataloader
                 self.val_dataloader_iters[i] = iter(self.val_dataloaders[i])
                 self._val_dataloader_idx = (self._val_dataloader_idx + 1) % num_dataloaders
@@ -589,7 +577,6 @@ class DataProcessor:
             keys = [str(uid) for uid in sample_ids]
             tags = [{"uid": sample_id} for sample_id in sample_ids]
 
-        # add `parent_id` tag
         if rollout_n > 1:
             for i in range(batch_size):
                 for j in range(rollout_n):
@@ -616,25 +603,35 @@ class DataProcessor:
         Returns:
             TensorDict | None:
                 Ready-to-dispatch TensorDict, or `None` if the dataloader
-                was exhausted before any prompt could be sampled.
+                yielded no data even after starting a fresh epoch.
         """
         assert n_prompts > 0, f"n_prompts must be positive, got {n_prompts!r}."
         rollout_n = self.rollout_n
 
-        # drain leftover and fetch from dataloader
         chunks: list[dict] = []
         remaining = n_prompts
+        # `_get_train_next` re-raises `StopIteration` only after rebuilding its iterators, so a
+        # second consecutive raise means the dataloader is exhausted and looping would spin.
+        rollover_used = False
         with self.dataloader_lock:
             while remaining > 0:
                 if self.retry_buffer is None or self._retry_buffer_size() == 0:
                     try:
                         self.retry_buffer = self._get_train_next()
+                        rollover_used = False
                     except StopIteration:
-                        psrl_logger.warning(
-                            f"sample_train_prompts: dataloader exhausted after "
-                            f"{n_prompts - remaining} of {n_prompts} prompts."
+                        if rollover_used:
+                            psrl_logger.warning(
+                                f"sample_train_prompts: dataloader yields no data across an epoch restart, "
+                                f"sampled={n_prompts - remaining}, requested={n_prompts}."
+                            )
+                            break
+                        rollover_used = True
+                        psrl_logger.info(
+                            f"sample_train_prompts: epoch boundary reached with sampled={n_prompts - remaining}, "
+                            f"requested={n_prompts}. Starting the next epoch."
                         )
-                        break
+                        continue
 
                 leftover_size = self._retry_buffer_size()
                 take = min(remaining, leftover_size)
@@ -650,7 +647,6 @@ class DataProcessor:
 
         actual_n_prompts = n_prompts - remaining
 
-        # Merge chunks
         batch_dict = chunks[0] if len(chunks) == 1 else self._concat_dict_chunks(chunks)
         sample_ids = self.get_train_sample_ids(actual_n_prompts)
 
@@ -673,7 +669,7 @@ class DataProcessor:
         ray.get(self.ps_manager_handle.add_request.remote(request_ids))
 
         psrl_logger.debug(
-            f"sample_train_prompts: produced {actual_n_prompts} prompts ({len(request_ids)} children) for retry."
+            f"sample_train_prompts: produced prompts={actual_n_prompts}, child requests={len(request_ids)} for retry."
         )
         return batch
 
@@ -822,18 +818,12 @@ class DataProcessor:
         # loop until all epochs are processed
         while not self.stop_data_process:
             try:
-                # AGENT(VERL): this process is mapped to the data loading and processing logic in
-                # `fit(...)` in `verl/trainer/ppo/ray_trainer.py`, you can find it by searching for
-                # `batch: DataProto = DataProto.from_single_dict(batch_dict)` in that file.
-
                 batch_meta: dict = self.get_single_controller_batch(DatasetType.train, return_meta=False)
                 batch = batch_meta
                 batch_size = len(batch) // self.rollout_n
 
-                # Register all requests with PSManager and dispatch the entire batch
-                # to the agent-loop manager in a single call for maximal dispatch
-                # throughput and rollout batching efficiency.
-                psrl_logger.debug(f"Generating {batch_size} prompts x rollout_n={self.rollout_n} children")
+                # Register the complete batch before one dispatch to preserve batching efficiency.
+                psrl_logger.debug(f"Generating prompts={batch_size}, rollout_n={self.rollout_n} children.")
                 if isinstance(batch, KVBatchMeta):
                     all_request_ids = [tag["uid"] for tag in batch.tags]
                 else:
@@ -857,6 +847,5 @@ class DataProcessor:
             except Exception as e:
                 psrl_logger.error(f"Exception in data processing thread: {e}", exc_info=True)
 
-        # Signal end of data processing
         psrl_logger.info("Data processing stopped, sending shutdown signal.")
         self.agent_loop_manager_handle.put_data.remote(None)

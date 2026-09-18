@@ -39,7 +39,7 @@ async def collect_git_patch(
     the workdir (e.g. ``test_repo/`` used to reproduce a DVC bug): a nested repo
     without a checked-out commit makes ``git add -A`` fail with
     ``error: 'test_repo/' does not have a commit checked out``. This collector
-    never stages anything; it emits ``git diff --cached`` (index vs base/HEAD)
+    never stages anything. It emits ``git diff --cached`` (index vs base/HEAD)
     plus ``git diff`` (worktree vs index) for tracked changes, then adds
     untracked files as ``new file`` diffs while excluding nested repositories.
     """

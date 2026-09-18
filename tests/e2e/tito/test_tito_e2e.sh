@@ -1,24 +1,6 @@
 #!/usr/bin/env bash
-# =============================================================================
-# E2E Test: TITO Session Training Data Pipeline
-#
-# Full data path: vLLM (gRPC) → SMG (TITO pipeline) → SessionRouter → test
-#
-# Tests:
-# 1. Session lifecycle (create/get/delete) via SMG
-# 2. Chat completion with logprobs through full TITO pipeline
-# 3. accumulated_token_ids + per-turn records from SMG GET endpoint
-# 4. Training-data construction (trailing trim, loss mask, logprobs)
-#
-# Prerequisites:
-#   - source env/psrl.sh
-#   - SMG installed: cd third_party/smg/bindings/python && pip install -e .
-#   - Model downloaded
-#
-# Usage:
-#   bash tests/e2e/tito/test_tito_e2e.sh [model_path]
-#   HOST_IP=127.0.0.1 bash tests/e2e/tito/test_tito_e2e.sh
-# =============================================================================
+# Exercise TITO training data construction across vLLM, SMG, and `SessionRouter`. Prerequisites are `env/psrl.sh`, the SMG bindings, and a downloaded model.
+# Usage: bash tests/e2e/tito/test_tito_e2e.sh [model_path] or HOST_IP=127.0.0.1 bash tests/e2e/tito/test_tito_e2e.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,9 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ---------------------------------------------------------------------------
-# Step 1: Launch vLLM gRPC server
-# ---------------------------------------------------------------------------
+# --- Step 1: Launch vLLM gRPC Server ---
 echo ">>> [Step 1/4] Launching vLLM gRPC server on ${HOST_IP}:${VLLM_GRPC_PORT} ..."
 python -m vllm.entrypoints.grpc_server \
     --model "$MODEL_PATH" \
@@ -87,9 +67,7 @@ grpc.channel_ready_future(channel).result(timeout=1)
     sleep 1
 done
 
-# ---------------------------------------------------------------------------
-# Step 2: Launch SMG with TITO, then register the vLLM worker
-# ---------------------------------------------------------------------------
+# --- Step 2: Launch SMG and Register vLLM ---
 echo ">>> [Step 2/4] Launching SMG router on ${HOST_IP}:${SMG_PORT} ..."
 python -c "
 from smg.launch_router import launch_router
@@ -127,8 +105,8 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# Register the vLLM gRPC worker with SMG
-# Note: gRPC worker URL must NOT have http:// prefix
+# Register the vLLM gRPC worker with SMG.
+# NOTE(lhy): The worker URL must omit the `http://` prefix.
 echo "    Registering vLLM worker with SMG..."
 REGISTER_HTTP_CODE=$(curl -s -o "$LOG_DIR/register_resp.json" -w "%{http_code}" \
     -X POST "http://${HOST_IP}:${SMG_PORT}/workers" \
@@ -147,7 +125,6 @@ if [ "$REGISTER_HTTP_CODE" -ge 400 ]; then
 fi
 echo "    ✓ Worker registered (HTTP $REGISTER_HTTP_CODE)"
 
-# Wait for worker to become healthy and servable
 echo "    Waiting for SMG to serve chat completions..."
 SMG_MODEL=""
 for i in $(seq 1 60); do
@@ -165,7 +142,6 @@ for i in $(seq 1 60); do
     sleep 1
 done
 
-# Verify end-to-end with a test request
 for i in $(seq 1 30); do
     RESP=$(curl -sf -X POST "http://${HOST_IP}:${SMG_PORT}/v1/chat/completions" \
         -H "Content-Type: application/json" \
@@ -182,9 +158,7 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# ---------------------------------------------------------------------------
-# Step 3: Launch SessionRouter
-# ---------------------------------------------------------------------------
+# --- Step 3: Launch SessionRouter ---
 echo ">>> [Step 3/4] Launching SessionRouter on ${HOST_IP}:${SESSION_ROUTER_PORT} ..."
 python -c "
 import uvicorn
@@ -210,9 +184,7 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# ---------------------------------------------------------------------------
-# Step 4: Run verification
-# ---------------------------------------------------------------------------
+# --- Step 4: Run Verification ---
 echo ""
 echo ">>> [Step 4/4] Running verification tests..."
 echo ""

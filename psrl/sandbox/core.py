@@ -40,7 +40,7 @@ class SandboxSourceKind(str, Enum):
 class SnapshotKind(str, Enum):
     """State included in a snapshot."""
 
-    # Filesystem contents only; running process and memory state are excluded.
+    # Filesystem contents only. Running process and memory state are excluded.
     FILESYSTEM = "filesystem"
     # Filesystem, running processes, and memory state when supported by the backend.
     FULL_STATE = "full_state"

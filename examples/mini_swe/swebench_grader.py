@@ -36,9 +36,7 @@ from psrl.sandbox import ExecResult, SandboxSpec, SnapshotRef, SyncSandboxManage
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+# --- Constants ---
 
 _DEFAULT_CONTAINER_TIMEOUT = "30m"
 _DEFAULT_EVAL_TIMEOUT = 900  # seconds
@@ -64,9 +62,7 @@ _PROXY_ENV_KEYS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Patch policy analysis  (mirrors OpenClaw-RL _analyze_patch_policy)
-# ---------------------------------------------------------------------------
+# --- Patch policy ---
 
 
 def _changed_files_from_patch(patch_text: str) -> list[str]:
@@ -124,9 +120,8 @@ def _is_config_like_path(path: str) -> bool:
     }
 
 
-# Files whose modification can change the installed dependency set or the build
-# backend. A patch touching any of them must keep the eval script's editable
-# re-install, because only that propagates the new metadata.
+# Files whose modification can change the installed dependency set or build backend. A patch
+# touching one must keep the eval script's editable re-install, which propagates new metadata.
 _PACKAGING_FILE_NAMES = frozenset(
     {
         "pyproject.toml",
@@ -204,7 +199,7 @@ def analyze_patch_policy(
     - ``SWE_STRICT_NO_CONFIG_PATCH=1``: disallow changes to config files.
     - ``SWE_TEST_PATCH_POLICY_SCOPE=eval_tests_only``: when enforcing the
       test-file rule, only flag files that appear in the FAIL_TO_PASS /
-      PASS_TO_PASS lists.  Set to ``all_tests`` to flag any test-like path.
+      PASS_TO_PASS lists. Set to ``all_tests`` to flag any test-like path.
 
     Args:
         patch_text (str): Unified diff produced by the agent.
@@ -248,9 +243,7 @@ def analyze_patch_policy(
     }
 
 
-# ---------------------------------------------------------------------------
-# Grader failure shaping
-# ---------------------------------------------------------------------------
+# --- Grader failure shaping ---
 
 
 def _grader_failure(swe_problem: dict[str, Any], error: str) -> dict[str, Any]:
@@ -274,15 +267,13 @@ def _grader_failure(swe_problem: dict[str, Any], error: str) -> dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Standalone (no PSRL sandbox manager) adapter
-# ---------------------------------------------------------------------------
+# --- Standalone adapter ---
 
 
 class _DockerGradingSession:
     """Adapt ``minisweagent``'s DockerEnvironment to the grading session API.
 
-    Only the standalone evaluation CLI takes this path; training always supplies
+    Only the standalone evaluation CLI takes this path, and training always supplies
     a PSRL ``SyncSandboxManager``. File transfers use base64 so the tiny payload
     survives shell quoting.
     """
@@ -321,9 +312,7 @@ class _DockerGradingSession:
         self._environment.cleanup()
 
 
-# ---------------------------------------------------------------------------
-# Main grader entry point
-# ---------------------------------------------------------------------------
+# --- Main grader entry point ---
 
 
 def grade_fresh_container(
@@ -342,7 +331,7 @@ def grade_fresh_container(
     """
     Grade a model patch in a fresh sandbox.
 
-    1. Runs ``analyze_patch_policy`` — returns immediately if violated.
+    1. Runs ``analyze_patch_policy`` and returns immediately if it is violated.
     2. Builds the :class:`GradingPlan` from the prepared row (host-independent).
     3. Spawns a fresh sandbox from the per-problem image.
     4. For SWE-smith, runs ``git checkout HEAD~1`` to restore F2P test files.
@@ -360,13 +349,13 @@ def grade_fresh_container(
         sandbox: Generic synchronous PSRL sandbox manager used by training.
         sandbox_spec: Backend-neutral grading sandbox request used by training.
         sandbox_snapshot: Compatible clean baseline restored by stateful backends.
-        grading_plan: Pre-built plan; when omitted it is derived from
+        grading_plan: Pre-built plan. When omitted it is derived from
             ``swe_problem`` (``eval_script`` + ``log_parser``).
 
     Returns:
         dict[str, Any]: Grading result. Infrastructure failures add
-        ``failure_reason`` / ``parser_error`` diagnostics; reward semantics are
-        unchanged (callers keep their existing ``reward_mode`` handling).
+        ``failure_reason`` / ``parser_error`` diagnostics, and reward semantics
+        are unchanged (callers keep their existing ``reward_mode`` handling).
     """
     swe_problem_id: str = swe_problem.get("instance_id", "unknown")
     log_prefix = f"[swebench_grader, task_id={swe_task_id or swe_problem_id}]"
@@ -423,7 +412,7 @@ def grade_fresh_container(
         return result
     if plan is None:
         psrl_logger.error(
-            f"{log_prefix} No eval_script on the prepared row; re-run the dataset preparation step for this split."
+            f"{log_prefix} No eval_script on the prepared row. Re-run the dataset preparation step for this split."
         )
         result = _grader_failure(swe_problem, "missing_eval_script")
         result["failure_reason"] = "missing_eval_script"
@@ -491,9 +480,7 @@ def grade_fresh_container(
                 raise RuntimeError(f"Could not restore SWE-smith baseline: {out.stdout[:200]!r}.")
 
         # --- 4. Reset tree and apply model patch ---
-        # Diff extraction is relative to the dataset baseline so agent-created
-        # commits remain part of the patch. Reset the disposable grader to that
-        # same baseline before applying it.
+        # Reset to the dataset baseline so agent-created commits stay part of the patch.
         base_commit = str(swe_problem.get("base_commit") or "")
         reset_target = shlex.quote(base_commit) if base_commit else "HEAD"
         out = execute(f"git reset --hard {reset_target} && git clean -fd", cwd="/testbed")
@@ -518,9 +505,7 @@ def grade_fresh_container(
                         raise RuntimeError(f"Could not restore grading tests: {out3.stdout[:200]!r}.")
 
             # --- 6. Run + grade inside the sandbox ---
-            # The frozen eval scripts re-run `pip install -e .`, which only
-            # rebuilds the image's existing editable wheel. Skip it unless the
-            # patch changed what that install would produce.
+            # Skip the eval script's editable re-install unless the patch changed that wheel.
             skip_editable_install = not _patch_needs_editable_install(model_patch)
             psrl_logger.info(f"{log_prefix} Running eval script (timeout={timeout}s)...")
             verdict = run_grading(
@@ -554,9 +539,8 @@ def grade_fresh_container(
                 sandbox_session.close()
             except Exception as cleanup_exc:
                 psrl_logger.warning(f"{log_prefix} Sandbox cleanup failed: {cleanup_exc}.")
-        # Synchronous belt-and-suspenders sweep by label for the standalone path:
-        # ``docker_env.cleanup`` has been observed to silently succeed without
-        # actually killing the container.
+        # Synchronous belt-and-suspenders sweep by label for the standalone path, since
+        # ``docker_env.cleanup`` has been observed to silently succeed without killing anything.
         if not uses_psrl_sandbox:
             try:
                 from psrl.sandbox.utils.docker_utils import force_remove_containers_by_label

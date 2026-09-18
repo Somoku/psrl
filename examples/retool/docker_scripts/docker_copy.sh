@@ -1,22 +1,7 @@
 #!/bin/bash
 # set -v
 
-# Copy a shared-fs docker image tar to all cluster nodes and docker load.
-#
-# Required env vars:
-#   DOCKER_NODE_IPS   — comma-separated list of ip:gpu_count pairs (e.g. 192.168.1.1:8,192.168.1.2:8)
-#   DOCKER_IMAGE_DIR  — source directory containing the tar file
-#   DOCKER_IMAGE_FILE — tar filename (basename)
-#
-# Optional env vars:
-#   DOCKER_NODE_NUM      — limit to first N nodes (default: all)
-#   DOCKER_IMAGE_TAG — if set, retag the loaded image to this repo:tag on every node
-#
-# Example:
-#   DOCKER_NODE_IPS=192.168.1.1:8,192.168.1.2:8 DOCKER_NODE_NUM=8 \
-#     DOCKER_IMAGE_DIR=/path/to/dir DOCKER_IMAGE_FILE=my.tar \
-#     DOCKER_IMAGE_TAG=code_sandbox:server \
-#     ./docker_copy.sh
+# Copy the configured shared image archive to every Docker node.
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=docker_common.sh
@@ -39,11 +24,7 @@ echo "=== Copying tar to all nodes in parallel ==="
 pssh -t 3600 -H "$hosts_str" -i "cp $DOCKER_IMAGE_DIR/$DOCKER_IMAGE_FILE /tmp/"
 
 echo "=== Loading docker image on all nodes in parallel ==="
-# Remote script: load tar, extract the image ref from docker load output, retag, cleanup.
-# docker load prints either:
-#   "Loaded image: repo:tag"         — tagged image
-#   "Loaded image ID: sha256:abc..."  — untagged / <none>:<none>
-# We use that to retag without needing the caller to know the original tag.
+# Detect the loaded image reference before applying an optional target tag.
 REMOTE_CMD='
 set -e
 TAR=/tmp/'"$DOCKER_IMAGE_FILE"'

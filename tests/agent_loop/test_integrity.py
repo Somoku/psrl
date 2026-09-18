@@ -33,9 +33,7 @@ def _lines(*events: dict) -> bytes:
     return "\n".join(json.dumps(event) for event in events).encode()
 
 
-# ---------------------------------------------------------------------------
-# Format dispatch: Claude Code stream-json
-# ---------------------------------------------------------------------------
+# --- Format dispatch: Claude Code stream-json ---
 
 
 def test_claude_code_wrapper_matches_format_dispatch() -> None:
@@ -47,9 +45,7 @@ def test_claude_code_wrapper_matches_format_dispatch() -> None:
     assert scan_claude_code_integrity(log, _REPO)["violated"] is True
 
 
-# ---------------------------------------------------------------------------
-# Format dispatch: Codex JSONL
-# ---------------------------------------------------------------------------
+# --- Format dispatch: Codex JSONL ---
 
 
 def test_codex_command_execution_repo_clone_is_violation() -> None:
@@ -113,9 +109,7 @@ def test_codex_clean_trajectory_is_not_violation() -> None:
     assert result["scannable"] is True
 
 
-# ---------------------------------------------------------------------------
-# Unscannable handling: warn, never a violation
-# ---------------------------------------------------------------------------
+# --- Unscannable handling: warn, never a violation ---
 
 
 def test_declared_format_zero_parsed_lines_not_violation() -> None:
@@ -140,9 +134,7 @@ def test_empty_stdout_not_violation() -> None:
     assert result["scannable"] is False
 
 
-# ---------------------------------------------------------------------------
-# HarnessConfig trajectory format
-# ---------------------------------------------------------------------------
+# --- HarnessConfig trajectory format ---
 
 
 def test_trajectory_format_auto_resolves_by_kind() -> None:
@@ -183,12 +175,10 @@ def test_codex_build_command_includes_json_without_shifting_prefix() -> None:
     assert "--json" in command
 
 
-# ---------------------------------------------------------------------------
-# Two-layer enforcement
+# --- Two-layer enforcement ---
 #
 # Import the loop package lazily and skip cleanly when the environment cannot
 # provide its heavier dependencies.
-# ---------------------------------------------------------------------------
 
 
 def _import_loop_module():
@@ -203,7 +193,7 @@ def _import_loop_module():
 try:
     _LOOP, _ARTIFACT = _import_loop_module()
     _LOOP_IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - environment dependent
+except Exception as exc:  # pragma: no cover (environment dependent)
     _LOOP, _ARTIFACT, _LOOP_IMPORT_ERROR = None, None, exc
 
 requires_loop = pytest.mark.skipif(_LOOP is None, reason=f"mini-SWE loop import unavailable: {_LOOP_IMPORT_ERROR}")

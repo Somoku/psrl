@@ -6,29 +6,10 @@ from psrl.utils.kv_cache.types import KVCacheBackend
 @dataclass
 class LMCacheConfig:
     """
-    PSRL-level configuration for LMCache KV cache offloading.
+    Configure LMCache KV cache offloading for PSRL.
 
-    Read from `psrl.lmcache` in the Hydra YAML and translated into vLLM
-    engine arguments at `PSRL_vLLMRollout` init time.
-
-    Configuration pathway
-    ---------------------
-    Two mechanisms feed settings into LMCache:
-
-    1. **vLLM engine kwargs** (`to_engine_kwargs()`):
-       `kv_offloading_backend` and `kv_offloading_size` are consumed by vLLM's
-       `VllmConfig._update_kv_transfer_from_offloading()`, which:
-       - Sets `kv_transfer_config.kv_connector = "LMCacheConnectorV1"`
-       - Computes `max_local_cpu_size = kv_offloading_size / num_kv_ranks` and
-         injects it via `kv_connector_extra_config["lmcache.max_local_cpu_size"]`
-       This ensures each TP rank gets the correct per-rank budget.
-       Do NOT set `LMCACHE_MAX_LOCAL_CPU_SIZE` via env var — it would apply the
-       total budget to every rank instead of the per-rank share.
-
-    2. **LMCache environment variables** (`to_env_vars()`):
-       All `LMCACHE_*` env vars are read by LMCache's config system before the
-       vLLM extra config is applied. The extra config has higher priority and will
-       override any conflicting env var values.
+    vLLM divides `offload_size_gb` across KV ranks before passing each rank's
+    budget to LMCache.
     """
 
     # --- Core ---
@@ -39,9 +20,7 @@ class LMCacheConfig:
     # Offloading backend: "cpu", "disk", or "remote".
     backend: str = "cpu"
 
-    # Total KV cache offloading buffer size in GiB (summed across all TP ranks).
-    # vLLM divides this by the number of KV ranks (TP × PP) to obtain the
-    # per-rank budget passed to LMCache as max_local_cpu_size / max_local_disk_size.
+    # Total offload budget in GiB. vLLM divides it across KV ranks.
     offload_size_gb: float = 10.0
 
     # LMCache token chunk size (in tokens) for hash-based KV indexing.
@@ -55,18 +34,12 @@ class LMCacheConfig:
     # Whether to clear the LMCache KV cache on model weight updates from PS.
     clear_on_weight_update: bool = True
 
-    # Whether to allow multiple model versions to coexist in the KV cache.
-    # When True, each stored entry is tagged with the model version that generated
-    # it, so version-N requests can never hit version-M KV entries (hash mismatch
-    # is structural). Requires clear_on_weight_update=False to retain old entries.
-    # Old-version entries are evicted naturally by LRU as new-version requests
-    # fill the cache.
+    # Retain version tagged entries for natural LRU eviction.
+    # This requires `clear_on_weight_update=False`.
     multi_version_kv: bool = False
 
     # --- CPU backend ---
-
-    # GiB of CPU memory to reserve and never use for KV offloading.
-    # Useful when other processes compete for pinned CPU memory.
+    # GiB of CPU memory to reserve from KV offloading when other processes compete for pinned memory.
     reserve_local_cpu_size: float = 0.0
 
     # --- Disk backend ---
@@ -87,8 +60,7 @@ class LMCacheConfig:
     # Enable LMCache P2P backend + Controller for cross-instance KV transfer.
     enable_p2p: bool = False
 
-    # Per-instance identifier passed to LMCache (must be unique per vLLM instance
-    # in the cluster).  Set at runtime by KVCacheManager.set_instance_id().
+    # Unique LMCache identifier assigned by `KVCacheManager.set_instance_id`.
     lmcache_instance_id: str = "psrl_instance_0"
 
     # Transport channel for P2P transfer: "nixl" (RDMA/IB) or "tcp".
@@ -98,11 +70,7 @@ class LMCacheConfig:
     # `find_available_port()` picks the actual port at runtime.
     controller_base_port: int = 9000
 
-    # Seconds RolloutCoordinator waits for the Controller HTTP API to become
-    # healthy before failing init. The controller imports torch+vLLM at startup
-    # (~30-40s standalone) and runs on the busy ps_manager node, so under cluster
-    # contention it can exceed the old hard-coded 90s budget. Read by
-    # RolloutCoordinator._start_lmcache_controller(); not exported as an env var.
+    # Controller startup timeout in seconds for contended manager nodes.
     controller_health_timeout_s: int = 300
 
     # Host where the LMCache Controller runs (defaults to ps_manager_ip).
@@ -113,14 +81,10 @@ class LMCacheConfig:
     controller_pull_port: int = 8300
     controller_reply_port: int = 8400
 
-    # The IP address of the worker node itself (for P2P listen).
-    # Other workers connect to this address to push KV data.
-    # Set at runtime by vllm_rollout.py using get_host_info().
+    # Worker address advertised for P2P pushes during rollout initialization.
     worker_host: str = ""
 
-    # Number of LMCache KV workers per instance (equals TP size for non-MLA models).
-    # Used to generate per-worker ZMQ ports for Controller communication.
-    # Set at runtime by vllm_rollout.py from config.tensor_model_parallel_size.
+    # KV workers per instance, assigned from tensor parallelism during rollout initialization.
     num_kv_workers: int = 1
 
     # Runtime-allocated ports (set by vllm_rollout.py via PortScanner to avoid conflicts).
@@ -131,16 +95,12 @@ class LMCacheConfig:
 
     # --- GPU pin budget ---
 
-    # Maximum number of GPU KV blocks that PSRL may hold pinned simultaneously.
-    # When this limit is exceeded, the oldest-pinned trajectory is unpinned
-    # (PSRL-side LRU). 0 means no limit.
+    # Maximum simultaneously pinned GPU KV blocks. Zero disables the limit.
     gpu_pin_block_budget: int = 0
 
     # --- Cache behaviour ---
 
-    # Whether to also cache KV entries produced during the decode phase.
-    # Disabled by default — enabling increases memory usage but can benefit
-    # multi-turn scenarios where the same decode prefix is reused.
+    # Cache decode outputs when repeated prefixes justify the extra memory.
     save_decode_cache: bool = False
 
     # Whether to persist a chunk even when it is not yet fully filled.
@@ -151,15 +111,10 @@ class LMCacheConfig:
     # Supported values: "LRU" (least-recently-used) or "FIFO".
     cache_policy: str = "LRU"
 
-    # Whether to retrieve KV cache entries asynchronously (overlapped with
-    # prefill computation).  Can reduce effective TTFT for cache-hit requests.
+    # Retrieve cache entries asynchronously while prefill runs.
     enable_async_loading: bool = False
 
-    # Whether LMCache publishes its own store events into vLLM's KV event
-    # stream, so the SMG router can index the off-GPU tier and score
-    # `lmcache_overlap_weight` against it.  Derived at runtime by
-    # `_build_kv_cache_manager()` from the routing config: without this the
-    # router's LMCache tier stays empty and that weight is silently a no-op.
+    # Publish store events so routing can score the off GPU cache tier.
     enable_kv_events: bool = False
 
     def get_backend_enum(self) -> KVCacheBackend:
@@ -190,16 +145,8 @@ class LMCacheConfig:
         """
         Translate this config into environment variables for LMCache.
 
-        Must be called before vLLM engine initialization so that LMCache reads
-        these via `LMCACHE_*` env vars during its config bootstrap.
-
-        Note on max_local_cpu_size / max_local_disk_size
-        -------------------------------------------------
-        These are intentionally NOT set here.  vLLM's
-        `VllmConfig._update_kv_transfer_from_offloading()` computes the correct
-        *per-rank* value from `kv_offloading_size / num_kv_ranks` and injects it
-        via `kv_connector_extra_config` (higher priority than env vars).  Setting
-        the env var would apply the full budget to every rank, overcounting memory.
+        vLLM supplies the per rank cache size separately through its higher priority
+        extra config.
 
         Returns:
             dict[str, str]: Env var name to value pairs.
@@ -215,7 +162,7 @@ class LMCacheConfig:
         # Chunk size (env var is read before vLLM extra config kicks in).
         env_vars["LMCACHE_CHUNK_SIZE"] = str(self.chunk_size)
 
-        # Full config file override — takes precedence over all other env vars.
+        # The full config file takes precedence over other environment variables.
         if self.config_file:
             env_vars["LMCACHE_CONFIG_FILE"] = self.config_file
 
@@ -247,15 +194,12 @@ class LMCacheConfig:
         if self.enable_kv_events:
             env_vars["LMCACHE_ENABLE_KV_EVENTS"] = "True"
 
-        # P2P / Controller configuration.
-        # When enable_p2p is True, tell the LMCache engine to register with the
-        # shared Controller so that cross-instance /move commands are routable.
+        # Register P2P workers with the shared controller for explicit transfers.
         if self.enable_p2p:
             env_vars["LMCACHE_ENABLE_CONTROLLER"] = "True"
             env_vars["LMCACHE_LMCACHE_INSTANCE_ID"] = self.lmcache_instance_id
-            # Disable automatic P2P retrieval during prefill. We only want
-            # explicit moves via transfer_direct(). Automatic P2P GET races
-            # with concurrent moves and causes double-free in memory management.
+            # Restrict retrieval to explicit moves because automatic P2P reads race
+            # with concurrent moves.
             env_vars["LMCACHE_RETRIEVE_LOCATIONS"] = "LocalCPUBackend"
             # Controller ZMQ endpoints (host:port).
             controller_host = self.controller_host or "127.0.0.1"

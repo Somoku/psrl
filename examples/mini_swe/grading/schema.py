@@ -83,10 +83,11 @@ class GradingPlan:
         if not isinstance(eval_script, str) or not eval_script.strip():
             return None
         eval_type = problem.get("eval_type") or EvalType.PASS_AND_FAIL.value
-        # Verified rows ship the repo-specific parser name; SWE-smith rows get a
-        # flattened name at prepare time; SWE-Gym rows carry neither and are all
-        # pytest-based, so default to the pytest parser rather than the
-        # repo-keyed map (which would pick an unrelated repo parser).
+        # Verified rows ship the repo-specific parser name, SWE-smith rows get a
+        # flattened name at prepare time.
+        #
+        # SWE-Gym rows carry neither and are all pytest-based, so default to the
+        # pytest parser rather than the repo-keyed map, which would pick an unrelated parser.
         from .parsers import DEFAULT_PARSER
 
         parser_name = str(problem.get("log_parser") or "").strip() or DEFAULT_PARSER
@@ -106,15 +107,15 @@ class GradingPlan:
         Return the eval script, optionally skipping a redundant editable install.
 
         The frozen eval scripts re-run `python -m pip install -e .` before the
-        tests. When the image already has the checkout installed editable — the
-        normal SWE-bench/SWE-Gym case — that command only rebuilds the same
+        tests. When the image already has the checkout installed editable (the
+        normal SWE-bench/SWE-Gym case), that command only rebuilds the same
         editable wheel (measured ~20s on a small repo, minutes on large ones),
         so it is replaced by a probe-guarded no-op. The caller keeps the install
         for patches that touch packaging metadata by passing
         `skip_editable_install=False`.
 
-        Only whole-line `python -m pip install -e .` commands are rewritten;
-        anything that also installs dependencies is left verbatim.
+        Only whole-line `python -m pip install -e .` commands are rewritten.
+        Anything that also installs dependencies is left verbatim.
         """
         from .editable import render_eval_script
 

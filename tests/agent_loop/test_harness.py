@@ -233,7 +233,7 @@ def test_claude_code_applies_turn_bound_and_leaves_output_limit_config_gated() -
 
     assert "--max-turns 12" in " ".join(command)
     # `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is config-gated: when unset, Claude Code's
-    # default applies; only an explicit `max_output_tokens` writes the env var.
+    # default applies. Only an explicit `max_output_tokens` writes the env var.
     assert "CLAUDE_CODE_MAX_OUTPUT_TOKENS" not in harness.build_env(runtime)
     assert configured.build_env(runtime)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "8192"
 
@@ -310,7 +310,7 @@ async def test_prepare_fails_clearly_when_runtime_tree_is_missing() -> None:
     with pytest.raises(RuntimeError, match="unavailable in the sandbox"):
         await create_harness(config, sandbox).prepare(_runtime())
 
-    # The explicit probe is the only setup command; there is no install path.
+    # The explicit probe is the only setup command. There is no install path.
     assert all("npm" not in command for command, _, _ in sandbox.commands)
 
 

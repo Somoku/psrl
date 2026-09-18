@@ -81,7 +81,7 @@ def _resolve_harness_sandbox_image(configured_image: str) -> str:
     ``psrl/swebench-harness:<sha12(base)>``. The derivative purges leaked git
     metadata, so a sandbox that starts from it already passes the runtime
     git-leak probe. When the derivative is absent we fall back to the original
-    image + the runtime git sanitization — correct, just slower. A missing bake
+    image plus the runtime git sanitization, which is correct but slower. A missing bake
     must never block the run.
 
     The tag keys on the base image alone, so changing the bake steps does not
@@ -160,10 +160,8 @@ def build_sandbox_spec(
 
     sandbox_config = payload["runtime_config"]["sandbox_config"]
     selected_template = template or (container_config.get("template") if image is None else None)
-    # Prefer the per-image baked derivative (git-purged, see
-    # prepare/docker_scripts/bake_harness_image.sh); falls back to the configured
-    # image when not baked. The grader keeps its explicit problem image
-    # (``image`` is non-None there).
+    # Prefer the per-image baked derivative (git-purged, see bake_harness_image.sh),
+    # falling back to the configured image. The grader keeps its explicit problem image.
     resolved_image = image or _resolve_harness_sandbox_image(str(container_config["image"]))
     source = (
         SandboxSource.template(str(selected_template)) if selected_template else SandboxSource.image(resolved_image)
@@ -336,9 +334,8 @@ def grade_patch(
     try:
         from examples.mini_swe.swebench_grader import grade_fresh_container
 
-        # ``grader_kind`` only selects the SWE-smith pre/post steps (HEAD~1
-        # restore and test-file revert); grading itself is driven entirely by the
-        # frozen eval script + vendored parser.
+        # ``grader_kind`` only selects the SWE-smith pre/post steps. Grading itself is
+        # driven entirely by the frozen eval script and the vendored parser.
         grader_kind = "smith" if observation.get("swe_restore_tests", False) else "verified"
         grader_config = resolve_container_config(payload, grading=True)
         grader_spec = grader_spec or build_grader_spec(payload)
@@ -374,7 +371,7 @@ def run_agent(
     """Run one task through mini-SWE-agent's standard Python bindings."""
     from minisweagent.agents.default import DefaultAgent
     from minisweagent.models import get_model
-    from psrl.utils.rollout.overflow import PromptOverflowError, ensure_overflow_handling
+    from psrl.utils.agent.overflow import PromptOverflowError, ensure_overflow_handling
 
     _silence_litellm()
 
@@ -410,9 +407,8 @@ def run_agent(
     grader_spec = None
     agent = None
     run_start = time.perf_counter()
-    # `timing` is mutated in the finally block, and every return dict below holds a
-    # reference to this same object, so assistant/env/elapsed are captured on ALL
-    # paths -- including PromptOverflowError / other exceptions raised mid-run.
+    # `timing` is mutated by the finally block and shared by every return dict, so
+    # all paths capture elapsed values, including mid-run exceptions.
     timing: dict[str, float] = {"prep_s": 0.0, "assistant_s": 0.0, "env_s": 0.0, "grading_s": 0.0, "elapsed_s": 0.0}
     resource_metrics_captured = False
     try:
@@ -433,7 +429,7 @@ def run_agent(
                 baseline_snapshot = harness.session.snapshot(state_policy=rollout_spec.state_policy)
             except Exception:
                 psrl_logger.warning(
-                    "Could not create a safe MiniSWE verifier snapshot; recreating the rollout sandbox.",
+                    "Could not create a safe MiniSWE verifier snapshot. Recreating the rollout sandbox.",
                     exc_info=True,
                 )
                 harness.cleanup()
@@ -474,10 +470,7 @@ def run_agent(
             "timing": timing,
         }
     except PromptOverflowError as exc:
-        # The turn prompt exceeded the engine context window. Turns generated
-        # before the overflow are valid; the loop recovers them from the TITO
-        # session and treats this as a normal max-length termination instead of
-        # a fatal rollout error.
+        # Preserve turns generated before context overflow and terminate normally.
         psrl_logger.warning("mini-SWE-agent stopped on context overflow: %s.", exc)
         return {
             "exit_status": "context_exceeded",
@@ -495,8 +488,7 @@ def run_agent(
             "timing": timing,
         }
     finally:
-        # Capture accumulated timing regardless of how we exit (success, overflow,
-        # or error). Runs before control leaves; the return dicts share `timing`.
+        # Shared return dictionaries receive final timing before control leaves.
         if agent is not None:
             timing["assistant_s"] = agent.assistant_s
             timing["env_s"] = agent.env_s

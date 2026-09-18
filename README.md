@@ -27,8 +27,9 @@ An Efficient Asynchronous RL Framework for LLM Post-Training
 
 ## 📰 News
 
-- **[2026/07/28]** 🎉 We open-source **PSRL**!
-- **[2026/06/13]** 🏆 **StaleFlow**, the paper introducing the PSRL system, is accepted to **SIGMOD 2027**! Check out the [paper](https://arxiv.org/abs/2601.12784).
+- **[2026/09/17]** 🔬 PSRL now powers the RL post-training of **[ScienceIDE](https://github.com/aitofound/ScienceIDE)** <a href="https://github.com/aitofound/ScienceIDE"><img src="https://img.shields.io/github/stars/aitofound/ScienceIDE?style=social" alt="ScienceIDE stars" valign="middle"></a>, a collection of **scientific codebase environments**. Check out the [technical report](https://arxiv.org/abs/2609.19134).
+- **[2026/07/28]** 🎉 We **open-source** PSRL.
+- **[2026/06/13]** 🏆 **StaleFlow**, the paper introducing the PSRL system, is accepted to **SIGMOD 2027**. Check out the [paper](https://arxiv.org/abs/2601.12784).
 - **[2026/06/10]** 🔬 We release **ForeMoE**, which uses foreseeable rollout expert-routing information to optimize MoE RL load balancing. Check out the [paper](https://arxiv.org/abs/2606.11867).
 
 ## ✨ Overview
@@ -131,6 +132,8 @@ Production-ready training recipes demonstrating PSRL's capabilities across diffe
 | [GRPO](https://psrl.readthedocs.io/en/latest/examples/rlvr/grpo.html) | Math / Reasoning | Verifiable | FSDP / Megatron | [`examples/grpo_trainer/`](examples/grpo_trainer/) | ✅ Ready |
 | [ReTool](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/retool/index.html) | Math + Code Interpreter | Verifiable | FSDP / Megatron | [`examples/retool/`](examples/retool/) | ✅ Ready |
 | [SWE-agent](https://psrl.readthedocs.io/en/latest/examples/agentic_rl/swe/index.html) | Software Engineering | Test execution (F2P/P2P) | FSDP / Megatron | [`examples/mini_swe/`](examples/mini_swe/) | ✅ Ready |
+| SciAccel-RL | Scientific Computing (LAPS / MITgcm / Athena++) | Numerical equivalence vs reference | FSDP | [`examples/sciaccel_rl/`](examples/sciaccel_rl/) | ✅ Ready |
+| MemAgent | Long-context QA | Exact-match answer | Megatron | [`examples/mem_agent/`](examples/mem_agent/) | ✅ Ready |
 | [LLM-as-a-Judge](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/llm_as_a_judge.html) | Open-ended | Judge LLM score | — | — | 🚧 TBD |
 | [On-Policy Distillation](https://psrl.readthedocs.io/en/latest/examples/generative_reward_model/on_policy_distillation.html) | Open-ended | Teacher token-level supervision | — | — | 🚧 TBD |
 
@@ -173,7 +176,7 @@ If you use PSRL in your research, please cite our paper:
 
 ```bibtex
 @article{li2026staleflow,
-  title={Unleashing Efficient Asynchronous RL Post-Training via Staleness-Constrained Rollout Coordination},
+  title={StaleFlow: Staleness-Aware Data Management for Mitigating Data Skewness in Fully Disaggregated RL Post-Training},
   author={Li, Haoyang and Lin, Sheng and Fu, Fangcheng and Zhou, Yuming and Ji, Xiaodong and Zhao, Yanfeng and Wang, Lefeng and Jiang, Jie and Cui, Bin},
   journal={arXiv preprint arXiv:2601.12784},
   year={2026}

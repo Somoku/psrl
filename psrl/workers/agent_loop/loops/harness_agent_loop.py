@@ -133,7 +133,7 @@ class HarnessAgentLoop(SessionAgentLoop):
 
         Runs after the clean snapshot and before the harness is created, so any
         sandbox mutation is not captured by the reusable clean snapshot. An
-        override may add its own float entries to ``timing``; the generic loop
+        override may add its own float entries to ``timing``. The generic loop
         records the total as ``sandbox_init_s``.
         """
         return None
@@ -165,7 +165,7 @@ class HarnessAgentLoop(SessionAgentLoop):
         if context_window > self.rollout_budget:
             psrl_logger.warning(
                 f"Harness context window ({context_window}) exceeds the trainable budget "
-                f"({self.rollout_budget}); a compaction branch may not fit. Keep "
+                f"({self.rollout_budget}). A compaction branch may not fit. Keep "
                 "rollout.max_model_len <= rollout.prompt_length + rollout.response_length."
             )
         self.compaction_budget = self.harness_config.compaction.resolve(context_window)
@@ -302,11 +302,11 @@ class HarnessAgentLoop(SessionAgentLoop):
             try:
                 outputs = [self._build_capped_output(item) for item in training_data]
             except Exception:
-                # The raw TITO trajectory is still valuable when the training
-                # budget cannot represent it (for example, when the harness
-                # system/tool prompt is already larger than prompt+response).
-                # The normal AgentLoopBase dump is unreachable in this case
-                # because run_with_termination_handling receives no output.
+                # The raw TITO trajectory is still valuable when the training budget cannot represent it,
+                # for example when the harness system/tool prompt already exceeds prompt+response.
+                #
+                # AgentLoopBase's normal dump is unreachable here, because run_with_termination_handling
+                # receives no output.
                 await self._dump_harness_training_data(
                     request,
                     training_data,
@@ -335,7 +335,7 @@ class HarnessAgentLoop(SessionAgentLoop):
     ) -> SnapshotRef | None:
         caps = lease.session.capabilities
         # The sandbox has not been prepared yet. Docker already shares the
-        # original image layers; committing here adds I/O without caching setup.
+        # original image layers. Committing here adds I/O without caching setup.
         if not caps.supports(SandboxFeature.FULL_STATE_SNAPSHOT):
             return None
         kind = SnapshotKind.FULL_STATE
@@ -351,7 +351,7 @@ class HarnessAgentLoop(SessionAgentLoop):
             )
         except Exception:
             psrl_logger.warning(
-                "Could not create a safe clean-sandbox snapshot; task finalization will provision a fresh sandbox.",
+                "Could not create a safe clean-sandbox snapshot. Task finalization will provision a fresh sandbox.",
                 exc_info=True,
             )
             return None
@@ -491,10 +491,11 @@ class HarnessAgentLoop(SessionAgentLoop):
 
     def _build_capped_output(self, training_data: dict) -> TokenOutput:
         output = self.build_token_output(training_data)
-        # Budget the trainable trajectory against the rollout packing budget
-        # (prompt_length + response_length), not the CLI compaction trigger.
-        # A TITO compaction branch legitimately carries the whole pre-compaction
-        # context as its prompt, which can be far larger than the initial prompt.
+        # Budget the trainable trajectory against the rollout packing budget (prompt_length + response_length),
+        # not the CLI compaction trigger.
+        #
+        # A TITO compaction branch legitimately carries the whole pre-compaction context as its prompt,
+        # which can be far larger than the initial prompt.
         remaining_response_tokens = self.rollout_budget - len(output.prompt_ids)
         if remaining_response_tokens <= 0:
             raise RuntimeError(

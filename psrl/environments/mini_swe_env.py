@@ -4,7 +4,7 @@ mini-SWE-agent Environment for PSRL.
 This environment adapts the mini-SWE-agent integration to PSRL's `Environment`
 interface. It handles:
 - `reset()`: Parse task metadata and build per-instance config.
-- `close()`: Close episode-local state; sandbox leases own runtime cleanup.
+- `close()`: Close episode-local state, since sandbox leases own runtime cleanup.
 
 It does NOT use `step()` because mini-swe-agent manages its own tool execution
 loop internally via `DefaultAgent.run()`.
@@ -78,8 +78,11 @@ class MiniSWEEnvironment(Environment[dict, None]):
         """
         self.task = task
 
-        # Extract extra_info if available (may be absent when the data pipeline
-        # does not copy it to gen_batch — the reward_manager holds the original).
+        # Log available keys for debugging data pipeline issues.
+        task_keys = list(task.keys()) if isinstance(task, dict) else []
+        psrl_logger.debug(f"MiniSWEEnvironment reset: task keys={task_keys}.")
+
+        # The reward manager retains `extra_info` if the data pipeline omits it.
         extra_info_raw = task.get("extra_info", {}) if isinstance(task, dict) else {}
         if isinstance(extra_info_raw, str):
             try:
@@ -110,10 +113,7 @@ class MiniSWEEnvironment(Environment[dict, None]):
         base_config = self._base_runtime_config or build_runtime_config({})
         self._runtime_config = apply_data_overrides(base_config, extra_info)
 
-        # Generate a fresh UUID for this rollout episode.
-        # swe_task_id is always new per episode so that concurrent rollouts on
-        # the same swe_problem_id (n_resp_per_prompt > 1) each get a distinct
-        # Docker label and cannot accidentally clean up each other's containers.
+        # A fresh ID prevents concurrent rollouts for one `swe_problem_id` from sharing Docker cleanup labels.
         task_uuid = f"{uuid.uuid4().hex[:12]}-{int(time.time())}"
         self._swe_task_id = task_uuid
         if swe_problem_id:
@@ -127,10 +127,7 @@ class MiniSWEEnvironment(Environment[dict, None]):
         if not use_preexisting_repo and not repo_path:
             use_preexisting_repo = True
 
-        # Grader fields: forwarded to the agent loop for post-rollout
-        # fresh-container evaluation.  Empty string means no grading.
-        # Support both current field names (swe_grader, swe_problem, ...) and
-        # legacy field names (grader, instance, image_name) from old parquets.
+        # Prepared datasets may use either supported grader field schema.
         swe_grader = str(extra_info.get("swe_grader", "") or extra_info.get("grader", "") or "")
         swe_problem = extra_info.get("swe_problem", None) or extra_info.get("instance", None) or {}
         swe_problem_image = str(extra_info.get("swe_problem_image", "") or extra_info.get("image_name", "") or "")

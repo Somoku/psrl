@@ -9,9 +9,8 @@ from omegaconf import OmegaConf
 
 pytestmark = pytest.mark.cpu_test
 
-# `RewardModelGateway` is decorated with `@ray.remote`. Reload the module with a
-# pass-through decorator so it is a plain class for CPU tests, then restore the
-# real `ray.remote`; the module may already have been imported with the real one.
+# `RewardModelGateway` is decorated with `@ray.remote`. Reload the module with a pass-through
+# decorator so it is a plain class for CPU tests, then restore the real `ray.remote`.
 _ray_remote = ray.remote
 ray.remote = lambda cls=None, **kwargs: (cls if cls is not None else lambda c: c)
 try:

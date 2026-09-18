@@ -15,25 +15,18 @@ from verl.utils.fsdp_utils import get_fsdp_wrap_policy
 
 def get_model_sharding(fsdp_model: FSDP) -> dict[str, dict]:
     """
-    Returns a dict mapping each original parameter FQN to its sharding info:
-      {
-        "shard_dim": int,
-        "shard_mesh": int,
-        "shard_offsets": tuple[int, ...],
-        "shard_lengths": tuple[int, ...],
-      }
+    Print the local sharded state dictionary on rank zero.
+
+    Args:
+        fsdp_model (FSDP): Model whose sharding metadata is inspected.
     """
-    # 1) Tell FSDP to give us a sharded state‐dict
     with FSDP.state_dict_type(
         fsdp_model,
         state_dict_type=StateDictType.SHARDED_STATE_DICT,
     ):
         sharded_sd = fsdp_model.state_dict()
 
-    # 2) Each value in the sharded state‐dict is a ShardedTensor;
-    #    we grab its single local_shard and read its metadata.
     for name, stensor in sharded_sd.items():
-        # stensor.local_shards is a list of length 1 on each rank
         if dist.get_rank() == 0:
             print(name, stensor)
 
@@ -53,7 +46,7 @@ def print_model_param_stats(model: torch.nn.Module, description: str):
     gpu_params = 0
     other_params = 0
 
-    print(f"\n[Rank {rank}] —— {description} ——")
+    print(f"\n[Rank {rank}] {description}")
     for name, param in model.named_parameters():
         numel = param.numel()
         total_params += numel
@@ -67,12 +60,12 @@ def print_model_param_stats(model: torch.nn.Module, description: str):
         else:
             other_params += numel
 
-    print(f"  • 总参数量（logical）: {total_params:,d}")
-    print(f"  • meta tensor 上参数: {meta_params:,d}")
-    print(f"  • cpu device 上参数: {cpu_params:,d}")
-    print(f"  • cuda device 上参数: {gpu_params:,d}")
+    print(f"  • Total parameters (logical): {total_params:,d}")
+    print(f"  • Meta tensor parameters: {meta_params:,d}")
+    print(f"  • CPU parameters: {cpu_params:,d}")
+    print(f"  • CUDA parameters: {gpu_params:,d}")
     if other_params > 0:
-        print(f"  • 其他 device 上参数: {other_params:,d}")
+        print(f"  • Other device parameters: {other_params:,d}")
     # print(model)
 
 
@@ -82,8 +75,7 @@ def auto_wrap(module, recurse, nonwrapped_numel):
 
 
 def load_and_shard_model():
-    """加载并分片模型"""
-    # 创建FSDP包裹的模型
+    """Load the model and wrap it with FSDP."""
     model = AutoModel.from_pretrained("Qwen/Qwen3-0.6B")
     model = FSDP(
         model,
@@ -94,7 +86,7 @@ def load_and_shard_model():
         sync_module_states=False,
         device_mesh=init_device_mesh("cuda", mesh_shape=(2,)),
     )
-    print_model_param_stats(model, "FSDP初始化后")
+    print_model_param_stats(model, "After FSDP initialization")
     get_model_sharding(model)
     return model
 
@@ -104,13 +96,11 @@ if __name__ == "__main__":
 
     setup()
 
-    # 加载并分片模型
     model = load_and_shard_model()
 
-    # 训练代码（此处省略）
+    # Training step omitted.
     # train(model, ...)
 
-    # 保存聚合后的模型
     rank = dist.get_rank()
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(True, True)):
         full_state_dict = model.state_dict()

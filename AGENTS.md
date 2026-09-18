@@ -2,16 +2,29 @@
 
 ## ALWAYS
 
-- Apply first-principles thinking. Do not assume that I always have a clear understanding of what I want or how to achieve it. Stay cautious and start from the fundamental needs and problem. If the motivation or objective is unclear, pause and discuss it with me. If the objective is clear but the path is not optimal, point that out and suggest a better approach. When you are reading my code, if you identify a better design, you could interrupt the current task to consider refactoring. Discuss the refactoring with me before proceeding.
+- Apply first-principles thinking. Do not assume that I always have a clear understanding of what I want or how to achieve it. Stay cautious and start from the fundamental needs and problem. If the motivation or objective is unclear, pause and discuss it with me. 
+- When running scripts or inspecting the environment, please activate the conda environment by executing `source /apdcephfs_zwfy10/share_303541817/lhy/env/psrl.sh`. All dependencies and packages are installed within this environment.
+- Make architectural decisions for the long term. Do not accept a stopgap that only works for now and is meant to be replaced later.
+- Do not preserve backward compatibility. Remove obsolete paths instead of adding compatibility layers, fallbacks, or migrations.
+- Keep components modular and concerns clearly separated.
+- Prefer established, well-maintained libraries when they reduce overall complexity or improve reliability. Do not reimplement common functionality without a clear reason.
 
 ## Coding Guidelines
 
-Two reference files live under `.claude/`:
+Three reference files live under `.claude/`:
 
 - **`.claude/coding-style.md`** — formatting rules, naming conventions, docstrings, logging, and annotation markers. Ordered by risk (silent-bug rules first).
 - **`.claude/codebase-map.md`** — system architecture, directory tree, configuration hierarchy, quick-lookup indices, and import dependency graphs.
+- **`.claude/readme-style.md`** — what belongs in a README and what does not. Read it before writing or editing any user-facing `.md`.
 
 Claude must read and apply these guides when writing or modifying code.
+
+## Documentation
+
+- A README tells a reader what to do and what will bite them. It is not the lab notebook that proves how we learned it.
+- Do not paste measured forensics into documentation. Keep a number only if the reader acts on it, and drop the run-specific evidence that merely justifies a past decision. Experiment results belong in a `Results` section or a `FINDINGS.md`, tied to the script that reproduces them.
+- Never write history into documentation or comments. `git log` owns what the code used to be.
+- Everything here is published. No absolute paths, real hostnames, cluster IPs, or internal mirrors, and every command must run exactly as written.
 
 ## Compact Instructions
 

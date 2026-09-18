@@ -521,9 +521,8 @@ class SandboxManager:
             ]
         leases = list(self._leases)
         results = await asyncio.gather(*(lease.release() for lease in leases), return_exceptions=True)
-        # A create may be waiting for capacity held by an existing lease. Free
-        # those leases before joining creates, then reclaim anything that was
-        # admitted while shutdown was in progress.
+        # A create may wait for capacity held by an existing lease. Free those leases before
+        # joining creates, then reclaim anything admitted while shutdown was in progress.
         create_results = await asyncio.gather(*create_tasks, return_exceptions=True)
         new_leases = self._leases.difference(leases)
         results.extend(await asyncio.gather(*(lease.release() for lease in new_leases), return_exceptions=True))

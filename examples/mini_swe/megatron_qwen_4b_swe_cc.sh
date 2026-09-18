@@ -7,7 +7,7 @@ experiment_name=GRPO-Qwen-4B-swe_smith-megatron-staleness_${staleness}
 
 source ${PSRL_WORKSPACE}/env/env.sh
 
-# Read-only harness runtime trees (native Claude Code / Codex; no Node).
+# Read-only harness runtime trees (native Claude Code / Codex, no Node).
 # Build once with examples/mini_swe/prepare/docker_scripts/build_harness_runtimes.sh.
 export PSRL_HARNESS_RUNTIME_ROOT="/shared/psrl/harness-runtimes"
 
@@ -32,6 +32,7 @@ HF_MODEL_PATH=/apdcephfs_zwfy_303760348/share_303760348/ls/models/Qwen3.5-4B
 
 # --- Data ---
 # Train: SWE-smith-py 1 000-problem repo-balanced subset.
+#
 # Validation: SWE-bench Verified 80-problem repo-balanced subset.
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_293/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_293/val.parquet
@@ -58,9 +59,10 @@ default_local_dir=$CKPT_ROOT/checkpoint/$experiment_name
 agent_loop_config_path=${PSRL_PATH}/examples/mini_swe/config/swebench_harness_config.yaml
 
 # --- Cluster layout (32 GPUs total: 16 for rollout, 16 for train) ---
-# Rollout: TP=2 (4B is small, TP=2 is sufficient for inference)
-# Train: TP=4, PP=1 (4B fits easily without pipeline parallelism; DP=4)
-# Val: TP=2 (matches rollout engine, 8 instances)
+# Rollout: TP=2 (4B is small, TP=2 is sufficient for inference).
+#
+# Train: TP=4, PP=1 (4B fits easily without pipeline parallelism, DP=4).
+# Val: TP=2 (matches rollout engine, 8 instances).
 GEN_TP=1
 GEN_PP=1
 
@@ -86,6 +88,7 @@ VAL_NGPUS_PER_NODE_PER_INSTANCE=${VAL_TP}
 
 # --- Algorithm (GRPO / DAPO) ---
 # Aligned with OpenClaw swe-rl 4B defaults:
+#
 #   GRPO + DAPO asymmetric clip (0.2/0.28), KL effectively off, entropy=0.
 # Dynamic sampling filter: drops rollout groups with std=0 reward.
 enable_dynamic_sampling_filter=False
@@ -98,11 +101,15 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths ---
+#
 # The harness protocol prompt (Claude Code system prompt + tool catalog + task)
-# is ~3.2k tokens, so the prompt budget must exceed 2048. TITO compaction
-# branches carry the whole pre-compaction context as their prompt (up to ~30k);
-# with packing_length=32000 (<= the 32768-token model window) those branches
-# still fit because the response is capped to budget - prompt.
+# is ~3.2k tokens, so the prompt budget must exceed 2048.
+#
+# TITO compaction branches carry the whole pre-compaction context as their
+# prompt (up to ~30k). With packing_length=32000 (<= the 32768-token model
+#
+# window) those branches still fit, because the response is capped to
+# budget minus prompt.
 max_turns=80
 val_max_turns=160
 max_prompt_length=32768

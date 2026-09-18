@@ -1,7 +1,6 @@
 #!/bin/bash
 # Integration test: vLLM weight conversion via SupportsWeightLayoutSpec (new API).
-# Tests TP=1, TP=2, and spec consistency check.
-# Requires: GPU node with psrl environment, model checkpoint at PSRL_WORKSPACE.
+# Covers TP=1, TP=2, and spec consistency on a GPU node with a PSRL checkpoint.
 #
 # Usage:
 #   PSRL_WORKSPACE=/path/to/workspace bash tests/state_dict/scripts/test_vllm_converter_new_api.sh

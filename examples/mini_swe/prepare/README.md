@@ -50,7 +50,7 @@ the ready-to-run Claude Code launch script is
 | `docker_scripts/probe_mirrors.sh` | Quickly check which public Docker Hub mirrors can serve a given image (uses `skopeo inspect`, no download) |
 | `docker_scripts/load_all_nodes.sh` | `pssh` fan-out: on every host listed in a file, `docker load` every `*.tar` in a shared-FS image dir, with per-node parallelism and skip-if-already-loaded |
 | `docker_scripts/migrate_docker_overlay2.sh` | Move the Docker data-root / `overlay2` store onto a larger disk before loading a big image set |
-| `_prefetch_logs/` | One log file per image (kept by `prefetch_images.sh`) — header `Already have` when cached, or a full per-mirror/per-attempt log when pulled |
+| `_prefetch_logs/` | One log file per image (kept by `prefetch_images.sh`) — header `Already cached` when cached, or a full per-mirror/per-attempt log when pulled |
 | `_load_logs/<timestamp>/` | `pssh` per-host stdout / stderr from `load_all_nodes.sh` |
 
 ---
@@ -278,7 +278,7 @@ What each flag does:
   `rm -f`'d before every retry, after every failed mirror, on SIGINT/SIGTERM
   (via `trap`), and again in the "all mirrors failed" branch.
 - Every image gets a log file in `_prefetch_logs/`:
-  - **Cached**: header `Already have <image>` + verification timestamp.
+  - **Cached**: header `Already cached <image>` + verification timestamp.
   - **Pulled**: per-mirror, per-attempt output (`----- attempt N/M -----`).
   - **Failed**: final attempt's fatal error + note pointing at `.log` /
     `.log.load`.

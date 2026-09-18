@@ -11,7 +11,7 @@ def sync_master_params_from_model(engine) -> None:
     from verl.utils.megatron_utils import load_megatron_optimizer, offload_megatron_optimizer
 
     assert engine.optimizer is not None, (
-        "sync_master_params_from_model requires a built optimizer; "
+        "sync_master_params_from_model requires a built optimizer. "
         "engine.optimizer is None (forward_only or not yet initialized?)"
     )
     if engine._is_offload_optimizer:

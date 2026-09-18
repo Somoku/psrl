@@ -1,17 +1,7 @@
-"""Detect vLLM prompt-overflow 400 errors and convert them to a terminal exception.
+"""Convert vLLM prompt-overflow HTTP 400 errors into terminal exceptions.
 
-litellm wraps vLLM's "prompt is too long" 400 as a generic ``BadRequestError``
-because the wording differs from what litellm expects (``"is longer than the
-model's context length"`` vs vLLM's ``"is longer than the maximum model length
-of"``). Without intervention, the ``tenacity`` retry loop in
-``minisweagent.models.LitellmModel.query`` retries indefinitely until the
-episode times out.
-
-This module provides:
-
-- ``PromptOverflowError`` — a terminal exception that aborts the retry loop.
-- ``ensure_overflow_handling(model)`` — instance-level patch (idempotent).
-- ``handle_prompt_overflow(cls)`` — class decorator equivalent.
+Litellm does not recognize vLLM's wording, so unclassified errors would retry
+until the episode times out.
 """
 
 from __future__ import annotations
@@ -29,8 +19,13 @@ _VLLM_OVERFLOW_MARKERS = (
 )
 
 
-def _is_vllm_overflow(exc: Exception) -> bool:
-    """Return whether *exc* is a vLLM context-window overflow (HTTP 400)."""
+def is_prompt_overflow(exc: Exception) -> bool:
+    """Return whether *exc* is a vLLM context-window overflow (HTTP 400).
+
+    Harbor's ``LiteLLMModel._is_context_length_error`` and litellm's own
+    ``ExceptionCheckers`` both miss vLLM's wording, so agent loops that drive
+    Harbor must classify the raw ``BadRequestError`` themselves.
+    """
     message = str(exc).lower()
     return any(marker in message for marker in _VLLM_OVERFLOW_MARKERS)
 
@@ -54,7 +49,7 @@ def ensure_overflow_handling(model: _T) -> _T:
         except PromptOverflowError:
             raise
         except Exception as exc:
-            if _is_vllm_overflow(exc):
+            if is_prompt_overflow(exc):
                 raise PromptOverflowError(str(exc)) from exc
             raise
 
@@ -85,7 +80,7 @@ def handle_prompt_overflow(cls):
         except PromptOverflowError:
             raise
         except Exception as exc:
-            if _is_vllm_overflow(exc):
+            if is_prompt_overflow(exc):
                 raise PromptOverflowError(str(exc)) from exc
             raise
 

@@ -161,7 +161,7 @@ class VllmQwen3MoeParameterMapping(ParameterMapping):
         return mapping
 
     def get_model_info(self):
-        # NOTE(zym): qwen3_moe directly provides head_dim,
+        # NOTE(zym): Qwen3 MoE directly provides `head_dim`,
         # which isn't equal to hidden_size // num_attention_heads.
         # The default get_model_info already handles head_dim via getattr fallback.
         info = super().get_model_info()

@@ -6,16 +6,9 @@ from psrl.workers.gen.vllm_async_server import GenInterface, PSRL_vLLMReplica
 
 class RewardModelReplica(PSRL_vLLMReplica):
     """
-    Replica for reward-model / pooling-model inference in gen.
+    Serve frozen reward or pooling models without parameter-server synchronization.
 
-    Extends ``PSRL_vLLMReplica`` with two key differences:
-
-    1. **No PS sync** — reward models have frozen weights that are never updated by
-       the parameter server, so ``sync_with_ps`` and ``pull_model`` are no-ops.
-
-    2. **Pooling mode** — the rollout config for a reward model replica must set
-       ``runner: pooling`` so that ``PSRL_vLLMHttpServer`` dispatches requests to
-       ``_encode_internal()`` instead of the autoregressive generation path.
+    The rollout configuration must set `runner: pooling`.
     """
 
     def __init__(
@@ -46,7 +39,8 @@ class RewardModelReplica(PSRL_vLLMReplica):
             gpus_per_node (int): Number of GPUs per node for this replica.
             tag (str): Tag used in logging and actor naming.
         """
-        # NOTE(linsh): is_reward_model=True propagates to PSRL_vLLMHttpServer for stat labelling.
+        # NOTE(linsh): Setting `is_reward_model=True` propagates reward-model stat
+        # labelling to `PSRL_vLLMHttpServer`.
         super().__init__(
             replica_rank=replica_rank,
             local_replica_rank=local_replica_rank,

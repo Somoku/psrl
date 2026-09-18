@@ -63,7 +63,9 @@ def validate_parallel_config(cfg: DictConfig) -> None:
     gen_ep = cfg.test.gen.get("expert_parallel_size", 1)
     gen_dp = cfg.test.gen.get("data_parallel_size", None)
 
-    assert num_gen % (gen_tp * gen_pp) == 0, f"num_gen {num_gen} must be divisible by gen TP*PP {gen_tp * gen_pp}."
+    assert num_gen % (gen_tp * gen_pp) == 0, (
+        f"Gen TP*PP does not divide num_gen. num_gen={num_gen!r}, product={gen_tp * gen_pp!r}."
+    )
     computed_dp = num_gen // (gen_tp * gen_pp)
     if gen_dp is not None and gen_dp > 1:
         assert computed_dp == gen_dp, (
@@ -71,13 +73,13 @@ def validate_parallel_config(cfg: DictConfig) -> None:
             f"{computed_dp} (num_gen={num_gen}, TP={gen_tp}, PP={gen_pp})."
         )
     if gen_ep > 1:
-        assert gen_ep == gen_tp, f"vLLM EP currently follows TP in PSRL; got gen EP {gen_ep} and TP {gen_tp}."
+        assert gen_ep == gen_tp, f"vLLM EP must match TP in PSRL. EP={gen_ep!r}, TP={gen_tp!r}."
 
     if train_engine_type == "fsdp_hybrid":
         ddp_size = cfg.test.fsdp_hybrid.ddp_size
         fsdp_size = cfg.test.fsdp_hybrid.fsdp_size
         assert num_train % (ddp_size * fsdp_size) == 0, (
-            f"num_train {num_train} must be divisible by HSDP DDP*FSDP {ddp_size * fsdp_size}."
+            f"HSDP DDP*FSDP does not divide num_train. num_train={num_train!r}, product={ddp_size * fsdp_size!r}."
         )
     elif train_engine_type == "megatron":
         megatron = cfg.test.megatron
@@ -86,7 +88,7 @@ def validate_parallel_config(cfg: DictConfig) -> None:
         train_cp = megatron.get("context_parallel_size", 1)
         model_parallel_size = train_tp * train_pp * train_cp
         assert num_train % model_parallel_size == 0, (
-            f"num_train {num_train} must be divisible by Megatron TP*PP*CP {model_parallel_size}."
+            f"Megatron TP*PP*CP does not divide num_train. num_train={num_train!r}, product={model_parallel_size!r}."
         )
 
 
@@ -204,7 +206,7 @@ class TrainClientActor:
         fsdp_hybrid_config=None,
         megatron_config=None,
     ):
-        assert engine_type in ["fsdp", "fsdp_hybrid", "megatron"], f"engine {engine_type} is not supported"
+        assert engine_type in ["fsdp", "fsdp_hybrid", "megatron"], f"Unsupported engine type: {engine_type!r}."
         if rank == 0:
             train_master_ip = ray.util.get_node_ip_address()
             ray.get(global_store.set_train_master_ip.remote(train_master_ip))
@@ -230,7 +232,7 @@ class TrainClientActor:
         dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
 
-        # NOTE(lhy): must create client here before loading the model
+        # NOTE(lhy): Create the client before loading the model.
         if engine_type == "megatron":
             self._init_megatron_parallel(megatron_config)
         self.client = NIXLStorageClient(
@@ -268,7 +270,8 @@ class TrainClientActor:
                 ddp_size = fsdp_hybrid_config.get("ddp_size", 2)
                 fsdp_size = fsdp_hybrid_config.get("fsdp_size", 4)
                 assert world_size % (ddp_size * fsdp_size) == 0, (
-                    f"world_size {world_size} is not divisible by {ddp_size * fsdp_size}"
+                    f"DDP*FSDP does not divide world_size. world_size={world_size!r}, "
+                    f"product={ddp_size * fsdp_size!r}."
                 )
                 self.model = FSDP(
                     model,
@@ -368,10 +371,6 @@ class TrainClientActor:
             param.data.fill_(1)
 
         self.print(f"[Rank {self.rank}] Model initialized: {self.model}")
-        # self.print(f"[Rank {self.rank}] Model state_dict keys: "
-        #            f"{[submodel.state_dict().keys() for submodel in self.model]}")
-        # self.print(f"[Rank {self.rank}] Model named parameter keys: "
-        #            f"{[name for submodel in self.model for name, _ in submodel.named_parameters()]}")
 
     def init_finished(self):
         self.print(f"Train client init finished on ip {os.environ.get('LOCAL_IP')}")
@@ -436,14 +435,11 @@ class TrainClientActor:
                     # self.print(f"Pushing {key} to {ps_client_name}")
             # self.print(f"Waiting for {len(wait_operations)} push operations")
             for key, ps_client_name, shards_to_transfer in wait_operations:
-                # start_time = time.time()
                 try:
                     self.client.wait(key, "train_push", "WRITE", target_client=ps_client_name)
                 except Exception as e:
                     self.print(f"Wait failed for key {key} to {ps_client_name}. error: {e}")
                     raise e
-                # end_time = time.time()
-                # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
                 futures.append(
                     self.ps_for_push_worker_handles[ps_client_name].transfer_train_to_gen.remote(
                         key, shards_to_transfer
@@ -498,15 +494,15 @@ class GenClientActor:
         self.tp_rank = rank % self.tp_size
         self.instance_world_size = self.tp_size * self.pp_size
         assert world_size % (self.tp_size * self.pp_size) == 0, (
-            f"world_size {world_size} is not divisible by {self.tp_size * self.pp_size}"
+            f"TP*PP does not divide world_size. world_size={world_size!r}, product={self.tp_size * self.pp_size!r}."
         )
         # Use explicit data_parallel_size from config if provided, otherwise compute from world_size
         config_dp_size = gen_config.get("data_parallel_size", None)
         computed_dp_size = world_size // self.instance_world_size
         if config_dp_size is not None and config_dp_size > 1:
             assert computed_dp_size == config_dp_size, (
-                f"Computed dp_size {computed_dp_size} != config data_parallel_size {config_dp_size}. "
-                f"Ensure num_gen ({world_size}) == TP ({self.tp_size}) * PP ({self.pp_size}) * DP ({config_dp_size})."
+                f"Computed and configured data parallel sizes differ. computed={computed_dp_size!r}, "
+                f"configured={config_dp_size!r}, num_gen={world_size!r}, TP={self.tp_size!r}, PP={self.pp_size!r}."
             )
         self.dp_size = computed_dp_size
         self.model_config = model_config
@@ -522,7 +518,7 @@ class GenClientActor:
         os.environ["LOCAL_RANK"] = str(0)
         self.print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '')}")
 
-        # NOTE(lhy): must create client here before loading the model
+        # NOTE(lhy): Create the client before loading the model.
         self.client = NIXLStorageClient(
             client_name=self.client_name,
             server_name=server_name,
@@ -630,7 +626,6 @@ class GenClientActor:
         for key in self.state_dict_keys:
             for ps_agent_name, ps_client_name in zip(ps_agent_names, ps_client_names):
                 # self.print(f"pull {key} from {ps_client_name}")
-                # start_time = time.time()
                 shards_to_transfer = self.client.client_read(
                     ps_agent_name,
                     ps_client_name,
@@ -638,20 +633,11 @@ class GenClientActor:
                     "gen_pull",
                     merge_and_cache_xfer=False,
                 )
-                # end_time = time.time()
                 if len(shards_to_transfer) > 0:
-                    # self.print(f"Read launched for (key {key}, shards {shards_to_transfer}) from {ps_client_name}. "
-                    #            f"time: {end_time - start_time}s")
                     wait_operations.append((key, ps_client_name, shards_to_transfer))
         for key, ps_client_name, shards_to_transfer in wait_operations:
-            # start_time = time.time()
             self.client.wait(key, "gen_pull", "READ", target_client=ps_client_name)
-            # end_time = time.time()
-            # self.print(f"Wait completed for key {key} to {ps_client_name}. time: {end_time - start_time}s")
-        # start_time = time.time()
         self.client.merge_and_finish_cached_xfer()
-        # end_time = time.time()
-        # self.print(f"Finish cached xfer done. time: {end_time - start_time}s")
         total_end_time = time.time()
         # torch.cuda.synchronize()
         self.print(f"Total pull from ps done: {total_end_time - total_start_time}s")
@@ -721,13 +707,13 @@ def test_nixl_e2e(cfg: DictConfig):
     # Use the first num_train / NUM_GPU_PER_NODE nodes for train
     train_nnodes = math.ceil(num_train / NUM_GPU_PER_NODE)
     assert len(ray_nodes_sorted) >= train_nnodes, (
-        f"Need {train_nnodes} train node(s), but Ray has {len(ray_nodes_sorted)} node(s)."
+        f"Ray has too few train nodes. required={train_nnodes!r}, available={len(ray_nodes_sorted)!r}."
     )
     train_nodes = [ray_nodes_sorted[i] for i in range(train_nnodes)]
     # Use the last num_gen / NUM_GPU_PER_NODE nodes for gen
     gen_nnodes = math.ceil(num_gen / NUM_GPU_PER_NODE)
     assert len(ray_nodes_sorted) >= gen_nnodes, (
-        f"Need {gen_nnodes} gen node(s), but Ray has {len(ray_nodes_sorted)} node(s)."
+        f"Ray has too few generation nodes. required={gen_nnodes!r}, available={len(ray_nodes_sorted)!r}."
     )
     gen_nodes = [ray_nodes_sorted[-i - 1] for i in range(gen_nnodes)]
     # print(f"train_nodes: {train_nodes}, gen_nodes: {gen_nodes}")
@@ -753,7 +739,7 @@ def test_nixl_e2e(cfg: DictConfig):
     ip_to_node_id = {node["NodeManagerAddress"]: node["NodeID"] for node in ray.nodes()}
 
     # Create per-node PortScanner actors (required by NIXLStorageClient).
-    assert listen_ip in ip_to_node_id, f"listen_ip {listen_ip} not found in ray nodes"
+    assert listen_ip in ip_to_node_id, f"listen_ip is absent from Ray nodes: {listen_ip!r}."
     server = MetaServerActor.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=ip_to_node_id[listen_ip], soft=False)
     ).remote(server_name, psrl_config, num_train + num_gen + num_ps, log_dir)

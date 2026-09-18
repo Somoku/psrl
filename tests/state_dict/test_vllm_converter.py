@@ -36,7 +36,6 @@ def example_with_real_model():
     # for module_prefix, module in vllm_model.named_modules():
     # print(f"[rank{rank}] {module_prefix}: {module.__class__.__name__}, {module}")
 
-    # Get the model class
     model_class = type(vllm_model)
     print(f"[rank{rank}] model_class: {model_class}")
     print(f"[rank{rank}] vllm_model: {vllm_model}")
@@ -108,9 +107,9 @@ def test_new_api_no_parameter_mapping():
     assert any("q_proj" in n for n in param_names), "q_proj must appear after QKV decomposition"
     assert any("k_proj" in n for n in param_names), "k_proj must appear after QKV decomposition"
     assert any("v_proj" in n for n in param_names), "v_proj must appear after QKV decomposition"
-    assert not any("qkv_proj" in n for n in param_names), "qkv_proj must NOT appear — must be split into q/k/v"
+    assert not any("qkv_proj" in n for n in param_names), "qkv_proj must not appear after splitting into q/k/v."
     assert any("gate_proj" in n for n in param_names), "gate_proj must appear after gate_up split"
-    assert not any("gate_up_proj" in n for n in param_names), "gate_up_proj must NOT appear — must be split"
+    assert not any("gate_up_proj" in n for n in param_names), "gate_up_proj must not appear after splitting."
 
     print(f"[rank{rank}] PASS: {len(hf_state_dict)} parameters converted")
     for name in sorted(hf_state_dict.keys())[:5]:
@@ -148,7 +147,7 @@ def test_spec_consistency():
     state_dict_keys = set(vllm_model.state_dict().keys())
     for packed_suffix, hf_suffix, shard_id in spec.stacked_params:
         found = any(packed_suffix in k for k in state_dict_keys)
-        assert found, f"Spec entry '{packed_suffix}' not found in model state dict — spec may be stale"
+        assert found, f"The model state dict lacks spec entry {packed_suffix!r}. The spec may be stale."
 
     print(f"[rank{rank}] PASS: spec consistency verified, {len(spec.stacked_params)} stacked entries")
 

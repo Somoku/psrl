@@ -1,13 +1,10 @@
 """
-GenRewardManager — reward loop for generative / pooling reward models.
+Route generative and pooling reward requests through the SMG gateway.
 
-Routes inference requests to a smg gateway via aiohttp, dispatching to the
-correct endpoint based on (runner, task) from the reward model rollout config.
-
-Endpoint mapping (from third_party/smg/model_gateway/src/server.rs):
-  runner=generate, task=generate  → POST /v1/completions   → choices[0]["text"]
-  runner=pooling,  task=classify  → POST /v1/classify      → data[0]["embedding"][0]
-  runner=pooling,  task=embed*    → POST /v1/embeddings    → data[0]["embedding"]
+Endpoint mapping from `third_party/smg/model_gateway/src/server.rs`:
+`generate/generate` -> `POST /v1/completions` -> `choices[0]["text"]`
+`pooling/classify` -> `POST /v1/classify` -> `data[0]["embedding"][0]`
+`pooling/embed*` -> `POST /v1/embeddings` -> `data[0]["embedding"]`
 """
 
 import inspect
@@ -35,12 +32,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @register("gen")
 class GenRewardManager(RewardManagerBase):
-    """
-    Reward loop for generative or pooling reward models accessed via smg gateway.
-
-    Replaces the previous Ray-actor–based routing with aiohttp HTTP calls to the
-    smg gateway URL obtained from ``reward_model_manager.get_gateway_url()``.
-    """
+    """Access generative or pooling reward models through the SMG gateway."""
 
     def __init__(
         self,
@@ -61,7 +53,6 @@ class GenRewardManager(RewardManagerBase):
         self.reward_model_manager = reward_model_manager
         self.reward_model_tokenizer = reward_model_manager.get_reward_model_tokenizer()
 
-        # Resolve gateway URL and smg endpoint from rollout runner/task config.
         rm_cfg = getattr(reward_model_manager, "reward_model_config", None)
         runner = "generate"
         task = "generate"
@@ -91,13 +82,13 @@ class GenRewardManager(RewardManagerBase):
             self._smg_endpoint,
         )
 
-    # ── Endpoint dispatch ──────────────────────────────────────────────────
+    # --- Endpoint Dispatch ---
 
     def _resolve_endpoint_and_parser(self, runner: str, task: str) -> tuple[str, Callable]:
         """
         Map (runner, task) to the smg gateway endpoint and its response parser.
 
-        Reference: third_party/smg/model_gateway/src/server.rs
+        Reference: `third_party/smg/model_gateway/src/server.rs`.
         """
         if runner == "generate":
             return "/v1/completions", self._parse_completions_response
@@ -111,7 +102,7 @@ class GenRewardManager(RewardManagerBase):
             f"Supported: (generate, generate) | (pooling, classify) | (pooling, embed)"
         )
 
-    # ── Request payload builders ───────────────────────────────────────────
+    # --- Request Payload Builders ---
 
     def _build_request_payload(self, prompt_ids: list[int]) -> dict:
         """Build the smg-compatible JSON payload for the given token IDs."""
@@ -123,16 +114,15 @@ class GenRewardManager(RewardManagerBase):
                 "temperature": self._sampling_config.get("temperature", 1.0),
                 "top_p": float(top_p) if isinstance(top_p, (int, float)) and top_p > 0 else 1.0,
             }
-        # Pooling endpoints: both classify and embeddings use "input"
         return {"input": prompt_ids}
 
-    # ── Response parsers ───────────────────────────────────────────────────
+    # --- Response Parsers ---
 
     def _parse_completions_response(self, data: dict, request_uid: str) -> dict:
         """
-        Parse /v1/completions → rm_output_str.
+        Parse `/v1/completions` into `rm_output_str`.
 
-        Uses choices[0]["text"] (pre-decoded by smg/vLLM) directly; no re-decode needed.
+        The SMG response is already decoded.
         """
         choices = data.get("choices", [])
         if not choices:
@@ -148,10 +138,10 @@ class GenRewardManager(RewardManagerBase):
 
     def _parse_classify_response(self, data: dict, request_uid: str) -> dict:
         """
-        Parse /v1/classify → scalar reward score.
+        Parse `/v1/classify` into a scalar reward score.
 
         For a single-logit classifier, returns the scalar directly.
-        For multi-class output, returns the full list (compute_score interprets it).
+        For multi-class output, returns the full list for `compute_score`.
         """
         entries = data.get("data", [])
         if not entries:
@@ -166,10 +156,9 @@ class GenRewardManager(RewardManagerBase):
 
     def _parse_embeddings_response(self, data: dict, request_uid: str) -> dict:
         """
-        Parse /v1/embeddings → embedding vector.
+        Parse `/v1/embeddings` into an embedding vector.
 
-        The full vector is returned in rm_output_value; compute_score() is responsible
-        for converting it to a scalar reward.
+        Store the full vector in `rm_output_value`. `compute_score` converts it to a scalar reward.
         """
         entries = data.get("data", [])
         if not entries:
@@ -180,7 +169,7 @@ class GenRewardManager(RewardManagerBase):
             "reward_metrics": {},
         }
 
-    # ── HTTP query ─────────────────────────────────────────────────────────
+    # --- HTTP Query ---
 
     async def _query_reward_model(self, rm_data_proto: DataProto, request_uid: str) -> dict:
         """
@@ -222,20 +211,14 @@ class GenRewardManager(RewardManagerBase):
         )
         return result
 
-    # ── Main entry point ───────────────────────────────────────────────────
+    # --- Main Entry Point ---
 
     async def run_single(self, data: TensorDict) -> dict:
-        """
-        Process a single data item through the reward model.
-
-        Constructs the RM prompt, tokenizes it, sends it to the smg gateway,
-        parses the response, and computes the final reward score.
-        """
+        """Process one data item through the reward model."""
         assert len(data) == 1, "Only single data items supported in run_single"
         data_item = data[0]
         request_uid = self._format_request_uid(tu.get(data_item, "uid"))
 
-        # Decode prompt and agent response
         prompt_ids = data_item["prompts"]
         prompt_str = await self.loop.run_in_executor(
             None,
@@ -255,7 +238,6 @@ class GenRewardManager(RewardManagerBase):
         ground_truth = reward_model_info.get("ground_truth", "") if isinstance(reward_model_info, dict) else ""
         extra_info = self.merge_extra_info(data_item)
 
-        # Build RM prompt and tokenize
         rm_prompt = self.reward_function.prompt_constructor(prompt_str=prompt_str, response_str=response_str)
         using_sys_prompt = self.reward_function.using_sys_prompt
         rm_inputs = await self.loop.run_in_executor(
@@ -272,7 +254,6 @@ class GenRewardManager(RewardManagerBase):
         if isinstance(rm_inputs, torch.Tensor):
             rm_inputs = {"input_ids": rm_inputs}
 
-        # Measure RM input length
         rm_input_len = None
         input_ids_tensor = rm_inputs.get("input_ids")
         attn_mask = rm_inputs.get("attention_mask")
@@ -283,10 +264,8 @@ class GenRewardManager(RewardManagerBase):
                 input_ids_tensor[0].numel() if input_ids_tensor.dim() == 2 else input_ids_tensor.numel()
             )
 
-        # Build DataProto for HTTP query
         rm_data_proto = self._build_rm_data_proto(rm_inputs, request_uid)
 
-        # Query reward model via smg gateway
         rm_output_dict = await self._query_reward_model(rm_data_proto, request_uid)
         rm_output_str = rm_output_dict.get("rm_output_str", "")
         rm_output_value = rm_output_dict.get("rm_output_value")
@@ -294,7 +273,6 @@ class GenRewardManager(RewardManagerBase):
         if not isinstance(reward_metrics, dict):
             reward_metrics = {}
 
-        # Compute final reward score
         if self.is_async_reward_score:
             result = await self.reward_function.compute_score(
                 data_source=data_source,
@@ -338,7 +316,7 @@ class GenRewardManager(RewardManagerBase):
         psrl_logger.info("Reward computed uid=%s score=%.4f source=%s", request_uid, score, data_source)
         return {"reward_score": score, "reward_extra_info": reward_extra_info, "reward_metrics": reward_metrics}
 
-    # ── Helpers ────────────────────────────────────────────────────────────
+    # --- Helpers ---
 
     def _build_rm_data_proto(self, rm_inputs: dict, request_uid: str | None) -> DataProto:
         """Build a minimal DataProto for RM HTTP inference (raw token IDs only)."""

@@ -9,7 +9,7 @@ from psrl.workers.gen.utils import TokenInput
 class _ConcreteAgentLoop(AgentLoopBase):
     """Concrete subclass so `__new__` can skip `__init__` on the ABC."""
 
-    async def run(self, request):  # pragma: no cover - only instantiation is under test
+    async def run(self, request):  # pragma: no cover (only instantiation is under test)
         raise NotImplementedError
 
 

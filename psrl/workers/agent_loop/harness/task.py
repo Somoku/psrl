@@ -41,7 +41,7 @@ def clean_snapshot_compatible(task: HarnessTaskContext, kind: SnapshotKind | Non
     Mounts: docker commit does not capture host bind mounts, so the committed
     image can only seed the grader when the rollout carries no content-bearing
     mounts the grader relies on. The read-only harness runtime mount is
-    excluded — the grader never needs it.
+    excluded. The grader never needs it.
     """
     clean_spec = task.clean_sandbox_spec
     if not (task.sandbox_spec.state_policy.enabled and clean_spec is not None and clean_spec.state_policy.enabled):

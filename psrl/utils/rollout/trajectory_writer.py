@@ -14,7 +14,7 @@ class TrajectoryWriter:
     """
     Writes per-trajectory text files under `<output_dir>/v{version}/{traj_id}.txt`.
 
-    Shared by all agent loops.  Initialized once per loop instance from
+    Shared by all agent loops. Initialized once per loop instance from
     `config.psrl.agentic_rl.trajectory_output` via `from_config`.
     """
 

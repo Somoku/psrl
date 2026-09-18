@@ -64,7 +64,7 @@ class BinaryTreeBroadcastPlan(BroadcastPlan):
     """
     Static binary tree broadcast: parent(i) = (i-1)//2, children(i) = [2i+1, 2i+2].
 
-    Built from rank indices alone; no external metadata required. For N workers,
+    Built from rank indices alone, with no external metadata required. For N workers,
     the broadcast completes in ceil(log2(N)) rounds. For N=256, this is 8 rounds.
     """
 
@@ -77,7 +77,6 @@ class BinaryTreeBroadcastPlan(BroadcastPlan):
         """
         assert world_size >= 1, f"world_size must be >= 1, got {world_size}."
         self._world_size = world_size
-        # Precompute senders per round for efficiency.
         self._senders_per_round: list[list[int]] = self._precompute_senders()
 
     def _precompute_senders(self) -> list[list[int]]:
@@ -87,15 +86,12 @@ class BinaryTreeBroadcastPlan(BroadcastPlan):
         if self._world_size == 1:
             return []
         n_rounds = self.num_rounds()
-        # Track only ranks that newly received data and are ready to send.
-        # Root starts ready; after each round, its children become the new ready set.
+        # Only ranks that received data in the previous round may send.
         ready_to_send: set[int] = {0}
         result: list[list[int]] = []
         for _ in range(n_rounds):
-            # Senders: ranks that are newly ready and have at least one child.
             senders = sorted(r for r in ready_to_send if self.get_children(r))
             result.append(senders)
-            # After this round, children of senders become ready to send.
             ready_to_send = set()
             for sender in senders:
                 ready_to_send.update(self.get_children(sender))

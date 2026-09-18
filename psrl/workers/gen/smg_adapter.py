@@ -46,14 +46,15 @@ def _cache_aware_cfg(config: Any, key: str, default: Any = None) -> Any:
 
 
 def _resolve_custom_chat_template(config: Any) -> str | None:
-    """Resolve `custom_chat_template` to a chat-template FILE PATH for SMG.
+    """Resolve the actor chat template to a chat-template FILE PATH for SMG.
 
-    The SMG gateway tokenizer reads the chat template from a file path
-    (``router_config.chat_template``), whereas the PSRL worker accepts either a
-    path or an inline jinja string. When the config value is a path, forward it
-    verbatim; when it is inline jinja, materialize it under the psrl log dir so
-    the gateway can load it.
+    `rollout.chat_template` already names a file. `model.custom_chat_template`
+    accepts either a path or inline jinja, so an inline value is materialized
+    under the psrl log dir for the gateway to load.
     """
+    value = cfg_get(config, "gen_actor_rollout_ref.rollout.chat_template", None)
+    if value:
+        return value
     value = cfg_get(config, "gen_actor_rollout_ref.model.custom_chat_template", None)
     if not value:
         return None
@@ -110,12 +111,8 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
         balance_rel_threshold=float(_cache_aware_cfg(config, "balance_rel_threshold", 1.5)),
         balance_token_usage_threshold=float(_cache_aware_cfg(config, "balance_token_usage_threshold", 1.0)),
         overload_token_usage_threshold=float(_cache_aware_cfg(config, "overload_token_usage_threshold", 1.0)),
-        # Admission gate is ALWAYS ON now (no master switch). The legacy
-        # `enable_kv_admission_control` RouterArgs field is repurposed to carry the
-        # strict "reject-on-waiting" switch: when True the gate only admits to an
-        # instance whose engine waiting queue is empty. This is SEPARATE from
-        # `max_num_waiting_reqs_after_preemption` (which is purely the vLLM-side
-        # preemption *notification* threshold, not an admission signal).
+        # This flag makes the always-on admission gate reject instances with a
+        # nonempty waiting queue.
         enable_kv_admission_control=bool(
             cfg_get(config, "psrl.rollout_coordination.routing_strategy.admission_reject_on_waiting", False)
         ),
@@ -168,15 +165,15 @@ def build_rollout_router_args(config: Any, host: str, port: int, ps_manager_addr
             cfg_get(config, "psrl.rollout_gateway.multimodal_tensor_transport", "auto")
         ).lower(),
         multimodal_shm_min_bytes=int(cfg_get(config, "psrl.rollout_gateway.multimodal_shm_min_bytes", 64 * 1024)),
+        model_path=cfg_get(config, "train_actor_rollout_ref.model.path", None),
         service_discovery=False,
         prometheus_port=None,
         request_timeout_secs=2**64 - 1,
         log_level="warn",
         log_dir=cfg_get(config, "psrl.logging_path", None),
         tool_call_parser=cfg_get(config, "psrl.rollout_gateway.tool_call_parser", "qwen"),
-        # Forward the patched actor chat template (e.g. Qwen3.5 tolerant of
-        # mid-conversation system messages) to the gateway tokenizer so the
-        # harness model requests render with the same template as the data side.
+        # Forward the patched actor chat template (e.g. Qwen3.5 tolerant of mid-conversation
+        # system messages) so harness requests render like the data side.
         chat_template=_resolve_custom_chat_template(config),
         api_key=None,
         disable_health_check=True,
@@ -247,11 +244,8 @@ def build_worker_registration_payload(
     # before the first KV event arrives (kv_event_monitor falls back to this).
     if kv_block_size:
         labels["kv_block_size"] = str(kv_block_size)
-    # LMCache instance id for cross-instance KV transfer: SMG's
-    # KvTransferCoordinator carries this id in TransferKv to target this instance
-    # as the re-route destination. The source servicer resolves the actual
-    # per-rank peer URLs from its own broadcast registry, so no peer URL is sent
-    # at registration time.
+    # SMG addresses cross-instance transfers by LMCache instance ID. The source
+    # servicer resolves per-rank peer URLs from its registry.
     if lmcache_instance_id:
         labels["lmcache_instance_id"] = lmcache_instance_id
     payload = {
@@ -262,9 +256,7 @@ def build_worker_registration_payload(
         "models": [{"id": model_id}],
         "labels": labels,
     }
-    # A stable, human-readable worker id (e.g. the rollout replica index) keeps
-    # SMG's route_trace `instance=...` aligned with the local stats files
-    # (`stats_r{replica_idx}_dp{dp_rank}.jsonl`) instead of an opaque UUID.
+    # A stable worker ID aligns SMG route traces with local statistics files.
     if worker_id is not None:
         payload["id"] = worker_id
     return payload

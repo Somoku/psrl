@@ -120,9 +120,7 @@ class Trajectory:
     # Rewards collected from an Interaction at each user turn (e.g. human feedback).
     turn_scores: list[float] = field(default_factory=list)
 
-    # Multi-modal data accumulated across turns.
-    # image_data: list of PIL.Image.Image (or any image objects accepted by the processor).
-    # video_data: list of (video_tensor, metadata) tuples.
+    # Multimodal data accepted by the processor across turns.
     image_data: list[Any] | None = None
     video_data: list[Any] | None = None
 
@@ -149,7 +147,7 @@ class SessionData:
     # val/train session data
     validate: bool = False
 
-    # NOTE(linsh): The following fields come from the dataset.
+    # Dataset-provided fields.
     # Data source of current session
     data_source: str = "unknown"
     # Reward model info (e.g., ground truth)
@@ -269,7 +267,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
             tool_reward=reward,
             done=done,
         )
-        # TODO(linsh): check whether global steps are required
+        # TODO(linsh): Check whether global steps are required.
         self.session_data.steps.append(step)
         self.session_data.trajectories[-1].steps.append(step)
         return step
@@ -562,9 +560,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         Returns:
             The computed step reward.
         """
-        # TODO(linsh): find a better approach to handle multiple tool rewards
-        # currently we just sum them up for trajectory-level reward computation,
-        # but we may want to keep them separate for more detailed credit assignment.
+        # TODO(linsh): Preserve separate tool rewards for detailed credit assignment.
         tool_reward = np.sum(step.tool_reward) if step.tool_reward is not None else 0.0
         model_reward = step.model_reward if step.model_reward is not None else 0.0
         step.reward = tool_reward + model_reward
@@ -583,8 +579,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
         Args:
             trajectory: The trajectory to adjust the rewards for.
         """
-        # Reward shaping: add bonus proportional to reward deltas
-        # Formula: s[i].reward = s[i].reward + bonus * (s[i].reward - s[i-1].reward) for i > 0
+        # Reward shaping uses deltas from the unmodified rewards.
         if self.reward_bonus_coeff > 0.0:
             raw_rewards = [step.reward for step in trajectory.steps]
             for i in range(1, len(trajectory.steps)):
@@ -639,7 +634,7 @@ class AgentData(ABC, Generic[ObsType, ActType]):
                     else None
                 ),
                 multi_modal_data=multi_modal_data,
-                # TODO(linsh): check whether use global num_turns
+                # TODO(linsh): Check whether to use the global turn count.
                 num_turns=self.session_data.assistant_turns + self.session_data.user_turns + 1,
                 rollout_instance_id=self.session_data.curr_rollout_instance_id,
                 agent_reward_info=self.session_data.agent_reward_info,

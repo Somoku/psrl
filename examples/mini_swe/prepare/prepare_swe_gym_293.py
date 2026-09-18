@@ -1,13 +1,15 @@
 """SkyRL-v0-293 dataset converter to the PSRL parquet format.
 
-  - Dataset : ``NovaSky-AI/SkyRL-v0-293-data`` — 293 train + 23 validation
-              instances, a curated SWE-bench Verified subset that a Qwen3.5-4B
-              model can already solve ~32.6% of the time (non-zero reward signal).
-  - Images  : (``xingyaoww/sweb.eval.x86_64.<instance __->_s_ lower>:latest``,
-              legacy repos -> ``swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<issue>:latest``).
-  - Grading : ``swebench_fresh_container``; the per-instance ``eval_script`` is
-              generated with the SWE-Bench-Fork (the swegym fork of swebench),
-              which supports the SWE-Gym repos that swebench 4.x does not.
+Dataset: ``NovaSky-AI/SkyRL-v0-293-data``, with 293 train and 23 validation
+instances. It is a curated SWE-bench Verified subset that a Qwen3.5-4B model
+can already solve about 32.6% of the time (non-zero reward signal).
+
+Images: ``xingyaoww/sweb.eval.x86_64.<instance __->_s_ lower>:latest``. Legacy
+repos use ``swebench/sweb.eval.x86_64.<owner>_1776_<repo>-<issue>:latest``.
+
+Grading: ``swebench_fresh_container``. The per-instance ``eval_script`` is
+generated with the SWE-Bench-Fork (the swegym fork of swebench), which supports
+the SWE-Gym repos that swebench 4.x does not.
 
 The output parquet matches the schema consumed by the mini-SWE harness pipeline
 (``prompt / data_source / ability / reward_model / extra_info / agent_name``),
@@ -18,8 +20,8 @@ Usage::
 
     # 1) Generate the parquet (creates a temp venv with the SWE-Bench-Fork if needed)
     python -m examples.mini_swe.prepare.prepare_swe_gym_293 \
-        --output-dir examples/mini_swe/data/swe_gym_293 \
-        --ensure-fork --fork-venv /tmp/swegym-fork-venv
+--output-dir examples/mini_swe/data/swe_gym_293 \
+--ensure-fork --fork-venv /tmp/swegym-fork-venv
 
     # 2) Prefetch / fan-out images (see prepare/docker_scripts/swe_gym_293.sh)
     bash examples/mini_swe/prepare/docker_scripts/swe_gym_293.sh
@@ -65,9 +67,7 @@ LEGACY_SWEBENCH_IMAGE_REPOS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Image naming
-# ---------------------------------------------------------------------------
+# --- Image naming ---
 
 
 def registry_image_for_instance(instance_id: str, repo: str) -> str:
@@ -80,9 +80,7 @@ def registry_image_for_instance(instance_id: str, repo: str) -> str:
     return f"xingyaoww/sweb.eval.x86_64.{suffix}:latest"
 
 
-# ---------------------------------------------------------------------------
-# SWE-Bench-Fork venv management (eval_script generation)
-# ---------------------------------------------------------------------------
+# --- SWE-Bench-Fork venv management (eval_script generation) ---
 
 
 def ensure_fork_venv(venv: str, *, force: bool = False) -> str:
@@ -128,9 +126,7 @@ def _make_eval_script(instance: dict[str, Any], fork_python: str) -> str:
     return script
 
 
-# ---------------------------------------------------------------------------
-# Row conversion
-# ---------------------------------------------------------------------------
+# --- Row conversion ---
 
 
 def _ensure_list(value: Any) -> list[str]:
@@ -274,9 +270,7 @@ def convert_split(
     return out
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# --- CLI ---
 
 
 def main() -> None:
@@ -316,7 +310,7 @@ def main() -> None:
         val = convert_split(VAL_PARQUET_URL, fork_python=fork_python, agent_name=args.agent_name, total=args.val_total)
         val.to_parquet(out_dir / "val.parquet")
         print(f"Wrote {len(val)} validation rows to {out_dir / 'val.parquet'}.")
-    except Exception as exc:  # noqa: BLE001 — validation split is optional
+    except Exception as exc:  # noqa: BLE001 (validation split is optional)
         psrl_logger.warning(f"Validation split conversion failed (continuing): {exc}")
 
     # Summary

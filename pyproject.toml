@@ -55,6 +55,8 @@ include-package-data = true
 psrl = [
     "trainer/config/*.yaml",
     "trainer/config/**/*.yaml",
+    "eval/config/*.yaml",
+    "eval/config/**/*.yaml",
 ]
 
 [project.entry-points."hydra.searchpath"]
@@ -64,7 +66,7 @@ psrl = "psrl.trainer.config.hydra_plugins.psrl_searchpath:PSRLSearchPathPlugin"
 line-length = 119
 src = ["psrl"]
 extend-exclude = [
-    # Archived pre-SMG code kept for reference only; never imported by live code.
+    # Archived pre-SMG code kept for reference only. It is never imported by live code.
     "deprecated",
     # Vendored upstream parsers: copied verbatim and hashed in _vendor/PROVENANCE.md.
     # Reformatting them would trip the payload integrity check in payload.py.

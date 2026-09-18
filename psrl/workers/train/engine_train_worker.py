@@ -1,5 +1,4 @@
 # Copyright (c) 2025, PSRL Authors.
-# Unified engine-based train worker for PSRL (replaces fsdp_train_worker and megatron_train_worker).
 
 import logging
 import os
@@ -26,8 +25,7 @@ from psrl.utils.common.patch_utils import apply_tms_patch
 from psrl.utils.converter import create_parameter_mapping
 from psrl.utils.converter.param_sync import ParamSyncPlan
 
-# Megatron imports — protected with TORCH_CUDA_ARCH_LIST to avoid CUDA JIT errors on CPU workers
-# (mirrors the guard used in verl.workers.engine.megatron.__init__)
+# Set an architecture before guarded Megatron imports on CPU workers.
 if not is_cuda_available and "TORCH_CUDA_ARCH_LIST" not in os.environ:
     os.environ["TORCH_CUDA_ARCH_LIST"] = "8.0"
 
@@ -96,7 +94,7 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             train_interface,
         )
 
-        # TODO(linsh): remove this hard patch to be cleaner
+        # TODO(linsh): Remove this strategy-specific configuration patch.
         if self.config.actor.strategy == "megatron":
             self.config.actor.megatron.use_per_rank_checkpoint = not self.psrl_config.checkpoint.use_dcp_save
 
@@ -104,9 +102,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
             if torch_memory_saver is None:
                 raise ImportError("torch_memory_saver is required when tms.range is 'train' or 'all'")
             apply_tms_patch()
-
-        # Megatron imports are resolved at module load time (see top of file).
-        # No additional imports needed here.
 
         self.log_prefix = f"TrainWorker_R{self.rank}"
         psrl_logger.addHandler(DualOutputHandler(self.psrl_config.logging_path, self.log_prefix))
@@ -139,9 +134,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
 
     def init_nixl_client(self):
         """Initialize the NIXL GPU-to-GPU weight-streaming client."""
-        # When DCP save is enabled, disable NIXL background UCX progress thread to prevent
-        # heap corruption from DCP's all_gather_object (large temporary allocations corrupt
-        # UCX endpoint address structures read by the background thread).
+        # DCP `all_gather_object` can corrupt UCX endpoint addresses read by the
+        # background progress thread, so disable that thread during DCP saves.
         enable_prog_thread = not self.psrl_config.checkpoint.use_dcp_save
         self.nixl_storage_client = NIXLStorageClient(
             client_name=train_client_name(self.rank),
@@ -195,8 +189,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         """Run the 8-step NIXL server handshake.
 
         Args:
-            mode: 'full' registers real tensors; 'meta' registers meta-tensors only
-                  (used when PS storage is initialised before real weights arrive).
+            mode: `full` registers real tensors. `meta` registers only metadata before
+                parameter server weights arrive.
         """
         meta_only = mode == "meta"
         if self.unified_state_dict is None or self.local_sharding_dict is None:
@@ -243,11 +237,9 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         if self.memory_logger is not None:
             self.memory_logger.log_now(prefix=f"Before TrainWorker_R{self.rank} sleep")
 
-        # NOTE(lhy): aggressive_empty_cache is used to ensure no torch reserved memory exists
-        # so torch won't trigger cudaFree from the mempool side
-        # otherwise it will cause double cuMemRelease (first pause, then free) in tms
+        # NOTE(lhy): Empty the PyTorch cache before pausing TMS to prevent duplicate
+        # `cuMemRelease` calls from the mempool and pause paths.
         aggressive_empty_cache(force_sync=True)
-        # Release GPU memory for FSDP model parameters
         if self.psrl_config.tms.range in ["train", "all"]:
             torch_memory_saver.pause()
         else:
@@ -293,7 +285,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 return
             device = get_device_id()
             model = self.actor.engine.module
-            # Apply each buffer by navigating the module tree with its dotted name.
             for full_name, cpu_tensor in ps_buffers.items():
                 *module_path_parts, buf_attr = full_name.split(".")
                 module = model
@@ -306,15 +297,14 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                     if isinstance(existing, torch.Tensor):
                         existing.data.copy_(cpu_tensor.to(device=device, dtype=existing.dtype))
             psrl_logger.info(
-                f"[_restore_non_persistent_buffers_from_ps] Restored {len(ps_buffers)} "
-                f"non-persistent buffers to FSDP model."
+                "[_restore_non_persistent_buffers_from_ps] Restored non-persistent FSDP buffers. "
+                f"Count={len(ps_buffers)}."
             )
         elif strategy == "megatron":
             from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
             ps_buffers = self._get_non_persistent_buffers_from_ps()
 
-            # Extract inv_freq tensors from PS buffers (HF naming).
             inv_freq_tensors = {
                 name: tensor for name, tensor in ps_buffers.items() if name.endswith(".inv_freq") or name == "inv_freq"
             }
@@ -322,21 +312,21 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 psrl_logger.warning("[_restore_non_persistent_buffers_from_ps] No inv_freq found in PS buffers.")
                 return
 
-            # Use the first available inv_freq (all layers share the same value for standard RoPE).
+            # Standard RoPE layers share one `inv_freq` value.
             reference_inv_freq = next(iter(inv_freq_tensors.values()))
             device = torch.cuda.current_device()
             restored = 0
             for model_chunk in self.actor.engine.module:
                 for module in model_chunk.modules():
                     if isinstance(module, RotaryEmbedding) and hasattr(module, "inv_freq"):
-                        # Clear lru_cache: cached cos/sin point to freed/garbage GPU memory.
+                        # Cached trigonometric tensors reference released GPU memory.
                         if hasattr(module.forward, "cache_clear"):
                             module.forward.cache_clear()
                         module.inv_freq = reference_inv_freq.to(device=device, dtype=module.inv_freq.dtype)
                         restored += 1
             psrl_logger.info(
-                f"[_restore_non_persistent_buffers_from_ps] Restored inv_freq and cleared "
-                f"lru_cache for {restored} RotaryEmbedding module(s)."
+                "[_restore_non_persistent_buffers_from_ps] Restored inv_freq and cleared lru_cache. "
+                f"Modules={restored}."
             )
         else:
             raise NotImplementedError(
@@ -370,13 +360,11 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                 buffer.untyped_storage().resize_(buffer._sleep_storage_size)
 
     def _sleep_megatron_model(self, models):
-        """Release GPU memory for Megatron model chunks by resizing DDP buffers to 0.
+        """
+        Release Megatron DDP buffer storage.
 
-        Megatron's DistributedDataParallel allocates all parameters and gradients into
-        large contiguous buffers (param_data and grad_data in _ParamAndGradBuffer).
-        Individual param.data tensors are views into these buffers, so resizing the
-        buffer storage to 0 releases the entire contiguous allocation in one operation
-        (typically 2 cudaFree calls per buffer group: one for params, one for grads).
+        Parameters and gradients are views into contiguous DDP buffers, so resizing
+        those buffers releases the underlying allocation.
         """
         try:
             from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
@@ -404,12 +392,10 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                         param.grad.untyped_storage().resize_(0)
 
     def _wake_up_megatron_model(self, models):
-        """Restore GPU memory allocation for Megatron model chunks (no data copy).
+        """
+        Restore Megatron DDP buffer storage without copying data.
 
-        Resizes DDP buffer storages back to their original sizes. The param.data views
-        remain valid because they reference the same storage object (only the backing
-        physical memory is reallocated by the caching allocator). NIXL pull fills the
-        actual weight data after this call.
+        Existing parameter views remain valid. The subsequent NIXL pull restores weights.
         """
         try:
             from megatron.core import DistributedDataParallel as DDP  # noqa: PLC0415
@@ -441,9 +427,9 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
     def ray_push_model(self) -> None:
         """Push model weights to the parameter server via CPU Ray object store.
 
-        Two sub-modes:
-          'cpu'     -- PS worker blocks on the large dict transfer.
-          'cpu_ref' -- train-side blocks on ray.put(); PS side is non-blocking.
+        Modes:
+            `cpu`: The parameter server blocks on the state dictionary transfer.
+            `cpu_ref`: The train side blocks on `ray.put()`. The parameter server remains non-blocking.
         """
         ps_manager_handle = self.train_interface.ps_manager_handle
         curr_version = ray.get(ps_manager_handle.get_ps_model_version.remote(debug_info="engine_train_worker"))
@@ -477,13 +463,8 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
                        'empty' skips weight loading (used by async NIXL boot path,
                        where NIXL streams the real weights from the parameter server).
         """
-        # Pre-initialize the default process group with an extended timeout before
-        # model init. megatron-core 0.19.0 added all_gather_object in _get_param_groups
-        # (called during optimizer build) that uses the default gloo process group.
-        # On cold filesystems, distributed checkpoint resharding causes a large spread
-        # in when workers reach that collective, exceeding the default 1800s gloo timeout.
-        # Calling this here (before ActorRolloutRefWorker.init_model's call) pre-empts
-        # the default init so all subsequent gloo operations use the extended timeout.
+        # NOTE(lhy): Initialize the default process group early because DCP resharding
+        # can exceed gloo's 30-minute timeout on cold filesystems.
         from verl.utils.distributed import initialize_global_process_group_ray
 
         initialize_global_process_group_ray(timeout_second=36000)
@@ -542,9 +523,6 @@ class PSRL_EngineTrainWorker(ActorRolloutRefWorker, PSRL_BaseTrainWorker):
         optimizer = engine.optimizer
         if not hasattr(optimizer, "reload_model_params"):
             return
-        # Megatron optimizers (Float16OptimizerWithFloat16Params, DistributedOptimizer,
-        # ChainedOptimizer) all support reload_model_params() which copies
-        # the model's current float16 params into the optimizer's fp32/bf16 master copy.
         optimizer.reload_model_params()
 
     def _debug_log_train_model_info(self, label: str, max_elements: int = 10):

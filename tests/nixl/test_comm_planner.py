@@ -3,7 +3,7 @@
 Tests for NIXL communication planner and network topology.
 
 test_network_topology_integration: CPU-only (pytestmark = cpu_test).
-test_communication_planner: CPU-only; NIXLTensorInfo is constructable without the
+test_communication_planner: CPU-only. NIXLTensorInfo is constructable without the
   nixl C library when desc_bytes_list is None (no real agent descriptors needed for
   testing the planner's routing/assignment logic).
 """
@@ -35,7 +35,7 @@ def _make_tensor_info(shard_indices):
     """
     Build a NIXLTensorInfo for testing comm plan logic.
 
-    Uses None for desc_bytes_list entries — the nixl C library is not needed
+    Uses None for desc_bytes_list entries, so the nixl C library is not needed
     for testing the planner's routing/assignment logic.
     NIXLShardMetaInfo requires torch.dtype, torch.device, torch.Size.
     """
@@ -148,7 +148,9 @@ def test_communication_planner():
         for key, ps_plans in key_plans.items():
             for ps_client, shards in ps_plans.items():
                 link_type = global_comm_planner._get_link_type_for_test(push_client, ps_client)
-                assert link_type is not None, f"Expected non-None link type for {push_client} -> {ps_client}"
+                assert link_type is not None, (
+                    f"Link type is missing. push_client={push_client!r}, ps_client={ps_client!r}."
+                )
                 assert isinstance(link_type, LinkType), f"Expected LinkType instance, got {type(link_type)}"
 
     # Verify PULL_SIDE <- PS_FOR_PULL plan has entries and link types are valid
@@ -156,14 +158,16 @@ def test_communication_planner():
         for key, ps_plans in key_plans.items():
             for ps_client, shards in ps_plans.items():
                 link_type = global_comm_planner._get_link_type_for_test(ps_client, pull_client)
-                assert link_type is not None, f"Expected non-None link type for {ps_client} -> {pull_client}"
+                assert link_type is not None, (
+                    f"Link type is missing. ps_client={ps_client!r}, pull_client={pull_client!r}."
+                )
                 assert isinstance(link_type, LinkType), f"Expected LinkType instance, got {type(link_type)}"
 
 
 def test_network_topology_integration():
     """Test network topology link-type and bandwidth determination.
 
-    CPU-only — does not require nixl C library or GPU.
+    CPU-only and does not require the nixl C library or a GPU.
     """
     topology = NetworkTopology()
 
@@ -193,7 +197,6 @@ def test_network_topology_integration():
     assert bw_nvlink > 0
     assert bw_pcie > 0
     assert bw_ib > 0
-    # LOCAL (1000 Gbps) is fastest; NVLINK is fast intra-node
     assert bw_local >= bw_nvlink, f"Expected LOCAL ({bw_local}) >= NVLINK ({bw_nvlink})"
 
     # Print bandwidth summary when run as a benchmark (not during pytest CI)

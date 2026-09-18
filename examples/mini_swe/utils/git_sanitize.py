@@ -7,7 +7,7 @@ from the baked derivative is already clean. This module is the fallback for
 images that were not baked: it runs a cheap probe and only pays for the purge
 when the image actually leaks.
 
-Nothing here resets the worktree or moves HEAD; it only removes the metadata
+Nothing here resets the worktree or moves HEAD. It only removes the metadata
 that could expose a future fix commit (remotes, refs, reflog, unreachable
 objects).
 """
@@ -30,10 +30,10 @@ PROBE_CLEAN_MARKER = "PSRL_GIT_CLEAN"
 PROBE_DIRTY_MARKER = "PSRL_GIT_DIRTY"
 
 # Cheap, read-only probe. A repository is clean when it has no remotes and no
-# commit reachable from any ref or reflog entry that is not already reachable
-# from HEAD. `--count` avoids materialising the commit list and is the single
-# correct reachability check; remotes are checked separately because a remote
-# with no fetched refs would not show up in `rev-list`.
+# commit reachable from any ref or reflog entry that HEAD cannot already reach.
+#
+# `--count` avoids materialising the commit list and is the single correct
+# reachability check. Remotes are checked separately because a remote with no fetched refs is invisible to `rev-list`.
 PROBE_SCRIPT = rf"""set -u
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "{PROBE_WORKTREE_MARKER}"; exit 0
@@ -112,7 +112,7 @@ async def ensure_git_sanitized(
     except Exception:
         metrics["git_probe_s"] = time.perf_counter() - probe_started
         metrics["git_sanitize_error"] = 1.0
-        psrl_logger.warning("Git leak probe failed for workdir %r; skipping sanitization.", workdir, exc_info=True)
+        psrl_logger.warning("Git leak probe failed for workdir %r, so skipping sanitization.", workdir, exc_info=True)
         return metrics
     metrics["git_probe_s"] = time.perf_counter() - probe_started
 
@@ -134,7 +134,7 @@ async def ensure_git_sanitized(
     except Exception:
         metrics["git_purge_s"] = time.perf_counter() - purge_started
         metrics["git_sanitize_error"] = 1.0
-        psrl_logger.warning("Git leak purge failed for workdir %r; continuing unsanitized.", workdir, exc_info=True)
+        psrl_logger.warning("Git leak purge failed for workdir %r, so continuing unsanitized.", workdir, exc_info=True)
         return metrics
     metrics["git_purge_s"] = time.perf_counter() - purge_started
     if purge.exit_code != 0:

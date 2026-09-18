@@ -36,12 +36,20 @@ tensorflow/my_graph/*
 !docs/_static/img/*.png
 !assets/*.png
 
+# AIRS-Bench pinned parquet dataset files (small metadata, not training data).
+!examples/airs_bench/data/
+!examples/airs_bench/data/*.parquet
+
 # Common artifact directories
 **/checkpoints
+**/ckpts
 **/wget-log
 **/_build/
 **/outputs
 **/outputs/
+
+# Talk material. Cites cluster-side measurements that stay out of published docs.
+examples/sciaccel_rl/slides/
 **/output/
 **/playground
 **/wandb
@@ -49,8 +57,11 @@ tensorflow/my_graph/*
 **/log/
 **/*log*/
 !examples/mini_swe/grading/_vendor/log_parsers/
+# "topology" contains "log", so the rule above swallows this config group.
+!psrl/eval/config/topology/
 **/models/
 **/data/
+**/results/
 
 
 # =========================================================================

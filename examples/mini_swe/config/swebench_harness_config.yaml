@@ -53,10 +53,8 @@
     compaction:
       enabled: true
       compact_percent: 87.5
-    # Canonical tool-call format guidance appended to the Claude Code system
-    # prompt (--append-system-prompt). Switch to enable/disable:
-    #   system_prompt_mode: append  -> injected
-    #   system_prompt_mode: none    -> not injected
+    # Canonical tool-call format guidance appended to the Claude Code system prompt
+    # (--append-system-prompt): system_prompt_mode: append -> injected, none -> not injected.
     system_prompt_mode: none
 
 - name: mini_swe_codex

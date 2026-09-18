@@ -188,10 +188,7 @@ def convert_hf_local_shard(
     if "visual.blocks" in param_name and "qkv" in param_name:
         shard_indices = sharding.shard_indices
         if shard_dim == 0:
-            # HF stores visual QKV as [Q; K; V]. FSDP shards that flat axis,
-            # while vLLM/Megatron shard the head axis inside each Q/K/V block.
-            # Re-expressing it as flattened heads preserves FSDP's dim-0
-            # partition without allocating or copying.
+            # Flattened heads preserve the FSDP row partition without copying.
             if shard_size > 1:
                 new_sharding = sharding
             else:

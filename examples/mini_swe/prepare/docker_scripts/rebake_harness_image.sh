@@ -1,33 +1,41 @@
 #!/usr/bin/env bash
-# rebake_harness_image.sh — force a re-bake of the git-purged derivative images.
+# rebake_harness_image.sh: force a re-bake of the git-purged derivative images.
 #
 # `bake_harness_image.sh` tags a derivative as
-# `psrl/swebench-harness:<sha12(base-image)>` and SKIPS any image that is already
-# baked, so a change to the bake steps alone does not replace an existing
-# derivative. This script deletes the derivative(s) first and then delegates to
-# the original bake, which is the supported way to roll out a changed purge.
+# `psrl/swebench-harness:<sha12(base-image)>` and SKIPS any image already baked,
 #
-# It reuses `bake_harness_image.sh` verbatim — this is a thin wrapper, not a
+# so a change to the bake steps alone does not replace an existing derivative.
+# This script deletes the derivative(s) first and then delegates to the original
+#
+# bake, the supported way to roll out a changed purge.
+#
+# It reuses `bake_harness_image.sh` verbatim. This is a thin wrapper, not a
 # second implementation of the bake steps.
 #
 # Usage (on each worker host that creates sandboxes):
-#   bash rebake_harness_image.sh swebench/swesmith.x86_64.foo:latest          # one image
-#   bash rebake_harness_image.sh --parquet ../../data/swe_smith_py_1k/train.parquet
+#   bash rebake_harness_image.sh <image> (one image)
 #
-# Removing a tag only untags the image; a running sandbox keeps its container.
+#   bash rebake_harness_image.sh --parquet <path>
+#
+# Removing a tag only untags the image. A running sandbox keeps its container.
 # Multi-host clusters are node-local: re-run this on every worker host, or push
+#
 # the result from one host and pull it on the others.
 #
 # Env overrides:
-#   PSRL_BAKE_IMAGE_GLOB   images to delete before re-baking (default
-#                          `psrl/swebench-harness:*`; the delete is by tag, so
-#                          stale tags from any earlier formula are removed too)
-#   PSRL_REBAKE_VERIFY=1   after each bake, run the git-leak probe from the
-#                          README against the new image and fail on a leak
-#   PSRL_REBAKE_DRY_RUN=1  print what would be removed/re-baked, change nothing
-#   PSRL_BAKE_SKIP_GIT_CLEAN, PSRL_BAKE_WORKDIR, PSRL_HARNESS_IMAGE_TAG
-#                          forwarded to bake_harness_image.sh (an explicit
-#                          PSRL_HARNESS_IMAGE_TAG disables the removal step)
+#   PSRL_BAKE_IMAGE_GLOB images to delete before re-baking (default
+#
+# `psrl/swebench-harness:*`). The delete is by tag, so stale tags from any
+# earlier formula are removed too.
+#
+#   PSRL_REBAKE_VERIFY=1 after each bake, run the git-leak probe from the
+#   README against the new image and fail on a leak.
+#
+#   PSRL_REBAKE_DRY_RUN=1 print what would be removed/re-baked, change nothing.
+#   PSRL_BAKE_SKIP_GIT_CLEAN, PSRL_BAKE_WORKDIR, PSRL_HARNESS_IMAGE_TAG are
+#
+#   forwarded to bake_harness_image.sh. An explicit PSRL_HARNESS_IMAGE_TAG
+#   disables the removal step.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,8 +59,9 @@ run() {
 }
 
 # Delete every tag matching $IMAGE_GLOB. Deleting by tag (not by image id) also
-# clears tags left behind by an older digest formula, which no current base
-# image maps onto.
+# clears tags left behind by an older digest formula.
+#
+# No current base image maps onto those leftover tags.
 remove_derivatives() {
     [ -z "${PSRL_HARNESS_IMAGE_TAG:-}" ] || return 0
     local repo="${IMAGE_GLOB%%:*}"

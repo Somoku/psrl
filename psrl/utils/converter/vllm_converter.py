@@ -35,9 +35,7 @@ from psrl.utils.converter.model_mappings import (
 from psrl.utils.converter.weight_layout_plan import PlanExecutor
 from psrl.utils.nixl.nixl_spec import NIXLSharding
 
-# QKV string shard_id → integer index
-# vLLM uses "q"/"k"/"v" in stacked_params_mapping, but convert_parameter()
-# uses integer index: assert shard_id < len(sliced_params); sliced_params[shard_id]
+# vLLM QKV shard identifiers map to split tensor indices.
 QKV_SHARD_ID_MAP: dict[str, int] = {"q": 0, "k": 1, "v": 2}
 
 
@@ -127,7 +125,7 @@ class VllmConverter(BaseConverter):
         Convert vLLM model using the unified WeightLayoutPlan from build_weight_layout().
 
         This is the canonical conversion path for all models implementing
-        SupportsWeightLayout. Errors are NOT silenced — they propagate to the caller.
+        SupportsWeightLayout. Errors propagate to the caller.
         """
         if not self.model_info:
             config = getattr(model, "config", None)
@@ -138,7 +136,6 @@ class VllmConverter(BaseConverter):
 
                 self.model_info = HFParameterMapping(config).get_model_info()
 
-        # Build and flatten the plan — let any error propagate
         plan = model.build_weight_layout()
         resolved_plan = plan.flatten()
 
@@ -180,9 +177,7 @@ class VllmConverter(BaseConverter):
                     converted_state_dict[converted_name] = converted_param
                     sharding_dict[converted_name] = sharding
 
-            # ── Buffers (non-parameter registered tensors, e.g. w_kc/w_vc) ──
-            # Only export buffers that have an explicit rule in the plan —
-            # most runtime buffers (rotary caches, etc.) should be skipped.
+            # Export only buffers with an explicit layout rule.
             for buf_name, buf in module.named_buffers(recurse=False):
                 if buf is None:
                     continue
@@ -411,9 +406,8 @@ class VllmConverter(BaseConverter):
                     raise ValueError(f"Failed to slice w13_weight parameter {full_name}: {e}") from e
                 out = {}
                 ep_size = getattr(module, "ep_size", 1)
-                # NOTE(zym) Though module has attribute "ep_rank", the value is incorrect,
-                # and now we only have dp=1, so we use tp_rank as ep_rank
-                ep_rank = self.tp_rank if ep_size > 1 else 0  # considering the case where not enable_expert_parallel
+                # NOTE(zym): The `ep_rank` value is unreliable with DP one, so use `tp_rank`.
+                ep_rank = self.tp_rank if ep_size > 1 else 0
                 num_experts = model_info["num_experts"]
                 num_experts_per_ep_rank = num_experts // ep_size
                 local_experts_start_id = ep_rank * num_experts_per_ep_rank
@@ -539,7 +533,7 @@ class VllmConverter(BaseConverter):
                 shard_dim = 0
             elif isinstance(module, RowParallelLinear):
                 if param_name == "bias":
-                    # NOTE(zym) bias doesn't need to be sharded
+                    # NOTE(zym): Bias remains replicated.
                     tp_size = 1
                     shard_indices = [(0,)]
                     shard_dim = 0
@@ -552,15 +546,12 @@ class VllmConverter(BaseConverter):
                     assert "w2" in param_name, f"FusedMoE param can only be w13 and w2, but get {param_name}"
                     shard_dim = 1
             elif isinstance(module, ReplicatedLinear):
-                # qwen2_moe  mlp.gate.weight
-                # NOTE(zym): ReplicatedLinear layer doesn't use tp, but it still has tp_size
-                # which is equal to get_tensor_model_parallel_world_size().
-                # Refer to vllm/vllm/model_executor/layers/linear.py
+                # NOTE(zym): `ReplicatedLinear` carries the global TP size despite
+                # storing a replicated parameter.
                 tp_size = 1
                 shard_indices = [(0,)]
                 shard_dim = 0
             elif isinstance(module, QwenGatedDeltaNetAttention):
-                # NOTE(zym): For param dt_bias and A_log
                 shard_dim = 0
             else:
                 raise ValueError(f"Unsupported module type for sharding: {type(module)}")

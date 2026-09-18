@@ -68,16 +68,13 @@
     {%- set content = render_content(message.content, true)|trim %}
     {%- if (message.role == "user") or (message.role == "system" and not loop.first) %}
         {#- Non-leading system messages (e.g. Claude Code's inline system/agent
-            context) are rendered in place like a user message instead of
-            raising. -#}
+            context) render in place like a user message instead of raising. -#}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "system" %}
-        {#- Leading system message was rendered in the system header above; skip. -#}
+        {#- Leading system message was rendered in the system header above, so skip it. -#}
     {%- elif message.role == "assistant" %}
-        {#- Always keep the <think> block for every assistant message — no
-            position-dependent stripping and no extra template variable.  Raw
-            generation and any re-render of the same message then render
-            identically, so the TITO prefix lookup reuses instead of forking. -#}
+        {#- Always keep the <think> block for every assistant message, with no
+            position-dependent stripping or template variables, so generation and re-renders match for TITO reuse. -#}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
             {%- set reasoning_content = message.reasoning_content %}

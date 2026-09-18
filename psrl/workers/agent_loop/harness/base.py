@@ -19,8 +19,7 @@ from psrl.sandbox import ExecResult, SandboxSession
 from psrl.workers.agent_loop.harness.runtime import executable_path
 
 # Trajectory output formats the post-rollout integrity scanner can dispatch on.
-# `auto` is a convenience that resolves to the kind default below; the actual
-# scan dispatch key is always a concrete format string.
+# `auto` resolves to the kind default below, but the scan dispatch key is always a concrete format.
 SUPPORTED_TRAJECTORY_FORMATS = (
     "auto",
     "claude_code_stream_json",
@@ -211,7 +210,7 @@ class Harness(ABC):
         """Verify the mounted executable and write harness-specific configuration.
 
         The executable comes from the read-only runtime tree mounted at
-        ``config.runtime_mount``; there is no in-sandbox installation, no
+        ``config.runtime_mount``. There is no in-sandbox installation, no
         network fetch and no mutation of the task image's global toolchain. All
         directories are created in the same probe, so per-trajectory setup stays
         to one round trip.
@@ -322,7 +321,7 @@ class Harness(ABC):
         )
 
     async def abort(self) -> None:
-        """Cancel the active exec; sandbox lease release supplies the hard stop."""
+        """Cancel the active exec. Sandbox lease release supplies the hard stop."""
         task = self._active_exec
         if task is None or task.done():
             return

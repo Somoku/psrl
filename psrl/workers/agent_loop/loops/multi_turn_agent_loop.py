@@ -79,6 +79,8 @@ class MultiTurnAgentLoop(AgentLoopBase):
                 return await self.agent_data.finalize_output(), TerminateReason.MAX_RESPONSE_LENGTH_EXCEEDED
 
             for _ in range(self.max_turns):
+                # Generation is token-in/token-out today but may move to chat-completion style.
+                # TODO: drop unnecessary DataProto fields and the redundant single-request padding.
                 output = await self.generate_sequence(
                     self.agent_data.prepare_generation_request(request),
                     is_sticky_session=self.config.psrl.rollout_coordination.routing_strategy.enable_trajectory_sticky,

@@ -98,7 +98,7 @@ class TestStalenessBufferStatus:
         """Buffer with ready_num_entries OCCUPIED and remaining EMPTY is READY_WITH_CAPACITY."""
         from psrl.workers.ps.staleness_controller import BufferStatus
 
-        # Insert ready_num_entries (3) OCCUPIED entries — buffer has 5 slots, so 2 remain EMPTY
+        # Three occupied entries leave two slots empty.
         for i in range(staleness_buffer.ready_num_entries):
             staleness_buffer.insert(i, EntryCategory.OCCUPIED, dummy_entry_info)
         status = staleness_buffer.get_status()
@@ -128,7 +128,7 @@ class TestStalenessBufferStatus:
 
 class TestStalenessInventoryStalenessWindow:
     def test_reserve_data_returns_buffer_and_entry_id(self, staleness_inventory, dummy_entry_info):
-        """reserve_data returns (buffer_id, entry_id) on success; buffers are auto-created."""
+        """Return buffer and entry IDs while creating missing buffers."""
         # For non-validate inventory, reserve_data auto-creates buffers via ensure_buffer_exists.
         # max_staleness_buffer_id must be an int (not None).
         result_buf, result_entry = staleness_inventory.reserve_data(

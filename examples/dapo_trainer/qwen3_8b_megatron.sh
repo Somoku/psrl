@@ -12,7 +12,7 @@ test_files=${PSRL_WORKSPACE}/data/dapo/aime-2024.parquet
 OUTPUT_DIR=${PSRL_PATH}/examples/dapo_trainer/output
 mkdir -p "$OUTPUT_DIR"
 project_name=tx_test_lhy
-experiment_name=qwen3_8b_megatron_dcp
+experiment_name=qwen3_8b_megatron_dcp_preempt
 CKPTS_DIR=${OUTPUT_DIR}/ckpts/"${project_name}"/"${experiment_name}"
 LOG_DIR=${OUTPUT_DIR}/logs/$(date +%Y%m%d_%H%M%S)
 
@@ -21,7 +21,7 @@ mkdir -p "$LOG_DIR"
 mkdir -p "$CKPTS_DIR"
 
 
-train_batch_size=64
+train_batch_size=96
 # train_batch_size=60
 tensor_model_parallel_size=4
 pipeline_model_parallel_size=1
@@ -37,23 +37,18 @@ VAL_DP=1
 VAL_TP=1
 VAL_PP=1
 
-GEN_NNODES=2
+GEN_NNODES=1
 GEN_NGPUS_PER_NODE=8
 GEN_INSTANCES=$(( (${GEN_NNODES} * ${GEN_NGPUS_PER_NODE}) / ( ${GEN_TP} * ${GEN_PP} ) )) # Number of generation instances
 GEN_NGPUS_PER_NODE_PER_INSTANCE=$(( ${GEN_TP} * ${GEN_PP} )) # Number of GPUs per node for generation per instance
 
-TRAIN_NNODES=2
+TRAIN_NNODES=3
 TRAIN_NGPUS_PER_NODE=8
 
 VAL_INSTANCES=$(( (${TRAIN_NNODES} * ${TRAIN_NGPUS_PER_NODE}) / ( ${VAL_TP} * ${VAL_PP} ) )) # Number of validation instances
 VAL_NGPUS_PER_NODE_PER_INSTANCE=$(( ${VAL_TP} * ${VAL_PP} )) # Number of GPUs per node for validation per instance
 
-# dependency: vllm>=0.11.0, megatron-lm>=0.13, mbridge with qwen3vl_cp branch
-# environment option1: use a stable container later than docker://verlai/verl:vllm011.dev6 
-    # and install mbridge in it by following the instruction in the container
-            # pip remove mbridge if you have installed it
-            # pip install git+https://github.com/ISEEKYAN/mbridge.git@qwen3vl_cp # for correct mbridge
-# environment option2: use container docker://verlai/verl:vllm011.dev_qwenvl_cp
+# Requires vLLM 0.11 or newer, Megatron-LM 0.13 or newer, and the `qwen3vl_cp` MBridge branch.
  
 
 PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --config-name='ppo_megatron_trainer' \
@@ -95,7 +90,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     train_actor_rollout_ref.actor.kl_loss_coef=0.01 \
     train_actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     train_actor_rollout_ref.actor.entropy_coeff=0 \
-    +train_actor_rollout_ref.actor.rollout_n=$rollout_N \
+    train_actor_rollout_ref.actor.rollout_n=$rollout_N \
     train_actor_rollout_ref.actor.use_dynamic_bsz=True \
     train_actor_rollout_ref.actor.ppo_max_token_len_per_gpu=45056 \
     +train_actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_offload_fraction=0 \
@@ -144,7 +139,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     \
     psrl.rollout_coordination.routing_strategy.method="request_num_balance" \
     psrl.rollout_coordination.routing_strategy.enable_group_sticky=False \
-    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=10000 \
+    psrl.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption=1 \
     psrl.rollout_coordination.routing_strategy.max_concurrent_seqs_per_instance=1024 \
     \
     psrl.rollout_coordination.sync_and_mig_strategy.method="greedy" \
@@ -161,7 +156,7 @@ PYTHONUNBUFFERED=1 python3 -m psrl.trainer.main_ppo --config-path=./config --con
     trainer.project_name=$project_name \
     trainer.experiment_name=$experiment_name \
     trainer.val_before_train=False \
-    trainer.save_freq=1 \
+    trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_training_steps=10 \
     trainer.default_local_dir="${CKPTS_DIR}" \

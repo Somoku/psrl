@@ -4,12 +4,10 @@ SWE-bench / SWE-smith-py Dataset Converter.
 Converts Hugging Face dataset rows into the PSRL parquet format consumed by
 `fsdp_qwen_7b_swe_smith.sh` and related training scripts.
 
-Each output row contains:
-  - prompt:        minimal [user] message (framework appends agent templates).
-  - data_source:   "swebench_verified" | "swe_smith_py".
-  - reward_model:  grounding truth for reward computation.
-  - extra_info:    per-SWE-problem overrides and grading metadata.
-  - agent_name:    "mini_swe_agent".
+Each output row contains `prompt` (a minimal user message, since the framework
+appends agent templates), `data_source` (`swebench_verified` or `swe_smith_py`),
+`reward_model` (grounding truth for reward computation), `extra_info` (per-problem
+overrides and grading metadata), and `agent_name` (`mini_swe_agent`).
 
 Usage::
 
@@ -65,9 +63,7 @@ from examples.mini_swe.prepare.swebench_subsets import (
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# ---------------------------------------------------------------------------
-# Dataset mappings (mirrors minisweagent DATASET_MAPPING)
-# ---------------------------------------------------------------------------
+# --- Dataset mappings ---
 
 _DATASET_HF_MAP: dict[str, str] = {
     "verified": "SWE-bench/SWE-bench_Verified",
@@ -83,9 +79,8 @@ _DATA_SOURCE_MAP: dict[str, str] = {
     "smith": "swe_smith_py",
 }
 
-# SWE-smith images have the repo baked in at HEAD with the bug committed, but
-# with the F2P test files *removed* on HEAD.  HEAD~1 has the bug + F2P tests.
-# Verified images are self-contained: the repo is at base_commit, no removal.
+# SWE-smith uses `HEAD~1` to restore removed F2P tests.
+# Other datasets use the image checkout directly.
 _NEEDS_HEAD_MINUS_ONE: dict[str, bool] = {
     "verified": False,
     "lite": False,
@@ -93,16 +88,14 @@ _NEEDS_HEAD_MINUS_ONE: dict[str, bool] = {
     "smith": True,
 }
 
-# ---------------------------------------------------------------------------
-# Row conversion
-# ---------------------------------------------------------------------------
+# --- Row conversion ---
 
 
 def _ensure_list(value: Any) -> list[str]:
     """
     Coerce FAIL_TO_PASS / PASS_TO_PASS to a plain Python list of strings.
 
-    SWE-bench rows may store these fields as JSON-encoded strings; SWE-smith
+    SWE-bench rows may store these fields as JSON-encoded strings. SWE-smith
     rows use native HF `Sequence` (already a list).
 
     Args:
@@ -156,16 +149,14 @@ def _build_row(
     f2p: list[str] = _ensure_list(swe_problem.get("FAIL_TO_PASS", []))
     p2p: list[str] = _ensure_list(swe_problem.get("PASS_TO_PASS", []))
 
-    # Ground truth for reward computation.  ``instance_id`` is kept as the dict
-    # key here because downstream swebench / swesmith harnesses expect exactly
-    # that field name.
+    # Keep `instance_id` because downstream harnesses require that exact key.
     ground_truth: dict[str, Any] = {
         "instance_id": swe_problem_id,
         "repo": swe_problem.get("repo", ""),
         "image_name": image_name,
         "FAIL_TO_PASS": f2p,
         "PASS_TO_PASS": p2p,
-        # Gold patch kept for reference / offline analysis; not used in RL reward.
+        # The gold patch supports offline analysis but is not used for RL reward.
         "gold_patch": swe_problem.get("patch", ""),
     }
     # Include Verified-only fields when present.
@@ -181,10 +172,8 @@ def _build_row(
         },
     }
 
-    # Store the complete SWE problem dict for the grader.  Verified rows already
-    # carry ``eval_script``/``log_parser`` from the HF dataset; SWE-smith rows do
-    # not, so freeze the official-shaped eval script and the flattened parser
-    # name here (see examples/mini_swe/grading/freeze.py).
+    # Store the complete SWE problem dict for the grader, freezing an official-shaped
+    # eval script for SWE-smith rows that lack the HF dataset's `eval_script`/`log_parser`.
     swe_problem_plain: dict[str, Any] = {
         k: _ensure_list(v) if k in ("FAIL_TO_PASS", "PASS_TO_PASS") else v for k, v in swe_problem.items()
     }
@@ -212,9 +201,7 @@ def _build_row(
     }
 
 
-# ---------------------------------------------------------------------------
-# Main conversion logic
-# ---------------------------------------------------------------------------
+# --- Main conversion ---
 
 
 def convert_dataset(
@@ -237,10 +224,10 @@ def convert_dataset(
             for SWE-smith-py).
         subset_spec (str): Optional slice (``"0:100"``) or regex filter applied
             before sampling.
-        total (int | None): Maximum number of rows in the output.  If None,
+        total (int | None): Maximum number of rows in the output. If None,
             use all rows that survive filtering and per-repo caps.
         repo_balanced (bool): If True, apply repo-balanced round-robin sampling
-            to reach `total`.  If False, simply truncate to `total`.
+            to reach `total`. If False, simply truncate to `total`.
         per_repo_k (int | None): Per-repo hard cap applied before round-robin.
         seed (int): Random seed for deterministic shuffling.
         agent_name (str): Agent loop name tag written to each row.
@@ -248,30 +235,29 @@ def convert_dataset(
     Returns:
         pd.DataFrame: Converted dataset, ready to write as parquet.
     """
-    from datasets import load_dataset  # local import — heavy dep
+    from datasets import load_dataset  # Avoid loading the heavy dependency at module import.
 
     hf_path = _DATASET_HF_MAP.get(dataset_key)
     assert hf_path is not None, f"Unknown dataset key {dataset_key!r}. Valid keys: {sorted(_DATASET_HF_MAP.keys())}."
     data_source = _DATA_SOURCE_MAP[dataset_key]
     needs_head_minus_one = _NEEDS_HEAD_MINUS_ONE[dataset_key]
 
-    psrl_logger.info(f"Loading {hf_path!r} split={split!r}...")
+    psrl_logger.info(f"Loading dataset={hf_path!r}, split={split!r}...")
     swe_problems: list[dict[str, Any]] = list(load_dataset(hf_path, split=split))
-    psrl_logger.info(f"Loaded {len(swe_problems)} SWE problems.")
+    psrl_logger.info(f"Loaded SWE problems. Count: {len(swe_problems)}.")
 
     # Apply spec filter first.
     if subset_spec:
         swe_problems = filter_by_spec(swe_problems, subset_spec)
-        psrl_logger.info(f"After spec filter: {len(swe_problems)} SWE problems.")
+        psrl_logger.info(f"SWE problems after spec filter: {len(swe_problems)}.")
 
-    # Drop instances whose problem_statement is empty — these have no task
-    # description for the agent and produce uninformative rollouts.
+    # Drop instances without a problem statement because they cannot guide an agent.
     n_before = len(swe_problems)
     swe_problems = [p for p in swe_problems if p.get("problem_statement", "")]
     n_dropped = n_before - len(swe_problems)
     if n_dropped:
         psrl_logger.info(
-            f"Dropped {n_dropped} instances with empty problem_statement ({len(swe_problems)} remaining)."
+            f"Dropped instances with empty problem_statement: {n_dropped}. Remaining: {len(swe_problems)}."
         )
         print(f"[prepare_swebench] Dropped {n_dropped} / {n_before} instances with empty problem_statement.")
 
@@ -286,19 +272,17 @@ def convert_dataset(
     elif total is not None:
         swe_problems = swe_problems[:total]
 
-    psrl_logger.info(f"Converting {len(swe_problems)} SWE problems to PSRL format...")
+    psrl_logger.info(f"Converting SWE problems to PSRL format. Count: {len(swe_problems)}...")
     rows = [
         _build_row(prob, data_source=data_source, needs_head_minus_one=needs_head_minus_one, agent_name=agent_name)
         for prob in swe_problems
     ]
     df = pd.DataFrame(rows)
-    psrl_logger.info(f"Conversion complete: {len(df)} rows.")
+    psrl_logger.info(f"Conversion row count: {len(df)}.")
     return df
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+# --- CLI ---
 
 
 def main() -> None:

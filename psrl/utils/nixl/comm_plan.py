@@ -80,8 +80,7 @@ class CommunicationPlanner:
 
     def __init__(self, restrict_client_group_comm: bool = False):
         """Initialize the communication planner"""
-        # NOTE(lhy): if restrict_client_group_comm is True,
-        # we will restrict communciation only happens between client groups
+        # NOTE(lhy): Restrict communication to matching client groups when enabled.
         self.restrict_client_group_comm = restrict_client_group_comm
 
     def make_comm_plan(self, clients: dict[str, NIXLClientInfo]) -> NIXLCommPlan:
@@ -224,9 +223,8 @@ class CommunicationPlanner:
 
         restrict_target_to_source_client_group_mapping = {}
         if self.restrict_client_group_comm:
-            # NOTE(lhy): for pull we don't have any restriction
-            # for push, we currently use round robin to map target client groups to source client groups
-            # this should be improved to use a more intelligent mapping
+            # NOTE(lhy): Push traffic uses round robin group pairing, while pull
+            # traffic remains unrestricted.
             if is_push_to_ps:
                 for target_client_group_id in target_client_groups.keys():
                     source_client_group_ids = [
@@ -252,10 +250,7 @@ class CommunicationPlanner:
                     source_client_groups.keys()
                 )
 
-        # Precompute key -> list of source clients once per unique restriction-group set,
-        # rather than re-scanning for every (target_client, key) pair: O(G × C_s) total
-        # instead of O(N_targets × N_keys × G × C_s).
-        # key_to_sources_by_restriction[restriction_key] = {key: [src_client, ...]}
+        # Cache source clients by restriction set to avoid rescanning every target key.
         key_to_sources_by_restriction: dict[tuple, dict[str, list[str]]] = {}
         for target_client_group_id in target_client_groups.keys():
             restrict_ids = restrict_target_to_source_client_group_mapping[target_client_group_id]
@@ -375,8 +370,8 @@ class CommunicationPlanner:
 
                     # Verify all shards are assigned
                     assert assigned_shards == needed_shards, (
-                        f"Not all shards assigned for key {key} on target client {target_client}, \
-                        needed_shards: {needed_shards}, assigned_shards: {assigned_shards}"
+                        f"Not all shards assigned for key {key} on target client {target_client}. "
+                        f"Needed shards: {needed_shards}. Assigned shards: {assigned_shards}."
                     )
 
     def _get_link_type_for_test(self, client1: str, client2: str):

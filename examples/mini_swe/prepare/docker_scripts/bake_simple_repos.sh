@@ -15,12 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="${1:-python:3.11-slim}"
 CONTAINER_NAME="bake_simple_repos_$$"
 
-# NOTE(lhy): Uncomment and replace with your own proxy if needed.
 # export http_proxy=http://your-proxy-host:port
 # export https_proxy=http://your-proxy-host:port
 
-# If the invoking shell has proxy vars set, pass them into containers (apt uses these).
 DOCKER_PROXY_ARGS=()
+# NOTE(lhy): Uncomment and replace the proxy exports above if needed.
 for _name in http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY; do
     if [[ -n "${!_name:-}" ]]; then
         DOCKER_PROXY_ARGS+=(-e "$_name")
@@ -59,7 +58,7 @@ print(' && '.join(commands))
 echo "[*] Force re-baking all repos..."
 echo "[*] Creating container and baking repos..."
 
-# python:3.11-slim doesn't have git by default — install it first
+# Install Git because the slim image omits it.
 docker run --name "$CONTAINER_NAME" "${DOCKER_PROXY_ARGS[@]}" "$IMAGE" \
     /bin/bash -ce "
         echo '>>> apt-get update' &&
@@ -69,7 +68,7 @@ docker run --name "$CONTAINER_NAME" "${DOCKER_PROXY_ARGS[@]}" "$IMAGE" \
         echo '>>> git global config' &&
         git config --global user.email 'psrl@swe-agent.local' &&
         git config --global user.name 'PSRL' &&
-        echo '>>> baking case repos (many commits; may take a while)...' &&
+        echo '>>> Baking case repositories. This may take a while...' &&
         $SETUP_SCRIPT
     "
 

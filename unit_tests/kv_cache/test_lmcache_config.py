@@ -47,9 +47,7 @@ class TestLMCacheConfig:
         assert config.to_engine_kwargs() == {}
         assert config.to_env_vars() == {}
 
-    # ------------------------------------------------------------------ #
-    # to_engine_kwargs                                                     #
-    # ------------------------------------------------------------------ #
+    # --- to_engine_kwargs ---
 
     def test_cpu_engine_kwargs(self):
         config = LMCacheConfig(enable=True, backend="cpu", offload_size_gb=20.0)
@@ -65,9 +63,7 @@ class TestLMCacheConfig:
             config = LMCacheConfig(enable=True, backend=backend)
             assert config.to_engine_kwargs()["disable_hybrid_kv_cache_manager"] is True
 
-    # ------------------------------------------------------------------ #
-    # to_env_vars — common                                                 #
-    # ------------------------------------------------------------------ #
+    # --- common to_env_vars ---
 
     def test_experimental_flag_always_set(self):
         config = LMCacheConfig(enable=True, backend="cpu")
@@ -84,9 +80,7 @@ class TestLMCacheConfig:
         env_vars = config.to_env_vars()
         assert env_vars["LMCACHE_CONFIG_FILE"] == "/path/to/lmcache.yaml"
 
-    # ------------------------------------------------------------------ #
-    # to_env_vars — CPU backend                                            #
-    # ------------------------------------------------------------------ #
+    # --- CPU backend to_env_vars ---
 
     def test_cpu_env_vars_basic(self):
         config = LMCacheConfig(enable=True, backend="cpu")
@@ -105,14 +99,12 @@ class TestLMCacheConfig:
         assert env_vars["LMCACHE_RESERVE_LOCAL_CPU_SIZE"] == "2.5"
 
     def test_cpu_no_max_local_cpu_size_env_var(self):
-        """max_local_cpu_size must NOT be set via env var — vLLM computes per-rank value."""
+        """Ensure vLLM computes each rank's max_local_cpu_size instead of reading an environment variable."""
         config = LMCacheConfig(enable=True, backend="cpu", offload_size_gb=20.0)
         env_vars = config.to_env_vars()
         assert "LMCACHE_MAX_LOCAL_CPU_SIZE" not in env_vars
 
-    # ------------------------------------------------------------------ #
-    # to_env_vars — disk backend                                           #
-    # ------------------------------------------------------------------ #
+    # --- disk backend to_env_vars ---
 
     def test_disk_env_vars(self):
         config = LMCacheConfig(
@@ -126,18 +118,14 @@ class TestLMCacheConfig:
         assert env_vars["LMCACHE_LOCAL_DISK"] == "/tmp/lmcache_disk"
         assert env_vars["LMCACHE_MAX_LOCAL_DISK_SIZE"] == "50.0"
 
-    # ------------------------------------------------------------------ #
-    # to_env_vars — remote backend                                         #
-    # ------------------------------------------------------------------ #
+    # --- remote backend to_env_vars ---
 
     def test_remote_env_vars(self):
         config = LMCacheConfig(enable=True, backend="remote", remote_url="redis://host:6379")
         env_vars = config.to_env_vars()
         assert env_vars["LMCACHE_REMOTE_URL"] == "redis://host:6379"
 
-    # ------------------------------------------------------------------ #
-    # to_env_vars — cache behaviour flags                                  #
-    # ------------------------------------------------------------------ #
+    # --- cache behavior flags ---
 
     def test_save_decode_cache_default_not_emitted(self):
         config = LMCacheConfig(enable=True, save_decode_cache=False)
@@ -171,9 +159,7 @@ class TestLMCacheConfig:
         config = LMCacheConfig(enable=True, enable_async_loading=True)
         assert config.to_env_vars()["LMCACHE_ENABLE_ASYNC_LOADING"] == "True"
 
-    # ------------------------------------------------------------------ #
-    # backend enum                                                         #
-    # ------------------------------------------------------------------ #
+    # --- backend enum ---
 
     def test_get_backend_enum(self):
         config = LMCacheConfig(enable=True, backend="cpu")

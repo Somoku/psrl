@@ -164,10 +164,9 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # are visible to vLLM, then attached to the live engine in run_server().
         self.kv_cache_manager: KVCacheManager | None = None
 
-        # NOTE(linsh): determine at construction time whether this server runs a pooling model
-        # (e.g., reward / embedding model) so that generate() can dispatch to encode() accordingly.
+        # NOTE(linsh): Detect pooling models before `generate` selects the inference path.
         self.is_pooling_model = config.get("runner", "generate") == "pooling"
-        # Populated in run_server() once the engine is up; None for generative models.
+        # Populated after engine startup. Generative models retain `None`.
         self.pooling_params: PoolingParams | None = None
 
     async def is_init_model(self):
@@ -208,11 +207,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
             lmcache_raw["lmcache_instance_id"] = lmcache_instance_id
 
-        # The router can only score the off-GPU tier if LMCache publishes its
-        # store events into vLLM's KV event stream. Derive it from the routing
-        # config the same way `_build_kv_events_args()` derives the vLLM-side
-        # publisher, so `lmcache_overlap_weight` cannot be set to a value that
-        # silently does nothing.
+        # Off-GPU cache scoring requires LMCache events in vLLM's KV event stream.
         lmcache_raw["enable_kv_events"] = bool(
             lmcache_raw.get("enable", False)
             and is_cache_aware_method(self.psrl_config.rollout_coordination.routing_strategy.method)
@@ -255,18 +250,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         lmcache_cfg.allocated_p2p_lookup_ports = ports[2 * n : 3 * n]
 
     def _build_kv_events_args(self) -> dict:
-        """Build vLLM ``kv_events_config`` for SMG event-driven routing.
+        """
+        Build vLLM `kv_events_config` for SMG event-driven routing.
 
         Returns an args fragment enabling the native ZMQ KV-event publisher when
         the rollout router uses the cache-aware strategy. Returns ``{}`` (no
         publisher) otherwise, so the feature is zero-cost when unused.
 
-        The publisher binds ``tcp://*:<base_port>`` on the server host; vLLM
-        offsets the port by ``dp_rank`` for each DP engine core
-        (``ZmqEventPublisher.offset_endpoint_port``), giving every rank an
-        independent stream + sequence counter. The SMG ``VllmEngineServicer``
-        bridge connects to ``127.0.0.1:<base_port + dp_rank>`` per the
-        ``dp_rank`` carried in the subscribe request.
+        Each DP rank uses an independent ZMQ port derived from `base_port`.
         """
         routing_method = self.psrl_config.rollout_coordination.routing_strategy.method
         if not is_cache_aware_method(routing_method):
@@ -384,11 +375,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         self.kv_cache_manager = self._build_kv_cache_manager()
         args.update(self.kv_cache_manager.get_engine_kwargs())
 
-        # Enable native vLLM KV cache event publishing so SMG's event-driven
-        # cache-aware router can subscribe.
-        # vLLM merges GPU prefix cache + LMCache connector events into one ZMQ stream;
-        # with DP it offsets the port per rank automatically (offset_endpoint_port).
-        # The SMG servicer bridge (SubscribeKvEvents) connects to this endpoint on localhost.
+        # SMG consumes the merged GPU and LMCache event stream through localhost.
         kv_events_args = self._build_kv_events_args()
         if kv_events_args:
             args.update(kv_events_args)
@@ -408,7 +395,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                     served_model_name = served_model_name.split("/")[-1]
                 args["served_model_name"] = served_model_name
 
-        # mtp (None for diffusion models; only LLM models use speculative decoding)
+        # MTP applies only to LLM models, not diffusion models.
         if self.config.mtp is not None and self.config.mtp.enable and self.config.mtp.enable_rollout:
             speculative_config = {
                 "method": self.config.mtp.method,
@@ -518,15 +505,17 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
         vllm_config.parallel_config.data_parallel_master_port = self._dp_master_port
-        # AGENT(VERL): wire preemption_notification_threshold into vLLM config for PSRL,
-        # so that the engine can trigger preemption notifications to PSRL when needed.
-
-        # NOTE(linsh): wire preemption_notification_threshold into SchedulerConfig for PSRL.
-        # This replaces the old additional_config["max_num_waiting_reqs_after_preemption"] mechanism
-        # and enables gateway_preemption_req_ids in SchedulerStats, consumed by PSRLPreemptionStatLogger.
+        # AGENT(VERL): wire preemption_notification_threshold into vLLM for the PSRL gateway loopback.
         vllm_config.scheduler_config.preemption_notification_threshold = (
             self.psrl_config.rollout_coordination.routing_strategy.max_num_waiting_reqs_after_preemption
         )
+        # Wire prefill composition logging config into SchedulerConfig so RolloutScheduler
+        # can read them directly without relying on environment variables.
+        vllm_config.scheduler_config.psrl_prefill_composition_enable = (
+            self.psrl_config.profile.prefill_composition.enable
+        )
+        vllm_config.scheduler_config.psrl_logging_path = str(self.psrl_config.logging_path)
+        vllm_config.scheduler_config.psrl_replica_idx = self.get_replica_idx()
 
         fn_args = set(dict(inspect.signature(AsyncLLM.from_vllm_config).parameters).keys())
         kwargs = {}
@@ -581,8 +570,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
         self._server_port = await self._start_grpc_server(engine_client)
 
-        # NOTE(linsh): initialize PoolingParams for pooling models (e.g., reward / embedding models).
-        # For generative models this remains None and is never used.
+        # NOTE(linsh): Initialize `PoolingParams` only for pooling models.
         if self.is_pooling_model:
             normalize = self.config.reward_kwargs.get("normalize", False)
             use_activation = self.config.reward_kwargs.get("use_activation", False)
@@ -600,21 +588,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             )
 
     async def _start_grpc_server(self, engine_client: "AsyncLLM") -> int:
-        """Start a gRPC server backed by *engine_client* and return the bound port.
+        """
+        Start the engine gRPC server and return its bound port.
 
-        The server implements the ``VllmEngine`` gRPC service defined in
-        ``smg/crates/grpc_client/proto/vllm_engine.proto`` via
-        ``smg_grpc_servicer.vllm.servicer.VllmEngineServicer``.
-
-        The port returned here is stored in ``self._server_port`` so that
-        ``register_server_to_gateway()`` can build the correct
-        ``grpc://<addr>:<port>`` URL for SMG registration.
-
-        Requirements (installed via ``scripts/install_basic.sh``):
-            - ``grpcio``
-            - ``grpcio-reflection``
-            - ``smg_grpc_proto``  (``smg/crates/grpc_client/python/``)
-            - ``smg-grpc-servicer`` (``smg/grpc_servicer/``)
+        The bound port is required for subsequent SMG registration.
         """
         start_time = time.time()
         kv_transfer_cfg = self.psrl_config.rollout_coordination.routing_strategy.get("kv_transfer", {})
@@ -632,24 +609,14 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
         server = grpc.aio.server(
             options=[
-                # Unlimited message sizes — model outputs can be very large.
+                # Model outputs require unlimited message sizes.
                 ("grpc.max_send_message_length", -1),
                 ("grpc.max_receive_message_length", -1),
-                # Allow client keepalive pings every 10 s even without active calls.
-                # The default 300 s threshold is too strict for long-running generation.
+                # Allow keepalive pings every 10 seconds without active calls.
                 ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
                 ("grpc.keepalive_permit_without_calls", True),
-                # Raise max_ping_strikes from the default of 2 to 0 (unlimited).
-                # During connection establishment (especially when multiple SMG
-                # channels connect simultaneously), HTTP/2 SETTINGS + PING
-                # handshakes can temporarily exceed the min_recv_ping_interval.
-                # The default of 2 strikes causes premature GOAWAY
-                # ("Too many pings") that kills the entire HTTP/2 transport,
-                # including unrelated Generate RPCs sharing the same channel.
-                # Setting to 0 disables the strike counter so the server relies
-                # solely on min_recv_ping_interval for rate-limiting — pings
-                # arriving too fast are silently ignored instead of triggering
-                # a connection-killing GOAWAY.
+                # Unlimited ping strikes prevent simultaneous channel setup from
+                # terminating the shared HTTP/2 transport.
                 ("grpc.http2.max_ping_strikes", 0),
             ],
         )
@@ -662,8 +629,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         )
         reflection.enable_server_reflection(service_names, server)
 
-        # Use port 0 to let the OS assign a free ephemeral port; grpc returns the
-        # actual bound port from add_insecure_port().
+        # Port zero requests a free ephemeral port from the operating system.
         port = server.add_insecure_port(f"{self._server_address}:0")
         await server.start()
 
@@ -754,8 +720,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def sleep(self, level: int):
         await self.engine.sleep(level)
         if self.psrl_config.tms.range in ["rollout", "all"]:
-            # NOTE(linsh): empty_cache is done in vLLM cumem, but not for TMS.
-            # Here we do an aggressive empty cache for TMS.
+            # NOTE(linsh): TMS requires an explicit aggressive cache clear.
             aggressive_empty_cache(force_sync=True)
 
     async def wake_up(self):
@@ -791,18 +756,16 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         await self.grpc_servicer.open_generate_admission()
 
     async def pause_for_sync(self):
-        # Clear the park gate BEFORE closing admission so the invariant holds
-        # (resume event set ⟹ engine live / sync-failed). New Generate calls
-        # arriving from now on will park instead of hitting the paused engine.
+        # Close the park gate before admission so new requests cannot reach a
+        # paused engine.
         self.grpc_servicer.pause_generation_admission()
         await self.close_grpc_generate_admission()
         # KV cache clearing is deferred to pull_model() after weights are updated.
         await self.pause_generation(clear_cache=False)
-        psrl_logger.info(f"Generation paused on replica {self.get_replica_idx()} for sync with PS")
+        psrl_logger.info(f"Generation paused for parameter server sync: replica={self.get_replica_idx()}.")
 
     async def resume_after_sync(self):
-        # Order matters: engine live first, then reopen admission, then wake
-        # parked requests — so woken requests find an open gate + live engine.
+        # Resume the engine before waking parked requests.
         await self.resume_generation()
         await self.open_grpc_generate_admission()
         self.grpc_servicer.resume_generation_admission()
@@ -811,9 +774,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
     async def fail_sync(self):
         await self.close_grpc_generate_admission()
         await self.pause_generation(clear_cache=False)
-        # Wake any parked requests with the failed flag set (engine quarantined),
-        # so they abort → gateway loopback re-routes them to a healthy instance
-        # instead of hanging forever.
+        # Failed parked requests must wake and reroute away from the quarantined engine.
         self.grpc_servicer.fail_generation_admission()
 
     async def wait_for_requests_to_drain(self):
@@ -895,11 +856,8 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             timeout = aiohttp.ClientTimeout(total=self._timeout)
             self._gateway_client = aiohttp.ClientSession(connector=connector, timeout=timeout)
 
-        # KV cache-aware routing label: the instance id lets SMG address this
-        # instance as a migration transfer destination. SMG carries only this id
-        # in TransferKv; the source instance's servicer resolves the actual
-        # per-rank peer URLs from its own broadcast registry (the single source
-        # of truth for P2P addressing, installed by init_lmcache_p2p()).
+        # SMG identifies transfer destinations by LMCache instance ID. Source
+        # servicers resolve per-rank peer URLs from their registries.
         lmcache_instance_id = None
         if self.kv_cache_manager is not None and self.kv_cache_manager.config.enable_p2p:
             lmcache_instance_id = self.kv_cache_manager.config.lmcache_instance_id
@@ -982,8 +940,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         is_validate: bool = False,
     ) -> TokenOutput | None:
         """Generate sequence with token-in-token-out."""
-        # NOTE(linsh): for pooling models (e.g., reward / embedding models), route to the
-        # encode path instead of the autoregressive generation path.
+        # NOTE(linsh): Route pooling models through the encoding path.
         if self.is_pooling_model:
             return await self._encode_internal(
                 prompt_ids=prompt_ids,
@@ -1000,17 +957,16 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         # The router should guarantee the request is assigned to a rollout instance
         # that can directly generate with the needed model version.
         assert version_tag <= curr_rollout_instance_model_version, (
-            f"Needed model version {version_tag} should not be greater than "
-            f"current rollout instance model version {curr_rollout_instance_model_version}."
+            f"Model version requirement exceeds rollout version: required={version_tag}, "
+            f"current={curr_rollout_instance_model_version}."
         )
 
         # All the partial rollout requests (with version tag less than the current rollout
         # instance model version) should be updated to the current rollout instance model version
         if version_tag < curr_rollout_instance_model_version:
             psrl_logger.debug(
-                f"Request {request_id} needed model version {version_tag} is less than "
-                f"current rollout instance model version {curr_rollout_instance_model_version}, "
-                f"we'll update needed model version to {curr_rollout_instance_model_version}."
+                f"Updating request model version: request_id={request_id!r}, "
+                f"required={version_tag}, current={curr_rollout_instance_model_version}."
             )
             version_tag = curr_rollout_instance_model_version
             # Update version tag in staleness inventory
@@ -1033,8 +989,6 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
             if not update_status_success:
                 return None
-
-        #### Pre processing before generation ####
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
@@ -1061,7 +1015,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
 
         assert max_tokens <= max_possible_tokens, (
-            f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
+            f"max_tokens={max_tokens} exceeds available context space={max_possible_tokens}."
         )
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -1107,7 +1061,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         final_res: RequestOutput | None = None
         async for output in generator:
             final_res = output
-        assert final_res is not None
+        assert final_res is not None, "Generation completed without a final response."
 
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
@@ -1184,15 +1138,10 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
         is_validate: bool = False,
     ) -> TokenOutput | None:
         """
-        Encode (pool) a sequence for reward-model / embedding inference.
+        Run pooling inference and return its output.
 
-        This is the pooling-model counterpart to the autoregressive generation path in
-        ``generate()``.  It calls ``self.engine.encode()`` with ``self.pooling_params``
-        and returns a ``TokenOutput`` whose ``pooling_output`` field carries the
-        resulting embedding / classification tensor.
-
-        Pooling requests are non-preemptible (single forward pass, no KV-cache growth)
-        so ``interrupted`` is always ``False``.
+        Pooling completes in one forward pass, so it cannot be preempted and
+        always returns `interrupted=False`.
 
         Args:
             prompt_ids (list[int]): Input token IDs.
@@ -1424,8 +1373,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
             (self.base_worker_id, data_parallel_rank)
         )
         assert curr_model_version >= ps_version, (
-            f"Current rollout instance model version should not be less than the required PS version, "
-            f"but got {curr_model_version} vs. {ps_version}."
+            f"Pulled model version is stale: current={curr_model_version}, required={ps_version}."
         )
         for dp_rank in data_parallel_ranks:
             self.curr_rollout_instance_model_version[dp_rank] = curr_model_version
@@ -1509,9 +1457,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
                 model_state_dict_cpu = (
                     await object_ref
                 )  # This blocks until the state dict is available in the object store
-            # Load the model state dict to the vllm model
-            # sharding will be handled automatically inside vllm
-            # NOTE(linsh): transfer from CPU to GPU is handled inside vLLM extension function `load_weights`.
+            # `load_weights` handles sharding and CPU-to-GPU transfer.
             params_to_load = [
                 (
                     name,
@@ -1533,9 +1479,7 @@ class PSRL_vLLMHttpServer(vLLMHttpServer):
 
     async def get_total_kv_cache_tokens(self) -> int:
         await self._is_init_model.wait()
-        # engine.collective_rpc returns a per-worker list; all ranks return the
-        # same value. The shared collective_rpc wrapper discards its result,
-        # so call the engine directly and unwrap.
+        # All ranks return the same value, so unwrap the first collective result.
         results = await self.engine.collective_rpc(method="get_total_kv_cache_tokens")
         if not results:
             raise RuntimeError("get_total_kv_cache_tokens collective_rpc returned no results")
@@ -1594,7 +1538,7 @@ class PSRL_vLLMReplica(vLLMReplica):
         """Launch http server in each node."""
         # AGENT(VERL): sync with verl's update
         assert len(self.workers) == self.world_size, (
-            f"worker number {len(self.workers)} not equal to world size {self.world_size}"
+            f"Worker count mismatch: workers={len(self.workers)}, world_size={self.world_size}."
         )
 
         self._validate_launch_requirements()
@@ -1636,10 +1580,7 @@ class PSRL_vLLMReplica(vLLMReplica):
             env_vars = {
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                 "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                # To prevent hanging or crash during synchronization of weights between actor and rollout
-                # in disaggregated mode. See:
-                # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
-                # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                # Disaggregated weight synchronization requires disabling NCCL cuMem.
                 "NCCL_CUMEM_ENABLE": "0",
                 "VLLM_DISABLE_ATTN": "1" if self.config.disable_attn else "0",
             }
@@ -1651,7 +1592,7 @@ class PSRL_vLLMReplica(vLLMReplica):
                     os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
                     "torch_memory_saver_hook_mode_preload.abi3.so",
                 )
-                assert os.path.exists(dynlib_path), f"LD_PRELOAD so file {dynlib_path} does not exist."
+                assert os.path.exists(dynlib_path), f"Missing LD_PRELOAD shared object: path={dynlib_path!r}."
 
                 vllm_patch_env = ""
                 if self.psrl_config.tms.enable_cuda_graph:

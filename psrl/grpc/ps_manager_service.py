@@ -13,7 +13,7 @@ from psrl.workers.ps.request_status_tracker import PSRL_RequestStatus
 
 try:
     from psrl_state_grpc_proto import psrl_manager_pb2, psrl_manager_pb2_grpc
-except ImportError as exc:  # pragma: no cover - import environment issue
+except ImportError as exc:  # pragma: no cover
     raise ImportError(
         "Missing dependency `psrl-state-grpc-proto`. "
         "Please install it (for example: pip install -e psrl_state/python)."
@@ -228,13 +228,10 @@ class PSManagerGrpcServer:
         server = grpc.server(
             futures.ThreadPoolExecutor(max_workers=16),
             options=[
-                # Allow client keepalive pings every 10s even without active calls.
-                # The SMG client sends HTTP/2 PING frames every 30s; the gRPC-core
-                # default of 300s would trigger GOAWAY after 2 strikes (60s).
+                # Permit 10-second client keepalives to avoid GOAWAY after two 30-second pings.
                 ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
                 ("grpc.keepalive_permit_without_calls", True),
-                # Disable GOAWAY on ping-rate violations — rely on the interval
-                # above for rate-limiting instead of killing the transport.
+                # Rely on the receive interval instead of GOAWAY for ping rate limiting.
                 ("grpc.http2.max_ping_strikes", 0),
             ],
         )

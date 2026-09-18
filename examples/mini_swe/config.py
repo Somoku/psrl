@@ -21,9 +21,8 @@ from omegaconf import DictConfig, OmegaConf
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# ---------------------------------------------------------------------------
-# Nested structured dataclasses
-# ---------------------------------------------------------------------------
+
+# --- Structured configuration ---
 
 
 @dataclass
@@ -47,7 +46,7 @@ class MiniEnvironmentConfig:
     forward_env: list[str] = field(default_factory=list)
     memory: str | int | None = "8g"
     container_timeout: str = "2h"
-    # Default shell-command timeout; case-specific mappings may override it.
+    # Default shell-command timeout. Case-specific mappings may override it.
     timeout: int = 30
 
 
@@ -109,10 +108,10 @@ class MiniModelConfig:
     Fields:
         model_class: mini-swe-agent model implementation name or import path.
         action_regex: Regex applied to the model's text output to extract the
-            shell command.  Change this to switch action formats, e.g.
+            shell command. Change this to switch action formats, e.g.
             ``"```bash\\\\s*\\\\n(.*?)\\\\n```"`` for a plain bash block.
         observation_template: Jinja2 template that formats Docker command output
-            into the next user message.  Training and eval must use the same
+            into the next user message. Training and eval must use the same
             template or the model sees unfamiliar observation formatting.
         format_error_template: Message sent back to the model when
             ``action_regex`` finds 0 or >1 matches.
@@ -140,9 +139,7 @@ class MiniSWEAgentRuntimeConfig:
     model: MiniModelConfig = field(default_factory=MiniModelConfig)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---
 
 
 def _ensure_dict(val: Any) -> dict:
@@ -162,9 +159,7 @@ def _ensure_dict(val: Any) -> dict:
     return {}
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+# --- Factory ---
 
 
 def build_runtime_config(
@@ -193,9 +188,7 @@ def build_runtime_config(
     return cfg
 
 
-# ---------------------------------------------------------------------------
-# Per-SWE-problem overrides
-# ---------------------------------------------------------------------------
+# --- Per-problem overrides ---
 
 _SANDBOX_FIELDS = frozenset(MiniSandboxConfig.__dataclass_fields__)
 _AGENT_OVERRIDE_FIELDS = frozenset(("cost_limit", "system_template", "problem_template"))

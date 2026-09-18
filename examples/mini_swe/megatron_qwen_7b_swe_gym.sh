@@ -50,8 +50,7 @@ DIST_CKPT_PATH=${PSRL_WORKSPACE}/models/mcore_ckpt/SWE-agent-LM-7B
 python ${PSRL_PATH}/scripts/convert_hf_to_mcore.py --hf_model_path ${HF_MODEL_PATH} --output_path ${DIST_CKPT_PATH}
 
 # --- Data ---
-# Train: SWE-Gym full 2438 instances (11 repos, difficulty suitable for 7B models).
-# Validation: SWE-bench Verified 80-problem repo-balanced subset.
+
 TRAIN_FILE=${PSRL_PATH}/examples/mini_swe/data/swe_gym_subset_100/train.parquet
 TEST_FILE=${PSRL_PATH}/examples/mini_swe/data/verified_subset_80/train.parquet
 
@@ -111,8 +110,8 @@ clip_ratio_low=0.2
 clip_ratio_high=0.28
 
 # --- Sequence lengths ---
-# SWE-Gym tasks are real-world bugs from 11 repos. Cap at 30 turns
-# which is sufficient for most resolvable instances.
+
+# Most resolvable SWE-Gym tasks fit within 30 turns.
 max_turns=30
 max_prompt_length=2048
 max_response_length=30000
@@ -136,8 +135,8 @@ top_k=-1
 val_top_p=0.7
 
 # --- Reward ---
-# SWE-Gym has moderate difficulty (7B model can resolve some instances),
-# so partial_credit provides useful gradient signal beyond binary {+1,-1}.
+
+# Partial credit provides signal beyond binary SWE-Gym outcomes.
 reward_mode=partial_credit
 
 # --- TIS ---

@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# build_harness_runtimes.sh — materialize the read-only harness runtime trees.
+# build_harness_runtimes.sh: materialize the read-only harness runtime trees.
 #
 # Each harness ships as a self-contained, node-free native executable placed at
 #     $PSRL_HARNESS_RUNTIME_ROOT/<kind>/bin/<executable>
+#
 # The harness loop bind-mounts that tree read-only into every sandbox, so no
 # sandbox installs Node/npm or mutates the task image's global toolchain.
 #
 # Run once per shared filesystem visible to every worker (the mount source is
-# resolved on the worker, like the task images). Idempotent: a tree whose
-# executable already answers --version is left untouched; pass --force to rebuild.
+# resolved on the worker, like the task images).
+#
+# Idempotent: a tree whose executable already answers --version is left
+# untouched. Pass --force to rebuild.
 #
 #   export PSRL_HARNESS_RUNTIME_ROOT=/shared/psrl/harness-runtimes
-#   bash build_harness_runtimes.sh              # all harnesses
-#   bash build_harness_runtimes.sh claude_code  # one harness
+#   bash build_harness_runtimes.sh (all harnesses)
 #
-# Pinned versions (single source of truth; bump here to upgrade):
-#   Claude Code 2.1.233  (linux-x64)
-#   Codex       0.154.0  (linux-x64)
+#   bash build_harness_runtimes.sh claude_code (one harness)
+#
+# Pinned versions (single source of truth, bump here to upgrade):
+#   Claude Code 2.1.233 (linux-x64)
+#
+#   Codex 0.154.0 (linux-x64)
 # Both come from the npm registry as platform packages. NPM_REGISTRY defaults to
-# registry.npmjs.org; point it at a mirror (e.g. https://mirrors.tencent.com/npm)
+#
+# registry.npmjs.org. Point it at a mirror (e.g. https://mirrors.tencent.com/npm)
 # when the node cannot reach npmjs.org directly.
 set -euo pipefail
 

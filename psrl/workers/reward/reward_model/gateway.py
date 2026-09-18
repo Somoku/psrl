@@ -17,16 +17,7 @@ psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 @ray.remote
 class RewardModelGateway:
-    """
-    Launches a dedicated smg router process for a single named reward model.
-
-    Key differences from RolloutGateway:
-    - routing policy: ``round_robin`` (no cost model, no staleness tracking)
-    - no PS manager integration
-    - ``enable_routing_loop=False``
-    - port range starts at 8200 (avoids collision with rollout gateway at 8100)
-    - one instance per reward model name
-    """
+    """Run a dedicated round-robin SMG router for one reward model."""
 
     def __init__(self, config: DictConfig, model_name: str) -> None:
         self.config = config
@@ -55,7 +46,7 @@ class RewardModelGateway:
             return self.smg_url
 
         self.smg_ip = ray.util.get_node_ip_address().strip("[]")
-        self.smg_port = find_available_port(base_port=8300)  # 8100=rollout main, 8200=rollout session
+        self.smg_port = find_available_port(base_port=8300)  # avoids rollout gateway ports 8100 and 8200
 
         router_args = self._init_router_args()
 

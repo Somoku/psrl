@@ -942,13 +942,19 @@ workloads to share GPU memory.
 
 Settings for multi-turn agent training loops (tool-use, code generation, SWE-agent).
 
-`agentic_rl.manager_retry_on_error`
-: On rollout errors, retry via the manager instead of crashing the worker. On
-  validation failure, manager shrinks `val_buffer_size` so the waiter is unblocked.
-  Applies to terminations where `TerminateReason.needs_manager_retry()` is `True`
-  (rollout errors and unclassified failures). When `False`, the worker raises
-  `RuntimeError` immediately so the failure is visible instead of silently stalling.
-  **Default:** `True`
+`agentic_rl.refill_failure_threshold`
+: How many rollout groups may fail back to back, with none completing in between,
+  before training aborts. A train buffer entry is all-or-nothing, so a failed group
+  is purged and replaced by one fresh prompt. When the fault is deterministic (an
+  unreachable registry, a broken task image) every replacement fails the same way
+  and the run churns refills at zero progress instead of failing. On reaching the
+  threshold the manager latches a diagnosis naming the dominant `TerminateReason`
+  and raises it from `wait_for_training_batch` and `wait_for_training_chunk`, which
+  are the calls the driver blocks on. Any group that reaches `OCCUPIED` clears the
+  count, so sporadic failures over a long run never accumulate into a trip. A refill
+  that dispatches nothing aborts immediately regardless of the count, because the
+  slot is already lost at that point.
+  **Default:** `32`
 
 `agentic_rl.trajectory_output.enable`
 : Whether every agent loop writes a per-trajectory text dump via `TrajectoryWriter`.
@@ -1137,8 +1143,10 @@ TransferQueue configuration is a top-level block in `ppo_trainer.yaml`.
 
 ### Profile
 
-Analysis-only switches that deliberately break training correctness. Keep both at
-their defaults for real runs.
+Switches for profiling and analysis. `disable_attn` and `fix_weight` deliberately
+break training correctness. Keep them at `False` for real runs. The `time_split`
+and `prefill_composition` switches are observability-only and safe to enable during
+normal training.
 
 `profile.disable_attn`
 : Disable attention in the rollout engine, propagated to vLLM as `VLLM_DISABLE_ATTN`
@@ -1148,6 +1156,26 @@ their defaults for real runs.
 `profile.fix_weight`
 : Skip the weight-load step after a parameter pull, so rollout instances keep serving
   their initial weights. Useful for measuring sync overhead without the load cost.
+  **Default:** `False`
+
+`profile.time_split.enable`
+: Enable periodic per-replica prefill/decode time-split logging to
+  `<psrl.logging_path>/TimeSplit_I{replica_idx}.log`. Each line reports cumulative
+  prefill and decode wall-time, prefill fraction, token counts, and wall time since
+  engine start.
+  **Default:** `True`
+
+`profile.time_split.interval_in_s`
+: Interval between time-split log entries, in seconds.
+  **Default:** `60.0`
+
+`profile.prefill_composition.enable`
+: Enable per-step prefill composition logging to
+  `<psrl.logging_path>/Prefill_I{replica_idx}.log`. Every engine step that runs a
+  prefill kernel emits one entry: which sequences were batched (new request, chunked
+  prefill, or co-scheduled decode), how many tokens each contributed as cache hit vs.
+  actual compute, and the host-side step duration. No sampling. High log volume on
+  long runs (potentially GB per replica).
   **Default:** `False`
 
 ---

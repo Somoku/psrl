@@ -64,18 +64,16 @@ class PSRL_AgentLoopWorker:
             capacity_coordinator: Node-local sandbox capacity coordinator.
         """
 
-        # Per-actor identity used to label every Docker container this worker
-        # spawns (rollout containers in MiniSWEAgentLoop, grader containers in
-        # swebench_grader). The reaper sidecar below filters by this label to
-        # reclaim only this actor's containers when the actor process dies,
-        # which is robust under SIGKILL, OOM, Ray actor restart, and
-        # multiple-actors-per-node packing.
+        # The sandbox lease uses this id to attribute containers to this worker.
         self._actor_id = f"w{worker_id}-{os.uname().nodename}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         os.environ["PSRL_ACTOR_ID"] = self._actor_id
 
         self.config = config
         model_config = config.gen_actor_rollout_ref.model
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+        self.overlong_filtering = bool(config.gen_actor_rollout_ref.rollout.agent.get("overlong_filtering", False))
+        if self.overlong_filtering:
+            psrl_logger.warning("Overlong filtering enabled: budget-truncated trajectories contribute no gradient.")
 
         # TransferQueue bootstrap (connects to controller/storage spun up by the driver).
         tq.init()
@@ -142,7 +140,7 @@ class PSRL_AgentLoopWorker:
             if self.model_config.processor is not None:
                 self.model_config.processor.chat_template = resolved_template
             self.model_config.tokenizer.chat_template = resolved_template
-            psrl_logger.info(f"Applied custom chat template from {custom_template_value!r} to agent-loop tokenizer.")
+            psrl_logger.info(f"Applied custom chat template: source={custom_template_value!r}.")
 
         # Initialize rollout trace config
         trace_config = self.config.gen_actor_rollout_ref.rollout.get("trace", {})
@@ -253,7 +251,7 @@ class PSRL_AgentLoopWorker:
                 future.result()  # This will raise an exception if the task failed
             except Exception as e:
                 tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-                psrl_logger.error(f"Task {task} failed with exception: {e}\nTraceback:\n{tb_str}")
+                psrl_logger.error(f"Task failed: task={task!r}, error={e!r}.\nTraceback:\n{tb_str}")
             finally:
                 self.agent_programs.discard(task)
 
@@ -335,8 +333,8 @@ class PSRL_AgentLoopWorker:
         except Exception as e:
             tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
             psrl_logger.error(
-                f"Agent loop '{agent_name}' for request {request_index} "
-                f"(prompt {prompt_index}) raised an exception: {e}\n"
+                f"Agent loop failed: name={agent_name!r}, request_id={request_index}, "
+                f"prompt_id={prompt_index}, error={e!r}.\n"
                 f"Full traceback:\n{tb_str}"
             )
             raise
@@ -362,7 +360,7 @@ class PSRL_AgentLoopWorker:
             validate=validate,
         ):
             assert agent_name in AGENT_LOOP_REGISTRY, (
-                f"Agent loop {agent_name} not registered, registered agent loops: {AGENT_LOOP_REGISTRY.keys()}"
+                f"Unregistered agent loop: name={agent_name!r}, available={AGENT_LOOP_REGISTRY.keys()!r}."
             )
             agent_loop = self._create_agent_loop(agent_name)
 
@@ -383,13 +381,10 @@ class PSRL_AgentLoopWorker:
                             batch, raise_on_error=raise_on_error
                         )
                     except Exception as e:
-                        # raise_on_error=True triggered from run_with_termination_handling.
-                        # Log the full traceback here (ensures visibility in DualOutputHandler),
-                        # then proceed with cleanup before re-raising.
+                        # Log the traceback before cleanup and propagation.
                         tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
                         psrl_logger.error(
-                            f"Agent loop for requests {request_ids} raised an error "
-                            f"(will proceed with cleanup before re-raising):\n{tb_str}"
+                            f"Agent loop failed before cleanup: request_ids={request_ids!r}.\nTraceback:\n{tb_str}"
                         )
                         raised_error = e
                         terminate_reason = TerminateReason.ROLLOUT_ERROR
@@ -409,9 +404,9 @@ class PSRL_AgentLoopWorker:
                                 self._failure_diagnostics(agent_loop),
                             )
                         psrl_logger.warning(
-                            f"Agent loop for requests {request_ids} "
-                            f"terminated with reason {terminate_reason.value} on "
-                            f"attempt {retry_attempt}/{retry_limit}, retrying..."
+                            f"Retrying agent loop: request_ids={request_ids!r}, "
+                            f"reason={terminate_reason.value!r}, "
+                            f"attempt={retry_attempt}/{retry_limit}."
                         )
                         continue
 
@@ -424,20 +419,16 @@ class PSRL_AgentLoopWorker:
                             self._failure_diagnostics(agent_loop),
                         )
                     psrl_logger.warning(
-                        f"Agent loop for requests {request_ids} "
-                        f"terminated with reason {terminate_reason.value} "
-                        f"after {retry_limit} attempts."
+                        f"Agent loop exhausted retries: request_ids={request_ids!r}, "
+                        f"reason={terminate_reason.value!r}, attempts={retry_limit}."
                     )
                     output = None
 
-                # Notify manager to recover the lost buffer slot.
-                # Uses TerminateReason.needs_manager_retry() as the single
-                # classification point — no hardcoded enum lists here.
+                # Only the manager can purge the partial group and dispatch a replacement
+                # prompt, and it owns the breaker that ends a deterministically failing run.
                 if terminate_reason.needs_manager_retry():
-                    # Reuse the scalar `validate` (see normalization above); a raw
-                    # `tu.get(batch, "validate")` here would be a truthy list and
-                    # wrongly route train failures into the validation branch of
-                    # `notify_group_failed`, skipping the fresh-data refill.
+                    # `validate` must remain scalar or training failures enter the
+                    # validation recovery branch.
                     failed_uid = tu.get(batch, "uid")[0]
                     parent_id = tu.get(batch, "parent_id")[0] if "parent_id" in batch else failed_uid
                     if self.config.psrl.agentic_rl.get("manager_retry_on_error", True):
@@ -453,6 +444,7 @@ class PSRL_AgentLoopWorker:
                             parent_id=parent_id,
                             failed_uid=failed_uid,
                             is_validate=validate,
+                            terminate_reason=terminate_reason,
                             failure_summary=self._failure_diagnostics(agent_loop),
                         )
                     else:
@@ -464,7 +456,7 @@ class PSRL_AgentLoopWorker:
                         )
                 else:
                     psrl_logger.debug(
-                        f"Agent loop for requests {request_ids} terminated with reason {terminate_reason.value}."
+                        f"Agent loop terminated: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
                     )
 
             # Put the output into the TransferQueue and notify PSManager
@@ -489,14 +481,12 @@ class PSRL_AgentLoopWorker:
                         level=logging.DEBUG,
                         event_type=EventType.OTHER,
                     ):
-                        await self.postprocess_output(output, batch)
+                        await self.postprocess_output(output, batch, terminate_reason)
             elif terminate_reason != TerminateReason.ABORTED:
-                # Generation failed (e.g. HTTP error, timeout) without PSManager being notified.
-                # The SMG already reserved a staleness-inventory entry for this request.
-                # Abort it now so the RESERVED entry is freed and the buffer can make progress.
+                # Abort the reserved inventory entry after an unreported generation
+                # failure so the buffer can progress.
                 psrl_logger.warning(
-                    f"Generation failed for requests {request_ids} "
-                    f"(terminate_reason={terminate_reason.value}), aborting in PSManager."
+                    f"Aborting failed generation: request_ids={request_ids!r}, reason={terminate_reason.value!r}."
                 )
                 await self.ps_manager_handle.abort_requests.remote(request_ids)
 
@@ -505,11 +495,23 @@ class PSRL_AgentLoopWorker:
             if raised_error is not None:
                 raise raised_error
 
-    async def postprocess_output(self, output: TokenOutput | list[TokenOutput], batch: TensorDict):
+    async def postprocess_output(
+        self,
+        output: TokenOutput | list[TokenOutput],
+        batch: TensorDict,
+        terminate_reason: TerminateReason = TerminateReason.FINISHED,
+    ):
         """Commit generation output to TQ and notify the manager.
 
-        Tensor payloads stay in TQ; only compact request metadata is sent to the
+        Tensor payloads stay in TQ. Only compact request metadata is sent to the
         manager for group occupation.
+
+        Args:
+            output (TokenOutput | list[TokenOutput]): Trajectories to commit.
+            batch (TensorDict): The originating prompt batch.
+            terminate_reason (TerminateReason): Why the episode stopped. Carried into
+                the committed fields so the trainer can drop budget-truncated
+                trajectories from the loss.
         """
         uid = tu.get(batch, "uid")[0]
         is_validate = tu.get(batch, "validate")[0]
@@ -519,7 +521,7 @@ class PSRL_AgentLoopWorker:
 
         outputs = output if isinstance(output, list) else [output]
 
-        keys, fields = self._build_output_fields(outputs, batch, uid, version_tag)
+        keys, fields = self._build_output_fields(outputs, batch, uid, version_tag, terminate_reason)
 
         await tq.async_kv_batch_put(
             keys=keys,
@@ -546,6 +548,7 @@ class PSRL_AgentLoopWorker:
         batch: TensorDict,
         uid: int,
         version_tag: int,
+        terminate_reason: TerminateReason = TerminateReason.FINISHED,
     ) -> tuple[list[str], list[dict]]:
         """Build output keys and field dicts with tensor operations.
 
@@ -563,9 +566,7 @@ class PSRL_AgentLoopWorker:
             position_ids = self._compute_position_ids(
                 input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
             ).squeeze(0)
-            # ``images_seqlens`` is training-engine metadata used for ViT FLOPs/MFU
-            # accounting, not a model input. Keep a single top-level copy instead of
-            # forwarding it through ``multi_modal_inputs`` as well.
+            # `images_seqlens` is training metadata, so retain only its top-level copy.
             images_seqlens = multi_modal_inputs.pop("images_seqlens", None)
             if images_seqlens is None:
                 images_seqlens = torch.empty(0, dtype=torch.int64)
@@ -581,12 +582,27 @@ class PSRL_AgentLoopWorker:
             # do not store raw image/video
             field.pop("multi_modal_data", None)
             field = {k: v for k, v in field.items() if v is not None}
+            # NOTE(lhy): DAPO overlong filtering. A truncated reward reports the cutoff
+            # and an ungraded one was never measured, so neither may steer the policy.
+            # Zero only the VALUES: the mask carries the nested per-row length contract.
+            if self.overlong_filtering and (terminate_reason.is_budget_truncated or terminate_reason.is_ungraded):
+                field["response_mask"] = torch.zeros_like(field["response_mask"])
             field["loss_mask"] = field["response_mask"]
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
             field["images_seqlens"] = images_seqlens
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+            # Merged batch fields can carry a stale `response_mask`, so recheck the
+            # response-length invariant after assembly.
+            mask_len = field["response_mask"].size(0)
+            if mask_len != response_len:
+                raise AssertionError(
+                    f"[uid={uid} trajectory={i}/{len(outputs)}] responses has {response_len} "
+                    f"tokens but response_mask has {mask_len} after merging the batch fields "
+                    f"with this trajectory's output (prompt_len={prompt_len}). The merge picked "
+                    "up a mask that does not belong to this trajectory."
+                )
             field["seq_len"] = prompt_len + response_len
             field["prompt_len"] = prompt_len
             field["response_len"] = response_len
@@ -596,6 +612,9 @@ class PSRL_AgentLoopWorker:
                 field["parent_id"] = tu.get(batch, "parent_id")[0]
             field["trajectory_index"] = i
             field["trajectory_num"] = len(outputs)
+            # Carried for metrics so the trainer can report reward and gradient share per
+            # termination without re-deriving them from the rollout logs.
+            field["terminate_reason"] = terminate_reason.value
             fields.append(field)
         return keys, fields
 

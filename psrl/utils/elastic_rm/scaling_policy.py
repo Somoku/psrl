@@ -33,7 +33,7 @@ class InstanceSignal:
     total_token_num: int
     snapshot_timestamp: str | None = None
     # Set of (node_id, gpu_id) pairs occupied by this instance.
-    # Populated by ElasticExecutor; None means mapping unavailable.
+    # Populated by `ElasticExecutor`. None means the mapping is unavailable.
     gpu_keys: frozenset | None = None
 
 
@@ -57,9 +57,9 @@ class ScalingDecision:
 
 class ThroughputProfileLoader:
     """
-    Loader for fitted throughput formulas in throughput_model/*_token.json.
-    The formula is evaluated by running-queue length x:
-        mu(x) = A * (1 - (B * x + 1)^(-k))
+    Load fitted throughput formulas from `throughput_model/*_token.json`.
+
+    Each formula maps running queue length to estimated throughput.
     """
 
     def __init__(
@@ -204,9 +204,7 @@ class ScalingPolicy:
         self.hysteresis = float(cfg.get("hysteresis", 0.05))
         self.min_awake_per_role = max(0, int(cfg.get("min_awake_per_role", 0)))
         self.full_load_mode = str(cfg.get("full_load_mode", "any")).lower()
-        # Extra guard for Priority-3 spontaneous shrink:
-        # even if KV cache is low, do not shrink when waiting queue is still high.
-        # This is computed per-role as total waiting queues across awake instances.
+        # Prevent spontaneous shrink while an awake role still has a large waiting queue.
         self.max_waiting_queue_for_scale_down = int(cfg.get("max_waiting_queue_for_scale_down", 0))
 
         profile_paths = cfg.get("profile_paths", {})
@@ -359,7 +357,7 @@ class ScalingPolicy:
         """Spontaneous shrink: only cede when KV is already low (below ``theta_low``).
 
         Used when a role has spare capacity (Priority 1/3), not for forced rebalance
-        under mutual full load — see ``_pick_scale_down_candidate_for_bottleneck_transfer``.
+        under mutual full load. See ``_pick_scale_down_candidate_for_bottleneck_transfer``.
         """
         awaken = [s for s in role_signals if s.is_awaken]
         if len(awaken) <= self.min_awake_per_role:
@@ -422,8 +420,8 @@ class ScalingPolicy:
         GPUs are completely free of any awake instance from the other role.
 
         "Free" means: the candidate's gpu_keys have no intersection with the gpu_keys
-        of any currently awake other-role instance.  Candidates with unknown GPU
-        mapping (gpu_keys is None or empty) are skipped — we can't guarantee they are
+        of any currently awake other-role instance. Candidates with unknown GPU
+        mapping (gpu_keys is None or empty) are skipped because we cannot guarantee they are
         free, so we won't take the risk of double-occupancy.
 
         Returns the highest-mu free candidate, or None if no such instance exists.
@@ -592,9 +590,7 @@ class ScalingPolicy:
             rollout_down_waiting=rollout_down_waiting,
         )
 
-        # Priority -1: keep trainer continuously training.
-        # When trainer is idle and blocked by current batch, directly bias scale-up
-        # towards the bottleneck stage (rollout/reward).
+        # Scale the stage blocking an idle trainer to keep training active.
         hint = trainer_waiting_hint or {}
         trainer_busy = bool(hint.get("trainer_busy", True))
         waiting_on = str(hint.get("waiting_on", "none")).lower()
@@ -658,15 +654,8 @@ class ScalingPolicy:
             )
             return actions, "trainer_idle_waiting_reward"
 
-        # ── Priority 1 (new) ──────────────────────────────────────────────────────
-        # Applies when EXACTLY one side is full.
-        # Step A: try to wake an instance of the full side on a GPU that is
-        #         completely idle for the other side (no scale_down needed).
-        # Step B: fall back to ceding a low-load instance from the other side.
-        # Both-full case is handled by Priority 2 below.
-        # ─────────────────────────────────────────────────────────────────────────
-
-        # Pre-compute free-GPU candidates (only needed when exactly one side full).
+        # Priority 1: when one side is full, prefer a free GPU to taking a low-load peer's resource.
+        # Pre-compute free-GPU candidates only when exactly one side is full.
         rm_free_up: InstanceSignal | None = None
         rollout_free_up: InstanceSignal | None = None
         if rm_full and not rollout_full:
@@ -676,7 +665,7 @@ class ScalingPolicy:
 
         # P1a: only RM is full
         if rm_full and not rollout_full:
-            # Step A: free-GPU scale-up — no resource taken from Rollout
+            # Step A uses a free GPU without taking resources from Rollout.
             if rm_free_up is not None:
                 actions.append(
                     ScalingAction(
@@ -698,7 +687,7 @@ class ScalingPolicy:
                     reason="rm_full_free_gpu_scale_up",
                 )
                 return actions, "rm_full_free_gpu_scale_up"
-            # Step B: fall back — cede a low-load Rollout instance
+            # Step B cedes a low load Rollout instance.
             if rm_up is not None and rollout_down is not None:
                 actions.append(
                     ScalingAction(
@@ -723,7 +712,7 @@ class ScalingPolicy:
 
         # P1b: only Rollout is full
         if rollout_full and not rm_full:
-            # Step A: free-GPU scale-up — no resource taken from RM
+            # Step A uses a free GPU without taking resources from RM.
             if rollout_free_up is not None:
                 actions.append(
                     ScalingAction(
@@ -745,7 +734,7 @@ class ScalingPolicy:
                     reason="rollout_full_free_gpu_scale_up",
                 )
                 return actions, "rollout_full_free_gpu_scale_up"
-            # Step B: fall back — cede a low-load RM instance
+            # Step B cedes a low load RM instance.
             if rollout_up is not None and rm_down is not None:
                 actions.append(
                     ScalingAction(
@@ -768,13 +757,9 @@ class ScalingPolicy:
                 )
                 return actions, "transfer_rm_to_rollout"
 
-        # ── Priority 2 ────────────────────────────────────────────────────────────
-        # Both sides full → optimize bottleneck throughput by one-step transfer.
-        # We compare candidate gains with queue-rebalance simulation instead of naive
-        # add/subtract current mu, because queue pressure changes after scaling.
-        # Sleep-side candidates ignore theta_low: full KV on both sides is normal
-        # here; theta_low remains the gate for *spontaneous* shrink in Priority 3.
-        # ─────────────────────────────────────────────────────────────────────────
+        # --- Priority 2 ---
+
+        # Transfer one instance only when simulated bottleneck throughput improves.
         bottleneck_before = min(
             self._estimate_role_total_mu_with_rebalance(rollout_signals),
             self._estimate_role_total_mu_with_rebalance(rm_signals),
@@ -992,9 +977,7 @@ class ScalingPolicy:
         instance_mu, role_total_mu = self._build_mu_maps(signals)
         estimated_lambda = self._estimate_lambda(signals, role_total_mu)
 
-        # Hard guarantee: if one role has zero awaken instances but router backlog exists,
-        # force wake one instance for that role. Must run *before* the all-signals-stale guard:
-        # asleep engines often have no fresh snapshot timestamps, which would otherwise skip this.
+        # Wake roles with backlog before stale snapshots can suppress the action.
         backlog_map = router_backlog_by_role or {}
         for role_name, role_signals in grouped.items():
             awaken_cnt = sum(1 for s in role_signals if s.is_awaken)

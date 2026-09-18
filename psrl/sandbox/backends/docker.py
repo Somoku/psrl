@@ -45,10 +45,8 @@ from psrl.sandbox.utils.docker_utils import lease_store_id
 
 psrl_logger = logging.getLogger(__file__)
 
-# FILESYSTEM_SNAPSHOT + RESTORE: a docker commit turns a container's writable
-# layer into a reusable image, and restore creates a container from it — the
-# cheap, self-contained "clean snapshot" used to seed the grader without a
-# fresh cold start.
+# FILESYSTEM_SNAPSHOT + RESTORE: docker commit turns a container's writable layer into a reusable
+# image, and restore creates one from it: a cheap, self-contained grader snapshot with no cold start.
 _DOCKER_CAPABILITIES = SandboxCapabilities(
     frozenset(
         {

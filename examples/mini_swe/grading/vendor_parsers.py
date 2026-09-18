@@ -15,7 +15,7 @@ It does two things:
    function named `swesmith_log_parser_<sha>` and writes them to
    `_vendor/swesmith_parsers.py`.
 
-The output is committed; `PROVENANCE.md` records the upstream versions and
+The output is committed. `PROVENANCE.md` records the upstream versions and
 per-file digests. `freeze.py` uses the same `<sha>` naming scheme, so a
 prepare-time assertion can guarantee every row's parser exists in the registry.
 """

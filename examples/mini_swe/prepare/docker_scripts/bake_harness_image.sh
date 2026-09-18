@@ -1,34 +1,43 @@
 #!/usr/bin/env bash
-# bake_harness_image.sh — bake per-task git-purged derivative images.
+# bake_harness_image.sh: bake per-task git-purged derivative images.
 #
 # Each SWE task uses its OWN per-problem base image (the parquet's
 # `sandbox_overrides.environment.image`), so a single global baked image is
-# meaningless. This script derives, from one base image or from every unique
-# image in a parquet, a derivative image
-#     psrl/swebench-harness:<sha12(base-image)>
-# that purges leaked git metadata (remotes / refs / reflog / unreachable objects)
-# so a sandbox that starts from it can never read a future fix commit. Runner
-# (`examples/mini_swe/runner.py`) selects the derivative when it exists locally
-# and otherwise falls back to the original image + the runtime git sanitization,
-# so a missing bake never blocks training.
 #
-# The harness executable is NOT baked here. It is mounted read-only from the
-# host runtime tree by the harness loop, so no sandbox ever installs into (or
-# mutates) the task image's global toolchain. Build that tree once with
+# meaningless. From one base image, or from every unique image in a parquet,
+# this script derives a derivative image:
+#
+#     psrl/swebench-harness:<sha12(base-image)>
+#
+# The derivative purges leaked git metadata (remotes / refs / reflog /
+# unreachable objects), so a sandbox that starts from it can never read a future
+#
+# fix commit. Runner (`examples/mini_swe/runner.py`) selects the derivative when
+# it exists locally and otherwise falls back to the original image plus the
+#
+# runtime git sanitization, so a missing bake never blocks training.
+#
+# The harness executable is NOT baked here. The harness loop mounts it read-only
+# from the host runtime tree, so no sandbox ever installs into (or mutates) the
+#
+# task image's global toolchain. Build that tree once with
 # `build_harness_runtimes.sh`.
 #
 # Usage (once per worker host that creates sandboxes):
-#   bash bake_harness_image.sh swebench/swesmith.x86_64.foo:latest          # one image
-#   bash bake_harness_image.sh --parquet ../../data/swe_smith_py_1k/train.parquet  # all unique images
+#   bash bake_harness_image.sh <image> (one image)
+#
+#   bash bake_harness_image.sh --parquet <path> (all unique images)
 #
 # Env overrides:
-#   PSRL_BAKE_WORKDIR    repo workdir inside the image to git-purge (default /testbed)
-#   PSRL_BAKE_SKIP_GIT_CLEAN=1  skip the git purge (no-op derivative)
-#   PSRL_HARNESS_IMAGE_TAG  explicit output tag (single-image mode only)
+#   PSRL_BAKE_WORKDIR repo workdir inside the image to git-purge (default /testbed)
 #
-# The tag keys on the base image alone, so this script SKIPS an image that is
-# already baked. After changing the bake steps, run rebake_harness_image.sh
-# instead to replace the stale derivative.
+#   PSRL_BAKE_SKIP_GIT_CLEAN=1 skip the git purge (no-op derivative)
+#   PSRL_HARNESS_IMAGE_TAG explicit output tag (single-image mode only)
+#
+# The tag keys on the base image alone, so this script SKIPS an image already
+# baked. After changing the bake steps, run rebake_harness_image.sh instead to
+#
+# replace the stale derivative.
 set -euo pipefail
 
 BAKE_WORKDIR="${PSRL_BAKE_WORKDIR:-/testbed}"
@@ -37,9 +46,12 @@ SKIP_GIT_CLEAN="${PSRL_BAKE_SKIP_GIT_CLEAN:-0}"
 digest() { printf '%s' "$1" | sha256sum | cut -c1-12; }
 
 # Purge leaked git metadata so the derivative can never expose a future fix
-# commit. Must stay in sync with examples/mini_swe/utils/git_sanitize.py. The workdir
-# placeholder is substituted on the host; a missing repo or a non-worktree is a
-# no-op, so this is safe for images that do not bake a repo at BAKE_WORKDIR.
+# commit. Must stay in sync with examples/mini_swe/utils/git_sanitize.py.
+#
+# The workdir placeholder is substituted on the host. A missing repo or a
+# non-worktree is a no-op, so this is safe for images that do not bake a repo at
+#
+# BAKE_WORKDIR.
 git_clean_script='set -u
 workdir="__PSRL_BAKE_WORKDIR__"
 cd "$workdir" 2>/dev/null || { echo "git-clean: $workdir missing; skipping" >&2; exit 0; }

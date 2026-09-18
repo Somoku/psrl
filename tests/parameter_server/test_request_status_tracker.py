@@ -16,6 +16,12 @@ class TestRequestLifecycleHappyPath:
         status = tracker.get_request_status(1)
         assert status == [PSRL_RequestStatus.PENDING]
 
+    def test_trajectory_count_updates_payload_keys(self, tracker):
+        tracker.add_request(request_id=34)
+        tracker.update_request_n_trajectory(request_id=34, n_trajectory=3)
+
+        assert tracker._request_tq_keys(34) == ["34_0", "34_1", "34_2"]
+
     def test_update_to_rollout_routing(self, tracker):
         tracker.add_request(1)
         tracker.update_request_status(1, PSRL_RequestStatus.ROLLOUT_ROUTING)
@@ -53,12 +59,7 @@ class TestInterruptionPaths:
         assert tracker.get_request_status(10) == [PSRL_RequestStatus.ROLLOUT_INTERRUPTED]
 
     def test_all_interrupt_states_covered(self, tracker):
-        """ROLLOUT_INTERRUPTED is the single interruption state on this branch.
-
-        Note: ROLLOUT_INTERRUPTED_BY_SCHEDULER was removed in base_agentic_rl;
-        ROLLOUT_INTERRUPTED now covers both coordinator-driven and scheduler-driven
-        interruptions.
-        """
+        """Verify the unified interruption state covers coordinator and scheduler aborts."""
         tracker.add_request(11)
         tracker.update_request_status(11, PSRL_RequestStatus.ROLLOUT_RUNNING)
         tracker.update_request_status(11, PSRL_RequestStatus.ROLLOUT_INTERRUPTED)
@@ -76,12 +77,7 @@ class TestErrorCases:
             tracker.get_request_status(99999)
 
     def test_duplicate_add_request_overwrites(self, tracker):
-        """add_request silently overwrites on duplicate — no exception raised.
-
-        Note: update_request_status does NOT raise on any transition; it returns
-        True (success) or False (aborted/stale). There is no invalid-transition
-        guard in the implementation — any PSRL_RequestStatus value is accepted.
-        """
+        """Duplicate requests overwrite status without transition validation."""
         tracker.add_request(20, status=PSRL_RequestStatus.PENDING)
         # overwrite: status resets to PENDING (the new call's default)
         tracker.add_request(20, status=PSRL_RequestStatus.PENDING)

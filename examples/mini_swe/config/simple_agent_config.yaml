@@ -109,11 +109,8 @@
       nl -ba filename.py | sed -n '10,20p'
       ```
   model:
-    # Action format used during training and eval.
-    # Both session-routed training and standalone eval (eval_swebench.py) read
-    # from this section, so editing one place changes both.
-    # To switch to plain ```bash blocks (e.g. for compatibility with other
-    # models), change action_regex and update the system_template accordingly.
+    # Training and evaluation share this action format.
+    # Update the system template when changing `action_regex`.
     action_regex: "```mswea_bash_command\\s*\\n(.*?)\\n```"
     observation_template: "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
     format_error_template: "Please always provide EXACTLY ONE action in triple backticks, found {{actions|length}} actions."

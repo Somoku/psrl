@@ -75,9 +75,8 @@ class ClaudeCodeHarness(Harness):
         if self.config.setting_sources:
             command.extend(("--setting-sources", self.config.setting_sources))
         if runtime.max_turns is not None:
-            # Keep the framework's episode bound enforced by Claude Code too;
-            # otherwise the CLI can continue making tool-use turns after PSRL's
-            # post-hoc max-turn classification has already become irrelevant.
+            # Keep the framework's episode bound enforced by Claude Code too, otherwise the CLI can
+            # keep making tool-use turns after PSRL's post-hoc max-turn classification became irrelevant.
             command.extend(("--max-turns", str(runtime.max_turns)))
         if self.config.reasoning_effort is not None:
             command.extend(("--effort", self.config.reasoning_effort))
@@ -129,10 +128,8 @@ class ClaudeCodeHarness(Harness):
         if not self.config.subagents_enabled:
             env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
         if runtime.context_window_tokens and runtime.compaction_token_limit:
-            # Claude Code accepts the compaction window in tokens and the trigger
-            # as a percentage of that window.
-            # The window is the rollout `max_model_len`;
-            # the percentage is the configured `compact_percent`.
+            # Claude Code takes the compaction window in tokens and the trigger as a percentage of
+            # that window. The window is the rollout `max_model_len`, the percentage `compact_percent`.
             env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(runtime.context_window_tokens))
             env.setdefault("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", str(self.config.compaction.compact_percent))
         return self.callback_no_proxy(runtime, env)

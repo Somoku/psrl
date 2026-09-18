@@ -32,9 +32,7 @@ CALCULATOR_TOOL = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- Helpers ---
 def create_session(base_url: str, client: httpx.Client) -> str:
     resp = client.post(f"{base_url}/sessions")
     resp.raise_for_status()
@@ -85,9 +83,7 @@ def run_tool(tool_calls):
     return results
 
 
-# ---------------------------------------------------------------------------
-# Verification logic
-# ---------------------------------------------------------------------------
+# --- Verification Logic ---
 def verify_training_data(accumulated, records, label, max_trim_tokens: int = 0):
     """Verify build_training_data produces correct output."""
     try:
@@ -137,14 +133,11 @@ def verify_training_data(accumulated, records, label, max_trim_tokens: int = 0):
     if model_tok == 0 and records:
         errors.append("no model tokens (all mask=0)")
 
-    # 7. Last-turn output must fully align with accumulated (no trim on last turn).
-    #    build_training_data already guards this; here we double-check for diagnostics.
+    # 7. The last-turn output must fully align with `accumulated`.
     if records:
         last_lps = records[-1].get("output_logprobs") or []
         last_output_ids = [int(pair[1]) for pair in last_lps]
         if last_output_ids and accumulated:
-            # Compute the start position of the last turn's output in accumulated
-            # by replaying the cursor logic from build_training_data.
             cursor = 0
             for rec_i, rec_r in enumerate(records[:-1]):
                 cursor = rec_r["prompt_token_count"] + len(rec_r.get("output_logprobs") or [])
@@ -190,9 +183,7 @@ def verify_logprobs_in_response(resp, label):
     return True  # Non-fatal
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# --- Tests ---
 def test_lifecycle(base_url, client):
     print("\n" + "=" * 60)
     print("Test 1: Session lifecycle (create → get → delete → get-404)")
@@ -231,7 +222,6 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
 
         ok = verify_logprobs_in_response(resp, "single-turn")
 
-        # Retrieve TITO data from SMG
         data = get_session_data(base_url, client, sid)
         max_trim_tokens = data.get("max_trim_tokens", 0)
 
@@ -245,10 +235,10 @@ def test_single_turn_with_tito(base_url, client, model, tokenizer):
         recs = trajectory.get("records", [])
 
         if not acc:
-            print("  ✗ accumulated_token_ids is empty — TITO did not capture data")
+            print("  ✗ accumulated_token_ids is empty. TITO did not capture data.")
             return False
         if not recs:
-            print("  ✗ records is empty — TurnRecord not stored")
+            print("  ✗ records is empty. TurnRecord was not stored.")
             return False
 
         print(f"  TITO data: {len(acc)} accumulated tokens, {len(recs)} records, max_trim_tokens={max_trim_tokens}")
@@ -313,7 +303,6 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
                 print(f"  → Tool: {tr['content'][:60]}")
                 messages.append(tr)
 
-        # Retrieve TITO data
         data = get_session_data(base_url, client, sid)
         max_trim_tokens = data.get("max_trim_tokens", 0)
 
@@ -327,10 +316,10 @@ def test_multi_turn_with_tito(base_url, client, model, max_turns, tokenizer):
         recs = trajectory.get("records", [])
 
         if not acc:
-            print("  ✗ accumulated_token_ids is empty — TITO not working")
+            print("  ✗ accumulated_token_ids is empty. TITO is not working.")
             return False
         if not recs:
-            print("  ✗ records is empty — TurnRecords not stored")
+            print("  ✗ records is empty. TurnRecords were not stored.")
             return False
 
         print(f"\n  TITO data: {len(acc)} accumulated tokens, {len(recs)} records, max_trim_tokens={max_trim_tokens}")
@@ -395,7 +384,7 @@ def test_independent_trajectories_with_tito(base_url, client, model, tokenizer):
             trajectory = by_id[trajectory_id]
             records = trajectory.get("records", [])
             if len(records) != 1:
-                print(f"  ✗ trajectory {trajectory_id} has {len(records)} records; expected one")
+                print(f"  ✗ Trajectory {trajectory_id} has {len(records)} records. Expected one.")
                 return False
             if not verify_training_data(
                 trajectory.get("accumulated_token_ids", []),
@@ -416,7 +405,7 @@ def test_independent_trajectories_with_tito(base_url, client, model, tokenizer):
         delete_session(base_url, client, sid)
 
 
-# ---------------------------------------------------------------------------
+# --- Entry Point ---
 def main():
     parser = argparse.ArgumentParser(description="E2E TITO training data verification")
     parser.add_argument("--session-router-url", required=True)
@@ -430,7 +419,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     client = httpx.Client(timeout=httpx.Timeout(args.timeout))
 
-    # Auto-detect model name from SMG
     model = args.model_path
     if args.smg_url:
         try:

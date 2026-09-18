@@ -1,4 +1,4 @@
-"""RolloutCoordinator — composes loop mixins into the public coordinator API."""
+"""RolloutCoordinator composes loop mixins into the public coordinator API."""
 
 from __future__ import annotations
 
@@ -41,17 +41,8 @@ from .sync_and_migrate import sync_and_migrate_mixin as sync_and_migrate_module
 psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
-# Per-loop log routing: each RolloutCoordinator loop lives in its own module with
-# its own module-level ``psrl_logger`` (named by ``__file__``, so they are all
-# distinct loggers with no parent-child relationship and no shared handler). To
-# make their records land on disk we attach a DualOutputHandler per target file
-# below. Modules mapped to the same file share ONE handler instance, because two
-# FileHandlers opened with mode="w" on the same path would truncate each other.
-#
-#   RolloutCoordinator.log : main lifecycle + command handling
-#   SyncAndMigStrategy.log : model-sync / rollout-migration loop
-#   Status.log             : engine-status queue + router-sync + stats recorder
-#   SessionStrategy.log    : session hang/continue scheduling (ThunderAgent port)
+# Loop modules use distinct loggers. Modules targeting one file must share a
+# handler because concurrent write-mode handlers would truncate each other.
 _LOG_FILE_TO_MODULE_LOGGERS = {
     "RolloutCoordinator": [command_loop_module.psrl_logger, base_module.psrl_logger],
     "SyncAndMigStrategy": [
@@ -184,10 +175,7 @@ class RolloutCoordinator(
         self._lmcache_controller_proc: subprocess.Popen | None = None
         self._lmcache_controller_url: str | None = None
 
-        # Build loggers. Each loop's module-level logger is routed to a dedicated
-        # per-loop file (see _LOG_FILE_TO_MODULE_LOGGERS) so hang/continue, sync,
-        # and status traces no longer all pile into one file. coordinator.py's own
-        # logger shares RolloutCoordinator.log with base/command_loop.
+        # Route each loop logger to its configured file.
         self.log_prefix = "RolloutCoordinator"
         self._attach_loop_log_handlers()
         psrl_logger.info("Initialized RolloutCoordinator")
@@ -207,14 +195,11 @@ class RolloutCoordinator(
             )
 
     def _attach_loop_log_handlers(self) -> None:
-        """Route each loop module's logger to its per-loop log file.
+        """
+        Route each loop module logger to its configured file.
 
-        coordinator.py, base.py, and command_loop.py share RolloutCoordinator.log;
-        the sync, status, and session loops each get their own file. A single
-        DualOutputHandler instance is reused for all loggers mapped to the same
-        file (two mode="w" FileHandlers on one path would truncate each other),
-        and re-attachment is guarded so a second RolloutCoordinator in-process
-        does not stack duplicate handlers.
+        Loggers targeting one file share a `DualOutputHandler` to prevent
+        write-mode handles from truncating each other.
         """
         logging_path = self.config.psrl.logging_path
 
@@ -338,7 +323,7 @@ class RolloutCoordinator(
         for server_handle in self.server_handles.values():
             futures.append(server_handle.init_nixl_client.remote())
         await asyncio.gather(*futures)
-        psrl_logger.info(f"Initialized NIXL client on all {len(self.server_handles)} replicas.")
+        psrl_logger.info(f"Initialized NIXL clients: replica_count={len(self.server_handles)}.")
         self._is_init_nixl_client.set()
 
     async def nixl_protocol(self, full_tag: str = "all"):
@@ -380,11 +365,8 @@ class RolloutCoordinator(
     async def initial_pull_from_ps(self, tag: str = "rollout") -> None:
         futures = [server_handle.pull_model.remote() for server_handle in self._tag_to_server(tag)]
         await asyncio.gather(*futures)
-        psrl_logger.info(f"Initial PS pull complete for {len(futures)} replicas with tag {tag}.")
-        # Sync version tracking after the pull.  At this point ps_model_version has
-        # already been set correctly by the PS manager:
-        #   - fresh training: 0 (default)
-        #   - resume training: the checkpoint step
+        psrl_logger.info(f"Initial parameter server pull complete: replicas={len(futures)}, tag={tag!r}.")
+        # Pulled replicas must advertise the parameter server version to the gateway.
         pulled_replica_ids = self.replica_ids if tag == "all" else self.tag_to_replica_ids[tag]
         pulled_instance_ids = [inst_id for inst_id in self.instance_ids if inst_id[0] in pulled_replica_ids]
         for instance_id in pulled_instance_ids:
@@ -394,8 +376,8 @@ class RolloutCoordinator(
             updates = build_weight_version_updates(pulled_instance_ids, self.ps_model_version)
             await self._publish_weight_version_updates(updates)
             psrl_logger.info(
-                f"Published initial weight version {self.ps_model_version} to gateway "
-                f"for {len(pulled_instance_ids)} instances with tag '{tag}'."
+                f"Published initial weight version: version={self.ps_model_version}, "
+                f"instances={len(pulled_instance_ids)}, tag={tag!r}."
             )
 
     async def sleep(self, tag: str = "all"):
@@ -563,8 +545,7 @@ class RolloutCoordinator(
         """
         self.ps_model_version = version
         assert self.ps_model_version > 0, "PS model version must be greater than 0."
-        # NOTE(claude): Skip ready_buffers check on the first push after resume,
-        # where the coordinator is freshly initialized and no buffers have been consumed yet
+        # NOTE(claude): Skip the ready-buffer check until resume consumes its first buffer.
         if self.ready_buffers:
             assert (self.ps_model_version - 1) in self.ready_buffers, (
                 "PS model version must be greater than the ready buffers."
@@ -583,7 +564,7 @@ class RolloutCoordinator(
             version (int): The PS model version to initialize to.
         """
         self.ps_model_version = version
-        psrl_logger.info(f"Initialized PS model version to {version} (resume)")
+        psrl_logger.info(f"Initialized resume PS model version: version={version}.")
 
     # This is called by the PS manager to update the rollout instance model version after pulling
     def set_rollout_instance_model_version(self, rollout_instance_id: RolloutInstanceId, version_tag: int):
@@ -599,7 +580,8 @@ class RolloutCoordinator(
         if rollout_instance_id in self.instance_to_engine_status:
             self.instance_to_engine_status[rollout_instance_id].model_version = version_tag
         psrl_logger.info(
-            f"Updated rollout instance {rollout_instance_id} model version: {old_version} -> {version_tag}"
+            f"Updated rollout model version: instance_id={rollout_instance_id!r}, "
+            f"old_version={old_version!r}, new_version={version_tag}."
         )
 
     def update_ready_buffer(self, ready_buffer: int):
@@ -628,9 +610,7 @@ class RolloutCoordinator(
             server_handle.set_lmcache_controller_url.remote(controller_url) for _, _, server_handle in server_items
         ]
         await asyncio.gather(*futures)
-        psrl_logger.info(
-            f"LMCache P2P Controller at {controller_url!r} broadcast to all {len(server_items)} replicas."
-        )
+        psrl_logger.info(f"Broadcast LMCache P2P controller: url={controller_url!r}, replicas={len(server_items)}.")
 
         # After Controller URL is set and Workers are registered, broadcast the
         # peer registry so server actors can bypass the Controller for KV transfers.
@@ -658,9 +638,7 @@ class RolloutCoordinator(
 
         server_items = self._get_ordered_server_items("all")
 
-        # Build peer registry: instance_id → rank-sorted list of peer_init_url
-        # (index == worker_id == global rank). Also collect each replica's own
-        # rank-sorted worker ZMQ URLs (ip:port of each rank's REP socket).
+        # Registry list indices must match global worker ranks.
         peer_registry: dict[str, list[str]] = {}
         per_replica_worker_zmq_urls: dict[int, list[str]] = {}
 
@@ -675,16 +653,14 @@ class RolloutCoordinator(
                 f"[LMCache] query_worker_info returned empty for {instance_id!r}. "
                 f"Workers may not have registered yet. resp={resp!r}"
             )
-            # Sort by worker_id so list index == global rank. An empty peer_init_url
-            # entry means that rank has no P2P endpoint, which transfer_direct's
-            # same-rank guard handles gracefully.
+            # Empty peer URLs mark ranks without a P2P endpoint.
             infos = sorted(resp["worker_infos"], key=lambda wi: wi.get("worker_id", 0))
             peer_registry[instance_id] = [wi.get("peer_init_url", "") for wi in infos]
             per_replica_worker_zmq_urls[replica_idx] = [f"{wi.get('ip', '')}:{wi.get('port', 0)}" for wi in infos]
 
         assert peer_registry, (
             "[LMCache] Peer registry is empty after querying Controller. "
-            "No instances have peer_init_url — P2P is not configured correctly."
+            "No instances have peer_init_url. P2P is not configured correctly."
         )
 
         # Broadcast to each server actor with the full registry plus that replica's
@@ -697,8 +673,8 @@ class RolloutCoordinator(
 
         total_ranks = sum(len(v) for v in per_replica_worker_zmq_urls.values())
         psrl_logger.info(
-            f"[LMCache] Peer registry broadcast to {len(server_items)} replicas "
-            f"({total_ranks} ranks total): {len(peer_registry)} instances with peers."
+            f"[LMCache] Peer registry broadcast: replicas={len(server_items)}, "
+            f"ranks={total_ranks}, peer_instances={len(peer_registry)}."
         )
 
     def start_lmcache_controller(self) -> str:
@@ -718,17 +694,8 @@ class RolloutCoordinator(
         """
         Start the `lmcache_controller` subprocess and poll until healthy.
 
-        Uses `find_available_port` to pick an unused port starting from
-        `psrl.lmcache.controller_base_port` and `get_host_info` to determine
-        the bind address.  Polls `GET /openapi.json` once per second up to
-        `psrl.lmcache.controller_health_timeout_s` seconds. The controller imports
-        torch+vLLM at startup (~30-40 s standalone) and runs on the busy ps_manager
-        node, so the budget must absorb cluster CPU/FS contention.
-
-        The subprocess stdout/stderr are redirected to
-        `${psrl.logging_path}/lmcache_controller.log` so a slow start can be told
-        apart from a crash. If the process exits before becoming healthy, this
-        fails fast with the tail of that log rather than waiting out the budget.
+        The controller must become healthy within the configured timeout. Its
+        output is retained in `lmcache_controller.log` for failure diagnosis.
 
         Returns:
             str: Base URL of the Controller, e.g. `"http://10.0.0.1:9042"`.
@@ -774,8 +741,7 @@ class RolloutCoordinator(
         health_url = f"{controller_url}/openapi.json"
         max_attempts = int(self.config.psrl.lmcache.controller_health_timeout_s)
         for attempt in range(max_attempts):
-            # Fast-fail if the process already exited — no point waiting the full
-            # budget for a controller that has crashed.
+            # A terminated process cannot become healthy within this attempt.
             returncode = self._lmcache_controller_proc.poll()
             if returncode is not None:
                 self._lmcache_controller_proc = None
@@ -788,7 +754,7 @@ class RolloutCoordinator(
                 resp = _requests.get(health_url, timeout=2)
                 if resp.status_code == 200:
                     psrl_logger.info(
-                        f"[LMCache] Controller healthy at {controller_url!r} (attempt {attempt + 1}/{max_attempts})."
+                        f"[LMCache] Controller healthy: url={controller_url!r}, attempt={attempt + 1}/{max_attempts}."
                     )
                     return controller_url
             except Exception:

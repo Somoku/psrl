@@ -55,14 +55,14 @@ class TestGlobalCompression:
 
 class TestWithinCross:
     def test_within_cross_sharing(self):
-        # g0: [7,7,1,2], [7,7,1,3]   g1: [7,7,9,9]   (SP=[7,7] shared across groups)
+        # g0: [7,7,1,2], [7,7,1,3], g1: [7,7,9,9] (SP=[7,7] shared across groups)
         seqs = [np.array([7, 7, 1, 2]), np.array([7, 7, 1, 3]), np.array([7, 7, 9, 9])]
         groups = [0, 0, 1]
         m = compute_pmr_metrics(seqs, group_ids=groups)
         # global: raw 12, sorted LCPs 3+2 -> tree 7
         assert m["pmr/compression_ratio"] == pytest.approx(12 / 7)
         assert m["pmr/common_prefix_len"] == 2
-        # within: g0 -> 8 raw, LCP 3 -> tree 5 (C=1.6, S=0.375); g1 -> C=1
+        # within: g0 -> 8 raw, LCP 3 -> tree 5 (C=1.6, S=0.375), g1 -> C=1
         assert m["pmr/within_compression_ratio/mean"] == pytest.approx((8 / 5 + 1) / 2)
         assert m["pmr/within_compression_ratio/min"] == pytest.approx(1.0)
         assert m["pmr/within_compression_ratio/max"] == pytest.approx(8 / 5)

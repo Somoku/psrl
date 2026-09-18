@@ -54,13 +54,12 @@ def build_training_data(
             - output_logprobs: list of [logprob, token_id] pairs (or None)
             - finish_reason: str
         max_trim_tokens: Maximum number of trailing boundary tokens allowed to be trimmed
-            on non-last turns.  Must be 0 for the last turn (boundary tokens are part of
-            the final output).  Sourced from the SMG GET endpoint ``max_trim_tokens``
-            field (0 = DefaultAdapter; 1 = Qwen3/GLM4.7).  A ``ValueError`` is raised
+            on non-last turns. Final-turn boundary tokens are retained. Sourced from
+            the SMG GET endpoint ``max_trim_tokens`` field. A ``ValueError`` is raised
             if the actual trim count exceeds this limit, which indicates a TITO merge
             bug rather than a normal boundary-token situation.
         prompt_ids_override: Optional initial prompt token ids rendered by the Python/verl
-            path.  When provided, these ids are used as ``prompt_ids`` instead of slicing
+            path. When provided, these ids are used as ``prompt_ids`` instead of slicing
             TITO ``accumulated_token_ids`` by the first record's ``prompt_token_count``.
 
     Returns:
@@ -106,10 +105,8 @@ def build_training_data(
         output_ids = [int(pair[1]) for pair in raw_lps]
         output_logprobs = [float(pair[0]) for pair in raw_lps]
 
-        # Fallback: if output_logprobs was None but accumulated_token_ids has
-        # tokens beyond prompt_len, recover token IDs from the accumulated buffer.
-        # This happens when the session router did not record logprobs (e.g.
-        # top_logprobs=0 edge case). Logprobs are filled with 0.0.
+        # Recover token IDs from TITO when log probabilities are unavailable.
+        # Zero log probabilities preserve positional alignment.
         if not output_ids and prompt_len < total_acc_len:
             is_last = i == len(records) - 1
             if is_last:
@@ -152,19 +149,14 @@ def build_training_data(
                 total_acc_len,
             )
 
-            # Validate against the model-specific ceiling.
-            # Last turn: no trimming ever allowed (allowed = 0).
-            # Non-last turn: at most max_trim_tokens (typically 0 or 1).
+            # Non-final turns may trim only the model-specific boundary-token allowance.
             allowed = max_trim_tokens  # is_last already guarded above
             if trim_count > allowed:
-                # A boundary divergence beyond the model's ceiling
-                # (e.g. a truncated turn, or a response that embeds a special
-                # token mid-stream) is a diagnostic condition, not a reason to
-                # discard the whole trajectory. Clamp the trim to the allowed
-                # ceiling and carry on instead of raising.
+                # A boundary divergence beyond the model's ceiling is a diagnostic condition, not
+                # a reason to discard the trajectory, so clamp the trim and carry on.
                 psrl_logger.warning(
                     "[TITO turn %d] trailing trim overflow: trim_count=%d exceeds "
-                    "allowed=%d (max_trim_tokens=%d); clamping trim to %d. "
+                    "allowed=%d (max_trim_tokens=%d). Clamping trim to %d. "
                     "output_ids[-3:]=%s, accumulated[%d:%d]=%s",
                     i,
                     trim_count,
@@ -198,6 +190,15 @@ def build_training_data(
         list(prompt_ids_override) if prompt_ids_override is not None else accumulated_token_ids[:first_prompt_len]
     )
     routed_experts = _assemble_routed_experts(records, len(prompt_ids) + len(all_response_ids) - 1)
+
+    # These fields are extended together and indexed interchangeably downstream.
+    if not (len(all_response_ids) == len(all_response_mask) == len(all_logprobs)):
+        raise AssertionError(
+            f"[TITO build_training_data] length drift over {len(records)} turns: "
+            f"response_ids={len(all_response_ids)} response_mask={len(all_response_mask)} "
+            f"logprobs={len(all_logprobs)}. These are appended in lockstep per turn, so a "
+            "mismatch means one append site diverged from the others."
+        )
 
     psrl_logger.debug(
         "[TITO build_training_data] prompt_len=%d tito_prompt_len=%d response_len=%d "

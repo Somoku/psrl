@@ -14,8 +14,8 @@ def compute_session_loss_weights(
 
     Each valid token in session `s` receives weight `1 / (S * T_s)`, where
     `T_s` counts unmasked tokens across all rows of that session and `S` counts
-    nonempty sessions. Compute after rejection masking, before worker splitting;
-    never renormalize these weights inside an optimizer or micro batch.
+    nonempty sessions. Compute after rejection masking and before worker splitting.
+    Never renormalize these weights inside an optimizer or micro batch.
     """
     if response_mask.ndim != 2 or len(session_ids) != response_mask.shape[0]:
         raise ValueError("Expected a two-dimensional response mask and one session ID per row.")

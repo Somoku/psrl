@@ -20,7 +20,7 @@ SMITH_PARSER_PREFIX = "swesmith_log_parser_"
 Parser = Callable[..., dict[str, str]]
 
 _VENDOR_DIR = Path(__file__).resolve().parent / "_vendor"
-# Enough to let `schema` import and the parser aggregator resolve; individual
+# Enough to let `schema` import and the parser aggregator resolve. Individual
 # language modules are covered by the import guards in `parser_registry`.
 _VENDOR_REQUIRED_FILES = (
     "_constants.py",
@@ -55,7 +55,7 @@ def _load_vendor_log_parsers() -> ModuleType:
     Import the vendored upstream parser aggregator, failing fast with guidance.
 
     The bundle is committed so it can be packaged into the sandbox payload
-    offline; an ImportError here means the checkout is incomplete or pruned.
+    offline. An ImportError here means the checkout is incomplete or pruned.
     """
     try:
         from ._vendor import log_parsers

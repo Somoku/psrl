@@ -19,6 +19,35 @@ When writing a string, ask: **"Is this string a name the program looks up, or a 
 | **Docstring prose** | Uppercase | Yes `.` | Yes `` `id` `` | N/A |
 | **Docstring arg desc** | Uppercase | `.` optional | Yes for *other* identifiers | N/A |
 
+### Banned characters in ALL prose ⚠️
+
+In every comment, docstring, log message, and assertion message, these characters are
+**forbidden anywhere**, not only at the end. Break the sentence in two instead.
+
+| Banned | Instead write | Why it is easy to get wrong |
+|--------|---------------|------------------------------|
+| `;` semicolon | `.` and a new sentence, or a conjunction | The most frequent violation. `A; B` reads naturally but is banned |
+| `—` em dash, `–` en dash | `.` and a new sentence, or restructure | Editors and models emit these automatically |
+| `-` dash joining clauses | plain prose (`# worker-side` → `# worker side`) | Hyphenated compounds inside words are fine |
+| `. ` double space | one space | Invisible in review |
+
+```python
+# BAD  — semicolon, em dash, double space
+# Recovery succeeded; the slot is not wasted — keep the data.  It trains fine.
+
+# GOOD — separate sentences, single spaces
+# Recovery succeeded, so the slot is not wasted. Keep the data because it trains fine.
+```
+
+Before finishing an edit, grep your own diff: `git diff -U0 | grep -nE '^\+.*[;—–]'`
+and confirm every hit is real code (a `for` loop, a shell command) rather than prose.
+
+### Comment length ⚠️
+
+**One line is the default. Two is the ceiling for ordinary code.**
+A comment states the intuition behind the design, never the history of the file
+and never a paraphrase of the line below it. Full rules in [§5.1](#51-what-a-comment-must-earn).
+
 ---
 
 ## §1. Identifier Strings vs. Human-Readable Messages ⚠️
@@ -280,11 +309,66 @@ def wait_for_nixl_push_completion(self, timeout: float | None = None) -> bool:
 - Reference other identifiers with backticks (§2.4).
 - Add `Usage:` with code block when call sequencing is non-obvious.
 
+**Length.** The summary line plus the sections is the whole docstring. Add a prose
+paragraph only to state an invariant, a threading or ownership rule, or a unit that the
+signature cannot express, and keep it to two or three lines. The comment anti-patterns
+in §5.1 (history, restating the signature, comparing alternatives, teaching the
+framework) are banned here too. One line of arg description per arg is normal.
+
 ---
 
 ## §5. Comments & Annotation Markers
 
-### 5.1 Block Comments
+### 5.1 What a Comment Must Earn ⚠️
+
+> **A comment earns its line by carrying information the code cannot.
+> One line is the default. Two is the ceiling for ordinary code.
+> Three is the absolute maximum, and only for a `NOTE` explaining a real design trap.**
+
+Write the **intuition**: the constraint, the invariant, the unit, the failure mode that
+made this code look the way it does. Then stop. If you cannot say it in one line, the
+explanation belongs in the function docstring or the code needs a better name, not a
+longer comment.
+
+**Never write these.** They are the four ways comments get bloated:
+
+| Anti-pattern | Why it is worthless |
+|--------------|---------------------|
+| **History** (`# Previously we called X`, `# The old version did Y`, `# Changed from Z because...`) | Nobody reads code to learn what it used to be. `git log` and `git blame` own this. Delete the old approach, do not narrate it |
+| **Restating the code** (`# Increment the counter` above `counter += 1`) | Costs a line, adds zero information, and rots the moment the code changes |
+| **Comparison to alternatives** (`# We could have used a heap here, but...`) | Design-space tourism. Keep it only if the alternative is one a reader would actively try and break something doing so, and then it is one line |
+| **Tutorials** (explaining what FSDP or a semaphore is) | The reader knows the language and the framework. Explain *this* code, not the concept |
+
+```python
+# BAD — 6 lines of history and self-narration for a 1-line fact
+# Previously, we computed the staleness inside the trainer loop, which meant the
+# value was recomputed on every microbatch. That turned out to be wasteful because
+# the PS version only changes once per step. We could have cached it on the worker,
+# but that would require plumbing the version through the worker constructor.
+# So now we compute it once here and pass it down. This is much cleaner than
+# the old approach and avoids the redundant recomputation.
+staleness = self.ps_version - batch_version
+
+# GOOD — one line, states the invariant a reader cannot see
+# `ps_version` only advances once per step, so this is safe to hoist out of the microbatch loop.
+staleness = self.ps_version - batch_version
+```
+
+```python
+# BAD — restates the code
+# Loop over the workers and call push on each one.
+for worker in self.workers:
+    worker.push()
+
+# GOOD — no comment needed at all
+for worker in self.workers:
+    worker.push()
+```
+
+**A missing comment is cheaper than a bloated one.** When nothing non-obvious is
+happening, write nothing.
+
+### 5.2 Block Comments
 
 Above the code, indented to match. Follow §2.1 (sentence vs. fragment).
 Reference identifiers with backticks (§2.4).
@@ -298,10 +382,11 @@ self.worker_rank = worker_rank
 ```
 
 - Blank line above when starting a new logical section.
-- **No dashes inside comment text.** Use plain prose instead (e.g., `# worker-side` → `# worker side`).
-- **One space after a period**, not two. Never write `. ` + extra space mid-sentence.
+- **Punctuation bans (`;`, `—`, `–`, clause dashes, double spaces) apply here in full.**
+  See [Banned characters in ALL prose](#banned-characters-in-all-prose-) at the top.
+  They are banned *anywhere* in the text, not only at the end.
 
-### 5.2 Inline Comments
+### 5.3 Inline Comments
 
 Two spaces before `#`, one space after. Short fragment preferred.
 
@@ -313,7 +398,7 @@ x = compute_staleness()  # This resets every epoch.
 - Fragment → no period. Sentence → period.
 - Do **not** vertically align across lines.
 
-### 5.3 Section Separators
+### 5.4 Section Separators
 
 Sparingly, only in files >150 lines:
 
@@ -323,7 +408,7 @@ Sparingly, only in files >150 lines:
 # --- Main Training Loop ---
 ```
 
-### 5.4 Annotation Markers
+### 5.5 Annotation Markers
 
 Format: `# MARKER(author): Uppercase message ending with period.`
 
@@ -337,13 +422,13 @@ Format: `# MARKER(author): Uppercase message ending with period.`
 - Always include author initials: `NOTE(lhy)`, `TODO(claude)`.
 - Colon immediately after `)`, one space, then the message.
 - **Uppercase** first letter, ends with **period**.
-- Multi-line: repeat `#` on each line, period on **last line only**.
+- **Three lines maximum**, including the marker line. Repeat `#` on each line,
+  period on the **last line only**. A marker is not a place to escape §5.1.
 
 ```python
-# GOOD
-# NOTE(claude): We use a dict to store the PS handle and merge on the PS side.
-# This is more efficient than calling `transfer_train_to_gen` for each key/shard,
-# which would cause excessive remote calls and may crash the Ray actor.
+# GOOD — 2 lines, states the trap and its consequence
+# NOTE(claude): Merge on the PS side rather than per key/shard, because one remote
+# call per shard floods the Ray actor and it dies.
 
 # BAD — no period, lowercase start
 # NOTE(claude): we use a dict to store the PS handle and merge on the PS side

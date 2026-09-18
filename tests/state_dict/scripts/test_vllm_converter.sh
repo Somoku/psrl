@@ -1,7 +1,6 @@
 #!/bin/bash
 # Run vLLM converter integration test with torchrun (2 GPUs, old ParameterMapping API).
-# Tests: vLLM → HuggingFace state dict conversion via ParameterMapping.
-# Requires: GPU node with psrl environment, model checkpoint at PSRL_WORKSPACE.
+# Requires a GPU node, the PSRL environment, and a checkpoint at `PSRL_WORKSPACE`.
 #
 # Usage:
 #   PSRL_WORKSPACE=/path/to/workspace bash tests/state_dict/scripts/test_vllm_converter.sh

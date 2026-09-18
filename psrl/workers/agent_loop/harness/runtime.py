@@ -5,7 +5,7 @@ filesystem, laid out by convention as ``<root>/<kind>/bin/<executable>``. A task
 sandbox binds that one tree read-only, so the harness never installs into (or
 mutates) the task image's global toolchain: no Node, no npm, no global prefix.
 
-The container mount point is configuration; the host root is the single
+The container mount point is configuration. The host root is the single
 environment input. Every sandbox path is derived from those two values.
 """
 

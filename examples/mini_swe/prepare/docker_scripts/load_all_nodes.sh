@@ -1,39 +1,6 @@
 #!/usr/bin/env bash
-# load_all_nodes.sh — fan out `docker load` of every *.tar in an image
-# directory to every host in a hosts file, in parallel via pssh.
-#
-# This assumes the image directory lives on a *shared* filesystem that every
-# node can read (e.g. ${PSRL_WORKSPACE}/docker_images/swe), so no scp/rsync copy
-# step is needed — each node loads directly off the shared path.
-#
-# Usage:
-#   bash load_all_nodes.sh \
-#       --hosts     ${PSRL_WORKSPACE}/hosts/32GPUs \
-#       --image-dir ${PSRL_WORKSPACE}/docker_images/swe
-#
-# Options:
-#   --hosts FILE           Hosts file, one IP (or IP:port) per line. Lines
-#                          starting with '#' and blank lines are ignored.
-#   --image-dir DIR        Directory containing *.tar files to load.
-#   --images-list FILE     Optional. Only load tars whose basenames (without
-#                          .tar) appear in this file, one per line. Useful to
-#                          roll out a subset.
-#   --parallel-per-node N  How many concurrent `docker load`s per node
-#                          (default: 2). docker load is mostly I/O bound,
-#                          so 1-4 is usually the sweet spot.
-#   --timeout S            pssh per-command timeout in seconds (default 7200).
-#   --user USER            ssh as USER on every node (pssh -l). If unset,
-#                          pssh uses $USER / ~/.ssh/config defaults.
-#   --outdir DIR           pssh -o DIR to collect per-host stdout/stderr
-#                          (default: `<prepare>/_load_logs/<timestamp>/`,
-#                          one level up from this script's docker_scripts/).
-#   --skip-existing        Skip tars whose embedded tag is already present on
-#                          the target node (default: on).
-#   --force                Don't skip anything — `docker load` every tar even
-#                          if the image already exists on the node.
-#   --dry-run              Print the plan and the remote script, don't run.
-#   --pssh PATH            Explicit pssh binary (default: autodetect
-#                          pssh / parallel-ssh).
+# Load shared-filesystem Docker archives on every host with parallel SSH.
+# Usage: `load_all_nodes.sh --hosts FILE --image-dir DIR [options]`
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -85,9 +52,7 @@ grep -Ev '^[[:space:]]*(#|$)' "$HOSTS" > "$CLEAN_HOSTS_FILE"
 NUM_HOSTS=$(wc -l < "$CLEAN_HOSTS_FILE")
 [[ "$NUM_HOSTS" -gt 0 ]] || { echo "ERROR: no hosts in $HOSTS." >&2; exit 1; }
 
-# Default outdir lives in `<prepare>/_load_logs/<timestamp>/` (one level up
-# from this script's `docker_scripts/` dir) so all prepare-phase artefacts
-# stay colocated.
+# Keep preparation logs beside other generated artifacts.
 if [[ -z "$OUTDIR" ]]; then
     PREPARE_DIR="$(dirname "$HERE")"
     OUTDIR="$PREPARE_DIR/_load_logs/$(date +%Y%m%d_%H%M%S)"
@@ -135,10 +100,7 @@ echo "  timeout      : ${TIMEOUT}s"
 echo "  outdir       : $OUTDIR"
 echo
 
-# -----------------------------------------------------------------------------
-# Remote script (runs once on each node). Reads 3 env vars exported via pssh:
-#   IMAGE_DIR_REMOTE, SKIP_EXISTING_REMOTE, JOBS_REMOTE, IMAGES_FILTER_REMOTE (optional)
-# -----------------------------------------------------------------------------
+# --- Remote node script ---
 read -r -d '' REMOTE_SCRIPT <<'REMOTE_EOF' || true
 set -u
 
@@ -243,7 +205,7 @@ if [[ -n "$IMAGES_LIST" ]]; then
 fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "=== DRY RUN — would execute on each of $NUM_HOSTS host(s): ==="
+    echo "=== DRY RUN: commands for each of $NUM_HOSTS host(s) ==="
     echo
     echo "IMAGE_DIR_REMOTE=$IMAGE_DIR  SKIP_EXISTING_REMOTE=$SKIP_EXISTING  JOBS_REMOTE=$PARALLEL_PER_NODE  bash -s <<(REMOTE_SCRIPT)"
     echo

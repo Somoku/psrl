@@ -82,11 +82,9 @@ rollout_is_threshold=2.0
 # Performance Related Parameter
 use_dynamic_bsz=True
 packing_length=$(( (max_prompt_length + max_response_length) * 1 ))
-# NOTE(lhy): parameters of the actor cannot be offloaded when using nixl_cpu mode
-# May support this in the future
+# NOTE(lhy): Actor parameters cannot be offloaded in `nixl_cpu` mode.
 offload=False
 
-# Rollout Trace Configuration (precision may be affected)
 # gen_actor_rollout_ref.rollout.trace.backend=weave
 # gen_actor_rollout_ref.rollout.trace.token2text=True
 

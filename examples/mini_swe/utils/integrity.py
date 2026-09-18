@@ -35,8 +35,7 @@ _PROTECTED_BASENAMES = {
 }
 
 # Trajectory output formats the scanner can dispatch on. These mirror the
-# `HarnessConfig.trajectory_format` values; `plain_text` intentionally has no
-# parser and is reported as unscannable.
+# `HarnessConfig.trajectory_format` values. `plain_text` intentionally has no parser and is unscannable.
 TRAJECTORY_FORMAT_CLAUDE_CODE = "claude_code_stream_json"
 TRAJECTORY_FORMAT_CODEX = "codex_jsonl"
 TRAJECTORY_FORMAT_PLAIN_TEXT = "plain_text"

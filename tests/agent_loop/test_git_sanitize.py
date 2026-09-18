@@ -21,9 +21,7 @@ from examples.mini_swe.utils.git_sanitize import (
 _REPO_ROOT = Path(__file__).parents[2]
 
 
-# ---------------------------------------------------------------------------
-# Shell helpers (run real git in a temp repo)
-# ---------------------------------------------------------------------------
+# --- Shell helpers (run real git in a temp repo) ---
 
 
 def _git(cwd: Path, command: str) -> subprocess.CompletedProcess:
@@ -68,9 +66,7 @@ def test_probe_reports_not_a_worktree(tmp_path: Path) -> None:
     assert PROBE_WORKTREE_MARKER in _git(tmp_path, PROBE_SCRIPT).stdout
 
 
-# ---------------------------------------------------------------------------
-# Purge script shape
-# ---------------------------------------------------------------------------
+# --- Purge script shape ---
 
 
 def test_purge_script_never_resets_or_cleans_worktree() -> None:
@@ -97,9 +93,7 @@ def test_purge_script_guards_non_ancestor_base_commit() -> None:
     assert "refs/psrl/base-commit" in script
 
 
-# ---------------------------------------------------------------------------
-# ensure_git_sanitized control flow
-# ---------------------------------------------------------------------------
+# --- ensure_git_sanitized control flow ---
 
 
 class _FakeExecSession:
@@ -186,9 +180,7 @@ async def test_ensure_git_sanitized_degrades_on_purge_failure() -> None:
     assert metrics["git_sanitize_error"] == 1.0
 
 
-# ---------------------------------------------------------------------------
-# Bake digest parity (bash script <-> runner.py)
-# ---------------------------------------------------------------------------
+# --- Bake digest parity (bash script <-> runner.py) ---
 
 _BAKE_SCRIPT = _REPO_ROOT / "examples/mini_swe/prepare/docker_scripts/bake_harness_image.sh"
 _REBAKE_SCRIPT = _REPO_ROOT / "examples/mini_swe/prepare/docker_scripts/rebake_harness_image.sh"
@@ -237,9 +229,7 @@ def test_rebake_tag_matches_runner() -> None:
     assert _run_shell_function(tag_body, "derivative_tag", image) == f"psrl/swebench-harness:{_image_digest(image)}"
 
 
-# ---------------------------------------------------------------------------
-# Trajectory time breakdown includes sandbox init / git keys
-# ---------------------------------------------------------------------------
+# --- Trajectory time breakdown includes sandbox init / git keys ---
 
 
 def _import_agent_loop_base():
@@ -257,7 +247,7 @@ def _import_agent_loop_base():
 try:
     _AGENT_LOOP_BASE, _TERMINATE_REASON = _import_agent_loop_base()
     _IMPORT_ERROR: Exception | None = None
-except Exception as exc:  # pragma: no cover - environment dependent
+except Exception as exc:  # pragma: no cover (environment dependent)
     _AGENT_LOOP_BASE, _TERMINATE_REASON, _IMPORT_ERROR = None, None, exc
 
 requires_loop = pytest.mark.skipif(_AGENT_LOOP_BASE is None, reason=f"agent loop import unavailable: {_IMPORT_ERROR}")

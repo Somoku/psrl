@@ -61,9 +61,7 @@ class TestHang:
             _session("env_big", I0, STATUS_ENV, 250),
         ]
         to_hang, _ = sched.decide(instances, sessions)
-        # First eviction is the smallest env session; that alone frees 150 →
-        # remaining = 800 - (600+250) = -50 → still over, evict next env (250) →
-        # remaining = 800 - 600 = 200 ≥ 0. Generate is never touched.
+        # Both environment sessions must be evicted before attributed usage fits.
         assert to_hang == ["env_small", "env_big"]
 
     def test_hang_generate_only_when_no_env_left(self):
@@ -90,9 +88,6 @@ class TestHang:
         assert to_hang == ["env_c"]
 
     def test_env_token_weight_reserves_less_for_env(self):
-        # Two env sessions (600 each), nothing resident (used_tokens=0, env KV
-        # freed). shared = 0. With weight 1.0: active = 1200 > 1000 → hang.
-        # With weight 0.5: active = 0.5*1200 = 600 ≤ 1000 → no hang.
         instances = [InstanceCapacity(I0, total_kv_tokens=1000, used_tokens=0)]
         sessions = [
             _session("e1", I0, STATUS_ENV, 600),
@@ -117,7 +112,7 @@ class TestContinue:
 
     def test_no_continue_when_still_full(self):
         sched = _sched()
-        # Running gen already fills the instance; hung must stay hung.
+        # The running generation fills the instance, so the hung session cannot continue.
         instances = [InstanceCapacity(I0, total_kv_tokens=500, used_tokens=100_000)]
         sessions = [
             _session("run", I0, STATUS_GENERATE, 500),
@@ -139,7 +134,7 @@ class TestContinue:
 
     def test_hung_only_continues_on_its_pinned_instance(self):
         sched = _sched()
-        # I0 is full; I1 has room. A session hung on I0 must NOT continue via I1
+        # I0 is full, while I1 has room. A session hung on I0 must not continue via I1
         # in bucketed scope (per-instance readmission, the default).
         instances = [
             InstanceCapacity(I0, total_kv_tokens=100, used_tokens=100_000),
@@ -154,7 +149,7 @@ class TestContinueGlobalBfd:
     """Global scope: continue uses global BFD and may relocate the session."""
 
     def test_hung_relocates_to_emptiest_instance(self):
-        # I0 (session's current instance) is full; I1 has room. In global scope
+        # I0 is full, while I1 has room. In global scope
         # the session is readmitted onto I1 and pinned there.
         sched = _sched(global_scope=True)
         instances = [
@@ -178,16 +173,13 @@ class TestContinueGlobalBfd:
             _session("small", I0, STATUS_ENV, 300, hang_state=SESSION_HUNG),
         ]
         _, to_continue = sched.decide(instances, sessions)
-        # total capacity = 1400 ≥ 500+300. big(500) → I1 (emptiest, 1000);
-        # I1 now 500. small(300) → max(I0=400, I1=500)=I1.
+        # Best-fit decreasing places both sessions on I1.
         assert ("big", I1) in to_continue
         assert ("small", I1) in to_continue
         assert len(to_continue) == 2
 
     def test_selects_smallest_first_when_capacity_limited(self):
-        # Hung sessions are always env-status (hang only happens at idle turn
-        # boundaries), so selection is purely smallest-tokens-first. Room for one
-        # (need 300, capacity 350): the smaller session is chosen.
+        # Idle-turn hanging makes selection depend only on token count, so the smaller session wins.
         sched = _sched(global_scope=True)
         instances = [InstanceCapacity(I0, total_kv_tokens=350, used_tokens=0)]
         sessions = [
@@ -217,7 +209,7 @@ class TestPinningAndBuffer:
             _session("g2", I0, STATUS_GENERATE, 300),
         ]
         to_hang, _ = sched.decide(instances, sessions)
-        # Evict smallest generate (g2=300): remaining = 800 - (400 + 1*100) = 300 ≥ 0.
+        # Evicting `g2` leaves 300 tokens free after the session buffer.
         assert to_hang == ["g2"]
 
     def test_min_with_measured_used_tokens(self):

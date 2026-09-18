@@ -1,14 +1,5 @@
-# Agent config for SWE-agent-LM-7B continued RL training.
-#
-# Matches the xml_function_calling format that SWE-agent-LM-7B was fine-tuned
-# with (see: third_party/SWE-smith/agent/swesmith_infer.yaml).
-#
-# Key differences from swebench_agent_config.yaml:
-# - System prompt uses xml function-calling tool docs (bash + submit only).
-# - XmlFcModel handles canonical XML function calls and degraded bash/markdown
-#   fallbacks.
-# - Observation template uses "OBSERVATION:" prefix matching swesmith training.
-# - str_replace_editor is NOT exposed; model uses sed/python for editing.
+# Configure continued RL with XML function calls.
+# `XmlFcModel` converts parsed calls into sandbox commands.
 - name: mini_swe_agent
   _target_: psrl.workers.agent_loop.loops.mini_swe_agent_loop_v1.MiniSWEAgentLoopV1
   sandbox_config:

@@ -65,10 +65,8 @@ class SessionAgentLoop(AgentLoopBase):
     async def create_session(self, request: dict) -> str:
         """Create one TITO session and bind its routing metadata."""
         headers = self.build_session_headers(request)
-        # Optional session-scoped prompt-too-long budget (set by harness loops,
-        # e.g. the compaction trigger). SMG enforces it by returning an Anthropic
-        # `prompt_too_long` error so Claude Code reactively compacts instead of
-        # growing past the training budget.
+        # Optional session-scoped prompt-too-long budget. SMG returns an Anthropic
+        # `prompt_too_long` error so Claude Code reactively compacts within the budget.
         limit = getattr(self, "prompt_too_long_limit", None)
         if limit is not None:
             headers["x-smg-prompt-too-long-limit"] = str(limit)
@@ -111,12 +109,12 @@ class SessionAgentLoop(AgentLoopBase):
     def attach_tito_tree_metadata(self, training_data: list[dict], outputs: list["TokenOutput"]) -> None:
         """Attach SMG TITO tree/leaf metadata to each generated output.
 
-        Reads the snapshot cached by :meth:`get_training_data`.  When the SMG
+        Reads the snapshot cached by :meth:`get_training_data`. When the SMG
         gateway exports the ``tree`` block, each ``TokenOutput`` gets:
 
         - ``tito_tree``: the full session prefix-tree (nodes with id/hash/parent/
-          finish_reason/truncated/num_tokens/trajectory_ids, leaves with
-          root->leaf path node ids);
+          finish_reason/truncated/num_tokens/trajectory_ids, leaves with a
+          root-to-leaf path of node ids).
         - ``tito_leaf``: the leaf descriptor of this trajectory (node_id, parent,
           path_node_ids) enriched with the leaf node's finish_reason/truncated.
 
@@ -198,12 +196,11 @@ class SessionAgentLoop(AgentLoopBase):
         multi_modal_data: dict | None = None,
         trajectory_id: int | str | None = None,
     ) -> dict:
-        """Send one chat-completion request through a session.
+        """
+        Send one chat completion request through a session.
 
-        ``trajectory_id`` is intentionally a request header rather than part of
-        the OpenAI payload.  With an unbound session this lets TITO preserve
-        independent model contexts without giving up session-level routing and
-        version pinning.
+        The `trajectory_id` request header preserves independent model contexts
+        while retaining session routing and version pinning.
         """
         messages = await normalize_messages(
             messages,
@@ -273,17 +270,32 @@ class SessionAgentLoop(AgentLoopBase):
         training_data["finish_reason"] = records[-1].get("finish_reason") if records else None
         return training_data
 
-    @staticmethod
-    def build_token_output(training_data: dict, *, extra_fields: dict | None = None) -> TokenOutput:
-        """Convert one TITO trajectory into the canonical rollout output."""
+    def build_token_output(self, training_data: dict, *, extra_fields: dict | None = None) -> TokenOutput:
+        """Convert one TITO trajectory into the canonical rollout output.
+
+        The response side is clamped to `rollout.response_length`, mirroring
+        `AgentData.finalize_output` and `GenerateAgentLoop`. Without the clamp an
+        over-long trajectory reaches the trainer intact and trips
+        `rearrange_micro_batches`' `max_token_len >= max_seq_len` assertion, which
+        surfaces as a crash rather than a truncated sample.
+        """
+        response_length = int(self.rollout_config.response_length)
+        response_ids = training_data["response_ids"][:response_length]
+        response_mask = training_data["response_mask"][:response_length]
+        logprobs = training_data["logprobs"]
+        response_log_probs = logprobs[:response_length] if logprobs else None
+        routed_experts = training_data["routed_experts"]
+        if routed_experts is not None:
+            routed_experts = routed_experts[: len(training_data["prompt_ids"]) + response_length]
+
         trajectory_fields = dict(extra_fields or {})
         trajectory_fields["trajectory_id"] = training_data["trajectory_id"]
         return TokenOutput(
             prompt_ids=training_data["prompt_ids"],
-            response_ids=training_data["response_ids"],
-            response_mask=training_data["response_mask"],
-            response_log_probs=training_data["logprobs"] or None,
-            routed_experts=training_data["routed_experts"],
+            response_ids=response_ids,
+            response_mask=response_mask,
+            response_log_probs=response_log_probs,
+            routed_experts=routed_experts,
             stop_reason=training_data.get("finish_reason"),
             num_turns=training_data["num_turns"],
             rollout_instance_id=training_data.get("rollout_instance_id"),
@@ -320,12 +332,6 @@ class SessionAgentLoop(AgentLoopBase):
     def _validate_records(records: list[dict]) -> None:
         for turn, record in enumerate(records):
             for mismatch in record.get("mismatch_report", []):
-                # The TITO re-tokenization comparator is a DEBUG
-                # diagnostic, not a correctness gate. Its mismatches legitimately
-                # fire on truncated generations (finish_reason=length) and on
-                # responses that embed a special token mid-stream — both produce
-                # raw recorded tokens that the chat-template re-render cannot
-                # reproduce exactly. The real gate is SMG's commit-time prefix
-                # validation, so a mismatch here only warrants a warning; aborting
-                # the whole trajectory on it throws away valid rollouts.
+                # The TITO re-tokenization comparator is a DEBUG diagnostic. Its mismatches fire on
+                # truncated generations and mid-stream special tokens, so warn without aborting.
                 psrl_logger.warning("TITO token mismatch at turn %d: %r", turn, mismatch)

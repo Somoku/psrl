@@ -49,7 +49,7 @@ This lifecycle is fully transparent to the workload: existing training and gener
 | Field | Type | Options | Description |
 |-------|------|---------|-------------|
 | `range` | str \| null | `null`, `train`, `all` | Scope of TMS-managed memory |
-| `enable_cuda_graph` | bool | `true` / `false` | Also release captured CUDA graphs when pausing |
+| `enable_cuda_graph` | bool | `true` / `false` | Also release captured CUDA graphs when pausing (both model runners, including breakable graphs) |
 | `enable_nixl` | bool | `true` / `false` | Manage NIXL pinned transfer buffers under TMS |
 
 ```yaml
@@ -84,7 +84,7 @@ Use `range=all` for maximum GPU utilization in resource-constrained deployments.
 
 ### CUDA Graph Management
 
-When `enable_cuda_graph=true`, TMS additionally releases captured CUDA graphs during the pause phase. This matters because CUDA graphs pin GPU memory that ordinary tensor offloading cannot release, without it, a paused vLLM instance would still hold significant GPU memory via its captured attention kernels.
+When `enable_cuda_graph=true`, TMS additionally releases captured CUDA graphs during the pause phase. This matters because CUDA graphs pin GPU memory that ordinary tensor offloading cannot release, without it, a paused vLLM instance would still hold significant GPU memory via its captured attention kernels. This applies to both of vLLM's model runners (v1 and v2) and to breakable CUDA graphs.
 
 ### NIXL Buffer Management
 

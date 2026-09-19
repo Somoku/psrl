@@ -105,6 +105,9 @@ class DPLBStatCollector(StatLoggerBase):
         self.last_dump_to_file_time = None
         self.last_push_to_queue_time = None
         self.output_queue = None
+        # This instance is shared across every engine index, so vLLM calls
+        # `log_engine_initialized` more than once. Log the message only once.
+        self._engine_initialized_logged = False
 
         # Cumulative prefill/decode time tracking.
         self._cumulative_prefill_time: float = 0.0
@@ -356,6 +359,9 @@ class DPLBStatCollector(StatLoggerBase):
         This method is called when the vLLM engine completes initialization
         and reports the number of GPU blocks available for caching.
         """
+        if self._engine_initialized_logged:
+            return
+        self._engine_initialized_logged = True
         if self.vllm_config.cache_config.num_gpu_blocks:
             psrl_logger.info(
                 f"Engine {self.replica_idx}: vllm cache_config_info with initialization "

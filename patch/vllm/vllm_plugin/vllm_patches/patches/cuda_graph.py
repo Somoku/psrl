@@ -17,7 +17,7 @@ from vllm.forward_context import (
 )
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
-from vllm.utils.torch_utils import weak_ref_tensors
+from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 from vllm_patches.core import min_vllm_version, vLLMPatch
 
@@ -25,12 +25,26 @@ psrl_logger = logging.getLogger(__file__)
 psrl_logger.setLevel(os.getenv("PSRL_LOGGING_LEVEL", "WARN"))
 
 
-@min_vllm_version("0.22.0")
+@min_vllm_version("0.29.0")
 class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
-    """
-    Replace `torch.cuda.graph()` with `torch_memory_saver.cuda_graph()`
+    """Capture the v1 model runner's CUDA graphs inside a TMS region.
 
-    Compatible with vLLM 0.22.0+
+    The v1 runner wraps its compiled model in `CUDAGraphWrapper` /
+    `BreakableCUDAGraphWrapper` (`vllm/v1/worker/gpu_model_runner.py`), so this
+    is the v1 counterpart of `TMSCudaGraphManagerPatch` (which covers the v2
+    runner's `CudaGraphManager`). Both are needed: vLLM selects the runner at
+    runtime and can fall back to v1 when a config enables a v2-unsupported
+    feature.
+
+    Mirrors `CUDAGraphWrapper.__call__` from vLLM 0.29.0 with a single change:
+    capture is entered through
+    `torch_memory_saver.cuda_graph(..., tag="graph")` instead of
+    `torch.cuda.graph(...)`, so the capture pool becomes part of the `graph`
+    region released by the TMS sleep backend.
+
+    Breakable capture never reaches this class's capture path (it uses
+    `BreakableCUDAGraphWrapper`, which drives `capture_begin`/`capture_end`
+    directly); it is covered by `vllm_patches.patches.breakable_cudagraph`.
     """
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any | None:
@@ -107,7 +121,7 @@ class TMSCUDAGraphWrapperPatch(vLLMPatch[CUDAGraphWrapper]):
                 with torch_memory_saver.cuda_graph(
                     cudagraph,
                     pool=self.graph_pool,
-                    stream=current_stream(),  # noqa: F821
+                    stream=current_stream(),
                     tag="graph",
                 ):
                     # `output` is managed by pytorch's cudagraph pool

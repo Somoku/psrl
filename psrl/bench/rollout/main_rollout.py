@@ -120,7 +120,13 @@ class SimpleRolloutTester:
                 log_dir=self.config.rollout_test.get("profile_logs_dir", "./profile_logs"),
                 log_file=self.config.rollout_test.get("profile_log_file", "profile"),
             )
-            stat_loggers = [self.stats_collector]
+
+            # vLLM accepts stat-logger factories, not pre-built instances.
+            # Return the shared collector for every engine index.
+            def stats_collector_factory(vllm_config, engine_index=0):
+                return self.stats_collector
+
+            stat_loggers = [stats_collector_factory]
             psrl_logger.info(f"Stats collector initialized, logs will be saved to: {self.stats_collector.log_file}")
         else:
             self.stats_collector = None

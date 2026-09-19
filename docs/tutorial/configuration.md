@@ -931,7 +931,8 @@ workloads to share GPU memory.
   **Default:** `null`
 
 `tms.enable_cuda_graph`
-: Release CUDA graphs via TMS when not in use. Requires `range: all`.
+: Release CUDA graphs via TMS when not in use. Covers both vLLM model runners
+  (v1 and v2) and breakable CUDA graphs. Requires `range: all`.
   **Default:** `False`
 
 `tms.enable_nixl`

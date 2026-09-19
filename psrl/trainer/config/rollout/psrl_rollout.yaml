@@ -57,6 +57,10 @@ reward_kwargs:
 # (TMS-only) Whether to enable offloading weights (level-1 sleep) to CPU.
 enable_weights_cpu_backup: False
 
+# Release idle NCCL communicator memory during sleep mode. Requires NCCL >= 2.29.7
+# from torch's bundled NCCL. On older NCCL it is a validated no-op.
+enable_nccl_comm_suspend: True
+
 # Multi-turn interaction config for tools or chat.
 multi_turn:
 
